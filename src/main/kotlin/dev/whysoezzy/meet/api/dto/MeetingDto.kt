@@ -60,5 +60,5 @@ data class PersonDto(
     val id: Long,
     val name: String,
     val surname: String,
-    val imageUrl: String?
+    val imageUrl: String
 ) : Serializable

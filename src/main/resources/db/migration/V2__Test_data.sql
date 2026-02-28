@@ -81,3 +81,48 @@ INSERT INTO user_interests (user_id, tag_id) VALUES
 SELECT setval('users_id_seq', 1);
 SELECT setval('communities_id_seq', 3);
 SELECT setval('meetings_id_seq', 5);
+
+-- Добавляем больше тестовых пользователей (участников встреч)
+INSERT INTO users (id, name, surname, phone, email, city, bio, avatar_url) VALUES
+(2, 'Анна', 'Иванова', '+79991234568', 'anna.ivanova@example.com', 'Москва', 'UX Designer', 'https://i.pravatar.cc/300?img=2'),
+(3, 'Петр', 'Петров', '+79991234569', 'petr.petrov@example.com', 'Москва', 'Android Developer', 'https://i.pravatar.cc/300?img=3'),
+(4, 'Мария', 'Сидорова', '+79991234570', 'maria.sidorova@example.com', 'Москва', 'Product Manager', 'https://i.pravatar.cc/300?img=4'),
+(5, 'Алексей', 'Козлов', '+79991234571', 'alexey.kozlov@example.com', 'Москва', 'Data Analyst', 'https://i.pravatar.cc/300?img=5'),
+(6, 'Ольга', 'Новикова', '+79991234572', 'olga.novikova@example.com', 'Москва', 'QA Engineer', 'https://i.pravatar.cc/300?img=6'),
+(7, 'Дмитрий', 'Кузнецов', '+79991234573', 'dmitry.kuznetsov@example.com', 'Москва', 'Backend Dev', 'https://i.pravatar.cc/300?img=7'),
+(8, 'Елена', 'Федорова', '+79991234574', 'elena.fedorova@example.com', 'Москва', 'iOS Dev', 'https://i.pravatar.cc/300?img=8'),
+(9, 'Максим', 'Орлов', '+79991234575', 'maxim.orlov@example.com', 'Москва', 'DevOps', 'https://i.pravatar.cc/300?img=9'),
+(10, 'Наталья', 'Ковалева', '+79991234576', 'natalia.kovaleva@example.com', 'Москва', 'Team Lead', 'https://i.pravatar.cc/300?img=10'),
+(11, 'Сергей', 'Морозов', '+79991234577', 'sergey.morozov@example.com', 'Москва', 'Frontend', 'https://i.pravatar.cc/300?img=11'),
+(12, 'Татьяна', 'Соколова', '+79991234578', 'tatiana.sokolova@example.com', 'Москва', 'Designer', 'https://i.pravatar.cc/300?img=12'),
+(13, 'Владимир', 'Попов', '+79991234579', 'vladimir.popov@example.com', 'Москва', 'Architect', 'https://i.pravatar.cc/300?img=13'),
+(14, 'Ирина', 'Лебедева', '+79991234580', 'irina.lebedeva@example.com', 'Москва', 'Scrum Master', 'https://i.pravatar.cc/300?img=14'),
+(15, 'Андрей', 'Волков', '+79991234581', 'andrey.volkov@example.com', 'Москва', 'Full Stack', 'https://i.pravatar.cc/300?img=15'),
+(16, 'Екатерина', 'Соловьева', '+79991234582', 'ekaterina.solovieva@example.com', 'Москва', 'Content Manager', 'https://i.pravatar.cc/300?img=16'),
+(17, 'Николай', 'Васильев', '+79991234583', 'nikolay.vasiliev@example.com', 'Москва', 'ML Engineer', 'https://i.pravatar.cc/300?img=17'),
+(18, 'Светлана', 'Павлова', '+79991234584', 'svetlana.pavlova@example.com', 'Москва', 'BA', 'https://i.pravatar.cc/300?img=18'),
+(19, 'Игорь', 'Семенов', '+79991234585', 'igor.semenov@example.com', 'Москва', 'Security', 'https://i.pravatar.cc/300?img=19'),
+(20, 'Юлия', 'Егорова', '+79991234586', 'yulia.egorova@example.com', 'Москва', 'Recruiter', 'https://i.pravatar.cc/300?img=20')
+ON CONFLICT (phone) DO NOTHING;
+
+-- Обновляем последовательность для users
+SELECT setval('users_id_seq', (SELECT MAX(id) FROM users));
+
+-- Добавляем участников к встрече #1 (Jetpack Compose Workshop)
+INSERT INTO meeting_participants (meeting_id, user_id) VALUES
+(1, 2), (1, 3), (1, 4), (1, 5), (1, 6),
+(1, 7), (1, 8), (1, 9), (1, 10), (1, 11),
+(1, 12), (1, 13), (1, 14), (1, 15)
+ON CONFLICT DO NOTHING;
+
+-- Добавляем участников к встрече #2 (Kotlin Coroutines)
+INSERT INTO meeting_participants (meeting_id, user_id) VALUES
+(2, 2), (2, 4), (2, 6), (2, 8), (2, 10),
+(2, 12), (2, 14), (2, 16), (2, 18), (2, 20)
+ON CONFLICT DO NOTHING;
+
+-- Добавляем участников к встрече #3 (Clean Architecture)
+INSERT INTO meeting_participants (meeting_id, user_id) VALUES
+(3, 3), (3, 5), (3, 7), (3, 9), (3, 11),
+(3, 13), (3, 15), (3, 17), (3, 19)
+ON CONFLICT DO NOTHING;

@@ -26,7 +26,10 @@ class User(
     
     @Column(columnDefinition = "TEXT")
     var bio: String = "",
-    
+
+    @Column(length = 100)
+    var role: String? = null,
+
     @ManyToMany
     @JoinTable(
         name = "user_interests",
