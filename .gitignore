@@ -21,3 +21,12 @@ out/
 
 ### Logs ###
 *.log
+
+### Uploads (локальное хранилище файлов) ###
+# Игнорируем сами файлы, но сохраняем структуру папок через .gitkeep
+uploads/avatars/*
+uploads/meetings/*
+uploads/communities/*
+!uploads/avatars/.gitkeep
+!uploads/meetings/.gitkeep
+!uploads/communities/.gitkeep

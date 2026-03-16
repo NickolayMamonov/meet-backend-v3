@@ -17,82 +17,66 @@ class CommunityService(
 ) {
 
     @Transactional(readOnly = true)
-    fun getRecommendedCommunities(): List<CommunityDto> {
+    fun getRecommendedCommunities(currentUserId: Long?): List<CommunityDto> {
         logger.info { "Fetching recommended communities" }
-
         return communityRepository.findAll()
             .take(20)
-            .map { it.toDto(MOCK_USER_ID) }
+            .map { it.toDto(currentUserId) }
     }
 
     @Transactional(readOnly = true)
-    fun getCommunityById(id: Long): CommunityDto {
-        logger.info { "Fetching community by id: $id" }
-
-        val community = communityRepository.findById(id).orElseThrow {
-            IllegalArgumentException("Community not found")
-        }
-
-        return community.toDto(MOCK_USER_ID)
+    fun getCommunityById(id: Long, currentUserId: Long?): CommunityDto {
+        logger.info { "Fetching community: $id" }
+        val community = communityRepository.findById(id)
+            .orElseThrow { IllegalArgumentException("Community not found: $id") }
+        return community.toDto(currentUserId)
     }
 
     @Transactional
-    fun subscribeToCommunity(communityId: Long) {
-        val userId = MOCK_USER_ID
+    fun subscribeToCommunity(communityId: Long, userId: Long) {
         logger.info { "User $userId subscribing to community: $communityId" }
 
-        val community = communityRepository.findById(communityId).orElseThrow {
-            IllegalArgumentException("Community not found")
-        }
+        val community = communityRepository.findById(communityId)
+            .orElseThrow { IllegalArgumentException("Community not found") }
+        val user = userRepository.findById(userId)
+            .orElseThrow { IllegalArgumentException("User not found") }
 
-        val user = userRepository.findById(userId).orElseThrow {
-            IllegalArgumentException("User not found")
-        }
-
-        if (communityRepository.isUserSubscribed(communityId, userId)) {
+        if (communityRepository.isUserSubscribed(communityId, userId))
             throw IllegalStateException("Already subscribed")
-        }
 
         community.subscribers.add(user)
         communityRepository.save(community)
     }
 
     @Transactional
-    fun unsubscribeFromCommunity(communityId: Long) {
-        val userId = MOCK_USER_ID
+    fun unsubscribeFromCommunity(communityId: Long, userId: Long) {
         logger.info { "User $userId unsubscribing from community: $communityId" }
 
-        val community = communityRepository.findById(communityId).orElseThrow {
-            IllegalArgumentException("Community not found")
-        }
+        val community = communityRepository.findById(communityId)
+            .orElseThrow { IllegalArgumentException("Community not found") }
+        val user = userRepository.findById(userId)
+            .orElseThrow { IllegalArgumentException("User not found") }
 
-        val user = userRepository.findById(userId).orElseThrow {
-            IllegalArgumentException("User not found")
-        }
-
-        if (!communityRepository.isUserSubscribed(communityId, userId)) {
+        if (!communityRepository.isUserSubscribed(communityId, userId))
             throw IllegalStateException("Not subscribed")
-        }
 
         community.subscribers.remove(user)
         communityRepository.save(community)
     }
 
     @Transactional(readOnly = true)
-    fun searchCommunities(query: String): List<CommunityDto> {
+    fun searchCommunities(query: String, currentUserId: Long?): List<CommunityDto> {
         logger.info { "Searching communities: $query" }
-
         return communityRepository.searchCommunities(query)
-            .map { it.toDto(MOCK_USER_ID) }
+            .map { it.toDto(currentUserId) }
     }
 
     @Transactional(readOnly = true)
-    fun getCommunityMeetings(communityId: Long): List<MeetingDto> {
+    fun getCommunityMeetings(communityId: Long, currentUserId: Long?): List<MeetingDto> {
         logger.info { "Fetching meetings for community: $communityId" }
 
-        val community = communityRepository.findById(communityId).orElseThrow {
-            IllegalArgumentException("Community not found")
-        }
+        val community = communityRepository.findById(communityId)
+            .orElseThrow { IllegalArgumentException("Community not found") }
 
         return community.getActiveMeetings().map { meeting ->
             MeetingDto(
@@ -122,15 +106,12 @@ class CommunityService(
                     meetingsInfo = emptyList()
                 ),
                 participants = meeting.participants.map {
-                    PersonDto(
-                        id = it.id!!,
-                        name = it.name,
-                        surname = it.surname,
-                        imageUrl = it.avatarUrl ?: ""
-                    )
+                    PersonDto(it.id!!, it.name, it.surname, it.avatarUrl ?: "")
                 },
                 meetingStatus = meeting.status.name,
-                isUserInParticipants = meeting.participants.any { it.id == MOCK_USER_ID }
+                isUserInParticipants = currentUserId?.let { uid ->
+                    meeting.participants.any { it.id == uid }
+                } ?: false
             )
         }
     }
@@ -139,9 +120,8 @@ class CommunityService(
     fun getCommunitySubscribers(communityId: Long): List<UserInfoDto> {
         logger.info { "Fetching subscribers for community: $communityId" }
 
-        val community = communityRepository.findById(communityId).orElseThrow {
-            IllegalArgumentException("Community not found")
-        }
+        val community = communityRepository.findById(communityId)
+            .orElseThrow { IllegalArgumentException("Community not found") }
 
         return community.subscribers.map { user ->
             UserInfoDto(
@@ -150,24 +130,24 @@ class CommunityService(
                 surname = user.surname,
                 avatarUrl = user.avatarUrl ?: "",
                 bio = user.bio,
-                role = user.bio // используем bio как role для совместимости
+                role = user.interests.firstOrNull()?.text ?: ""
             )
         }
     }
 
-    private fun Community.toDto(currentUserId: Long): CommunityDto {
+    private fun Community.toDto(currentUserId: Long?): CommunityDto {
+        val isSubscribed = currentUserId?.let {
+            communityRepository.isUserSubscribed(id!!, it)
+        } ?: false
+
         return CommunityDto(
             id = id!!,
             name = name,
             description = description,
             imageUrl = imageUrl,
             subscribersCount = subscribersCount,
-            isSubscribed = communityRepository.isUserSubscribed(id!!, currentUserId),
+            isSubscribed = isSubscribed,
             tags = tags.map { TagDto(it.id!!, it.text) }
         )
     }
-    companion object {
-        private const val MOCK_USER_ID = 1L
-    }
 }
-

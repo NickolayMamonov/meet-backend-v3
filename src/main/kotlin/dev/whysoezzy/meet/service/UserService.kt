@@ -1,25 +1,26 @@
 package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.api.dto.*
-import dev.whysoezzy.meet.domain.entity.User
+import dev.whysoezzy.meet.domain.entity.SocialMediaType
+import dev.whysoezzy.meet.domain.entity.UserSocialMedia
 import dev.whysoezzy.meet.domain.repository.CommunityRepository
-import dev.whysoezzy.meet.domain.repository.MeetingRepository
+import dev.whysoezzy.meet.domain.repository.TagRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import mu.KotlinLogging
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
+import java.time.LocalDateTime
 
 private val logger = KotlinLogging.logger {}
 
-
 @Service
 class UserService(
-    private val userRepository: UserRepository
+    private val userRepository: UserRepository,
+    private val tagRepository: TagRepository
 ) {
 
     @Transactional(readOnly = true)
-    fun getCurrentUserProfile(): UserProfileDto {
-        val userId = MOCK_USER_ID
+    fun getCurrentUserProfile(userId: Long): UserProfileDto {
         logger.info { "Fetching current user profile: $userId" }
         return getUserProfile(userId)
     }
@@ -29,35 +30,21 @@ class UserService(
         logger.info { "Fetching user profile: $userId" }
 
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found with id: $userId") }
+            .orElseThrow { NoSuchElementException("User not found: $userId") }
 
-        return UserProfileDto(
-            id = user.id!!,
-            name = user.name,
-            surname = user.surname,
-            email = user.email,
-            phone = user.phone,
-            city = user.city,
-            description = user.bio,
-            avatarUrl = user.avatarUrl,
-            socialMedias = user.socialMedia.map { social ->
-                SocialMediaDto(
-                    type = social.platform.name.lowercase(),
-                    url = social.username
-                )
-            }
-        )
+        if (user.isDeleted) throw NoSuchElementException("User account is deleted")
+
+        return user.toProfileDto()
     }
 
     @Transactional
-    fun updateProfile(updateDto: UpdateUserDto): UserProfileDto {
-        val userId = MOCK_USER_ID
+    fun updateProfile(userId: Long, updateDto: UpdateUserDto): UserProfileDto {
         logger.info { "Updating user profile: $userId" }
 
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found with id: $userId") }
+            .orElseThrow { NoSuchElementException("User not found: $userId") }
 
-        // Обновляем только переданные поля
+        // Базовые поля
         updateDto.name?.let { user.name = it }
         updateDto.surname?.let { user.surname = it }
         updateDto.email?.let { user.email = it }
@@ -65,26 +52,55 @@ class UserService(
         updateDto.description?.let { user.bio = it }
         updateDto.avatarUrl?.let { user.avatarUrl = it }
 
-        val updatedUser = userRepository.save(user)
+        // Настройки
+        updateDto.showCommunities?.let { user.showCommunities = it }
+        updateDto.showMeetings?.let { user.showMeetings = it }
+        updateDto.notificationsEnabled?.let { user.notificationsEnabled = it }
 
-        logger.info { "User profile updated successfully: $userId" }
+        // Интересы — перезаписываем весь список
+        updateDto.interestIds?.let { ids ->
+            val tags = tagRepository.findAllById(ids).toMutableSet()
+            user.interests.clear()
+            user.interests.addAll(tags)
+        }
 
-        return UserProfileDto(
-            id = updatedUser.id!!,
-            name = updatedUser.name,
-            surname = updatedUser.surname,
-            email = updatedUser.email,
-            phone = updatedUser.phone,
-            city = updatedUser.city,
-            description = updatedUser.bio,
-            avatarUrl = updatedUser.avatarUrl,
-            socialMedias = updatedUser.socialMedia.map { social ->
-                SocialMediaDto(
-                    type = social.platform.name.lowercase(),
-                    url = social.username
+        // Соцсети — перезаписываем полностью
+        updateDto.socialMedias?.let { dtos ->
+            user.socialMedia.clear()
+            dtos.forEach { dto ->
+                val platform = runCatching {
+                    SocialMediaType.valueOf(dto.type.uppercase())
+                }.getOrElse {
+                    throw IllegalArgumentException("Unknown social media type: ${dto.type}")
+                }
+                user.socialMedia.add(
+                    UserSocialMedia(user = user, platform = platform, username = dto.url)
                 )
             }
-        )
+        }
+
+        val saved = userRepository.save(user)
+        logger.info { "User profile updated: $userId" }
+
+        return saved.toProfileDto()
+    }
+
+    @Transactional
+    fun updateFcmToken(userId: Long, fcmToken: String) {
+        logger.info { "Updating FCM token for user: $userId" }
+        val user = userRepository.findById(userId)
+            .orElseThrow { NoSuchElementException("User not found: $userId") }
+        user.fcmToken = fcmToken
+        userRepository.save(user)
+    }
+
+    @Transactional
+    fun deleteAccount(userId: Long) {
+        logger.info { "Soft deleting account: $userId" }
+        val user = userRepository.findById(userId)
+            .orElseThrow { NoSuchElementException("User not found: $userId") }
+        user.deletedAt = LocalDateTime.now()
+        userRepository.save(user)
     }
 
     @Transactional(readOnly = true)
@@ -92,11 +108,9 @@ class UserService(
         logger.info { "Fetching meetings for user: $userId" }
 
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found with id: $userId") }
+            .orElseThrow { NoSuchElementException("User not found: $userId") }
 
-        val meetings = user.participatingMeetings
-
-        return meetings.map { meeting ->
+        return user.participatingMeetings.map { meeting ->
             MeetingInfoDto(
                 id = meeting.id!!,
                 title = meeting.title,
@@ -111,11 +125,9 @@ class UserService(
         logger.info { "Fetching communities for user: $userId" }
 
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found with id: $userId") }
+            .orElseThrow { NoSuchElementException("User not found: $userId") }
 
-        val communities = user.subscribedCommunities
-
-        return communities.map { community ->
+        return user.subscribedCommunities.map { community ->
             CommunityInfoDto(
                 id = community.id!!,
                 name = community.name,
@@ -125,8 +137,21 @@ class UserService(
             )
         }
     }
-
-    companion object {
-        private const val MOCK_USER_ID = 1L
-    }
 }
+
+// Extension function для маппинга User -> UserProfileDto
+fun dev.whysoezzy.meet.domain.entity.User.toProfileDto() = UserProfileDto(
+    id = id!!,
+    name = name,
+    surname = surname,
+    email = email,
+    phone = phone,
+    city = city,
+    description = bio,
+    avatarUrl = avatarUrl,
+    interests = interests.map { TagDto(it.id!!, it.text) },
+    socialMedias = socialMedia.map { SocialMediaDto(it.platform.name.lowercase(), it.username) },
+    showCommunities = showCommunities,
+    showMeetings = showMeetings,
+    notificationsEnabled = notificationsEnabled
+)

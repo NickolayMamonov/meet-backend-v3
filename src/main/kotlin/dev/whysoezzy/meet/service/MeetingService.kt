@@ -16,121 +16,122 @@ class MeetingService(
     private val meetingRepository: MeetingRepository,
     private val userRepository: UserRepository
 ) {
-    
-    // Mock user ID для разработки без авторизации
-    private val MOCK_USER_ID = 1L
-    
+
     @Transactional(readOnly = true)
-    fun getMainMeetings(): List<MeetingDto> {
+    fun getMainMeetings(currentUserId: Long?): List<MeetingDto> {
         logger.info { "Fetching main meetings" }
-        
+
         val currentTime = System.currentTimeMillis()
-        
-        // Получаем ближайшую встречу, популярные и предстоящие
         val upcoming = meetingRepository.findUpcomingMeetings(MeetingStatus.ACTIVE, currentTime)
         val popular = meetingRepository.findPopularMeetings(MeetingStatus.ACTIVE)
-        
-        // Объединяем списки и убираем дубликаты
+
         return (upcoming.take(1) + popular.take(10) + upcoming.drop(1).take(10))
             .distinctBy { it.id }
-            .map { it.toDto(MOCK_USER_ID) }
+            .map { it.toDto(currentUserId) }
     }
-    
+
     @Transactional(readOnly = true)
-    fun getPopularMeetings(): List<MeetingDto> {
+    fun getPopularMeetings(currentUserId: Long?): List<MeetingDto> {
         logger.info { "Fetching popular meetings" }
-        
+
         return meetingRepository.findPopularMeetings(MeetingStatus.ACTIVE)
             .take(20)
-            .map { it.toDto(MOCK_USER_ID) }
+            .map { it.toDto(currentUserId) }
     }
-    
+
     @Transactional(readOnly = true)
-    fun getAllMeetings(page: Int, limit: Int): List<MeetingDto> {
-        logger.info { "Fetching all meetings - page: $page, limit: $limit" }
-        
-        return meetingRepository.findAllByStatus(MeetingStatus.ACTIVE)
+    fun getAllMeetings(page: Int, limit: Int, tagId: Long?, currentUserId: Long?): List<MeetingDto> {
+        logger.info { "Fetching all meetings - page: $page, limit: $limit, tagId: $tagId" }
+
+        val meetings = if (tagId != null) {
+            meetingRepository.findByTagId(tagId, MeetingStatus.ACTIVE)
+        } else {
+            meetingRepository.findAllByStatus(MeetingStatus.ACTIVE)
+        }
+
+        return meetings
             .drop(page * limit)
             .take(limit)
-            .map { it.toDto(MOCK_USER_ID) }
+            .map { it.toDto(currentUserId) }
     }
-    
+
     @Transactional(readOnly = true)
-    fun searchMeetings(query: String): List<MeetingDto> {
+    fun searchMeetings(query: String, currentUserId: Long?): List<MeetingDto> {
         logger.info { "Searching meetings: $query" }
-        
         return meetingRepository.searchMeetings(query, MeetingStatus.ACTIVE)
-            .map { it.toDto(MOCK_USER_ID) }
+            .map { it.toDto(currentUserId) }
     }
-    
+
     @Transactional(readOnly = true)
-    fun getMeetingById(id: Long): MeetingDto {
-        logger.info { "Fetching meeting by id: $id" }
-        
-        val meeting = meetingRepository.findById(id).orElseThrow {
-            IllegalArgumentException("Meeting not found with id: $id")
-        }
-        
-        return meeting.toDto(MOCK_USER_ID)
+    fun getMeetingById(id: Long, currentUserId: Long?): MeetingDto {
+        logger.info { "Fetching meeting: $id" }
+        val meeting = meetingRepository.findById(id)
+            .orElseThrow { IllegalArgumentException("Meeting not found: $id") }
+        return meeting.toDto(currentUserId)
     }
-    
+
     @Transactional
-    fun joinMeeting(meetingId: Long) {
-        val userId = MOCK_USER_ID
+    fun joinMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId joining meeting: $meetingId" }
-        
-        val meeting = meetingRepository.findById(meetingId).orElseThrow {
-            IllegalArgumentException("Meeting not found")
-        }
-        
-        val user = userRepository.findById(userId).orElseThrow {
-            IllegalArgumentException("User not found")
-        }
-        
-        if (!meeting.isActive()) {
-            throw IllegalStateException("Meeting is not active")
-        }
-        
-        if (meetingRepository.isUserParticipant(meetingId, userId)) {
+
+        val meeting = meetingRepository.findById(meetingId)
+            .orElseThrow { IllegalArgumentException("Meeting not found") }
+        val user = userRepository.findById(userId)
+            .orElseThrow { IllegalArgumentException("User not found") }
+
+        if (!meeting.isActive()) throw IllegalStateException("Meeting is not active")
+        if (meetingRepository.isUserParticipant(meetingId, userId))
             throw IllegalStateException("User already joined this meeting")
-        }
-        
+
         meeting.addParticipant(user)
         meetingRepository.save(meeting)
     }
-    
+
     @Transactional
-    fun leaveMeeting(meetingId: Long) {
-        val userId = MOCK_USER_ID
+    fun leaveMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId leaving meeting: $meetingId" }
-        
-        val meeting = meetingRepository.findById(meetingId).orElseThrow {
-            IllegalArgumentException("Meeting not found")
-        }
-        
-        val user = userRepository.findById(userId).orElseThrow {
-            IllegalArgumentException("User not found")
-        }
-        
-        if (!meetingRepository.isUserParticipant(meetingId, userId)) {
+
+        val meeting = meetingRepository.findById(meetingId)
+            .orElseThrow { IllegalArgumentException("Meeting not found") }
+        val user = userRepository.findById(userId)
+            .orElseThrow { IllegalArgumentException("User not found") }
+
+        if (!meetingRepository.isUserParticipant(meetingId, userId))
             throw IllegalStateException("User is not a participant")
-        }
-        
+
         meeting.removeParticipant(user)
         meetingRepository.save(meeting)
     }
-    
+
     @Transactional(readOnly = true)
-    fun getUserMeetings(): List<MeetingDto> {
-        val userId = MOCK_USER_ID
+    fun getUserMeetings(userId: Long): List<MeetingDto> {
         logger.info { "Fetching meetings for user: $userId" }
-        
         return meetingRepository.findByParticipantId(userId)
             .map { it.toDto(userId) }
     }
-    
-    // Extension function для маппинга
-    private fun Meeting.toDto(currentUserId: Long): MeetingDto {
+
+    @Transactional(readOnly = true)
+    fun getMeetingParticipants(meetingId: Long): List<UserInfoDto> {
+        logger.info { "Fetching participants for meeting: $meetingId" }
+        val meeting = meetingRepository.findById(meetingId)
+            .orElseThrow { IllegalArgumentException("Meeting not found: $meetingId") }
+
+        return meeting.participants.map { user ->
+            UserInfoDto(
+                id = user.id!!,
+                name = user.name,
+                surname = user.surname,
+                avatarUrl = user.avatarUrl ?: "",
+                bio = user.bio,
+                // Берём первый тег интересов как специализацию (экран People)
+                role = user.interests.firstOrNull()?.text ?: user.bio.take(30)
+            )
+        }
+    }
+
+    // ==================== Маппинг ====================
+
+    private fun Meeting.toDto(currentUserId: Long?): MeetingDto {
         return MeetingDto(
             id = id!!,
             imageUrl = imageUrl,
@@ -162,10 +163,12 @@ class MeetingService(
                 )
             },
             participants = participants.map {
-                PersonDto(it.id!!, it.name, it.surname, it.avatarUrl)
+                PersonDto(it.id!!, it.name, it.surname, it.avatarUrl ?: "")
             },
             meetingStatus = status.name,
-            isUserInParticipants = participants.any { it.id == currentUserId }
+            isUserInParticipants = currentUserId?.let { uid ->
+                participants.any { it.id == uid }
+            } ?: false
         )
     }
 }

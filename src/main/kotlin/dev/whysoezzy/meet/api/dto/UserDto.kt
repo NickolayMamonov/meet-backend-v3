@@ -2,9 +2,7 @@ package dev.whysoezzy.meet.api.dto
 
 import java.io.Serializable
 
-/**
- * DTO для профиля пользователя
- */
+/** DTO для полного профиля пользователя */
 data class UserProfileDto(
     val id: Long,
     val name: String,
@@ -14,32 +12,39 @@ data class UserProfileDto(
     val city: String?,
     val description: String?,
     val avatarUrl: String?,
-    val socialMedias: List<SocialMediaDto> = emptyList()
+    val interests: List<TagDto> = emptyList(),
+    val socialMedias: List<SocialMediaDto> = emptyList(),
+    // Настройки
+    val showCommunities: Boolean = true,
+    val showMeetings: Boolean = true,
+    val notificationsEnabled: Boolean = true
 ) : Serializable
 
-/**
- * DTO для обновления профиля
- */
+/** DTO для обновления профиля */
 data class UpdateUserDto(
-    val name: String?,
-    val surname: String?,
-    val email: String?,
-    val city: String?,
-    val description: String?,
-    val avatarUrl: String?
+    val name: String? = null,
+    val surname: String? = null,
+    val email: String? = null,
+    val city: String? = null,
+    val description: String? = null,
+    val avatarUrl: String? = null,
+    // Интересы — список id тегов
+    val interestIds: List<Long>? = null,
+    // Соцсети
+    val socialMedias: List<SocialMediaDto>? = null,
+    // Настройки
+    val showCommunities: Boolean? = null,
+    val showMeetings: Boolean? = null,
+    val notificationsEnabled: Boolean? = null
 ) : Serializable
 
-/**
- * DTO для социальных сетей
- */
+/** DTO для социальных сетей */
 data class SocialMediaDto(
-    val type: String,
-    val url: String
+    val type: String,    // "telegram" или "habr"
+    val url: String      // username/handle
 ) : Serializable
 
-/**
- * DTO для простой информации о пользователе (для списков)
- */
+/** DTO для краткой информации о пользователе */
 data class UserDto(
     val id: Long,
     val name: String,
@@ -48,8 +53,8 @@ data class UserDto(
 ) : Serializable
 
 /**
- * DTO для информации о пользователе с дополнительными полями
- * Используется для списков участников и подписчиков
+ * DTO для информации о пользователе в списках участников/подписчиков
+ * Экран People — показывает аватарку, имя и специализацию (первый тег интересов)
  */
 data class UserInfoDto(
     val id: Long,
@@ -58,4 +63,9 @@ data class UserInfoDto(
     val avatarUrl: String,
     val bio: String,
     val role: String
+) : Serializable
+
+/** DTO для запроса обновления FCM токена */
+data class UpdateFcmTokenDto(
+    val fcmToken: String
 ) : Serializable
