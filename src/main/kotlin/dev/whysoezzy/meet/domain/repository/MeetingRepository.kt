@@ -85,4 +85,6 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
         source: EventSource,
         sourceExternalId: String
     ): Meeting?
+
+    fun deleteBySource(source: EventSource): Int
 }

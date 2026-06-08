@@ -1,11 +1,14 @@
 package dev.whysoezzy.meet.ingestion
 
+import dev.whysoezzy.meet.domain.entity.EventSource
 import dev.whysoezzy.meet.domain.entity.IngestionRun
 import dev.whysoezzy.meet.domain.entity.IngestionStatus
 import dev.whysoezzy.meet.domain.repository.IngestionRunRepository
+import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import mu.KotlinLogging
 import org.springframework.beans.factory.ObjectProvider
 import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
 import java.time.LocalDateTime
 
 private val logger = KotlinLogging.logger {}
@@ -15,9 +18,12 @@ class IngestionService(
     private val providers: ObjectProvider<EventProvider>,
     private val upsertService: MeetingUpsertService,
     private val ingestionRunRepository: IngestionRunRepository,
+    private val meetingRepository: MeetingRepository,
 ) {
     /** Прогнать все зарегистрированные источники. */
     fun runAll(): List<IngestionRun> = providers.toList().map { runProvider(it) }
+
+
 
     /** Прогон одного источника: изоляция ошибок + запись в журнал. */
     fun runProvider(provider: EventProvider): IngestionRun {
@@ -33,6 +39,7 @@ class IngestionService(
                     when (upsertService.upsert(provider.source(), raw)) {
                         UpsertResult.CREATED -> run.createdCount++
                         UpsertResult.UPDATED -> run.updatedCount++
+                        UpsertResult.SKIPPED -> run.skippedCount++
                     }
                 } catch (e: Exception) {
                     hadEventError = true
@@ -51,4 +58,8 @@ class IngestionService(
         }
         return run
     }
+
+    @Transactional
+    fun purgeBySource(source: EventSource): Int =
+        meetingRepository.deleteBySource(source)
 }

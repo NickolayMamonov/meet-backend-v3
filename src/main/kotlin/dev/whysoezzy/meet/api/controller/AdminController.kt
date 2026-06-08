@@ -6,9 +6,11 @@ import dev.whysoezzy.meet.ingestion.IngestionService
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
+import org.springframework.web.bind.annotation.DeleteMapping
 import org.springframework.web.bind.annotation.PostMapping
 import org.springframework.web.bind.annotation.RequestHeader
 import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.RestController
 
 @RestController
@@ -37,5 +39,18 @@ class AdminController(
             )
         }
         return ResponseEntity.ok(IngestTriggerResponse(runs = summary))
+    }
+
+    @DeleteMapping("/purge")
+    fun purge(
+        @RequestHeader(value = "X-Admin-Key", required = false) apiKey: String?,
+        @RequestParam source: String,
+    ): ResponseEntity<Map<String, Any>> {
+        if (adminApiKey.isBlank() || apiKey != adminApiKey) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).build()
+        }
+        val src = dev.whysoezzy.meet.domain.entity.EventSource.valueOf(source.uppercase())
+        val deleted = ingestionService.purgeBySource(src)
+        return ResponseEntity.ok(mapOf("source" to src.name, "deleted" to deleted))
     }
 }

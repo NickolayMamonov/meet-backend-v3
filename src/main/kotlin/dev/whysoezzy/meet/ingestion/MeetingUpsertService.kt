@@ -12,21 +12,27 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
-enum class UpsertResult { CREATED, UPDATED }
+enum class UpsertResult { CREATED, UPDATED, SKIPPED }
 
 @Service
 class MeetingUpsertService(
     private val meetingRepository: MeetingRepository,
+    private val tagRepository: dev.whysoezzy.meet.domain.repository.TagRepository,
+    private val topicClassifier: TopicClassifier,
     @Value("\${app.ingestion.zone:Europe/Moscow}") private val zoneId: String,
+    @Value("\${app.ingestion.only-matching-topics:true}") private val onlyMatchingTopics: Boolean,
 ) {
     private val dateFormatter = DateTimeFormatter.ofPattern("dd.MM.yyyy")
 
     @Transactional
     fun upsert(source: EventSource, raw: RawEvent): UpsertResult {
+        val topics = topicClassifier.classify(raw)
+        if (topics.isEmpty() && onlyMatchingTopics) return UpsertResult.SKIPPED
+
         val dateLabel = Instant.ofEpochMilli(raw.startsAtEpochMs)
-            .atZone(ZoneId.of(zoneId))
-            .format(dateFormatter)
+            .atZone(ZoneId.of(zoneId)).format(dateFormatter)
         val dedup = dedupHash(raw, dateLabel)
+        val tags = resolveTags(topics)
 
         val existing = meetingRepository.findBySourceAndSourceExternalId(source, raw.sourceExternalId)
         return if (existing != null) {
@@ -42,6 +48,8 @@ class MeetingUpsertService(
             existing.isOnline = raw.isOnline
             existing.ingestedAt = LocalDateTime.now()
             existing.dedupHash = dedup
+            existing.tags.clear()
+            existing.tags.addAll(tags)
             meetingRepository.save(existing)
             UpsertResult.UPDATED
         } else {
@@ -54,6 +62,7 @@ class MeetingUpsertService(
                 address = raw.address,
                 latitude = raw.latitude,
                 longitude = raw.longitude,
+                tags = tags.toMutableSet(),
                 source = source,
                 sourceExternalId = raw.sourceExternalId,
                 externalUrl = raw.externalUrl,
@@ -65,6 +74,13 @@ class MeetingUpsertService(
             UpsertResult.CREATED
         }
     }
+
+    /** Находит тег по тексту или создаёт новый. */
+    private fun resolveTags(topics: Set<String>): MutableSet<dev.whysoezzy.meet.domain.entity.Tag> =
+        topics.map { text ->
+            tagRepository.findByText(text)
+                ?: tagRepository.save(dev.whysoezzy.meet.domain.entity.Tag(text = text))
+        }.toMutableSet()
 
     private fun dedupHash(raw: RawEvent, dateLabel: String): String {
         val basis = "${raw.title.trim().lowercase()}|$dateLabel|${raw.externalUrl ?: ""}"
