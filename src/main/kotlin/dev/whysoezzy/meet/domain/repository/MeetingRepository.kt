@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.domain.repository
 
+import dev.whysoezzy.meet.domain.entity.EventSource
 import dev.whysoezzy.meet.domain.entity.Meeting
 import dev.whysoezzy.meet.domain.entity.MeetingStatus
 import org.springframework.data.jpa.repository.JpaRepository
@@ -78,4 +79,10 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
         @Param("meetingId") meetingId: Long,
         @Param("userId") userId: Long
     ): Boolean
+
+    /** Поиск существующего внешнего события для идемпотентного upsert. */
+    fun findBySourceAndSourceExternalId(
+        source: EventSource,
+        sourceExternalId: String
+    ): Meeting?
 }
