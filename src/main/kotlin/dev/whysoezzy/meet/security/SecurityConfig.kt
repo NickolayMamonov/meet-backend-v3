@@ -43,6 +43,7 @@ class SecurityConfig(
                     .requestMatchers(HttpMethod.GET, "/meetings/**").permitAll()
                     .requestMatchers(HttpMethod.GET, "/communities/**").permitAll()
                     .requestMatchers(HttpMethod.GET, "/tags/**").permitAll()
+                    .requestMatchers(HttpMethod.GET, "/api/v1/tags").permitAll()
                     // AdBlocks — контроллер маппится на /api/ads (не /ad-blocks)
                     .requestMatchers(HttpMethod.GET, "/api/ads/**").permitAll()
                     // Admin-эндпоинты: на уровне Spring Security открыты,
