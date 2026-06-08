@@ -33,17 +33,29 @@ server:
 
 app:
   admin:
-    api-key: ${ADMIN_API_KEY:}          # пусто → /admin/** всегда 403, пока не задан
+    api-key: dev-secret
 
   ingestion:
     enabled: ${INGESTION_ENABLED:true}
-    cron: ${INGESTION_CRON:0 0 3 * * *}  # каждый день в 03:00
+    cron: ${INGESTION_CRON:0 0 3 * * *}
     zone: ${INGESTION_ZONE:Europe/Moscow}
 
   jwt:
     secret: "meet-app-super-secret-key-change-in-production-min-32-chars"
     access-token-expiration-ms: 604800000   # 7 дней
     refresh-token-expiration-days: 30
+
+  timepad:
+    enabled: true
+    base-url: https://api.timepad.ru/v1
+    token: ${TIMEPAD_TOKEN:}
+    category-ids:                # пусто = все; пример списком: [217, 452]
+    keywords:                    # пример: [разработка, дизайн, data]
+    cities:
+    page-size: 100
+    max-pages: 5
+    days-ahead: 180
+    zone: Europe/Moscow
 
   otp:
     expiration-minutes: 5
