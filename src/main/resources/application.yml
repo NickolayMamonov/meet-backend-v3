@@ -39,6 +39,7 @@ app:
     enabled: ${INGESTION_ENABLED:true}
     cron: ${INGESTION_CRON:0 0 3 * * *}
     zone: ${INGESTION_ZONE:Europe/Moscow}
+    only-matching-topics: true
 
   jwt:
     secret: "meet-app-super-secret-key-change-in-production-min-32-chars"
@@ -49,7 +50,7 @@ app:
     enabled: true
     base-url: https://api.timepad.ru/v1
     token: ${TIMEPAD_TOKEN:}
-    category-ids:                # пусто = все; пример списком: [217, 452]
+    category-ids: [452]                # пусто = все; пример списком: [217, 452]
     keywords:                    # пример: [разработка, дизайн, data]
     cities:
     page-size: 100
