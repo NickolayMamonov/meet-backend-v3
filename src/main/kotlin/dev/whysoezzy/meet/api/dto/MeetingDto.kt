@@ -19,7 +19,10 @@ data class MeetingDto(
     val communityHost: CommunityHostDto?,
     val participants: List<PersonDto>,
     val meetingStatus: String,
-    val isUserInParticipants: Boolean
+    val isUserInParticipants: Boolean,
+    val source: String = "MANUAL",
+    val externalUrl: String? = null,
+    val isOnline: Boolean = false,
 ) : Serializable
 
 data class MeetingAddressDto(

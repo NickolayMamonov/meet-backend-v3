@@ -168,7 +168,10 @@ class MeetingService(
             meetingStatus = status.name,
             isUserInParticipants = currentUserId?.let { uid ->
                 participants.any { it.id == uid }
-            } ?: false
+            } ?: false,
+            source = source.name,
+            externalUrl = externalUrl,
+            isOnline = isOnline,
         )
     }
 }
