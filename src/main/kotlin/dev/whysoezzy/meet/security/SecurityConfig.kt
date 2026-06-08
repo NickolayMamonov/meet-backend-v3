@@ -45,6 +45,9 @@ class SecurityConfig(
                     .requestMatchers(HttpMethod.GET, "/tags/**").permitAll()
                     // AdBlocks — контроллер маппится на /api/ads (не /ad-blocks)
                     .requestMatchers(HttpMethod.GET, "/api/ads/**").permitAll()
+                    // Admin-эндпоинты: на уровне Spring Security открыты,
+                    // доступ гейтится заголовком X-Admin-Key в контроллере (интерим, до ролей)
+                    .requestMatchers("/admin/**").permitAll()
 
                     // Всё остальное — JWT обязателен
                     .anyRequest().authenticated()
