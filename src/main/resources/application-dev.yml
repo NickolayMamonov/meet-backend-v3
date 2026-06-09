@@ -1,0 +1,7 @@
+# application-dev.yml
+# Dev-профиль: подключает тестовый сид из db/seed поверх схемы.
+# Активируется через SPRING_PROFILES_ACTIVE=dev (или --spring.profiles.active=dev).
+# В default/prod-профиле сид НЕ подключается — БД остаётся чистой.
+spring:
+  flyway:
+    locations: classpath:db/migration,classpath:db/seed
