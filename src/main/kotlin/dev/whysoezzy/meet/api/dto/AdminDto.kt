@@ -2,6 +2,7 @@ package dev.whysoezzy.meet.api.dto
 
 data class IngestTriggerResponse(
     val runs: List<IngestRunSummary>,
+    val purgedPast: Int = 0,
 )
 
 data class IngestRunSummary(

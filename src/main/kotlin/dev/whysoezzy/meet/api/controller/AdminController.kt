@@ -27,7 +27,9 @@ class AdminController(
         if (adminApiKey.isBlank() || apiKey != adminApiKey) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).build()
         }
-        val summary = ingestionService.runAll().map {
+        val runs = ingestionService.runAll()
+        val purgedPast = ingestionService.purgePastEvents()
+        val summary = runs.map {
             IngestRunSummary(
                 source = it.source.name,
                 status = it.status.name,
@@ -38,7 +40,7 @@ class AdminController(
                 errorMessage = it.errorMessage,
             )
         }
-        return ResponseEntity.ok(IngestTriggerResponse(runs = summary))
+        return ResponseEntity.ok(IngestTriggerResponse(runs = summary, purgedPast = purgedPast))
     }
 
     @DeleteMapping("/purge")

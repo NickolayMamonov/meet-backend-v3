@@ -62,4 +62,14 @@ class IngestionService(
     @Transactional
     fun purgeBySource(source: EventSource): Int =
         meetingRepository.deleteBySource(source)
+
+    @Transactional
+    fun purgePastEvents(
+        source: EventSource = EventSource.TIMEPAD,
+    ): Int {
+        val now = System.currentTimeMillis()
+        val deleted = meetingRepository.deleteBySourceAndTimeLessThan(source, now)
+        if (deleted > 0) logger.info { "Удалено прошедших событий ($source): $deleted" }
+        return deleted
+    }
 }

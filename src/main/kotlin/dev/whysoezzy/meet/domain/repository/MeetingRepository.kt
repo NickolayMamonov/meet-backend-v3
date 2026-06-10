@@ -87,4 +87,7 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
     ): Meeting?
 
     fun deleteBySource(source: EventSource): Int
+
+    /** Удаление прошедших событий источника (time — epoch ms). */
+    fun deleteBySourceAndTimeLessThan(source: EventSource, time: Long): Int
 }
