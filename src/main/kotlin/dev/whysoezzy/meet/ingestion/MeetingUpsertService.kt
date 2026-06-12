@@ -2,6 +2,7 @@ package dev.whysoezzy.meet.ingestion
 
 import dev.whysoezzy.meet.domain.entity.EventSource
 import dev.whysoezzy.meet.domain.entity.Meeting
+import dev.whysoezzy.meet.domain.entity.Tag
 import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
@@ -19,6 +20,7 @@ class MeetingUpsertService(
     private val meetingRepository: MeetingRepository,
     private val tagRepository: dev.whysoezzy.meet.domain.repository.TagRepository,
     private val topicClassifier: TopicClassifier,
+    private val geocodingService: GeocodingService,
     @Value("\${app.ingestion.zone:Europe/Moscow}") private val zoneId: String,
     @Value("\${app.ingestion.only-matching-topics:true}") private val onlyMatchingTopics: Boolean,
 ) {
@@ -35,6 +37,13 @@ class MeetingUpsertService(
         val tags = resolveTags(topics)
 
         val existing = meetingRepository.findBySourceAndSourceExternalId(source, raw.sourceExternalId)
+
+        val (lat, lng) = resolveCoordinates(
+            raw = raw,
+            existingLat = existing?.latitude ?: 0.0,
+            existingLng = existing?.longitude ?: 0.0,
+        )
+
         return if (existing != null) {
             existing.title = raw.title
             existing.description = raw.description
@@ -42,8 +51,8 @@ class MeetingUpsertService(
             existing.time = raw.startsAtEpochMs
             existing.date = dateLabel
             existing.address = raw.address
-            existing.latitude = raw.latitude
-            existing.longitude = raw.longitude
+            existing.latitude = lat
+            existing.longitude = lng
             existing.externalUrl = raw.externalUrl
             existing.isOnline = raw.isOnline
             existing.ingestedAt = LocalDateTime.now()
@@ -60,8 +69,8 @@ class MeetingUpsertService(
                 time = raw.startsAtEpochMs,
                 date = dateLabel,
                 address = raw.address,
-                latitude = raw.latitude,
-                longitude = raw.longitude,
+                latitude = lat,
+                longitude = lng,
                 tags = tags.toMutableSet(),
                 source = source,
                 sourceExternalId = raw.sourceExternalId,
@@ -75,11 +84,31 @@ class MeetingUpsertService(
         }
     }
 
+    /**
+     * Приоритет координат:
+     * 1) дал источник (Timepad) — берём их;
+     * 2) уже геокодили раньше (сохранённые ≠ 0) — оставляем (повторно не геокодим);
+     * 3) иначе геокодируем адрес (кроме онлайна / пустого адреса);
+     * 4) не вышло — нули (на клиенте карта просто не покажется).
+     */
+    private fun resolveCoordinates(
+        raw: RawEvent,
+        existingLat: Double,
+        existingLng: Double,
+    ): Pair<Double, Double> {
+        if (raw.latitude != 0.0 || raw.longitude != 0.0) return raw.latitude to raw.longitude
+        if (existingLat != 0.0 || existingLng != 0.0) return existingLat to existingLng
+        if (!raw.isOnline && raw.address.isNotBlank()) {
+            geocodingService.geocode(raw.address)?.let { return it.latitude to it.longitude }
+        }
+        return 0.0 to 0.0
+    }
+
     /** Находит тег по тексту или создаёт новый. */
-    private fun resolveTags(topics: Set<String>): MutableSet<dev.whysoezzy.meet.domain.entity.Tag> =
+    private fun resolveTags(topics: Set<String>): MutableSet<Tag> =
         topics.map { text ->
             tagRepository.findByText(text)
-                ?: tagRepository.save(dev.whysoezzy.meet.domain.entity.Tag(text = text))
+                ?: tagRepository.save(Tag(text = text))
         }.toMutableSet()
 
     private fun dedupHash(raw: RawEvent, dateLabel: String): String {
@@ -89,4 +118,6 @@ class MeetingUpsertService(
             .joinToString("") { "%02x".format(it) }
             .take(64)
     }
+
+
 }
