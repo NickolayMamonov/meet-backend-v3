@@ -14,7 +14,7 @@ class StaticMapService(
 ) {
     private val client = restClientBuilder.build()
 
-    @Cacheable("staticMaps", key = "T(java.lang.String).format('%.5f,%.5f', #lat, #lon)")
+    @Cacheable("staticMaps", key = "T(java.lang.String).format('%.5f,%.5f', #lat, #lon)", unless = "#result == null")
     fun render(lat: Double, lon: Double): ByteArray? {
         if (geocoderProps.apiKey.isBlank()) return null
         val center = "$lat,$lon"
