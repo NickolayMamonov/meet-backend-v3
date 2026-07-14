@@ -19,7 +19,6 @@ data class MeetingDto(
     val communityHost: CommunityHostDto?,
     val participants: List<PersonDto>,
     val meetingStatus: String,
-    val mapImageUrl: String? = null,
     val isUserInParticipants: Boolean,
     val source: String = "MANUAL",
     val externalUrl: String? = null,

@@ -16,7 +16,6 @@ private val logger = KotlinLogging.logger {}
 class MeetingService(
     private val meetingRepository: MeetingRepository,
     private val userRepository: UserRepository,
-    @Value("\${app.public-base-url}") private val publicBaseUrl: String,
 ) {
 
     @Transactional(readOnly = true)
@@ -174,8 +173,6 @@ class MeetingService(
             source = source.name,
             externalUrl = externalUrl,
             isOnline = isOnline,
-            mapImageUrl = if (!isOnline && (latitude != 0.0 || longitude != 0.0))
-                "$publicBaseUrl/meetings/$id/map.png" else null,
         )
     }
 }

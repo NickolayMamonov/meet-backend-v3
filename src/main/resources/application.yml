@@ -35,10 +35,8 @@ app:
   geocoder:
     enabled: true
     api-key: ${LOCATIONIQ_KEY:}
-    base-url: https://us1.locationiq.com/v1
+    base-url: https://eu1.locationiq.com/v1
     lang: ru
-
-    public-base-url: ${PUBLIC_BASE_URL:http://localhost:8080}
 
   admin:
     api-key: dev-secret

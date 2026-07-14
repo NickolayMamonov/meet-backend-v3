@@ -3,8 +3,11 @@ package dev.whysoezzy.meet.ingestion
 import com.fasterxml.jackson.databind.JsonNode
 import dev.whysoezzy.meet.config.GeocoderProperties
 import mu.KotlinLogging
+import org.springframework.boot.web.client.ClientHttpRequestFactories
+import org.springframework.boot.web.client.ClientHttpRequestFactorySettings
 import org.springframework.stereotype.Service
 import org.springframework.web.client.RestClient
+import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 
 data class Coordinates(val latitude: Double, val longitude: Double)
@@ -16,7 +19,16 @@ class GeocodingService(
 ) {
     private val logger = KotlinLogging.logger {}
     private val cache = ConcurrentHashMap<String, Coordinates>()
-    private val client = restClientBuilder.baseUrl(props.baseUrl).build()
+    private val client = restClientBuilder
+        .baseUrl(props.baseUrl)
+        .requestFactory(
+            ClientHttpRequestFactories.get(
+                ClientHttpRequestFactorySettings.DEFAULTS
+                    .withConnectTimeout(Duration.ofSeconds(3))
+                    .withReadTimeout(Duration.ofSeconds(5))
+            )
+        )
+        .build()
 
     fun geocode(address: String): Coordinates? {
         if (!props.enabled || props.apiKey.isBlank() || address.isBlank()) {
@@ -29,6 +41,7 @@ class GeocodingService(
     }
 
     private fun request(address: String): Coordinates? = try {
+        Thread.sleep(550)
         val body: JsonNode? = client.get()
             .uri { b ->
                 b.path("/search")
