@@ -2,9 +2,9 @@ package dev.whysoezzy.meet.api.controller
 
 import dev.whysoezzy.meet.api.dto.IngestRunSummary
 import dev.whysoezzy.meet.api.dto.IngestTriggerResponse
+import dev.whysoezzy.meet.api.error.ForbiddenException
 import dev.whysoezzy.meet.ingestion.IngestionService
 import org.springframework.beans.factory.annotation.Value
-import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.DeleteMapping
 import org.springframework.web.bind.annotation.PostMapping
@@ -25,7 +25,7 @@ class AdminController(
     ): ResponseEntity<IngestTriggerResponse> {
         // Пустой ключ → эндпоинт выключен (всегда 403), пока не задан ADMIN_API_KEY
         if (adminApiKey.isBlank() || apiKey != adminApiKey) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).build()
+            throw ForbiddenException()
         }
         val runs = ingestionService.runAll()
         val purgedPast = ingestionService.purgePastEvents()
@@ -49,7 +49,7 @@ class AdminController(
         @RequestParam source: String,
     ): ResponseEntity<Map<String, Any>> {
         if (adminApiKey.isBlank() || apiKey != adminApiKey) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).build()
+            throw ForbiddenException()
         }
         val src = dev.whysoezzy.meet.domain.entity.EventSource.valueOf(source.uppercase())
         val deleted = ingestionService.purgeBySource(src)

@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.api.controller
 
+import dev.whysoezzy.meet.api.error.NotFoundException
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.security.AuthUtils
 import dev.whysoezzy.meet.service.StorageService
@@ -55,7 +56,7 @@ class MediaController(
 
         // Удаляем старую аватарку если она была загружена локально
         val user = userRepository.findById(userId).orElseThrow {
-            NoSuchElementException("User not found: $userId")
+            NotFoundException("User not found")
         }
         user.avatarUrl?.let { oldUrl ->
             if (oldUrl.isNotBlank() && oldUrl.contains("/media/avatars/")) {

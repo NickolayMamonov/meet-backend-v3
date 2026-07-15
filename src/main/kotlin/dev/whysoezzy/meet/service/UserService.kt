@@ -1,6 +1,8 @@
 package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.api.dto.*
+import dev.whysoezzy.meet.api.error.BadRequestException
+import dev.whysoezzy.meet.api.error.NotFoundException
 import dev.whysoezzy.meet.domain.entity.SocialMediaType
 import dev.whysoezzy.meet.domain.entity.UserSocialMedia
 import dev.whysoezzy.meet.domain.repository.CommunityRepository
@@ -30,9 +32,9 @@ class UserService(
         logger.info { "Fetching user profile: $userId" }
 
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found: $userId") }
+            .orElseThrow { NotFoundException("User not found") }
 
-        if (user.isDeleted) throw NoSuchElementException("User account is deleted")
+        if (user.isDeleted) throw NotFoundException("User not found")
 
         return user.toProfileDto()
     }
@@ -42,7 +44,7 @@ class UserService(
         logger.info { "Updating user profile: $userId" }
 
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found: $userId") }
+            .orElseThrow { NotFoundException("User not found") }
 
         // Базовые поля
         updateDto.name?.let { user.name = it }
@@ -71,7 +73,7 @@ class UserService(
                 val platform = runCatching {
                     SocialMediaType.valueOf(dto.type.uppercase())
                 }.getOrElse {
-                    throw IllegalArgumentException("Unknown social media type: ${dto.type}")
+                    throw BadRequestException("Unknown social media type")
                 }
                 user.socialMedia.add(
                     UserSocialMedia(user = user, platform = platform, username = dto.url)
@@ -89,7 +91,7 @@ class UserService(
     fun updateFcmToken(userId: Long, fcmToken: String) {
         logger.info { "Updating FCM token for user: $userId" }
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found: $userId") }
+            .orElseThrow { NotFoundException("User not found") }
         user.fcmToken = fcmToken
         userRepository.save(user)
     }
@@ -98,7 +100,7 @@ class UserService(
     fun deleteAccount(userId: Long) {
         logger.info { "Soft deleting account: $userId" }
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found: $userId") }
+            .orElseThrow { NotFoundException("User not found") }
         user.deletedAt = LocalDateTime.now()
         userRepository.save(user)
     }
@@ -108,7 +110,7 @@ class UserService(
         logger.info { "Fetching meetings for user: $userId" }
 
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found: $userId") }
+            .orElseThrow { NotFoundException("User not found") }
 
         return user.participatingMeetings.map { meeting ->
             MeetingInfoDto(
@@ -125,7 +127,7 @@ class UserService(
         logger.info { "Fetching communities for user: $userId" }
 
         val user = userRepository.findById(userId)
-            .orElseThrow { NoSuchElementException("User not found: $userId") }
+            .orElseThrow { NotFoundException("User not found") }
 
         return user.subscribedCommunities.map { community ->
             CommunityInfoDto(

@@ -1,7 +1,9 @@
 package dev.whysoezzy.meet.security
 
+import dev.whysoezzy.meet.api.error.ApiErrorResponseWriter
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.http.HttpStatus
 import org.springframework.http.HttpMethod
 import org.springframework.security.config.annotation.web.builders.HttpSecurity
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity
@@ -12,7 +14,8 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @Configuration
 @EnableWebSecurity
 class SecurityConfig(
-    private val jwtAuthFilter: JwtAuthFilter
+    private val jwtAuthFilter: JwtAuthFilter,
+    private val apiErrorResponseWriter: ApiErrorResponseWriter,
 ) {
 
     @Bean
@@ -20,6 +23,27 @@ class SecurityConfig(
         http
             .csrf { it.disable() }
             .sessionManagement { it.sessionCreationPolicy(SessionCreationPolicy.STATELESS) }
+            .exceptionHandling { exceptions ->
+                exceptions
+                    .authenticationEntryPoint { request, response, _ ->
+                        apiErrorResponseWriter.write(
+                            request,
+                            response,
+                            HttpStatus.UNAUTHORIZED,
+                            "Authentication is required",
+                            "UNAUTHORIZED",
+                        )
+                    }
+                    .accessDeniedHandler { request, response, _ ->
+                        apiErrorResponseWriter.write(
+                            request,
+                            response,
+                            HttpStatus.FORBIDDEN,
+                            "Access is denied",
+                            "FORBIDDEN",
+                        )
+                    }
+            }
             .authorizeHttpRequests { auth ->
                 auth
                     // Auth — полностью публичный
