@@ -22,9 +22,17 @@ data class JwtProperties(
         require(secret.toByteArray(StandardCharsets.UTF_8).size >= MINIMUM_SECRET_BYTES) {
             "app.jwt.secret must contain at least $MINIMUM_SECRET_BYTES UTF-8 bytes"
         }
+        require(accessTokenExpirationMs in MINIMUM_ACCESS_TOKEN_EXPIRATION_MS..MAXIMUM_ACCESS_TOKEN_EXPIRATION_MS) {
+            "app.jwt.access-token-expiration-ms must be between one minute and one day"
+        }
+        require(refreshTokenExpirationDays > 0) {
+            "app.jwt.refresh-token-expiration-days must be positive"
+        }
     }
 
     companion object {
         const val MINIMUM_SECRET_BYTES = 32
+        const val MINIMUM_ACCESS_TOKEN_EXPIRATION_MS = 60_000L
+        const val MAXIMUM_ACCESS_TOKEN_EXPIRATION_MS = 86_400_000L
     }
 }

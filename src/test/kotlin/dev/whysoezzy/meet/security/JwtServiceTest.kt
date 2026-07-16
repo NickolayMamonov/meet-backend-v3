@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.security
 
+import dev.whysoezzy.meet.config.JwtConfigurationInitializer
 import dev.whysoezzy.meet.config.JwtProperties
 import io.jsonwebtoken.Jwts
 import io.jsonwebtoken.security.Keys
@@ -64,11 +65,21 @@ class JwtServiceTest {
     }
 
     @Test
-    fun `fails startup binding for weak secrets and unsafe access token durations`() {
-        contextRunner
+    fun `fails startup initialization for missing or weak signing secrets`() {
+        startupContextRunner
+            .run { context -> assertThat(context.startupFailure).isNotNull }
+
+        startupContextRunner
             .withPropertyValues("app.jwt.secret=too-short")
             .run { context -> assertThat(context.startupFailure).isNotNull }
 
+        startupContextRunner
+            .withPropertyValues("app.jwt.secret=${"a".repeat(JwtProperties.MINIMUM_SECRET_BYTES)}")
+            .run { context -> assertThat(context.startupFailure).isNull() }
+    }
+
+    @Test
+    fun `fails startup binding for unsafe access token durations`() {
         contextRunner
             .withPropertyValues(
                 "app.jwt.secret=${"a".repeat(JwtProperties.MINIMUM_SECRET_BYTES)}",
@@ -80,6 +91,9 @@ class JwtServiceTest {
     private companion object {
         val contextRunner = ApplicationContextRunner()
             .withUserConfiguration(JwtPropertiesTestConfiguration::class.java)
+
+        val startupContextRunner = ApplicationContextRunner()
+            .withInitializer(JwtConfigurationInitializer())
     }
 }
 
