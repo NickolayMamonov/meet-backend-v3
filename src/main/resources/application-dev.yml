@@ -2,7 +2,3 @@
 spring:
   flyway:
     locations: classpath:db/migration,classpath:db/seed
-
-app:
-  jwt:
-    secret: dev-only-jwt-secret-not-for-production-32-bytes
