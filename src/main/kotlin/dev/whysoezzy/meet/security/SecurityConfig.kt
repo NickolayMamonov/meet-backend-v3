@@ -1,9 +1,7 @@
 package dev.whysoezzy.meet.security
 
-import dev.whysoezzy.meet.api.error.ApiErrorResponseWriter
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
-import org.springframework.http.HttpStatus
 import org.springframework.http.HttpMethod
 import org.springframework.security.config.annotation.web.builders.HttpSecurity
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity
@@ -15,7 +13,8 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @EnableWebSecurity
 class SecurityConfig(
     private val jwtAuthFilter: JwtAuthFilter,
-    private val apiErrorResponseWriter: ApiErrorResponseWriter,
+    private val apiAuthenticationEntryPoint: ApiAuthenticationEntryPoint,
+    private val apiAccessDeniedHandler: ApiAccessDeniedHandler,
 ) {
 
     @Bean
@@ -25,24 +24,8 @@ class SecurityConfig(
             .sessionManagement { it.sessionCreationPolicy(SessionCreationPolicy.STATELESS) }
             .exceptionHandling { exceptions ->
                 exceptions
-                    .authenticationEntryPoint { request, response, _ ->
-                        apiErrorResponseWriter.write(
-                            request,
-                            response,
-                            HttpStatus.UNAUTHORIZED,
-                            "Authentication is required",
-                            "UNAUTHORIZED",
-                        )
-                    }
-                    .accessDeniedHandler { request, response, _ ->
-                        apiErrorResponseWriter.write(
-                            request,
-                            response,
-                            HttpStatus.FORBIDDEN,
-                            "Access is denied",
-                            "FORBIDDEN",
-                        )
-                    }
+                    .authenticationEntryPoint(apiAuthenticationEntryPoint)
+                    .accessDeniedHandler(apiAccessDeniedHandler)
             }
             .authorizeHttpRequests { auth ->
                 auth
