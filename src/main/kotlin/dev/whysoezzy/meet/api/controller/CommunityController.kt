@@ -8,13 +8,17 @@ import dev.whysoezzy.meet.service.CommunityService
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.security.SecurityRequirement
 import io.swagger.v3.oas.annotations.tags.Tag
+import jakarta.validation.constraints.NotBlank
+import jakarta.validation.constraints.Size
 import mu.KotlinLogging
 import org.springframework.http.ResponseEntity
+import org.springframework.validation.annotation.Validated
 import org.springframework.web.bind.annotation.*
 
 private val logger = KotlinLogging.logger {}
 
 @RestController
+@Validated
 @Tag(name = "Communities", description = "Community management")
 class CommunityController(
     private val communityService: CommunityService,
@@ -57,7 +61,12 @@ class CommunityController(
 
     @GetMapping("/communities/search")
     @Operation(summary = "Search communities")
-    fun searchCommunities(@RequestParam query: String): List<CommunityDto> {
+    fun searchCommunities(
+        @RequestParam
+        @NotBlank(message = "Query is required")
+        @Size(max = 200, message = "Query must not exceed 200 characters")
+        query: String,
+    ): List<CommunityDto> {
         val userId = authUtils.getCurrentUserIdOrNull()
         logger.info { "GET /communities/search - query: $query" }
         return communityService.searchCommunities(query, userId)

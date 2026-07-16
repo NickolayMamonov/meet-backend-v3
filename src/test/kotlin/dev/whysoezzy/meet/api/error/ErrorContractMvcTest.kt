@@ -3,6 +3,7 @@ package dev.whysoezzy.meet.api.error
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import dev.whysoezzy.meet.api.controller.AdminController
 import dev.whysoezzy.meet.api.controller.AuthController
+import dev.whysoezzy.meet.api.controller.CommunityController
 import dev.whysoezzy.meet.api.controller.MeetingController
 import dev.whysoezzy.meet.api.controller.MediaController
 import dev.whysoezzy.meet.api.controller.UserController
@@ -14,6 +15,7 @@ import dev.whysoezzy.meet.security.ApiAuthenticationEntryPoint
 import dev.whysoezzy.meet.security.AuthUtils
 import dev.whysoezzy.meet.security.JwtService
 import dev.whysoezzy.meet.service.MeetingService
+import dev.whysoezzy.meet.service.CommunityService
 import dev.whysoezzy.meet.service.AuthService
 import dev.whysoezzy.meet.service.StorageService
 import dev.whysoezzy.meet.service.UserService
@@ -53,6 +55,7 @@ import org.mockito.Mockito.`when`
     controllers = [
         ErrorContractController::class,
         AuthController::class,
+        CommunityController::class,
         MeetingController::class,
         UserController::class,
         MediaController::class,
@@ -76,6 +79,9 @@ class ErrorContractMvcTest(
 
     @MockBean
     private lateinit var meetingService: MeetingService
+
+    @MockBean
+    private lateinit var communityService: CommunityService
 
     @MockBean
     private lateinit var authService: AuthService
@@ -251,6 +257,15 @@ class ErrorContractMvcTest(
 
         mockMvc.perform(get("/meetings").param("limit", "101"))
             .andExpectError(400, "Limit must not exceed 100", "/meetings", "BAD_REQUEST")
+    }
+
+    @Test
+    fun `rejects blank and oversized community search queries with structured errors`() {
+        mockMvc.perform(get("/communities/search").param("query", "   "))
+            .andExpectError(400, "Query is required", "/communities/search", "BAD_REQUEST")
+
+        mockMvc.perform(get("/communities/search").param("query", "a".repeat(201)))
+            .andExpectError(400, "Query must not exceed 200 characters", "/communities/search", "BAD_REQUEST")
     }
 
     @Test
