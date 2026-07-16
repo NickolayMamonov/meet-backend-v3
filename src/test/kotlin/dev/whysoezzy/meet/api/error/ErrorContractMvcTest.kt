@@ -80,6 +80,12 @@ class ErrorContractMvcTest(
     }
 
     @Test
+    fun `returns structured not found error for unmatched route`() {
+        mockMvc.perform(get("/unknown-review-probe"))
+            .andExpectError(404, "Resource not found", "/unknown-review-probe", "NOT_FOUND")
+    }
+
+    @Test
     fun `returns structured conflict when joining a full meeting`() {
         `when`(authUtils.getCurrentUserId()).thenReturn(42L)
         doThrow(ConflictException("Meeting is at full capacity"))

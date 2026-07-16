@@ -10,6 +10,8 @@ import org.springframework.web.bind.ServletRequestBindingException
 import org.springframework.web.bind.annotation.ExceptionHandler
 import org.springframework.web.bind.annotation.RestControllerAdvice
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException
+import org.springframework.web.servlet.NoHandlerFoundException
+import org.springframework.web.servlet.resource.NoResourceFoundException
 
 @RestControllerAdvice
 class ApiExceptionHandler(
@@ -34,6 +36,13 @@ class ApiExceptionHandler(
             ?: "Invalid request"
         return response(HttpStatus.BAD_REQUEST, message, request, "BAD_REQUEST")
     }
+
+    @ExceptionHandler(
+        NoResourceFoundException::class,
+        NoHandlerFoundException::class,
+    )
+    fun notFound(exception: Exception, request: HttpServletRequest): ResponseEntity<ApiError> =
+        response(HttpStatus.NOT_FOUND, "Resource not found", request, "NOT_FOUND")
 
     @ExceptionHandler(Exception::class)
     fun unexpected(exception: Exception, request: HttpServletRequest): ResponseEntity<ApiError> =
