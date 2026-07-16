@@ -1,12 +1,14 @@
 package dev.whysoezzy.meet.api.controller
 
 import dev.whysoezzy.meet.api.error.NotFoundException
+import dev.whysoezzy.meet.api.error.ValidationException
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.security.AuthUtils
 import dev.whysoezzy.meet.service.StorageService
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.security.SecurityRequirement
 import io.swagger.v3.oas.annotations.tags.Tag
+import jakarta.validation.constraints.NotNull
 import mu.KotlinLogging
 import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
@@ -49,10 +51,11 @@ class MediaController(
         security = [SecurityRequirement(name = "bearerAuth")]
     )
     fun uploadAvatar(
-        @RequestParam("file") file: MultipartFile
+        @RequestParam("file") @NotNull(message = "File is required") file: MultipartFile
     ): ResponseEntity<UploadResponse> {
+        validateFilePresent(file)
         val userId = authUtils.getCurrentUserId()
-        logger.info { "POST /media/avatar - user: $userId, file: ${file.originalFilename}, size: ${file.size}" }
+        logger.info { "POST /media/avatar - user: $userId, size: ${file.size}" }
 
         // Удаляем старую аватарку если она была загружена локально
         val user = userRepository.findById(userId).orElseThrow {
@@ -88,8 +91,9 @@ class MediaController(
         security = [SecurityRequirement(name = "bearerAuth")]
     )
     fun uploadMeetingImage(
-        @RequestParam("file") file: MultipartFile
+        @RequestParam("file") @NotNull(message = "File is required") file: MultipartFile
     ): ResponseEntity<UploadResponse> {
+        validateFilePresent(file)
         val userId = authUtils.getCurrentUserId()
         logger.info { "POST /media/meeting - user: $userId, size: ${file.size}" }
 
@@ -111,12 +115,17 @@ class MediaController(
         security = [SecurityRequirement(name = "bearerAuth")]
     )
     fun uploadCommunityImage(
-        @RequestParam("file") file: MultipartFile
+        @RequestParam("file") @NotNull(message = "File is required") file: MultipartFile
     ): ResponseEntity<UploadResponse> {
+        validateFilePresent(file)
         val userId = authUtils.getCurrentUserId()
         logger.info { "POST /media/community - user: $userId, size: ${file.size}" }
 
         val result = storageService.uploadCommunityImage(file)
         return ResponseEntity.ok(UploadResponse(url = result.publicUrl))
+    }
+
+    private fun validateFilePresent(file: MultipartFile) {
+        if (file.isEmpty) throw ValidationException("File is empty")
     }
 }

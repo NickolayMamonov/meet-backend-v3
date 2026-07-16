@@ -4,7 +4,10 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import dev.whysoezzy.meet.api.controller.AdminController
 import dev.whysoezzy.meet.api.controller.AuthController
 import dev.whysoezzy.meet.api.controller.MeetingController
+import dev.whysoezzy.meet.api.controller.MediaController
+import dev.whysoezzy.meet.api.controller.UserController
 import dev.whysoezzy.meet.config.StorageProperties
+import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.ingestion.IngestionService
 import dev.whysoezzy.meet.security.ApiAccessDeniedHandler
 import dev.whysoezzy.meet.security.ApiAuthenticationEntryPoint
@@ -12,6 +15,8 @@ import dev.whysoezzy.meet.security.AuthUtils
 import dev.whysoezzy.meet.security.JwtService
 import dev.whysoezzy.meet.service.MeetingService
 import dev.whysoezzy.meet.service.AuthService
+import dev.whysoezzy.meet.service.StorageService
+import dev.whysoezzy.meet.service.UserService
 import jakarta.validation.Valid
 import jakarta.validation.constraints.NotBlank
 import org.junit.jupiter.api.Test
@@ -30,6 +35,7 @@ import org.springframework.test.web.servlet.ResultMatcher
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete
+import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.status
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.header
@@ -44,7 +50,14 @@ import org.mockito.Mockito.doThrow
 import org.mockito.Mockito.`when`
 
 @WebMvcTest(
-    controllers = [ErrorContractController::class, AuthController::class, MeetingController::class, AdminController::class],
+    controllers = [
+        ErrorContractController::class,
+        AuthController::class,
+        MeetingController::class,
+        UserController::class,
+        MediaController::class,
+        AdminController::class,
+    ],
     properties = ["app.admin.api-key=test-admin-key"],
 )
 @Import(
@@ -69,6 +82,15 @@ class ErrorContractMvcTest(
 
     @MockBean
     private lateinit var authUtils: AuthUtils
+
+    @MockBean
+    private lateinit var userService: UserService
+
+    @MockBean
+    private lateinit var storageService: StorageService
+
+    @MockBean
+    private lateinit var userRepository: UserRepository
 
     @MockBean
     private lateinit var ingestionService: IngestionService
@@ -171,6 +193,59 @@ class ErrorContractMvcTest(
                 "RATE_LIMITED",
             )
             .andExpect(header().doesNotExist("Retry-After"))
+    }
+
+    @Test
+    fun `rejects invalid auth payloads with structured errors`() {
+        mockMvc.perform(
+            post("/auth/send-otp")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""{"phone":"79990000000"}"""),
+        ).andExpectError(400, "Phone must be in E.164 format", "/auth/send-otp", "BAD_REQUEST")
+
+        mockMvc.perform(
+            post("/auth/verify-otp")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""{"phone":"+79990000000","code":"abc"}"""),
+        ).andExpectError(400, "OTP code must be a six-digit number", "/auth/verify-otp", "BAD_REQUEST")
+    }
+
+    @Test
+    fun `rejects invalid profile email and FCM token with structured errors`() {
+        mockMvc.perform(
+            org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/profile")
+                .with(user("42"))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""{"email":"not-an-email"}"""),
+        ).andExpectError(400, "Email must be valid", "/profile", "BAD_REQUEST")
+
+        mockMvc.perform(
+            org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/profile/fcm-token")
+                .with(user("42"))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""{"fcmToken":""}"""),
+        ).andExpectError(400, "FCM token is required", "/profile/fcm-token", "BAD_REQUEST")
+    }
+
+    @Test
+    fun `rejects invalid pagination with structured errors`() {
+        mockMvc.perform(get("/meetings").param("page", "-1"))
+            .andExpectError(400, "Page must be zero or greater", "/meetings", "BAD_REQUEST")
+
+        mockMvc.perform(get("/meetings").param("limit", "101"))
+            .andExpectError(400, "Limit must not exceed 100", "/meetings", "BAD_REQUEST")
+    }
+
+    @Test
+    fun `rejects missing and empty avatar upload with structured errors`() {
+        mockMvc.perform(multipart("/media/avatar").with(user("42")))
+            .andExpectError(400, "Invalid request", "/media/avatar", "BAD_REQUEST")
+
+        mockMvc.perform(
+            multipart("/media/avatar")
+                .file("file", ByteArray(0))
+                .with(user("42")),
+        ).andExpectError(400, "File is empty", "/media/avatar", "BAD_REQUEST")
     }
 
     private fun ResultActions.andExpectError(

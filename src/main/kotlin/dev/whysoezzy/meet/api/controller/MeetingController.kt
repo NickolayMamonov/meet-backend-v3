@@ -7,13 +7,19 @@ import dev.whysoezzy.meet.service.MeetingService
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.security.SecurityRequirement
 import io.swagger.v3.oas.annotations.tags.Tag
+import jakarta.validation.constraints.Max
+import jakarta.validation.constraints.NotBlank
+import jakarta.validation.constraints.Positive
+import jakarta.validation.constraints.PositiveOrZero
 import mu.KotlinLogging
+import org.springframework.validation.annotation.Validated
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 
 private val logger = KotlinLogging.logger {}
 
 @RestController
+@Validated
 @Tag(name = "Meetings", description = "Meeting management")
 class MeetingController(
     private val meetingService: MeetingService,
@@ -39,9 +45,9 @@ class MeetingController(
     @GetMapping("/meetings")
     @Operation(summary = "Get all meetings, optionally filtered by tag")
     fun getAllMeetings(
-        @RequestParam(defaultValue = "0") page: Int,
-        @RequestParam(defaultValue = "20") limit: Int,
-        @RequestParam(required = false) tagId: Long?   // фильтр по тегу для chips на Main Page
+        @RequestParam(defaultValue = "0") @PositiveOrZero(message = "Page must be zero or greater") page: Int,
+        @RequestParam(defaultValue = "20") @Positive(message = "Limit must be greater than zero") @Max(100, message = "Limit must not exceed 100") limit: Int,
+        @RequestParam(required = false) @Positive(message = "Tag ID must be greater than zero") tagId: Long?   // фильтр по тегу для chips на Main Page
     ): List<MeetingDto> {
         val userId = authUtils.getCurrentUserIdOrNull()
         logger.info { "GET /meetings - page: $page, limit: $limit, tagId: $tagId" }
@@ -50,7 +56,7 @@ class MeetingController(
 
     @GetMapping("/meetings/search")
     @Operation(summary = "Search meetings by title/description/address")
-    fun searchMeetings(@RequestParam query: String): List<MeetingDto> {
+    fun searchMeetings(@RequestParam @NotBlank(message = "Query is required") @Max(200, message = "Query must not exceed 200 characters") query: String): List<MeetingDto> {
         val userId = authUtils.getCurrentUserIdOrNull()
         logger.info { "GET /meetings/search - query: $query" }
         return meetingService.searchMeetings(query, userId)
