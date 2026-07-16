@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.security
 
+import dev.whysoezzy.meet.api.exception.UnauthorizedException
 import org.springframework.security.core.context.SecurityContextHolder
 import org.springframework.stereotype.Component
 
@@ -12,12 +13,12 @@ class AuthUtils {
      */
     fun getCurrentUserId(): Long {
         val authentication = SecurityContextHolder.getContext().authentication
-            ?: throw IllegalStateException("No authentication found in security context")
+            ?: throw UnauthorizedException()
 
         return when (val principal = authentication.principal) {
             is Long -> principal
             is String -> principal.toLong()
-            else -> throw IllegalStateException("Unexpected principal type: ${principal::class.simpleName}")
+            else -> throw UnauthorizedException()
         }
     }
 
