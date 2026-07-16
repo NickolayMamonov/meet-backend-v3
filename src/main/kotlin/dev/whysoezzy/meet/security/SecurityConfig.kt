@@ -12,7 +12,9 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @Configuration
 @EnableWebSecurity
 class SecurityConfig(
-    private val jwtAuthFilter: JwtAuthFilter
+    private val jwtAuthFilter: JwtAuthFilter,
+    private val apiAuthenticationEntryPoint: ApiAuthenticationEntryPoint,
+    private val apiAccessDeniedHandler: ApiAccessDeniedHandler,
 ) {
 
     @Bean
@@ -20,6 +22,11 @@ class SecurityConfig(
         http
             .csrf { it.disable() }
             .sessionManagement { it.sessionCreationPolicy(SessionCreationPolicy.STATELESS) }
+            .exceptionHandling { exceptions ->
+                exceptions
+                    .authenticationEntryPoint(apiAuthenticationEntryPoint)
+                    .accessDeniedHandler(apiAccessDeniedHandler)
+            }
             .authorizeHttpRequests { auth ->
                 auth
                     // Auth — полностью публичный

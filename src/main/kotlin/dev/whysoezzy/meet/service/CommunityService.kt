@@ -1,5 +1,7 @@
 package dev.whysoezzy.meet.service
 
+import dev.whysoezzy.meet.api.error.ConflictException
+import dev.whysoezzy.meet.api.error.NotFoundException
 import dev.whysoezzy.meet.api.dto.*
 import dev.whysoezzy.meet.domain.entity.Community
 import dev.whysoezzy.meet.domain.repository.CommunityRepository
@@ -28,7 +30,7 @@ class CommunityService(
     fun getCommunityById(id: Long, currentUserId: Long?): CommunityDto {
         logger.info { "Fetching community: $id" }
         val community = communityRepository.findById(id)
-            .orElseThrow { IllegalArgumentException("Community not found: $id") }
+            .orElseThrow { NotFoundException("Community not found") }
         return community.toDto(currentUserId)
     }
 
@@ -37,12 +39,12 @@ class CommunityService(
         logger.info { "User $userId subscribing to community: $communityId" }
 
         val community = communityRepository.findById(communityId)
-            .orElseThrow { IllegalArgumentException("Community not found") }
+            .orElseThrow { NotFoundException("Community not found") }
         val user = userRepository.findById(userId)
-            .orElseThrow { IllegalArgumentException("User not found") }
+            .orElseThrow { NotFoundException("User not found") }
 
         if (communityRepository.isUserSubscribed(communityId, userId))
-            throw IllegalStateException("Already subscribed")
+            throw ConflictException("Already subscribed")
 
         community.subscribers.add(user)
         communityRepository.save(community)
@@ -53,12 +55,12 @@ class CommunityService(
         logger.info { "User $userId unsubscribing from community: $communityId" }
 
         val community = communityRepository.findById(communityId)
-            .orElseThrow { IllegalArgumentException("Community not found") }
+            .orElseThrow { NotFoundException("Community not found") }
         val user = userRepository.findById(userId)
-            .orElseThrow { IllegalArgumentException("User not found") }
+            .orElseThrow { NotFoundException("User not found") }
 
         if (!communityRepository.isUserSubscribed(communityId, userId))
-            throw IllegalStateException("Not subscribed")
+            throw ConflictException("Not subscribed")
 
         community.subscribers.remove(user)
         communityRepository.save(community)
@@ -76,7 +78,7 @@ class CommunityService(
         logger.info { "Fetching meetings for community: $communityId" }
 
         val community = communityRepository.findById(communityId)
-            .orElseThrow { IllegalArgumentException("Community not found") }
+            .orElseThrow { NotFoundException("Community not found") }
 
         return community.getActiveMeetings().map { meeting ->
             MeetingDto(
@@ -121,7 +123,7 @@ class CommunityService(
         logger.info { "Fetching subscribers for community: $communityId" }
 
         val community = communityRepository.findById(communityId)
-            .orElseThrow { IllegalArgumentException("Community not found") }
+            .orElseThrow { NotFoundException("Community not found") }
 
         return community.subscribers.map { user ->
             UserInfoDto(

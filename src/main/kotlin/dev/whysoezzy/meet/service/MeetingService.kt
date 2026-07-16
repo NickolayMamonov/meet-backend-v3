@@ -1,7 +1,10 @@
 package dev.whysoezzy.meet.service
 
+import dev.whysoezzy.meet.api.error.ConflictException
+import dev.whysoezzy.meet.api.error.NotFoundException
 import dev.whysoezzy.meet.api.dto.*
 import dev.whysoezzy.meet.domain.entity.Meeting
+import dev.whysoezzy.meet.domain.entity.MeetingCapacityExceededException
 import dev.whysoezzy.meet.domain.entity.MeetingStatus
 import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
@@ -67,7 +70,7 @@ class MeetingService(
     fun getMeetingById(id: Long, currentUserId: Long?): MeetingDto {
         logger.info { "Fetching meeting: $id" }
         val meeting = meetingRepository.findById(id)
-            .orElseThrow { IllegalArgumentException("Meeting not found: $id") }
+            .orElseThrow { NotFoundException("Meeting not found") }
         return meeting.toDto(currentUserId)
     }
 
@@ -76,15 +79,19 @@ class MeetingService(
         logger.info { "User $userId joining meeting: $meetingId" }
 
         val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { IllegalArgumentException("Meeting not found") }
+            .orElseThrow { NotFoundException("Meeting not found") }
         val user = userRepository.findById(userId)
-            .orElseThrow { IllegalArgumentException("User not found") }
+            .orElseThrow { NotFoundException("User not found") }
 
-        if (!meeting.isActive()) throw IllegalStateException("Meeting is not active")
+        if (!meeting.isActive()) throw ConflictException("Meeting is not active")
         if (meetingRepository.isUserParticipant(meetingId, userId))
-            throw IllegalStateException("User already joined this meeting")
+            throw ConflictException("User already joined this meeting")
 
-        meeting.addParticipant(user)
+        try {
+            meeting.addParticipant(user)
+        } catch (_: MeetingCapacityExceededException) {
+            throw ConflictException("Meeting is at full capacity")
+        }
         meetingRepository.save(meeting)
     }
 
@@ -93,12 +100,12 @@ class MeetingService(
         logger.info { "User $userId leaving meeting: $meetingId" }
 
         val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { IllegalArgumentException("Meeting not found") }
+            .orElseThrow { NotFoundException("Meeting not found") }
         val user = userRepository.findById(userId)
-            .orElseThrow { IllegalArgumentException("User not found") }
+            .orElseThrow { NotFoundException("User not found") }
 
         if (!meetingRepository.isUserParticipant(meetingId, userId))
-            throw IllegalStateException("User is not a participant")
+            throw ConflictException("User is not a participant")
 
         meeting.removeParticipant(user)
         meetingRepository.save(meeting)
@@ -115,7 +122,7 @@ class MeetingService(
     fun getMeetingParticipants(meetingId: Long): List<UserInfoDto> {
         logger.info { "Fetching participants for meeting: $meetingId" }
         val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { IllegalArgumentException("Meeting not found: $meetingId") }
+            .orElseThrow { NotFoundException("Meeting not found") }
 
         return meeting.participants.map { user ->
             UserInfoDto(

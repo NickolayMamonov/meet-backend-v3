@@ -1,6 +1,8 @@
 package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.api.dto.*
+import dev.whysoezzy.meet.api.error.BadRequestException
+import dev.whysoezzy.meet.api.error.ConflictException
 import dev.whysoezzy.meet.domain.entity.OtpCode
 import dev.whysoezzy.meet.domain.entity.RefreshToken
 import dev.whysoezzy.meet.domain.entity.User
@@ -44,7 +46,7 @@ class AuthService(
             LocalDateTime.now().minusHours(1)
         )
         if (recentAttempts >= maxAttemptsPerHour) {
-            throw IllegalStateException("Too many OTP requests. Please try again later.")
+            throw ConflictException("Too many OTP requests. Please try again later.")
         }
 
         val code = generateOtpCode()
@@ -76,7 +78,7 @@ class AuthService(
         val normalizedPhone = normalizePhone(request.phone)
 
         val otp = otpRepository.findValidCode(normalizedPhone, request.code)
-            ?: throw IllegalArgumentException("Invalid or expired OTP code")
+            ?: throw BadRequestException("Invalid or expired OTP code")
 
         // Помечаем код как использованный
         otp.isUsed = true
@@ -112,11 +114,11 @@ class AuthService(
     @Transactional
     fun refreshToken(refreshToken: String): RefreshTokenResponse {
         val tokenEntity = refreshTokenRepository.findByToken(refreshToken)
-            ?: throw IllegalArgumentException("Refresh token not found")
+            ?: throw BadRequestException("Invalid refresh token")
 
         if (tokenEntity.isExpired) {
             refreshTokenRepository.delete(tokenEntity)
-            throw IllegalArgumentException("Refresh token expired")
+            throw BadRequestException("Invalid refresh token")
         }
 
         val user = tokenEntity.user

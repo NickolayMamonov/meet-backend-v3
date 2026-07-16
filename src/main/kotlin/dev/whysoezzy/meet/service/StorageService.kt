@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.service
 
+import dev.whysoezzy.meet.api.error.BadRequestException
 import dev.whysoezzy.meet.config.StorageProperties
 import mu.KotlinLogging
 import org.springframework.stereotype.Service
@@ -100,19 +101,19 @@ class StorageService(
 
     private fun validateFile(file: MultipartFile) {
         if (file.isEmpty) {
-            throw IllegalArgumentException("File is empty")
+            throw BadRequestException("File is empty")
         }
 
         if (file.size > props.maxFileSize) {
             val maxMb = props.maxFileSize / 1_048_576
-            throw IllegalArgumentException("File size exceeds maximum allowed size of ${maxMb}MB")
+            throw BadRequestException("File size exceeds maximum allowed size of ${maxMb}MB")
         }
 
         val contentType = file.contentType?.lowercase()
-            ?: throw IllegalArgumentException("Cannot determine file content type")
+            ?: throw BadRequestException("Cannot determine file content type")
 
         if (contentType !in props.allowedTypesSet()) {
-            throw IllegalArgumentException(
+            throw BadRequestException(
                 "File type '$contentType' is not allowed. Allowed: ${props.allowedTypes}"
             )
         }
@@ -124,7 +125,7 @@ class StorageService(
             null
         }
         if (image == null) {
-            throw IllegalArgumentException("File is not a valid image")
+            throw BadRequestException("File is not a valid image")
         }
     }
 
