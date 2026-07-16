@@ -3,6 +3,7 @@ package dev.whysoezzy.meet.api.dto
 import jakarta.validation.Valid
 import jakarta.validation.constraints.Email
 import jakarta.validation.constraints.NotBlank
+import jakarta.validation.constraints.Positive
 import jakarta.validation.constraints.Size
 import java.io.Serializable
 
@@ -42,7 +43,7 @@ data class UpdateUserDto(
     // Интересы — список id тегов
     @field:Size(max = 50, message = "No more than 50 interests are allowed")
     @field:Valid
-    val interestIds: List<Long>? = null,
+    val interestIds: List<@Positive(message = "Interest IDs must be positive") Long>? = null,
     // Соцсети
     @field:Size(max = 20, message = "No more than 20 social media links are allowed")
     @field:Valid

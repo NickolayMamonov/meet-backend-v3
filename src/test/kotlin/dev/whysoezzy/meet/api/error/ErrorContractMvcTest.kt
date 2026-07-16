@@ -228,6 +228,23 @@ class ErrorContractMvcTest(
     }
 
     @Test
+    fun `rejects non-positive profile interest IDs with structured error`() {
+        mockMvc.perform(
+            org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/profile")
+                .with(user("42"))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""{"interestIds":[0]}"""),
+        ).andExpectError(400, "Interest IDs must be positive", "/profile", "BAD_REQUEST")
+
+        mockMvc.perform(
+            org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/profile")
+                .with(user("42"))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""{"interestIds":[-1]}"""),
+        ).andExpectError(400, "Interest IDs must be positive", "/profile", "BAD_REQUEST")
+    }
+
+    @Test
     fun `rejects invalid pagination with structured errors`() {
         mockMvc.perform(get("/meetings").param("page", "-1"))
             .andExpectError(400, "Page must be zero or greater", "/meetings", "BAD_REQUEST")
