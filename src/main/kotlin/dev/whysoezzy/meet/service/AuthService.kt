@@ -13,8 +13,11 @@ import dev.whysoezzy.meet.security.JwtService
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.time.LocalDateTime
-import java.util.UUID
+import java.util.Base64
+import java.util.HexFormat
 import kotlin.random.Random
 
 @Service
@@ -105,7 +108,7 @@ class AuthService(
      */
     @Transactional
     fun refreshToken(refreshToken: String): RefreshTokenResponse {
-        val tokenEntity = refreshTokenRepository.findByToken(refreshToken)
+        val tokenEntity = refreshTokenRepository.findByTokenHash(hashRefreshToken(refreshToken))
             ?: throw UnauthorizedException("Invalid refresh token")
 
         if (tokenEntity.isExpired) {
@@ -132,10 +135,10 @@ class AuthService(
     private fun issueTokens(user: User, isNewUser: Boolean): AuthResponse {
         val accessToken = jwtService.generateAccessToken(user.id!!, user.phone)
 
-        val refreshTokenValue = UUID.randomUUID().toString()
+        val refreshTokenValue = generateRefreshToken()
         val refreshTokenEntity = RefreshToken(
             user = user,
-            token = refreshTokenValue,
+            tokenHash = hashRefreshToken(refreshTokenValue),
             expiresAt = LocalDateTime.now().plusDays(refreshTokenExpirationDays)
         )
         refreshTokenRepository.save(refreshTokenEntity)
@@ -164,6 +167,15 @@ class AuthService(
         return Random.nextInt(1000, 9999).toString()
     }
 
+    private fun generateRefreshToken(): String {
+        val tokenBytes = ByteArray(REFRESH_TOKEN_BYTES)
+        secureRandom.nextBytes(tokenBytes)
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
+    }
+
+    private fun hashRefreshToken(refreshToken: String): String =
+        HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(refreshToken.toByteArray(Charsets.UTF_8)))
+
     private fun normalizePhone(phone: String): String {
         // Приводим к формату +7XXXXXXXXXX
         val digits = phone.filter { it.isDigit() }
@@ -180,5 +192,10 @@ class AuthService(
         // TODO: подключить реального SMS-провайдера
         // Например, СМС.ру: https://sms.ru/api/send
         // Twilio, Vonage и т.д.
+    }
+
+    private companion object {
+        const val REFRESH_TOKEN_BYTES = 32
+        val secureRandom = SecureRandom()
     }
 }
