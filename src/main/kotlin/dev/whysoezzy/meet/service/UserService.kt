@@ -1,8 +1,8 @@
 package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.api.dto.*
-import dev.whysoezzy.meet.api.error.BadRequestException
 import dev.whysoezzy.meet.api.error.NotFoundException
+import dev.whysoezzy.meet.api.error.ValidationException
 import dev.whysoezzy.meet.domain.entity.SocialMediaType
 import dev.whysoezzy.meet.domain.entity.UserSocialMedia
 import dev.whysoezzy.meet.domain.repository.CommunityRepository
@@ -73,7 +73,7 @@ class UserService(
                 val platform = runCatching {
                     SocialMediaType.valueOf(dto.type.uppercase())
                 }.getOrElse {
-                    throw BadRequestException("Unknown social media type")
+                    throw ValidationException("Unknown social media type")
                 }
                 user.socialMedia.add(
                     UserSocialMedia(user = user, platform = platform, username = dto.url)

@@ -1,8 +1,8 @@
 package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.api.dto.*
-import dev.whysoezzy.meet.api.error.BadRequestException
-import dev.whysoezzy.meet.api.error.ConflictException
+import dev.whysoezzy.meet.api.error.RateLimitException
+import dev.whysoezzy.meet.api.error.UnauthorizedException
 import dev.whysoezzy.meet.domain.entity.OtpCode
 import dev.whysoezzy.meet.domain.entity.RefreshToken
 import dev.whysoezzy.meet.domain.entity.User
@@ -46,7 +46,7 @@ class AuthService(
             LocalDateTime.now().minusHours(1)
         )
         if (recentAttempts >= maxAttemptsPerHour) {
-            throw ConflictException("Too many OTP requests. Please try again later.")
+            throw RateLimitException("Too many OTP requests. Please try again later.")
         }
 
         val code = generateOtpCode()
@@ -78,7 +78,7 @@ class AuthService(
         val normalizedPhone = normalizePhone(request.phone)
 
         val otp = otpRepository.findValidCode(normalizedPhone, request.code)
-            ?: throw BadRequestException("Invalid or expired OTP code")
+            ?: throw UnauthorizedException("Invalid or expired OTP code")
 
         // Помечаем код как использованный
         otp.isUsed = true
@@ -114,11 +114,11 @@ class AuthService(
     @Transactional
     fun refreshToken(refreshToken: String): RefreshTokenResponse {
         val tokenEntity = refreshTokenRepository.findByToken(refreshToken)
-            ?: throw BadRequestException("Invalid refresh token")
+            ?: throw UnauthorizedException("Invalid refresh token")
 
         if (tokenEntity.isExpired) {
             refreshTokenRepository.delete(tokenEntity)
-            throw BadRequestException("Invalid refresh token")
+            throw UnauthorizedException("Invalid refresh token")
         }
 
         val user = tokenEntity.user

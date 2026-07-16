@@ -2,6 +2,7 @@ package dev.whysoezzy.meet.api.error
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import dev.whysoezzy.meet.api.controller.AdminController
+import dev.whysoezzy.meet.api.controller.AuthController
 import dev.whysoezzy.meet.api.controller.MeetingController
 import dev.whysoezzy.meet.config.StorageProperties
 import dev.whysoezzy.meet.ingestion.IngestionService
@@ -10,6 +11,7 @@ import dev.whysoezzy.meet.security.ApiAuthenticationEntryPoint
 import dev.whysoezzy.meet.security.AuthUtils
 import dev.whysoezzy.meet.security.JwtService
 import dev.whysoezzy.meet.service.MeetingService
+import dev.whysoezzy.meet.service.AuthService
 import jakarta.validation.Valid
 import jakarta.validation.constraints.NotBlank
 import org.junit.jupiter.api.Test
@@ -30,6 +32,7 @@ import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.status
+import org.springframework.test.web.servlet.result.MockMvcResultMatchers.header
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.PostMapping
 import org.springframework.web.bind.annotation.RequestBody
@@ -41,7 +44,7 @@ import org.mockito.Mockito.doThrow
 import org.mockito.Mockito.`when`
 
 @WebMvcTest(
-    controllers = [ErrorContractController::class, MeetingController::class, AdminController::class],
+    controllers = [ErrorContractController::class, AuthController::class, MeetingController::class, AdminController::class],
     properties = ["app.admin.api-key=test-admin-key"],
 )
 @Import(
@@ -60,6 +63,9 @@ class ErrorContractMvcTest(
 
     @MockBean
     private lateinit var meetingService: MeetingService
+
+    @MockBean
+    private lateinit var authService: AuthService
 
     @MockBean
     private lateinit var authUtils: AuthUtils
@@ -98,6 +104,21 @@ class ErrorContractMvcTest(
     }
 
     @Test
+    fun `returns structured typed application errors`() {
+        mapOf(
+            "/contract/bad-request" to ErrorExpectation(400, "Bad request", "BAD_REQUEST"),
+            "/contract/unauthorized" to ErrorExpectation(401, "Authentication is required", "UNAUTHORIZED"),
+            "/contract/forbidden" to ErrorExpectation(403, "Access is denied", "FORBIDDEN"),
+            "/contract/not-found" to ErrorExpectation(404, "Resource not found", "NOT_FOUND"),
+            "/contract/conflict" to ErrorExpectation(409, "State conflict", "CONFLICT"),
+            "/contract/rate-limited" to ErrorExpectation(429, "Too many OTP requests. Please try again later.", "RATE_LIMITED"),
+        ).forEach { (path, expected) ->
+            mockMvc.perform(get(path))
+                .andExpectError(expected.status, expected.message, path, expected.code)
+        }
+    }
+
+    @Test
     fun `returns structured not found error for unmatched route`() {
         mockMvc.perform(get("/unknown-review-probe"))
             .andExpectError(404, "Resource not found", "/unknown-review-probe", "NOT_FOUND")
@@ -132,6 +153,26 @@ class ErrorContractMvcTest(
             .andExpectError(403, "Access is denied", "/contract/admin", "FORBIDDEN")
     }
 
+    @Test
+    fun `returns OTP rate limit without inaccurate retry guidance`() {
+        doThrow(RateLimitException("Too many OTP requests. Please try again later."))
+            .`when`(authService)
+            .sendOtp("+79990000000")
+
+        mockMvc.perform(
+            post("/auth/send-otp")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""{"phone":"+79990000000"}"""),
+        )
+            .andExpectError(
+                429,
+                "Too many OTP requests. Please try again later.",
+                "/auth/send-otp",
+                "RATE_LIMITED",
+            )
+            .andExpect(header().doesNotExist("Retry-After"))
+    }
+
     private fun ResultActions.andExpectError(
         expectedStatus: Int,
         expectedMessage: String,
@@ -153,6 +194,8 @@ class ErrorContractMvcTest(
     }
 }
 
+private data class ErrorExpectation(val status: Int, val message: String, val code: String)
+
 @RestController
 private class ErrorContractController {
     @PostMapping("/contract/validated")
@@ -160,6 +203,21 @@ private class ErrorContractController {
 
     @GetMapping("/contract/not-found")
     fun notFound(): Nothing = throw NotFoundException("Resource not found")
+
+    @GetMapping("/contract/bad-request")
+    fun badRequest(): Nothing = throw BadRequestException("Bad request")
+
+    @GetMapping("/contract/unauthorized")
+    fun unauthorized(): Nothing = throw UnauthorizedException()
+
+    @GetMapping("/contract/forbidden")
+    fun forbidden(): Nothing = throw ForbiddenException()
+
+    @GetMapping("/contract/conflict")
+    fun conflict(): Nothing = throw ConflictException("State conflict")
+
+    @GetMapping("/contract/rate-limited")
+    fun rateLimited(): Nothing = throw RateLimitException("Too many OTP requests. Please try again later.")
 
     @GetMapping("/contract/failure")
     fun failure(): Nothing = throw IllegalStateException("sensitive implementation detail")
@@ -188,8 +246,14 @@ private class ErrorContractSecurityConfig(
             .authorizeHttpRequests {
                 it.requestMatchers(HttpMethod.POST, "/contract/validated").permitAll()
                     .requestMatchers(
+                        "/contract/bad-request",
+                        "/contract/unauthorized",
+                        "/contract/forbidden",
                         "/contract/not-found",
+                        "/contract/conflict",
+                        "/contract/rate-limited",
                         "/contract/failure",
+                        "/auth/send-otp",
                     ).permitAll()
                     .requestMatchers(HttpMethod.POST, "/meetings/*/join").authenticated()
                     .requestMatchers("/contract/admin").hasRole("ADMIN")
