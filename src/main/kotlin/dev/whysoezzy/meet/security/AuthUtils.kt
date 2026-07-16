@@ -1,6 +1,6 @@
 package dev.whysoezzy.meet.security
 
-import dev.whysoezzy.meet.api.exception.UnauthorizedException
+import dev.whysoezzy.meet.api.error.UnauthorizedException
 import org.springframework.security.core.context.SecurityContextHolder
 import org.springframework.stereotype.Component
 
