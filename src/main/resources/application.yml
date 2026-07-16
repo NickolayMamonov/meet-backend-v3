@@ -48,16 +48,16 @@ app:
     only-matching-topics: true
 
   jwt:
-    secret: "meet-app-super-secret-key-change-in-production-min-32-chars"
-    access-token-expiration-ms: 604800000   # 7 дней
+    secret: ${APP_JWT_SECRET:}
+    access-token-expiration-ms: ${APP_JWT_ACCESS_TOKEN_EXPIRATION_MS:900000}
     refresh-token-expiration-days: 30
 
   timepad:
     enabled: true
     base-url: https://api.timepad.ru/v1
     token: ${TIMEPAD_TOKEN:}
-    category-ids: [452]                # пусто = все; пример списком: [217, 452]
-    keywords:                    # пример: [разработка, дизайн, data]
+    category-ids: [452]
+    keywords:
     cities:
     page-size: 100
     max-pages: 5
