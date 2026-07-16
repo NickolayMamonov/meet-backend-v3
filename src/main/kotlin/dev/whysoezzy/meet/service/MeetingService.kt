@@ -4,6 +4,7 @@ import dev.whysoezzy.meet.api.error.ConflictException
 import dev.whysoezzy.meet.api.error.NotFoundException
 import dev.whysoezzy.meet.api.dto.*
 import dev.whysoezzy.meet.domain.entity.Meeting
+import dev.whysoezzy.meet.domain.entity.MeetingCapacityExceededException
 import dev.whysoezzy.meet.domain.entity.MeetingStatus
 import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
@@ -86,7 +87,11 @@ class MeetingService(
         if (meetingRepository.isUserParticipant(meetingId, userId))
             throw ConflictException("User already joined this meeting")
 
-        meeting.addParticipant(user)
+        try {
+            meeting.addParticipant(user)
+        } catch (_: MeetingCapacityExceededException) {
+            throw ConflictException("Meeting is at full capacity")
+        }
         meetingRepository.save(meeting)
     }
 

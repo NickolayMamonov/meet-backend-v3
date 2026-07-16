@@ -86,7 +86,7 @@ class Meeting(
     
     fun addParticipant(user: User) {
         if (participants.size >= capacity) {
-            throw IllegalStateException("Meeting is at full capacity")
+            throw MeetingCapacityExceededException()
         }
         participants.add(user)
     }
@@ -99,6 +99,8 @@ class Meeting(
     
     fun isActive(): Boolean = status == MeetingStatus.ACTIVE
 }
+
+class MeetingCapacityExceededException : RuntimeException("Meeting is at full capacity")
 
 enum class MeetingStatus {
     ACTIVE,

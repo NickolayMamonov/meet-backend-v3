@@ -1,10 +1,13 @@
 package dev.whysoezzy.meet.api.error
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import dev.whysoezzy.meet.api.controller.MeetingController
 import dev.whysoezzy.meet.config.StorageProperties
 import dev.whysoezzy.meet.security.ApiAccessDeniedHandler
 import dev.whysoezzy.meet.security.ApiAuthenticationEntryPoint
+import dev.whysoezzy.meet.security.AuthUtils
 import dev.whysoezzy.meet.security.JwtService
+import dev.whysoezzy.meet.service.MeetingService
 import jakarta.validation.Valid
 import jakarta.validation.constraints.NotBlank
 import org.junit.jupiter.api.Test
@@ -31,8 +34,10 @@ import org.springframework.web.bind.annotation.RestController
 import java.time.Instant
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.user
+import org.mockito.Mockito.doThrow
+import org.mockito.Mockito.`when`
 
-@WebMvcTest(controllers = [ErrorContractController::class])
+@WebMvcTest(controllers = [ErrorContractController::class, MeetingController::class])
 @Import(
     ApiExceptionHandler::class,
     ApiErrorResponseWriter::class,
@@ -46,6 +51,12 @@ class ErrorContractMvcTest(
 ) {
     @MockBean
     private lateinit var jwtService: JwtService
+
+    @MockBean
+    private lateinit var meetingService: MeetingService
+
+    @MockBean
+    private lateinit var authUtils: AuthUtils
 
     @Test
     fun `returns structured bad request validation error`() {
@@ -63,9 +74,14 @@ class ErrorContractMvcTest(
     }
 
     @Test
-    fun `returns structured conflict error`() {
-        mockMvc.perform(get("/contract/conflict"))
-            .andExpectError(409, "Resource already exists", "/contract/conflict", "CONFLICT")
+    fun `returns structured conflict when joining a full meeting`() {
+        `when`(authUtils.getCurrentUserId()).thenReturn(42L)
+        doThrow(ConflictException("Meeting is at full capacity"))
+            .`when`(meetingService)
+            .joinMeeting(99L, 42L)
+
+        mockMvc.perform(post("/meetings/99/join").with(user("42")))
+            .andExpectError(409, "Meeting is at full capacity", "/meetings/99/join", "CONFLICT")
     }
 
     @Test
@@ -115,9 +131,6 @@ private class ErrorContractController {
     @GetMapping("/contract/not-found")
     fun notFound(): Nothing = throw NotFoundException("Resource not found")
 
-    @GetMapping("/contract/conflict")
-    fun conflict(): Nothing = throw ConflictException("Resource already exists")
-
     @GetMapping("/contract/failure")
     fun failure(): Nothing = throw IllegalStateException("sensitive implementation detail")
 
@@ -146,9 +159,9 @@ private class ErrorContractSecurityConfig(
                 it.requestMatchers(HttpMethod.POST, "/contract/validated").permitAll()
                     .requestMatchers(
                         "/contract/not-found",
-                        "/contract/conflict",
                         "/contract/failure",
                     ).permitAll()
+                    .requestMatchers(HttpMethod.POST, "/meetings/*/join").authenticated()
                     .requestMatchers("/contract/admin").hasRole("ADMIN")
                     .requestMatchers("/contract/protected").authenticated()
                     .anyRequest().permitAll()
