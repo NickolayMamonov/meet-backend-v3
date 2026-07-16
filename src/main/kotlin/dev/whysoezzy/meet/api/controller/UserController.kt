@@ -6,6 +6,7 @@ import dev.whysoezzy.meet.service.UserService
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.security.SecurityRequirement
 import io.swagger.v3.oas.annotations.tags.Tag
+import jakarta.validation.Valid
 import mu.KotlinLogging
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
@@ -39,7 +40,7 @@ class UserController(
     /** Обновить свой профиль */
     @PutMapping("/profile")
     @Operation(summary = "Update current user profile", security = [SecurityRequirement(name = "bearerAuth")])
-    fun updateProfile(@RequestBody updateDto: UpdateUserDto): UserProfileDto {
+    fun updateProfile(@Valid @RequestBody updateDto: UpdateUserDto): UserProfileDto {
         val userId = authUtils.getCurrentUserId()
         logger.info { "PUT /profile - user: $userId" }
         return userService.updateProfile(userId, updateDto)
@@ -48,7 +49,7 @@ class UserController(
     /** Обновить FCM токен для push-уведомлений */
     @PutMapping("/profile/fcm-token")
     @Operation(summary = "Update FCM push token", security = [SecurityRequirement(name = "bearerAuth")])
-    fun updateFcmToken(@RequestBody request: UpdateFcmTokenDto): ResponseEntity<Map<String, String>> {
+    fun updateFcmToken(@Valid @RequestBody request: UpdateFcmTokenDto): ResponseEntity<Map<String, String>> {
         val userId = authUtils.getCurrentUserId()
         logger.info { "PUT /profile/fcm-token - user: $userId" }
         userService.updateFcmToken(userId, request.fcmToken)

@@ -1,6 +1,7 @@
 package dev.whysoezzy.meet.api.error
 
 import jakarta.servlet.http.HttpServletRequest
+import jakarta.validation.ConstraintViolationException
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.http.converter.HttpMessageNotReadableException
@@ -10,6 +11,8 @@ import org.springframework.web.bind.ServletRequestBindingException
 import org.springframework.web.bind.annotation.ExceptionHandler
 import org.springframework.web.bind.annotation.RestControllerAdvice
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException
+import org.springframework.web.method.annotation.HandlerMethodValidationException
+import org.springframework.web.multipart.support.MissingServletRequestPartException
 import org.springframework.web.servlet.NoHandlerFoundException
 import org.springframework.web.servlet.resource.NoResourceFoundException
 
@@ -25,7 +28,10 @@ class ApiExceptionHandler(
         MethodArgumentNotValidException::class,
         MethodArgumentTypeMismatchException::class,
         HttpMessageNotReadableException::class,
+        MissingServletRequestPartException::class,
         ServletRequestBindingException::class,
+        ConstraintViolationException::class,
+        HandlerMethodValidationException::class,
     )
     fun badRequest(exception: Exception, request: HttpServletRequest): ResponseEntity<ApiError> {
         val message = (exception as? MethodArgumentNotValidException)
@@ -33,6 +39,10 @@ class ApiExceptionHandler(
             ?.allErrors
             ?.firstOrNull()
             ?.let { error -> (error as? FieldError)?.defaultMessage ?: error.defaultMessage }
+            ?: (exception as? ConstraintViolationException)
+                ?.constraintViolations
+                ?.firstOrNull()
+                ?.message
             ?: "Invalid request"
         return response(HttpStatus.BAD_REQUEST, message, request, "BAD_REQUEST")
     }

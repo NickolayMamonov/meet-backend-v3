@@ -6,6 +6,7 @@ import dev.whysoezzy.meet.service.AuthService
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.security.SecurityRequirement
 import io.swagger.v3.oas.annotations.tags.Tag
+import jakarta.validation.Valid
 import mu.KotlinLogging
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
@@ -26,8 +27,8 @@ class AuthController(
      */
     @PostMapping("/send-otp")
     @Operation(summary = "Send OTP code to phone number")
-    fun sendOtp(@RequestBody request: SendOtpRequest): ResponseEntity<Map<String, String>> {
-        logger.info { "POST /auth/send-otp - phone: ${request.phone}" }
+    fun sendOtp(@Valid @RequestBody request: SendOtpRequest): ResponseEntity<Map<String, String>> {
+        logger.info { "POST /auth/send-otp" }
         authService.sendOtp(request.phone)
         return ResponseEntity.ok(mapOf("message" to "OTP sent successfully"))
     }
@@ -38,8 +39,8 @@ class AuthController(
      */
     @PostMapping("/verify-otp")
     @Operation(summary = "Verify OTP code and get JWT tokens")
-    fun verifyOtp(@RequestBody request: VerifyOtpRequest): AuthResponse {
-        logger.info { "POST /auth/verify-otp - phone: ${request.phone}" }
+    fun verifyOtp(@Valid @RequestBody request: VerifyOtpRequest): AuthResponse {
+        logger.info { "POST /auth/verify-otp" }
         return authService.verifyOtp(request)
     }
 
@@ -48,7 +49,7 @@ class AuthController(
      */
     @PostMapping("/refresh")
     @Operation(summary = "Refresh access token")
-    fun refreshToken(@RequestBody request: RefreshTokenRequest): RefreshTokenResponse {
+    fun refreshToken(@Valid @RequestBody request: RefreshTokenRequest): RefreshTokenResponse {
         logger.info { "POST /auth/refresh" }
         return authService.refreshToken(request.refreshToken)
     }
