@@ -1,11 +1,11 @@
 package dev.whysoezzy.meet.security
 
+import dev.whysoezzy.meet.config.JwtProperties
 import io.jsonwebtoken.Claims
 import io.jsonwebtoken.JwtException
 import io.jsonwebtoken.Jwts
 import io.jsonwebtoken.security.Keys
 import mu.KotlinLogging
-import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import java.util.Date
 import javax.crypto.SecretKey
@@ -14,12 +14,10 @@ private val logger = KotlinLogging.logger {}
 
 @Service
 class JwtService(
-    @Value("\${app.jwt.secret}") private val secret: String,
-    @Value("\${app.jwt.access-token-expiration-ms}") private val accessTokenExpirationMs: Long,
+    properties: JwtProperties,
 ) {
-    private val signingKey: SecretKey by lazy {
-        Keys.hmacShaKeyFor(secret.toByteArray())
-    }
+    private val accessTokenExpirationMs = properties.accessTokenExpirationMs
+    private val signingKey: SecretKey = Keys.hmacShaKeyFor(properties.secret.toByteArray())
 
     fun generateAccessToken(userId: Long, phone: String): String {
         return Jwts.builder()

@@ -1,0 +1,3 @@
+app:
+  jwt:
+    secret: test-only-jwt-signing-secret-not-for-production
