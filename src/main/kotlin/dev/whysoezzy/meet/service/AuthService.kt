@@ -10,15 +10,12 @@ import dev.whysoezzy.meet.domain.repository.OtpRepository
 import dev.whysoezzy.meet.domain.repository.RefreshTokenRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.security.JwtService
-import mu.KotlinLogging
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import java.time.LocalDateTime
 import java.util.UUID
 import kotlin.random.Random
-
-private val logger = KotlinLogging.logger {}
 
 @Service
 class AuthService(
@@ -61,12 +58,9 @@ class AuthService(
 
         // В реальном приложении здесь был бы вызов SMS-провайдера (Twilio, СМС.ру и т.д.)
         if (fakeSms) {
-            logger.info { "📱 [FAKE SMS] Phone: $normalizedPhone, Code: $code (expires in $otpExpirationMinutes min)" }
         } else {
             sendSmsViProvider(normalizedPhone, code)
         }
-
-        logger.info { "OTP sent to $normalizedPhone" }
     }
 
     /**
@@ -95,13 +89,11 @@ class AuthService(
                 surname = request.surname ?: ""
             )
             userRepository.save(user)
-            logger.info { "New user created: $normalizedPhone" }
         } else {
             // Проверяем soft delete — восстанавливаем аккаунт
             if (user!!.isDeleted) {
                 user.deletedAt = null
                 userRepository.save(user)
-                logger.info { "Account restored for: $normalizedPhone" }
             }
         }
 
@@ -133,7 +125,6 @@ class AuthService(
     @Transactional
     fun logout(userId: Long) {
         refreshTokenRepository.deleteAllByUserId(userId)
-        logger.info { "User $userId logged out" }
     }
 
     // ==================== Private ====================
@@ -184,10 +175,10 @@ class AuthService(
         }
     }
 
+    @Suppress("UNUSED_PARAMETER")
     private fun sendSmsViProvider(phone: String, code: String) {
         // TODO: подключить реального SMS-провайдера
         // Например, СМС.ру: https://sms.ru/api/send
         // Twilio, Vonage и т.д.
-        logger.info { "Sending SMS to $phone with code $code" }
     }
 }

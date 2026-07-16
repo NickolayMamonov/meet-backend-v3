@@ -49,6 +49,7 @@ import java.time.Instant
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.user
 import org.mockito.Mockito.doThrow
+import org.mockito.Mockito.verify
 import org.mockito.Mockito.`when`
 
 @WebMvcTest(
@@ -114,6 +115,22 @@ class ErrorContractMvcTest(
     fun `returns structured bad request for missing required query parameter`() {
         mockMvc.perform(get("/meetings/search"))
             .andExpectError(400, "Invalid request", "/meetings/search", "BAD_REQUEST")
+    }
+
+    @Test
+    fun `accepts a normal meeting search term and rejects blank or oversized terms`() {
+        `when`(authUtils.getCurrentUserIdOrNull()).thenReturn(null)
+        `when`(meetingService.searchMeetings("coffee", null)).thenReturn(emptyList())
+
+        mockMvc.perform(get("/meetings/search").param("query", "coffee"))
+            .andExpect(status().isOk)
+        verify(meetingService).searchMeetings("coffee", null)
+
+        mockMvc.perform(get("/meetings/search").param("query", "   "))
+            .andExpectError(400, "Query is required", "/meetings/search", "BAD_REQUEST")
+
+        mockMvc.perform(get("/meetings/search").param("query", "a".repeat(201)))
+            .andExpectError(400, "Query must not exceed 200 characters", "/meetings/search", "BAD_REQUEST")
     }
 
     @Test

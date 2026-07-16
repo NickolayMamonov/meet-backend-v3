@@ -11,6 +11,7 @@ import jakarta.validation.constraints.Max
 import jakarta.validation.constraints.NotBlank
 import jakarta.validation.constraints.Positive
 import jakarta.validation.constraints.PositiveOrZero
+import jakarta.validation.constraints.Size
 import mu.KotlinLogging
 import org.springframework.validation.annotation.Validated
 import org.springframework.http.ResponseEntity
@@ -56,7 +57,7 @@ class MeetingController(
 
     @GetMapping("/meetings/search")
     @Operation(summary = "Search meetings by title/description/address")
-    fun searchMeetings(@RequestParam @NotBlank(message = "Query is required") @Max(200, message = "Query must not exceed 200 characters") query: String): List<MeetingDto> {
+    fun searchMeetings(@RequestParam @NotBlank(message = "Query is required") @Size(max = 200, message = "Query must not exceed 200 characters") query: String): List<MeetingDto> {
         val userId = authUtils.getCurrentUserIdOrNull()
         logger.info { "GET /meetings/search - query: $query" }
         return meetingService.searchMeetings(query, userId)
