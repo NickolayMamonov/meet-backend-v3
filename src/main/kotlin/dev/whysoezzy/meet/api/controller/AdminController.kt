@@ -2,7 +2,9 @@ package dev.whysoezzy.meet.api.controller
 
 import dev.whysoezzy.meet.api.dto.IngestRunSummary
 import dev.whysoezzy.meet.api.dto.IngestTriggerResponse
+import dev.whysoezzy.meet.api.error.BadRequestException
 import dev.whysoezzy.meet.api.error.ForbiddenException
+import dev.whysoezzy.meet.domain.entity.EventSource
 import dev.whysoezzy.meet.ingestion.IngestionService
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.ResponseEntity
@@ -51,7 +53,8 @@ class AdminController(
         if (adminApiKey.isBlank() || apiKey != adminApiKey) {
             throw ForbiddenException()
         }
-        val src = dev.whysoezzy.meet.domain.entity.EventSource.valueOf(source.uppercase())
+        val src = EventSource.entries.firstOrNull { it.name.equals(source, ignoreCase = true) }
+            ?: throw BadRequestException("Invalid source")
         val deleted = ingestionService.purgeBySource(src)
         return ResponseEntity.ok(mapOf("source" to src.name, "deleted" to deleted))
     }

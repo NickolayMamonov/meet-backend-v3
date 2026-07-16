@@ -1,8 +1,10 @@
 package dev.whysoezzy.meet.api.error
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import dev.whysoezzy.meet.api.controller.AdminController
 import dev.whysoezzy.meet.api.controller.MeetingController
 import dev.whysoezzy.meet.config.StorageProperties
+import dev.whysoezzy.meet.ingestion.IngestionService
 import dev.whysoezzy.meet.security.ApiAccessDeniedHandler
 import dev.whysoezzy.meet.security.ApiAuthenticationEntryPoint
 import dev.whysoezzy.meet.security.AuthUtils
@@ -25,6 +27,7 @@ import org.springframework.test.web.servlet.ResultActions
 import org.springframework.test.web.servlet.ResultMatcher
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post
+import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.status
 import org.springframework.web.bind.annotation.GetMapping
@@ -37,7 +40,10 @@ import org.springframework.security.test.web.servlet.request.SecurityMockMvcRequ
 import org.mockito.Mockito.doThrow
 import org.mockito.Mockito.`when`
 
-@WebMvcTest(controllers = [ErrorContractController::class, MeetingController::class])
+@WebMvcTest(
+    controllers = [ErrorContractController::class, MeetingController::class, AdminController::class],
+    properties = ["app.admin.api-key=test-admin-key"],
+)
 @Import(
     ApiExceptionHandler::class,
     ApiErrorResponseWriter::class,
@@ -58,6 +64,9 @@ class ErrorContractMvcTest(
     @MockBean
     private lateinit var authUtils: AuthUtils
 
+    @MockBean
+    private lateinit var ingestionService: IngestionService
+
     @Test
     fun `returns structured bad request validation error`() {
         mockMvc.perform(
@@ -71,6 +80,15 @@ class ErrorContractMvcTest(
     fun `returns structured bad request for missing required query parameter`() {
         mockMvc.perform(get("/meetings/search"))
             .andExpectError(400, "Invalid request", "/meetings/search", "BAD_REQUEST")
+    }
+
+    @Test
+    fun `returns structured bad request for invalid admin purge source with valid admin key`() {
+        mockMvc.perform(
+            delete("/admin/purge")
+                .header("X-Admin-Key", "test-admin-key")
+                .param("source", "not-a-source"),
+        ).andExpectError(400, "Invalid source", "/admin/purge", "BAD_REQUEST")
     }
 
     @Test
