@@ -6,6 +6,7 @@ import org.springframework.http.ResponseEntity
 import org.springframework.http.converter.HttpMessageNotReadableException
 import org.springframework.validation.FieldError
 import org.springframework.web.bind.MethodArgumentNotValidException
+import org.springframework.web.bind.ServletRequestBindingException
 import org.springframework.web.bind.annotation.ExceptionHandler
 import org.springframework.web.bind.annotation.RestControllerAdvice
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException
@@ -22,6 +23,7 @@ class ApiExceptionHandler(
         MethodArgumentNotValidException::class,
         MethodArgumentTypeMismatchException::class,
         HttpMessageNotReadableException::class,
+        ServletRequestBindingException::class,
     )
     fun badRequest(exception: Exception, request: HttpServletRequest): ResponseEntity<ApiError> {
         val message = (exception as? MethodArgumentNotValidException)

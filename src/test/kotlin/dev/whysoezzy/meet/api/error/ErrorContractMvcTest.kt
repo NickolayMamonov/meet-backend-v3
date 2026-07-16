@@ -68,6 +68,12 @@ class ErrorContractMvcTest(
     }
 
     @Test
+    fun `returns structured bad request for missing required query parameter`() {
+        mockMvc.perform(get("/meetings/search"))
+            .andExpectError(400, "Invalid request", "/meetings/search", "BAD_REQUEST")
+    }
+
+    @Test
     fun `returns structured not found error`() {
         mockMvc.perform(get("/contract/not-found"))
             .andExpectError(404, "Resource not found", "/contract/not-found", "NOT_FOUND")
