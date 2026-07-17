@@ -42,7 +42,7 @@ interface OtpRepository : JpaRepository<OtpCode, Long> {
 @Repository
 interface RefreshTokenRepository : JpaRepository<RefreshToken, Long> {
 
-    fun findByToken(token: String): RefreshToken?
+    fun findByTokenHash(tokenHash: String): RefreshToken?
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     fun findWithLockByToken(token: String): RefreshToken?

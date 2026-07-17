@@ -42,8 +42,8 @@ class RefreshToken(
     @JoinColumn(name = "user_id", nullable = false)
     var user: User,
 
-    @Column(nullable = false, unique = true, length = 512)
-    var token: String,
+    @Column(name = "token_hash", nullable = false, unique = true, length = 64)
+    var tokenHash: String,
 
     @Column(name = "expires_at", nullable = false)
     var expiresAt: LocalDateTime,
