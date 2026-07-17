@@ -15,7 +15,6 @@ class JwtConfigurationInitializer : ApplicationContextInitializer<ConfigurableAp
         val binder = Binder.get(environment)
 
         binder.bind("app.jwt", Bindable.of(JwtProperties::class.java)).orElseGet(::JwtProperties)
-        binder.bind("app.admin", Bindable.of(AdminProperties::class.java)).orElseGet(::AdminProperties)
         val otp = binder.bind("app.otp", Bindable.of(OtpProperties::class.java)).orElseGet(::OtpProperties)
 
         listOf(

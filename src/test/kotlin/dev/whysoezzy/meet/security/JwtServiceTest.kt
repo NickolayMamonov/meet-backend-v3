@@ -77,9 +77,8 @@ class JwtServiceTest {
     }
 
     @Test
-    fun `fails startup initialization for missing or blank secrets and database settings`() {
+    fun `fails startup initialization for missing or blank JWT secrets and database settings`() {
         listOf(
-            "app.admin.api-key=",
             "spring.datasource.url=",
             "spring.datasource.username=",
             "spring.datasource.password=",
@@ -102,12 +101,22 @@ class JwtServiceTest {
     }
 
     @Test
+    fun `allows startup without an admin key`() {
+        startupContextRunner
+            .withPropertyValues(*validDevProperties())
+            .run { context -> assertThat(context.startupFailure).isNull() }
+
+        startupContextRunner
+            .withPropertyValues(*validDevProperties(), "app.admin.api-key=")
+            .run { context -> assertThat(context.startupFailure).isNull() }
+    }
+
+    @Test
     fun `allows fake SMS only for the dev profile`() {
         startupContextRunner
             .withPropertyValues(
                 "spring.profiles.active=dev",
                 "app.jwt.secret=dev-only-jwt-signing-secret-not-for-production",
-                "app.admin.api-key=dev-admin-key",
                 "spring.datasource.url=jdbc:postgresql://localhost:5432/meet_db",
                 "spring.datasource.username=postgres",
                 "spring.datasource.password=postgres",
@@ -153,6 +162,15 @@ class JwtServiceTest {
             "spring.datasource.username=meet",
             "spring.datasource.password=production-db-password",
             "app.otp.fake-sms=false",
+        )
+
+        fun validDevProperties(): Array<String> = arrayOf(
+            "spring.profiles.active=dev",
+            "app.jwt.secret=dev-only-jwt-signing-secret-not-for-production",
+            "spring.datasource.url=jdbc:postgresql://localhost:5432/meet_db",
+            "spring.datasource.username=postgres",
+            "spring.datasource.password=postgres",
+            "app.otp.fake-sms=true",
         )
     }
 }

@@ -13,6 +13,7 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @EnableWebSecurity
 class SecurityConfig(
     private val jwtAuthFilter: JwtAuthFilter,
+    private val adminKeyAuthFilter: AdminKeyAuthFilter,
     private val apiAuthenticationEntryPoint: ApiAuthenticationEntryPoint,
     private val apiAccessDeniedHandler: ApiAccessDeniedHandler,
 ) {
@@ -53,14 +54,13 @@ class SecurityConfig(
                     .requestMatchers(HttpMethod.GET, "/api/v1/tags").permitAll()
                     // AdBlocks — контроллер маппится на /api/ads (не /ad-blocks)
                     .requestMatchers(HttpMethod.GET, "/api/ads/**").permitAll()
-                    // Admin-эндпоинты: на уровне Spring Security открыты,
-                    // доступ гейтится заголовком X-Admin-Key в контроллере (интерим, до ролей)
-                    .requestMatchers("/admin/**").permitAll()
+                    .requestMatchers("/admin/**").hasRole("ADMIN")
 
                     // Всё остальное — JWT обязателен
                     .anyRequest().authenticated()
             }
             .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter::class.java)
+            .addFilterAfter(adminKeyAuthFilter, JwtAuthFilter::class.java)
 
         return http.build()
     }
