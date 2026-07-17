@@ -31,13 +31,14 @@ meet-backend-clean/
 ### 1. Запустить PostgreSQL
 
 ```bash
+cp .env.example .env
 docker-compose up -d
 ```
 
 ### 2. Запустить приложение
 
 ```bash
-./gradlew bootRun
+SPRING_PROFILES_ACTIVE=dev ./gradlew bootRun
 ```
 
 Приложение будет доступно на `http://localhost:8080`
@@ -83,15 +84,28 @@ GET    /api/v1/tags
 
 ## 🔧 Конфигурация
 
-Отредактируйте `src/main/resources/application.yml`:
+Локальная конфигурация намеренно изолирована в профиле `dev`. Файл `.env` не
+коммитится; создайте его из `.env.example` для Docker PostgreSQL. Приложение
+локально запускается только с `SPRING_PROFILES_ACTIVE=dev`.
 
-```yaml
-spring:
-  datasource:
-    url: jdbc:postgresql://localhost:5432/meet_db
-    username: postgres
-    password: postgres
+Для production передайте значения через secret manager или переменные окружения:
+
+```text
+DB_HOST
+DB_PORT                 # optional, defaults to 5432
+DB_NAME
+DB_USERNAME
+DB_PASSWORD
+APP_JWT_SECRET          # at least 32 UTF-8 bytes
+ADMIN_API_KEY
+SMS_PROVIDER            # required while APP_FAKE_SMS=false
 ```
+
+`APP_FAKE_SMS=true` разрешён только при `SPRING_PROFILES_ACTIVE=dev`. Реальный
+SMS-провайдер ещё не реализован: production-конфигурация требует явный
+`SMS_PROVIDER`, а подключение самого провайдера должно быть выполнено до
+включения OTP в production. Не добавляйте значения этих переменных в
+`application.yml`, Compose или Git.
 
 ## 🧪 Тестовые данные
 

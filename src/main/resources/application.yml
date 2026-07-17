@@ -3,9 +3,9 @@ spring:
     name: meet-backend
 
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:5432/meet_db
-    username: postgres
-    password: postgres
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
 
   jpa:
@@ -39,7 +39,7 @@ app:
     lang: ru
 
   admin:
-    api-key: dev-secret
+    api-key: ${ADMIN_API_KEY}
 
   ingestion:
     enabled: ${INGESTION_ENABLED:true}
@@ -67,7 +67,8 @@ app:
   otp:
     expiration-minutes: 5
     max-attempts-per-hour: 5
-    fake-sms: true
+    fake-sms: ${APP_FAKE_SMS:false}
+    provider: ${SMS_PROVIDER:}
 
   storage:
     upload-dir: ./uploads

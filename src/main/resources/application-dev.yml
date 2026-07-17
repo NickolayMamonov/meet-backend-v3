@@ -1,4 +1,16 @@
 # Enable with SPRING_PROFILES_ACTIVE=dev.
 spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/meet_db
+    username: postgres
+    password: postgres
   flyway:
     locations: classpath:db/migration,classpath:db/seed
+
+app:
+  admin:
+    api-key: dev-admin-key
+  jwt:
+    secret: dev-only-jwt-signing-secret-not-for-production
+  otp:
+    fake-sms: true

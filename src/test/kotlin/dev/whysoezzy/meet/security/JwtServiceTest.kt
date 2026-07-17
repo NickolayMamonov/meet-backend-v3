@@ -71,11 +71,52 @@ class JwtServiceTest {
             .run { context -> assertThat(context.startupFailure).isNotNull }
 
         startupContextRunner
-            .withPropertyValues("app.jwt.secret=too-short")
+            .withPropertyValues(*validProductionProperties(), "app.jwt.secret=too-short")
             .run { context -> assertThat(context.startupFailure).isNotNull }
 
         startupContextRunner
-            .withPropertyValues("app.jwt.secret=${"a".repeat(JwtProperties.MINIMUM_SECRET_BYTES)}")
+            .withPropertyValues(*validProductionProperties())
+            .run { context -> assertThat(context.startupFailure).isNull() }
+    }
+
+    @Test
+    fun `fails startup initialization for missing or blank production secrets and database settings`() {
+        listOf(
+            "app.admin.api-key=",
+            "spring.datasource.url=",
+            "spring.datasource.username=",
+            "spring.datasource.password=",
+            "app.otp.provider=",
+        ).forEach { invalidProperty ->
+            val propertyName = invalidProperty.substringBefore("=")
+            startupContextRunner
+                .withPropertyValues(
+                    *validProductionProperties().filterNot { it.startsWith("$propertyName=") }.toTypedArray(),
+                    invalidProperty,
+                )
+                .run { context -> assertThat(context.startupFailure).isNotNull }
+        }
+
+        startupContextRunner
+            .withPropertyValues(
+                *validProductionProperties().filterNot { it.startsWith("app.otp.fake-sms=") }.toTypedArray(),
+                "app.otp.fake-sms=true",
+            )
+            .run { context -> assertThat(context.startupFailure).isNotNull }
+    }
+
+    @Test
+    fun `allows fake SMS only for the dev profile`() {
+        startupContextRunner
+            .withPropertyValues(
+                "spring.profiles.active=dev",
+                "app.jwt.secret=dev-only-jwt-signing-secret-not-for-production",
+                "app.admin.api-key=dev-admin-key",
+                "spring.datasource.url=jdbc:postgresql://localhost:5432/meet_db",
+                "spring.datasource.username=postgres",
+                "spring.datasource.password=postgres",
+                "app.otp.fake-sms=true",
+            )
             .run { context -> assertThat(context.startupFailure).isNull() }
     }
 
@@ -95,6 +136,16 @@ class JwtServiceTest {
 
         val startupContextRunner = ApplicationContextRunner()
             .withInitializer(JwtConfigurationInitializer())
+
+        fun validProductionProperties(): Array<String> = arrayOf(
+            "app.jwt.secret=${"a".repeat(JwtProperties.MINIMUM_SECRET_BYTES)}",
+            "app.admin.api-key=production-admin-key",
+            "spring.datasource.url=jdbc:postgresql://db.example:5432/meet",
+            "spring.datasource.username=meet",
+            "spring.datasource.password=production-db-password",
+            "app.otp.fake-sms=false",
+            "app.otp.provider=provider-configured-outside-this-service",
+        )
     }
 }
 

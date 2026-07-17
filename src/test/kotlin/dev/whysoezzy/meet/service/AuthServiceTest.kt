@@ -3,6 +3,8 @@ package dev.whysoezzy.meet.service
 import dev.whysoezzy.meet.api.dto.VerifyOtpRequest
 import dev.whysoezzy.meet.api.error.RateLimitException
 import dev.whysoezzy.meet.api.error.UnauthorizedException
+import dev.whysoezzy.meet.config.JwtProperties
+import dev.whysoezzy.meet.config.OtpProperties
 import dev.whysoezzy.meet.domain.entity.OtpCode
 import dev.whysoezzy.meet.domain.entity.RefreshToken
 import dev.whysoezzy.meet.domain.entity.User
@@ -35,10 +37,8 @@ class AuthServiceTest {
         otpRepository = otpRepository,
         refreshTokenRepository = refreshTokenRepository,
         jwtService = jwtService,
-        otpExpirationMinutes = 5,
-        maxAttemptsPerHour = 5,
-        refreshTokenExpirationDays = 30,
-        fakeSms = true,
+        jwtProperties = JwtProperties(secret = "test-jwt-signing-secret-that-is-at-least-32-bytes"),
+        otpProperties = OtpProperties(fakeSms = true),
     )
 
     @Test
