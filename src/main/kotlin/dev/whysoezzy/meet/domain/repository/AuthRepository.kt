@@ -40,7 +40,7 @@ interface OtpRepository : JpaRepository<OtpCode, Long> {
 @Repository
 interface RefreshTokenRepository : JpaRepository<RefreshToken, Long> {
 
-    fun findByToken(token: String): RefreshToken?
+    fun findByTokenHash(tokenHash: String): RefreshToken?
 
     @Modifying
     @Query("DELETE FROM RefreshToken r WHERE r.user.id = :userId")
