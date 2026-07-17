@@ -15,7 +15,9 @@ import org.junit.jupiter.api.assertThrows
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers.any
 import org.mockito.ArgumentMatchers.anyString
+import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.mock
+import org.mockito.Mockito.times
 import org.mockito.Mockito.verify
 import org.mockito.Mockito.`when`
 import java.security.MessageDigest
@@ -84,29 +86,54 @@ class AuthServiceTest {
     }
 
     @Test
-    fun `looks up refresh tokens by their hash`() {
+    fun `rotates refresh token, rejects old-token replay, and accepts replacement`() {
         val user = user()
-        val rawToken = "raw-refresh-token"
-        val token = RefreshToken(user, sha256(rawToken), LocalDateTime.now().plusDays(1))
-        `when`(refreshTokenRepository.findByTokenHash(sha256(rawToken))).thenReturn(token)
+        val oldRawToken = "raw-refresh-token"
+        val oldToken = RefreshToken(user, sha256(oldRawToken), LocalDateTime.now().plusDays(1))
+        val tokensByHash = mutableMapOf(oldToken.tokenHash to oldToken)
+        `when`(refreshTokenRepository.findWithLockByTokenHash(anyString())).thenAnswer {
+            tokensByHash[it.getArgument(0)]
+        }
+        doAnswer {
+            tokensByHash.remove((it.arguments[0] as RefreshToken).tokenHash)
+            null
+        }.`when`(refreshTokenRepository).delete(any(RefreshToken::class.java))
+        doAnswer {
+            val replacement = it.arguments[0] as RefreshToken
+            tokensByHash[replacement.tokenHash] = replacement
+            replacement
+        }.`when`(refreshTokenRepository).save(any(RefreshToken::class.java))
         `when`(jwtService.generateAccessToken(1L, "+79990000000")).thenReturn("new-access-token")
 
-        val response = authService.refreshToken(rawToken)
+        val firstResponse = authService.refreshToken(oldRawToken)
 
-        assertEquals("new-access-token", response.accessToken)
-        verify(refreshTokenRepository).findByTokenHash(sha256(rawToken))
+        assertEquals("new-access-token", firstResponse.accessToken)
+        assertNotEquals(oldRawToken, firstResponse.refreshToken)
+        verify(refreshTokenRepository).delete(oldToken)
+        assertEquals(sha256(firstResponse.refreshToken), tokensByHash.keys.single())
+
+        assertThrows<UnauthorizedException> {
+            authService.refreshToken(oldRawToken)
+        }
+
+        val replacementResponse = authService.refreshToken(firstResponse.refreshToken)
+
+        assertEquals("new-access-token", replacementResponse.accessToken)
+        assertNotEquals(firstResponse.refreshToken, replacementResponse.refreshToken)
+        verify(refreshTokenRepository, times(2)).findWithLockByTokenHash(sha256(oldRawToken))
+        verify(refreshTokenRepository).findWithLockByTokenHash(sha256(firstResponse.refreshToken))
     }
 
     @Test
     fun `rejects an unknown refresh token after hashed lookup`() {
         val rawToken = "unknown-refresh-token"
-        `when`(refreshTokenRepository.findByTokenHash(sha256(rawToken))).thenReturn(null)
+        `when`(refreshTokenRepository.findWithLockByTokenHash(sha256(rawToken))).thenReturn(null)
 
         assertThrows<UnauthorizedException> {
             authService.refreshToken(rawToken)
         }
 
-        verify(refreshTokenRepository).findByTokenHash(sha256(rawToken))
+        verify(refreshTokenRepository).findWithLockByTokenHash(sha256(rawToken))
     }
 
     @Test
@@ -114,7 +141,7 @@ class AuthServiceTest {
         val user = user()
         val rawToken = "expired-refresh-token"
         val token = RefreshToken(user, sha256(rawToken), LocalDateTime.now().minusSeconds(1))
-        `when`(refreshTokenRepository.findByTokenHash(sha256(rawToken))).thenReturn(token)
+        `when`(refreshTokenRepository.findWithLockByTokenHash(sha256(rawToken))).thenReturn(token)
 
         assertThrows<UnauthorizedException> {
             authService.refreshToken(rawToken)

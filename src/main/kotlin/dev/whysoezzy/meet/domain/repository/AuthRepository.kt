@@ -2,6 +2,8 @@ package dev.whysoezzy.meet.domain.repository
 
 import dev.whysoezzy.meet.domain.entity.OtpCode
 import dev.whysoezzy.meet.domain.entity.RefreshToken
+import jakarta.persistence.LockModeType
+import org.springframework.data.jpa.repository.Lock
 import org.springframework.data.jpa.repository.JpaRepository
 import org.springframework.data.jpa.repository.Modifying
 import org.springframework.data.jpa.repository.Query
@@ -41,6 +43,9 @@ interface OtpRepository : JpaRepository<OtpCode, Long> {
 interface RefreshTokenRepository : JpaRepository<RefreshToken, Long> {
 
     fun findByTokenHash(tokenHash: String): RefreshToken?
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    fun findWithLockByTokenHash(tokenHash: String): RefreshToken?
 
     @Modifying
     @Query("DELETE FROM RefreshToken r WHERE r.user.id = :userId")

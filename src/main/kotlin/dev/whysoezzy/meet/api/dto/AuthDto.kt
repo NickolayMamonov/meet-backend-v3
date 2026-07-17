@@ -48,7 +48,8 @@ data class RefreshTokenRequest(
 
 /** Ответ с новым access токеном */
 data class RefreshTokenResponse(
-    val accessToken: String
+    val accessToken: String,
+    val refreshToken: String
 ) : Serializable
 
 /** Запрос регистрации FCM токена */
