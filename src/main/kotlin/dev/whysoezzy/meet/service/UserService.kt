@@ -7,6 +7,7 @@ import dev.whysoezzy.meet.domain.entity.SocialMediaType
 import dev.whysoezzy.meet.domain.entity.UserSocialMedia
 import dev.whysoezzy.meet.domain.repository.CommunityRepository
 import dev.whysoezzy.meet.domain.repository.TagRepository
+import dev.whysoezzy.meet.domain.repository.RefreshTokenRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import mu.KotlinLogging
 import org.springframework.stereotype.Service
@@ -18,7 +19,8 @@ private val logger = KotlinLogging.logger {}
 @Service
 class UserService(
     private val userRepository: UserRepository,
-    private val tagRepository: TagRepository
+    private val tagRepository: TagRepository,
+    private val refreshTokenRepository: RefreshTokenRepository,
 ) {
 
     @Transactional(readOnly = true)
@@ -99,10 +101,12 @@ class UserService(
     @Transactional
     fun deleteAccount(userId: Long) {
         logger.info { "Soft deleting account: $userId" }
-        val user = userRepository.findById(userId)
-            .orElseThrow { NotFoundException("User not found") }
+        val user = userRepository.findWithLockById(userId)
+            ?: throw NotFoundException("User not found")
         user.deletedAt = LocalDateTime.now()
+        user.authVersion += 1
         userRepository.save(user)
+        refreshTokenRepository.deleteAllByUserId(userId)
     }
 
     @Transactional(readOnly = true)

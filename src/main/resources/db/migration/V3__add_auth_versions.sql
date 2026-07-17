@@ -1,0 +1,5 @@
+ALTER TABLE users
+    ADD COLUMN auth_version BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE refresh_tokens
+    ADD COLUMN auth_version BIGINT NOT NULL DEFAULT 0;

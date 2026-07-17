@@ -25,16 +25,17 @@ class JwtServiceTest {
     @Test
     fun `generates and validates access token`() {
         val service = JwtService(properties)
-        val token = service.generateAccessToken(userId = 42, phone = "+15551234567")
+        val token = service.generateAccessToken(userId = 42, phone = "+15551234567", authVersion = 3)
 
         assertTrue(service.validateToken(token))
         assertEquals(42, service.getUserIdFromToken(token))
+        assertEquals(3, service.getAuthVersionFromToken(token))
     }
 
     @Test
     fun `rejects tampered tokens`() {
         val service = JwtService(properties)
-        val token = service.generateAccessToken(userId = 42, phone = "+15551234567")
+        val token = service.generateAccessToken(userId = 42, phone = "+15551234567", authVersion = 0)
 
         assertFalse(service.validateToken("${token}tampered"))
     }

@@ -49,6 +49,9 @@ class User(
     @Column(name = "deleted_at")
     var deletedAt: LocalDateTime? = null,
 
+    @Column(name = "auth_version", nullable = false)
+    var authVersion: Long = 0,
+
     @ManyToMany
     @JoinTable(
         name = "user_interests",

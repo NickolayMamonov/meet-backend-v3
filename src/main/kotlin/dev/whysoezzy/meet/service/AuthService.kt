@@ -108,7 +108,12 @@ class AuthService(
      */
     @Transactional
     fun refreshToken(refreshToken: String): RefreshTokenResponse {
-        val tokenEntity = refreshTokenRepository.findWithLockByTokenHash(hashRefreshToken(refreshToken))
+        val tokenHash = hashRefreshToken(refreshToken)
+        val tokenCandidate = refreshTokenRepository.findByTokenHash(tokenHash)
+            ?: throw UnauthorizedException("Invalid refresh token")
+        val user = userRepository.findWithLockById(tokenCandidate.user.id!!)
+            ?: throw UnauthorizedException("Invalid refresh token")
+        val tokenEntity = refreshTokenRepository.findWithLockByTokenHash(tokenHash)
             ?: throw UnauthorizedException("Invalid refresh token")
 
         if (tokenEntity.isExpired) {
@@ -116,8 +121,11 @@ class AuthService(
             throw UnauthorizedException("Invalid refresh token")
         }
 
-        val user = tokenEntity.user
-        val newAccessToken = jwtService.generateAccessToken(user.id!!, user.phone)
+        if (user.isDeleted || tokenEntity.authVersion != user.authVersion) {
+            refreshTokenRepository.delete(tokenEntity)
+            throw UnauthorizedException("Invalid refresh token")
+        }
+        val newAccessToken = jwtService.generateAccessToken(user.id!!, user.phone, user.authVersion)
         refreshTokenRepository.delete(tokenEntity)
 
         val replacementToken = generateRefreshToken()
@@ -125,7 +133,8 @@ class AuthService(
             RefreshToken(
                 user = user,
                 tokenHash = hashRefreshToken(replacementToken),
-                expiresAt = LocalDateTime.now().plusDays(refreshTokenExpirationDays)
+                expiresAt = LocalDateTime.now().plusDays(refreshTokenExpirationDays),
+                authVersion = user.authVersion,
             )
         )
 
@@ -140,19 +149,24 @@ class AuthService(
      */
     @Transactional
     fun logout(userId: Long) {
+        val user = userRepository.findWithLockById(userId)
+            ?: throw UnauthorizedException("User not found")
+        user.authVersion += 1
+        userRepository.save(user)
         refreshTokenRepository.deleteAllByUserId(userId)
     }
 
     // ==================== Private ====================
 
     private fun issueTokens(user: User, isNewUser: Boolean): AuthResponse {
-        val accessToken = jwtService.generateAccessToken(user.id!!, user.phone)
+        val accessToken = jwtService.generateAccessToken(user.id!!, user.phone, user.authVersion)
 
         val refreshTokenValue = generateRefreshToken()
         val refreshTokenEntity = RefreshToken(
             user = user,
             tokenHash = hashRefreshToken(refreshTokenValue),
-            expiresAt = LocalDateTime.now().plusDays(refreshTokenExpirationDays)
+            expiresAt = LocalDateTime.now().plusDays(refreshTokenExpirationDays),
+            authVersion = user.authVersion,
         )
         refreshTokenRepository.save(refreshTokenEntity)
 
