@@ -45,7 +45,7 @@ interface RefreshTokenRepository : JpaRepository<RefreshToken, Long> {
     fun findByTokenHash(tokenHash: String): RefreshToken?
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    fun findWithLockByToken(token: String): RefreshToken?
+    fun findWithLockByTokenHash(tokenHash: String): RefreshToken?
 
     @Modifying
     @Query("DELETE FROM RefreshToken r WHERE r.user.id = :userId")

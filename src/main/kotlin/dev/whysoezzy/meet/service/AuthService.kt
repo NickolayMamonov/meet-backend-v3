@@ -108,7 +108,7 @@ class AuthService(
      */
     @Transactional
     fun refreshToken(refreshToken: String): RefreshTokenResponse {
-        val tokenEntity = refreshTokenRepository.findByTokenHash(hashRefreshToken(refreshToken))
+        val tokenEntity = refreshTokenRepository.findWithLockByTokenHash(hashRefreshToken(refreshToken))
             ?: throw UnauthorizedException("Invalid refresh token")
 
         if (tokenEntity.isExpired) {
@@ -120,11 +120,11 @@ class AuthService(
         val newAccessToken = jwtService.generateAccessToken(user.id!!, user.phone)
         refreshTokenRepository.delete(tokenEntity)
 
-        val replacementToken = UUID.randomUUID().toString()
+        val replacementToken = generateRefreshToken()
         refreshTokenRepository.save(
             RefreshToken(
                 user = user,
-                token = replacementToken,
+                tokenHash = hashRefreshToken(replacementToken),
                 expiresAt = LocalDateTime.now().plusDays(refreshTokenExpirationDays)
             )
         )
