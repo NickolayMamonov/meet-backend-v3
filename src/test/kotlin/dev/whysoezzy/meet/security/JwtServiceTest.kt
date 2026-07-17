@@ -94,8 +94,8 @@ class JwtServiceTest {
 
         startupContextRunner
             .withPropertyValues(
-                *validProductionProperties().filterNot { it.startsWith("app.otp.fake-sms=") }.toTypedArray(),
-                "app.otp.fake-sms=true",
+                *validProductionProperties().filterNot { it.startsWith("app.sms.provider=") }.toTypedArray(),
+                "app.sms.provider=fake",
             )
             .run { context -> assertThat(context.startupFailure).isNotNull }
     }
@@ -120,21 +120,19 @@ class JwtServiceTest {
                 "spring.datasource.url=jdbc:postgresql://localhost:5432/meet_db",
                 "spring.datasource.username=postgres",
                 "spring.datasource.password=postgres",
-                "app.otp.fake-sms=true",
+                "app.sms.provider=fake",
             )
             .run { context -> assertThat(context.startupFailure).isNull() }
     }
 
     @Test
-    fun `fails startup outside dev even when arbitrary SMS provider is configured`() {
+    fun `allows startup with the default disabled SMS provider outside dev`() {
         startupContextRunner
             .withPropertyValues(
                 *validProductionProperties(),
-                "app.otp.provider=fictional",
             )
             .run { context ->
-                assertThat(context.startupFailure)
-                    .hasMessageContaining("OTP delivery is not implemented outside the dev profile")
+                assertThat(context.startupFailure).isNull()
             }
     }
 
@@ -161,7 +159,7 @@ class JwtServiceTest {
             "spring.datasource.url=jdbc:postgresql://db.example:5432/meet",
             "spring.datasource.username=meet",
             "spring.datasource.password=production-db-password",
-            "app.otp.fake-sms=false",
+            "app.sms.provider=disabled",
         )
 
         fun validDevProperties(): Array<String> = arrayOf(
@@ -170,7 +168,7 @@ class JwtServiceTest {
             "spring.datasource.url=jdbc:postgresql://localhost:5432/meet_db",
             "spring.datasource.username=postgres",
             "spring.datasource.password=postgres",
-            "app.otp.fake-sms=true",
+            "app.sms.provider=fake",
         )
     }
 }

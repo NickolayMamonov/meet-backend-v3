@@ -15,7 +15,8 @@ class JwtConfigurationInitializer : ApplicationContextInitializer<ConfigurableAp
         val binder = Binder.get(environment)
 
         binder.bind("app.jwt", Bindable.of(JwtProperties::class.java)).orElseGet(::JwtProperties)
-        val otp = binder.bind("app.otp", Bindable.of(OtpProperties::class.java)).orElseGet(::OtpProperties)
+        binder.bind("app.otp", Bindable.of(OtpProperties::class.java)).orElseGet(::OtpProperties)
+        val sms = binder.bind("app.sms", Bindable.of(SmsProperties::class.java)).orElseGet(::SmsProperties)
 
         listOf(
             "spring.datasource.url",
@@ -28,11 +29,8 @@ class JwtConfigurationInitializer : ApplicationContextInitializer<ConfigurableAp
         }
 
         val isDev = environment.activeProfiles.contains("dev")
-        require(isDev || !otp.fakeSms) {
-            "app.otp.fake-sms may only be enabled with the dev profile"
-        }
-        require(isDev) {
-            "OTP delivery is not implemented outside the dev profile"
+        require(isDev || sms.provider != SmsProvider.FAKE) {
+            "app.sms.provider=fake may only be enabled with the dev profile"
         }
     }
 }

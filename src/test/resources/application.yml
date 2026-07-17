@@ -3,5 +3,5 @@ app:
     api-key: test-only-admin-key
   jwt:
     secret: test-only-jwt-signing-secret-not-for-production
-  otp:
-    fake-sms: true
+  sms:
+    provider: fake

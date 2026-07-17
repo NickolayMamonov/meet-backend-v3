@@ -26,3 +26,5 @@ class UnauthorizedException(message: String = "Authentication is required") :
 class ForbiddenException(message: String = "Access is denied") : ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message)
 class RateLimitException(message: String = "Too many requests. Please try again later.") :
     ApiException(HttpStatus.TOO_MANY_REQUESTS, "RATE_LIMITED", message)
+class ServiceUnavailableException(message: String) :
+    ApiException(HttpStatus.SERVICE_UNAVAILABLE, "SMS_UNAVAILABLE", message)

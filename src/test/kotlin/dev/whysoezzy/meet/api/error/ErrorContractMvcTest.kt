@@ -147,6 +147,7 @@ class ErrorContractMvcTest(
             "/contract/not-found" to ErrorExpectation(404, "Resource not found", "NOT_FOUND"),
             "/contract/conflict" to ErrorExpectation(409, "State conflict", "CONFLICT"),
             "/contract/rate-limited" to ErrorExpectation(429, "Too many OTP requests. Please try again later.", "RATE_LIMITED"),
+            "/contract/service-unavailable" to ErrorExpectation(503, "SMS delivery is not configured", "SMS_UNAVAILABLE"),
         ).forEach { (path, expected) ->
             mockMvc.perform(get(path))
                 .andExpectError(expected.status, expected.message, path, expected.code)
@@ -206,6 +207,19 @@ class ErrorContractMvcTest(
                 "RATE_LIMITED",
             )
             .andExpect(header().doesNotExist("Retry-After"))
+    }
+
+    @Test
+    fun `returns a structured service unavailable response when SMS delivery is disabled`() {
+        doThrow(ServiceUnavailableException("SMS delivery is not configured"))
+            .`when`(authService)
+            .sendOtp("+79990000000")
+
+        mockMvc.perform(
+            post("/auth/send-otp")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""{"phone":"+79990000000"}"""),
+        ).andExpectError(503, "SMS delivery is not configured", "/auth/send-otp", "SMS_UNAVAILABLE")
     }
 
     @Test
@@ -333,6 +347,9 @@ private class ErrorContractController {
     @GetMapping("/contract/rate-limited")
     fun rateLimited(): Nothing = throw RateLimitException("Too many OTP requests. Please try again later.")
 
+    @GetMapping("/contract/service-unavailable")
+    fun serviceUnavailable(): Nothing = throw ServiceUnavailableException("SMS delivery is not configured")
+
     @GetMapping("/contract/failure")
     fun failure(): Nothing = throw IllegalStateException("sensitive implementation detail")
 
@@ -366,6 +383,7 @@ private class ErrorContractSecurityConfig(
                         "/contract/not-found",
                         "/contract/conflict",
                         "/contract/rate-limited",
+                        "/contract/service-unavailable",
                         "/contract/failure",
                         "/auth/send-otp",
                     ).permitAll()
