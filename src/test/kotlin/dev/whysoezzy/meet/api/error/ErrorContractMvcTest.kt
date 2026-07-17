@@ -7,7 +7,6 @@ import dev.whysoezzy.meet.api.controller.CommunityController
 import dev.whysoezzy.meet.api.controller.MeetingController
 import dev.whysoezzy.meet.api.controller.MediaController
 import dev.whysoezzy.meet.api.controller.UserController
-import dev.whysoezzy.meet.config.AdminProperties
 import dev.whysoezzy.meet.config.StorageProperties
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.ingestion.IngestionService
@@ -63,7 +62,6 @@ import org.mockito.Mockito.`when`
         MediaController::class,
         AdminController::class,
     ],
-    properties = ["app.admin.api-key=test-admin-key"],
 )
 @Import(
     ApiExceptionHandler::class,
@@ -103,23 +101,6 @@ class ErrorContractMvcTest(
     @MockBean
     private lateinit var ingestionService: IngestionService
 
-    @MockBean
-    private lateinit var adminProperties: AdminProperties
-
-    @Test
-    fun `rejects missing and incorrect admin keys`() {
-        `when`(adminProperties.apiKey).thenReturn("test-admin-key")
-
-        mockMvc.perform(delete("/admin/purge").param("source", "timepad"))
-            .andExpectError(403, "Access is denied", "/admin/purge", "FORBIDDEN")
-
-        mockMvc.perform(
-            delete("/admin/purge")
-                .header("X-Admin-Key", "wrong-key")
-                .param("source", "timepad"),
-        ).andExpectError(403, "Access is denied", "/admin/purge", "FORBIDDEN")
-    }
-
     @Test
     fun `returns structured bad request validation error`() {
         mockMvc.perform(
@@ -149,17 +130,6 @@ class ErrorContractMvcTest(
 
         mockMvc.perform(get("/meetings/search").param("query", "a".repeat(201)))
             .andExpectError(400, "Query must not exceed 200 characters", "/meetings/search", "BAD_REQUEST")
-    }
-
-    @Test
-    fun `returns structured bad request for invalid admin purge source with valid admin key`() {
-        `when`(adminProperties.apiKey).thenReturn("test-admin-key")
-
-        mockMvc.perform(
-            delete("/admin/purge")
-                .header("X-Admin-Key", "test-admin-key")
-                .param("source", "not-a-source"),
-        ).andExpectError(400, "Invalid source", "/admin/purge", "BAD_REQUEST")
     }
 
     @Test

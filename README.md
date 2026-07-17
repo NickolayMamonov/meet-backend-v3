@@ -97,7 +97,7 @@ DB_NAME
 DB_USERNAME
 DB_PASSWORD
 APP_JWT_SECRET          # at least 32 UTF-8 bytes
-ADMIN_API_KEY
+ADMIN_API_KEY           # optional at startup; a nonblank value enables /admin/** endpoints
 ```
 
 `APP_FAKE_SMS=true` разрешён только при `SPRING_PROFILES_ACTIVE=dev`. Реальный
