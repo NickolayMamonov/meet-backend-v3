@@ -26,6 +26,7 @@ import java.security.MessageDigest
 import java.time.LocalDateTime
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
 
 class AuthServiceTest {
     private val userRepository = mock(UserRepository::class.java)
@@ -59,6 +60,18 @@ class AuthServiceTest {
             anyString(),
             any(LocalDateTime::class.java) ?: LocalDateTime.MIN,
         )
+    }
+
+    @Test
+    fun `persists a normalized phone with a six-digit numeric OTP`() {
+        authService.sendOtp("8 (999) 000-00-00")
+
+        val otpCaptor = ArgumentCaptor.forClass(OtpCode::class.java)
+        verify(otpRepository).save(otpCaptor.capture())
+        val savedOtp = otpCaptor.value
+
+        assertEquals("+79990000000", savedOtp.phone)
+        assertTrue(savedOtp.code.matches(Regex("^\\d{6}$")))
     }
 
     @Test

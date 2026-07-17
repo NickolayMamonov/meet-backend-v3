@@ -19,7 +19,6 @@ import java.security.SecureRandom
 import java.time.LocalDateTime
 import java.util.Base64
 import java.util.HexFormat
-import kotlin.random.Random
 
 @Service
 class AuthService(
@@ -190,7 +189,7 @@ class AuthService(
     }
 
     private fun generateOtpCode(): String {
-        return Random.nextInt(1000, 9999).toString()
+        return secureRandom.nextInt(100_000, 1_000_000).toString()
     }
 
     private fun generateRefreshToken(): String {
