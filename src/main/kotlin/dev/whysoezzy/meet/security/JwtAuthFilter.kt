@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.security
 
+import dev.whysoezzy.meet.domain.repository.UserRepository
 import jakarta.servlet.FilterChain
 import jakarta.servlet.http.HttpServletRequest
 import jakarta.servlet.http.HttpServletResponse
@@ -15,7 +16,8 @@ private val logger = KotlinLogging.logger {}
 
 @Component
 class JwtAuthFilter(
-    private val jwtService: JwtService
+    private val jwtService: JwtService,
+    private val userRepository: UserRepository,
 ) : OncePerRequestFilter() {
 
     override fun doFilterInternal(
@@ -35,6 +37,12 @@ class JwtAuthFilter(
         try {
             if (jwtService.validateToken(token)) {
                 val userId = jwtService.getUserIdFromToken(token)
+                val tokenAuthVersion = jwtService.getAuthVersionFromToken(token)
+                val user = userRepository.findById(userId).orElse(null)
+                if (tokenAuthVersion == null || user == null || user.isDeleted || user.authVersion != tokenAuthVersion) {
+                    filterChain.doFilter(request, response)
+                    return
+                }
 
                 val authentication = UsernamePasswordAuthenticationToken(
                     userId,

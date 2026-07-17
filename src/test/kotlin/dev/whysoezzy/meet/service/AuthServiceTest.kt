@@ -73,7 +73,7 @@ class AuthServiceTest {
             ),
         ).thenReturn(otp)
         `when`(userRepository.findByPhone("+79990000000")).thenReturn(user)
-        `when`(jwtService.generateAccessToken(1L, "+79990000000")).thenReturn("access-token")
+        `when`(jwtService.generateAccessToken(1L, "+79990000000", 0)).thenReturn("access-token")
 
         val response = authService.verifyOtp(VerifyOtpRequest("+79990000000", "123456"))
 
@@ -91,6 +91,9 @@ class AuthServiceTest {
         val oldRawToken = "raw-refresh-token"
         val oldToken = RefreshToken(user, sha256(oldRawToken), LocalDateTime.now().plusDays(1))
         val tokensByHash = mutableMapOf(oldToken.tokenHash to oldToken)
+        `when`(refreshTokenRepository.findByTokenHash(anyString())).thenAnswer {
+            tokensByHash[it.getArgument(0)]
+        }
         `when`(refreshTokenRepository.findWithLockByTokenHash(anyString())).thenAnswer {
             tokensByHash[it.getArgument(0)]
         }
@@ -103,7 +106,8 @@ class AuthServiceTest {
             tokensByHash[replacement.tokenHash] = replacement
             replacement
         }.`when`(refreshTokenRepository).save(any(RefreshToken::class.java))
-        `when`(jwtService.generateAccessToken(1L, "+79990000000")).thenReturn("new-access-token")
+        `when`(userRepository.findWithLockById(1L)).thenReturn(user)
+        `when`(jwtService.generateAccessToken(1L, "+79990000000", 0)).thenReturn("new-access-token")
 
         val firstResponse = authService.refreshToken(oldRawToken)
 
@@ -120,20 +124,21 @@ class AuthServiceTest {
 
         assertEquals("new-access-token", replacementResponse.accessToken)
         assertNotEquals(firstResponse.refreshToken, replacementResponse.refreshToken)
-        verify(refreshTokenRepository, times(2)).findWithLockByTokenHash(sha256(oldRawToken))
+        verify(refreshTokenRepository).findWithLockByTokenHash(sha256(oldRawToken))
         verify(refreshTokenRepository).findWithLockByTokenHash(sha256(firstResponse.refreshToken))
     }
 
     @Test
     fun `rejects an unknown refresh token after hashed lookup`() {
         val rawToken = "unknown-refresh-token"
+        `when`(refreshTokenRepository.findByTokenHash(sha256(rawToken))).thenReturn(null)
         `when`(refreshTokenRepository.findWithLockByTokenHash(sha256(rawToken))).thenReturn(null)
 
         assertThrows<UnauthorizedException> {
             authService.refreshToken(rawToken)
         }
 
-        verify(refreshTokenRepository).findWithLockByTokenHash(sha256(rawToken))
+        verify(refreshTokenRepository).findByTokenHash(sha256(rawToken))
     }
 
     @Test
@@ -141,11 +146,39 @@ class AuthServiceTest {
         val user = user()
         val rawToken = "expired-refresh-token"
         val token = RefreshToken(user, sha256(rawToken), LocalDateTime.now().minusSeconds(1))
+        `when`(refreshTokenRepository.findByTokenHash(sha256(rawToken))).thenReturn(token)
         `when`(refreshTokenRepository.findWithLockByTokenHash(sha256(rawToken))).thenReturn(token)
+        `when`(userRepository.findWithLockById(1L)).thenReturn(user)
 
         assertThrows<UnauthorizedException> {
             authService.refreshToken(rawToken)
         }
+
+        verify(refreshTokenRepository).delete(token)
+    }
+
+    @Test
+    fun `logout increments auth version and revokes every refresh token`() {
+        val user = user()
+        `when`(userRepository.findWithLockById(1L)).thenReturn(user)
+
+        authService.logout(1L)
+
+        assertEquals(1, user.authVersion)
+        verify(userRepository).save(user)
+        verify(refreshTokenRepository).deleteAllByUserId(1L)
+    }
+
+    @Test
+    fun `rejects refresh token from a prior authentication version`() {
+        val user = user().also { it.authVersion = 1 }
+        val rawToken = "old-version-token"
+        val token = RefreshToken(user, sha256(rawToken), LocalDateTime.now().plusDays(1), authVersion = 0)
+        `when`(refreshTokenRepository.findByTokenHash(sha256(rawToken))).thenReturn(token)
+        `when`(refreshTokenRepository.findWithLockByTokenHash(sha256(rawToken))).thenReturn(token)
+        `when`(userRepository.findWithLockById(1L)).thenReturn(user)
+
+        assertThrows<UnauthorizedException> { authService.refreshToken(rawToken) }
 
         verify(refreshTokenRepository).delete(token)
     }
