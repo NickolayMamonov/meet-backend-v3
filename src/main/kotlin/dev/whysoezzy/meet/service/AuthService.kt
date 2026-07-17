@@ -12,6 +12,7 @@ import dev.whysoezzy.meet.domain.repository.OtpRepository
 import dev.whysoezzy.meet.domain.repository.RefreshTokenRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.security.JwtService
+import dev.whysoezzy.meet.service.sms.SmsSender
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import java.security.MessageDigest
@@ -28,6 +29,7 @@ class AuthService(
     private val jwtService: JwtService,
     private val jwtProperties: JwtProperties,
     private val otpProperties: OtpProperties,
+    private val smsSender: SmsSender,
 ) {
 
     /**
@@ -50,18 +52,8 @@ class AuthService(
         val code = generateOtpCode()
         val expiresAt = LocalDateTime.now().plusMinutes(otpProperties.expirationMinutes)
 
-        val otp = OtpCode(
-            phone = normalizedPhone,
-            code = code,
-            expiresAt = expiresAt
-        )
-        otpRepository.save(otp)
-
-        // В реальном приложении здесь был бы вызов SMS-провайдера (Twilio, СМС.ру и т.д.)
-        if (otpProperties.fakeSms) {
-        } else {
-            sendSmsViProvider(normalizedPhone, code)
-        }
+        smsSender.sendOtp(normalizedPhone, code)
+        otpRepository.save(OtpCode(normalizedPhone, code, expiresAt))
     }
 
     /**
@@ -210,13 +202,6 @@ class AuthService(
             digits.length == 10 -> "+7$digits"
             else -> phone
         }
-    }
-
-    @Suppress("UNUSED_PARAMETER")
-    private fun sendSmsViProvider(phone: String, code: String): Nothing {
-        throw IllegalStateException(
-            "SMS delivery is not implemented. Use fake SMS only with the dev profile until a provider is integrated.",
-        )
     }
 
     private companion object {

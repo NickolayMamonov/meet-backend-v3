@@ -2,6 +2,7 @@ package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.api.dto.VerifyOtpRequest
 import dev.whysoezzy.meet.api.error.RateLimitException
+import dev.whysoezzy.meet.api.error.ServiceUnavailableException
 import dev.whysoezzy.meet.api.error.UnauthorizedException
 import dev.whysoezzy.meet.config.JwtProperties
 import dev.whysoezzy.meet.config.OtpProperties
@@ -12,6 +13,7 @@ import dev.whysoezzy.meet.domain.repository.OtpRepository
 import dev.whysoezzy.meet.domain.repository.RefreshTokenRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.security.JwtService
+import dev.whysoezzy.meet.service.sms.SmsSender
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.mockito.ArgumentCaptor
@@ -33,13 +35,15 @@ class AuthServiceTest {
     private val otpRepository = mock(OtpRepository::class.java)
     private val refreshTokenRepository = mock(RefreshTokenRepository::class.java)
     private val jwtService = mock(JwtService::class.java)
+    private val smsSender = TestSmsSender()
     private val authService = AuthService(
         userRepository = userRepository,
         otpRepository = otpRepository,
         refreshTokenRepository = refreshTokenRepository,
         jwtService = jwtService,
         jwtProperties = JwtProperties(secret = "test-jwt-signing-secret-that-is-at-least-32-bytes"),
-        otpProperties = OtpProperties(fakeSms = true),
+        otpProperties = OtpProperties(),
+        smsSender = smsSender,
     )
 
     @Test
@@ -71,7 +75,20 @@ class AuthServiceTest {
         val savedOtp = otpCaptor.value
 
         assertEquals("+79990000000", savedOtp.phone)
+        assertEquals(savedOtp.phone, smsSender.deliveries.single().phone)
         assertTrue(savedOtp.code.matches(Regex("^\\d{6}$")))
+        assertEquals(savedOtp.code, smsSender.deliveries.single().code)
+    }
+
+    @Test
+    fun `does not persist OTP when SMS delivery is unavailable`() {
+        smsSender.failure = ServiceUnavailableException("SMS delivery is not configured")
+
+        assertThrows<ServiceUnavailableException> {
+            authService.sendOtp("+79990000000")
+        }
+
+        verify(otpRepository, org.mockito.Mockito.never()).save(any(OtpCode::class.java))
     }
 
     @Test
@@ -200,4 +217,16 @@ class AuthServiceTest {
 
     private fun sha256(value: String): String =
         MessageDigest.getInstance("SHA-256").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
+
+    private class TestSmsSender : SmsSender {
+        val deliveries = mutableListOf<Delivery>()
+        var failure: RuntimeException? = null
+
+        override fun sendOtp(phone: String, code: String) {
+            failure?.let { throw it }
+            deliveries += Delivery(phone, code)
+        }
+    }
+
+    private data class Delivery(val phone: String, val code: String)
 }

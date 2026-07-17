@@ -100,10 +100,12 @@ APP_JWT_SECRET          # at least 32 UTF-8 bytes
 ADMIN_API_KEY           # optional at startup; a nonblank value enables /admin/** endpoints
 ```
 
-`APP_FAKE_SMS=true` разрешён только при `SPRING_PROFILES_ACTIVE=dev`. Реальный
-SMS-провайдер ещё не реализован, поэтому приложение намеренно не запускается
-вне профиля `dev` до его подключения. Не добавляйте значения этих переменных в
-`application.yml`, Compose или Git.
+`APP_SMS_PROVIDER=fake` разрешён только при `SPRING_PROFILES_ACTIVE=dev`.
+По умолчанию `APP_SMS_PROVIDER=disabled`: приложение запускается, но
+`POST /auth/send-otp` возвращает `503 SMS_UNAVAILABLE` и не сохраняет OTP.
+Реальный адаптер SMS ещё не реализован; при его добавлении передавайте
+учётные данные через environment/secret manager, не через `application.yml`,
+Compose или Git.
 
 ## 🧪 Тестовые данные
 
