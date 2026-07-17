@@ -28,12 +28,6 @@ interface OtpRepository : JpaRepository<OtpCode, Long> {
         @Param("now") now: LocalDateTime = LocalDateTime.now()
     ): OtpCode?
 
-    @Query("SELECT COUNT(o) FROM OtpCode o WHERE o.phone = :phone AND o.createdAt > :since")
-    fun countRecentAttempts(
-        @Param("phone") phone: String,
-        @Param("since") since: LocalDateTime
-    ): Long
-
     @Modifying
     @Query("DELETE FROM OtpCode o WHERE o.expiresAt < :now")
     fun deleteExpired(@Param("now") now: LocalDateTime)

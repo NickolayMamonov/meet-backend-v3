@@ -16,6 +16,7 @@ class JwtConfigurationInitializer : ApplicationContextInitializer<ConfigurableAp
 
         binder.bind("app.jwt", Bindable.of(JwtProperties::class.java)).orElseGet(::JwtProperties)
         binder.bind("app.otp", Bindable.of(OtpProperties::class.java)).orElseGet(::OtpProperties)
+        binder.bind("app.otp.rate-limit", Bindable.of(OtpRateLimitProperties::class.java)).orElseGet(::OtpRateLimitProperties)
         val sms = binder.bind("app.sms", Bindable.of(SmsProperties::class.java)).orElseGet(::SmsProperties)
 
         listOf(

@@ -67,6 +67,11 @@ app:
   otp:
     expiration-minutes: 5
     max-attempts-per-hour: 5
+    rate-limit:
+      window-minutes: 60
+      ip-max-attempts: ${APP_OTP_IP_MAX_ATTEMPTS:20}
+      device-enabled: ${APP_OTP_DEVICE_LIMIT_ENABLED:false}
+      device-max-attempts: ${APP_OTP_DEVICE_MAX_ATTEMPTS:10}
 
   sms:
     provider: ${APP_SMS_PROVIDER:disabled}
