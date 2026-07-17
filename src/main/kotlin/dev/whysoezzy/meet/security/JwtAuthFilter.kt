@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.security
 
+import dev.whysoezzy.meet.domain.repository.UserRepository
 import jakarta.servlet.FilterChain
 import jakarta.servlet.http.HttpServletRequest
 import jakarta.servlet.http.HttpServletResponse
@@ -15,7 +16,8 @@ private val logger = KotlinLogging.logger {}
 
 @Component
 class JwtAuthFilter(
-    private val jwtService: JwtService
+    private val jwtService: JwtService,
+    private val userRepository: UserRepository,
 ) : OncePerRequestFilter() {
 
     override fun doFilterInternal(
@@ -36,15 +38,19 @@ class JwtAuthFilter(
             if (jwtService.validateToken(token)) {
                 val userId = jwtService.getUserIdFromToken(token)
 
-                val authentication = UsernamePasswordAuthenticationToken(
-                    userId,
-                    null,
-                    listOf(SimpleGrantedAuthority("ROLE_USER"))
-                )
-                authentication.details = WebAuthenticationDetailsSource().buildDetails(request)
-                SecurityContextHolder.getContext().authentication = authentication
+                if (userRepository.existsByIdAndDeletedAtIsNull(userId)) {
+                    val authentication = UsernamePasswordAuthenticationToken(
+                        userId,
+                        null,
+                        listOf(SimpleGrantedAuthority("ROLE_USER"))
+                    )
+                    authentication.details = WebAuthenticationDetailsSource().buildDetails(request)
+                    SecurityContextHolder.getContext().authentication = authentication
 
-                logger.debug { "Authenticated user: $userId" }
+                    logger.debug { "Authenticated user: $userId" }
+                } else {
+                    logger.warn { "Rejected JWT for inactive user: $userId" }
+                }
             }
         } catch (e: Exception) {
             logger.warn { "Failed to authenticate JWT: ${e.message}" }

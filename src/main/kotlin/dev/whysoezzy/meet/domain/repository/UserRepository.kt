@@ -7,4 +7,5 @@ import org.springframework.stereotype.Repository
 @Repository
 interface UserRepository : JpaRepository<User, Long> {
     fun findByPhone(phone: String): User?
+    fun existsByIdAndDeletedAtIsNull(id: Long): Boolean
 }
