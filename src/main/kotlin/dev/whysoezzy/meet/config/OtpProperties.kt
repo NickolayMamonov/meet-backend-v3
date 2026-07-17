@@ -12,5 +12,4 @@ data class OtpProperties(
     @field:Min(value = 1, message = "app.otp.max-attempts-per-hour must be positive")
     val maxAttemptsPerHour: Long = 5,
     val fakeSms: Boolean = false,
-    val provider: String = "",
 )

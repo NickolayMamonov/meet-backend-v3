@@ -32,8 +32,8 @@ class JwtConfigurationInitializer : ApplicationContextInitializer<ConfigurableAp
         require(isDev || !otp.fakeSms) {
             "app.otp.fake-sms may only be enabled with the dev profile"
         }
-        require(isDev || otp.provider.isNotBlank()) {
-            "app.otp.provider must be provided outside the dev profile"
+        require(isDev) {
+            "OTP delivery is not implemented outside the dev profile"
         }
     }
 }

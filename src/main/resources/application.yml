@@ -68,7 +68,6 @@ app:
     expiration-minutes: 5
     max-attempts-per-hour: 5
     fake-sms: ${APP_FAKE_SMS:false}
-    provider: ${SMS_PROVIDER:}
 
   storage:
     upload-dir: ./uploads

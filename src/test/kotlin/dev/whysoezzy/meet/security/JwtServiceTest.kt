@@ -74,19 +74,15 @@ class JwtServiceTest {
             .withPropertyValues(*validProductionProperties(), "app.jwt.secret=too-short")
             .run { context -> assertThat(context.startupFailure).isNotNull }
 
-        startupContextRunner
-            .withPropertyValues(*validProductionProperties())
-            .run { context -> assertThat(context.startupFailure).isNull() }
     }
 
     @Test
-    fun `fails startup initialization for missing or blank production secrets and database settings`() {
+    fun `fails startup initialization for missing or blank secrets and database settings`() {
         listOf(
             "app.admin.api-key=",
             "spring.datasource.url=",
             "spring.datasource.username=",
             "spring.datasource.password=",
-            "app.otp.provider=",
         ).forEach { invalidProperty ->
             val propertyName = invalidProperty.substringBefore("=")
             startupContextRunner
@@ -121,6 +117,19 @@ class JwtServiceTest {
     }
 
     @Test
+    fun `fails startup outside dev even when arbitrary SMS provider is configured`() {
+        startupContextRunner
+            .withPropertyValues(
+                *validProductionProperties(),
+                "app.otp.provider=fictional",
+            )
+            .run { context ->
+                assertThat(context.startupFailure)
+                    .hasMessageContaining("OTP delivery is not implemented outside the dev profile")
+            }
+    }
+
+    @Test
     fun `fails startup binding for unsafe access token durations`() {
         contextRunner
             .withPropertyValues(
@@ -144,7 +153,6 @@ class JwtServiceTest {
             "spring.datasource.username=meet",
             "spring.datasource.password=production-db-password",
             "app.otp.fake-sms=false",
-            "app.otp.provider=provider-configured-outside-this-service",
         )
     }
 }

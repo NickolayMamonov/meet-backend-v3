@@ -98,13 +98,11 @@ DB_USERNAME
 DB_PASSWORD
 APP_JWT_SECRET          # at least 32 UTF-8 bytes
 ADMIN_API_KEY
-SMS_PROVIDER            # required while APP_FAKE_SMS=false
 ```
 
 `APP_FAKE_SMS=true` разрешён только при `SPRING_PROFILES_ACTIVE=dev`. Реальный
-SMS-провайдер ещё не реализован: production-конфигурация требует явный
-`SMS_PROVIDER`, а подключение самого провайдера должно быть выполнено до
-включения OTP в production. Не добавляйте значения этих переменных в
+SMS-провайдер ещё не реализован, поэтому приложение намеренно не запускается
+вне профиля `dev` до его подключения. Не добавляйте значения этих переменных в
 `application.yml`, Compose или Git.
 
 ## 🧪 Тестовые данные
