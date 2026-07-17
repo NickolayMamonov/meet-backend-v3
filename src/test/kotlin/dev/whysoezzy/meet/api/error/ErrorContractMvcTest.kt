@@ -7,6 +7,7 @@ import dev.whysoezzy.meet.api.controller.CommunityController
 import dev.whysoezzy.meet.api.controller.MeetingController
 import dev.whysoezzy.meet.api.controller.MediaController
 import dev.whysoezzy.meet.api.controller.UserController
+import dev.whysoezzy.meet.config.AdminProperties
 import dev.whysoezzy.meet.config.StorageProperties
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.ingestion.IngestionService
@@ -102,6 +103,23 @@ class ErrorContractMvcTest(
     @MockBean
     private lateinit var ingestionService: IngestionService
 
+    @MockBean
+    private lateinit var adminProperties: AdminProperties
+
+    @Test
+    fun `rejects missing and incorrect admin keys`() {
+        `when`(adminProperties.apiKey).thenReturn("test-admin-key")
+
+        mockMvc.perform(delete("/admin/purge").param("source", "timepad"))
+            .andExpectError(403, "Access is denied", "/admin/purge", "FORBIDDEN")
+
+        mockMvc.perform(
+            delete("/admin/purge")
+                .header("X-Admin-Key", "wrong-key")
+                .param("source", "timepad"),
+        ).andExpectError(403, "Access is denied", "/admin/purge", "FORBIDDEN")
+    }
+
     @Test
     fun `returns structured bad request validation error`() {
         mockMvc.perform(
@@ -135,6 +153,8 @@ class ErrorContractMvcTest(
 
     @Test
     fun `returns structured bad request for invalid admin purge source with valid admin key`() {
+        `when`(adminProperties.apiKey).thenReturn("test-admin-key")
+
         mockMvc.perform(
             delete("/admin/purge")
                 .header("X-Admin-Key", "test-admin-key")
