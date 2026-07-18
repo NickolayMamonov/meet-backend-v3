@@ -68,7 +68,7 @@ class CommunityController(
         query: String,
     ): List<CommunityDto> {
         val userId = authUtils.getCurrentUserIdOrNull()
-        logger.info { "GET /communities/search - query: $query" }
+        logger.info { "GET /communities/search" }
         return communityService.searchCommunities(query, userId)
     }
 

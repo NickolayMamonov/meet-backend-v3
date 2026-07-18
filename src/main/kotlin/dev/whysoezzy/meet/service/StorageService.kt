@@ -41,7 +41,7 @@ class StorageService(
         listOf("avatars", "meetings", "communities").forEach { sub ->
             Files.createDirectories(rootLocation.resolve(sub))
         }
-        logger.info { "Storage initialized at: $rootLocation" }
+        logger.info { "Storage initialized" }
     }
 
     /**
@@ -85,15 +85,15 @@ class StorageService(
 
         // Защита от path traversal
         if (!filePath.startsWith(rootLocation)) {
-            logger.warn { "Attempt to delete file outside storage: $filePath" }
+            logger.warn { "Storage delete rejected: invalid location" }
             return
         }
 
         try {
             Files.deleteIfExists(filePath)
-            logger.info { "Deleted file: $filePath" }
-        } catch (e: Exception) {
-            logger.warn { "Failed to delete file $filePath: ${e.message}" }
+            logger.info { "Storage file deleted" }
+        } catch (_: Exception) {
+            logger.warn { "Storage file deletion failed" }
         }
     }
 
@@ -145,7 +145,7 @@ class StorageService(
         val relativePath = "$subdir/$filename"
         val publicUrl = "${props.baseUrl.trimEnd('/')}/$relativePath"
 
-        logger.info { "Saved file: $targetPath → $publicUrl" }
+        logger.info { "Storage file saved: type=$subdir, size=${file.size}" }
         return UploadResult(publicUrl = publicUrl, relativePath = relativePath)
     }
 

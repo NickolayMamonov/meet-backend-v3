@@ -34,11 +34,11 @@ class JwtService(
         return try {
             getClaims(token)
             true
-        } catch (e: JwtException) {
-            logger.warn { "Invalid JWT token: ${e.message}" }
+        } catch (_: JwtException) {
+            logger.warn { "JWT validation failed" }
             false
-        } catch (e: IllegalArgumentException) {
-            logger.warn { "JWT claims empty: ${e.message}" }
+        } catch (_: IllegalArgumentException) {
+            logger.warn { "JWT validation failed: invalid claims" }
             false
         }
     }

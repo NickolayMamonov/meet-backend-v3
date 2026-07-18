@@ -59,7 +59,7 @@ class MeetingController(
     @Operation(summary = "Search meetings by title/description/address")
     fun searchMeetings(@RequestParam @NotBlank(message = "Query is required") @Size(max = 200, message = "Query must not exceed 200 characters") query: String): List<MeetingDto> {
         val userId = authUtils.getCurrentUserIdOrNull()
-        logger.info { "GET /meetings/search - query: $query" }
+        logger.info { "GET /meetings/search" }
         return meetingService.searchMeetings(query, userId)
     }
 

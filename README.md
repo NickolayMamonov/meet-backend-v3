@@ -107,6 +107,19 @@ ADMIN_API_KEY           # optional at startup; a nonblank value enables /admin/*
 учётные данные через environment/secret manager, не через `application.yml`,
 Compose или Git.
 
+### Логирование
+
+Без активного профиля `dev` приложение использует `INFO` для пакета
+`dev.whysoezzy` (и для root logger). Профиль `dev` явно повышает уровень
+`dev.whysoezzy` до `DEBUG` для локальной диагностики. Production-логи
+содержат только безопасные операционные категории и метаданные; не
+добавляйте в них значения запросов, адреса, URL/пути файлов, токены, OTP,
+секреты или тексты исключений/stack trace.
+
+В production-профиле `spring.mvc.log-resolved-exception=false`: Spring MVC не
+пишет в лог детали исключений, уже преобразованных в API-ответ. В `dev` это
+явно включено для локальной диагностики.
+
 ## 🧪 Тестовые данные
 
 После первого запуска БД будет содержать:
