@@ -12,6 +12,7 @@ import org.mockito.Mockito.doThrow
 import org.mockito.Mockito.doReturn
 import org.mockito.Mockito.mock
 import org.mockito.Mockito.never
+import org.mockito.Mockito.spy
 import org.mockito.Mockito.verify
 import org.mockito.Mockito.`when`
 import org.springframework.dao.DataIntegrityViolationException
@@ -109,6 +110,68 @@ class AvatarReplacementServiceTest {
     }
 
     @Test
+    fun `preserves the prior avatar URL and resource when an oversized upload is rejected`() {
+        val storage = storage()
+        val oldUpload = storage.uploadAvatar(imageFile(), 1)
+        val user = user(oldUpload.publicUrl)
+        val users = mock(UserRepository::class.java)
+        val service = AvatarReplacementService(storage, users)
+        val oversizedFile = MockMultipartFile(
+            "file",
+            "avatar.jpg",
+            "image/jpeg",
+            encodedImage().copyOf(5_242_881),
+        )
+
+        assertFailsWith<ValidationException> { service.replace(1, oversizedFile) }
+
+        assertEquals(oldUpload.publicUrl, user.avatarUrl)
+        assertImageRetrievable(oldUpload)
+        verify(users, never()).findWithLockById(1)
+    }
+
+    @Test
+    fun `preserves the prior avatar URL and resource when storage writing fails`() {
+        val realStorage = storage()
+        val oldUpload = realStorage.uploadAvatar(imageFile(), 1)
+        val storage = spy(realStorage)
+        val user = user(oldUpload.publicUrl)
+        val users = mock(UserRepository::class.java)
+        val service = AvatarReplacementService(storage, users)
+        val file = imageFile()
+        doThrow(IllegalStateException("storage write failure")).`when`(storage).uploadAvatar(file, 1)
+
+        assertFailsWith<IllegalStateException> { service.replace(1, file) }
+
+        assertEquals(oldUpload.publicUrl, user.avatarUrl)
+        assertImageRetrievable(oldUpload)
+        verify(users, never()).findWithLockById(1)
+    }
+
+    @Test
+    fun `deletes the physical old object after commit while the replacement remains retrievable`() {
+        TransactionSynchronizationManager.initSynchronization()
+        val storage = storage()
+        val oldUpload = storage.uploadAvatar(imageFile(), 1)
+        val user = user(oldUpload.publicUrl)
+        val users = mock(UserRepository::class.java)
+        val service = AvatarReplacementService(storage, users)
+        var persistedAvatarUrl: String? = null
+        `when`(users.findWithLockById(1)).thenReturn(user)
+        doAnswer { invocation ->
+            persistedAvatarUrl = invocation.getArgument<User>(0).avatarUrl
+            invocation.getArgument<User>(0)
+        }.`when`(users).saveAndFlush(user)
+
+        val replacement = service.replace(1, imageFile())
+        TransactionSynchronizationManager.getSynchronizations().single().afterCommit()
+
+        assertEquals(replacement.publicUrl, persistedAvatarUrl)
+        assertTrue(Files.notExists(storageDirectory.resolve(oldUpload.relativePath)))
+        assertImageRetrievable(replacement)
+    }
+
+    @Test
     fun `keeps the committed replacement when old object deletion fails after commit`() {
         TransactionSynchronizationManager.initSynchronization()
         val storage = storage()
@@ -153,6 +216,12 @@ class AvatarReplacementServiceTest {
     private fun imageFile() = MockMultipartFile("file", "avatar.jpg", "image/jpeg", encodedImage())
 
     private fun gifFile() = MockMultipartFile("file", "avatar.gif", "image/gif", encodedImage("gif"))
+
+    private fun assertImageRetrievable(upload: UploadResult) {
+        Files.newInputStream(storageDirectory.resolve(upload.relativePath)).use {
+            assertTrue(ImageIO.read(it) != null)
+        }
+    }
 
     private fun encodedImage(format: String = "jpg"): ByteArray {
         val image = BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB)
