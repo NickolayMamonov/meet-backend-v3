@@ -107,6 +107,15 @@ ADMIN_API_KEY           # optional at startup; a nonblank value enables /admin/*
 учётные данные через environment/secret manager, не через `application.yml`,
 Compose или Git.
 
+### Логирование
+
+Без активного профиля `dev` приложение использует `INFO` для пакета
+`dev.whysoezzy` (и для root logger). Профиль `dev` явно повышает уровень
+`dev.whysoezzy` до `DEBUG` для локальной диагностики. Production-логи
+содержат только безопасные операционные категории и метаданные; не
+добавляйте в них значения запросов, адреса, URL/пути файлов, токены, OTP,
+секреты или тексты исключений/stack trace.
+
 ## 🧪 Тестовые данные
 
 После первого запуска БД будет содержать:

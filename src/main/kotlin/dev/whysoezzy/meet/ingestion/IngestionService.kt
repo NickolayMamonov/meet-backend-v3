@@ -41,17 +41,17 @@ class IngestionService(
                         UpsertResult.UPDATED -> run.updatedCount++
                         UpsertResult.SKIPPED -> run.skippedCount++
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     hadEventError = true
                     run.skippedCount++
-                    logger.warn(e) { "Ingestion: пропущено событие ${raw.sourceExternalId} из ${provider.source()}" }
+                    logger.warn { "Ingestion event skipped: source=${provider.source()}" }
                 }
             }
             run.status = if (hadEventError) IngestionStatus.PARTIAL else IngestionStatus.SUCCESS
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             run.status = IngestionStatus.FAILED
-            run.errorMessage = e.message?.take(2000)
-            logger.error(e) { "Ingestion: источник ${provider.source()} упал" }
+            run.errorMessage = "Provider fetch failed"
+            logger.error { "Ingestion provider failed: source=${provider.source()}" }
         } finally {
             run.finishedAt = LocalDateTime.now()
             ingestionRunRepository.save(run)

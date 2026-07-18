@@ -12,3 +12,7 @@ app:
     secret: dev-only-jwt-signing-secret-not-for-production
   sms:
     provider: fake
+
+logging:
+  level:
+    dev.whysoezzy: DEBUG

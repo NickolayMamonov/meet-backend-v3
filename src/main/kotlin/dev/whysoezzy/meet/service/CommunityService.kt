@@ -68,7 +68,7 @@ class CommunityService(
 
     @Transactional(readOnly = true)
     fun searchCommunities(query: String, currentUserId: Long?): List<CommunityDto> {
-        logger.info { "Searching communities: $query" }
+        logger.info { "Searching communities" }
         return communityRepository.searchCommunities(query)
             .map { it.toDto(currentUserId) }
     }

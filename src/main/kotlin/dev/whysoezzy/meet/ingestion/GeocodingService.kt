@@ -32,12 +32,12 @@ class GeocodingService(
 
     fun geocode(address: String): Coordinates? {
         if (!props.enabled || props.apiKey.isBlank() || address.isBlank()) {
-            logger.warn { "Geocode skip: enabled=${props.enabled}, keyLen=${props.apiKey.length}" }
+            logger.warn { "Geocoding skipped: unavailable configuration or address" }
             return null
         }
         cache[address]?.let { return it }
         return request(address)?.also { cache[address] = it }
-            ?: run { logger.warn { "Geocode null for '$address'" }; null }
+            ?: run { logger.warn { "Geocoding returned no coordinates" }; null }
     }
 
     private fun request(address: String): Coordinates? = try {
@@ -61,8 +61,8 @@ class GeocodingService(
             val lon = node.path("lon").asText().toDoubleOrNull()
             if (lat != null && lon != null) Coordinates(lat, lon) else null
         }
-    } catch (e: Exception) {
-        logger.warn { "Геокодинг не удался для '$address': ${e.message}" }
+    } catch (_: Exception) {
+        logger.warn { "Geocoding request failed" }
         null
     }
 }

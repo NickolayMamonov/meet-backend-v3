@@ -73,7 +73,7 @@ class MediaController(
         user.avatarUrl = result.publicUrl
         userRepository.save(user)
 
-        logger.info { "Avatar uploaded for user $userId: ${result.publicUrl}" }
+        logger.info { "Avatar uploaded for user $userId" }
         return ResponseEntity.ok(UploadResponse(url = result.publicUrl))
     }
 

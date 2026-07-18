@@ -54,8 +54,8 @@ class JwtAuthFilter(
 
                 logger.debug { "Authenticated user: $userId" }
             }
-        } catch (e: Exception) {
-            logger.warn { "Failed to authenticate JWT: ${e.message}" }
+        } catch (_: Exception) {
+            logger.warn { "JWT authentication failed" }
         }
 
         filterChain.doFilter(request, response)

@@ -86,7 +86,7 @@ app:
 logging:
   level:
     root: INFO
-    dev.whysoezzy: DEBUG
+    dev.whysoezzy: INFO
     org.hibernate.SQL: WARN
 
 springdoc:

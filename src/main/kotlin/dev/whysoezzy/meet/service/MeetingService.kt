@@ -61,7 +61,7 @@ class MeetingService(
 
     @Transactional(readOnly = true)
     fun searchMeetings(query: String, currentUserId: Long?): List<MeetingDto> {
-        logger.info { "Searching meetings: $query" }
+        logger.info { "Searching meetings" }
         return meetingRepository.searchMeetings(query, MeetingStatus.ACTIVE)
             .map { it.toDto(currentUserId) }
     }

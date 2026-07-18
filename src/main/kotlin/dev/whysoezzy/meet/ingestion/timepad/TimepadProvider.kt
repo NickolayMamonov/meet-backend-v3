@@ -123,8 +123,8 @@ class TimepadProvider(
         return try {
             LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE)
                 .atStartOfDay(zone).toInstant().toEpochMilli()
-        } catch (e: DateTimeParseException) {
-            logger.warn { "Timepad: не распознал дату '$value'" }
+        } catch (_: DateTimeParseException) {
+            logger.warn { "Timepad: unrecognized event date format" }
             0L
         }
     }
