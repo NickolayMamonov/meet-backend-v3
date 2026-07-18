@@ -2,6 +2,7 @@ package dev.whysoezzy.meet.api.error
 
 import ch.qos.logback.classic.Logger
 import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.classic.spi.ThrowableProxyUtil
 import ch.qos.logback.core.read.ListAppender
 import dev.whysoezzy.meet.api.controller.AuthController
 import dev.whysoezzy.meet.api.controller.MeetingController
@@ -22,7 +23,6 @@ import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.context.annotation.Import
 import org.springframework.context.annotation.FilterType
-import org.springframework.core.env.Environment
 import org.springframework.http.HttpMethod
 import org.springframework.http.MediaType
 import org.springframework.security.config.annotation.web.builders.HttpSecurity
@@ -33,7 +33,6 @@ import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.status
-import org.springframework.test.context.TestPropertySource
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 
@@ -49,11 +48,9 @@ import kotlin.test.assertFalse
     MvcLoggingTestSecurityConfig::class,
     StorageProperties::class,
 )
-@TestPropertySource(properties = ["spring.mvc.log-resolved-exception=false"])
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class MvcResolvedExceptionLoggingTest(
     @Autowired private val mockMvc: MockMvc,
-    @Autowired private val environment: Environment,
 ) {
     @MockBean
     private lateinit var authService: AuthService
@@ -66,8 +63,6 @@ class MvcResolvedExceptionLoggingTest(
 
     @Test
     fun `default profile does not log rejected auth or MVC validation values`() {
-        assertEquals("false", environment.getProperty("spring.mvc.log-resolved-exception"))
-
         val invalidAuthMarker = "invalid-auth-marker-7f3b"
         val validationMarker = "mvc-validation-marker-5d1e"
         val events = captureRootLogs {
@@ -107,7 +102,7 @@ class MvcResolvedExceptionLoggingTest(
 
     private fun assertNoMarkerInRootLogs(events: List<ILoggingEvent>, vararg markers: String) {
         val output = events.joinToString("\n") {
-            "${it.formattedMessage}\n${it.throwableProxy}"
+            "${it.formattedMessage}\n${it.throwableProxy?.let(ThrowableProxyUtil::asString).orEmpty()}"
         }
         markers.forEach { marker ->
             assertFalse(output.contains(marker), "root log output leaked '$marker': $output")
