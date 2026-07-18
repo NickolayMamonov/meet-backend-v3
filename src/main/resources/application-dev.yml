@@ -1,5 +1,8 @@
 # Enable with SPRING_PROFILES_ACTIVE=dev.
 spring:
+  mvc:
+    log-resolved-exception: true
+
   datasource:
     url: jdbc:postgresql://localhost:5432/meet_db
     username: postgres
