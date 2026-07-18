@@ -7,6 +7,7 @@ import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.jdbc.core.PreparedStatementCallback
 import org.springframework.jdbc.core.PreparedStatementCreator
 import org.springframework.stereotype.Service
+import org.springframework.transaction.support.TransactionTemplate
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.LocalDateTime
@@ -16,8 +17,15 @@ class OtpRateLimiter(
     private val jdbcTemplate: JdbcTemplate,
     private val otpProperties: OtpProperties,
     private val rateLimitProperties: OtpRateLimitProperties,
+    private val transactionTemplate: TransactionTemplate,
 ) {
     fun claim(phone: String, context: OtpRequestContext) {
+        transactionTemplate.executeWithoutResult {
+            claimInTransaction(phone, context)
+        }
+    }
+
+    private fun claimInTransaction(phone: String, context: OtpRequestContext) {
         val limits = buildList {
             add(RateLimitScope("phone", hash(phone), otpProperties.maxAttemptsPerHour))
             context.clientIp?.takeIf { it.isNotBlank() }?.let {
@@ -47,6 +55,7 @@ class OtpRateLimiter(
         }
 
         val cutoff = LocalDateTime.now().minusMinutes(rateLimitProperties.windowMinutes)
+        cleanupExpiredAttempts(cutoff)
         limits.forEach { limit ->
             jdbcTemplate.update(
                 "DELETE FROM otp_rate_limit_attempts WHERE scope = ? AND subject_key = ? AND attempted_at <= ?",
@@ -78,6 +87,25 @@ class OtpRateLimiter(
                 attemptedAt,
             )
         }
+    }
+
+    private fun cleanupExpiredAttempts(cutoff: LocalDateTime) {
+        jdbcTemplate.update(
+            """
+            WITH expired AS (
+                SELECT id
+                FROM otp_rate_limit_attempts
+                WHERE attempted_at <= ?
+                ORDER BY attempted_at, id
+                LIMIT ?
+                FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM otp_rate_limit_attempts
+            WHERE id IN (SELECT id FROM expired)
+            """.trimIndent(),
+            cutoff,
+            rateLimitProperties.cleanupBatchSize,
+        )
     }
 
     private fun hash(value: String): String =

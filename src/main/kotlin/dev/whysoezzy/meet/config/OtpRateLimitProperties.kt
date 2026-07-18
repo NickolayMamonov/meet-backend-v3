@@ -14,4 +14,6 @@ data class OtpRateLimitProperties(
     val deviceEnabled: Boolean = false,
     @field:Min(value = 1, message = "app.otp.rate-limit.device-max-attempts must be positive")
     val deviceMaxAttempts: Long = 10,
+    @field:Min(value = 1, message = "app.otp.rate-limit.cleanup-batch-size must be positive")
+    val cleanupBatchSize: Int = 1_000,
 )

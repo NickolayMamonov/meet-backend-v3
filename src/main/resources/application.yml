@@ -72,6 +72,7 @@ app:
       ip-max-attempts: ${APP_OTP_IP_MAX_ATTEMPTS:20}
       device-enabled: ${APP_OTP_DEVICE_LIMIT_ENABLED:false}
       device-max-attempts: ${APP_OTP_DEVICE_MAX_ATTEMPTS:10}
+      cleanup-batch-size: ${APP_OTP_RATE_LIMIT_CLEANUP_BATCH_SIZE:1000}
 
   sms:
     provider: ${APP_SMS_PROVIDER:disabled}
