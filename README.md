@@ -136,3 +136,22 @@ Compose или Git.
 ## 📄 Лицензия
 
 MIT
+
+## Integration tests
+
+`ApiMvcIntegrationTest` runs the production Spring context, Flyway migrations, security filters, repositories,
+and MockMvc against PostgreSQL. By default it starts `postgres:16-alpine` through Testcontainers:
+
+```bash
+./gradlew test --tests dev.whysoezzy.meet.integration.ApiMvcIntegrationTest
+```
+
+For CI or a host where Docker is unavailable, point it at an existing disposable PostgreSQL database. The test
+creates a unique schema and applies Flyway migrations there:
+
+```bash
+TEST_POSTGRES_JDBC_URL=jdbc:postgresql://localhost:5432/postgres \
+TEST_POSTGRES_USERNAME=postgres \
+TEST_POSTGRES_PASSWORD=postgres \
+./gradlew test --tests dev.whysoezzy.meet.integration.ApiMvcIntegrationTest
+```

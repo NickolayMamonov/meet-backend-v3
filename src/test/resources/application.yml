@@ -4,4 +4,13 @@ app:
   jwt:
     secret: test-only-jwt-signing-secret-not-for-production
   sms:
-    provider: fake
+    provider: disabled
+  ingestion:
+    enabled: false
+  timepad:
+    enabled: false
+
+spring:
+  task:
+    scheduling:
+      enabled: false
