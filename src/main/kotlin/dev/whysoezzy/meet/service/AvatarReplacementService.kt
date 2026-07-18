@@ -16,12 +16,16 @@ class AvatarReplacementService(
     @Transactional
     fun replace(userId: Long, file: MultipartFile): UploadResult {
         var uploaded: UploadResult? = null
+        var updatedUser: dev.whysoezzy.meet.domain.entity.User? = null
+        var userAvatarUrlBeforeReplacement: String? = null
         try {
             val newUpload = storageService.uploadAvatar(file, userId)
             uploaded = newUpload
             val user = userRepository.findWithLockById(userId)
                 ?: throw NotFoundException("User not found")
             val oldUrl = user.avatarUrl
+            updatedUser = user
+            userAvatarUrlBeforeReplacement = oldUrl
             user.avatarUrl = newUpload.publicUrl
             userRepository.saveAndFlush(user)
 
@@ -40,6 +44,7 @@ class AvatarReplacementService(
             })
             return newUpload
         } catch (e: Exception) {
+            updatedUser?.avatarUrl = userAvatarUrlBeforeReplacement
             uploaded?.let { storageService.deleteByUrl(it.publicUrl) }
             throw e
         }

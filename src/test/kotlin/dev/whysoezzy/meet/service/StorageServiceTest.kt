@@ -11,6 +11,7 @@ import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import javax.imageio.ImageIO
+import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class StorageServiceTest {
@@ -58,6 +59,31 @@ class StorageServiceTest {
             storage.uploadAvatar(MockMultipartFile("file", "large.jpg", "image/jpeg", encodedImage("jpg")), 1)
         }
         assertTrue(Files.list(storageDirectory.resolve("avatars")).use { !it.findAny().isPresent })
+    }
+
+    @Test
+    fun `rejects decodable unsupported images before persisting an object`() {
+        val storage = storage()
+
+        assertThrows<ValidationException> {
+            storage.uploadAvatar(MockMultipartFile("file", "avatar.gif", "image/gif", encodedImage("gif")), 1)
+        }
+
+        assertTrue(Files.list(storageDirectory.resolve("avatars")).use { !it.findAny().isPresent })
+    }
+
+    @Test
+    fun `leaves the existing storage entry intact when writing a new avatar fails`() {
+        val storage = storage()
+        val avatars = storageDirectory.resolve("avatars")
+        Files.delete(avatars)
+        Files.writeString(avatars, "not a directory")
+
+        assertThrows<Exception> {
+            storage.uploadAvatar(MockMultipartFile("file", "avatar.jpg", "image/jpeg", encodedImage("jpg")), 1)
+        }
+
+        assertEquals("not a directory", Files.readString(avatars))
     }
 
     private fun storage(maxFileSize: Long = 5_242_880L): StorageService {
