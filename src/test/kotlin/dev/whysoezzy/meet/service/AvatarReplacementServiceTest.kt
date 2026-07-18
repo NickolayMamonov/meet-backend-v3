@@ -1,6 +1,7 @@
 package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.config.StorageProperties
+import dev.whysoezzy.meet.api.error.ValidationException
 import dev.whysoezzy.meet.domain.entity.User
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import org.junit.jupiter.api.AfterEach
@@ -93,6 +94,21 @@ class AvatarReplacementServiceTest {
     }
 
     @Test
+    fun `preserves the prior avatar URL and resource when a decodable unsupported upload is rejected`() {
+        val storage = storage()
+        val oldUpload = storage.uploadAvatar(imageFile(), 1)
+        val user = user(oldUpload.publicUrl)
+        val users = mock(UserRepository::class.java)
+        val service = AvatarReplacementService(storage, users)
+
+        assertFailsWith<ValidationException> { service.replace(1, gifFile()) }
+
+        assertEquals(oldUpload.publicUrl, user.avatarUrl)
+        assertTrue(Files.exists(storageDirectory.resolve(oldUpload.relativePath)))
+        verify(users, never()).findWithLockById(1)
+    }
+
+    @Test
     fun `keeps the committed replacement when old object deletion fails after commit`() {
         TransactionSynchronizationManager.initSynchronization()
         val storage = storage()
@@ -136,10 +152,12 @@ class AvatarReplacementServiceTest {
 
     private fun imageFile() = MockMultipartFile("file", "avatar.jpg", "image/jpeg", encodedImage())
 
-    private fun encodedImage(): ByteArray {
+    private fun gifFile() = MockMultipartFile("file", "avatar.gif", "image/gif", encodedImage("gif"))
+
+    private fun encodedImage(format: String = "jpg"): ByteArray {
         val image = BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB)
         return ByteArrayOutputStream().use { output ->
-            check(ImageIO.write(image, "jpg", output))
+            check(ImageIO.write(image, format, output))
             output.toByteArray()
         }
     }
