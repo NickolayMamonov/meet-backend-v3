@@ -17,6 +17,7 @@ import dev.whysoezzy.meet.security.JwtService
 import dev.whysoezzy.meet.service.MeetingService
 import dev.whysoezzy.meet.service.CommunityService
 import dev.whysoezzy.meet.service.AuthService
+import dev.whysoezzy.meet.service.OtpRequestContext
 import dev.whysoezzy.meet.service.StorageService
 import dev.whysoezzy.meet.service.UserService
 import jakarta.validation.Valid
@@ -193,7 +194,10 @@ class ErrorContractMvcTest(
     fun `returns OTP rate limit without inaccurate retry guidance`() {
         doThrow(RateLimitException("Too many OTP requests. Please try again later."))
             .`when`(authService)
-            .sendOtp("+79990000000")
+            .sendOtp(
+                org.mockito.ArgumentMatchers.eq("+79990000000") ?: "",
+                org.mockito.ArgumentMatchers.any(OtpRequestContext::class.java),
+            )
 
         mockMvc.perform(
             post("/auth/send-otp")
@@ -213,7 +217,10 @@ class ErrorContractMvcTest(
     fun `returns a structured service unavailable response when SMS delivery is disabled`() {
         doThrow(ServiceUnavailableException("SMS delivery is not configured"))
             .`when`(authService)
-            .sendOtp("+79990000000")
+            .sendOtp(
+                org.mockito.ArgumentMatchers.eq("+79990000000") ?: "",
+                org.mockito.ArgumentMatchers.any(OtpRequestContext::class.java),
+            )
 
         mockMvc.perform(
             post("/auth/send-otp")

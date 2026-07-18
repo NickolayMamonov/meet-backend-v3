@@ -36,6 +36,8 @@ class AuthServiceTest {
     private val refreshTokenRepository = mock(RefreshTokenRepository::class.java)
     private val jwtService = mock(JwtService::class.java)
     private val smsSender = TestSmsSender()
+    private val otpRateLimiter = mock(OtpRateLimiter::class.java)
+    private val requestContext = OtpRequestContext(clientIp = "127.0.0.1", userAgent = "test-agent")
     private val authService = AuthService(
         userRepository = userRepository,
         otpRepository = otpRepository,
@@ -44,31 +46,28 @@ class AuthServiceTest {
         jwtProperties = JwtProperties(secret = "test-jwt-signing-secret-that-is-at-least-32-bytes"),
         otpProperties = OtpProperties(),
         smsSender = smsSender,
+        otpRateLimiter = otpRateLimiter,
     )
 
     @Test
-    fun `rejects OTP requests over the rolling window limit with rate limit exception`() {
-        `when`(
-            otpRepository.countRecentAttempts(
-                anyString(),
-                any(LocalDateTime::class.java) ?: LocalDateTime.MIN,
-            ),
-        ).thenReturn(5)
+    fun `does not send or persist OTP when a rate limit scope rejects the request`() {
+        org.mockito.Mockito.doThrow(RateLimitException("Too many OTP requests. Please try again later."))
+            .`when`(otpRateLimiter)
+            .claim("+79990000000", requestContext)
 
         val exception = assertThrows<RateLimitException> {
-            authService.sendOtp("+79990000000")
+            authService.sendOtp("+79990000000", requestContext)
         }
 
         assertEquals("Too many OTP requests. Please try again later.", exception.message)
-        verify(otpRepository).countRecentAttempts(
-            anyString(),
-            any(LocalDateTime::class.java) ?: LocalDateTime.MIN,
-        )
+        verify(otpRateLimiter).claim("+79990000000", requestContext)
+        verify(otpRepository, org.mockito.Mockito.never()).save(any(OtpCode::class.java))
+        assertTrue(smsSender.deliveries.isEmpty())
     }
 
     @Test
     fun `persists a normalized phone with a six-digit numeric OTP`() {
-        authService.sendOtp("8 (999) 000-00-00")
+        authService.sendOtp("8 (999) 000-00-00", requestContext)
 
         val otpCaptor = ArgumentCaptor.forClass(OtpCode::class.java)
         verify(otpRepository).save(otpCaptor.capture())
@@ -85,7 +84,7 @@ class AuthServiceTest {
         smsSender.failure = ServiceUnavailableException("SMS delivery is not configured")
 
         assertThrows<ServiceUnavailableException> {
-            authService.sendOtp("+79990000000")
+            authService.sendOtp("+79990000000", requestContext)
         }
 
         verify(otpRepository, org.mockito.Mockito.never()).save(any(OtpCode::class.java))

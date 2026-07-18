@@ -1,7 +1,6 @@
 package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.api.dto.*
-import dev.whysoezzy.meet.api.error.RateLimitException
 import dev.whysoezzy.meet.api.error.UnauthorizedException
 import dev.whysoezzy.meet.config.JwtProperties
 import dev.whysoezzy.meet.config.OtpProperties
@@ -30,6 +29,7 @@ class AuthService(
     private val jwtProperties: JwtProperties,
     private val otpProperties: OtpProperties,
     private val smsSender: SmsSender,
+    private val otpRateLimiter: OtpRateLimiter,
 ) {
 
     /**
@@ -37,17 +37,9 @@ class AuthService(
      * Если пользователь не существует — создаём «заготовку» без имени.
      */
     @Transactional
-    fun sendOtp(phone: String) {
+    fun sendOtp(phone: String, context: OtpRequestContext?) {
         val normalizedPhone = normalizePhone(phone)
-
-        // Rate limiting
-        val recentAttempts = otpRepository.countRecentAttempts(
-            normalizedPhone,
-            LocalDateTime.now().minusHours(1)
-        )
-        if (recentAttempts >= otpProperties.maxAttemptsPerHour) {
-            throw RateLimitException("Too many OTP requests. Please try again later.")
-        }
+        otpRateLimiter.claim(normalizedPhone, context ?: OtpRequestContext(clientIp = null, userAgent = null))
 
         val code = generateOtpCode()
         val expiresAt = LocalDateTime.now().plusMinutes(otpProperties.expirationMinutes)

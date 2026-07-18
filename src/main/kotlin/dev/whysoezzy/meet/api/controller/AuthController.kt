@@ -3,6 +3,8 @@ package dev.whysoezzy.meet.api.controller
 import dev.whysoezzy.meet.api.dto.*
 import dev.whysoezzy.meet.security.AuthUtils
 import dev.whysoezzy.meet.service.AuthService
+import dev.whysoezzy.meet.service.OtpRequestContext
+import jakarta.servlet.http.HttpServletRequest
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.security.SecurityRequirement
 import io.swagger.v3.oas.annotations.tags.Tag
@@ -27,9 +29,18 @@ class AuthController(
      */
     @PostMapping("/send-otp")
     @Operation(summary = "Send OTP code to phone number")
-    fun sendOtp(@Valid @RequestBody request: SendOtpRequest): ResponseEntity<Map<String, String>> {
+    fun sendOtp(
+        @Valid @RequestBody request: SendOtpRequest,
+        httpRequest: HttpServletRequest,
+    ): ResponseEntity<Map<String, String>> {
         logger.info { "POST /auth/send-otp" }
-        authService.sendOtp(request.phone)
+        authService.sendOtp(
+            request.phone,
+            OtpRequestContext(
+                clientIp = httpRequest.remoteAddr,
+                userAgent = httpRequest.getHeader("User-Agent"),
+            ),
+        )
         return ResponseEntity.ok(mapOf("message" to "OTP sent successfully"))
     }
 
