@@ -7,6 +7,8 @@ import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.jdbc.core.PreparedStatementCallback
 import org.springframework.jdbc.core.PreparedStatementCreator
 import org.springframework.stereotype.Service
+import org.springframework.transaction.PlatformTransactionManager
+import org.springframework.transaction.TransactionDefinition
 import org.springframework.transaction.support.TransactionTemplate
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -17,10 +19,14 @@ class OtpRateLimiter(
     private val jdbcTemplate: JdbcTemplate,
     private val otpProperties: OtpProperties,
     private val rateLimitProperties: OtpRateLimitProperties,
-    private val transactionTemplate: TransactionTemplate,
+    transactionManager: PlatformTransactionManager,
 ) {
+    private val claimTransactionTemplate = TransactionTemplate(transactionManager).apply {
+        propagationBehavior = TransactionDefinition.PROPAGATION_REQUIRES_NEW
+    }
+
     fun claim(phone: String, context: OtpRequestContext) {
-        transactionTemplate.executeWithoutResult {
+        claimTransactionTemplate.executeWithoutResult {
             claimInTransaction(phone, context)
         }
     }

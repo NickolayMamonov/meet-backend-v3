@@ -151,7 +151,38 @@ class OtpRateLimiterPostgresIntegrationTest {
         assertEquals(0L, countExpired())
     }
 
+    @Test
+    fun `commits and releases a claim before an enclosing transaction rolls back`() {
+        val transactionManager = DataSourceTransactionManager(dataSource)
+        val limiter = limiter(
+            transactionManager = transactionManager,
+            phoneMaxAttempts = 2,
+            ipMaxAttempts = 100,
+            deviceMaxAttempts = 100,
+        )
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            assertThrows<IllegalStateException> {
+                TransactionTemplate(transactionManager).executeWithoutResult {
+                    limiter.claim("+79990000001", context("10.0.0.1", "device-a"))
+
+                    executor.submit(Callable {
+                        limiter.claim("+79990000001", context("10.0.0.2", "device-b"))
+                    }).get(5, TimeUnit.SECONDS)
+
+                    throw IllegalStateException("Simulated downstream failure")
+                }
+            }
+
+            assertEquals(2L, countAttempts("phone"))
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
     private fun limiter(
+        transactionManager: DataSourceTransactionManager = DataSourceTransactionManager(dataSource),
         phoneMaxAttempts: Long = 10,
         ipMaxAttempts: Long = 10,
         deviceMaxAttempts: Long = 10,
@@ -165,7 +196,7 @@ class OtpRateLimiterPostgresIntegrationTest {
             deviceMaxAttempts = deviceMaxAttempts,
             cleanupBatchSize = cleanupBatchSize,
         ),
-        transactionTemplate = TransactionTemplate(DataSourceTransactionManager(dataSource)),
+        transactionManager = transactionManager,
     )
 
     private fun context(ip: String, device: String) = OtpRequestContext(ip, device)
