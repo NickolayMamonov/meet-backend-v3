@@ -42,10 +42,18 @@ class StorageService(
     fun uploadCommunityImage(file: MultipartFile): UploadResult =
         saveFile(file, "communities", buildFilename(validateFile(file)))
 
-    fun isManagedUrl(publicUrl: String): Boolean = localRelativePath(publicUrl) != null
+    fun deleteUploaded(upload: UploadResult) {
+        deleteRelativePath(upload.relativePath)
+    }
 
-    fun deleteByUrl(publicUrl: String) {
+    fun deleteOwnedAvatarByUrl(publicUrl: String, userId: Long) {
         val relativePath = localRelativePath(publicUrl) ?: return
+        val filename = relativePath.removePrefix("avatars/")
+        if (!filename.startsWith("user_${userId}_") || '/' in filename) return
+        deleteRelativePath(relativePath)
+    }
+
+    private fun deleteRelativePath(relativePath: String) {
         val filePath = rootLocation.resolve(relativePath).normalize()
         if (!filePath.startsWith(rootLocation)) {
             logger.warn { "Storage delete rejected: invalid location" }
@@ -128,9 +136,7 @@ class StorageService(
         val baseUrl = props.baseUrl.trimEnd('/')
         if (!publicUrl.startsWith("$baseUrl/")) return null
         val relativePath = publicUrl.removePrefix(baseUrl).trimStart('/')
-        return relativePath.takeIf {
-            it.startsWith("avatars/") || it.startsWith("meetings/") || it.startsWith("communities/")
-        }
+        return relativePath.takeIf { it.startsWith("avatars/") }
     }
 
     private data class DetectedImage(val mimeType: String, val extension: String)

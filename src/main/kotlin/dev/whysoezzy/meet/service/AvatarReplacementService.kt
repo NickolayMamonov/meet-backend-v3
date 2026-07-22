@@ -31,21 +31,19 @@ class AvatarReplacementService(
 
             TransactionSynchronizationManager.registerSynchronization(object : TransactionSynchronization {
                 override fun afterCommit() {
-                    if (oldUrl != null && storageService.isManagedUrl(oldUrl)) {
-                        storageService.deleteByUrl(oldUrl)
-                    }
+                    oldUrl?.let { storageService.deleteOwnedAvatarByUrl(it, userId) }
                 }
 
                 override fun afterCompletion(status: Int) {
                     if (status != TransactionSynchronization.STATUS_COMMITTED) {
-                        storageService.deleteByUrl(newUpload.publicUrl)
+                        storageService.deleteUploaded(newUpload)
                     }
                 }
             })
             return newUpload
         } catch (e: Exception) {
             updatedUser?.avatarUrl = userAvatarUrlBeforeReplacement
-            uploaded?.let { storageService.deleteByUrl(it.publicUrl) }
+            uploaded?.let(storageService::deleteUploaded)
             throw e
         }
     }

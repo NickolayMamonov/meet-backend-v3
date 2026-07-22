@@ -12,6 +12,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import javax.imageio.ImageIO
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class StorageServiceTest {
@@ -86,6 +87,24 @@ class StorageServiceTest {
         assertEquals("not a directory", Files.readString(avatars))
     }
 
+    @Test
+    fun `deletes only an avatar owned by the requested user`() {
+        val storage = storage()
+        val ownerAvatar = storage.uploadAvatar(imageUpload("owner.jpg"), 1)
+        val otherAvatar = storage.uploadAvatar(imageUpload("other.jpg"), 2)
+        val meetingImage = storage.uploadMeetingImage(imageUpload("meeting.jpg"))
+
+        storage.deleteOwnedAvatarByUrl(otherAvatar.publicUrl, 1)
+        storage.deleteOwnedAvatarByUrl(meetingImage.publicUrl, 1)
+
+        assertTrue(Files.exists(storageDirectory.resolve(otherAvatar.relativePath)))
+        assertTrue(Files.exists(storageDirectory.resolve(meetingImage.relativePath)))
+
+        storage.deleteOwnedAvatarByUrl(ownerAvatar.publicUrl, 1)
+
+        assertFalse(Files.exists(storageDirectory.resolve(ownerAvatar.relativePath)))
+    }
+
     private fun storage(maxFileSize: Long = 5_242_880L): StorageService {
         val props = StorageProperties().apply {
             uploadDir = storageDirectory.toString()
@@ -94,6 +113,9 @@ class StorageServiceTest {
         }
         return StorageService(props).also { it.init() }
     }
+
+    private fun imageUpload(filename: String) =
+        MockMultipartFile("file", filename, "image/jpeg", encodedImage("jpg"))
 
     private fun encodedImage(format: String): ByteArray {
         val image = BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB)

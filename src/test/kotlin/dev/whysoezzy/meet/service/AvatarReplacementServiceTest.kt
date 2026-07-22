@@ -31,8 +31,11 @@ class AvatarReplacementServiceTest {
     private val storage = mock(StorageService::class.java)
     private val users = mock(UserRepository::class.java)
     private val service = AvatarReplacementService(storage, users)
-    private val upload = UploadResult("http://localhost:8080/media/avatars/new.jpg", "avatars/new.jpg")
-    private val oldUrl = "http://localhost:8080/media/avatars/old.jpg"
+    private val upload = UploadResult(
+        "http://localhost:8080/media/avatars/user_1_new.jpg",
+        "avatars/user_1_new.jpg",
+    )
+    private val oldUrl = "http://localhost:8080/media/avatars/user_1_old.jpg"
 
     @TempDir
     lateinit var storageDirectory: Path
@@ -55,8 +58,8 @@ class AvatarReplacementServiceTest {
         assertFailsWith<DataIntegrityViolationException> { service.replace(1, file) }
 
         assertEquals(oldUrl, user.avatarUrl)
-        verify(storage).deleteByUrl(upload.publicUrl)
-        verify(storage, never()).deleteByUrl(oldUrl)
+        verify(storage).deleteUploaded(upload)
+        verify(storage, never()).deleteOwnedAvatarByUrl(oldUrl, 1)
     }
 
     @Test
@@ -67,14 +70,12 @@ class AvatarReplacementServiceTest {
         `when`(storage.uploadAvatar(file, 1)).thenReturn(upload)
         `when`(users.findWithLockById(1)).thenReturn(user)
         doReturn(user).`when`(users).saveAndFlush(user)
-        `when`(storage.isManagedUrl(oldUrl)).thenReturn(true)
-
         service.replace(1, file)
 
         assertEquals(upload.publicUrl, user.avatarUrl)
-        verify(storage, never()).deleteByUrl(oldUrl)
+        verify(storage, never()).deleteOwnedAvatarByUrl(oldUrl, 1)
         TransactionSynchronizationManager.getSynchronizations().single().afterCommit()
-        verify(storage).deleteByUrl(oldUrl)
+        verify(storage).deleteOwnedAvatarByUrl(oldUrl, 1)
     }
 
     @Test
@@ -175,10 +176,10 @@ class AvatarReplacementServiceTest {
     fun `keeps the committed replacement when old object deletion fails after commit`() {
         TransactionSynchronizationManager.initSynchronization()
         val storage = storage()
-        val oldPath = storageDirectory.resolve("avatars/old.jpg")
+        val oldPath = storageDirectory.resolve("avatars/user_1_old.jpg")
         Files.createDirectories(oldPath)
         Files.writeString(oldPath.resolve("keep"), "old object cannot be deleted")
-        val user = user("http://localhost:8080/media/avatars/old.jpg")
+        val user = user("http://localhost:8080/media/avatars/user_1_old.jpg")
         val users = mock(UserRepository::class.java)
         val service = AvatarReplacementService(storage, users)
         var persistedAvatarUrl: String? = null
