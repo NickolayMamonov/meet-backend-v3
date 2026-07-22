@@ -15,17 +15,23 @@ RUN ./gradlew --no-daemon clean bootJar \
 
 FROM eclipse-temurin:21-jre-alpine@sha256:3f08b13888f595cc49edabea7250ba69499ba25602b267da591720769400e08c
 
-RUN apk add --no-cache curl \
-    && addgroup -S app \
-    && adduser -S -G app app \
+ARG BACKEND_REVISION
+LABEL org.opencontainers.image.source="https://github.com/NickolayMamonov/meet-backend-v3" \
+      org.opencontainers.image.revision="${BACKEND_REVISION}"
+
+RUN test "${#BACKEND_REVISION}" -eq 40 \
+    && case "${BACKEND_REVISION}" in *[!0-9a-f]*) exit 1;; esac \
+    && apk add --no-cache curl \
+    && addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app \
     && mkdir -p /app /data/uploads \
-    && chown -R app:app /data
+    && chown -R 10001:10001 /app /data
 
 WORKDIR /app
 
-COPY --from=builder /workspace/app.jar app.jar
+COPY --from=builder --chown=10001:10001 /workspace/app.jar app.jar
 
-USER app
+USER 10001:10001
 
 ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
 

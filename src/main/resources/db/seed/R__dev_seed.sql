@@ -1,12 +1,40 @@
--- V5_1__dev_seed.sql  (папка db/seed — подключается ТОЛЬКО в dev-профиле)
+-- R__dev_seed.sql  (папка db/seed — подключается ТОЛЬКО в dev-профиле)
 -- Тестовые данные для локальной разработки. В default/prod-профиле НЕ выполняется.
 -- Консолидировано из бывших V2/V4/V5/V6.
+--
+-- Repeatable migration runs after all versioned schema migrations. Existing
+-- local databases with core application data are left untouched.
+
+DO $dev_seed$
+BEGIN
+    IF EXISTS (SELECT 1 FROM tags)
+        OR EXISTS (SELECT 1 FROM users)
+        OR EXISTS (SELECT 1 FROM communities)
+        OR EXISTS (SELECT 1 FROM meetings)
+        OR EXISTS (SELECT 1 FROM ad_blocks)
+        OR EXISTS (SELECT 1 FROM user_interests)
+        OR EXISTS (SELECT 1 FROM user_social_media)
+        OR EXISTS (SELECT 1 FROM community_tags)
+        OR EXISTS (SELECT 1 FROM community_subscribers)
+        OR EXISTS (SELECT 1 FROM meeting_tags)
+        OR EXISTS (SELECT 1 FROM meeting_participants)
+        OR EXISTS (SELECT 1 FROM ad_block_communities)
+        OR EXISTS (SELECT 1 FROM ad_block_users)
+        OR EXISTS (SELECT 1 FROM auth_identities)
+        OR EXISTS (SELECT 1 FROM refresh_tokens)
+        OR EXISTS (SELECT 1 FROM otp_codes)
+        OR EXISTS (SELECT 1 FROM otp_rate_limit_attempts)
+        OR EXISTS (SELECT 1 FROM ingestion_runs)
+    THEN
+        RAISE NOTICE 'Skipping dev seed because application data already exists';
+        RETURN;
+    END IF;
 
 -- =========================== Tags ===========================
-INSERT INTO tags (text) VALUES
-('Android'), ('Kotlin'), ('Compose'), ('Backend'),
-('iOS'), ('UI/UX'), ('DevOps'), ('Data Science'),
-('Flutter'), ('React Native'), ('JavaScript'), ('Python');
+INSERT INTO tags (id, text) VALUES
+(1, 'Android'), (2, 'Kotlin'), (3, 'Compose'), (4, 'Backend'),
+(5, 'iOS'), (6, 'UI/UX'), (7, 'DevOps'), (8, 'Data Science'),
+(9, 'Flutter'), (10, 'React Native'), (11, 'JavaScript'), (12, 'Python');
 
 -- =========================== Users ==========================
 INSERT INTO users (id, name, surname, phone, email, city, bio, avatar_url) VALUES
@@ -122,8 +150,10 @@ INSERT INTO ad_blocks (id, type, title, description, is_active) VALUES
 INSERT INTO ad_block_users (ad_block_id, user_id) VALUES (3, 1), (3, 2), (3, 3), (3, 4);
 
 -- ============= Сброс sequences после явных id ===============
-SELECT setval('users_id_seq',        (SELECT MAX(id) FROM users));
-SELECT setval('communities_id_seq',  (SELECT MAX(id) FROM communities));
-SELECT setval('meetings_id_seq',      (SELECT MAX(id) FROM meetings));
-SELECT setval('tags_id_seq',          (SELECT MAX(id) FROM tags));
-SELECT setval('ad_blocks_id_seq',     (SELECT MAX(id) FROM ad_blocks));
+PERFORM setval('users_id_seq',        (SELECT MAX(id) FROM users));
+PERFORM setval('communities_id_seq',  (SELECT MAX(id) FROM communities));
+PERFORM setval('meetings_id_seq',     (SELECT MAX(id) FROM meetings));
+PERFORM setval('tags_id_seq',          (SELECT MAX(id) FROM tags));
+PERFORM setval('ad_blocks_id_seq',     (SELECT MAX(id) FROM ad_blocks));
+END;
+$dev_seed$;

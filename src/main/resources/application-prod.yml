@@ -1,6 +1,8 @@
 spring:
   lifecycle:
     timeout-per-shutdown-phase: 20s
+  jpa:
+    open-in-view: false
 
 server:
   forward-headers-strategy: framework

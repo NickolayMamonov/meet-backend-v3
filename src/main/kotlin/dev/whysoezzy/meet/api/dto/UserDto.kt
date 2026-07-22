@@ -42,12 +42,10 @@ data class UpdateUserDto(
     val avatarUrl: String? = null,
     // Интересы — список id тегов
     @field:Size(max = 50, message = "No more than 50 interests are allowed")
-    @field:Valid
     val interestIds: List<@Positive(message = "Interest IDs must be positive") Long>? = null,
     // Соцсети
     @field:Size(max = 20, message = "No more than 20 social media links are allowed")
-    @field:Valid
-    val socialMedias: List<SocialMediaDto>? = null,
+    val socialMedias: List<@Valid SocialMediaDto>? = null,
     // Настройки
     val showCommunities: Boolean? = null,
     val showMeetings: Boolean? = null,
