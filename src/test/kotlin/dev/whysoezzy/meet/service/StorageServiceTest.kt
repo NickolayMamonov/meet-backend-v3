@@ -96,6 +96,10 @@ class StorageServiceTest {
 
         storage.deleteOwnedAvatarByUrl(otherAvatar.publicUrl, 1)
         storage.deleteOwnedAvatarByUrl(meetingImage.publicUrl, 1)
+        storage.deleteOwnedAvatarByUrl(
+            "http://localhost:8080/media/avatars/user_1_\\..\\..\\${meetingImage.relativePath.replace('/', '\\')}",
+            1,
+        )
 
         assertTrue(Files.exists(storageDirectory.resolve(otherAvatar.relativePath)))
         assertTrue(Files.exists(storageDirectory.resolve(meetingImage.relativePath)))

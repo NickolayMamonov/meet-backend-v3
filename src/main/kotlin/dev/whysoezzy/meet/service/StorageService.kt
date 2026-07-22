@@ -48,8 +48,8 @@ class StorageService(
 
     fun deleteOwnedAvatarByUrl(publicUrl: String, userId: Long) {
         val relativePath = localRelativePath(publicUrl) ?: return
-        val filename = relativePath.removePrefix("avatars/")
-        if (!filename.startsWith("user_${userId}_") || '/' in filename) return
+        val ownedAvatarPattern = Regex("""avatars/user_${userId}_[0-9a-f]{32}\.(jpg|png|webp)""")
+        if (!ownedAvatarPattern.matches(relativePath)) return
         deleteRelativePath(relativePath)
     }
 
