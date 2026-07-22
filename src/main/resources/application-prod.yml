@@ -1,0 +1,38 @@
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  forward-headers-strategy: framework
+  shutdown: graceful
+
+app:
+  geocoder:
+    enabled: ${GEOCODER_ENABLED:false}
+  ingestion:
+    enabled: ${INGESTION_ENABLED:false}
+  timepad:
+    enabled: ${TIMEPAD_ENABLED:false}
+  storage:
+    upload-dir: ${APP_STORAGE_UPLOAD_DIR:/data/uploads}
+    base-url: ${APP_STORAGE_BASE_URL}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+      group:
+        readiness:
+          include: readinessState,db
+
+springdoc:
+  api-docs:
+    enabled: ${SPRINGDOC_API_DOCS_ENABLED:false}
+  swagger-ui:
+    enabled: ${SPRINGDOC_SWAGGER_UI_ENABLED:false}
