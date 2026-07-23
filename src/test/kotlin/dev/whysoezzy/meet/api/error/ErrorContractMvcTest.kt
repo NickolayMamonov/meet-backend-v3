@@ -19,6 +19,7 @@ import dev.whysoezzy.meet.service.CommunityService
 import dev.whysoezzy.meet.service.AuthService
 import dev.whysoezzy.meet.service.OtpRequestContext
 import dev.whysoezzy.meet.service.StorageService
+import dev.whysoezzy.meet.service.AvatarReplacementService
 import dev.whysoezzy.meet.service.UserService
 import jakarta.validation.Valid
 import jakarta.validation.constraints.NotBlank
@@ -95,6 +96,9 @@ class ErrorContractMvcTest(
 
     @MockBean
     private lateinit var storageService: StorageService
+
+    @MockBean
+    private lateinit var avatarReplacementService: AvatarReplacementService
 
     @MockBean
     private lateinit var userRepository: UserRepository

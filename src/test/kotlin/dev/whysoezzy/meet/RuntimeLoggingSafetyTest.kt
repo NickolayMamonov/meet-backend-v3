@@ -18,6 +18,7 @@ import dev.whysoezzy.meet.ingestion.IngestionService
 import dev.whysoezzy.meet.ingestion.MeetingUpsertService
 import dev.whysoezzy.meet.security.JwtService
 import dev.whysoezzy.meet.service.StorageService
+import dev.whysoezzy.meet.service.UploadResult
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import org.junit.jupiter.params.ParameterizedTest
@@ -128,7 +129,12 @@ class RuntimeLoggingSafetyTest {
         Files.writeString(nonEmptyDirectory.resolve(exceptionMarker), "non-empty directory must not be deleted")
 
         val events = captureApplicationLogs(profile) {
-            storage.deleteByUrl("${properties.baseUrl}/meetings/$pathMarker")
+            storage.deleteUploaded(
+                UploadResult(
+                    publicUrl = "${properties.baseUrl}/meetings/$pathMarker",
+                    relativePath = "meetings/$pathMarker",
+                ),
+            )
         }
 
         assertSafeEvent(events, "Storage file deletion failed", pathMarker, exceptionMarker)
