@@ -26,6 +26,7 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-data-jpa")
     implementation("org.springframework.boot:spring-boot-starter-validation")
     implementation("org.springframework.boot:spring-boot-starter-security")
+    implementation("org.springframework.boot:spring-boot-starter-mail")
 
     // JWT
     implementation("io.jsonwebtoken:jjwt-api:0.12.5")
@@ -79,4 +80,23 @@ tasks.withType<KotlinCompile> {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+}
+
+tasks.named<Test>("test") {
+    useJUnitPlatform {
+        if (project.hasProperty("skipPostgresTests")) {
+            excludeTags("postgres")
+        }
+    }
+}
+
+tasks.register<Test>("postgresTest") {
+    description = "Runs the mandatory PostgreSQL-backed test suite."
+    group = "verification"
+    testClassesDirs = sourceSets["test"].output.classesDirs
+    classpath = sourceSets["test"].runtimeClasspath
+    useJUnitPlatform {
+        includeTags("postgres")
+    }
+    shouldRunAfter(tasks.named("test"))
 }

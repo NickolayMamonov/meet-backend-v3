@@ -28,3 +28,27 @@ class RateLimitException(message: String = "Too many requests. Please try again 
     ApiException(HttpStatus.TOO_MANY_REQUESTS, "RATE_LIMITED", message)
 class ServiceUnavailableException(message: String) :
     ApiException(HttpStatus.SERVICE_UNAVAILABLE, "SMS_UNAVAILABLE", message)
+class EmailOtpRateLimitedException :
+    ApiException(
+        HttpStatus.TOO_MANY_REQUESTS,
+        "OTP_RATE_LIMITED",
+        "Too many OTP requests. Please try again later.",
+    )
+class EmailOtpDeliveryUnavailableException :
+    ApiException(
+        HttpStatus.SERVICE_UNAVAILABLE,
+        "OTP_DELIVERY_UNAVAILABLE",
+        "OTP delivery is temporarily unavailable.",
+    )
+class EmailOtpActivationUnavailableException :
+    ApiException(
+        HttpStatus.SERVICE_UNAVAILABLE,
+        "OTP_ACTIVATION_UNAVAILABLE",
+        "OTP is temporarily unavailable. Please request a new code.",
+    )
+class EmailOtpInvalidException :
+    ApiException(
+        HttpStatus.UNAUTHORIZED,
+        "OTP_INVALID_OR_EXPIRED",
+        "Invalid or expired OTP code.",
+    )

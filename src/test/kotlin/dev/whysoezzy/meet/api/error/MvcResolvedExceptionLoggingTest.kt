@@ -12,12 +12,16 @@ import dev.whysoezzy.meet.security.AuthUtils
 import dev.whysoezzy.meet.security.JwtAuthFilter
 import dev.whysoezzy.meet.service.AuthService
 import dev.whysoezzy.meet.service.MeetingService
+import dev.whysoezzy.meet.service.auth.identifier.ClientRequestContextResolver
+import dev.whysoezzy.meet.service.auth.identifier.DeviceIdParser
+import dev.whysoezzy.meet.service.auth.identifier.EmailOtpRequestValidator
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest
 import org.springframework.boot.test.mock.mockito.MockBean
+import org.springframework.boot.test.context.TestConfiguration
 import org.springframework.context.annotation.ComponentScan.Filter
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
@@ -47,6 +51,8 @@ import kotlin.test.assertFalse
     ApiErrorResponseWriter::class,
     MvcLoggingTestSecurityConfig::class,
     StorageProperties::class,
+    DeviceIdParser::class,
+    EmailOtpRequestValidator::class,
 )
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class MvcResolvedExceptionLoggingTest(
@@ -61,9 +67,15 @@ class MvcResolvedExceptionLoggingTest(
     @MockBean
     private lateinit var meetingService: MeetingService
 
+    @MockBean
+    private lateinit var clientRequestContextResolver: ClientRequestContextResolver
+
     @Test
     fun `default profile does not log rejected auth or MVC validation values`() {
         val invalidAuthMarker = "invalid-auth-marker-7f3b"
+        val emailMarker = "email-marker-8f4c"
+        val deviceMarker = "device-marker"
+        val codeMarker = "code-marker"
         val validationMarker = "mvc-validation-marker-5d1e"
         val events = captureRootLogs {
             mockMvc.perform(
@@ -73,11 +85,40 @@ class MvcResolvedExceptionLoggingTest(
             ).andExpectBadRequest("Phone must be in E.164 format", "/auth/send-otp")
 
             mockMvc.perform(
+                post("/auth/email/send-otp")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content("""{"email":"$emailMarker"}"""),
+            ).andExpectBadRequest("Email must be valid", "/auth/email/send-otp")
+
+            mockMvc.perform(
+                post("/auth/email/verify-otp")
+                    .header("X-Device-Id", deviceMarker)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content("""{"email":"person@example.com","code":"123456"}"""),
+            ).andExpectBadRequest(
+                "X-Device-Id must be 16 to 128 safe ASCII characters",
+                "/auth/email/verify-otp",
+            )
+
+            mockMvc.perform(
+                post("/auth/email/verify-otp")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content("""{"email":"person@example.com","code":"$codeMarker"}"""),
+            ).andExpectBadRequest("OTP code must be a six-digit number", "/auth/email/verify-otp")
+
+            mockMvc.perform(
                 get("/meetings/search").param("query", validationMarker.repeat(20)),
             ).andExpectBadRequest("Query must not exceed 200 characters", "/meetings/search")
         }
 
-        assertNoMarkerInRootLogs(events, invalidAuthMarker, validationMarker)
+        assertNoMarkerInRootLogs(
+            events,
+            invalidAuthMarker,
+            emailMarker,
+            deviceMarker,
+            codeMarker,
+            validationMarker,
+        )
     }
 
     private fun ResultActions.andExpectBadRequest(message: String, path: String): ResultActions =
@@ -110,7 +151,7 @@ class MvcResolvedExceptionLoggingTest(
     }
 }
 
-@Configuration
+@TestConfiguration
 private class MvcLoggingTestSecurityConfig {
     @Bean
     fun mvcLoggingTestSecurityFilterChain(http: HttpSecurity): SecurityFilterChain =
@@ -118,6 +159,7 @@ private class MvcLoggingTestSecurityConfig {
             .csrf { it.disable() }
             .authorizeHttpRequests {
                 it.requestMatchers(HttpMethod.POST, "/auth/send-otp").permitAll()
+                    .requestMatchers(HttpMethod.POST, "/auth/email/**").permitAll()
                     .requestMatchers(HttpMethod.GET, "/meetings/search").permitAll()
                     .anyRequest().denyAll()
             }

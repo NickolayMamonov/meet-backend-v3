@@ -26,6 +26,14 @@ spring:
     baseline-on-migrate: true
     locations: classpath:db/migration
 
+  mail:
+    host: ${SPRING_MAIL_HOST:}
+    port: ${SPRING_MAIL_PORT:587}
+    username: ${SPRING_MAIL_USERNAME:}
+    password: ${SPRING_MAIL_PASSWORD:}
+    protocol: smtp
+    test-connection: false
+
   servlet:
     multipart:
       max-file-size: 5MB
@@ -68,14 +76,41 @@ app:
     zone: Europe/Moscow
 
   otp:
-    expiration-minutes: 5
-    max-attempts-per-hour: 5
+    expiration-minutes: ${APP_OTP_EXPIRATION_MINUTES:5}
+    max-attempts-per-hour: ${APP_OTP_MAX_ATTEMPTS_PER_HOUR:5}
+    challenge-retention-hours: ${APP_OTP_CHALLENGE_RETENTION_HOURS:24}
+    challenge-cleanup-batch-size: ${APP_OTP_CHALLENGE_CLEANUP_BATCH_SIZE:1000}
+    challenge-cleanup-delay-ms: ${APP_OTP_CHALLENGE_CLEANUP_DELAY_MS:600000}
+    hash:
+      current-key-id: ${APP_OTP_HMAC_CURRENT_KEY_ID:}
+      current-key-base64: ${APP_OTP_HMAC_CURRENT_KEY_BASE64:}
+      previous-key-id: ${APP_OTP_HMAC_PREVIOUS_KEY_ID:}
+      previous-key-base64: ${APP_OTP_HMAC_PREVIOUS_KEY_BASE64:}
     rate-limit:
       window-minutes: 60
       ip-max-attempts: ${APP_OTP_IP_MAX_ATTEMPTS:20}
       device-enabled: ${APP_OTP_DEVICE_LIMIT_ENABLED:false}
       device-max-attempts: ${APP_OTP_DEVICE_MAX_ATTEMPTS:10}
       cleanup-batch-size: ${APP_OTP_RATE_LIMIT_CLEANUP_BATCH_SIZE:1000}
+      cleanup-delay-ms: ${APP_OTP_RATE_LIMIT_CLEANUP_DELAY_MS:600000}
+    verification:
+      window-minutes: ${APP_OTP_VERIFICATION_WINDOW_MINUTES:15}
+      identifier-max-attempts: ${APP_OTP_VERIFICATION_IDENTIFIER_MAX_ATTEMPTS:5}
+      ip-max-attempts: ${APP_OTP_VERIFICATION_IP_MAX_ATTEMPTS:50}
+      device-max-attempts: ${APP_OTP_VERIFICATION_DEVICE_MAX_ATTEMPTS:10}
+
+  email:
+    provider: ${APP_EMAIL_PROVIDER:disabled}
+    from-address: ${APP_EMAIL_FROM:}
+    from-name: ${APP_EMAIL_FROM_NAME:Meet}
+    connect-timeout-ms: ${APP_EMAIL_CONNECT_TIMEOUT_MS:5000}
+    read-timeout-ms: ${APP_EMAIL_READ_TIMEOUT_MS:5000}
+    write-timeout-ms: ${APP_EMAIL_WRITE_TIMEOUT_MS:5000}
+
+  http:
+    client-ip:
+      trusted-proxy-cidrs: ${APP_HTTP_CLIENT_IP_TRUSTED_PROXY_CIDRS:}
+      max-forwarded-hops: ${APP_HTTP_CLIENT_IP_MAX_FORWARDED_HOPS:10}
 
   sms:
     provider: ${APP_SMS_PROVIDER:disabled}
@@ -91,6 +126,10 @@ logging:
     root: INFO
     dev.whysoezzy: INFO
     org.hibernate.SQL: WARN
+    org.springframework.mail: INFO
+    jakarta.mail: INFO
+    org.eclipse.angus.mail: INFO
+    com.sun.mail: INFO
 
 springdoc:
   api-docs:

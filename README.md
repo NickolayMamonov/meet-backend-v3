@@ -98,6 +98,22 @@ DB_USERNAME
 DB_PASSWORD
 APP_JWT_SECRET          # at least 32 UTF-8 bytes
 ADMIN_API_KEY           # optional at startup; a nonblank value enables /admin/** endpoints
+APP_EMAIL_PROVIDER      # must be smtp outside exactly dev/test
+APP_EMAIL_FROM
+APP_EMAIL_FROM_NAME
+SPRING_MAIL_HOST
+SPRING_MAIL_PORT        # optional, defaults to 587
+SPRING_MAIL_USERNAME
+SPRING_MAIL_PASSWORD
+APP_EMAIL_CONNECT_TIMEOUT_MS
+APP_EMAIL_READ_TIMEOUT_MS
+APP_EMAIL_WRITE_TIMEOUT_MS
+APP_OTP_HMAC_CURRENT_KEY_ID
+APP_OTP_HMAC_CURRENT_KEY_BASE64
+APP_OTP_HMAC_PREVIOUS_KEY_ID       # optional; configure both previous values
+APP_OTP_HMAC_PREVIOUS_KEY_BASE64
+APP_HTTP_CLIENT_IP_TRUSTED_PROXY_CIDRS  # optional comma-separated controlled proxy CIDRs
+APP_HTTP_CLIENT_IP_MAX_FORWARDED_HOPS   # optional, defaults to 10
 ```
 
 `APP_SMS_PROVIDER=fake` разрешён только при `SPRING_PROFILES_ACTIVE=dev`.
@@ -107,6 +123,19 @@ ADMIN_API_KEY           # optional at startup; a nonblank value enables /admin/*
 учётные данные через environment/secret manager, не через `application.yml`,
 Compose или Git.
 
+Email OTP требует SMTP и отдельный HMAC key ring во всех режимах, кроме ровно
+`dev` или ровно `test`. Пустой набор профилей считается production. Смешанные
+профили (`prod,dev`, `dev,test`) отклоняются при старте. Production SMTP всегда
+использует authentication, обязательный STARTTLS, проверку имени сертификата и
+таймауты 1–30 секунд; JNDI, SMTPS, test-connection, mail debug/trace,
+trust-all/custom socket factories и ослабляющие overrides запрещены.
+
+Для локального запуска профиль `dev` использует fake email sender, который
+ничего не логирует. Для ручной проверки письма переключите dev на SMTP и
+используйте локальный inbox (например, Mailpit), не добавляя OTP или адреса в
+логи. Production checklist, rotation и rollback описаны в
+`docs/operations/email-otp.md`.
+
 ### Логирование
 
 Без активного профиля `dev` приложение использует `INFO` для пакета
@@ -114,7 +143,8 @@ Compose или Git.
 `dev.whysoezzy` до `DEBUG` для локальной диагностики. Production-логи
 содержат только безопасные операционные категории и метаданные; не
 добавляйте в них значения запросов, адреса, URL/пути файлов, токены, OTP,
-секреты или тексты исключений/stack trace.
+секреты, HMAC key IDs/material, SMTP credentials, provider payload/message ID
+или тексты provider-исключений/stack trace.
 
 В production-профиле `spring.mvc.log-resolved-exception=false`: Spring MVC не
 пишет в лог детали исключений, уже преобразованных в API-ответ. В `dev` это

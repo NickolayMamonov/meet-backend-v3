@@ -1,6 +1,7 @@
 package dev.whysoezzy.meet.domain.repository
 
-import dev.whysoezzy.meet.domain.entity.OtpCode
+import dev.whysoezzy.meet.domain.entity.AuthIdentity
+import dev.whysoezzy.meet.domain.entity.AuthIdentityType
 import dev.whysoezzy.meet.domain.entity.RefreshToken
 import jakarta.persistence.LockModeType
 import org.springframework.data.jpa.repository.Lock
@@ -12,25 +13,17 @@ import org.springframework.stereotype.Repository
 import java.time.LocalDateTime
 
 @Repository
-interface OtpRepository : JpaRepository<OtpCode, Long> {
+interface AuthIdentityRepository : JpaRepository<AuthIdentity, Long> {
+    fun findByTypeAndNormalizedIdentifier(
+        type: AuthIdentityType,
+        normalizedIdentifier: String,
+    ): AuthIdentity?
 
-    @Query("""
-        SELECT o FROM OtpCode o
-        WHERE o.phone = :phone
-          AND o.code = :code
-          AND o.isUsed = false
-          AND o.expiresAt > :now
-        ORDER BY o.createdAt DESC
-    """)
-    fun findValidCode(
-        @Param("phone") phone: String,
-        @Param("code") code: String,
-        @Param("now") now: LocalDateTime = LocalDateTime.now()
-    ): OtpCode?
-
-    @Modifying
-    @Query("DELETE FROM OtpCode o WHERE o.expiresAt < :now")
-    fun deleteExpired(@Param("now") now: LocalDateTime)
+    @Query("SELECT identity FROM AuthIdentity identity WHERE identity.user.id = :userId AND identity.type = :type")
+    fun findByUserIdAndType(
+        @Param("userId") userId: Long,
+        @Param("type") type: AuthIdentityType,
+    ): AuthIdentity?
 }
 
 @Repository
