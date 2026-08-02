@@ -2,6 +2,8 @@
 
 Date: August 2, 2026
 
+Verified implementation commit: `70c2adb771cd2058e84ecce9eff55c7528d64c6b`.
+
 ## Source composition
 
 - Started from the task worktree at `d3b34d7`.
