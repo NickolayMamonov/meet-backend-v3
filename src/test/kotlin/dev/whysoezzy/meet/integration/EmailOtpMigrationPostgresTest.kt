@@ -49,7 +49,7 @@ class EmailOtpMigrationPostgresTest {
             """.trimIndent(),
         )
 
-        flyway().migrate()
+        flyway(MigrationVersion.fromVersion("6")).migrate()
 
         assertEquals(0L, jdbc.count("otp_codes"))
         assertEquals(
@@ -223,6 +223,22 @@ class EmailOtpMigrationPostgresTest {
         listOf("otp_rate_limit_attempts", "auth_identities").forEach { table ->
             assertTrue(jdbc.tableExists(table), "$table must exist")
         }
+
+        assertFalse(jdbc.indexExists("idx_otp_codes_expires_id"))
+        flyway(MigrationVersion.fromVersion("6")).validate()
+        flyway().migrate()
+        assertEquals(
+            IndexSpec(
+                unique = false,
+                columns = listOf("expires_at", "id"),
+                descending = listOf(false, false),
+                predicate = null,
+            ),
+            index("idx_otp_codes_expires_id"),
+        )
+        assertTrue(jdbc.indexIsReady("idx_otp_codes_expires_id"))
+        assertTrue(jdbc.indexIsValid("idx_otp_codes_expires_id"))
+        flyway().validate()
     }
 
     private fun flyway(target: MigrationVersion? = null): Flyway {
@@ -246,6 +262,46 @@ class EmailOtpMigrationPostgresTest {
             """.trimIndent(),
             Boolean::class.java,
             table,
+        )
+
+    private fun JdbcTemplate.indexExists(name: String): Boolean =
+        queryForObject(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_class index_class
+                JOIN pg_namespace namespace ON namespace.oid = index_class.relnamespace
+                WHERE namespace.nspname = current_schema() AND index_class.relname = ?
+            )
+            """.trimIndent(),
+            Boolean::class.java,
+            name,
+        )
+
+    private fun JdbcTemplate.indexIsReady(name: String): Boolean =
+        queryForObject(
+            """
+            SELECT i.indisready
+            FROM pg_index i
+            JOIN pg_class index_class ON index_class.oid = i.indexrelid
+            JOIN pg_namespace namespace ON namespace.oid = index_class.relnamespace
+            WHERE namespace.nspname = current_schema() AND index_class.relname = ?
+            """.trimIndent(),
+            Boolean::class.java,
+            name,
+        )
+
+    private fun JdbcTemplate.indexIsValid(name: String): Boolean =
+        queryForObject(
+            """
+            SELECT i.indisvalid
+            FROM pg_index i
+            JOIN pg_class index_class ON index_class.oid = i.indexrelid
+            JOIN pg_namespace namespace ON namespace.oid = index_class.relnamespace
+            WHERE namespace.nspname = current_schema() AND index_class.relname = ?
+            """.trimIndent(),
+            Boolean::class.java,
+            name,
         )
 
     private fun columns(table: String): List<ColumnSpec> =

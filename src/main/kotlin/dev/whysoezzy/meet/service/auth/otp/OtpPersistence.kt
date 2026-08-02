@@ -237,18 +237,7 @@ class OtpChallengeStore(
 
     fun cleanup(retentionHours: Long, batchSize: Int): Int =
         jdbcTemplate.update(
-            """
-            WITH eligible AS (
-                SELECT id
-                FROM otp_codes
-                WHERE expires_at <= clock_timestamp() - (? * INTERVAL '1 hour')
-                ORDER BY expires_at, id
-                LIMIT ?
-                FOR UPDATE SKIP LOCKED
-            )
-            DELETE FROM otp_codes
-            WHERE id IN (SELECT id FROM eligible)
-            """.trimIndent(),
+            CLEANUP_SQL,
             retentionHours,
             batchSize,
         )
@@ -267,10 +256,26 @@ class OtpChallengeStore(
             expiresAt = resultSet.getObject("expires_at", LocalDateTime::class.java),
         )
 
-    private companion object {
-        const val SELECT_COLUMNS =
+    companion object {
+        private const val SELECT_COLUMNS =
             "SELECT id, channel, identifier, code_hash, hash_salt, hash_key_id, status, " +
                 "failed_attempts, max_attempts, expires_at"
+
+        internal val CLEANUP_SQL: String =
+            """
+            WITH eligible AS (
+                SELECT id
+                FROM otp_codes
+                WHERE expires_at <= (
+                    SELECT clock_timestamp() - (? * INTERVAL '1 hour')
+                )
+                ORDER BY expires_at, id
+                LIMIT ?
+                FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM otp_codes
+            WHERE id IN (SELECT id FROM eligible)
+            """.trimIndent()
     }
 }
 

@@ -146,9 +146,8 @@ trust-all/custom socket factories и ослабляющие overrides запре
 секреты, HMAC key IDs/material, SMTP credentials, provider payload/message ID
 или тексты provider-исключений/stack trace.
 
-В production-профиле `spring.mvc.log-resolved-exception=false`: Spring MVC не
-пишет в лог детали исключений, уже преобразованных в API-ответ. В `dev` это
-явно включено для локальной диагностики.
+В production- и `dev`-профилях `spring.mvc.log-resolved-exception=false`:
+Spring MVC не пишет в лог детали исключений, уже преобразованных в API-ответ.
 
 ## 🧪 Тестовые данные
 
