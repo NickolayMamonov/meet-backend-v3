@@ -55,9 +55,38 @@ The packaged runtime matrix passed with generated non-production markers and log
   overrides failed with bounded nonzero exits; timeout was never accepted;
 - generated database/JWT/SMTP/from/HMAC markers were absent from captured logs.
 
+## Reverification after the V7 delivery-gate re-scope
+
+The authoritative re-scope is task comment
+`comment-84e5d3b5-4939-4543-8d2c-89d3ff67eff6`. It permits PR #19 merge and workflow completion because no
+persistent production email-OTP dataset or live OTP write workload exists yet; production measurements were not
+invented.
+
+After recording that re-scope, the required checks were rerun:
+
+| Command or check | Result |
+| --- | --- |
+| `./gradlew compileTestKotlin -PskipPostgresTests=true` | Passed |
+| Focused non-PostgreSQL auth/config/logging/avatar/storage/TIMEPAD tests | Passed |
+| `./gradlew --rerun-tasks postgresTest` | 36 passed, 0 failed, 0 skipped |
+| `./gradlew --rerun-tasks test` | Passed; 116 tests, 0 failed, 0 skipped |
+| `./gradlew --no-daemon --rerun-tasks clean build` | Passed; 10 actionable tasks |
+| Packaged startup/fail-fast matrix | Repassed against fresh PostgreSQL 16 databases; all success, missing, and unsafe cases bounded as required |
+| Migration blobs, ancestry, `git diff --check`, and clean-worktree checks | Passed |
+
+The packaged re-run again proved exact per-case `current_database()` isolation and exact-dev-only Flyway 5.1.
+Logs remained outside the worktree and generated markers remained absent. The controlled-inbox SMTP canary and
+A-048 remain separate external release gates.
+
 ## Operational and external gates
 
-V7 was applied only in disposable test databases. Production row/size/write-rate evidence and named
-database/release-owner approval for the ordinary transactional index-build window remain required before any
-persistent V7 application or production rollout. The controlled-inbox SMTP canary and A-048 remain external
-release gates and were not fabricated as repository-test results.
+The authoritative V7 delivery-gate re-scope is task comment
+`comment-84e5d3b5-4939-4543-8d2c-89d3ff67eff6`. It names NickolayMamonov as the database/release owner and
+permits PR #19 merge and workflow completion. No persistent production email-OTP dataset or live OTP write
+workload exists yet, so production row/size/write-rate/build-duration evidence is not applicable and is not
+fabricated. V7 was applied only in disposable test databases.
+
+Persistent V7 application remains forbidden until the hard pre-deployment gate records actual or explicit-zero
+metrics, PostgreSQL 16 timing or approved assumptions, an exact maintenance/write-block window, and explicit
+owner acceptance in a durable evidence record. The controlled-inbox SMTP canary and A-048 remain separate
+external release gates and were not fabricated as repository-test results.

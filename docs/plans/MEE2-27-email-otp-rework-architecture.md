@@ -300,8 +300,11 @@ Retain `idx_otp_codes_status_expires_id`. It is not a substitute because cleanup
 V1–V6 remain byte-for-byte unchanged.
 
 The selected default is ordinary transactional `CREATE INDEX`, matching current Flyway conventions. It permits
-reads but blocks writes to `otp_codes` during the build. Before V7 is merged or applied to a persistent shared
-database, the deployment evidence must record:
+reads but blocks writes to `otp_codes` during the build. The authoritative delivery-gate re-scope is recorded
+in task comment `comment-84e5d3b5-4939-4543-8d2c-89d3ff67eff6`: NickolayMamonov is the named database/release
+owner, no persistent production email-OTP dataset or live OTP write workload exists yet, and PR #19 merge plus
+workflow completion may proceed without fabricated production metrics. Before V7 is applied to a persistent
+shared database, the deployment evidence must record:
 
 - production `otp_codes` row count plus table and existing-index sizes;
 - normal and peak `otp_codes` write rates;
@@ -311,8 +314,8 @@ database, the deployment evidence must record:
 - the named database/release owner and their explicit approval;
 - the worklog or PR evidence location containing the decision.
 
-Without that approval, persistent V7 application stops and the task returns for separately reviewed
-nontransactional Flyway migration design. Once applied anywhere persistent, V7 is immutable.
+Without that hard pre-deployment approval, persistent V7 application stops and the task returns for separately
+reviewed nontransactional Flyway migration design. Once applied anywhere persistent, V7 is immutable.
 
 ## Failure handling
 

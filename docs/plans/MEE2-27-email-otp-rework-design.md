@@ -256,11 +256,15 @@ status-free selection. The new index matches both the range predicate's leading 
 
 The migration is intentionally transactional and uses ordinary `CREATE INDEX`, consistent with the repository's
 Flyway setup. Ordinary PostgreSQL `CREATE INDEX` permits reads but blocks writes on the table while it builds.
-Before V7 is merged or applied to any persistent shared database, the PR/deployment owner must record the
-production `otp_codes` row count/write rate and obtain explicit acceptance of the expected write-block window
-from the database/release owner. If the window is unacceptable or cannot be assessed, choose and validate an
-approved nontransactional concurrent-index V7 before its first persistent application. Once V7 has been applied
-to any persistent environment, it is immutable and cannot be edited or replaced.
+The authoritative delivery-gate re-scope is recorded in task comment
+`comment-84e5d3b5-4939-4543-8d2c-89d3ff67eff6`: NickolayMamonov is the named database/release owner, no
+persistent production email-OTP dataset or live OTP write workload exists yet, and PR #19 merge plus workflow
+completion may proceed without fabricated production metrics. Before V7 is applied to any persistent shared
+database, the PR/deployment owner must record the production metrics (or explicit-zero values), PostgreSQL 16
+timing/approved assumptions, exact write-block window, and explicit owner acceptance. If the window is
+unacceptable or cannot be assessed, choose and validate an approved nontransactional concurrent-index V7 before
+its first persistent application. Once V7 has been applied to any persistent environment, it is immutable and
+cannot be edited or replaced.
 
 The migration is backward-compatible with the V6-aware MEE2-23 application. Application rollback therefore
 leaves V7 applied; dropping the index is unnecessary for functional rollback and would remove the performance

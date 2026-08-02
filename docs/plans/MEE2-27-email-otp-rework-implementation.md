@@ -46,7 +46,7 @@ Stop and return for review instead of choosing silently when:
 
 - the approved MEE2-27 design and architecture appear to conflict;
 - a newly fetched `dev` tip adds material scope or changes an approved boundary;
-- ordinary V7 index-build blocking cannot be assessed or is rejected by the named database/release owner;
+- the authoritative V7 delivery-gate re-scope is contradicted by a later approved task record;
 - a persistent environment has already applied a different V7;
 - preserving both sides of an overlap would require a product/API behavior change;
 - required verification reveals a security, migration, concurrency, Android compatibility, or data-loss defect.
@@ -394,14 +394,22 @@ Acceptance:
 
 ### Slice 7 — Satisfy the V7 operational gate
 
-Ordinary transactional `CREATE INDEX` permits reads but blocks writes to `otp_codes` during the build. At
-implementation start, identify the database/release owner and the durable approval channel in the task record.
-If they are unknown, ask the task owner to name them; do not guess. The preferred durable path is:
+Ordinary transactional `CREATE INDEX` permits reads but blocks writes to `otp_codes` during the build. The
+authoritative delivery-gate re-scope is recorded in task comment
+`comment-84e5d3b5-4939-4543-8d2c-89d3ff67eff6`. It names NickolayMamonov as the database/release owner and
+explicitly permits PR #19 merge and workflow completion because no persistent production email-OTP dataset or
+live OTP write workload exists yet. Production measurements must not be fabricated.
+
+The hard pre-deployment gate remains mandatory before V7 is applied to any persistent environment:
 
 1. named owner supplies or validates aggregate evidence in a task comment or approved release record;
 2. the implementation worklog references that record without copying credentials or sensitive operational data;
 3. the replacement PR repeats the owner, decision, offered window, and evidence reference;
 4. the owner approval remains externally auditable before merge.
+
+For this re-scope, the durable record records that the production metrics are not yet applicable. Before
+persistent V7 use, the same gate must record actual or explicit-zero row/size/write-rate metrics, PostgreSQL 16
+timing or approved assumptions, an exact maintenance/write-block window, and explicit owner acceptance.
 
 Safe database-size queries for an authorized operator to run are:
 
@@ -422,7 +430,7 @@ production-sized PostgreSQL 16 staging clone when available. If no clone is avai
 approve a documented estimate that states row count, total bytes, hardware/I/O, concurrent load, and safety
 margin.
 
-Before V7 is merged or applied to any persistent shared database, record:
+Before V7 is applied to any persistent shared database, record:
 
 1. production `otp_codes` row count;
 2. table size and every existing index size;
@@ -434,18 +442,21 @@ Before V7 is merged or applied to any persistent shared database, record:
 7. that owner's explicit acceptance of the window;
 8. the durable evidence location and approval record.
 
-Disposable Testcontainers execution is allowed before this gate. Persistent application and merge are not.
+Disposable Testcontainers execution is allowed before this gate. PR merge and workflow completion are allowed
+under the authoritative re-scope, but persistent V7 application is not.
 
-If the named owner, measurements/estimate, or approval cannot be obtained, implementation may finish disposable
-tests and prepare a draft branch, but it must stop before workflow completion, PR readiness/merge, and persistent
-V7 application. Ask the task owner for the smallest missing evidence. Do not silently switch to
-`CREATE INDEX CONCURRENTLY`; return for a separately reviewed nontransactional Flyway migration design before V7
-has any persistent use. Once V7 is applied persistently, treat its filename and contents as immutable.
+If the hard pre-deployment owner approval, metrics/estimate, timing assumptions, or exact window is absent, block
+only persistent V7 application and production rollout. Do not silently switch to `CREATE INDEX CONCURRENTLY`;
+return for a separately reviewed nontransactional Flyway migration design before V7 has any persistent use. Once
+V7 is applied persistently, treat its filename and contents as immutable.
 
 Acceptance:
 
-- every required measurement or estimate and assumption is recorded;
-- a named owner has explicitly accepted the ordinary-index window;
+- the authoritative re-scope and its durable record are referenced;
+- NickolayMamonov is recorded as the named database/release owner;
+- the absence of a persistent production dataset/workload is recorded without fabricated metrics;
+- the hard pre-deployment gate's required actual/zero metrics, timing assumptions, exact window, and explicit
+  owner acceptance remain a precondition to persistent V7 application;
 - no persistent V7 application occurred before approval.
 
 ### Slice 8 — Run complete automated and packaged-runtime verification
@@ -961,7 +972,8 @@ The implementation is acceptable only when all of the following are observable:
 - One-schema migration coverage proves V5→V6→V7 and exact catalog shape.
 - The 60,000-row unforced JSON plan uses V7 with an `expires_at` index condition and no eligible-path Sort.
 - Separate concurrency proves locked-oldest-row skip and later deletion.
-- The ordinary-index operational gate is recorded and explicitly approved before merge or persistent use.
+- The authoritative re-scope is recorded and explicitly permits merge/workflow completion; the hard
+  pre-deployment operational gate remains required before persistent V7 use.
 
 ### Verification, security, and release
 
