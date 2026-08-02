@@ -16,7 +16,12 @@ class UserServiceTest {
     private val userRepository = mock(UserRepository::class.java)
     private val tagRepository = mock(TagRepository::class.java)
     private val refreshTokenRepository = mock(RefreshTokenRepository::class.java)
-    private val userService = UserService(userRepository, tagRepository, refreshTokenRepository)
+    private val userService = UserService(
+        userRepository,
+        tagRepository,
+        refreshTokenRepository,
+        UserProfileMapper(),
+    )
 
     @Test
     fun `deleting account increments auth version and revokes every refresh token`() {

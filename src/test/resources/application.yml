@@ -5,12 +5,22 @@ app:
     secret: test-only-jwt-signing-secret-not-for-production
   sms:
     provider: disabled
+  email:
+    provider: fake
+  otp:
+    cleanup:
+      enabled: false
+    hash:
+      current-key-id: test-current
+      current-key-base64: dGVzdC1vbmx5LW90cC1obWFjLWtleS1tYXRlcmlhbC0zMg==
   ingestion:
     enabled: false
   timepad:
     enabled: false
 
 spring:
+  profiles:
+    active: test
   task:
     scheduling:
       enabled: false

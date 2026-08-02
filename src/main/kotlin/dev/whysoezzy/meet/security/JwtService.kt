@@ -19,13 +19,16 @@ class JwtService(
     private val accessTokenExpirationMs = properties.accessTokenExpirationMs
     private val signingKey: SecretKey = Keys.hmacShaKeyFor(properties.secret.toByteArray())
 
-    fun generateAccessToken(userId: Long, phone: String, authVersion: Long): String {
-        return Jwts.builder()
+    fun generateAccessToken(userId: Long, phone: String?, authVersion: Long): String {
+        val builder = Jwts.builder()
             .subject(userId.toString())
-            .claim("phone", phone)
             .claim(AUTH_VERSION_CLAIM, authVersion)
             .issuedAt(Date())
             .expiration(Date(System.currentTimeMillis() + accessTokenExpirationMs))
+        if (phone != null) {
+            builder.claim("phone", phone)
+        }
+        return builder
             .signWith(signingKey)
             .compact()
     }

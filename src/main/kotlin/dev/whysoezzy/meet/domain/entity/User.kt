@@ -13,8 +13,8 @@ class User(
     @Column(nullable = false, length = 100)
     var surname: String,
 
-    @Column(nullable = false, unique = true, length = 20)
-    var phone: String,
+    @Column(unique = true, length = 20)
+    var phone: String?,
 
     @Column(length = 255)
     var email: String? = null,

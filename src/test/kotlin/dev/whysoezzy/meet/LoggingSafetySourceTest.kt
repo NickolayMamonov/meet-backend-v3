@@ -21,10 +21,21 @@ class LoggingSafetySourceTest {
             "api/controller/MeetingController.kt",
             "service/CommunityService.kt",
             "service/MeetingService.kt",
+            "api/controller/AuthController.kt",
+            "service/AuthService.kt",
+            "service/AuthTokenIssuer.kt",
+            "service/auth/identifier/AuthIdentifier.kt",
+            "service/auth/identifier/EmailAddressNormalizer.kt",
+            "service/auth/identifier/DeviceId.kt",
+            "service/auth/identifier/ClientRequestContextResolver.kt",
+            "service/auth/otp/OtpRequestFlow.kt",
+            "service/auth/otp/OtpVerificationExecutor.kt",
+            "service/auth/otp/OtpCleanupJobs.kt",
+            "service/email/SmtpEmailOtpSender.kt",
         ).map(::source)
 
         val unsafeLogValue = Regex(
-            """logger\.(?:trace|debug|info|warn|error)\s*\{[^}\n]*\$\{?(?:query|address|publicUrl|filePath|targetPath|rootLocation|value|e\.message)""",
+            """logger\.(?:trace|debug|info|warn|error)\s*\{[^}\n]*\$\{?(?:query|address|email|recipient|code|deviceId|clientIp|canonicalValue|hashKeyId|token|password|username|publicUrl|filePath|targetPath|rootLocation|value|e\.message|exception\.message)""",
         )
         val exceptionLoggingOverload = Regex(
             """logger\.(?:trace|debug|info|warn|error)\s*\(\s*(?:e|exception)\s*\)""",

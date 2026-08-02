@@ -23,12 +23,27 @@ data class VerifyOtpRequest(
         message = "Phone must be in E.164 format",
     )
     val phone: String,
-    @field:Pattern(regexp = "^\\d{6}$", message = "OTP code must be a six-digit number")
+    @field:Pattern(regexp = "^[0-9]{6}$", message = "OTP code must be a six-digit number")
     val code: String,
     @field:Size(max = 100, message = "Name must not exceed 100 characters")
     val name: String? = null,   // Только для новых пользователей
     @field:Size(max = 100, message = "Surname must not exceed 100 characters")
     val surname: String? = null
+) : Serializable
+
+data class SendEmailOtpRequest(
+    val email: String? = null,
+) : Serializable
+
+data class VerifyEmailOtpRequest(
+    val email: String? = null,
+    val code: String? = null,
+    val name: String? = null,
+    val surname: String? = null,
+) : Serializable
+
+data class OtpAcceptedResponse(
+    val message: String,
 ) : Serializable
 
 /** Ответ с токенами */

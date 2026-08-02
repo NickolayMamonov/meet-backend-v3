@@ -11,25 +11,18 @@ import dev.whysoezzy.meet.domain.repository.CommunityRepository
 import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import dev.whysoezzy.meet.domain.repository.TagRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
+import dev.whysoezzy.meet.support.PostgresTestDatabase
+import org.junit.jupiter.api.Tag as JUnitTag
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
-import org.springframework.jdbc.datasource.DriverManagerDataSource
 import org.springframework.test.context.DynamicPropertyRegistry
 import org.springframework.test.context.DynamicPropertySource
-import org.junit.jupiter.api.extension.ConditionEvaluationResult
-import org.junit.jupiter.api.extension.ExecutionCondition
-import org.junit.jupiter.api.extension.ExtensionContext
-import org.junit.jupiter.api.extension.ExtendWith
-import org.junit.jupiter.api.AfterAll
-import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
-import java.util.UUID
 
 @SpringBootTest
 @AutoConfigureMockMvc
-@ExtendWith(ExternalOrDockerPostgresCondition::class)
+@JUnitTag("postgres")
 abstract class IntegrationTestSupport {
     @Autowired
     protected lateinit var jdbcTemplate: JdbcTemplate
@@ -48,7 +41,8 @@ abstract class IntegrationTestSupport {
         jdbcTemplate.execute(
             "TRUNCATE TABLE ad_block_communities, ad_block_users, meeting_participants, meeting_tags, " +
                 "community_subscribers, community_tags, user_interests, user_social_media, refresh_tokens, " +
-                "otp_codes, otp_rate_limit_attempts, ad_blocks, meetings, communities, users, tags RESTART IDENTITY CASCADE",
+                "otp_codes, otp_rate_limit_attempts, auth_identities, ad_blocks, meetings, communities, users, " +
+                "tags RESTART IDENTITY CASCADE",
         )
     }
 
@@ -113,7 +107,9 @@ abstract class IntegrationTestSupport {
     }
 
     companion object {
-        private val database = TestPostgresDatabase()
+        private val database = PostgresTestDatabase("meet_integration").also { database ->
+            Runtime.getRuntime().addShutdownHook(Thread(database::close))
+        }
 
         @JvmStatic
         @DynamicPropertySource
@@ -123,24 +119,6 @@ abstract class IntegrationTestSupport {
             registry.add("spring.datasource.password") { database.password }
         }
 
-        @JvmStatic
-        @AfterAll
-        fun stopDatabase() = database.close()
-    }
-}
-
-class ExternalOrDockerPostgresCondition : ExecutionCondition {
-    override fun evaluateExecutionCondition(context: ExtensionContext): ConditionEvaluationResult {
-        if (!System.getenv("TEST_POSTGRES_JDBC_URL").isNullOrBlank()) {
-            return ConditionEvaluationResult.enabled("Using TEST_POSTGRES_JDBC_URL")
-        }
-        return if (DockerClientFactory.instance().isDockerAvailable) {
-            ConditionEvaluationResult.enabled("Docker is available for PostgreSQL Testcontainers")
-        } else {
-            ConditionEvaluationResult.disabled(
-                "Set TEST_POSTGRES_JDBC_URL, TEST_POSTGRES_USERNAME, and TEST_POSTGRES_PASSWORD, or start Docker",
-            )
-        }
     }
 }
 
@@ -153,44 +131,3 @@ data class ApiFixture(
     val textAd: AdBlock,
     val communityAd: AdBlock,
 )
-
-private class TestPostgresDatabase : AutoCloseable {
-    private val externalUrl = System.getenv("TEST_POSTGRES_JDBC_URL")
-    private val schema = "meet_integration_${UUID.randomUUID().toString().replace("-", "")}"
-    private val containerDelegate = lazy { PostgreSQLContainer<Nothing>("postgres:16-alpine").apply { start() } }
-    private val container by containerDelegate
-    private val externalCredentials by lazy {
-        val username = requireNotNull(System.getenv("TEST_POSTGRES_USERNAME")) {
-            "TEST_POSTGRES_USERNAME is required with TEST_POSTGRES_JDBC_URL"
-        }
-        val password = requireNotNull(System.getenv("TEST_POSTGRES_PASSWORD")) {
-            "TEST_POSTGRES_PASSWORD is required with TEST_POSTGRES_JDBC_URL"
-        }
-        DriverManagerDataSource(externalUrl, username, password).also {
-            JdbcTemplate(it).execute("CREATE SCHEMA $schema")
-        }
-        username to password
-    }
-
-    val jdbcUrl: String
-        get() = externalUrl?.let {
-            val separator = if (it.contains("?")) "&" else "?"
-            "$it${separator}currentSchema=$schema"
-        } ?: container.jdbcUrl
-
-    val username: String
-        get() = externalUrl?.let { externalCredentials.first } ?: container.username
-
-    val password: String
-        get() = externalUrl?.let { externalCredentials.second } ?: container.password
-
-    override fun close() {
-        if (externalUrl != null) {
-            val (username, password) = externalCredentials
-            JdbcTemplate(DriverManagerDataSource(externalUrl, username, password))
-                .execute("DROP SCHEMA IF EXISTS $schema CASCADE")
-        } else if (containerDelegate.isInitialized()) {
-            container.stop()
-        }
-    }
-}

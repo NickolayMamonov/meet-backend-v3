@@ -4,28 +4,28 @@ import jakarta.persistence.*
 import java.time.LocalDateTime
 
 @Entity
-@Table(name = "otp_codes")
-class OtpCode(
-    @Column(nullable = false, length = 20)
-    var phone: String,
-    @Column(nullable = false, length = 10)
-    var code: String,
-    @Column(name = "expires_at", nullable = false)
-    var expiresAt: LocalDateTime,
-    @Column(name = "is_used", nullable = false)
-    var isUsed: Boolean = false,
+@Table(name = "auth_identities")
+class AuthIdentity(
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id", nullable = false)
+    val user: User,
+    @Enumerated(EnumType.STRING)
+    @Column(name = "type", nullable = false, length = 16)
+    val type: AuthIdentityType,
+    @Column(name = "normalized_identifier", nullable = false, length = 254)
+    val normalizedIdentifier: String,
     @Column(name = "created_at", nullable = false)
-    var createdAt: LocalDateTime = LocalDateTime.now(),
+    val createdAt: LocalDateTime = LocalDateTime.now(),
 ) {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     var id: Long? = null
+        protected set
+}
 
-    val isExpired: Boolean
-        get() = LocalDateTime.now().isAfter(expiresAt)
-
-    val isValid: Boolean
-        get() = !isUsed && !isExpired
+enum class AuthIdentityType {
+    PHONE,
+    EMAIL,
 }
 
 @Entity

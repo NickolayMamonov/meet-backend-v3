@@ -21,6 +21,7 @@ class UserService(
     private val userRepository: UserRepository,
     private val tagRepository: TagRepository,
     private val refreshTokenRepository: RefreshTokenRepository,
+    private val profileMapper: UserProfileMapper,
 ) {
 
     @Transactional(readOnly = true)
@@ -38,7 +39,7 @@ class UserService(
 
         if (user.isDeleted) throw NotFoundException("User not found")
 
-        return user.toProfileDto()
+        return profileMapper.toFullProfileDto(user)
     }
 
     @Transactional
@@ -86,7 +87,7 @@ class UserService(
         val saved = userRepository.save(user)
         logger.info { "User profile updated: $userId" }
 
-        return saved.toProfileDto()
+        return profileMapper.toFullProfileDto(saved)
     }
 
     @Transactional
@@ -144,20 +145,3 @@ class UserService(
         }
     }
 }
-
-// Extension function для маппинга User -> UserProfileDto
-fun dev.whysoezzy.meet.domain.entity.User.toProfileDto() = UserProfileDto(
-    id = id!!,
-    name = name,
-    surname = surname,
-    email = email,
-    phone = phone,
-    city = city,
-    description = bio,
-    avatarUrl = avatarUrl,
-    interests = interests.map { TagDto(it.id!!, it.text) },
-    socialMedias = socialMedia.map { SocialMediaDto(it.platform.name.lowercase(), it.username) },
-    showCommunities = showCommunities,
-    showMeetings = showMeetings,
-    notificationsEnabled = notificationsEnabled
-)

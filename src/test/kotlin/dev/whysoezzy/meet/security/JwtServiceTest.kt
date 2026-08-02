@@ -1,13 +1,16 @@
 package dev.whysoezzy.meet.security
 
-import dev.whysoezzy.meet.config.JwtConfigurationInitializer
 import dev.whysoezzy.meet.config.JwtProperties
+import dev.whysoezzy.meet.config.RuntimeConfigurationInitializer
+import dev.whysoezzy.meet.config.RuntimeConfigurationValidator
 import io.jsonwebtoken.Jwts
 import io.jsonwebtoken.security.Keys
 import org.assertj.core.api.Assertions.assertThat
 import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.boot.test.context.runner.ApplicationContextRunner
 import org.springframework.context.annotation.Configuration
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import java.util.Base64
 import java.util.Date
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -30,6 +33,23 @@ class JwtServiceTest {
         assertTrue(service.validateToken(token))
         assertEquals(42, service.getUserIdFromToken(token))
         assertEquals(3, service.getAuthVersionFromToken(token))
+    }
+
+    @Test
+    fun `email-only access token omits phone and email claims`() {
+        val token = JwtService(properties).generateAccessToken(
+            userId = 42,
+            phone = null,
+            authVersion = 3,
+        )
+        val payload = jacksonObjectMapper().readTree(
+            Base64.getUrlDecoder().decode(token.split('.')[1]),
+        )
+
+        assertEquals("42", payload.path("sub").asText())
+        assertEquals(3, payload.path("av").asLong())
+        assertFalse(payload.has("phone"))
+        assertFalse(payload.has("email"))
     }
 
     @Test
@@ -121,6 +141,9 @@ class JwtServiceTest {
                 "spring.datasource.username=postgres",
                 "spring.datasource.password=postgres",
                 "app.sms.provider=fake",
+                "app.email.provider=fake",
+                "app.otp.hash.current-key-id=dev-current",
+                "app.otp.hash.current-key-base64=${RuntimeConfigurationValidator.NON_PRODUCTION_DEV_KEY_BASE64}",
             )
             .run { context -> assertThat(context.startupFailure).isNull() }
     }
@@ -151,7 +174,7 @@ class JwtServiceTest {
             .withUserConfiguration(JwtPropertiesTestConfiguration::class.java)
 
         val startupContextRunner = ApplicationContextRunner()
-            .withInitializer(JwtConfigurationInitializer())
+            .withInitializer(RuntimeConfigurationInitializer())
 
         fun validProductionProperties(): Array<String> = arrayOf(
             "app.jwt.secret=${"a".repeat(JwtProperties.MINIMUM_SECRET_BYTES)}",
@@ -160,6 +183,13 @@ class JwtServiceTest {
             "spring.datasource.username=meet",
             "spring.datasource.password=production-db-password",
             "app.sms.provider=disabled",
+            "app.email.provider=smtp",
+            "app.email.from-address=no-reply@example.com",
+            "spring.mail.host=smtp.example.com",
+            "spring.mail.username=smtp-user",
+            "spring.mail.password=smtp-password",
+            "app.otp.hash.current-key-id=production-current",
+            "app.otp.hash.current-key-base64=${Base64.getEncoder().encodeToString(ByteArray(32) { 7 })}",
         )
 
         fun validDevProperties(): Array<String> = arrayOf(
@@ -169,6 +199,9 @@ class JwtServiceTest {
             "spring.datasource.username=postgres",
             "spring.datasource.password=postgres",
             "app.sms.provider=fake",
+            "app.email.provider=fake",
+            "app.otp.hash.current-key-id=dev-current",
+            "app.otp.hash.current-key-base64=${RuntimeConfigurationValidator.NON_PRODUCTION_DEV_KEY_BASE64}",
         )
     }
 }

@@ -1,7 +1,7 @@
 # Enable with SPRING_PROFILES_ACTIVE=dev.
 spring:
   mvc:
-    log-resolved-exception: true
+    log-resolved-exception: false
 
   datasource:
     url: jdbc:postgresql://localhost:5432/meet_db
@@ -15,6 +15,12 @@ app:
     secret: dev-only-jwt-signing-secret-not-for-production
   sms:
     provider: fake
+  email:
+    provider: fake
+  otp:
+    hash:
+      current-key-id: dev-current
+      current-key-base64: ZGV2LW9ubHktb3RwLWhtYWMta2V5LW1hdGVyaWFsLTMyaA==
 
 logging:
   level:

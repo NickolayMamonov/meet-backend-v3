@@ -17,9 +17,9 @@ class LoggingProfileConfigurationTest {
     }
 
     @Test
-    fun `production suppresses resolved MVC exception logs while dev explicitly enables them`() {
+    fun `all profiles suppress resolved MVC exception detail logs`() {
         assertFalse(logResolvedException("application.yml"))
-        assertTrue(logResolvedException("application-dev.yml"))
+        assertFalse(logResolvedException("application-dev.yml"))
     }
 
     @Suppress("UNCHECKED_CAST")
