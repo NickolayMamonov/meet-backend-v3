@@ -400,12 +400,16 @@ authoritative delivery-gate re-scope is recorded in task comment
 explicitly permits PR #19 merge and workflow completion because no persistent production email-OTP dataset or
 live OTP write workload exists yet. Production measurements must not be fabricated.
 
-The hard pre-deployment gate remains mandatory before V7 is applied to any persistent environment:
+The hard pre-deployment gate remains mandatory before V7 is applied to any persistent environment or production
+rollout:
 
-1. named owner supplies or validates aggregate evidence in a task comment or approved release record;
-2. the implementation worklog references that record without copying credentials or sensitive operational data;
-3. the replacement PR repeats the owner, decision, offered window, and evidence reference;
-4. the owner approval remains externally auditable before merge.
+1. before persistent V7 use, the named owner supplies or validates aggregate evidence in a task comment or approved
+   release record;
+2. the implementation worklog references the current re-scope and, before persistent use, that hard-gate record
+   without copying credentials or sensitive operational data;
+3. the replacement PR records the owner, re-scope decision, and deferred hard-gate status; when persistent V7 is
+   proposed, it repeats the exact window and evidence reference;
+4. the owner approval remains externally auditable before persistent V7 application or production rollout.
 
 For this re-scope, the durable record records that the production metrics are not yet applicable. Before
 persistent V7 use, the same gate must record actual or explicit-zero row/size/write-rate metrics, PostgreSQL 16
@@ -903,7 +907,8 @@ Acceptance:
    - V7 catalog output and Flyway validations;
    - formatted plan evidence and PostgreSQL version;
    - `SKIP LOCKED` result;
-   - V7 operational-gate evidence and named approval;
+   - the V7 delivery-gate re-scope, named owner, deferred hard-gate status, and the required pre-persistent
+     metrics/timing/window/approval evidence fields;
    - marker-scan scope/results/exclusions;
    - external SMTP canary and A-048 status as external gates.
 5. Review the final diff relative to both source lines and then-current `dev`.
