@@ -2,88 +2,59 @@ package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.api.error.ValidationException
 import dev.whysoezzy.meet.config.StorageProperties
+import jakarta.annotation.PostConstruct
 import mu.KotlinLogging
 import org.springframework.stereotype.Service
 import org.springframework.web.multipart.MultipartFile
-import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
 import java.util.UUID
 import javax.imageio.ImageIO
-import jakarta.annotation.PostConstruct
 
 private val logger = KotlinLogging.logger {}
 
-/**
- * Результат загрузки файла
- * @param publicUrl  URL для клиента (сохраняется в avatarUrl/imageUrl)
- * @param relativePath  путь внутри upload-dir, например "avatars/uuid.jpg"
- */
 data class UploadResult(
     val publicUrl: String,
-    val relativePath: String
+    val relativePath: String,
 )
 
 @Service
 class StorageService(
-    private val props: StorageProperties
+    private val props: StorageProperties,
 ) {
-    // Корневая директория хранилища (абсолютный путь)
     private lateinit var rootLocation: Path
 
     @PostConstruct
     fun init() {
         rootLocation = Paths.get(props.uploadDir).toAbsolutePath().normalize()
-        // Создаём поддиректории при старте
-        listOf("avatars", "meetings", "communities").forEach { sub ->
-            Files.createDirectories(rootLocation.resolve(sub))
-        }
+        listOf("avatars", "meetings", "communities").forEach { Files.createDirectories(rootLocation.resolve(it)) }
         logger.info { "Storage initialized" }
     }
 
-    /**
-     * Загрузить аватарку пользователя.
-     * Файл сохраняется в uploads/avatars/{uuid}.{ext}
-     * Возвращает публичный URL.
-     */
-    fun uploadAvatar(file: MultipartFile, userId: Long): UploadResult {
-        validateFile(file)
-        val filename = buildFilename(file, prefix = "user_${userId}")
-        return saveFile(file, subdir = "avatars", filename = filename)
+    fun uploadAvatar(file: MultipartFile, userId: Long): UploadResult =
+        saveFile(file, "avatars", buildFilename(validateFile(file), "user_$userId"))
+
+    fun uploadMeetingImage(file: MultipartFile): UploadResult =
+        saveFile(file, "meetings", buildFilename(validateFile(file)))
+
+    fun uploadCommunityImage(file: MultipartFile): UploadResult =
+        saveFile(file, "communities", buildFilename(validateFile(file)))
+
+    fun deleteUploaded(upload: UploadResult) {
+        deleteRelativePath(upload.relativePath)
     }
 
-    /**
-     * Загрузить изображение для встречи.
-     * Файл сохраняется в uploads/meetings/{uuid}.{ext}
-     */
-    fun uploadMeetingImage(file: MultipartFile): UploadResult {
-        validateFile(file)
-        val filename = buildFilename(file)
-        return saveFile(file, subdir = "meetings", filename = filename)
+    fun deleteOwnedAvatarByUrl(publicUrl: String, userId: Long) {
+        val relativePath = localRelativePath(publicUrl) ?: return
+        val ownedAvatarPattern = Regex("""avatars/user_${userId}_[0-9a-f]{32}\.(jpg|png|webp)""")
+        if (!ownedAvatarPattern.matches(relativePath)) return
+        deleteRelativePath(relativePath)
     }
 
-    /**
-     * Загрузить изображение сообщества.
-     * Файл сохраняется в uploads/communities/{uuid}.{ext}
-     */
-    fun uploadCommunityImage(file: MultipartFile): UploadResult {
-        validateFile(file)
-        val filename = buildFilename(file)
-        return saveFile(file, subdir = "communities", filename = filename)
-    }
-
-    /**
-     * Удалить файл по его публичному URL или относительному пути.
-     * Используется при смене аватарки — старый файл удаляем.
-     */
-    fun deleteByUrl(publicUrl: String) {
-        val relativePath = publicUrl.removePrefix(props.baseUrl).trimStart('/')
+    private fun deleteRelativePath(relativePath: String) {
         val filePath = rootLocation.resolve(relativePath).normalize()
-
-        // Защита от path traversal
         if (!filePath.startsWith(rootLocation)) {
             logger.warn { "Storage delete rejected: invalid location" }
             return
@@ -97,49 +68,56 @@ class StorageService(
         }
     }
 
-    // ==================== Private ====================
-
-    private fun validateFile(file: MultipartFile) {
-        if (file.isEmpty) {
-            throw ValidationException("File is empty")
-        }
-
+    private fun validateFile(file: MultipartFile): DetectedImage {
+        if (file.isEmpty) throw ValidationException("File is empty")
         if (file.size > props.maxFileSize) {
-            val maxMb = props.maxFileSize / 1_048_576
-            throw ValidationException("File size exceeds maximum allowed size of ${maxMb}MB")
+            throw ValidationException("File size exceeds maximum allowed size of ${props.maxFileSize / 1_048_576}MB")
         }
 
-        val contentType = file.contentType?.lowercase()
-            ?: throw ValidationException("Cannot determine file content type")
-
-        if (contentType !in props.allowedTypesSet()) {
-            throw ValidationException(
-                "File type '$contentType' is not allowed. Allowed: ${props.allowedTypes}"
-            )
+        val image = detectImage(file)
+        if (image.mimeType !in props.allowedTypesSet()) {
+            throw ValidationException("Detected image format '${image.mimeType}' is not allowed")
         }
+        return image
+    }
 
-        // Проверяем, что файл действительно является изображением (защита от подмены)
-        val image: BufferedImage? = try {
-            ImageIO.read(file.inputStream)
+    private fun detectImage(file: MultipartFile): DetectedImage {
+        try {
+            file.inputStream.use { input ->
+                ImageIO.createImageInputStream(input).use { stream ->
+                    val reader = ImageIO.getImageReaders(stream).asSequence().firstOrNull()
+                        ?: throw ValidationException("File is not a valid image")
+                    try {
+                        reader.input = stream
+                        reader.read(0) ?: throw ValidationException("File is not a valid image")
+                        return when (reader.formatName.lowercase()) {
+                            "jpeg", "jpg" -> DetectedImage("image/jpeg", "jpg")
+                            "png" -> DetectedImage("image/png", "png")
+                            "webp" -> DetectedImage("image/webp", "webp")
+                            else -> throw ValidationException("Detected image format is not allowed")
+                        }
+                    } finally {
+                        reader.dispose()
+                    }
+                }
+            }
+        } catch (e: ValidationException) {
+            throw e
         } catch (e: Exception) {
-            null
-        }
-        if (image == null) {
             throw ValidationException("File is not a valid image")
         }
     }
 
     private fun saveFile(file: MultipartFile, subdir: String, filename: String): UploadResult {
-        val targetDir = rootLocation.resolve(subdir)
-        val targetPath = targetDir.resolve(filename).normalize()
-
-        // Защита от path traversal
-        if (!targetPath.startsWith(rootLocation)) {
-            throw SecurityException("Invalid file path detected")
-        }
-
-        file.inputStream.use { input ->
-            Files.copy(input, targetPath, StandardCopyOption.REPLACE_EXISTING)
+        val targetPath = rootLocation.resolve(subdir).resolve(filename).normalize()
+        if (!targetPath.startsWith(rootLocation)) throw SecurityException("Invalid file path detected")
+        val temporaryPath = Files.createTempFile(targetPath.parent, ".upload-", ".tmp")
+        try {
+            file.inputStream.use { Files.copy(it, temporaryPath, StandardCopyOption.REPLACE_EXISTING) }
+            Files.move(temporaryPath, targetPath, StandardCopyOption.ATOMIC_MOVE)
+        } catch (e: Exception) {
+            Files.deleteIfExists(temporaryPath)
+            throw e
         }
 
         val relativePath = "$subdir/$filename"
@@ -149,19 +127,17 @@ class StorageService(
         return UploadResult(publicUrl = publicUrl, relativePath = relativePath)
     }
 
-    private fun buildFilename(file: MultipartFile, prefix: String? = null): String {
-        val ext = getExtension(file)
+    private fun buildFilename(image: DetectedImage, prefix: String? = null): String {
         val uuid = UUID.randomUUID().toString().replace("-", "")
-        return if (prefix != null) "${prefix}_${uuid}.${ext}" else "${uuid}.${ext}"
+        return listOfNotNull(prefix, uuid).joinToString("_") + ".${image.extension}"
     }
 
-    private fun getExtension(file: MultipartFile): String {
-        // Определяем расширение из MIME-типа, не из оригинального имени файла
-        return when (file.contentType?.lowercase()) {
-            "image/jpeg" -> "jpg"
-            "image/png" -> "png"
-            "image/webp" -> "webp"
-            else -> "jpg"
-        }
+    private fun localRelativePath(publicUrl: String): String? {
+        val baseUrl = props.baseUrl.trimEnd('/')
+        if (!publicUrl.startsWith("$baseUrl/")) return null
+        val relativePath = publicUrl.removePrefix(baseUrl).trimStart('/')
+        return relativePath.takeIf { it.startsWith("avatars/") }
     }
+
+    private data class DetectedImage(val mimeType: String, val extension: String)
 }

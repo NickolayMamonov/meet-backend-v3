@@ -47,6 +47,7 @@ dependencies {
 
     // Logging
     implementation("io.github.microutils:kotlin-logging-jvm:3.0.5")
+    implementation("org.sejda.imageio:webp-imageio:0.1.6")
 
     // Development
     developmentOnly("org.springframework.boot:spring-boot-devtools")
