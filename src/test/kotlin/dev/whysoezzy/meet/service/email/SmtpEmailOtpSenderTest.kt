@@ -1,9 +1,13 @@
 package dev.whysoezzy.meet.service.email
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import dev.whysoezzy.meet.config.EmailProperties
 import dev.whysoezzy.meet.config.EmailProvider
 import dev.whysoezzy.meet.config.SmtpRuntimeSettings
 import jakarta.mail.internet.MimeMessage
+import org.slf4j.LoggerFactory
 import org.springframework.mail.MailSendException
 import org.springframework.mail.javamail.JavaMailSenderImpl
 import org.springframework.mock.env.MockEnvironment
@@ -67,9 +71,17 @@ class SmtpEmailOtpSenderTest {
             MailSendException(providerMarker, SocketTimeoutException(providerMarker)),
         )
         val sender = SmtpEmailOtpSender(mailSender, settings())
+        val logger = LoggerFactory.getLogger(SmtpEmailOtpSender::class.java) as Logger
+        val appender = ListAppender<ILoggingEvent>().apply { start() }
+        logger.addAppender(appender)
 
-        val exception = assertFailsWith<EmailOtpDeliveryException> {
-            sender.send(EmailOtpMessage("person@example.com", "123456", 5))
+        val exception = try {
+            assertFailsWith<EmailOtpDeliveryException> {
+                sender.send(EmailOtpMessage("person@example.com", "123456", 5))
+            }
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
         }
 
         assertEquals(1, mailSender.invocationCount, "delivery must make one provider attempt without automatic retry")
@@ -77,6 +89,11 @@ class SmtpEmailOtpSenderTest {
         assertEquals("Email OTP delivery failed", exception.message)
         assertNull(exception.cause)
         assertTrue(providerMarker !in exception.stackTraceToString())
+        assertEquals(
+            listOf("Email OTP delivery failed provider=smtp operation=send_otp outcome=TIMEOUT"),
+            appender.list.map(ILoggingEvent::getFormattedMessage),
+        )
+        assertTrue(providerMarker !in appender.list.joinToString { it.formattedMessage })
     }
 
     @Test
