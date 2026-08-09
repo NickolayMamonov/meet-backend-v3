@@ -23,6 +23,9 @@ permissions:
 jobs:
   quarantine:
     if: github.ref == 'refs/heads/master'
+    concurrency:
+      group: backend-ghcr-recovery-${{ github.repository }}-${{ inputs.tag }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     env:
       TAG: ${{ inputs.tag }}
@@ -50,7 +53,9 @@ jobs:
           set -euo pipefail
           test "$TAG" = "v$VERSION"
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --no-tags origin dev
+          git fetch --no-tags origin dev "refs/tags/$TAG:refs/tags/$TAG"
+          test "$(git rev-list -n 1 "$TAG")" = "$SOURCE_SHA"
+          test "$(git show "$SOURCE_SHA:version.json" | jq -r '.version')" = "$VERSION"
           git merge-base --is-ancestor "$SOURCE_SHA" origin/dev
           gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -Fx true
           set +e

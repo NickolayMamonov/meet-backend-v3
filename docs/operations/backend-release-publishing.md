@@ -31,11 +31,15 @@ the release publish operation is the final mutation.
 
 The three aliases are immutable by this enforced publication policy, not by an
 assumed GHCR compare-and-swap primitive. `scripts/release-registry-state.sh`
-is deliberately read-only for complete, partial, divergent, and externally
-raced states. A one- or two-alias state is quarantined and the old draft stays
-unpublished. Do not push, retag, copy, overwrite, or delete an alias during
-recovery. The authorized recovery is a new Conventional Commit on `dev`, which
-creates a distinct patch tuple and source SHA through Release Please.
+is deliberately read-only for complete, partial, divergent, identity-mismatch,
+and externally raced states. The publication job has a repository/tag-scoped
+GitHub Actions concurrency lock, performs an identity-aware preflight, and
+performs an identity-aware post-publish inventory. A one- or two-alias state is
+quarantined and the old draft stays unpublished. Do not push, retag, copy,
+overwrite, or delete an alias during recovery. The authorized recovery is a new
+Conventional Commit on `dev`, which creates a distinct patch tuple and source
+SHA through Release Please. The lock serializes cooperating workflows; it is
+not represented as a GHCR CAS guarantee.
 
 ## Production access prerequisites
 
@@ -58,9 +62,14 @@ Configure and audit enforceable protections on both `dev` and `master`:
 The `production` Environment must have required reviewers, prevent self-review,
 administrator bypass disabled where available, and a selected deployment
 branch policy allowing only exact `master` (no tags). Run
-`scripts/audit-github-policies.sh` with a real `PRODUCTION_APPROVER` and
+`scripts/audit-default-branch-bootstrap.sh`,
+`scripts/audit-github-policies.sh` with a real `PRODUCTION_APPROVER`, and
 `scripts/audit-production-environment.sh` after the operator configures the
 Environment. These scripts print names and policy evidence only, never values.
+The bootstrap audit requires the dispatch/recovery workflow and helper blobs on
+the actual default `master` ref and proves no master/dev drift. Until a
+reviewed dev-to-master promotion supplies those blobs and the required
+protections, dispatch and production readiness remain externally blocked.
 Until that identity and those protections exist, production and master
 promotion remain externally blocked.
 

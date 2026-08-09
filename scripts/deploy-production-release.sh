@@ -8,17 +8,21 @@ STATE_DIR=/var/lib/meet-production
 ACTIVE_COMPOSE="$STATE_DIR/active-compose.yml"
 RUNTIME_OVERRIDE="$STATE_DIR/active-runtime.override.yml"
 IMAGE=$(sed -n 's/^BACKEND_IMAGE=//p' .env.production)
+VERSION=$(sed -n 's/^BACKEND_VERSION=//p' .env.production)
 REVISION=$(sed -n 's/^BACKEND_REVISION=//p' .env.production)
 [ "$(grep -c "^BACKEND_IMAGE=" .env.production)" -eq 1 ]
+[ "$(grep -c "^BACKEND_VERSION=" .env.production)" -eq 1 ]
 [ "$(grep -c "^BACKEND_REVISION=" .env.production)" -eq 1 ]
 [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]
+[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 test -n "$IMAGE"
 case "$IMAGE" in *[[:space:]]*|*:latest) echo "BACKEND_IMAGE must be a non-latest immutable release reference" >&2; exit 1;; esac
 test "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$REVISION"
+test "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = "$VERSION"
 test "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = "https://github.com/NickolayMamonov/meet-backend-v3"
 test "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = "10001:10001"
 
-STATE_NAMES=(previous-image previous-image-id previous-revision previous-uid
+STATE_NAMES=(previous-image previous-image-id previous-version previous-revision previous-uid
   previous-gid previous-upload-volume previous-config.sha256
   previous-compose.yml previous-runtime.override.yml previous-compose.sha256
   previous-runtime.sha256 previous-compose-config-hash)
@@ -37,11 +41,13 @@ if [ "${#EXISTING_STATE[@]}" -gt 0 ]; then
   [ "$(sha256sum "$STATE_DIR/previous-compose.yml" | awk '{print $1}')" = "$(< "$STATE_DIR/previous-compose.sha256")" ]
   [ "$(sha256sum "$STATE_DIR/previous-runtime.override.yml" | awk '{print $1}')" = "$(< "$STATE_DIR/previous-runtime.sha256")" ]
   PREVIOUS_IMAGE_ID=$(< "$STATE_DIR/previous-image-id")
+  PREVIOUS_VERSION=$(< "$STATE_DIR/previous-version")
   PREVIOUS_REVISION=$(< "$STATE_DIR/previous-revision")
   PREVIOUS_UID=$(< "$STATE_DIR/previous-uid")
   PREVIOUS_GID=$(< "$STATE_DIR/previous-gid")
   EXPECTED_CONFIG_HASH=$(< "$STATE_DIR/previous-compose-config-hash")
   [[ "$PREVIOUS_REVISION" =~ ^[0-9a-f]{40}$ ]]
+  [[ "$PREVIOUS_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
   [[ "$PREVIOUS_UID:$PREVIOUS_GID" =~ ^[0-9]+:[0-9]+$ ]]
   [[ "$EXPECTED_CONFIG_HASH" =~ ^[0-9a-f]{64}$ ]]
   UPLOAD_VOLUME=$(< "$STATE_DIR/previous-upload-volume")

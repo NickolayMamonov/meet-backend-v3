@@ -21,6 +21,13 @@ if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then
   [[ "$LEGACY_PREVIOUS_REVISION" =~ ^[0-9a-f]{40}$ ]]
   REVISION=$LEGACY_PREVIOUS_REVISION
 fi
+VERSION=$(docker image inspect "$IMAGE_ID" \
+  --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  : "${LEGACY_PREVIOUS_VERSION:?export the exact SemVer for the legacy image}"
+  [[ "$LEGACY_PREVIOUS_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+  VERSION=$LEGACY_PREVIOUS_VERSION
+fi
 ROLLBACK_IMAGE="meet-backend:rollback-$REVISION-${IMAGE_ID#sha256:}"
 docker image tag "$IMAGE_ID" "$ROLLBACK_IMAGE"
 
@@ -70,6 +77,7 @@ CAPTURED_CONFIG_HASH=$("${COMPOSE[@]}" --captured-runtime config --hash backend 
 
 printf '%s\n' "$ROLLBACK_IMAGE" > "$STATE_DIR/previous-image"
 printf '%s\n' "$IMAGE_ID" > "$STATE_DIR/previous-image-id"
+printf '%s\n' "$VERSION" > "$STATE_DIR/previous-version"
 printf '%s\n' "$REVISION" > "$STATE_DIR/previous-revision"
 printf '%s\n' "$UID_VALUE" > "$STATE_DIR/previous-uid"
 printf '%s\n' "$GID_VALUE" > "$STATE_DIR/previous-gid"

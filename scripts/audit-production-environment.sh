@@ -8,6 +8,11 @@ MODE=${1:-}
 }
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GH_TOKEN:?GH_TOKEN is required}"
+: "${PRODUCTION_APPROVER:?PRODUCTION_APPROVER must be supplied by an operator}"
+[ "$PRODUCTION_APPROVER" != NickolayMamonov ] || {
+  echo "PRODUCTION_APPROVER must be distinct from NickolayMamonov" >&2
+  exit 1
+}
 
 api() {
   gh api "$@"
@@ -55,9 +60,21 @@ if [ "$MODE" = --expect-unconfigured ] && [ "$found" -ne 0 ]; then exit 1; fi
 review_rule=$(jq '[.protection_rules[]? | select(.type == "required_reviewers")][0] // {}' <<<"$environment")
 reviewer_count=$(jq '[.reviewers[]?] | length' <<<"$review_rule")
 prevent_self_review=$(jq -r '.prevent_self_review // false' <<<"$review_rule")
+if [[ "$PRODUCTION_APPROVER" == */* ]]; then
+  approver_org=${PRODUCTION_APPROVER%%/*}
+  approver_team=${PRODUCTION_APPROVER#*/}
+  approver_id=$(api "orgs/$approver_org/teams/$approver_team" --jq '.id')
+else
+  approver_id=$(api "users/$PRODUCTION_APPROVER" --jq '.id')
+fi
+reviewer_ids=$(jq -r '.reviewers[]? | (.reviewer.id // .id // empty)' <<<"$review_rule")
 printf 'required_reviewers=%s\nprevent_self_review=%s\n' "$reviewer_count" "$prevent_self_review"
 [ "$reviewer_count" -ge 1 ] || { echo "production needs a real required reviewer" >&2; exit 1; }
 [ "$prevent_self_review" = true ] || { echo "production must prevent self-review" >&2; exit 1; }
+grep -Fxq "$approver_id" <<<"$reviewer_ids" || {
+  echo "PRODUCTION_APPROVER is not the configured Environment reviewer" >&2
+  exit 1
+}
 
 branch_policy=$(jq '[.protection_rules[]? | select(.type == "branch_policy")][0] // {}' <<<"$environment")
 custom_policy=$(jq -r 'if .custom_branch_policies == true then "custom" else "not-custom" end' <<<"$branch_policy")
@@ -66,7 +83,7 @@ printf 'deployment_branch_policy=%s\n' "$custom_policy"
   echo "production must use a selected deployment branch policy" >&2
   exit 1
 }
-jq -e 'length == 1 and .[0].type == "branch" and .[0].name == "master"' \
+jq -e '.branch_policies | length == 1 and .[0].type == "branch" and .[0].name == "master"' \
   <<<"$deployment_policies" >/dev/null || {
   echo "production deployment policy must allow exact master only" >&2
   exit 1

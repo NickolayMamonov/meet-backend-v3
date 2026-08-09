@@ -42,9 +42,7 @@ jobs:
           set -euo pipefail
           version=$(jq -r '.version' version.json)
           [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          ./gradlew properties -q | grep -Fx "version: $version"
-          unzip -p build/libs/*-plain.jar META-INF/build-info.properties 2>/dev/null |
-            grep -Fx "build.version=$version"
+          scripts/verify-release-consistency.sh "$version" "$(git rev-parse HEAD)"
 
   postgres:
     name: PostgreSQL tests
@@ -79,15 +77,29 @@ jobs:
           bash -n scripts/*.sh
           shellcheck --severity=warning scripts/*.sh
       - name: Validate production Compose
-        env:
-          DB_NAME: meet
-          DB_USERNAME: meet
-          DB_PASSWORD: local-only-validation-value
-          APP_JWT_SECRET: local-only-validation-value
-          APP_STORAGE_BASE_URL: http://localhost:8080
-          BACKEND_IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-          BACKEND_REVISION: 0123456789abcdef0123456789abcdef01234567
-        run: docker compose -f docker-compose.production.yml config --quiet
+        run: |
+          set -euo pipefail
+          validation_env="$RUNNER_TEMP/meet-production.env"
+          cp .env.production.example "$validation_env"
+          sed -i \
+            -e 's/^BACKEND_VERSION=.*/BACKEND_VERSION=1.0.0/' \
+            -e 's/^BACKEND_REVISION=.*/BACKEND_REVISION=0123456789abcdef0123456789abcdef01234567/' \
+            -e 's#^BACKEND_IMAGE=.*#BACKEND_IMAGE=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#' \
+            -e 's/^DB_PASSWORD=.*/DB_PASSWORD=local-only-validation-value/' \
+            -e 's/^APP_JWT_SECRET=.*/APP_JWT_SECRET=local-only-validation-value/' \
+            -e 's#^APP_STORAGE_BASE_URL=.*#APP_STORAGE_BASE_URL=http://localhost:8080#' \
+            "$validation_env"
+          cp "$validation_env" .env.production
+          trap 'rm -f .env.production' EXIT
+          export DB_NAME=meet
+          export DB_USERNAME=meet
+          export DB_PASSWORD=local-only-validation-value
+          export APP_JWT_SECRET=local-only-validation-value
+          export APP_STORAGE_BASE_URL=http://localhost:8080
+          export BACKEND_VERSION=1.0.0
+          export BACKEND_REVISION=0123456789abcdef0123456789abcdef01234567
+          export BACKEND_IMAGE=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          docker compose -f docker-compose.production.yml config --quiet
 
   docker:
     name: Docker image verification
@@ -121,3 +133,4 @@ jobs:
           docker image inspect meet-backend:ci --format '{{json .Config.Labels}}' | jq -e 'has("org.opencontainers.image.source")'
           docker run --rm --entrypoint sh meet-backend:ci -ec \
             'test -f /app/app.jar && test -d /data/uploads && test -w /data/uploads'
+          scripts/verify-release-consistency.sh "$version" "$revision" --image meet-backend:ci

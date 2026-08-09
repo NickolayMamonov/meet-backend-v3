@@ -40,6 +40,9 @@ jobs:
     name: Publish immutable release
     needs: [release, gates]
     if: needs.release.outputs.created == 'true'
+    concurrency:
+      group: backend-ghcr-publication-${{ github.repository }}-${{ needs.release.outputs.tag }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -97,6 +100,7 @@ jobs:
           test "$TAG" = "v$VERSION"
           test "$SOURCE_SHA" = "$(git rev-list -n 1 "$TAG")"
           test "$(jq -r '.version' version.json)" = "$VERSION"
+          test "$(git show "$SOURCE_SHA:version.json" | jq -r '.version')" = "$VERSION"
           revision=$(git rev-parse HEAD)
           test "$revision" = "$SOURCE_SHA"
           mkdir -p "$RUNNER_TEMP/release"
@@ -130,29 +134,56 @@ jobs:
           printf '%s\n' "$final_state"
           grep -Fx 'state=complete' <<<"$final_state"
           test "$(awk -F= '/^digest=/{print $2}' <<<"$final_state")" = "$digest"
-          cat > release-manifest.json <<EOF
-          {
-            "version": "$VERSION",
-            "tag": "$TAG",
-            "sourceSha": "$SOURCE_SHA",
-            "image": "$IMAGE",
-            "digest": "$digest",
-            "aliases": ["$TAG", "$VERSION", "sha-$SOURCE_SHA"],
-            "platform": "linux/amd64",
-            "publicationPolicy": "exactly-three-aliases-publish-last"
-          }
-          EOF
-          sha256sum release-manifest.json > SHA256SUMS
+          docker buildx imagetools inspect --raw "$IMAGE@$digest" > image-index.json
+          docker buildx imagetools inspect "$IMAGE@$digest" > image-inspect.txt
+          jq -e '
+            ([.manifests[]? | select(.platform.architecture == "unknown" and .platform.os == "unknown")] | length) >= 2
+          ' image-index.json
+          jq -n \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --arg sourceSha "$SOURCE_SHA" \
+            --arg image "$IMAGE" \
+            --arg digest "$digest" \
+            '{
+              version: $version,
+              tag: $tag,
+              sourceSha: $sourceSha,
+              image: $image,
+              digest: $digest,
+              aliases: ["v" + $version, $version, "sha-" + $sourceSha],
+              platform: "linux/amd64",
+              publicationPolicy: "exactly-three-aliases-publish-last",
+              provenance: true,
+              sbom: true,
+              artifactAttestation: true,
+              evidence: ["image-index.json", "image-inspect.txt"]
+            }' > release-manifest.json
+          scripts/verify-release-consistency.sh "$VERSION" "$SOURCE_SHA" \
+            --tag "$TAG" --image "$IMAGE@$digest" --manifest release-manifest.json
+          sha256sum release-manifest.json image-index.json image-inspect.txt > SHA256SUMS
       - name: Create artifact attestation
+        id: attestation
         uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.publish-image.outputs.digest }}
           push-to-registry: true
+      - name: Verify artifact attestation and evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://$IMAGE@${{ steps.publish-image.outputs.digest }}" \
+            --repo "$GITHUB_REPOSITORY"
+          sha256sum -c SHA256SUMS
       - name: Attach evidence and publish last
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" release-manifest.json SHA256SUMS
+          gh release upload "$TAG" release-manifest.json image-index.json image-inspect.txt SHA256SUMS
           gh release edit "$TAG" --draft=false
+      - name: Logout from GHCR
+        if: always()
+        run: docker logout ghcr.io >/dev/null 2>&1 || true

@@ -17,10 +17,12 @@ permissions:
 jobs:
   deploy:
     if: github.ref == 'refs/heads/master'
+    concurrency:
+      group: production-deploy-${{ github.repository }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     environment:
       name: production
-      url: https://${{ vars.PRODUCTION_HOST }}
     env:
       VERSION: ${{ inputs.version }}
       HOST: ${{ vars.PRODUCTION_HOST }}
@@ -88,24 +90,43 @@ jobs:
           set -euo pipefail
           tag="v$VERSION"
           gh release view "$tag" --json isDraft --jq '.isDraft' | grep -Fx false
-          gh release download "$tag" --pattern release-manifest.json --dir "$RUNNER_TEMP/release"
-          jq -e --arg version "$VERSION" '
-            .version == $version and .tag == ("v" + $version) and
+          mkdir -p "$RUNNER_TEMP/release"
+          gh release download "$tag" \
+            --pattern release-manifest.json \
+            --pattern image-index.json \
+            --pattern image-inspect.txt \
+            --pattern SHA256SUMS \
+            --dir "$RUNNER_TEMP/release"
+          (
+            cd "$RUNNER_TEMP/release"
+            sha256sum -c SHA256SUMS
+          )
+          jq -e --arg version "$VERSION" --arg image "$IMAGE" '
+            .version == $version and
+            .tag == ("v" + $version) and
+            .image == $image and
             (.digest | test("^sha256:[0-9a-f]{64}$")) and
-            (.aliases | length == 3) and (.aliases | index("latest") | not)
+            .aliases == [("v" + $version), $version, ("sha-" + .sourceSha)] and
+            .platform == "linux/amd64" and
+            .publicationPolicy == "exactly-three-aliases-publish-last" and
+            .provenance == true and .sbom == true and .artifactAttestation == true and
+            .evidence == ["image-index.json", "image-inspect.txt"]
           ' "$RUNNER_TEMP/release/release-manifest.json"
+          jq -e '
+            ([.manifests[]? | select(.platform.architecture == "unknown" and .platform.os == "unknown")] | length) >= 2
+          ' "$RUNNER_TEMP/release/image-index.json"
           source_sha=$(jq -r '.sourceSha' "$RUNNER_TEMP/release/release-manifest.json")
           digest=$(jq -r '.digest' "$RUNNER_TEMP/release/release-manifest.json")
-          image=$(jq -r '.image' "$RUNNER_TEMP/release/release-manifest.json")
+          grep -F "Digest: $digest" "$RUNNER_TEMP/release/image-inspect.txt"
           [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
           git fetch --no-tags origin dev "$tag"
           test "$(git rev-list -n 1 "$tag")" = "$source_sha"
+          test "$(git show "$source_sha:version.json" | jq -r '.version')" = "$VERSION"
           git merge-base --is-ancestor "$source_sha" origin/dev
-          gh attestation verify "oci://$image@$digest" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "oci://$IMAGE@$digest" --repo "$GITHUB_REPOSITORY"
           {
             echo "SOURCE_SHA=$source_sha"
             echo "DIGEST=$digest"
-            echo "IMAGE=$image"
           } >> "$GITHUB_ENV"
       - name: Authenticate to GHCR
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
@@ -117,6 +138,7 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "$IMAGE@$DIGEST"
+          test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{.Os}}/{{.Architecture}}')" = "linux/amd64"
           test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
           test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
           test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{.Config.User}}')" = "10001:10001"
@@ -154,11 +176,12 @@ jobs:
             -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
             -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
             -o ConnectionAttempts=1)
-          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- "$PATH_ON_HOST" "$IMAGE@$DIGEST" "$SOURCE_SHA" <<'REMOTE'
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- "$PATH_ON_HOST" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
           set -euo pipefail
           path=$1
           image=$2
           revision=$3
+          version=$4
           test -d "$path"
           test -x "$path/scripts/prepare-production-release.sh"
           test -x "$path/scripts/backup-production.sh"
@@ -169,24 +192,25 @@ jobs:
           test -s "$path/.backup.env"
           command -v docker >/dev/null
           docker compose version >/dev/null
+          command -v flock >/dev/null
           command -v age >/dev/null
           grep -q '^AGE_RECIPIENT=' "$path/.backup.env"
           cd "$path"
           REMOTE
           quoted_path=$(printf '%q' "$PATH_ON_HOST")
+          quoted_image=$(printf '%q' "$IMAGE@$DIGEST")
+          quoted_revision=$(printf '%q' "$SOURCE_SHA")
+          quoted_version=$(printf '%q' "$VERSION")
           printf '%s' "$GHCR_TOKEN" |
             ssh "${ssh_opts[@]}" "$USER@$HOST" \
-              "cd -- $quoted_path && docker login ghcr.io --username github-actions --password-stdin"
-          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- "$PATH_ON_HOST" "$IMAGE@$DIGEST" "$SOURCE_SHA" <<'REMOTE'
-          set -euo pipefail
-          path=$1
-          image=$2
-          revision=$3
-          cd "$path"
-          docker pull "$image"
-          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision"
-          REMOTE
-          ssh "${ssh_opts[@]}" "$USER@$HOST" "docker logout ghcr.io >/dev/null 2>&1 || true"
+              "set -euo pipefail;
+               cleanup(){ docker logout ghcr.io >/dev/null 2>&1 || true; };
+               trap cleanup EXIT;
+               cd -- $quoted_path;
+               docker login ghcr.io --username github-actions --password-stdin;
+               docker pull $quoted_image;
+               test \"\$(docker image inspect $quoted_image --format '{{index .Config.Labels \\\"org.opencontainers.image.revision\\\"}}')\" = $quoted_revision;
+               test \"\$(docker image inspect $quoted_image --format '{{index .Config.Labels \\\"org.opencontainers.image.version\\\"}}')\" = $quoted_version"
       - name: Capture, back up, deploy, and rollback on failure
         shell: bash
         run: |
@@ -196,17 +220,20 @@ jobs:
             -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
             -o ConnectionAttempts=1)
           set +e
-          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- "$PATH_ON_HOST" "$IMAGE@$DIGEST" "$SOURCE_SHA" <<'REMOTE'
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- "$PATH_ON_HOST" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
           set -euo pipefail
           path=$1
           image=$2
           revision=$3
+          version=$4
           cd "$path"
+          exec 9>"$path/.production-release.lock"
+          flock -n 9 || { echo "another production release is active" >&2; exit 75; }
           scripts/prepare-production-release.sh >/dev/null
           scripts/backup-production.sh >/dev/null
           mutation_started=0
           trap 'status=$?; if [ "$status" -ne 0 ] && [ "$mutation_started" -eq 1 ]; then scripts/rollback-production-release.sh || echo rollback_failed >&2; fi; exit "$status"' EXIT
-          scripts/update-production-release.sh "$image" "$revision" >/dev/null
+          scripts/update-production-release.sh "$image" "$revision" "$version" >/dev/null
           mutation_started=1
           scripts/deploy-production-release.sh >/dev/null
           REMOTE
@@ -217,3 +244,6 @@ jobs:
             exit "$status"
           fi
           echo "deployment=ready digest=$DIGEST"
+      - name: Logout from GHCR
+        if: always()
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
