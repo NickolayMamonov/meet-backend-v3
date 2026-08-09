@@ -1,0 +1,14 @@
+.git
+.github
+.gradle
+.kotlin
+.idea
+.run
+build
+out
+uploads
+.env
+.env.*
+*.iml
+*.log
+README.md

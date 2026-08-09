@@ -40,11 +40,11 @@ spring:
       max-request-size: 5MB
 
 server:
-  port: 8080
+  port: ${SERVER_PORT:8080}
 
 app:
   geocoder:
-    enabled: true
+    enabled: ${GEOCODER_ENABLED:true}
     api-key: ${LOCATIONIQ_KEY:}
     base-url: https://eu1.locationiq.com/v1
     lang: ru
@@ -64,7 +64,7 @@ app:
     refresh-token-expiration-days: 30
 
   timepad:
-    enabled: true
+    enabled: ${TIMEPAD_ENABLED:true}
     base-url: https://api.timepad.ru/v1
     token: ${TIMEPAD_TOKEN:}
     category-ids: [452]
@@ -116,10 +116,10 @@ app:
     provider: ${APP_SMS_PROVIDER:disabled}
 
   storage:
-    upload-dir: ./uploads
-    base-url: http://localhost:8080/media
-    max-file-size: 5242880
-    allowed-types: image/jpeg,image/png,image/webp
+    upload-dir: ${APP_STORAGE_UPLOAD_DIR:./uploads}
+    base-url: ${APP_STORAGE_BASE_URL:http://localhost:8080/media}
+    max-file-size: ${APP_STORAGE_MAX_FILE_SIZE:5242880}
+    allowed-types: ${APP_STORAGE_ALLOWED_TYPES:image/jpeg,image/png,image/webp}
 
 logging:
   level:

@@ -197,3 +197,13 @@ TEST_POSTGRES_USERNAME=postgres \
 TEST_POSTGRES_PASSWORD=postgres \
 ./gradlew test --tests dev.whysoezzy.meet.integration.ApiMvcIntegrationTest
 ```
+
+## Production deployment
+
+The repository includes a fixed-UID multi-stage image, immutable release identity,
+health/readiness probes, bounded container logs, persistent volumes, and a
+fail-fast production configuration. Production email OTP is wired to SMTP and
+requires operator-managed SMTP credentials plus an application OTP HMAC key ring;
+SMS remains disabled.
+
+See [`docs/production-deployment.md`](docs/production-deployment.md).
