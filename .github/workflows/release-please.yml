@@ -136,15 +136,19 @@ jobs:
           test "$(awk -F= '/^digest=/{print $2}' <<<"$final_state")" = "$digest"
           docker buildx imagetools inspect --raw "$IMAGE@$digest" > image-index.json
           docker buildx imagetools inspect "$IMAGE@$digest" > image-inspect.txt
-          jq -e '
-            ([.manifests[]? | select(.platform.architecture == "unknown" and .platform.os == "unknown")] | length) >= 2
-          ' image-index.json
+          evidence=$(scripts/verify-oci-evidence.sh "$IMAGE" "$digest" image-index.json)
+          provenance=$(awk -F= '/^provenance=/{print $2}' <<<"$evidence")
+          sbom=$(awk -F= '/^sbom=/{print $2}' <<<"$evidence")
+          test "$provenance" = true
+          test "$sbom" = true
           jq -n \
             --arg version "$VERSION" \
             --arg tag "$TAG" \
             --arg sourceSha "$SOURCE_SHA" \
             --arg image "$IMAGE" \
             --arg digest "$digest" \
+            --argjson provenance "$provenance" \
+            --argjson sbom "$sbom" \
             '{
               version: $version,
               tag: $tag,
@@ -154,8 +158,8 @@ jobs:
               aliases: ["v" + $version, $version, "sha-" + $sourceSha],
               platform: "linux/amd64",
               publicationPolicy: "exactly-three-aliases-publish-last",
-              provenance: true,
-              sbom: true,
+              provenance: $provenance,
+              sbom: $sbom,
               artifactAttestation: true,
               evidence: ["image-index.json", "image-inspect.txt"]
             }' > release-manifest.json

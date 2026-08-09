@@ -156,8 +156,9 @@ with configuration or credential changes.
 
    ```bash
    REVISION=<new-full-git-sha>
+   VERSION=<new-canonical-backend-semver>
    IMAGE=registry.example/meet-backend:git-$REVISION
-   scripts/update-production-release.sh "$IMAGE" "$REVISION"
+   scripts/update-production-release.sh "$IMAGE" "$REVISION" "$VERSION"
    ```
 
 5. Check out/build the exact revision as in section 1, then deploy:
@@ -186,6 +187,7 @@ state:
 
 ```bash
 LEGACY_PREVIOUS_REVISION=<full-40-character-lowercase-git-sha> \
+LEGACY_PREVIOUS_VERSION=<legacy-canonical-backend-semver> \
   scripts/prepare-production-release.sh
 ```
 
@@ -198,7 +200,7 @@ scripts/rollback-production-release.sh
 Rollback verifies the captured image ID, uploads volume, prior Compose files,
 effective UID/GID, and non-release config digest. It restores the prior image
 with the captured Compose/runtime definition while changing only
-`BACKEND_IMAGE` and `BACKEND_REVISION`; current secrets remain in
+`BACKEND_IMAGE`, `BACKEND_VERSION`, and `BACKEND_REVISION`; current secrets remain in
 `.env.production`. The protected `/var/lib/meet-production/active-*.yml` files
 keep that exact runtime definition active. The next normal deployment removes
 them and returns to the repository Compose file and `10001:10001`.

@@ -76,14 +76,20 @@ grep -Fxq "$approver_id" <<<"$reviewer_ids" || {
   exit 1
 }
 
-branch_policy=$(jq '[.protection_rules[]? | select(.type == "branch_policy")][0] // {}' <<<"$environment")
-custom_policy=$(jq -r 'if .custom_branch_policies == true then "custom" else "not-custom" end' <<<"$branch_policy")
+custom_policy=$(jq -r '
+  if .deployment_branch_policy.custom_branch_policies == true
+  then "custom" else "not-custom" end
+' <<<"$environment")
 printf 'deployment_branch_policy=%s\n' "$custom_policy"
 [ "$custom_policy" = custom ] || {
   echo "production must use a selected deployment branch policy" >&2
   exit 1
 }
-jq -e '.branch_policies | length == 1 and .[0].type == "branch" and .[0].name == "master"' \
+jq -e '
+  (.branch_policies | length == 1) and
+  (.branch_policies[0].name == "master") and
+  ((.branch_policies[0].type? // "branch") == "branch")
+' \
   <<<"$deployment_policies" >/dev/null || {
   echo "production deployment policy must allow exact master only" >&2
   exit 1

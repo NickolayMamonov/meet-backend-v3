@@ -41,6 +41,13 @@ Conventional Commit on `dev`, which creates a distinct patch tuple and source
 SHA through Release Please. The lock serializes cooperating workflows; it is
 not represented as a GHCR CAS guarantee.
 
+BuildKit provenance and SBOM publication is accepted only when the OCI index
+contains subject-bound attestation descriptors and their child manifests carry
+the expected in-toto predicate types (`slsa.dev/provenance` and SPDX or
+CycloneDX). `scripts/verify-oci-evidence.sh` derives the `provenance` and
+`sbom` fields in the release manifest from those descriptors; the workflow does
+not treat a handwritten boolean as evidence.
+
 ## Production access prerequisites
 
 `NickolayMamonov` is the current master-promotion authority. Before promoting

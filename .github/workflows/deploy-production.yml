@@ -83,6 +83,8 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
+      - name: Set up Buildx for descriptor verification
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       - name: Resolve and verify published release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -142,6 +144,15 @@ jobs:
           test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
           test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
           test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{.Config.User}}')" = "10001:10001"
+      - name: Verify subject-bound provenance and SBOM descriptors
+        run: |
+          set -euo pipefail
+          evidence=$(scripts/verify-oci-evidence.sh "$IMAGE" "$DIGEST" "$RUNNER_TEMP/release/image-index.json")
+          provenance=$(awk -F= '/^provenance=/{print $2}' <<<"$evidence")
+          sbom=$(awk -F= '/^sbom=/{print $2}' <<<"$evidence")
+          jq -e --argjson provenance "$provenance" --argjson sbom "$sbom" \
+            '.provenance == $provenance and .sbom == $sbom' \
+            "$RUNNER_TEMP/release/release-manifest.json"
       - name: Establish strict host trust
         shell: bash
         run: |
@@ -197,20 +208,28 @@ jobs:
           grep -q '^AGE_RECIPIENT=' "$path/.backup.env"
           cd "$path"
           REMOTE
-          quoted_path=$(printf '%q' "$PATH_ON_HOST")
-          quoted_image=$(printf '%q' "$IMAGE@$DIGEST")
-          quoted_revision=$(printf '%q' "$SOURCE_SHA")
-          quoted_version=$(printf '%q' "$VERSION")
-          printf '%s' "$GHCR_TOKEN" |
-            ssh "${ssh_opts[@]}" "$USER@$HOST" \
-              "set -euo pipefail;
-               cleanup(){ docker logout ghcr.io >/dev/null 2>&1 || true; };
-               trap cleanup EXIT;
-               cd -- $quoted_path;
-               docker login ghcr.io --username github-actions --password-stdin;
-               docker pull $quoted_image;
-               test \"\$(docker image inspect $quoted_image --format '{{index .Config.Labels \\\"org.opencontainers.image.revision\\\"}}')\" = $quoted_revision;
-               test \"\$(docker image inspect $quoted_image --format '{{index .Config.Labels \\\"org.opencontainers.image.version\\\"}}')\" = $quoted_version"
+          {
+            printf '%s\n' "$GHCR_TOKEN"
+            cat <<'REMOTE'
+          set -euo pipefail
+          IFS= read -r token
+          path=$1
+          image=$2
+          revision=$3
+          version=$4
+          cleanup() {
+            docker logout ghcr.io >/dev/null 2>&1 || true
+            unset token
+          }
+          trap cleanup EXIT
+          cd "$path"
+          printf '%s' "$token" | docker login ghcr.io --username github-actions --password-stdin
+          docker pull "$image"
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision"
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
+          REMOTE
+          } | ssh "${ssh_opts[@]}" "$USER@$HOST" \
+            bash -s -- "$PATH_ON_HOST" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION"
       - name: Capture, back up, deploy, and rollback on failure
         shell: bash
         run: |

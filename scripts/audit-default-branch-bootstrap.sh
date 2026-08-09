@@ -15,6 +15,7 @@ required_paths=(
   .github/workflows/deploy-production.yml
   .github/workflows/release-recovery.yml
   scripts/release-registry-state.sh
+  scripts/verify-oci-evidence.sh
   scripts/verify-release-consistency.sh
 )
 for path in "${required_paths[@]}"; do

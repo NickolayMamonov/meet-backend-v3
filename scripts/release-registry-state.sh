@@ -23,6 +23,7 @@ fi
 }
 [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid source revision" >&2; exit 2; }
 command -v jq >/dev/null || { echo "jq is required for identity inspection" >&2; exit 2; }
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 refs=(
   "$IMAGE:v$VERSION"
@@ -83,21 +84,23 @@ if [ "$unique_digests" -eq 1 ]; then
   label_version=$(jq -r '."org.opencontainers.image.version" // ""' <<<"$labels")
   label_revision=$(jq -r '."org.opencontainers.image.revision" // ""' <<<"$labels")
   label_source=$(jq -r '."org.opencontainers.image.source" // ""' <<<"$labels")
-  attestation_count=$(jq '
-    if (.manifests? | type) == "array" then
-      [.manifests[] | select(.platform.architecture == "unknown" and .platform.os == "unknown")] | length
-    else 0 end
-  ' <<<"$raw" 2>/dev/null || echo 0)
+  raw_file=$(mktemp)
+  printf '%s\n' "$raw" > "$raw_file"
+  evidence=$("$SCRIPT_DIR/verify-oci-evidence.sh" "$IMAGE" "$digest" "$raw_file" 2>/dev/null || true)
+  rm -f "$raw_file"
+  provenance=$(awk -F= '/^provenance=/{print $2}' <<<"$evidence")
+  sbom=$(awk -F= '/^sbom=/{print $2}' <<<"$evidence")
   if [ "$label_version" != "$VERSION" ] ||
      [ "$label_revision" != "$REVISION" ] ||
      [ "$label_source" != "https://github.com/NickolayMamonov/meet-backend-v3" ] ||
      [ "$platform" != "linux/amd64" ] ||
      [ "$user" != "10001:10001" ] ||
-     [ "$attestation_count" -lt 2 ]; then
+     [ "$provenance" != true ] ||
+     [ "$sbom" != true ]; then
     identity_mismatch=1
   fi
-  printf 'identity version=%s revision=%s source=%s platform=%s user=%s attestations=%s\n' \
-    "$label_version" "$label_revision" "$label_source" "$platform" "$user" "$attestation_count"
+  printf 'identity version=%s revision=%s source=%s platform=%s user=%s provenance=%s sbom=%s\n' \
+    "$label_version" "$label_revision" "$label_source" "$platform" "$user" "$provenance" "$sbom"
 fi
 
 if [ "$present" -eq 3 ] && [ "$unique_digests" -eq 1 ] && [ "$identity_mismatch" -eq 0 ]; then
