@@ -49,6 +49,7 @@ class MeetingUpsertService(
             existing.description = raw.description
             existing.imageUrl = raw.imageUrl
             existing.time = raw.startsAtEpochMs
+            existing.endsAt = raw.endsAtEpochMs
             existing.date = dateLabel
             existing.address = raw.address
             existing.latitude = lat
@@ -67,6 +68,7 @@ class MeetingUpsertService(
                 description = raw.description,
                 imageUrl = raw.imageUrl,
                 time = raw.startsAtEpochMs,
+                endsAt = raw.endsAtEpochMs,
                 date = dateLabel,
                 address = raw.address,
                 latitude = lat,

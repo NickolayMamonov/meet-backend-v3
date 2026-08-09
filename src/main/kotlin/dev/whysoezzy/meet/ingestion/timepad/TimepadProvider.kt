@@ -13,7 +13,6 @@ import java.time.LocalDateTime
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-import java.time.format.DateTimeParseException
 import com.fasterxml.jackson.databind.JsonNode
 
 private val logger = KotlinLogging.logger {}
@@ -46,7 +45,7 @@ class TimepadProvider(
                         .queryParam("limit", props.pageSize)
                         .queryParam("skip", skip)
                         .queryParam("sort", "+starts_at")
-                        .queryParam("fields", "location,description_short,description_html")
+                        .queryParam("fields", "location,description_short,description_html,ends_at")
                         .queryParam("starts_at_min", startMin)
                         .queryParam("starts_at_max", startMax)
                     if (props.categoryIds.isNotEmpty()) b.queryParam("category_ids", props.categoryIds.joinToString(","))
@@ -59,7 +58,15 @@ class TimepadProvider(
                 .body(TimepadEventsResponse::class.java) ?: break
 
             if (response.values.isEmpty()) break
-            response.values.forEach { collected += it.toRawEvent(zone) }
+            response.values.forEach { event ->
+                try {
+                    collected += event.toRawEvent(zone)
+                } catch (rejection: EventMappingRejection) {
+                    logger.warn {
+                        "Timepad: skipped event source=${source()} externalId=${event.id} reason=${rejection.reason}"
+                    }
+                }
+            }
             logger.info { "Timepad: страница ${page + 1}, получено ${response.values.size}/${response.total}" }
 
             if (skip + response.values.size >= response.total) break
@@ -90,12 +97,24 @@ class TimepadProvider(
             else -> "Онлайн"
         }
 
+        val startsAtEpochMs = parseTimestamp(startsAt, zone) ?: 0L
+        val endsAtEpochMs = if (endsAt.isNullOrBlank()) {
+            null
+        } else {
+            parseTimestamp(endsAt, zone)
+                ?: throw EventMappingRejection("malformed_end")
+        }
+        if (endsAtEpochMs != null && endsAtEpochMs < startsAtEpochMs) {
+            throw EventMappingRejection("end_before_start")
+        }
+
         return RawEvent(
             sourceExternalId = id.toString(),
             title = name,
             description = descriptionShort?.takeIf { it.isNotBlank() } ?: descriptionHtml.orEmpty(),
             imageUrl = imageUrl,
-            startsAtEpochMs = parseStartsAt(startsAt, zone),
+            startsAtEpochMs = startsAtEpochMs,
+            endsAtEpochMs = endsAtEpochMs,
             address = addr,
             latitude = lat,
             longitude = lng,
@@ -105,8 +124,8 @@ class TimepadProvider(
         )
     }
 
-    private fun parseStartsAt(value: String?, zone: ZoneId): Long {
-        if (value.isNullOrBlank()) return 0L
+    private fun parseTimestamp(value: String?, zone: ZoneId): Long? {
+        if (value.isNullOrBlank()) return null
         // Timepad обычно отдаёт смещение без двоеточия: 2026-09-15T19:00:00+0300
         runCatching {
             return OffsetDateTime.parse(value, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ"))
@@ -120,15 +139,14 @@ class TimepadProvider(
             return LocalDateTime.parse(value, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"))
                 .atZone(zone).toInstant().toEpochMilli()
         }
-        return try {
+        return runCatching {
             LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE)
                 .atStartOfDay(zone).toInstant().toEpochMilli()
-        } catch (_: DateTimeParseException) {
-            logger.warn { "Timepad: unrecognized event date format" }
-            0L
-        }
+        }.getOrNull()
     }
 }
+
+private class EventMappingRejection(val reason: String) : RuntimeException()
 
 private fun extractCategoryNames(node: JsonNode?): Set<String> {
     // categories бывает массивом [{name:...}] или объектом {..:{name:...}} — обходим оба
