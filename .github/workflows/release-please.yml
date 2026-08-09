@@ -1,0 +1,158 @@
+name: Backend release
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    name: Release Please
+    runs-on: ubuntu-24.04
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      release-id: ${{ steps.release.outputs.release_id }}
+    steps:
+      - name: Release Please manifest
+        id: release
+        uses: googleapis/release-please-action@c2a5a2bd6a758a0937f1ddb1e8950609867ed15c
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          target-branch: dev
+          manifest-file: .release-please-manifest.json
+          config-file: release-please-config.json
+
+  gates:
+    name: Re-run release gates
+    needs: release
+    if: needs.release.outputs.created == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.release.outputs.tag }}
+
+  publish:
+    name: Publish immutable release
+    needs: [release, gates]
+    if: needs.release.outputs.created == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+      VERSION: ${{ needs.release.outputs.version }}
+      SOURCE_SHA: ${{ needs.release.outputs.sha }}
+      IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          fetch-depth: 0
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - name: Authenticate to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Inspect registry before publication
+        id: registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          result=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA")
+          status=$?
+          set -e
+          printf '%s\n' "$result"
+          state=$(printf '%s\n' "$result" | awk -F= '/^state=/{print $2}')
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [ "$state" = complete ]; then
+            digest=$(printf '%s\n' "$result" | awk -F= '/^digest=/{print $2}')
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$status" -eq 42 ]; then
+            gh release edit "$TAG" --draft --notes-file release-quarantine.json
+            echo "partial/divergent/raced aliases are quarantined; no GHCR repair is attempted" >&2
+            exit 1
+          fi
+          [ "$status" -eq 0 ] && [ "$state" = empty -o "$state" = complete ]
+      - name: Build and publish exactly three aliases
+        id: publish-image
+        env:
+          REGISTRY_STATE: ${{ steps.registry.outputs.state }}
+          REGISTRY_DIGEST: ${{ steps.registry.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test "$TAG" = "v$VERSION"
+          test "$SOURCE_SHA" = "$(git rev-list -n 1 "$TAG")"
+          test "$(jq -r '.version' version.json)" = "$VERSION"
+          revision=$(git rev-parse HEAD)
+          test "$revision" = "$SOURCE_SHA"
+          mkdir -p "$RUNNER_TEMP/release"
+          if [ "$REGISTRY_STATE" = complete ]; then
+            digest="$REGISTRY_DIGEST"
+          else
+            test "$REGISTRY_STATE" = empty
+            docker buildx build \
+              --platform linux/amd64 \
+              --provenance=true \
+              --sbom=true \
+              --push \
+              --tag "$IMAGE:$TAG" \
+              --tag "$IMAGE:$VERSION" \
+              --tag "$IMAGE:sha-$SOURCE_SHA" \
+              --build-arg "BACKEND_VERSION=$VERSION" \
+              --build-arg "BACKEND_REVISION=$SOURCE_SHA" \
+              --metadata-file "$RUNNER_TEMP/release/build-metadata.json" \
+              .
+            digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/release/build-metadata.json")
+          fi
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          docker pull "$IMAGE@$digest"
+          test "$(docker image inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
+          test "$(docker image inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
+          test "$(docker image inspect "$IMAGE@$digest" --format '{{.Config.User}}')" = "10001:10001"
+          docker run --rm --entrypoint sh "$IMAGE@$digest" -ec \
+            'test -f /app/app.jar && test -d /data/uploads && test -w /data/uploads'
+          final_state=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA")
+          printf '%s\n' "$final_state"
+          grep -Fx 'state=complete' <<<"$final_state"
+          test "$(awk -F= '/^digest=/{print $2}' <<<"$final_state")" = "$digest"
+          cat > release-manifest.json <<EOF
+          {
+            "version": "$VERSION",
+            "tag": "$TAG",
+            "sourceSha": "$SOURCE_SHA",
+            "image": "$IMAGE",
+            "digest": "$digest",
+            "aliases": ["$TAG", "$VERSION", "sha-$SOURCE_SHA"],
+            "platform": "linux/amd64",
+            "publicationPolicy": "exactly-three-aliases-publish-last"
+          }
+          EOF
+          sha256sum release-manifest.json > SHA256SUMS
+      - name: Create artifact attestation
+        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.publish-image.outputs.digest }}
+          push-to-registry: true
+      - name: Attach evidence and publish last
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" release-manifest.json SHA256SUMS
+          gh release edit "$TAG" --draft=false

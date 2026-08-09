@@ -1,0 +1,22 @@
+{
+  "release-type": "simple",
+  "package-name": "meet-backend",
+  "initial-version": "1.0.0",
+  "include-v-in-tag": true,
+  "draft": true,
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "refactor", "section": "Refactoring" }
+  ],
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "meet-backend",
+      "extra-files": [
+        { "type": "json", "path": "version.json", "jsonpath": "$.version" }
+      ]
+    }
+  }
+}

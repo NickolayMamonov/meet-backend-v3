@@ -1,0 +1,63 @@
+name: Backend release recovery audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft tag to quarantine
+        required: true
+        type: string
+      version:
+        description: Canonical SemVer for the draft
+        required: true
+        type: string
+      source_sha:
+        description: Full source SHA recorded by Release Please
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  quarantine:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag }}
+      VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
+    steps:
+      - name: Checkout default-branch recovery tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Set up read-only registry inspection
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - name: Authenticate for read-only inspection
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Quarantine without registry mutation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$TAG" = "v$VERSION"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin dev
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/dev
+          gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -Fx true
+          set +e
+          scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+            --quarantine-file "$RUNNER_TEMP/quarantine.json"
+          status=$?
+          set -e
+          test "$status" -eq 42
+          gh release edit "$TAG" --draft --notes-file "$RUNNER_TEMP/quarantine.json"
+          jq -e '.registryWrites == 0' "$RUNNER_TEMP/quarantine.json"

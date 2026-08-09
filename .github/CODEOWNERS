@@ -1,0 +1,6 @@
+# NickolayMamonov is the current master-promotion authority. A distinct,
+# operator-supplied PRODUCTION_APPROVER must also review production promotion.
+/.github/workflows/ @NickolayMamonov
+/scripts/ @NickolayMamonov
+/Dockerfile @NickolayMamonov
+/docker-compose.production.yml @NickolayMamonov
