@@ -21,8 +21,8 @@ class MeetingUpsertService(
     private val tagRepository: dev.whysoezzy.meet.domain.repository.TagRepository,
     private val topicClassifier: TopicClassifier,
     private val geocodingService: GeocodingService,
-    @Value("\${app.ingestion.zone:Europe/Moscow}") private val zoneId: String,
-    @Value("\${app.ingestion.only-matching-topics:true}") private val onlyMatchingTopics: Boolean,
+    @param:Value("\${app.ingestion.zone:Europe/Moscow}") private val zoneId: String,
+    @param:Value("\${app.ingestion.only-matching-topics:true}") private val onlyMatchingTopics: Boolean,
 ) {
     private val dateFormatter = DateTimeFormatter.ofPattern("dd.MM.yyyy")
 

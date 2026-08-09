@@ -1,6 +1,6 @@
 package dev.whysoezzy.meet.integration
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.jayway.jsonpath.JsonPath
 import dev.whysoezzy.meet.domain.entity.AuthIdentity
 import dev.whysoezzy.meet.domain.entity.AuthIdentityType
@@ -19,7 +19,7 @@ import org.junit.jupiter.api.Test
 import org.mockito.Mockito.mockingDetails
 import org.mockito.Mockito.reset
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.boot.test.mock.mockito.MockBean
+import org.springframework.test.context.bean.override.mockito.MockitoBean
 import org.springframework.http.MediaType
 import org.springframework.test.web.servlet.MockMvc
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete
@@ -36,16 +36,16 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class ApiMvcIntegrationTest(
-    @Autowired private val mockMvc: MockMvc,
-    @Autowired private val identities: AuthIdentityRepository,
-    @Autowired private val hasher: OtpHasher,
-    @Autowired private val lifecycle: OtpChallengeLifecycle,
+class ApiMvcIntegrationTest @Autowired constructor(
+    private val mockMvc: MockMvc,
+    private val identities: AuthIdentityRepository,
+    private val hasher: OtpHasher,
+    private val lifecycle: OtpChallengeLifecycle,
 ) : IntegrationTestSupport() {
-    @MockBean
+    @MockitoBean
     private lateinit var emailSender: EmailOtpSender
 
-    @MockBean
+    @MockitoBean
     private lateinit var smsSender: SmsSender
 
     @BeforeEach
@@ -89,7 +89,7 @@ class ApiMvcIntegrationTest(
             .contentAsString
         assertEquals(
             "+15550000088",
-            jwtPayload(JsonPath.read(response, "$.accessToken")).path("phone").asText(),
+            jwtPayload(JsonPath.read(response, "$.accessToken")).path("phone").asString(),
         )
 
         mockMvc.perform(
@@ -232,7 +232,7 @@ class ApiMvcIntegrationTest(
             .contentAsString
         val accessToken = JsonPath.read<String>(authResponse, "$.accessToken")
         val refreshToken = JsonPath.read<String>(authResponse, "$.refreshToken")
-        assertEquals("+15550000001", jwtPayload(accessToken).path("phone").asText())
+        assertEquals("+15550000001", jwtPayload(accessToken).path("phone").asString())
 
         mockMvc.perform(get("/profile").bearer(accessToken))
             .andExpect(status().isOk)

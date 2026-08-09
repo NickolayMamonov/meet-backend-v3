@@ -6,8 +6,8 @@ import dev.whysoezzy.meet.service.auth.identifier.IpLiteralParser
 import dev.whysoezzy.meet.service.auth.otp.OtpAttemptStore
 import dev.whysoezzy.meet.service.auth.otp.OtpChallengeStore
 import dev.whysoezzy.meet.service.auth.otp.OtpRequestRateLimiter
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
@@ -165,28 +165,28 @@ class OtpCleanupPostgresTest(
         )
         val root = ObjectMapper().readTree(planJson)
         val eligibleSubplans = findNodes(root) {
-            it.path("Subplan Name").asText() == "CTE eligible"
+            it.path("Subplan Name").asString() == "CTE eligible"
         }
         assertTrue(eligibleSubplans.isNotEmpty(), root.toPrettyString())
         val eligible = eligibleSubplans.first()
         assertTrue(
-            findNodes(eligible) { it.path("Node Type").asText() == "Limit" }.isNotEmpty(),
+            findNodes(eligible) { it.path("Node Type").asString() == "Limit" }.isNotEmpty(),
             root.toPrettyString(),
         )
         assertTrue(
-            findNodes(eligible) { it.path("Node Type").asText() == "LockRows" }.isNotEmpty(),
+            findNodes(eligible) { it.path("Node Type").asString() == "LockRows" }.isNotEmpty(),
             root.toPrettyString(),
         )
         val indexScans = findNodes(eligible) {
-            it.path("Index Name").asText() == "idx_otp_codes_expires_id"
+            it.path("Index Name").asString() == "idx_otp_codes_expires_id"
         }
         assertTrue(indexScans.isNotEmpty(), root.toPrettyString())
         assertTrue(
-            indexScans.any { it.path("Index Cond").asText().contains("expires_at") },
+            indexScans.any { it.path("Index Cond").asString().contains("expires_at") },
             root.toPrettyString(),
         )
         assertTrue(
-            findNodes(eligible) { it.path("Node Type").asText() == "Sort" }.isEmpty(),
+            findNodes(eligible) { it.path("Node Type").asString() == "Sort" }.isEmpty(),
             root.toPrettyString(),
         )
     }
@@ -292,8 +292,8 @@ class OtpCleanupPostgresTest(
             matches.add(node)
         }
         when {
-            node.isObject -> node.elements().forEachRemaining { matches.addAll(findNodes(it, predicate)) }
-            node.isArray -> node.elements().forEachRemaining { matches.addAll(findNodes(it, predicate)) }
+            node.isObject -> node.values().forEach { matches.addAll(findNodes(it, predicate)) }
+            node.isArray -> node.values().forEach { matches.addAll(findNodes(it, predicate)) }
         }
         return matches
     }

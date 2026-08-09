@@ -8,8 +8,8 @@ import io.jsonwebtoken.security.Keys
 import org.assertj.core.api.Assertions.assertThat
 import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.boot.test.context.runner.ApplicationContextRunner
-import org.springframework.context.annotation.Configuration
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import org.springframework.boot.test.context.TestConfiguration
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import java.util.Base64
 import java.util.Date
 import kotlin.test.Test
@@ -46,7 +46,7 @@ class JwtServiceTest {
             Base64.getUrlDecoder().decode(token.split('.')[1]),
         )
 
-        assertEquals("42", payload.path("sub").asText())
+        assertEquals("42", payload.path("sub").asString())
         assertEquals(3, payload.path("av").asLong())
         assertFalse(payload.has("phone"))
         assertFalse(payload.has("email"))
@@ -206,6 +206,6 @@ class JwtServiceTest {
     }
 }
 
-@Configuration(proxyBeanMethods = false)
+@TestConfiguration(proxyBeanMethods = false)
 @EnableConfigurationProperties(JwtProperties::class)
 private class JwtPropertiesTestConfiguration

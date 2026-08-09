@@ -14,7 +14,7 @@ import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
-import com.fasterxml.jackson.databind.JsonNode
+import tools.jackson.databind.JsonNode
 
 private val logger = KotlinLogging.logger {}
 
@@ -72,15 +72,15 @@ class TimepadProvider(
     private fun TimepadEvent.toRawEvent(zone: ZoneId): RawEvent {
         // poster_image / location могут прийти объектом, пустым массивом [] или отсутствовать —
         // JsonNode.path() безопасен в любом случае (вернёт MissingNode, не упадёт).
-        val imageUrl = posterImage?.path("default_url")?.takeIf { it.isTextual }?.asText().orEmpty()
+        val imageUrl = posterImage?.path("default_url")?.takeIf { it.isString }?.stringValue().orEmpty()
 
         val loc = location
-        val city = loc?.path("city")?.takeIf { it.isTextual }?.asText().orEmpty()
-        val address = loc?.path("address")?.takeIf { it.isTextual }?.asText().orEmpty()
+        val city = loc?.path("city")?.takeIf { it.isString }?.stringValue().orEmpty()
+        val address = loc?.path("address")?.takeIf { it.isString }?.stringValue().orEmpty()
 
         val coords = loc?.path("coordinates")
-        val lat = coords?.takeIf { it.isArray && it.size() > 0 }?.get(0)?.asText()?.toDoubleOrNull() ?: 0.0
-        val lng = coords?.takeIf { it.isArray && it.size() > 1 }?.get(1)?.asText()?.toDoubleOrNull() ?: 0.0
+        val lat = coords?.takeIf { it.isArray && it.size() > 0 }?.get(0)?.asString()?.toDoubleOrNull() ?: 0.0
+        val lng = coords?.takeIf { it.isArray && it.size() > 1 }?.get(1)?.asString()?.toDoubleOrNull() ?: 0.0
 
         val hasPhysical = address.isNotBlank() ||
                 (city.isNotBlank() && !city.equals("Онлайн", ignoreCase = true))
@@ -133,8 +133,8 @@ class TimepadProvider(
 private fun extractCategoryNames(node: JsonNode?): Set<String> {
     // categories бывает массивом [{name:...}] или объектом {..:{name:...}} — обходим оба
     if (node == null || (!node.isArray && !node.isObject)) return emptySet()
-    return node.elements().asSequence()
-        .mapNotNull { el -> el.path("name").takeIf { it.isTextual }?.asText() }
+    return node.values().asSequence()
+        .mapNotNull { el -> el.path("name").takeIf { it.isString }?.stringValue() }
         .filter { it.isNotBlank() }
         .toSet()
 }

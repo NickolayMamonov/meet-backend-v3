@@ -262,7 +262,7 @@ class EmailOtpMigrationPostgresTest {
             """.trimIndent(),
             Boolean::class.java,
             table,
-        )
+        ) ?: error("table existence query returned no result")
 
     private fun JdbcTemplate.indexExists(name: String): Boolean =
         queryForObject(
@@ -276,7 +276,7 @@ class EmailOtpMigrationPostgresTest {
             """.trimIndent(),
             Boolean::class.java,
             name,
-        )
+        ) ?: error("index existence query returned no result")
 
     private fun JdbcTemplate.indexIsReady(name: String): Boolean =
         queryForObject(
@@ -289,7 +289,7 @@ class EmailOtpMigrationPostgresTest {
             """.trimIndent(),
             Boolean::class.java,
             name,
-        )
+        ) ?: error("index state query returned no result")
 
     private fun JdbcTemplate.indexIsValid(name: String): Boolean =
         queryForObject(
@@ -302,7 +302,7 @@ class EmailOtpMigrationPostgresTest {
             """.trimIndent(),
             Boolean::class.java,
             name,
-        )
+        ) ?: error("index state query returned no result")
 
     private fun columns(table: String): List<ColumnSpec> =
         jdbc.query(

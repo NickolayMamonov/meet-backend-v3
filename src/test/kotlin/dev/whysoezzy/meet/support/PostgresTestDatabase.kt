@@ -2,7 +2,7 @@ package dev.whysoezzy.meet.support
 
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.jdbc.datasource.DriverManagerDataSource
-import org.testcontainers.containers.PostgreSQLContainer
+import org.testcontainers.postgresql.PostgreSQLContainer
 import java.util.UUID
 
 class PostgresTestDatabase(
@@ -12,7 +12,7 @@ class PostgresTestDatabase(
     private val schema = "${schemaPrefix}_${UUID.randomUUID().toString().replace("-", "")}"
     private val containerDelegate = lazy {
         try {
-            PostgreSQLContainer<Nothing>("postgres:16-alpine").apply { start() }
+            PostgreSQLContainer("postgres:16-alpine").apply { start() }
         } catch (exception: Exception) {
             throw IllegalStateException(
                 "PostgreSQL tests require Docker or TEST_POSTGRES_JDBC_URL with username and password",

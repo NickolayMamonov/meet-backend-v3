@@ -1,10 +1,9 @@
 package dev.whysoezzy.meet.ingestion
 
-import com.fasterxml.jackson.databind.JsonNode
+import tools.jackson.databind.JsonNode
 import dev.whysoezzy.meet.config.GeocoderProperties
 import mu.KotlinLogging
-import org.springframework.boot.web.client.ClientHttpRequestFactories
-import org.springframework.boot.web.client.ClientHttpRequestFactorySettings
+import org.springframework.http.client.SimpleClientHttpRequestFactory
 import org.springframework.stereotype.Service
 import org.springframework.web.client.RestClient
 import java.time.Duration
@@ -21,13 +20,10 @@ class GeocodingService(
     private val cache = ConcurrentHashMap<String, Coordinates>()
     private val client = restClientBuilder
         .baseUrl(props.baseUrl)
-        .requestFactory(
-            ClientHttpRequestFactories.get(
-                ClientHttpRequestFactorySettings.DEFAULTS
-                    .withConnectTimeout(Duration.ofSeconds(3))
-                    .withReadTimeout(Duration.ofSeconds(5))
-            )
-        )
+        .requestFactory(SimpleClientHttpRequestFactory().apply {
+            setConnectTimeout(Duration.ofSeconds(3))
+            setReadTimeout(Duration.ofSeconds(5))
+        })
         .build()
 
     fun geocode(address: String): Coordinates? {
@@ -57,8 +53,8 @@ class GeocodingService(
             .body(JsonNode::class.java)
 
         body?.firstOrNull()?.let { node ->
-            val lat = node.path("lat").asText().toDoubleOrNull()
-            val lon = node.path("lon").asText().toDoubleOrNull()
+            val lat = node.path("lat").asString().toDoubleOrNull()
+            val lon = node.path("lon").asString().toDoubleOrNull()
             if (lat != null && lon != null) Coordinates(lat, lon) else null
         }
     } catch (_: Exception) {
