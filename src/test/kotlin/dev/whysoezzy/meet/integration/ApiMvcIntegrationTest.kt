@@ -4,6 +4,9 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.jayway.jsonpath.JsonPath
 import dev.whysoezzy.meet.domain.entity.AuthIdentity
 import dev.whysoezzy.meet.domain.entity.AuthIdentityType
+import dev.whysoezzy.meet.domain.entity.Meeting
+import dev.whysoezzy.meet.domain.entity.MeetingStatus
+import dev.whysoezzy.meet.domain.entity.Tag
 import dev.whysoezzy.meet.domain.entity.User
 import dev.whysoezzy.meet.domain.repository.AuthIdentityRepository
 import dev.whysoezzy.meet.service.auth.identifier.AuthIdentifier
@@ -18,6 +21,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.mockito.Mockito.mockingDetails
 import org.mockito.Mockito.reset
+import org.mockito.Mockito.`when`
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.mock.mockito.MockBean
 import org.springframework.http.MediaType
@@ -30,6 +34,7 @@ import org.springframework.test.web.servlet.result.MockMvcResultMatchers.header
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.status
 import java.util.Base64
+import java.time.Clock
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
@@ -48,10 +53,14 @@ class ApiMvcIntegrationTest(
     @MockBean
     private lateinit var smsSender: SmsSender
 
+    @MockBean
+    private lateinit var clock: Clock
+
     @BeforeEach
     fun setUp() {
         resetDatabase()
-        reset(emailSender, smsSender)
+        reset(emailSender, smsSender, clock)
+        `when`(clock.millis()).thenReturn(FIXED_DISCOVERY_NOW)
     }
 
     @Test
@@ -459,6 +468,143 @@ class ApiMvcIntegrationTest(
     }
 
     @Test
+    fun `all discovery routes use one fixed boundary and keep details history and DTO shape`() {
+        val topic = tags.save(Tag("Discovery"))
+        val alice = users.save(User("Alice", "Discovery", "+15550000101"))
+        val bob = users.save(User("Bob", "Discovery", "+15550000102"))
+        val carol = users.save(User("Carol", "Discovery", "+15550000103"))
+
+        val completedExplicit = saveDiscoveryMeeting(
+            title = "Discovery completed explicit",
+            time = FIXED_DISCOVERY_NOW + 10,
+            endsAt = FIXED_DISCOVERY_NOW - 1,
+            tags = setOf(topic),
+            participants = setOf(alice, bob, carol),
+        )
+        val boundaryExplicit = saveDiscoveryMeeting(
+            title = "Discovery boundary explicit",
+            time = FIXED_DISCOVERY_NOW + 20,
+            endsAt = FIXED_DISCOVERY_NOW,
+            tags = setOf(topic),
+        )
+        val futureExplicit = saveDiscoveryMeeting(
+            title = "Discovery future explicit",
+            time = FIXED_DISCOVERY_NOW + 30,
+            endsAt = FIXED_DISCOVERY_NOW + 1_000,
+            tags = setOf(topic),
+        )
+        val boundaryFallback = saveDiscoveryMeeting(
+            title = "Discovery boundary fallback",
+            time = FIXED_DISCOVERY_NOW,
+            tags = setOf(topic),
+        )
+        val completedFallback = saveDiscoveryMeeting(
+            title = "Discovery completed fallback",
+            time = FIXED_DISCOVERY_NOW - 1,
+            tags = setOf(topic),
+        )
+        val popularFuture = saveDiscoveryMeeting(
+            title = "Discovery popular future",
+            time = FIXED_DISCOVERY_NOW + 40,
+            endsAt = FIXED_DISCOVERY_NOW + 2_000,
+            tags = setOf(topic),
+            participants = setOf(alice),
+        )
+        val extraFuture = saveDiscoveryMeeting(
+            title = "Discovery extra future",
+            time = FIXED_DISCOVERY_NOW + 50,
+            endsAt = FIXED_DISCOVERY_NOW + 3_000,
+            tags = setOf(topic),
+        )
+        saveDiscoveryMeeting(
+            title = "Cancelled discovery",
+            time = FIXED_DISCOVERY_NOW + 60,
+            endsAt = FIXED_DISCOVERY_NOW + 4_000,
+            status = MeetingStatus.CANCELLED,
+            tags = setOf(topic),
+        )
+
+        val allPage0 = mockMvc.perform(
+            get("/meetings").param("page", "0").param("limit", "3"),
+        )
+            .andExpect(status().isOk)
+            .andExpect(jsonPath("$[0].id").value(boundaryFallback.id))
+            .andExpect(jsonPath("$[1].id").value(boundaryExplicit.id))
+            .andExpect(jsonPath("$[2].id").value(futureExplicit.id))
+            .andExpect(jsonPath("$[0].endsAt").doesNotExist())
+            .andExpect(jsonPath("$[0].ends_at").doesNotExist())
+            .andReturn()
+        val allPage0Ids = responseIds(allPage0.response.contentAsString)
+        assertEquals(listOf(boundaryFallback.id, boundaryExplicit.id, futureExplicit.id), allPage0Ids)
+
+        val allPage1 = mockMvc.perform(
+            get("/meetings").param("page", "1").param("limit", "2"),
+        )
+            .andExpect(status().isOk)
+            .andReturn()
+        assertEquals(
+            listOf(futureExplicit.id, popularFuture.id),
+            responseIds(allPage1.response.contentAsString),
+        )
+
+        val tagged = mockMvc.perform(
+            get("/meetings")
+                .param("tagId", topic.id.toString())
+                .param("page", "0")
+                .param("limit", "2"),
+        )
+            .andExpect(status().isOk)
+            .andReturn()
+        val taggedIds = responseIds(tagged.response.contentAsString)
+        assertEquals(listOf(boundaryFallback.id, boundaryExplicit.id), taggedIds)
+
+        val search = mockMvc.perform(get("/meetings/search").param("query", "Discovery"))
+            .andExpect(status().isOk)
+            .andExpect(jsonPath("$[0].time").value(FIXED_DISCOVERY_NOW))
+            .andExpect(jsonPath("$[0].meetingStatus").value("ACTIVE"))
+            .andExpect(jsonPath("$[0].source").value("MANUAL"))
+            .andExpect(jsonPath("$[0].endsAt").doesNotExist())
+            .andReturn()
+        val searchIds = responseIds(search.response.contentAsString)
+
+        val popular = mockMvc.perform(get("/meetings/popular"))
+            .andExpect(status().isOk)
+            .andReturn()
+        val popularIds = responseIds(popular.response.contentAsString)
+        assertEquals(popularFuture.id, popularIds.first())
+
+        val main = mockMvc.perform(get("/meetings/main"))
+            .andExpect(status().isOk)
+            .andReturn()
+        val mainIds = responseIds(main.response.contentAsString)
+        assertEquals(boundaryFallback.id, mainIds.first())
+        assertTrue(popularFuture.id in mainIds)
+        assertTrue(extraFuture.id in mainIds)
+        assertEquals(mainIds.distinct(), mainIds)
+
+        listOf(allPage0Ids, responseIds(allPage1.response.contentAsString), taggedIds, searchIds, popularIds, mainIds)
+            .forEach { ids ->
+                assertTrue(completedExplicit.id !in ids)
+                assertTrue(completedFallback.id !in ids)
+            }
+        assertTrue(boundaryExplicit.id in searchIds)
+        assertTrue(boundaryFallback.id in popularIds)
+
+        mockMvc.perform(get("/meetings/${completedExplicit.id}"))
+            .andExpect(status().isOk)
+            .andExpect(jsonPath("$.id").value(completedExplicit.id))
+            .andExpect(jsonPath("$.time").value(FIXED_DISCOVERY_NOW + 10))
+            .andExpect(jsonPath("$.meetingStatus").value("ACTIVE"))
+            .andExpect(jsonPath("$.endsAt").doesNotExist())
+            .andExpect(jsonPath("$.ends_at").doesNotExist())
+
+        val historyToken = tokenFor(alice)
+        mockMvc.perform(get("/user/meetings").bearer(historyToken))
+            .andExpect(status().isOk)
+            .andExpect(jsonPath("$[?(@.id == ${completedExplicit.id})]").isNotEmpty)
+    }
+
+    @Test
     fun `tags and ads endpoints serialize repository-backed fixtures`() {
         val data = fixture()
 
@@ -530,4 +676,35 @@ class ApiMvcIntegrationTest(
 
     private fun org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder.bearer(token: String) =
         header("Authorization", "Bearer $token")
+
+    private fun saveDiscoveryMeeting(
+        title: String,
+        time: Long,
+        endsAt: Long? = null,
+        status: MeetingStatus = MeetingStatus.ACTIVE,
+        tags: Set<Tag> = emptySet(),
+        participants: Set<User> = emptySet(),
+    ): Meeting = meetings.saveAndFlush(
+        Meeting(
+            title = title,
+            description = "Discovery fixture",
+            imageUrl = "",
+            time = time,
+            date = "14.11.2023",
+            address = "Discovery address",
+            latitude = 55.75,
+            longitude = 37.61,
+            status = status,
+            tags = tags.toMutableSet(),
+            participants = participants.toMutableSet(),
+            endsAt = endsAt,
+        ),
+    )
+
+    private fun responseIds(body: String): List<Long> =
+        JsonPath.read<List<Number>>(body, "$[*].id").map(Number::toLong)
+
+    companion object {
+        private const val FIXED_DISCOVERY_NOW = 1_700_000_000_000L
+    }
 }

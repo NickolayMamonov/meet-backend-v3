@@ -1,5 +1,7 @@
 package dev.whysoezzy.meet.integration
 
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
 import dev.whysoezzy.meet.domain.entity.Meeting
 import dev.whysoezzy.meet.domain.entity.MeetingStatus
 import dev.whysoezzy.meet.domain.entity.Tag
@@ -99,6 +101,43 @@ class MeetingDiscoveryRepositoryPostgresTest : IntegrationTestSupport() {
     }
 
     @Test
+    fun `chronological and popular exclusions are applied before limits`() {
+        val now = 1_700_000_000_000L
+        val excludedParticipant = users.save(User("Excluded", "Participant", "+15550000003"))
+        val excluded = meetings.save(
+            meeting("excluded", now + 1).also {
+                it.participants.add(excludedParticipant)
+            },
+        )
+        val chronologicalOne = meetings.save(meeting("chronological-one", now + 2))
+        val chronologicalTwo = meetings.save(meeting("chronological-two", now + 3))
+        val popularOne = meetings.save(meeting("popular-one", now + 4))
+        val popularTwo = meetings.save(meeting("popular-two", now + 5))
+        meetings.flush()
+
+        val chronological = meetings.findDiscoveryMeetingsExcluding(
+            MeetingStatus.ACTIVE,
+            now,
+            setOf(excluded.id!!),
+            PageRequest.of(0, 2),
+        )
+        val popular = meetings.findPopularDiscoveryMeetingsExcluding(
+            MeetingStatus.ACTIVE,
+            now,
+            setOf(excluded.id!!),
+            PageRequest.of(0, 2),
+        )
+
+        assertEquals(listOf(chronologicalOne.id, chronologicalTwo.id), chronological.map { it.id })
+        assertEquals(listOf(chronologicalOne.id, chronologicalTwo.id), popular.map { it.id })
+        assertEquals(popular.size, popular.map { it.id }.distinct().size)
+        assertTrue(excluded.id !in chronological.map { it.id })
+        assertTrue(excluded.id !in popular.map { it.id })
+        assertTrue(popularOne.id !in popular.map { it.id })
+        assertTrue(popularTwo.id !in popular.map { it.id })
+    }
+
+    @Test
     fun `detail and participant history remain available for completed meetings`() {
         val participant = users.save(User("History", "User", "+15550000002"))
         val completed = meetings.save(
@@ -113,21 +152,162 @@ class MeetingDiscoveryRepositoryPostgresTest : IntegrationTestSupport() {
     }
 
     @Test
-    fun `representative discovery predicate produces explain evidence`() {
-        val plan = jdbcTemplate.query(
+    fun `representative discovery predicate is filtered ordered and bounded in postgres`() {
+        val now = 1_700_000_000_000L
+        val completedRows = 600
+        val eligibleRows = 80
+        val cancelledRows = 20
+        val limit = 20
+
+        jdbcTemplate.update(
             """
-            EXPLAIN (ANALYZE, BUFFERS)
-            SELECT id
+            INSERT INTO meetings (
+                title, description, image_url, time, date, address, latitude, longitude, status, ends_at
+            )
+            SELECT
+                'completed-' || series,
+                'Repository volume fixture',
+                '',
+                ? - series * 1000,
+                '01.01.2026',
+                'Online',
+                0.0,
+                0.0,
+                'ACTIVE',
+                CASE WHEN series % 2 = 0 THEN ? - series ELSE NULL END
+            FROM generate_series(1, ?) AS series
+            """.trimIndent(),
+            now,
+            now,
+            completedRows,
+        )
+        jdbcTemplate.update(
+            """
+            INSERT INTO meetings (
+                title, description, image_url, time, date, address, latitude, longitude, status, ends_at
+            )
+            SELECT
+                'eligible-' || series,
+                'Repository volume fixture',
+                '',
+                ? + series * 1000,
+                '01.01.2026',
+                'Online',
+                0.0,
+                0.0,
+                'ACTIVE',
+                CASE WHEN series % 2 = 0 THEN ? + series * 2000 ELSE NULL END
+            FROM generate_series(1, ?) AS series
+            """.trimIndent(),
+            now,
+            now,
+            eligibleRows,
+        )
+        jdbcTemplate.update(
+            """
+            INSERT INTO meetings (
+                title, description, image_url, time, date, address, latitude, longitude, status, ends_at
+            )
+            SELECT
+                'cancelled-' || series,
+                'Repository volume fixture',
+                '',
+                ? + series * 1000,
+                '01.01.2026',
+                'Online',
+                0.0,
+                0.0,
+                'CANCELLED',
+                ? + series * 2000
+            FROM generate_series(1, ?) AS series
+            """.trimIndent(),
+            now,
+            now,
+            cancelledRows,
+        )
+        jdbcTemplate.execute("ANALYZE meetings")
+
+        assertEquals(
+            eligibleRows.toLong(),
+            jdbcTemplate.queryForObject(
+                """
+                SELECT COUNT(*)
+                FROM meetings
+                WHERE status = 'ACTIVE'
+                  AND COALESCE(ends_at, time) >= $now
+                """.trimIndent(),
+                Long::class.java,
+            ),
+        )
+        assertEquals(
+            completedRows.toLong(),
+            jdbcTemplate.queryForObject(
+                """
+                SELECT COUNT(*)
+                FROM meetings
+                WHERE status = 'ACTIVE'
+                  AND COALESCE(ends_at, time) < $now
+                """.trimIndent(),
+                Long::class.java,
+            ),
+        )
+
+        val selectedTitles = jdbcTemplate.queryForList(
+            """
+            SELECT title
             FROM meetings
             WHERE status = 'ACTIVE'
-              AND COALESCE(ends_at, time) >= 1700000000000
+              AND COALESCE(ends_at, time) >= $now
             ORDER BY time ASC, id ASC
-            LIMIT 20
+            LIMIT $limit
             """.trimIndent(),
-        ) { rs, _ -> rs.getString(1) }
+            String::class.java,
+        )
+        assertEquals((1..limit).map { "eligible-$it" }, selectedTitles)
 
-        assertTrue(plan.isNotEmpty())
-        assertTrue(plan.any { it.contains("Scan") || it.contains("scan") })
+        val planJson = requireNotNull(
+            jdbcTemplate.queryForObject(
+                """
+                EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+                SELECT id
+                FROM meetings
+                WHERE status = 'ACTIVE'
+                  AND COALESCE(ends_at, time) >= $now
+                ORDER BY time ASC, id ASC
+                LIMIT $limit
+                """.trimIndent(),
+                String::class.java,
+            ),
+        )
+        val plan = ObjectMapper().readTree(planJson)
+        val evidence = plan.toPrettyString()
+        val limitNode = findNodes(plan) { it.path("Node Type").asText() == "Limit" }.single()
+        val relationNodes = findNodes(plan) { it.path("Relation Name").asText() == "meetings" }
+        val conditions = relationNodes.flatMap { node ->
+            listOf("Filter", "Index Cond", "Recheck Cond")
+                .map { node.path(it).asText() }
+                .filter { it.isNotBlank() }
+        }.joinToString(" ")
+        val sortKeys = findNodes(plan) { it.has("Sort Key") }
+            .flatMap { node -> node.path("Sort Key").map(JsonNode::asText) }
+        val sharedBlocks = findNodes(plan) {
+            it.has("Shared Hit Blocks") || it.has("Shared Read Blocks")
+        }.sumOf {
+            it.path("Shared Hit Blocks").asLong() + it.path("Shared Read Blocks").asLong()
+        }
+
+        assertEquals(limit.toLong(), limitNode.path("Actual Rows").asLong(), evidence)
+        assertEquals(1L, limitNode.path("Actual Loops").asLong(), evidence)
+        assertTrue(limitNode.path("Plan Rows").asLong() in 1..limit.toLong(), evidence)
+        assertTrue(
+            limitNode.path("Total Cost").asDouble() >= limitNode.path("Startup Cost").asDouble(),
+            evidence,
+        )
+        assertTrue(relationNodes.isNotEmpty(), evidence)
+        assertTrue(conditions.contains("COALESCE"), evidence)
+        assertTrue(conditions.contains("status") && conditions.contains("ACTIVE"), evidence)
+        assertTrue(sortKeys.any { it.contains("time") } && sortKeys.any { it.contains("id") }, evidence)
+        assertTrue(sharedBlocks > 0, evidence)
     }
 
     private fun meeting(
@@ -145,4 +325,16 @@ class MeetingDiscoveryRepositoryPostgresTest : IntegrationTestSupport() {
         longitude = 0.0,
         endsAt = endsAt,
     )
+
+    private fun findNodes(node: JsonNode, predicate: (JsonNode) -> Boolean): List<JsonNode> {
+        val matches = mutableListOf<JsonNode>()
+        if (predicate(node)) {
+            matches.add(node)
+        }
+        when {
+            node.isObject -> node.elements().forEachRemaining { matches.addAll(findNodes(it, predicate)) }
+            node.isArray -> node.elements().forEachRemaining { matches.addAll(findNodes(it, predicate)) }
+        }
+        return matches
+    }
 }
