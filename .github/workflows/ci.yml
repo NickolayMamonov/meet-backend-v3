@@ -128,8 +128,8 @@ jobs:
             --build-arg "BACKEND_REVISION=$revision" \
             .
           test "$(docker image inspect meet-backend:ci --format '{{.Config.User}}')" = "10001:10001"
-          test "$(docker image inspect meet-backend:ci --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}')" = "$version"
-          test "$(docker image inspect meet-backend:ci --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}')" = "$revision"
+          test "$(docker image inspect meet-backend:ci --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
+          test "$(docker image inspect meet-backend:ci --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision"
           docker image inspect meet-backend:ci --format '{{json .Config.Labels}}' | jq -e 'has("org.opencontainers.image.source")'
           docker run --rm --entrypoint sh meet-backend:ci -ec \
             'test -f /app/app.jar && test -d /data/uploads && test -w /data/uploads'
