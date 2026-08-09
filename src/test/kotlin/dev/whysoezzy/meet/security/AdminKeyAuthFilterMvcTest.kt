@@ -74,11 +74,11 @@ class AdminKeyAuthFilterMvcTest(
     fun `allows valid keys on all admin endpoints`() {
         `when`(adminProperties.apiKey).thenReturn("test-admin-key")
         `when`(ingestionService.runAll()).thenReturn(emptyList())
-        `when`(ingestionService.purgePastEvents()).thenReturn(0)
         `when`(ingestionService.purgeBySource(EventSource.TIMEPAD)).thenReturn(3)
 
         mockMvc.perform(ingestRequest().header("X-Admin-Key", "test-admin-key"))
             .andExpect(status().isOk)
+            .andExpect(jsonPath("$.purgedPast").value(0))
 
         mockMvc.perform(purgeRequest().header("X-Admin-Key", "test-admin-key"))
             .andExpect(status().isOk)

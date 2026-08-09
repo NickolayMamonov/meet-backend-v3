@@ -16,7 +16,6 @@ class IngestionScheduler(
     fun scheduled() {
         logger.info { "Запуск ингестии по расписанию" }
         val runs = ingestionService.runAll()
-        val purged = ingestionService.purgePastEvents()
-        logger.info { "Ингестия завершена: прогонов=${runs.size}, удалено прошедших=$purged" }
+        logger.info { "Ингестия завершена: прогонов=${runs.size}" }
     }
 }

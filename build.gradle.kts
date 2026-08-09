@@ -81,6 +81,8 @@ tasks.withType<KotlinCompile> {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Testcontainers 1.19.3 defaults to API 1.32; the current Docker Engine requires at least 1.40.
+    systemProperty("api.version", "1.40")
 }
 
 tasks.named<Test>("test") {
