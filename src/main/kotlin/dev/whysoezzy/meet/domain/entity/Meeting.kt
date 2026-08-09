@@ -80,7 +80,10 @@ class Meeting(
     var ingestedAt: LocalDateTime? = null,
 
     @Column(name = "dedup_hash", length = 64)
-    var dedupHash: String? = null
+    var dedupHash: String? = null,
+
+    @Column(name = "ends_at")
+    var endsAt: Long? = null, // Unix timestamp in milliseconds; null falls back to time for discovery
     
 ) : BaseEntity() {
     

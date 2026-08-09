@@ -9,9 +9,10 @@ import dev.whysoezzy.meet.domain.entity.MeetingStatus
 import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import mu.KotlinLogging
-import org.springframework.beans.factory.annotation.Value
+import org.springframework.data.domain.PageRequest
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
+import java.time.Clock
 
 private val logger = KotlinLogging.logger {}
 
@@ -19,18 +20,36 @@ private val logger = KotlinLogging.logger {}
 class MeetingService(
     private val meetingRepository: MeetingRepository,
     private val userRepository: UserRepository,
+    private val clock: Clock,
 ) {
 
     @Transactional(readOnly = true)
     fun getMainMeetings(currentUserId: Long?): List<MeetingDto> {
         logger.info { "Fetching main meetings" }
 
-        val currentTime = System.currentTimeMillis()
-        val upcoming = meetingRepository.findUpcomingMeetings(MeetingStatus.ACTIVE, currentTime)
-        val popular = meetingRepository.findPopularMeetings(MeetingStatus.ACTIVE)
+        val currentTime = clock.millis()
+        val upcoming = meetingRepository.findDiscoveryMeetings(
+            MeetingStatus.ACTIVE,
+            currentTime,
+            PageRequest.of(0, 1),
+        )
+        if (upcoming.isEmpty()) return emptyList()
 
-        return (upcoming.take(1) + popular.take(10) + upcoming.drop(1).take(10))
-            .distinctBy { it.id }
+        val popular = meetingRepository.findPopularDiscoveryMeetingsExcluding(
+            MeetingStatus.ACTIVE,
+            currentTime,
+            setOf(upcoming.first().id!!),
+            PageRequest.of(0, 10),
+        )
+        val selectedIds = (upcoming + popular).mapNotNull { it.id }.toSet()
+        val laterUpcoming = meetingRepository.findDiscoveryMeetingsExcluding(
+            MeetingStatus.ACTIVE,
+            currentTime,
+            selectedIds,
+            PageRequest.of(0, 10),
+        )
+
+        return (upcoming + popular + laterUpcoming)
             .map { it.toDto(currentUserId) }
     }
 
@@ -38,8 +57,12 @@ class MeetingService(
     fun getPopularMeetings(currentUserId: Long?): List<MeetingDto> {
         logger.info { "Fetching popular meetings" }
 
-        return meetingRepository.findPopularMeetings(MeetingStatus.ACTIVE)
-            .take(20)
+        val currentTime = clock.millis()
+        return meetingRepository.findPopularDiscoveryMeetings(
+            MeetingStatus.ACTIVE,
+            currentTime,
+            PageRequest.of(0, 20),
+        )
             .map { it.toDto(currentUserId) }
     }
 
@@ -47,22 +70,29 @@ class MeetingService(
     fun getAllMeetings(page: Int, limit: Int, tagId: Long?, currentUserId: Long?): List<MeetingDto> {
         logger.info { "Fetching all meetings - page: $page, limit: $limit, tagId: $tagId" }
 
+        val currentTime = clock.millis()
         val meetings = if (tagId != null) {
-            meetingRepository.findByTagId(tagId, MeetingStatus.ACTIVE)
+            meetingRepository.findDiscoveryMeetingsByTag(
+                tagId,
+                MeetingStatus.ACTIVE,
+                currentTime,
+                PageRequest.of(page, limit),
+            )
         } else {
-            meetingRepository.findAllByStatus(MeetingStatus.ACTIVE)
+            meetingRepository.findDiscoveryMeetings(
+                MeetingStatus.ACTIVE,
+                currentTime,
+                PageRequest.of(page, limit),
+            )
         }
 
-        return meetings
-            .drop(page * limit)
-            .take(limit)
-            .map { it.toDto(currentUserId) }
+        return meetings.map { it.toDto(currentUserId) }
     }
 
     @Transactional(readOnly = true)
     fun searchMeetings(query: String, currentUserId: Long?): List<MeetingDto> {
         logger.info { "Searching meetings" }
-        return meetingRepository.searchMeetings(query, MeetingStatus.ACTIVE)
+        return meetingRepository.searchDiscoveryMeetings(query, MeetingStatus.ACTIVE, clock.millis())
             .map { it.toDto(currentUserId) }
     }
 
