@@ -11,10 +11,10 @@ import dev.whysoezzy.meet.ingestion.IngestionService
 import org.junit.jupiter.api.Test
 import org.mockito.Mockito.`when`
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest
-import org.springframework.boot.test.mock.mockito.MockBean
+import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest
 import org.springframework.context.annotation.Import
 import org.springframework.test.web.servlet.MockMvc
+import org.springframework.test.context.bean.override.mockito.MockitoBean
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post
@@ -32,19 +32,19 @@ import java.util.Optional
     ApiErrorResponseWriter::class,
     StorageProperties::class,
 )
-class AdminKeyAuthFilterMvcTest(
-    @Autowired private val mockMvc: MockMvc,
+class AdminKeyAuthFilterMvcTest @Autowired constructor(
+    private val mockMvc: MockMvc,
 ) {
-    @MockBean
+    @MockitoBean
     private lateinit var adminProperties: AdminProperties
 
-    @MockBean
+    @MockitoBean
     private lateinit var jwtService: JwtService
 
-    @MockBean
+    @MockitoBean
     private lateinit var userRepository: UserRepository
 
-    @MockBean
+    @MockitoBean
     private lateinit var ingestionService: IngestionService
 
     @Test

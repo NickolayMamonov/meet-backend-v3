@@ -24,8 +24,8 @@ class AdBlockController(
     }
 
     @GetMapping("/{id}")
-    fun getAdBlockById(@PathVariable id: Long): ResponseEntity<AdBlockResponseDto?> {
+    fun getAdBlockById(@PathVariable id: Long): ResponseEntity<AdBlockResponseDto> {
         val adBlock = adBlockService.getAdBlockById(id)
-        return ResponseEntity.ok(adBlock?.toDto())
+        return adBlock?.let { ResponseEntity.ok(it.toDto()) } ?: ResponseEntity.ok().build()
     }
 }

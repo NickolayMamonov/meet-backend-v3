@@ -132,7 +132,7 @@ class OtpChallengeStore(
             challenge.channel.name,
             challenge.identifier,
             challenge.id,
-        )
+        ) ?: error("OTP challenge existence query returned no result")
 
     fun isPendingAndUnexpired(id: Long): Boolean =
         jdbcTemplate.queryForObject(
@@ -144,7 +144,7 @@ class OtpChallengeStore(
             """.trimIndent(),
             Boolean::class.java,
             id,
-        )
+        ) ?: error("OTP pending challenge query returned no result")
 
     fun isActiveAndUnexpired(id: Long): Boolean =
         jdbcTemplate.queryForObject(
@@ -158,7 +158,7 @@ class OtpChallengeStore(
             """.trimIndent(),
             Boolean::class.java,
             id,
-        )
+        ) ?: error("OTP active challenge query returned no result")
 
     fun supersedeActive(challenge: OtpChallengeSnapshot): Int =
         jdbcTemplate.update(
@@ -332,7 +332,7 @@ class OtpAttemptStore(
                 limit.scope,
                 limit.key,
                 windowMinutes,
-            ) >= limit.maxAttempts
+            ) ?: error("OTP rate limit count query returned no result") >= limit.maxAttempts
         }
 
     internal fun insert(limits: Collection<AttemptLimit>) {

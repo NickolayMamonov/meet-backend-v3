@@ -11,11 +11,12 @@ import dev.whysoezzy.meet.config.OtpRateLimitProperties
 import dev.whysoezzy.meet.config.OtpVerificationProperties
 import dev.whysoezzy.meet.config.RuntimeConfigurationInitializer
 import dev.whysoezzy.meet.config.SmsProperties
+import org.springframework.boot.security.autoconfigure.UserDetailsServiceAutoConfiguration
 import org.springframework.boot.SpringApplication
 import org.springframework.boot.autoconfigure.SpringBootApplication
 import org.springframework.boot.context.properties.EnableConfigurationProperties
 
-@SpringBootApplication
+@SpringBootApplication(exclude = [UserDetailsServiceAutoConfiguration::class])
 @EnableConfigurationProperties(
     AdminProperties::class,
     ClientIpProperties::class,

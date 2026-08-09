@@ -1,6 +1,6 @@
 package dev.whysoezzy.meet.api.error
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import dev.whysoezzy.meet.api.controller.AdminController
 import dev.whysoezzy.meet.api.controller.AuthController
 import dev.whysoezzy.meet.api.controller.CommunityController
@@ -26,11 +26,11 @@ import dev.whysoezzy.meet.service.auth.identifier.EmailOtpRequestValidator
 import jakarta.validation.Valid
 import jakarta.validation.constraints.NotBlank
 import org.junit.jupiter.api.Test
-import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest
+import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Import
 import org.springframework.boot.test.context.TestConfiguration
-import org.springframework.boot.test.mock.mockito.MockBean
+import org.springframework.test.context.bean.override.mockito.MockitoBean
 import org.springframework.http.HttpMethod
 import org.springframework.http.MediaType
 import org.springframework.security.config.annotation.web.builders.HttpSecurity
@@ -79,37 +79,37 @@ import org.mockito.Mockito.`when`
     EmailOtpRequestValidator::class,
     ErrorContractSecurityConfig::class,
 )
-class ErrorContractMvcTest(
-    @Autowired private val mockMvc: MockMvc,
+class ErrorContractMvcTest @Autowired constructor(
+    private val mockMvc: MockMvc,
 ) {
-    @MockBean
+    @MockitoBean
     private lateinit var jwtService: JwtService
 
-    @MockBean
+    @MockitoBean
     private lateinit var meetingService: MeetingService
 
-    @MockBean
+    @MockitoBean
     private lateinit var communityService: CommunityService
 
-    @MockBean
+    @MockitoBean
     private lateinit var authService: AuthService
 
-    @MockBean
+    @MockitoBean
     private lateinit var authUtils: AuthUtils
 
-    @MockBean
+    @MockitoBean
     private lateinit var userService: UserService
 
-    @MockBean
+    @MockitoBean
     private lateinit var storageService: StorageService
 
-    @MockBean
+    @MockitoBean
     private lateinit var avatarReplacementService: AvatarReplacementService
 
-    @MockBean
+    @MockitoBean
     private lateinit var userRepository: UserRepository
 
-    @MockBean
+    @MockitoBean
     private lateinit var ingestionService: IngestionService
 
     @Test
@@ -531,7 +531,7 @@ class ErrorContractMvcTest(
         val timestamp = jacksonObjectMapper()
             .readTree(result.response.contentAsString)
             .path("timestamp")
-            .asText()
+            .stringValue()
         Instant.parse(timestamp)
     }
 

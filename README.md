@@ -4,8 +4,8 @@ REST API для Android приложения Meeting - платформы для
 
 ## 🚀 Технологии
 
-- **Kotlin** 1.9.25
-- **Spring Boot** 3.2.2
+- **Kotlin** 2.2.21
+- **Spring Boot** 4.1.0
 - **PostgreSQL** 16
 - **Flyway** - миграции БД
 - **SpringDoc OpenAPI** - документация API

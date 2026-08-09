@@ -21,7 +21,7 @@ object EmailAddressNormalizer {
     private val domainLabel = Regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
     fun normalize(raw: String?): String {
-        val stripped = raw?.strip()
+        val stripped = raw?.trim()
         if (stripped.isNullOrEmpty()) {
             throw EmailNormalizationException(EmailNormalizationFailure.REQUIRED)
         }

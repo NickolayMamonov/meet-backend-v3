@@ -19,12 +19,11 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest
-import org.springframework.boot.test.mock.mockito.MockBean
+import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest
 import org.springframework.boot.test.context.TestConfiguration
+import org.springframework.test.context.bean.override.mockito.MockitoBean
 import org.springframework.context.annotation.ComponentScan.Filter
 import org.springframework.context.annotation.Bean
-import org.springframework.context.annotation.Configuration
 import org.springframework.context.annotation.Import
 import org.springframework.context.annotation.FilterType
 import org.springframework.http.HttpMethod
@@ -43,7 +42,10 @@ import kotlin.test.assertFalse
 @WebMvcTest(
     controllers = [AuthController::class, MeetingController::class],
     excludeFilters = [
-        Filter(type = FilterType.ASSIGNABLE_TYPE, classes = [JwtAuthFilter::class, AdminKeyAuthFilter::class]),
+        Filter(
+            type = FilterType.REGEX,
+            pattern = ["dev\\.whysoezzy\\.meet\\.security\\.(JwtAuthFilter|AdminKeyAuthFilter)"],
+        ),
     ],
 )
 @Import(
@@ -55,19 +57,19 @@ import kotlin.test.assertFalse
     EmailOtpRequestValidator::class,
 )
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class MvcResolvedExceptionLoggingTest(
-    @Autowired private val mockMvc: MockMvc,
+class MvcResolvedExceptionLoggingTest @Autowired constructor(
+    private val mockMvc: MockMvc,
 ) {
-    @MockBean
+    @MockitoBean
     private lateinit var authService: AuthService
 
-    @MockBean
+    @MockitoBean
     private lateinit var authUtils: AuthUtils
 
-    @MockBean
+    @MockitoBean
     private lateinit var meetingService: MeetingService
 
-    @MockBean
+    @MockitoBean
     private lateinit var clientRequestContextResolver: ClientRequestContextResolver
 
     @Test

@@ -2,7 +2,7 @@ package dev.whysoezzy.meet.ingestion.timepad
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.fasterxml.jackson.databind.JsonNode
+import tools.jackson.databind.JsonNode
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class TimepadEventsResponse(
@@ -14,18 +14,18 @@ data class TimepadEventsResponse(
 data class TimepadEvent(
     val id: Long,
     val name: String = "",
-    @JsonProperty("description_short") val descriptionShort: String? = null,
-    @JsonProperty("description_html") val descriptionHtml: String? = null,
-    @JsonProperty("starts_at") val startsAt: String? = null,
+    @param:JsonProperty("description_short") val descriptionShort: String? = null,
+    @param:JsonProperty("description_html") val descriptionHtml: String? = null,
+    @param:JsonProperty("starts_at") val startsAt: String? = null,
     val url: String? = null,
-    @JsonProperty("poster_image") val posterImage: JsonNode? = null,
+    @param:JsonProperty("poster_image") val posterImage: JsonNode? = null,
     val location: JsonNode? = null,
     val categories: JsonNode? = null,
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class TimepadImage(
-    @JsonProperty("default_url") val defaultUrl: String? = null,
+    @param:JsonProperty("default_url") val defaultUrl: String? = null,
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
