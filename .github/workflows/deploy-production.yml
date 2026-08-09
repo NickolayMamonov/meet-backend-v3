@@ -282,6 +282,7 @@ jobs:
           docker compose version >/dev/null
           command -v flock >/dev/null
           command -v age >/dev/null
+          command -v curl >/dev/null
           [ "$(grep -c '^AGE_RECIPIENT=' "$path/.backup.env")" -eq 1 ]
           age_recipient=$(sed -n 's/^AGE_RECIPIENT=//p' "$path/.backup.env")
           case "$age_recipient" in

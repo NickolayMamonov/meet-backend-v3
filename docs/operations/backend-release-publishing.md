@@ -131,7 +131,8 @@ scripts/audit-production-environment.sh --expect-configured
 Name evidence does not reveal values and does not certify a live deployment.
 The deployment requires a healthy predecessor, host-local `.backup.env` with
 `AGE_RECIPIENT`, strict native OpenSSH host-key verification, an encrypted
-backup, digest pull, and the existing prepare/update/deploy/rollback scripts.
+backup, digest pull, host `docker`, Compose, `flock`, `age`, and `curl`
+commands, and the existing prepare/update/deploy/rollback scripts.
 Before any of those scripts run, the workflow archives the reviewed Compose and
 helper files, transfers them over the already fingerprint-validated connection,
 verifies their SHA-256 manifest on the VPS, and invokes only that staged copy.
