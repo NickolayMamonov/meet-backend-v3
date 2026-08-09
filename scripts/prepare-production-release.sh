@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
-COMPOSE=(scripts/production-compose.sh)
+SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
+COMPOSE=("$SCRIPTS_DIR/production-compose.sh")
 STATE_DIR=/var/lib/meet-production
 sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 700 "$STATE_DIR"
 umask 077
@@ -20,6 +21,13 @@ if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then
   : "${LEGACY_PREVIOUS_REVISION:?export the exact source SHA for the legacy image}"
   [[ "$LEGACY_PREVIOUS_REVISION" =~ ^[0-9a-f]{40}$ ]]
   REVISION=$LEGACY_PREVIOUS_REVISION
+fi
+VERSION=$(docker image inspect "$IMAGE_ID" \
+  --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  : "${LEGACY_PREVIOUS_VERSION:?export the exact SemVer for the legacy image}"
+  [[ "$LEGACY_PREVIOUS_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+  VERSION=$LEGACY_PREVIOUS_VERSION
 fi
 ROLLBACK_IMAGE="meet-backend:rollback-$REVISION-${IMAGE_ID#sha256:}"
 docker image tag "$IMAGE_ID" "$ROLLBACK_IMAGE"
@@ -46,7 +54,7 @@ RUNNING_CONFIG_HASH=$(docker inspect --format \
 [ "$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' \
   "$CONTAINER")" = backend ]
 
-SOURCE_COMPOSE=docker-compose.production.yml
+SOURCE_COMPOSE=${PRODUCTION_BASE_COMPOSE:-"$ROOT_DIR/docker-compose.production.yml"}
 if [ -s "$STATE_DIR/active-compose.yml" ]; then
   SOURCE_COMPOSE="$STATE_DIR/active-compose.yml"
 fi
@@ -70,6 +78,7 @@ CAPTURED_CONFIG_HASH=$("${COMPOSE[@]}" --captured-runtime config --hash backend 
 
 printf '%s\n' "$ROLLBACK_IMAGE" > "$STATE_DIR/previous-image"
 printf '%s\n' "$IMAGE_ID" > "$STATE_DIR/previous-image-id"
+printf '%s\n' "$VERSION" > "$STATE_DIR/previous-version"
 printf '%s\n' "$REVISION" > "$STATE_DIR/previous-revision"
 printf '%s\n' "$UID_VALUE" > "$STATE_DIR/previous-uid"
 printf '%s\n' "$GID_VALUE" > "$STATE_DIR/previous-gid"
@@ -78,7 +87,7 @@ sha256sum "$STATE_DIR/previous-compose.yml" | awk '{print $1}' > \
   "$STATE_DIR/previous-compose.sha256"
 sha256sum "$STATE_DIR/previous-runtime.override.yml" | awk '{print $1}' > \
   "$STATE_DIR/previous-runtime.sha256"
-scripts/production-config-digest.sh > "$STATE_DIR/previous-config.sha256"
+"$SCRIPTS_DIR/production-config-digest.sh" > "$STATE_DIR/previous-config.sha256"
 chmod 600 "$STATE_DIR"/previous-*
 printf '%s\n' "$RUNNING_CONFIG_HASH" > "$STATE_DIR/previous-compose-config-hash"
 chmod 600 "$STATE_DIR/previous-compose-config-hash"

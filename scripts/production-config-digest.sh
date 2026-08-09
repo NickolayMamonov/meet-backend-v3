@@ -7,4 +7,4 @@ test -f "$FILE" || {
   exit 1
 }
 
-sed -E '/^BACKEND_(IMAGE|REVISION)=/d' "$FILE" | sha256sum | awk '{print $1}'
+sed -E '/^BACKEND_(IMAGE|VERSION|REVISION)=/d' "$FILE" | sha256sum | awk '{print $1}'

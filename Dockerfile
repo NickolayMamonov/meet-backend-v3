@@ -4,7 +4,7 @@ WORKDIR /workspace
 
 COPY gradle gradle
 COPY gradlew gradlew
-COPY settings.gradle.kts build.gradle.kts ./
+COPY settings.gradle.kts build.gradle.kts version.json ./
 RUN sed -i 's/\r$//' gradlew \
     && chmod +x gradlew \
     && ./gradlew --no-daemon dependencies
@@ -15,11 +15,19 @@ RUN ./gradlew --no-daemon clean bootJar \
 
 FROM eclipse-temurin:21-jre-alpine@sha256:3f08b13888f595cc49edabea7250ba69499ba25602b267da591720769400e08c
 
+ARG BACKEND_VERSION
 ARG BACKEND_REVISION
 LABEL org.opencontainers.image.source="https://github.com/NickolayMamonov/meet-backend-v3" \
+      org.opencontainers.image.version="${BACKEND_VERSION}" \
       org.opencontainers.image.revision="${BACKEND_REVISION}"
 
-RUN test "${#BACKEND_REVISION}" -eq 40 \
+RUN test -n "${BACKEND_VERSION}" \
+    && case "${BACKEND_VERSION}" in *[!0-9.]*|.*|*.|*..*) exit 1;; esac \
+    && test "$(printf '%s\n' "${BACKEND_VERSION}" | awk -F. \
+      'NF == 3 && ($1 == "0" || $1 ~ /^[1-9][0-9]*$/) && \
+       ($2 == "0" || $2 ~ /^[1-9][0-9]*$/) && \
+       ($3 == "0" || $3 ~ /^[1-9][0-9]*$/) { print 1 }')" = 1 \
+    && test "${#BACKEND_REVISION}" -eq 40 \
     && case "${BACKEND_REVISION}" in *[!0-9a-f]*) exit 1;; esac \
     && apk add --no-cache curl \
     && addgroup -S -g 10001 app \

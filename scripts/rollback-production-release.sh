@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
-COMPOSE=(scripts/production-compose.sh)
+SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
+COMPOSE=("$SCRIPTS_DIR/production-compose.sh")
 STATE_DIR=/var/lib/meet-production
 
-for name in previous-image previous-image-id previous-revision previous-uid previous-gid previous-upload-volume previous-config.sha256 previous-compose.yml previous-runtime.override.yml previous-compose.sha256 previous-runtime.sha256 previous-compose-config-hash; do
+for name in previous-image previous-image-id previous-version previous-revision previous-uid previous-gid previous-upload-volume previous-config.sha256 previous-compose.yml previous-runtime.override.yml previous-compose.sha256 previous-runtime.sha256 previous-compose-config-hash; do
   test -s "$STATE_DIR/$name" || { echo "missing rollback state: $name" >&2; exit 1; }
 done
-[ "$(scripts/production-config-digest.sh)" = "$(< "$STATE_DIR/previous-config.sha256")" ] || {
+[ "$("$SCRIPTS_DIR/production-config-digest.sh")" = "$(< "$STATE_DIR/previous-config.sha256")" ] || {
   echo "non-release configuration changed; automatic rollback is prohibited" >&2
   echo "preserve rotated credentials and roll forward, or explicitly validate prior-image compatibility" >&2
   exit 1
@@ -18,16 +19,20 @@ done
 IMAGE=$(< "$STATE_DIR/previous-image")
 IMAGE_ID=$(< "$STATE_DIR/previous-image-id")
 REVISION=$(< "$STATE_DIR/previous-revision")
+VERSION=$(< "$STATE_DIR/previous-version")
 UID_VALUE=$(< "$STATE_DIR/previous-uid")
 GID_VALUE=$(< "$STATE_DIR/previous-gid")
 UPLOAD_VOLUME=$(< "$STATE_DIR/previous-upload-volume")
 [[ "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
 [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]
+[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 [[ "$UID_VALUE:$GID_VALUE" =~ ^[0-9]+:[0-9]+$ ]]
 [ "$UPLOAD_VOLUME" = meet-production_uploads_data ]
 [ "$(docker image inspect "$IMAGE" --format '{{.Id}}')" = "$IMAGE_ID" ]
 LABEL_REVISION=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
 [ -z "$LABEL_REVISION" ] || [ "$LABEL_REVISION" = "$REVISION" ]
+LABEL_VERSION=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+[ -z "$LABEL_VERSION" ] || [ "$LABEL_VERSION" = "$VERSION" ]
 [ "$(sha256sum "$STATE_DIR/previous-compose.yml" | awk '{print $1}')" = "$(< "$STATE_DIR/previous-compose.sha256")" ]
 [ "$(sha256sum "$STATE_DIR/previous-runtime.override.yml" | awk '{print $1}')" = "$(< "$STATE_DIR/previous-runtime.sha256")" ]
 docker volume inspect "$UPLOAD_VOLUME" >/dev/null
@@ -45,7 +50,7 @@ docker run --rm --user "$UID_VALUE:$GID_VALUE" --entrypoint sh \
 install -m 600 "$STATE_DIR/previous-compose.yml" "$STATE_DIR/active-compose.yml"
 install -m 600 "$STATE_DIR/previous-runtime.override.yml" \
   "$STATE_DIR/active-runtime.override.yml"
-scripts/update-production-release.sh "$IMAGE" "$REVISION"
+"$SCRIPTS_DIR/update-production-release.sh" "$IMAGE" "$REVISION" "$VERSION"
 
 "${COMPOSE[@]}" up -d --no-deps --no-build --pull never --wait --wait-timeout 180 backend
 CONTAINER=$("${COMPOSE[@]}" ps -q backend)

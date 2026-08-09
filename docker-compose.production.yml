@@ -33,6 +33,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        BACKEND_VERSION: ${BACKEND_VERSION:?BACKEND_VERSION must be the canonical backend SemVer}
         BACKEND_REVISION: ${BACKEND_REVISION:?BACKEND_REVISION must be the full source commit SHA}
     env_file:
       - .env.production

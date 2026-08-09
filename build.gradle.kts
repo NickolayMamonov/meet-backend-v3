@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import groovy.json.JsonSlurper
 
 plugins {
     kotlin("jvm") version "2.2.21"
@@ -9,8 +10,26 @@ plugins {
 }
 
 group = "dev.whysoezzy"
-version = "1.0.0"
+val versionFile = layout.projectDirectory.file("version.json").asFile
+val versionDocument = versionFile.takeIf { it.isFile }?.readText()
+    ?: error("version.json is required")
+val backendVersion = (JsonSlurper().parseText(versionDocument) as? Map<*, *>)
+    ?.get("version") as? String
+    ?: error("version.json must contain a string version property")
+require(backendVersion.matches(Regex("""(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"""))) {
+    "version.json must contain canonical MAJOR.MINOR.PATCH SemVer"
+}
+version = backendVersion
 description = "Meet Backend API - Clean Implementation"
+
+springBoot {
+    mainClass.set("dev.whysoezzy.meet.MeetBackendApplicationKt")
+    buildInfo {
+        properties {
+            version = backendVersion
+        }
+    }
+}
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21

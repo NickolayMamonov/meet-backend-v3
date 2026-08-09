@@ -55,13 +55,15 @@ chmod 600 .env.production
 ```
 
 Edit durable configuration and secrets, including the SMTP and OTP settings
-listed above, leaving `BACKEND_IMAGE` and `BACKEND_REVISION` to the release
-updater. Then choose an immutable image and exact source revision:
+listed above, leaving `BACKEND_VERSION`, `BACKEND_IMAGE`, and
+`BACKEND_REVISION` to the release updater. Then choose an immutable image and
+exact source revision:
 
 ```bash
 REVISION=<full-40-character-lowercase-git-sha>
 IMAGE=registry.example/meet-backend:git-$REVISION
-scripts/update-production-release.sh "$IMAGE" "$REVISION"
+VERSION=<canonical-backend-semver>
+scripts/update-production-release.sh "$IMAGE" "$REVISION" "$VERSION"
 ```
 
 Build only from that clean revision:
@@ -154,8 +156,9 @@ with configuration or credential changes.
 
    ```bash
    REVISION=<new-full-git-sha>
+   VERSION=<new-canonical-backend-semver>
    IMAGE=registry.example/meet-backend:git-$REVISION
-   scripts/update-production-release.sh "$IMAGE" "$REVISION"
+   scripts/update-production-release.sh "$IMAGE" "$REVISION" "$VERSION"
    ```
 
 5. Check out/build the exact revision as in section 1, then deploy:
@@ -167,7 +170,7 @@ with configuration or credential changes.
    ```
 
 `deploy-production-release.sh` rejects non-release config drift, verifies the
-image labels and fixed runtime identity, migrates an existing uploads volume to
+image version/revision labels and fixed runtime identity, migrates an existing uploads volume to
 `10001:10001`, removes any legacy rollback override, starts without implicit
 pull/build, and checks readiness. Backend and PostgreSQL use bounded Docker
 `local` logs (`10m` x five files by default).
@@ -184,6 +187,7 @@ state:
 
 ```bash
 LEGACY_PREVIOUS_REVISION=<full-40-character-lowercase-git-sha> \
+LEGACY_PREVIOUS_VERSION=<legacy-canonical-backend-semver> \
   scripts/prepare-production-release.sh
 ```
 
@@ -196,7 +200,7 @@ scripts/rollback-production-release.sh
 Rollback verifies the captured image ID, uploads volume, prior Compose files,
 effective UID/GID, and non-release config digest. It restores the prior image
 with the captured Compose/runtime definition while changing only
-`BACKEND_IMAGE` and `BACKEND_REVISION`; current secrets remain in
+`BACKEND_IMAGE`, `BACKEND_VERSION`, and `BACKEND_REVISION`; current secrets remain in
 `.env.production`. The protected `/var/lib/meet-production/active-*.yml` files
 keep that exact runtime definition active. The next normal deployment removes
 them and returns to the repository Compose file and `10001:10001`.
