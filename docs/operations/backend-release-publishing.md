@@ -29,17 +29,38 @@ There is no `latest` alias. The image digest is deployment authority. The
 release manifest and `SHA256SUMS` are attached before the draft is made public;
 the release publish operation is the final mutation.
 
-The three aliases are immutable by this enforced publication policy, not by an
-assumed GHCR compare-and-swap primitive. `scripts/release-registry-state.sh`
-is deliberately read-only for complete, partial, divergent, identity-mismatch,
-and externally raced states. The publication job has a repository/tag-scoped
-GitHub Actions concurrency lock, performs an identity-aware preflight, and
-performs an identity-aware post-publish inventory. A one- or two-alias state is
-quarantined and the old draft stays unpublished. Do not push, retag, copy,
-overwrite, or delete an alias during recovery. The authorized recovery is a new
-Conventional Commit on `dev`, which creates a distinct patch tuple and source
-SHA through Release Please. The lock serializes cooperating workflows; it is
-not represented as a GHCR CAS guarantee.
+GHCR does not provide a compare-and-swap primitive in this publication flow.
+The accepted admission mechanism is therefore explicit and two-layered:
+
+1. The job uses one package-scoped GitHub Actions concurrency group and, before
+   its first GHCR write, creates the non-forced Git ref
+   `refs/tags/release-lease-v<version>-<source-sha>` with
+   `scripts/acquire-release-lease.sh`. Git ref creation is create-only, so
+   cooperating writers cannot both acquire the same lease. The lease is never
+   deleted and is an audit/quarantine marker. A complete pre-existing release
+   is reused without acquiring a new lease.
+2. The build publishes the exact three aliases in one BuildKit promotion
+   operation, after a fresh read-only empty-state check taken immediately
+   after lease acquisition. An identity-aware post-publish inventory is
+   mandatory. If an external writer that is outside the lease policy races
+   either check or the operation, the resulting partial, divergent, or
+   identity-mismatched state is quarantined: the draft stays unpublished, the
+   local quarantine evidence is attached, and no GHCR repair, retag, copy,
+   overwrite, or delete is attempted.
+
+The zero-write guarantee applies to `release-registry-state.sh` and recovery:
+they never mutate GHCR, including when status 42 is returned. It does not
+pretend that an unauthorized package writer can be prevented by a registry CAS
+that does not exist. GHCR package write access must remain restricted to the
+approved publication path. The authorized recovery is a new Conventional
+Commit on `dev`, which creates a distinct patch tuple and source SHA through
+Release Please; an old lease is not reused.
+
+The publication workflow captures the registry inspection exit status under
+`set +e`. A status 42 is therefore handled as evidence: its quarantine JSON is
+checked, attached to the still-draft release, and only then is the job failed.
+It is never allowed to terminate the shell before the draft receives the
+quarantine note.
 
 BuildKit provenance and SBOM publication is accepted only when the OCI index
 contains subject-bound attestation descriptors and their child manifests carry
@@ -111,5 +132,10 @@ Name evidence does not reveal values and does not certify a live deployment.
 The deployment requires a healthy predecessor, host-local `.backup.env` with
 `AGE_RECIPIENT`, strict native OpenSSH host-key verification, an encrypted
 backup, digest pull, and the existing prepare/update/deploy/rollback scripts.
+Before any of those scripts run, the workflow archives the reviewed Compose and
+helper files, transfers them over the already fingerprint-validated connection,
+verifies their SHA-256 manifest on the VPS, and invokes only that staged copy.
+The staged scripts use the live production root for `.env.production`, state,
+volumes, and locks while keeping their reviewed code root separate.
 First install, database downgrade, infrastructure provisioning, and production
 certification are out of scope.

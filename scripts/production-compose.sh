@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
 
 test -f .env.production || {
@@ -40,7 +40,7 @@ if [ "${1:-}" = --captured-runtime ]; then
     exit 1
   }
 else
-  BASE_COMPOSE=docker-compose.production.yml
+  BASE_COMPOSE=${PRODUCTION_BASE_COMPOSE:-"$ROOT_DIR/docker-compose.production.yml"}
   [ ! -s "$STATE_DIR/active-compose.yml" ] || \
     BASE_COMPOSE="$STATE_DIR/active-compose.yml"
   RUNTIME_OVERRIDE="$STATE_DIR/active-runtime.override.yml"

@@ -12,8 +12,18 @@ default_branch=$(api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
 }
 
 required_paths=(
+  .github/workflows/release-please.yml
   .github/workflows/deploy-production.yml
   .github/workflows/release-recovery.yml
+  docker-compose.production.yml
+  scripts/acquire-release-lease.sh
+  scripts/production-compose.sh
+  scripts/production-config-digest.sh
+  scripts/prepare-production-release.sh
+  scripts/backup-production.sh
+  scripts/update-production-release.sh
+  scripts/deploy-production-release.sh
+  scripts/rollback-production-release.sh
   scripts/release-registry-state.sh
   scripts/verify-oci-evidence.sh
   scripts/verify-release-consistency.sh
@@ -29,7 +39,7 @@ for path in "${required_paths[@]}"; do
 done
 
 workflows=$(api "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100")
-for workflow in deploy-production.yml release-recovery.yml; do
+for workflow in release-please.yml deploy-production.yml release-recovery.yml; do
   jq -e --arg path ".github/workflows/$workflow" \
     '.workflows[] | select(.path == $path and .state == "active")' <<<"$workflows" >/dev/null || {
     echo "workflow $workflow is not active on default master" >&2

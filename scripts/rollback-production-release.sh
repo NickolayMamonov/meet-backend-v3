@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
-COMPOSE=(scripts/production-compose.sh)
+SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
+COMPOSE=("$SCRIPTS_DIR/production-compose.sh")
 STATE_DIR=/var/lib/meet-production
 
 for name in previous-image previous-image-id previous-version previous-revision previous-uid previous-gid previous-upload-volume previous-config.sha256 previous-compose.yml previous-runtime.override.yml previous-compose.sha256 previous-runtime.sha256 previous-compose-config-hash; do
   test -s "$STATE_DIR/$name" || { echo "missing rollback state: $name" >&2; exit 1; }
 done
-[ "$(scripts/production-config-digest.sh)" = "$(< "$STATE_DIR/previous-config.sha256")" ] || {
+[ "$("$SCRIPTS_DIR/production-config-digest.sh")" = "$(< "$STATE_DIR/previous-config.sha256")" ] || {
   echo "non-release configuration changed; automatic rollback is prohibited" >&2
   echo "preserve rotated credentials and roll forward, or explicitly validate prior-image compatibility" >&2
   exit 1
@@ -49,7 +50,7 @@ docker run --rm --user "$UID_VALUE:$GID_VALUE" --entrypoint sh \
 install -m 600 "$STATE_DIR/previous-compose.yml" "$STATE_DIR/active-compose.yml"
 install -m 600 "$STATE_DIR/previous-runtime.override.yml" \
   "$STATE_DIR/active-runtime.override.yml"
-scripts/update-production-release.sh "$IMAGE" "$REVISION" "$VERSION"
+"$SCRIPTS_DIR/update-production-release.sh" "$IMAGE" "$REVISION" "$VERSION"
 
 "${COMPOSE[@]}" up -d --no-deps --no-build --pull never --wait --wait-timeout 180 backend
 CONTAINER=$("${COMPOSE[@]}" ps -q backend)

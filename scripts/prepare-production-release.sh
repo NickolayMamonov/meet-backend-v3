@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
-COMPOSE=(scripts/production-compose.sh)
+SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
+COMPOSE=("$SCRIPTS_DIR/production-compose.sh")
 STATE_DIR=/var/lib/meet-production
 sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 700 "$STATE_DIR"
 umask 077
@@ -53,7 +54,7 @@ RUNNING_CONFIG_HASH=$(docker inspect --format \
 [ "$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' \
   "$CONTAINER")" = backend ]
 
-SOURCE_COMPOSE=docker-compose.production.yml
+SOURCE_COMPOSE=${PRODUCTION_BASE_COMPOSE:-"$ROOT_DIR/docker-compose.production.yml"}
 if [ -s "$STATE_DIR/active-compose.yml" ]; then
   SOURCE_COMPOSE="$STATE_DIR/active-compose.yml"
 fi
@@ -86,7 +87,7 @@ sha256sum "$STATE_DIR/previous-compose.yml" | awk '{print $1}' > \
   "$STATE_DIR/previous-compose.sha256"
 sha256sum "$STATE_DIR/previous-runtime.override.yml" | awk '{print $1}' > \
   "$STATE_DIR/previous-runtime.sha256"
-scripts/production-config-digest.sh > "$STATE_DIR/previous-config.sha256"
+"$SCRIPTS_DIR/production-config-digest.sh" > "$STATE_DIR/previous-config.sha256"
 chmod 600 "$STATE_DIR"/previous-*
 printf '%s\n' "$RUNNING_CONFIG_HASH" > "$STATE_DIR/previous-compose-config-hash"
 chmod 600 "$STATE_DIR/previous-compose-config-hash"

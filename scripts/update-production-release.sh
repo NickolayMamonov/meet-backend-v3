@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
+SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
 
 if [ "$#" -ne 3 ]; then
   echo "usage: $0 <immutable-image> <full-40-character-git-sha> <canonical-version>" >&2
@@ -40,7 +41,7 @@ test -f "$ENV_FILE" || {
 [ "$(grep -c '^BACKEND_VERSION=' "$ENV_FILE")" -eq 1 ]
 [ "$(grep -c '^BACKEND_REVISION=' "$ENV_FILE")" -eq 1 ]
 
-CONFIG_BEFORE=$(scripts/production-config-digest.sh "$ENV_FILE")
+CONFIG_BEFORE=$("$SCRIPTS_DIR/production-config-digest.sh" "$ENV_FILE")
 TMP=$(mktemp ./.env.production.release.XXXXXX)
 trap 'rm -f "$TMP"' EXIT
 awk -v image="$IMAGE" -v version="$VERSION" -v revision="$REVISION" '
@@ -56,7 +57,7 @@ awk -v image="$IMAGE" -v version="$VERSION" -v revision="$REVISION" '
   }
 ' "$ENV_FILE" > "$TMP"
 chmod 600 "$TMP"
-[ "$(scripts/production-config-digest.sh "$TMP")" = "$CONFIG_BEFORE" ]
+[ "$("$SCRIPTS_DIR/production-config-digest.sh" "$TMP")" = "$CONFIG_BEFORE" ]
 mv "$TMP" "$ENV_FILE"
 trap - EXIT
 

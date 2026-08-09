@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
-COMPOSE=(scripts/production-compose.sh)
+SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
+COMPOSE=("$SCRIPTS_DIR/production-compose.sh")
 STATE_DIR=/var/lib/meet-production
 ACTIVE_COMPOSE="$STATE_DIR/active-compose.yml"
 RUNTIME_OVERRIDE="$STATE_DIR/active-runtime.override.yml"
@@ -34,7 +35,7 @@ if [ "${#EXISTING_STATE[@]}" -gt 0 ]; then
       exit 1
     }
   done
-  [ "$(scripts/production-config-digest.sh)" = "$(< "$STATE_DIR/previous-config.sha256")" ] || {
+  [ "$("$SCRIPTS_DIR/production-config-digest.sh")" = "$(< "$STATE_DIR/previous-config.sha256")" ] || {
     echo "non-release configuration changed; mixed release/config deployment is prohibited" >&2
     exit 1
   }

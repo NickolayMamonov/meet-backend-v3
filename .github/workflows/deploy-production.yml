@@ -177,6 +177,74 @@ jobs:
           }
           echo "KEY_FILE=$key_file" >> "$GITHUB_ENV"
           echo "KNOWN_HOSTS=$known_hosts" >> "$GITHUB_ENV"
+      - name: Stage and verify reviewed deployment tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          tooling_root="$RUNNER_TEMP/production-tooling"
+          archive="$RUNNER_TEMP/production-tooling.tar"
+          test ! -e "$tooling_root"
+          mkdir -p "$tooling_root/scripts"
+          tooling_files=(
+            docker-compose.production.yml
+            scripts/production-compose.sh
+            scripts/production-config-digest.sh
+            scripts/prepare-production-release.sh
+            scripts/backup-production.sh
+            scripts/update-production-release.sh
+            scripts/deploy-production-release.sh
+            scripts/rollback-production-release.sh
+          )
+          for file in "${tooling_files[@]}"; do
+            mkdir -p "$tooling_root/$(dirname "$file")"
+            cp -- "$file" "$tooling_root/$file"
+          done
+          chmod 755 "$tooling_root"/scripts/*.sh
+          (
+            cd "$tooling_root"
+            sha256sum "${tooling_files[@]}" > SHA256SUMS
+          )
+          tar -C "$tooling_root" -cf "$archive" "${tooling_files[@]}" SHA256SUMS
+          ssh_opts=(-p "$PORT" -i "$KEY_FILE" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
+            -o ConnectionAttempts=1)
+          scp_opts=(-P "$PORT" -i "$KEY_FILE" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
+            -o ConnectionAttempts=1)
+          remote_archive="$PATH_ON_HOST/.production-tooling-$SOURCE_SHA-$GITHUB_RUN_ID.tar"
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- "$PATH_ON_HOST" <<'REMOTE'
+          set -euo pipefail
+          test -d "$1"
+          REMOTE
+          scp "${scp_opts[@]}" "$archive" "$USER@$HOST:$remote_archive"
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- \
+            "$PATH_ON_HOST" "$remote_archive" "$SOURCE_SHA" "$GITHUB_RUN_ID" <<'REMOTE'
+          set -euo pipefail
+          path=$1
+          archive=$2
+          source_sha=$3
+          run_id=$4
+          stage="$path/.release-tooling-$source_sha-$run_id"
+          test ! -e "$stage"
+          install -d -m 700 "$stage"
+          tar -xf "$archive" -C "$stage"
+          (
+            cd "$stage"
+            sha256sum -c SHA256SUMS
+          )
+          for script in production-compose.sh production-config-digest.sh \
+            prepare-production-release.sh backup-production.sh \
+            update-production-release.sh deploy-production-release.sh \
+            rollback-production-release.sh; do
+            test -x "$stage/scripts/$script"
+          done
+          test -s "$stage/docker-compose.production.yml"
+          rm -f "$archive"
+          REMOTE
+          printf 'TOOLING_ROOT=%s\n' \
+            "$PATH_ON_HOST/.release-tooling-$SOURCE_SHA-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
       - name: Remote read-only preflight and digest pull
         shell: bash
         env:
@@ -187,25 +255,47 @@ jobs:
             -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
             -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
             -o ConnectionAttempts=1)
-          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- "$PATH_ON_HOST" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- \
+            "$PATH_ON_HOST" "$TOOLING_ROOT" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
           set -euo pipefail
           path=$1
-          image=$2
-          revision=$3
-          version=$4
+          tooling_root=$2
+          image=$3
+          revision=$4
+          version=$5
           test -d "$path"
-          test -x "$path/scripts/prepare-production-release.sh"
-          test -x "$path/scripts/backup-production.sh"
-          test -x "$path/scripts/update-production-release.sh"
-          test -x "$path/scripts/deploy-production-release.sh"
-          test -x "$path/scripts/rollback-production-release.sh"
+          test -d "$tooling_root"
+          (
+            cd "$tooling_root"
+            sha256sum -c SHA256SUMS
+          )
+          for script in production-compose.sh production-config-digest.sh \
+            prepare-production-release.sh backup-production.sh \
+            update-production-release.sh deploy-production-release.sh \
+            rollback-production-release.sh; do
+            test -x "$tooling_root/scripts/$script"
+          done
+          test -s "$tooling_root/docker-compose.production.yml"
           test -s "$path/.env.production"
           test -s "$path/.backup.env"
           command -v docker >/dev/null
           docker compose version >/dev/null
           command -v flock >/dev/null
           command -v age >/dev/null
-          grep -q '^AGE_RECIPIENT=' "$path/.backup.env"
+          [ "$(grep -c '^AGE_RECIPIENT=' "$path/.backup.env")" -eq 1 ]
+          age_recipient=$(sed -n 's/^AGE_RECIPIENT=//p' "$path/.backup.env")
+          case "$age_recipient" in
+            ""|*[[:space:]]*) echo "AGE_RECIPIENT is invalid" >&2; exit 1 ;;
+          esac
+          [ "$(grep -c '^BACKUP_DIR=' "$path/.backup.env")" -le 1 ]
+          backup_dir=$(sed -n 's/^BACKUP_DIR=//p' "$path/.backup.env")
+          if [ -n "$backup_dir" ]; then
+            [[ "$backup_dir" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+              [[ "$backup_dir" != *..* ]] || {
+              echo "BACKUP_DIR is invalid" >&2
+              exit 1
+            }
+          fi
           cd "$path"
           REMOTE
           {
@@ -239,22 +329,45 @@ jobs:
             -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
             -o ConnectionAttempts=1)
           set +e
-          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- "$PATH_ON_HOST" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- \
+            "$PATH_ON_HOST" "$TOOLING_ROOT" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
           set -euo pipefail
           path=$1
-          image=$2
-          revision=$3
-          version=$4
+          tooling_root=$2
+          image=$3
+          revision=$4
+          version=$5
+          export PRODUCTION_ROOT="$path"
+          export PRODUCTION_SCRIPTS_DIR="$tooling_root/scripts"
+          export PRODUCTION_BASE_COMPOSE="$tooling_root/docker-compose.production.yml"
           cd "$path"
           exec 9>"$path/.production-release.lock"
           flock -n 9 || { echo "another production release is active" >&2; exit 75; }
-          scripts/prepare-production-release.sh >/dev/null
-          scripts/backup-production.sh >/dev/null
+          "$PRODUCTION_SCRIPTS_DIR/prepare-production-release.sh" >/dev/null
+          [ "$(grep -c '^AGE_RECIPIENT=' "$path/.backup.env")" -eq 1 ]
+          AGE_RECIPIENT=$(sed -n 's/^AGE_RECIPIENT=//p' "$path/.backup.env")
+          case "$AGE_RECIPIENT" in
+            ""|*[[:space:]]*) echo "AGE_RECIPIENT is invalid" >&2; exit 1 ;;
+          esac
+          export AGE_RECIPIENT
+          [ "$(grep -c '^BACKUP_DIR=' "$path/.backup.env")" -le 1 ]
+          if grep -q '^BACKUP_DIR=' "$path/.backup.env"; then
+            BACKUP_DIR=$(sed -n 's/^BACKUP_DIR=//p' "$path/.backup.env")
+            [[ "$BACKUP_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+              [[ "$BACKUP_DIR" != *..* ]] || {
+              echo "BACKUP_DIR is invalid" >&2
+              exit 1
+            }
+            export BACKUP_DIR
+          else
+            unset BACKUP_DIR
+          fi
+          "$PRODUCTION_SCRIPTS_DIR/backup-production.sh" >/dev/null
           mutation_started=0
-          trap 'status=$?; if [ "$status" -ne 0 ] && [ "$mutation_started" -eq 1 ]; then scripts/rollback-production-release.sh || echo rollback_failed >&2; fi; exit "$status"' EXIT
-          scripts/update-production-release.sh "$image" "$revision" "$version" >/dev/null
+          trap 'status=$?; if [ "$status" -ne 0 ] && [ "$mutation_started" -eq 1 ]; then "$PRODUCTION_SCRIPTS_DIR/rollback-production-release.sh" || echo rollback_failed >&2; fi; exit "$status"' EXIT
+          "$PRODUCTION_SCRIPTS_DIR/update-production-release.sh" "$image" "$revision" "$version" >/dev/null
           mutation_started=1
-          scripts/deploy-production-release.sh >/dev/null
+          "$PRODUCTION_SCRIPTS_DIR/deploy-production-release.sh" >/dev/null
           REMOTE
           status=$?
           set -e

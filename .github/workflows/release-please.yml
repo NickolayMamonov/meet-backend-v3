@@ -41,7 +41,7 @@ jobs:
     needs: [release, gates]
     if: needs.release.outputs.created == 'true'
     concurrency:
-      group: backend-ghcr-publication-${{ github.repository }}-${{ needs.release.outputs.tag }}
+      group: backend-ghcr-publication-${{ github.repository }}
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
@@ -73,8 +73,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          quarantine="$RUNNER_TEMP/release/preflight-quarantine.json"
           set +e
-          result=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA")
+          result=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+            --quarantine-file "$quarantine")
           status=$?
           set -e
           printf '%s\n' "$result"
@@ -85,14 +88,19 @@ jobs:
             echo "digest=$digest" >> "$GITHUB_OUTPUT"
           fi
           if [ "$status" -eq 42 ]; then
-            gh release edit "$TAG" --draft --notes-file release-quarantine.json
+            test -s "$quarantine"
+            gh release edit "$TAG" --draft --notes-file "$quarantine"
             echo "partial/divergent/raced aliases are quarantined; no GHCR repair is attempted" >&2
             exit 1
           fi
           [ "$status" -eq 0 ] && [ "$state" = empty -o "$state" = complete ]
+      - name: Acquire create-only publication lease
+        if: steps.registry.outputs.state == 'empty'
+        run: scripts/acquire-release-lease.sh "$VERSION" "$SOURCE_SHA"
       - name: Build and publish exactly three aliases
         id: publish-image
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REGISTRY_STATE: ${{ steps.registry.outputs.state }}
           REGISTRY_DIGEST: ${{ steps.registry.outputs.digest }}
         run: |
@@ -108,6 +116,32 @@ jobs:
             digest="$REGISTRY_DIGEST"
           else
             test "$REGISTRY_STATE" = empty
+            admission_quarantine="$RUNNER_TEMP/release/lease-quarantine.json"
+            set +e
+            admission=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+              --quarantine-file "$admission_quarantine")
+            status=$?
+            set -e
+            printf '%s\n' "$admission"
+            if [ "$status" -eq 42 ]; then
+              test -s "$admission_quarantine"
+              gh release edit "$TAG" --draft --notes-file "$admission_quarantine"
+              echo "registry changed after lease acquisition; no GHCR repair is attempted" >&2
+              exit 1
+            fi
+            [ "$status" -eq 0 ]
+            admission_state=$(awk -F= '/^state=/{print $2}' <<<"$admission")
+            if [ "$admission_state" != empty ]; then
+              jq -n --arg state "$admission_state" '{
+                status: "quarantined",
+                registryWrites: 0,
+                observedState: $state,
+                reason: "registry changed after publication lease"
+              }' > "$admission_quarantine"
+              gh release edit "$TAG" --draft --notes-file "$admission_quarantine"
+              echo "registry was not empty after lease acquisition; no GHCR repair is attempted" >&2
+              exit 1
+            fi
             docker buildx build \
               --platform linux/amd64 \
               --provenance=true \
@@ -130,8 +164,20 @@ jobs:
           test "$(docker image inspect "$IMAGE@$digest" --format '{{.Config.User}}')" = "10001:10001"
           docker run --rm --entrypoint sh "$IMAGE@$digest" -ec \
             'test -f /app/app.jar && test -d /data/uploads && test -w /data/uploads'
-          final_state=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA")
+          quarantine="$RUNNER_TEMP/release/post-publish-quarantine.json"
+          set +e
+          final_state=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+            --quarantine-file "$quarantine")
+          status=$?
+          set -e
           printf '%s\n' "$final_state"
+          if [ "$status" -eq 42 ]; then
+            test -s "$quarantine"
+            gh release edit "$TAG" --draft --notes-file "$quarantine"
+            echo "post-publish registry race quarantined; no GHCR repair is attempted" >&2
+            exit 1
+          fi
+          [ "$status" -eq 0 ]
           grep -Fx 'state=complete' <<<"$final_state"
           test "$(awk -F= '/^digest=/{print $2}' <<<"$final_state")" = "$digest"
           docker buildx imagetools inspect --raw "$IMAGE@$digest" > image-index.json

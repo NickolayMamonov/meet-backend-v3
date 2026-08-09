@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
 
 : "${AGE_RECIPIENT:?AGE_RECIPIENT is required}"
 BACKUP_DIR=${BACKUP_DIR:-/var/backups/meet-production}
-COMPOSE=(scripts/production-compose.sh)
+SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
+COMPOSE=("$SCRIPTS_DIR/production-compose.sh")
 CURRENT_CONTAINER=$("${COMPOSE[@]}" ps -q backend)
 test -n "$CURRENT_CONTAINER" || {
   echo "a running backend is required for a coordinated backup" >&2
