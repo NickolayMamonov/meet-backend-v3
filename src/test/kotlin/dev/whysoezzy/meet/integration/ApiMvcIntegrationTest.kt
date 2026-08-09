@@ -27,6 +27,7 @@ import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.header
+import org.springframework.test.web.servlet.result.MockMvcResultMatchers.content
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.status
 import java.util.Base64
@@ -477,6 +478,9 @@ class ApiMvcIntegrationTest @Autowired constructor(
             .andExpect(status().isOk)
             .andExpect(jsonPath("$.type").value("COMMUNITIES"))
             .andExpect(jsonPath("$.communities[0].id").value(data.community.id))
+        mockMvc.perform(get("/api/ads/${Long.MAX_VALUE}"))
+            .andExpect(status().isOk)
+            .andExpect(content().string(""))
     }
 
     private fun tokenFor(user: User): String {
