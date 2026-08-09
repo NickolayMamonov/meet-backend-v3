@@ -4,8 +4,8 @@ REST API для Android приложения Meeting - платформы для
 
 ## 🚀 Технологии
 
-- **Kotlin** 2.2.21
-- **Spring Boot** 4.1.0
+- **Kotlin** 1.9.25
+- **Spring Boot** 3.2.2
 - **PostgreSQL** 16
 - **Flyway** - миграции БД
 - **SpringDoc OpenAPI** - документация API
@@ -197,20 +197,6 @@ TEST_POSTGRES_USERNAME=postgres \
 TEST_POSTGRES_PASSWORD=postgres \
 ./gradlew test --tests dev.whysoezzy.meet.integration.ApiMvcIntegrationTest
 ```
-
-## IntelliJ IDEA
-
-For local startup, use a Spring Boot run configuration with active profile
-`dev`, or set this environment variable:
-
-```text
-SPRING_PROFILES_ACTIVE=dev
-```
-
-The `dev` profile supplies a local-only JWT secret and PostgreSQL settings.
-Without it, the application deliberately fails fast unless
-`APP_JWT_SECRET` (at least 32 UTF-8 bytes) and all production database
-variables are provided.
 
 ## Production deployment
 
