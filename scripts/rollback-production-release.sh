@@ -6,10 +6,7 @@ cd "$ROOT_DIR"
 COMPOSE=(scripts/production-compose.sh)
 STATE_DIR=/var/lib/meet-production
 
-for name in previous-image previous-image-id previous-revision previous-uid \
-  previous-gid previous-upload-volume previous-config.sha256 \
-  previous-compose.yml previous-runtime.override.yml previous-compose.sha256
-  previous-runtime.sha256 previous-compose-config-hash; do
+for name in previous-image previous-image-id previous-revision previous-uid previous-gid previous-upload-volume previous-config.sha256 previous-compose.yml previous-runtime.override.yml previous-compose.sha256 previous-runtime.sha256 previous-compose-config-hash; do
   test -s "$STATE_DIR/$name" || { echo "missing rollback state: $name" >&2; exit 1; }
 done
 [ "$(scripts/production-config-digest.sh)" = "$(< "$STATE_DIR/previous-config.sha256")" ] || {
