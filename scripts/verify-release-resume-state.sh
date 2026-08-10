@@ -380,27 +380,10 @@ else
   [ "$(jq -S -c . "$LIVE_INDEX")" = "$(jq -S -c . "$INDEX")" ] ||
     fail "attached OCI index is not the live registry index"
   PACKAGE_INVENTORY=$WORK_DIR/package-inventory.json
-  jq -s \
-    --arg digest "$DIGEST" \
-    --arg tag "$TAG" \
-    --arg version "$VERSION" \
-    --arg source "$SOURCE_SHA" '
-      [ .[][] ] as $versions |
-      [$versions[] | select(.name == $digest) |
-        (.metadata.container.tags // [])] | add as $aliases |
-      {
-        digest: $digest,
-        aliases: reduce ($aliases // [])[] as $alias
-          ({}; .[$alias] = $digest),
-        latest: (if any($versions[]; (.metadata.container.tags // []) |
-          index("latest")) then $digest else null end),
-        versions: [$versions[] | {
-          id: .id,
-          digest: .name,
-          tags: (.metadata.container.tags // [])
-        }]
-      }
-    ' "$PACKAGE_VERSIONS" >"$PACKAGE_INVENTORY" ||
+  "$SCRIPT_DIR/normalize-ghcr-package-inventory.sh" \
+    --package-versions-file "$PACKAGE_VERSIONS" \
+    --digest "$DIGEST" \
+    --output "$PACKAGE_INVENTORY" ||
     fail "GHCR package inventory normalization failed"
   PLATFORM_SUBJECT=$(jq -r '
     [

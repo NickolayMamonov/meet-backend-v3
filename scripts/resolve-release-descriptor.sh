@@ -552,6 +552,9 @@ case "$MODE" in
     done < <(jq -c '.[]' <<<"$RELEASES")
 
     if [ "${#ELIGIBLE[@]}" -eq 0 ]; then
+      canonical_target=$(resolve_tag "$AUTHORITY_TAG") || return 1
+      [ "$canonical_target" = absent ] ||
+        fail "current canonical tag exists without a release candidate"
       emit_pre_action_action
     elif [ "${#ELIGIBLE[@]}" -eq 1 ]; then
       emit_pre_action_recovery "${ELIGIBLE[0]}"

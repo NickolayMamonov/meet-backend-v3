@@ -239,4 +239,4 @@ done < <(jq -r '.cases | keys[]' "$FIXTURES")
   echo "$failures pre-action routing fixture checks failed" >&2
   exit 1
 }
-echo "release pre-action routing fixtures passed: 9 cases"
+echo "release pre-action routing fixtures passed: 13 cases"

@@ -64,10 +64,14 @@ require_file scripts/verify-release-resume-state.sh
 require_file scripts/verify-ghcr-package-inventory.sh
 require_file scripts/verify-oci-referrer-closure.sh
 require_file scripts/test-oci-referrer-closure.sh
+require_file scripts/normalize-ghcr-package-inventory.sh
+require_file scripts/test-ghcr-package-normalization.sh
 
 WORKFLOW_TEXT=$(sed 's/\r$//' "$RELEASE_WORKFLOW")
 RESUME_TEXT=$(sed 's/\r$//' scripts/verify-release-resume-state.sh)
 CLOSURE_TEXT=$(sed 's/\r$//' scripts/verify-oci-referrer-closure.sh)
+INVENTORY_TEXT=$(sed 's/\r$//' scripts/verify-ghcr-package-inventory.sh)
+INVENTORY_TEST_TEXT=$(sed 's/\r$//' scripts/test-ghcr-package-inventory.sh)
 PRE_ACTION_FIXTURES=$(sed 's/\r$//' scripts/fixtures/release-preaction-routing/scenarios.json)
 
 jq empty "$CONFIG" "$MANIFEST" "$VERSION_FILE" >/dev/null ||
@@ -209,6 +213,12 @@ grep -Fq 'verify-ghcr-package-inventory.sh' <<<"$RESUME_TEXT" ||
   fail "resume verifier is missing GHCR inventory closure"
 grep -Fq 'verify-oci-referrer-closure.sh' <<<"$RESUME_TEXT" ||
   fail "resume verifier is missing subject-bound OCI referrer closure"
+grep -Fq 'normalize-ghcr-package-inventory.sh' <<<"$RESUME_TEXT" ||
+  fail "resume verifier is missing page-array package normalization"
+grep -Fq 'SUBJECT_MARKER' <<<"$INVENTORY_TEXT" ||
+  fail "GHCR inventory verifier is missing subject-marker uniqueness"
+grep -Fq 'duplicate-subject-marker' <<<"$INVENTORY_TEST_TEXT" ||
+  fail "GHCR inventory fixtures are missing duplicate subject-marker rejection"
 grep -Fq 'validate_descriptor' <<<"$CLOSURE_TEXT" ||
   fail "OCI referrer closure is missing child descriptor validation"
 grep -Fq 'fetch_raw' <<<"$CLOSURE_TEXT" ||
@@ -222,6 +232,10 @@ grep -Fq 'published-current-conflict' <<<"$PRE_ACTION_FIXTURES" ||
   fail "pre-action fixtures are missing the published current conflict"
 grep -Fq 'published-future-conflict' <<<"$PRE_ACTION_FIXTURES" ||
   fail "pre-action fixtures are missing the published future conflict"
+grep -Fq 'no-candidate-canonical-ref' <<<"$PRE_ACTION_FIXTURES" ||
+  fail "pre-action fixtures are missing the orphan canonical-ref conflict"
+grep -Fq 'no-candidate-refs-api-error' <<<"$PRE_ACTION_FIXTURES" ||
+  fail "pre-action fixtures are missing the zero-candidate refs API error"
 require_text 'if: needs.release.outputs.active == '\''true'\'''
 require_text 'source_sha: ${{ needs.release.outputs.source_sha }}'
 require_text 'release_tag: ${{ needs.release.outputs.release_tag }}'
@@ -373,6 +387,8 @@ grep -Fq 'test-release-mutation-revalidation.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the mutation revalidation regression"
 grep -Fq 'test-oci-referrer-closure.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the OCI referrer closure fixtures"
+grep -Fq 'test-ghcr-package-normalization.sh' <<<"$CI_TEXT" ||
+  fail "reusable CI does not run the GHCR page-array normalization fixtures"
 for input in source_sha release_tag release_version release_id; do
   grep -Eq "^[[:space:]]+$input:" <<<"$CI_TEXT" ||
     fail "reusable CI is missing additive input: $input"

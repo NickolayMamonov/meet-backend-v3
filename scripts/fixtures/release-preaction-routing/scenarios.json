@@ -181,6 +181,24 @@
         "refs": {},
         "tags": {}
       }
+    },
+    "no-candidate-canonical-ref": {
+      "expected": "failure",
+      "releasePatches": [],
+      "refs": {
+        "refs": {
+          "v1.0.1": {
+            "type": "commit",
+            "sha": "@SOURCE@"
+          }
+        },
+        "tags": {}
+      }
+    },
+    "no-candidate-refs-api-error": {
+      "expected": "failure",
+      "transport": "refs_api_error",
+      "releasePatches": []
     }
   }
 }

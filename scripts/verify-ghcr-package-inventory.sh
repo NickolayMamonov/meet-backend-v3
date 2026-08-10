@@ -43,6 +43,7 @@ fi
 EXPECTED_TAGS=$(jq -cn --arg tag "$TAG" --arg version "$VERSION" \
   --arg source "$SOURCE_SHA" \
   '[$tag, $version, ("sha-" + $source)] | sort')
+SUBJECT_MARKER="sha256-${DIGEST#sha256:}"
 
 jq -e \
   --arg digest "$DIGEST" \
@@ -63,6 +64,15 @@ jq -e --arg digest "$DIGEST" --argjson expected "$EXPECTED_TAGS" '
   (($images[0].tags | sort) == $expected)
 ' "$INVENTORY_FILE" >/dev/null ||
   fail "expected image digest does not carry exactly the three release aliases"
+
+jq -e \
+  --arg digest "$DIGEST" \
+  --arg marker "$SUBJECT_MARKER" '
+  [.versions[] | select((.tags | index($marker)) != null)] as $markers |
+  ($markers | length) <= 1 and
+  (($markers | length) == 0 or $markers[0].digest != $digest)
+' "$INVENTORY_FILE" >/dev/null ||
+  fail "subject marker must not be duplicated or belong to the image version"
 
 jq -e \
   --arg digest "$DIGEST" \

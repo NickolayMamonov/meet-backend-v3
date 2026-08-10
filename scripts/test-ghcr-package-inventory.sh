@@ -63,4 +63,7 @@ expect_failure partial-alias 'del(.aliases["1.0.1"])'
 expect_failure unverified-referrer '.versions[1].attribution.verified = false'
 expect_failure divergent-subject \
   '.versions[2].attribution.subject = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"'
+expect_failure duplicate-subject-marker \
+  '(.digest | sub("^sha256:";"")) as $marker |
+   .versions[1].tags = ["sha256-" + $marker]'
 echo "GHCR package inventory fixtures passed: valid hosted closure and five rejects"
