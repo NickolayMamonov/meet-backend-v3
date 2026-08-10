@@ -118,7 +118,7 @@ jobs:
           if [ -n "$SOURCE_SHA" ]; then
             test "$revision" = "$SOURCE_SHA"
             test "$version" = "$RELEASE_VERSION"
-            test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .tag_name)" = "$RELEASE_TAG"
+            test "$RELEASE_TAG" = "v$RELEASE_VERSION"
             "$TOOLING_SCRIPTS/verify-release-consistency.sh" \
               "$RELEASE_VERSION" "$SOURCE_SHA" --tag "$RELEASE_TAG"
           else
@@ -197,7 +197,7 @@ jobs:
           "$TOOLING_SCRIPTS/test-release-registry-state.sh"
       - name: Verify Release Please state
         env:
-          RELEASE_REF: ${{ inputs.source_sha != '' && '' || inputs.ref }}
+          RELEASE_REF: ${{ inputs.source_sha == '' && inputs.ref || '' }}
         working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
           set -euo pipefail
