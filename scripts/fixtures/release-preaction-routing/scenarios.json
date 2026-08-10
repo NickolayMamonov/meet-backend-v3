@@ -194,6 +194,48 @@
         "tags": {}
       }
     },
+    "injected-malformed-release-item": {
+      "expected": "failure",
+      "profile": "action",
+      "releases": [
+        null
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "injected-malformed-release-result": {
+      "expected": "failure",
+      "profile": "action",
+      "releases": {
+        "pages": []
+      },
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "live-malformed-page": {
+      "expected": "failure",
+      "profile": "action",
+      "transport": "live_malformed_page",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "live-malformed-release-item": {
+      "expected": "failure",
+      "profile": "action",
+      "transport": "live_malformed_item",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
     "action-canonical-recovery": {
       "expected": "recovery",
       "profile": "action",

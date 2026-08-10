@@ -95,6 +95,26 @@ chmod +x "$TMP/bin/mock-release-please"
   echo '      echo "HTTP 404" >&2; exit 1 ;;'
   echo '  esac'
   echo 'fi'
+  echo 'if [ "${GH_MOCK_MODE:-}" = live_malformed_page ]; then'
+  echo '  case "$endpoint" in'
+  echo '    repos/fixture/repository)'
+  echo '      printf "%s\n" '\''{"full_name":"fixture/repository","permissions":{"push":true}}'\''; exit 0 ;;'
+  echo '    repos/fixture/repository/releases*)'
+  echo '      printf "%s\n" '\''[null]'\''; exit 0 ;;'
+  echo '    repos/fixture/repository/git/ref/tags/*)'
+  echo '      echo "HTTP 404" >&2; exit 1 ;;'
+  echo '  esac'
+  echo 'fi'
+  echo 'if [ "${GH_MOCK_MODE:-}" = live_malformed_item ]; then'
+  echo '  case "$endpoint" in'
+  echo '    repos/fixture/repository)'
+  echo '      printf "%s\n" '\''{"full_name":"fixture/repository","permissions":{"push":true}}'\''; exit 0 ;;'
+  echo '    repos/fixture/repository/releases*)'
+  echo '      printf "%s\n" '\''[[null]]'\''; exit 0 ;;'
+  echo '    repos/fixture/repository/git/ref/tags/*)'
+  echo '      echo "HTTP 404" >&2; exit 1 ;;'
+  echo '  esac'
+  echo 'fi'
   echo 'if [ "${GH_MOCK_MODE:-}" = authority_api_error ] &&'
   echo '   [ "$endpoint" = repos/fixture/repository ]; then'
   echo '  echo "fixture repository authority API failed" >&2'
@@ -112,10 +132,13 @@ materialize_case() {
   local case_name=$1 releases_file=$2 refs_file=$3 authority_file=$4
   jq --arg case_name "$case_name" \
     --arg source "$SOURCE" --arg old "$OLD" --arg tip "$TIP" '
-      [
-        .cases[$case_name].releasePatches[] as $patch |
-        (.baseRelease + $patch)
-      ] | walk(
+      (
+        .cases[$case_name].releases //
+        [
+          .cases[$case_name].releasePatches[] as $patch |
+          (.baseRelease + $patch)
+        ]
+      ) | walk(
         if type == "string" then
           gsub("@SOURCE@"; $source) |
           gsub("@OLD@"; $old) |
@@ -218,7 +241,7 @@ run_case() {
     refs_api_error)
       args+=(--releases-file "$releases_file")
       ;;
-    paginated_empty|authority_api_error)
+    paginated_empty|authority_api_error|live_malformed_page|live_malformed_item)
       ;;
     *)
       echo "unknown fixture transport: $transport" >&2

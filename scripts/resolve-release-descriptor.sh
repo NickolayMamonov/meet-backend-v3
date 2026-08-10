@@ -214,15 +214,34 @@ prove_action_authority() {
 
 load_releases() {
   if [ -n "$RELEASES_FILE" ]; then
-    jq -e 'type == "array"' "$RELEASES_FILE" >/dev/null ||
-      fail "injected releases must be a JSON array"
-    jq -c . "$RELEASES_FILE"
+    jq -e -s '
+      length == 1 and
+      (.[0] | type == "array" and all(.[]; type == "object"))
+    ' "$RELEASES_FILE" >/dev/null ||
+      fail "injected releases contain a malformed result or release item"
+    jq -c -s '.[0]' "$RELEASES_FILE"
     return
   fi
   [ -n "$REPOSITORY" ] || fail "repository is required for live API reads"
   command -v gh >/dev/null 2>&1 || fail "gh is required for live API reads"
-  gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100" |
-    jq -c 'add // []'
+  local pages releases
+  pages=$(gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100") ||
+    fail "paginated release enumeration failed"
+  jq -e -s '
+    length == 1 and
+    (.[0] |
+      type == "array" and
+      all(.[]; type == "array" and all(.[]; type == "object")))
+  ' <<<"$pages" >/dev/null ||
+    fail "paginated releases contain a malformed page, result, or release item"
+  releases=$(jq -c -s '.[0] | add // []' <<<"$pages") ||
+    fail "paginated release reduction failed"
+  jq -e -s '
+    length == 1 and
+    (.[0] | type == "array" and all(.[]; type == "object"))
+  ' <<<"$releases" >/dev/null ||
+    fail "paginated release reduction produced a malformed result"
+  printf '%s\n' "$releases"
 }
 
 resolve_tag() {

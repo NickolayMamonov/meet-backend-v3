@@ -490,6 +490,14 @@ grep -Fq 'recovery-only-visible-placeholder-audit' \
 grep -Fq 'recovery-only-zero-candidate-safe-failure' \
   <<<"$PRE_ACTION_FIXTURES" ||
   fail "pre-action fixtures are missing the recovery-only zero-candidate case"
+for fixture in \
+  injected-malformed-release-item \
+  injected-malformed-release-result \
+  live-malformed-page \
+  live-malformed-release-item; do
+  grep -Fq "\"$fixture\"" <<<"$PRE_ACTION_FIXTURES" ||
+    fail "pre-action fixtures are missing malformed enumeration case: $fixture"
+done
 grep -Fq 'release_id:' <<<"$RECOVERY_TEXT" ||
   fail "manual recovery must accept a numeric release ID"
 grep -Fq 'scripts/resolve-release-descriptor.sh pre-action' <<<"$RECOVERY_TEXT" ||
