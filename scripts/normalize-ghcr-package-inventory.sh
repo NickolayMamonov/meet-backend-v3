@@ -63,8 +63,8 @@ normalized=$(jq --arg digest "$DIGEST" '
       (.metadata.container.tags // [])] | add as $aliases |
     {
       digest: $digest,
-      aliases: reduce ($aliases // [])[] as $alias
-        ({}; .[$alias] = $digest),
+      aliases: (reduce ($aliases // [])[] as $alias
+        ({}; .[$alias] = $digest)),
       latest: (if any($versions[]; (.metadata.container.tags // []) |
         index("latest")) then $digest else null end),
       versions: [$versions[] | {
