@@ -1,0 +1,18 @@
+{
+  "assignees": [],
+  "base_ref": "dev",
+  "body_sha256": "03000f4b27cc401b307996b891205dc9a247a7d5e35478dd7bd5290c042d1597",
+  "draft": false,
+  "head": {
+    "ref": "release-please--branches--dev--components--meet-backend",
+    "sha": "672bcbd9d7bceef175ecbca97fc3e7294e294ce3"
+  },
+  "labels": [
+    "autorelease: pending"
+  ],
+  "milestone": null,
+  "number": 28,
+  "requested_reviewers": [],
+  "state": "open",
+  "title_sha256": "323713a6ef0c3f586320748c56e7866ddf6405887e64473f87c7451777fb253a"
+}

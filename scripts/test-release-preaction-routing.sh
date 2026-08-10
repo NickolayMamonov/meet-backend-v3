@@ -5,11 +5,12 @@ set -euo pipefail
 #   resolve-release-descriptor.sh pre-action [common resolver options]
 # emits exactly one route:
 #   route=recovery  - one canonical/current generated-placeholder draft exists
-#   route=action    - no current-authority candidate exists
+#   route=action    - action authority is proven, no candidate exists, and the
+#                     canonical ref is absent
 # Any malformed, conflicting, ambiguous, ref-divergent, or API-unverifiable
 # state exits nonzero without emitting a route. Recovery also emits the
 # canonical descriptor plus observed_state=canonical|generated_placeholder;
-# origin is intentionally not part of this routing contract.
+# default pre-action is recovery-only and never emits route=action.
 # The workflow may invoke Release Please only for route=action.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -67,6 +68,7 @@ chmod +x "$TMP/bin/mock-release-please"
   echo 'set -euo pipefail'
   echo 'method=GET'
   echo 'next_is_method=false'
+  echo 'endpoint='
   echo 'for argument in "$@"; do'
   echo '  if [ "$next_is_method" = true ]; then'
   echo '    method=$argument'
@@ -76,10 +78,27 @@ chmod +x "$TMP/bin/mock-release-please"
   echo '  case "$argument" in'
   echo '    --method) next_is_method=true ;;'
   echo '    --method=*) method=${argument#--method=} ;;'
+  echo '    --*) ;;'
+  echo '    *) endpoint=$argument ;;'
   echo '  esac'
   echo 'done'
   echo 'if [ "$method" != GET ]; then'
   echo '  printf "gh api method=%s\n" "$method" >>"$WRITE_LOG"'
+  echo 'fi'
+  echo 'if [ "${GH_MOCK_MODE:-}" = paginated_empty ]; then'
+  echo '  case "$endpoint" in'
+  echo '    repos/fixture/repository)'
+  echo '      printf "%s\n" '\''{"full_name":"fixture/repository","permissions":{"push":true}}'\''; exit 0 ;;'
+  echo '    repos/fixture/repository/releases*)'
+  echo '      printf "%s\n" '\''[[],[]]'\''; exit 0 ;;'
+  echo '    repos/fixture/repository/git/ref/tags/*)'
+  echo '      echo "HTTP 404" >&2; exit 1 ;;'
+  echo '  esac'
+  echo 'fi'
+  echo 'if [ "${GH_MOCK_MODE:-}" = authority_api_error ] &&'
+  echo '   [ "$endpoint" = repos/fixture/repository ]; then'
+  echo '  echo "fixture repository authority API failed" >&2'
+  echo '  exit 1'
   echo 'fi'
   echo 'echo "fixture GitHub API read failed" >&2'
   echo 'exit 1'
@@ -90,7 +109,7 @@ PATH=$TMP/bin:$PATH
 export PATH
 
 materialize_case() {
-  local case_name=$1 releases_file=$2 refs_file=$3
+  local case_name=$1 releases_file=$2 refs_file=$3 authority_file=$4
   jq --arg case_name "$case_name" \
     --arg source "$SOURCE" --arg old "$OLD" --arg tip "$TIP" '
       [
@@ -118,6 +137,10 @@ materialize_case() {
         end
       )
     ' "$FIXTURES" >"$refs_file"
+  jq --arg case_name "$case_name" '
+    .cases[$case_name].authority //
+    {full_name:"fixture/repository", permissions:{push:true}}
+  ' "$FIXTURES" >"$authority_file"
 }
 
 value() {
@@ -126,6 +149,14 @@ value() {
     sub(/^[^=]*=/, "")
     print
   }' <<<"$descriptor"
+}
+
+invoke_resolver() {
+  if [ "$token" = __missing__ ]; then
+    env -u GH_TOKEN GH_MOCK_MODE="$transport" "$RESOLVER" "$@"
+  else
+    env GH_TOKEN="$token" GH_MOCK_MODE="$transport" "$RESOLVER" "$@"
+  fi
 }
 
 assert_no_action_or_write() {
@@ -142,18 +173,26 @@ assert_no_action_or_write() {
 }
 
 run_case() {
-  local case_name=$1 expected transport observed_state
+  local case_name=$1 expected transport profile authority_transport token
   local releases_file=$TMP/$case_name-releases.json
   local refs_file=$TMP/$case_name-refs.json
+  local authority_file=$TMP/$case_name-authority.json
   local output_file=$TMP/$case_name-output
   local error_file=$TMP/$case_name-error
+  local descriptor route observed_state
   local -a args
 
   expected=$(jq -r --arg case_name "$case_name" \
     '.cases[$case_name].expected' "$FIXTURES")
   transport=$(jq -r --arg case_name "$case_name" \
     '.cases[$case_name].transport // "injected"' "$FIXTURES")
-  materialize_case "$case_name" "$releases_file" "$refs_file"
+  profile=$(jq -r --arg case_name "$case_name" \
+    '.cases[$case_name].profile // "recovery"' "$FIXTURES")
+  authority_transport=$(jq -r --arg case_name "$case_name" \
+    '.cases[$case_name].authorityTransport // "injected"' "$FIXTURES")
+  token=$(jq -r --arg case_name "$case_name" \
+    '.cases[$case_name].token // "fixture-token"' "$FIXTURES")
+  materialize_case "$case_name" "$releases_file" "$refs_file" "$authority_file"
   printf '0\n' >"$ACTION_COUNT"
   : >"$WRITE_LOG"
 
@@ -163,6 +202,12 @@ run_case() {
     --dev-ref HEAD
     --repository fixture/repository
   )
+  if [ "$profile" = action ]; then
+    args+=(--require-action-authority)
+    if [ "$authority_transport" != repository_api_error ]; then
+      args+=(--repository-file "$authority_file")
+    fi
+  fi
   case "$transport" in
     injected)
       args+=(--releases-file "$releases_file" --refs-file "$refs_file")
@@ -173,13 +218,15 @@ run_case() {
     refs_api_error)
       args+=(--releases-file "$releases_file")
       ;;
+    paginated_empty|authority_api_error)
+      ;;
     *)
       echo "unknown fixture transport: $transport" >&2
       return 1
       ;;
   esac
 
-  if "$RESOLVER" "${args[@]}" >"$output_file" 2>"$error_file"; then
+  if invoke_resolver "${args[@]}" >"$output_file" 2>"$error_file"; then
     descriptor=$(<"$output_file")
     route=$(value route "$descriptor")
     [ "$expected" != failure ] || {
@@ -204,6 +251,10 @@ run_case() {
         assert_no_action_or_write "$case_name"
         ;;
       action)
+        [ "$profile" = action ] || {
+          echo "not ok - $case_name used action in recovery-only profile" >&2
+          return 1
+        }
         "$TMP/bin/mock-release-please"
         [ "$(cat "$ACTION_COUNT")" -eq 1 ]
         [ ! -s "$WRITE_LOG" ]
@@ -239,4 +290,5 @@ done < <(jq -r '.cases | keys[]' "$FIXTURES")
   echo "$failures pre-action routing fixture checks failed" >&2
   exit 1
 }
-echo "release pre-action routing fixtures passed: 13 cases"
+case_count=$(jq '.cases | length' "$FIXTURES")
+echo "release pre-action routing fixtures passed: $case_count cases"

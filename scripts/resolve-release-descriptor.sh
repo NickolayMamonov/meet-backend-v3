@@ -18,9 +18,12 @@ options:
   --repo-dir PATH       source Git repository (default: .)
   --dev-ref REF         exact authoritative dev ref (default: origin/dev)
   --repository OWNER/REPO
+  --repository-file PATH  injected authenticated repository authority object
   --release-file PATH   injected single GitHub release object
   --releases-file PATH  injected GitHub release array
   --refs-file PATH      injected tag/ref object; omitted means live GitHub API
+  --require-action-authority
+                         action-admission proof (pre-action only)
 EOF
   exit 2
 }
@@ -40,9 +43,11 @@ esac
 REPO_DIR=.
 DEV_REF=origin/dev
 REPOSITORY=${GITHUB_REPOSITORY:-}
+REPOSITORY_FILE=
 RELEASE_FILE=
 RELEASES_FILE=
 REFS_FILE=
+REQUIRE_ACTION_AUTHORITY=false
 EXPECTED_ID=
 EXPECTED_TAG=
 EXPECTED_VERSION=
@@ -54,9 +59,11 @@ while [ "$#" -gt 0 ]; do
     --repo-dir) [ "$#" -ge 2 ] || usage; REPO_DIR=$2; shift 2 ;;
     --dev-ref) [ "$#" -ge 2 ] || usage; DEV_REF=$2; shift 2 ;;
     --repository) [ "$#" -ge 2 ] || usage; REPOSITORY=$2; shift 2 ;;
+    --repository-file) [ "$#" -ge 2 ] || usage; REPOSITORY_FILE=$2; shift 2 ;;
     --release-file) [ "$#" -ge 2 ] || usage; RELEASE_FILE=$2; shift 2 ;;
     --releases-file) [ "$#" -ge 2 ] || usage; RELEASES_FILE=$2; shift 2 ;;
     --refs-file) [ "$#" -ge 2 ] || usage; REFS_FILE=$2; shift 2 ;;
+    --require-action-authority) REQUIRE_ACTION_AUTHORITY=true; shift ;;
     --release-id) [ "$#" -ge 2 ] || usage; EXPECTED_ID=$2; shift 2 ;;
     --tag) [ "$#" -ge 2 ] || usage; EXPECTED_TAG=$2; shift 2 ;;
     --version) [ "$#" -ge 2 ] || usage; EXPECTED_VERSION=$2; shift 2 ;;
@@ -69,6 +76,11 @@ while [ "$#" -gt 0 ]; do
     *) usage ;;
   esac
 done
+
+[ "$MODE" = pre-action ] || [ "$REQUIRE_ACTION_AUTHORITY" = false ] ||
+  usage
+[ "$MODE" = pre-action ] || [ -z "$REPOSITORY_FILE" ] ||
+  usage
 
 git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   fail "repo-dir is not a Git work tree"
@@ -169,6 +181,35 @@ load_release_by_id() {
   [ -n "$REPOSITORY" ] || fail "repository is required for live API reads"
   command -v gh >/dev/null 2>&1 || fail "gh is required for live API reads"
   gh api "repos/$REPOSITORY/releases/$id"
+}
+
+prove_action_authority() {
+  local authority
+  [ "$REQUIRE_ACTION_AUTHORITY" = true ] || return 0
+  [ -n "${GH_TOKEN:-}" ] ||
+    fail "action authority credential is missing or empty"
+  case "${GH_TOKEN:-}" in
+    *[[:space:]]*) fail "action authority credential contains whitespace" ;;
+  esac
+
+  if [ -n "$REPOSITORY_FILE" ]; then
+    jq -e 'type == "object"' "$REPOSITORY_FILE" >/dev/null ||
+      fail "injected repository authority is not an object"
+    authority=$(jq -c . "$REPOSITORY_FILE")
+  else
+    [ -n "$REPOSITORY" ] || fail "repository is required for action authority"
+    command -v gh >/dev/null 2>&1 || fail "gh is required for action authority"
+    authority=$(gh api "repos/$REPOSITORY") ||
+      fail "authenticated repository authority read failed"
+  fi
+
+  jq -e --arg repository "$REPOSITORY" '
+    type == "object" and
+    (.full_name | type == "string" and . == $repository) and
+    (.permissions | type == "object") and
+    (.permissions.push | type == "boolean" and . == true)
+  ' <<<"$authority" >/dev/null ||
+    fail "repository identity or push permission is not positively proven"
 }
 
 load_releases() {
@@ -528,6 +569,7 @@ case "$MODE" in
     fi
     ;;
   pre-action)
+    prove_action_authority
     RELEASES=$(load_releases)
     ELIGIBLE=()
     while IFS= read -r release; do
@@ -555,7 +597,11 @@ case "$MODE" in
       canonical_target=$(resolve_tag "$AUTHORITY_TAG") || return 1
       [ "$canonical_target" = absent ] ||
         fail "current canonical tag exists without a release candidate"
-      emit_pre_action_action
+      if [ "$REQUIRE_ACTION_AUTHORITY" = true ]; then
+        emit_pre_action_action
+      else
+        fail "no visible recovery candidate; action admission is disabled"
+      fi
     elif [ "${#ELIGIBLE[@]}" -eq 1 ]; then
       emit_pre_action_recovery "${ELIGIBLE[0]}"
     else

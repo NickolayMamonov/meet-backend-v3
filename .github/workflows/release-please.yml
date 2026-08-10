@@ -42,12 +42,13 @@ jobs:
       - name: Classify current authority before Release Please
         id: pre_action
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         run: |
           set -euo pipefail
           descriptor=$(scripts/resolve-release-descriptor.sh pre-action \
             --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev)
+            --dev-ref origin/dev \
+            --require-action-authority)
           printf '%s\n' "$descriptor"
           value() {
             awk -F= -v key="$1" '$1 == key {

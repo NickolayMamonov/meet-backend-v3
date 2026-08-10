@@ -9,6 +9,7 @@ MANIFEST=.release-please-manifest.json
 VERSION_FILE=version.json
 CHANGELOG=CHANGELOG.md
 RELEASE_WORKFLOW=.github/workflows/release-please.yml
+RECOVERY_WORKFLOW=.github/workflows/release-recovery.yml
 BOOTSTRAP_SHA=bea6672443c16ee7be2297cc39ad5cd4e2a077c4
 
 fail() {
@@ -57,7 +58,8 @@ require_regex() {
 command -v jq >/dev/null 2>&1 ||
   fail "jq is required; hosted CI provides the supported JSON validator"
 
-for file in "$CONFIG" "$MANIFEST" "$VERSION_FILE" "$CHANGELOG" "$RELEASE_WORKFLOW"; do
+for file in "$CONFIG" "$MANIFEST" "$VERSION_FILE" "$CHANGELOG" \
+  "$RELEASE_WORKFLOW" "$RECOVERY_WORKFLOW"; do
   require_file "$file"
 done
 require_file scripts/verify-release-resume-state.sh
@@ -413,6 +415,14 @@ grep -Fq 'test-release-resume-state.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the release resume fixtures"
 grep -Fq 'test-release-mutation-revalidation.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the mutation revalidation regression"
+grep -Fq 'test-release-preaction-routing.sh' <<<"$CI_TEXT" ||
+  fail "hosted CI does not run the mock-only pre-action authority matrix"
+grep -Fq 'contents: read' <<<"$CI_TEXT" ||
+  fail "hosted pre-action matrix does not have read-only job permissions"
+if grep -Fq 'RELEASE_PLEASE_TOKEN' <<<"$CI_TEXT" ||
+   grep -Fq 'environment:' <<<"$CI_TEXT"; then
+  fail "hosted pre-action matrix references a repository secret or environment"
+fi
 grep -Fq 'test-oci-referrer-closure.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the OCI referrer closure fixtures"
 grep -Fq 'test-ghcr-package-normalization.sh' <<<"$CI_TEXT" ||
@@ -431,6 +441,55 @@ grep -Fq 'path: source' <<<"$CI_TEXT" ||
 RECOVERY_WORKFLOW=.github/workflows/release-recovery.yml
 require_file "$RECOVERY_WORKFLOW"
 RECOVERY_TEXT=$(sed 's/\r$//' "$RECOVERY_WORKFLOW")
+if [ "$(grep -F 'GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}' \
+    <<<"$WORKFLOW_TEXT" | wc -l | tr -d '[:space:]')" -ne 1 ]; then
+  fail "release workflow must have one dedicated pre-action token expression"
+fi
+if [ "$(grep -F 'token: ${{ secrets.RELEASE_PLEASE_TOKEN }}' \
+    <<<"$WORKFLOW_TEXT" | wc -l | tr -d '[:space:]')" -ne 1 ]; then
+  fail "Release Please must have one dedicated token expression"
+fi
+grep -Fq -- '--require-action-authority' <<<"$pre_action_block" ||
+  fail "only the Release Please pre-action must request action admission"
+if grep -Fq 'GITHUB_TOKEN' <<<"$pre_action_block"; then
+  fail "action-admission pre-action contains a GITHUB_TOKEN fallback"
+fi
+workflow_action_option_count=$(
+  grep -R -h --include='*.yml' --include='*.yaml' \
+    -- '--require-action-authority' .github/workflows |
+    wc -l | tr -d '[:space:]'
+)
+[ "$workflow_action_option_count" -eq 1 ] ||
+  fail "more than one workflow caller can request action admission"
+if grep -Fq -- '--require-action-authority' <<<"$RECOVERY_TEXT" ||
+   grep -Fq -- '--require-action-authority' \
+     scripts/mutate-release-metadata.sh; then
+  fail "recovery-only callers request action admission"
+fi
+grep -Fq 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery must remain GITHUB_TOKEN-backed"
+if grep -Fq 'RELEASE_PLEASE_TOKEN' <<<"$RECOVERY_TEXT"; then
+  fail "manual recovery must not receive the release PAT"
+fi
+grep -Fq 'workflow_dispatch:' <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery must remain workflow_dispatch-only"
+grep -Fq "github.ref == 'refs/heads/master'" <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery must remain bound to master"
+grep -Fq 'contents: read' <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery must retain contents:read"
+grep -Fq 'packages: read' <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery must retain packages:read"
+if grep -Eiq \
+    'contents: write|packages: write|attestations: write|id-token: write|googleapis/release-please-action|mutate-release-metadata|gh api --method (PATCH|POST|PUT|DELETE)|gh release (create|edit|upload)|docker (push|build)' \
+    <<<"$RECOVERY_TEXT"; then
+  fail "manual recovery contains an action or mutation construct"
+fi
+grep -Fq 'recovery-only-visible-placeholder-audit' \
+  <<<"$PRE_ACTION_FIXTURES" ||
+  fail "pre-action fixtures are missing the successful recovery audit case"
+grep -Fq 'recovery-only-zero-candidate-safe-failure' \
+  <<<"$PRE_ACTION_FIXTURES" ||
+  fail "pre-action fixtures are missing the recovery-only zero-candidate case"
 grep -Fq 'release_id:' <<<"$RECOVERY_TEXT" ||
   fail "manual recovery must accept a numeric release ID"
 grep -Fq 'scripts/resolve-release-descriptor.sh pre-action' <<<"$RECOVERY_TEXT" ||

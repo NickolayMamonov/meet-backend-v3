@@ -28,14 +28,25 @@ current/future relevant conflicts fail closed.
 
 Before Release Please can run, the workflow checks out the reviewed tooling,
 fetches the exact `origin/dev` head, and executes the resolver's read-only
-`pre-action` mode. That classifier has one explicit action route and one
-recovery route. A single current-authority canonical draft or strict GitHub
-generated `untagged-<20 lowercase hex>` placeholder draft selects recovery;
-the action is skipped and the normalized recovery descriptor is used directly.
-No candidate selects the action route, preserving fresh and resume-registry
-behavior. Malformed, ambiguous, divergent-ref, stale/future, or
-API-unverifiable current-authority state fails before Release Please and before
-any hosted write. Recovery never consumes Release Please outputs.
+`pre-action` mode with the same
+`${{ secrets.RELEASE_PLEASE_TOKEN }}` expression later supplied to Release
+Please. The explicit `--require-action-authority` profile first proves a
+non-empty credential, the exact authenticated repository identity, and an
+explicit `permissions.push == true` value. It then completes paginated release
+enumeration and proves that the canonical ref is absent before it may emit
+`route=action`. Missing, rejected, under-scoped, malformed, identity-mismatched,
+filtered-empty, incomplete, or API-failing authority state fails before a
+route, Release Please, or any hosted write.
+
+The default `pre-action` profile is recovery-only. A single
+current-authority canonical draft or strict GitHub generated
+`untagged-<20 lowercase hex>` placeholder draft selects recovery; the action is
+skipped and the normalized recovery descriptor is used directly. Zero visible
+candidates fails closed and can never select action. This profile is used by
+`release-recovery.yml` and `mutate-release-metadata.sh` with the read-only
+`GITHUB_TOKEN`; neither caller receives the release PAT or can authorize
+Release Please. A visible generated placeholder therefore remains a recovery
+state even when the action-admission profile is used.
 
 When Release Please creates no new release, the resolver can recover exactly
 one draft only when its numeric release ID, canonical tag/version,
