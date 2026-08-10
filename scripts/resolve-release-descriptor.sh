@@ -544,7 +544,7 @@ case "$MODE" in
       fi
       [ "$relevant" = true ] || continue
       if jq -e '.draft == false and .published_at != null' >/dev/null <<<"$release"; then
-        continue
+        fail "relevant published current or future release conflicts with authority"
       fi
       validated=$(validate_pre_action_candidate "$release") ||
         fail "current-authority pre-action candidate is invalid"

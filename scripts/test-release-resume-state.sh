@@ -174,6 +174,26 @@ tag_present_output=$(verify_fixture "$tag_present_fixture")
 [ "$tag_present_output" = "resume_admission=verified" ]
 [ ! -s "$MUTATION_LOG" ]
 
+generated_placeholder_fixture=$WORK_DIR/generated-placeholder
+cp -R "$VALID" "$generated_placeholder_fixture"
+jq '.tag_name = "untagged-d63e3a440e23d8d24858"' \
+  "$generated_placeholder_fixture/release.json" \
+  >"$generated_placeholder_fixture/release.json.tmp"
+mv "$generated_placeholder_fixture/release.json.tmp" \
+  "$generated_placeholder_fixture/release.json"
+generated_output=$(dash "$VERIFY" "$RELEASE_ID" \
+  --repository "$REPOSITORY" \
+  --version "$VERSION" \
+  --tag "$TAG" \
+  --source-sha "$SOURCE_SHA" \
+  --target "$TARGET" \
+  --image "$IMAGE" \
+  --observed-state generated_placeholder \
+  --observed-tag untagged-d63e3a440e23d8d24858 \
+  --fixture "$generated_placeholder_fixture")
+[ "$generated_output" = "resume_admission=verified" ]
+[ ! -s "$MUTATION_LOG" ]
+
 failures=0
 for case_file in "$FIXTURES"/cases/*.json; do
   case_name=$(basename "$case_file" .json)
@@ -198,4 +218,4 @@ for case_file in "$FIXTURES"/cases/*.json; do
 done
 
 [ "$failures" -eq 20 ]
-echo "release resume verifier fixtures passed: 2 valid, $failures rejected, 0 mutation commands"
+echo "release resume verifier fixtures passed: 3 valid, $failures rejected, 0 mutation commands"

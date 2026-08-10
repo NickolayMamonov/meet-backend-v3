@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 
 usage() {
   echo "usage: $0 <release-id> --repository owner/repo --version x.y.z --tag vX.Y.Z --source-sha sha --target sha --image registry/image [--observed-state canonical|generated_placeholder --observed-tag tag] [--fixture directory]" >&2
@@ -55,7 +55,8 @@ case "$TARGET" in ''|*[!0-9a-f]*) usage ;; esac
 [ "$OBSERVED_STATE" = canonical ] ||
   [ "$OBSERVED_STATE" = generated_placeholder ] || usage
 if [ "$OBSERVED_STATE" = generated_placeholder ]; then
-  [[ "$OBSERVED_TAG" =~ ^untagged-[0-9a-f]{20}$ ]] || usage
+  printf '%s\n' "$OBSERVED_TAG" |
+    grep -Eq '^untagged-[0-9a-f]{20}$' || usage
 fi
 
 WORK_DIR=$(mktemp -d)
@@ -172,7 +173,8 @@ download_asset() {
 
 for asset_name in release-manifest.json image-index.json image-inspect.txt SHA256SUMS; do
   asset_id=$(jq -r --arg name "$asset_name" \
-    '.assets[] | select(.name == $name) | .id' "$RELEASE_JSON")
+    '.assets[] | select(.name == $name) | .id' "$RELEASE_JSON" |
+    tr -d '\r')
   download_asset "$asset_id" "$asset_name"
 done
 
@@ -222,7 +224,7 @@ jq -e \
     .artifactAttestation == true and
     .evidence == ["image-index.json", "image-inspect.txt"]
   ' "$MANIFEST" >/dev/null || fail "release manifest identity or evidence policy is invalid"
-DIGEST=$(jq -r '.digest' "$MANIFEST")
+DIGEST=$(jq -r '.digest' "$MANIFEST" | tr -d '\r')
 
 INDEX=$ASSET_DIR/image-index.json
 jq -e --arg digest "$DIGEST" '
@@ -411,26 +413,16 @@ else
       | .digest
     ] | if length == 1 then .[0] else empty end
   ' "$LIVE_INDEX")
-  jq \
-    --arg digest "$DIGEST" \
-    --arg platform "$PLATFORM_SUBJECT" \
-    --slurpfile index "$LIVE_INDEX" '
-      ($index[0].manifests // []) as $manifests |
-      .versions |= map(
-        if .digest == $digest then .
-        else
-          . as $version |
-          ($manifests | any(.[]; .digest == $version.digest)) as $member |
-          .attribution = {
-            verified: $member,
-            subject: $digest,
-            platformSubject: $platform,
-            kind: "referrer"
-          }
-        end
-      )
-    ' "$PACKAGE_INVENTORY" >"$PACKAGE_INVENTORY.attributed" ||
-    fail "GHCR referrer attribution normalization failed"
+  [ -n "$PLATFORM_SUBJECT" ] ||
+    fail "live OCI index does not contain exactly one linux/amd64 subject manifest"
+  "$SCRIPT_DIR/verify-oci-referrer-closure.sh" \
+    --image "$IMAGE" \
+    --index-file "$LIVE_INDEX" \
+    --inventory-file "$PACKAGE_INVENTORY" \
+    --subject-digest "$DIGEST" \
+    --platform-subject "$PLATFORM_SUBJECT" \
+    --output "$PACKAGE_INVENTORY.attributed" ||
+    fail "subject-bound OCI referrer closure verification failed"
   mv "$PACKAGE_INVENTORY.attributed" "$PACKAGE_INVENTORY"
   "$SCRIPT_DIR/verify-ghcr-package-inventory.sh" \
     --inventory-file "$PACKAGE_INVENTORY" \

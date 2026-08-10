@@ -5,13 +5,16 @@ on:
     branches: [dev]
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 jobs:
   release:
     name: Release Please and resolve draft
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       route: ${{ steps.pre_action.outputs.route == 'recovery' && 'recovery' || steps.action_descriptor.outputs.route }}
       active: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.active || steps.action_descriptor.outputs.active }}
@@ -121,7 +124,8 @@ jobs:
   publish:
     name: Publish immutable release
     needs: [release, gates]
-    if: needs.release.outputs.active == 'true'
+    if: needs.release.outputs.active == 'true' &&
+        needs.release.outputs.route == 'action'
     concurrency:
       group: backend-ghcr-publication-${{ github.repository }}
       cancel-in-progress: false
@@ -132,9 +136,6 @@ jobs:
       attestations: write
       id-token: write
     env:
-      ROUTE: ${{ needs.release.outputs.route }}
-      OBSERVED_STATE: ${{ needs.release.outputs.observed_state }}
-      OBSERVED_TAG: ${{ needs.release.outputs.observed_tag }}
       RELEASE_ID: ${{ needs.release.outputs.release_id }}
       TAG: ${{ needs.release.outputs.release_tag }}
       VERSION: ${{ needs.release.outputs.release_version }}
@@ -162,13 +163,6 @@ jobs:
           set -euo pipefail
           git -C tooling fetch --no-tags origin \
             '+refs/heads/dev:refs/remotes/origin/dev'
-          if [ "$ROUTE" = recovery ]; then
-            test "$OBSERVED_STATE" = canonical ||
-              test "$OBSERVED_STATE" = generated_placeholder
-            test "$TAG" = "v$VERSION"
-            test "$SOURCE_SHA" = "$(git -C source rev-parse HEAD)"
-            exit 0
-          fi
           descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
             --repo-dir tooling \
             --repository "$GITHUB_REPOSITORY" \
@@ -207,14 +201,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/release"
-          if [ "$ROUTE" = recovery ]; then
-            echo "route=recovery" >> "$GITHUB_OUTPUT"
-            echo "registry_digest=" >> "$GITHUB_OUTPUT"
-            echo "quarantine=" >> "$GITHUB_OUTPUT"
-            echo "recovery route uses read-only OCI and asset verification" \
-              >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
           quarantine="$RUNNER_TEMP/release/preflight-quarantine.json"
           set +e
           result=$(tooling/scripts/release-registry-state.sh inspect \
@@ -501,37 +487,15 @@ jobs:
       - name: Deep-verify resumable release state
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PUBLICATION_ROUTE: ${{ steps.admission.outputs.route }}
         run: |
           set -euo pipefail
-          args=(
-            "$RELEASE_ID"
-            --repository "$GITHUB_REPOSITORY"
-            --version "$VERSION"
-            --tag "$TAG"
-            --source-sha "$SOURCE_SHA"
-            --target "$SOURCE_SHA"
-            --image "$IMAGE"
-          )
-          if [ "$ROUTE" = recovery ]; then
-            args+=(--observed-state "$OBSERVED_STATE" --observed-tag "$OBSERVED_TAG")
-          fi
-          tooling/scripts/verify-release-resume-state.sh "${args[@]}"
-      - name: Canonicalize generated placeholder metadata
-        if: env.ROUTE == 'recovery' && env.OBSERVED_STATE == 'generated_placeholder'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tooling/scripts/mutate-release-metadata.sh canonicalize \
+          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
             --repository "$GITHUB_REPOSITORY" \
-            --release-id "$RELEASE_ID" \
             --version "$VERSION" \
             --tag "$TAG" \
             --source-sha "$SOURCE_SHA" \
             --target "$SOURCE_SHA" \
-            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --repo-dir source
+            --image "$IMAGE"
       - name: Final descriptor and deep admission, then publish last
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -593,6 +557,150 @@ jobs:
             "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
             --jq '.object.sha')
           test "$ref" = "$SOURCE_SHA"
+      - name: Logout from GHCR
+        if: always()
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
+
+  recovery:
+    name: Recover immutable release
+    needs: [release, gates]
+    if: needs.release.outputs.active == 'true' &&
+        needs.release.outputs.route == 'recovery'
+    concurrency:
+      group: backend-ghcr-publication-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: read
+    env:
+      RELEASE_ID: ${{ needs.release.outputs.release_id }}
+      TAG: ${{ needs.release.outputs.release_tag }}
+      VERSION: ${{ needs.release.outputs.release_version }}
+      SOURCE_SHA: ${{ needs.release.outputs.source_sha }}
+      OBSERVED_STATE: ${{ needs.release.outputs.observed_state }}
+      OBSERVED_TAG: ${{ needs.release.outputs.observed_tag }}
+      ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
+      IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
+    steps:
+      - name: Checkout reviewed recovery tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: tooling
+      - name: Checkout exact release source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          path: source
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - name: Authenticate for read-only registry inspection
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Deep-verify observed recovery state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_SHA" = "$(git -C source rev-parse HEAD)"
+          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
+            --repository "$GITHUB_REPOSITORY" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --source-sha "$SOURCE_SHA" \
+            --target "$SOURCE_SHA" \
+            --image "$IMAGE" \
+            --observed-state "$OBSERVED_STATE" \
+            --observed-tag "$OBSERVED_TAG"
+      - name: Canonicalize generated placeholder metadata
+        if: env.OBSERVED_STATE == 'generated_placeholder'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tooling/scripts/mutate-release-metadata.sh canonicalize \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --source-sha "$SOURCE_SHA" \
+            --target "$SOURCE_SHA" \
+            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --repo-dir source
+      - name: Re-verify canonical draft before publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
+            --repository "$GITHUB_REPOSITORY" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --source-sha "$SOURCE_SHA" \
+            --target "$SOURCE_SHA" \
+            --image "$IMAGE"
+      - name: Publish canonical release metadata last
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_json="$RUNNER_TEMP/recovery-release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
+          fingerprint=$(
+            printf '%s' "$(jq -c '
+              [.assets[] | {
+                name, id, size, state, created_at, updated_at, url
+              }] | sort_by(.name)
+            ' "$release_json")" |
+              sha256sum | awk '{print $1}'
+          )
+          tooling/scripts/revalidate-release-mutation.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --expected-fingerprint "$fingerprint" \
+            --repo-dir tooling \
+            --dev-ref origin/dev
+          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
+            --repository "$GITHUB_REPOSITORY" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --source-sha "$SOURCE_SHA" \
+            --target "$SOURCE_SHA" \
+            --image "$IMAGE"
+          tooling/scripts/mutate-release-metadata.sh publish \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --source-sha "$SOURCE_SHA" \
+            --target "$SOURCE_SHA" \
+            --expected-fingerprint "$fingerprint" \
+            --repo-dir source
+      - name: Read-only recovery verification
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" |
+            jq -e \
+              --argjson id "$RELEASE_ID" \
+              --arg tag "$TAG" \
+              --arg source "$SOURCE_SHA" '
+                .id == $id and .tag_name == $tag and
+                .target_commitish == $source and
+                .draft == false and .published_at != null
+              ' >/dev/null
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+            --jq '.object.sha')" = "$SOURCE_SHA"
       - name: Logout from GHCR
         if: always()
         run: docker logout ghcr.io >/dev/null 2>&1 || true

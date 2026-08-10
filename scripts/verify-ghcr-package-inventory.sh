@@ -96,7 +96,7 @@ jq -e \
     .attribution.verified == true and
     (.attribution.subject == $digest or .attribution.subject == $platform) and
     (.attribution.kind | type == "string" and
-      test("^(provenance|sbom|referrer)$"))
+      test("^(provenance|sbom|referrer|signature|subject)$"))
   )
 ' "$INVENTORY_FILE" >/dev/null ||
   fail "additional package versions are not cryptographically attributable referrers"

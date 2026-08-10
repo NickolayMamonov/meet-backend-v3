@@ -62,9 +62,13 @@ for file in "$CONFIG" "$MANIFEST" "$VERSION_FILE" "$CHANGELOG" "$RELEASE_WORKFLO
 done
 require_file scripts/verify-release-resume-state.sh
 require_file scripts/verify-ghcr-package-inventory.sh
+require_file scripts/verify-oci-referrer-closure.sh
+require_file scripts/test-oci-referrer-closure.sh
 
 WORKFLOW_TEXT=$(sed 's/\r$//' "$RELEASE_WORKFLOW")
 RESUME_TEXT=$(sed 's/\r$//' scripts/verify-release-resume-state.sh)
+CLOSURE_TEXT=$(sed 's/\r$//' scripts/verify-oci-referrer-closure.sh)
+PRE_ACTION_FIXTURES=$(sed 's/\r$//' scripts/fixtures/release-preaction-routing/scenarios.json)
 
 jq empty "$CONFIG" "$MANIFEST" "$VERSION_FILE" >/dev/null ||
   fail "release configuration or bootstrap state is not valid JSON"
@@ -203,6 +207,21 @@ require_text 'mutate-release-metadata.sh canonicalize'
 require_text 'mutate-release-metadata.sh publish'
 grep -Fq 'verify-ghcr-package-inventory.sh' <<<"$RESUME_TEXT" ||
   fail "resume verifier is missing GHCR inventory closure"
+grep -Fq 'verify-oci-referrer-closure.sh' <<<"$RESUME_TEXT" ||
+  fail "resume verifier is missing subject-bound OCI referrer closure"
+grep -Fq 'validate_descriptor' <<<"$CLOSURE_TEXT" ||
+  fail "OCI referrer closure is missing child descriptor validation"
+grep -Fq 'fetch_raw' <<<"$CLOSURE_TEXT" ||
+  fail "OCI referrer closure is missing raw manifest reads"
+grep -Fq '#!/bin/sh' <<<"$(head -1 scripts/verify-release-resume-state.sh)" ||
+  fail "resume verifier must remain POSIX /bin/sh"
+if grep -Eq '(^|[[:space:]])\[\[[[:space:]]' <<<"$RESUME_TEXT"; then
+  fail "POSIX resume verifier contains Bash conditional syntax"
+fi
+grep -Fq 'published-current-conflict' <<<"$PRE_ACTION_FIXTURES" ||
+  fail "pre-action fixtures are missing the published current conflict"
+grep -Fq 'published-future-conflict' <<<"$PRE_ACTION_FIXTURES" ||
+  fail "pre-action fixtures are missing the published future conflict"
 require_text 'if: needs.release.outputs.active == '\''true'\'''
 require_text 'source_sha: ${{ needs.release.outputs.source_sha }}'
 require_text 'release_tag: ${{ needs.release.outputs.release_tag }}'
@@ -236,6 +255,29 @@ require_text 'repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID'
 require_text 'repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$file'
 require_text 'Fetch exact origin/dev authority'
 require_text 'Read-only publication verification'
+
+PUBLISH_BLOCK=$(sed -n '/^  publish:/,/^  recovery:/p' <<<"$WORKFLOW_TEXT")
+RECOVERY_BLOCK=$(sed -n '/^  recovery:/,$p' <<<"$WORKFLOW_TEXT")
+grep -Fq "needs.release.outputs.route == 'action'" <<<"$PUBLISH_BLOCK" ||
+  fail "publish job is not action-only"
+if grep -Fq 'mutate-release-metadata.sh canonicalize' <<<"$PUBLISH_BLOCK"; then
+  fail "action-only publish job contains recovery canonicalization"
+fi
+grep -Fq "needs.release.outputs.route == 'recovery'" <<<"$RECOVERY_BLOCK" ||
+  fail "recovery job does not require the recovery route"
+grep -Fq 'contents: write' <<<"$RECOVERY_BLOCK" ||
+  fail "recovery job cannot publish release metadata"
+grep -Fq 'packages: read' <<<"$RECOVERY_BLOCK" ||
+  fail "recovery job must inspect GHCR with packages:read"
+if grep -Eq 'packages: write|attestations: write|id-token: write' \
+    <<<"$RECOVERY_BLOCK"; then
+  fail "recovery job has package, attestation, or OIDC write permission"
+fi
+if grep -Eiq \
+    '(attach|upload)[^.!?]*quarantine JSON' \
+    <<<"$(sed 's/\r$//' docs/operations/backend-release-publishing.md)"; then
+  fail "operations docs instruct operators to attach or upload quarantine JSON"
+fi
 
 pre_action_block=$(sed -n '/id: pre_action/,/id: action_descriptor/p' \
   <<<"$WORKFLOW_TEXT")
@@ -284,29 +326,43 @@ pre_action_line=$(grep -n 'Classify current authority before Release Please' <<<
   head -1 | cut -d: -f1)
 action_line=$(grep -n 'uses: googleapis/release-please-action@' <<<"$WORKFLOW_TEXT" |
   head -1 | cut -d: -f1)
-deep_verify_first=$(grep -n 'verify-release-resume-state.sh' <<<"$WORKFLOW_TEXT" |
-  head -1 | cut -d: -f1)
-canonicalize_line=$(grep -n 'mutate-release-metadata.sh canonicalize' <<<"$WORKFLOW_TEXT" |
-  head -1 | cut -d: -f1)
-deep_verify_second=$(grep -n 'verify-release-resume-state.sh' <<<"$WORKFLOW_TEXT" |
-  tail -1 | cut -d: -f1)
-publish_line=$(grep -n 'mutate-release-metadata.sh publish' <<<"$WORKFLOW_TEXT" |
-  tail -1 | cut -d: -f1)
-readonly_line=$(grep -n 'Read-only publication verification' <<<"$WORKFLOW_TEXT" |
-  head -1 | cut -d: -f1)
 [ -n "$checkout_line" ] && [ -n "$fetch_line" ] &&
   [ -n "$pre_action_line" ] && [ -n "$action_line" ] &&
-  [ -n "$deep_verify_first" ] && [ -n "$canonicalize_line" ] &&
-  [ -n "$deep_verify_second" ] && [ -n "$publish_line" ] &&
-  [ -n "$readonly_line" ] &&
   [ "$checkout_line" -lt "$fetch_line" ] &&
   [ "$fetch_line" -lt "$pre_action_line" ] &&
-  [ "$pre_action_line" -lt "$action_line" ] &&
-  [ "$deep_verify_first" -lt "$canonicalize_line" ] &&
-  [ "$canonicalize_line" -lt "$deep_verify_second" ] &&
-  [ "$deep_verify_second" -lt "$publish_line" ] &&
-  [ "$publish_line" -lt "$readonly_line" ] ||
+  [ "$pre_action_line" -lt "$action_line" ] ||
   fail "release ordering is not statically provable"
+
+action_deep_line=$(grep -n 'verify-release-resume-state.sh' <<<"$PUBLISH_BLOCK" |
+  head -1 | cut -d: -f1)
+action_publish_line=$(grep -n 'mutate-release-metadata.sh publish' <<<"$PUBLISH_BLOCK" |
+  tail -1 | cut -d: -f1)
+action_readonly_line=$(grep -n 'Read-only publication verification' <<<"$PUBLISH_BLOCK" |
+  head -1 | cut -d: -f1)
+[ -n "$action_deep_line" ] && [ -n "$action_publish_line" ] &&
+  [ -n "$action_readonly_line" ] &&
+  [ "$action_deep_line" -lt "$action_publish_line" ] &&
+  [ "$action_publish_line" -lt "$action_readonly_line" ] ||
+  fail "action publication ordering is not statically provable"
+
+recovery_deep_first=$(grep -n 'verify-release-resume-state.sh' <<<"$RECOVERY_BLOCK" |
+  sed -n '1p' | cut -d: -f1)
+recovery_canonicalize=$(grep -n 'mutate-release-metadata.sh canonicalize' \
+  <<<"$RECOVERY_BLOCK" | head -1 | cut -d: -f1)
+recovery_deep_second=$(grep -n 'verify-release-resume-state.sh' <<<"$RECOVERY_BLOCK" |
+  sed -n '2p' | cut -d: -f1)
+recovery_publish=$(grep -n 'mutate-release-metadata.sh publish' <<<"$RECOVERY_BLOCK" |
+  tail -1 | cut -d: -f1)
+recovery_readonly=$(grep -n 'Read-only recovery verification' <<<"$RECOVERY_BLOCK" |
+  head -1 | cut -d: -f1)
+[ -n "$recovery_deep_first" ] && [ -n "$recovery_canonicalize" ] &&
+  [ -n "$recovery_deep_second" ] && [ -n "$recovery_publish" ] &&
+  [ -n "$recovery_readonly" ] &&
+  [ "$recovery_deep_first" -lt "$recovery_canonicalize" ] &&
+  [ "$recovery_canonicalize" -lt "$recovery_deep_second" ] &&
+  [ "$recovery_deep_second" -lt "$recovery_publish" ] &&
+  [ "$recovery_publish" -lt "$recovery_readonly" ] ||
+  fail "recovery publication ordering is not statically provable"
 
 CI_WORKFLOW=.github/workflows/ci.yml
 require_file "$CI_WORKFLOW"
@@ -315,6 +371,8 @@ grep -Fq 'test-release-resume-state.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the release resume fixtures"
 grep -Fq 'test-release-mutation-revalidation.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the mutation revalidation regression"
+grep -Fq 'test-oci-referrer-closure.sh' <<<"$CI_TEXT" ||
+  fail "reusable CI does not run the OCI referrer closure fixtures"
 for input in source_sha release_tag release_version release_id; do
   grep -Eq "^[[:space:]]+$input:" <<<"$CI_TEXT" ||
     fail "reusable CI is missing additive input: $input"

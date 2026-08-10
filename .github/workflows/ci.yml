@@ -200,6 +200,7 @@ jobs:
           "$TOOLING_SCRIPTS/test-release-preaction-routing.sh"
           "$TOOLING_SCRIPTS/test-release-metadata-mutation.sh"
           "$TOOLING_SCRIPTS/test-ghcr-package-inventory.sh"
+          "$TOOLING_SCRIPTS/test-oci-referrer-closure.sh"
           "$TOOLING_SCRIPTS/test-release-pr-fingerprint.sh"
       - name: Verify Release Please state
         env:

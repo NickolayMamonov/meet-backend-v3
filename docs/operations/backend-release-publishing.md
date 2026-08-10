@@ -119,9 +119,9 @@ The accepted admission mechanism is therefore explicit and two-layered:
    after lease acquisition. An identity-aware post-publish inventory is
    mandatory. If an external writer that is outside the lease policy races
    either check or the operation, the resulting partial, divergent, or
-   identity-mismatched state is quarantined: the draft stays unpublished, the
-   local quarantine evidence is attached, and no GHCR repair, retag, copy,
-   overwrite, or delete is attempted.
+   identity-mismatched state fails closed: the draft stays unpublished,
+   sanitized evidence is written only to the Actions summary/artifact, and no
+   GHCR repair, retag, copy, overwrite, or delete is attempted.
 
 The zero-write guarantee applies to `release-registry-state.sh` and recovery:
 they never mutate GHCR, including when status 42 is returned. It does not
@@ -132,10 +132,9 @@ Commit on `dev`, which creates a distinct patch tuple and source SHA through
 Release Please; an old lease is not reused.
 
 The publication workflow captures the registry inspection exit status under
-`set +e`. A status 42 is therefore handled as evidence: its quarantine JSON is
-checked, attached to the still-draft release, and only then is the job failed.
-It is never allowed to terminate the shell before the draft receives the
-quarantine note.
+`set +e`. A status 42 is handled as sanitized evidence in the Actions summary
+or a reviewed artifact, and the job then fails without mutating the release.
+No quarantine JSON is attached to a release and no quarantine note is written.
 
 BuildKit provenance and SBOM publication is accepted only when the OCI index
 contains at least one subject-bound attestation descriptor and its child
