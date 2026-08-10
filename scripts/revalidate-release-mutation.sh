@@ -73,11 +73,14 @@ jq -e \
   ' "$release_file" >/dev/null ||
   fail "release is not the expected draft descriptor"
 
-fingerprint=$(jq -c '
-  [.assets[] | {
-    name, id, size, state, created_at, updated_at, url
-  }] | sort_by(.name)
-' "$release_file" | sha256sum | awk '{print $1}')
+fingerprint=$(
+  printf '%s' "$(jq -c '
+    [.assets[] | {
+      name, id, size, state, created_at, updated_at, url
+    }] | sort_by(.name)
+  ' "$release_file")" |
+    sha256sum | awk '{print $1}'
+)
 [ "$fingerprint" = "$EXPECTED_FINGERPRINT" ] ||
   fail "release asset metadata fingerprint changed"
 

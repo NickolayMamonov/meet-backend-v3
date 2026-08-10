@@ -315,8 +315,12 @@ else
   done
   [ "$(sort -u "$REGISTRY_DIGESTS" | wc -l | tr -d ' ')" -eq 1 ] ||
     fail "registry aliases do not resolve to one digest"
-  if docker buildx imagetools inspect "$IMAGE:latest" >/dev/null 2>&1; then
+  latest_output=
+  if latest_output=$(docker buildx imagetools inspect "$IMAGE:latest" 2>&1); then
     fail "latest registry alias is forbidden"
+  elif ! printf '%s\n' "$latest_output" |
+    grep -Eqi 'manifest unknown|name unknown|repository does not exist|not found'; then
+    fail "latest registry alias inspection failed"
   fi
   registry_path=${IMAGE#ghcr.io/}
   registry_owner=${registry_path%%/*}
@@ -343,10 +347,12 @@ else
         digest: .name,
         tags: (.metadata.container.tags // [])
       }] as $inventory |
-      ($inventory | length) == 1 and
-      $inventory[0].digest == $digest and
-      ($inventory[0].tags | sort) ==
-        ([$tag, $version, ("sha-" + $source)] | sort)
+      [$inventory[] | select((.tags | length) > 0)] as $tagged |
+      ($tagged | length) == 1 and
+      $tagged[0].digest == $digest and
+      ($tagged[0].tags | sort) ==
+        ([$tag, $version, ("sha-" + $source)] | sort) and
+      all($inventory[]; all(.tags[]; . != "latest"))
     ' "$PACKAGE_VERSIONS" >/dev/null ||
     fail "GHCR package inventory is not exactly three aliases on one digest without latest"
   LIVE_INDEX=$WORK_DIR/live-index.json
