@@ -26,6 +26,17 @@ both authority files and proves every later first-parent commit retains the
 pair. Disagreement, missing or ambiguous boundaries, post-boundary drift, and
 current/future relevant conflicts fail closed.
 
+Before Release Please can run, the workflow checks out the reviewed tooling,
+fetches the exact `origin/dev` head, and executes the resolver's read-only
+`pre-action` mode. That classifier has one explicit action route and one
+recovery route. A single current-authority canonical draft or strict GitHub
+generated `untagged-<20 lowercase hex>` placeholder draft selects recovery;
+the action is skipped and the normalized recovery descriptor is used directly.
+No candidate selects the action route, preserving fresh and resume-registry
+behavior. Malformed, ambiguous, divergent-ref, stale/future, or
+API-unverifiable current-authority state fails before Release Please and before
+any hosted write. Recovery never consumes Release Please outputs.
+
 When Release Please creates no new release, the resolver can recover exactly
 one draft only when its numeric release ID, canonical tag/version,
 target/source SHA, draft/unpublished state, source files,
@@ -77,9 +88,10 @@ route only when the registry is complete, its digest is identity-verified, and
 write, and continues with attestation, evidence, deep verification, and
 publish-last. Partial, divergent, identity-mismatched, raced, or `latest`
 registry state and any asset/content/evidence failure leave the release draft
-in place. Quarantine notes may be attached to the same numeric release ID, but
-the workflow never repairs, replaces, retags, deletes, or pre-populates
-registry state.
+in place. Sanitized failure evidence is written only to the Actions job
+summary or a reviewed workflow artifact; release notes are never replaced by
+quarantine JSON. The workflow never repairs, replaces, retags, deletes, or
+pre-populates registry state.
 
 The registry preflight explicitly inspects `IMAGE:latest` before the lease or
 any GHCR write. Only a confirmed not-found response emits `latest=absent`;
@@ -107,9 +119,9 @@ The accepted admission mechanism is therefore explicit and two-layered:
    after lease acquisition. An identity-aware post-publish inventory is
    mandatory. If an external writer that is outside the lease policy races
    either check or the operation, the resulting partial, divergent, or
-   identity-mismatched state is quarantined: the draft stays unpublished, the
-   local quarantine evidence is attached, and no GHCR repair, retag, copy,
-   overwrite, or delete is attempted.
+   identity-mismatched state fails closed: the draft stays unpublished,
+   sanitized evidence is written only to the Actions summary/artifact, and no
+   GHCR repair, retag, copy, overwrite, or delete is attempted.
 
 The zero-write guarantee applies to `release-registry-state.sh` and recovery:
 they never mutate GHCR, including when status 42 is returned. It does not
@@ -120,10 +132,9 @@ Commit on `dev`, which creates a distinct patch tuple and source SHA through
 Release Please; an old lease is not reused.
 
 The publication workflow captures the registry inspection exit status under
-`set +e`. A status 42 is therefore handled as evidence: its quarantine JSON is
-checked, attached to the still-draft release, and only then is the job failed.
-It is never allowed to terminate the shell before the draft receives the
-quarantine note.
+`set +e`. A status 42 is handled as sanitized evidence in the Actions summary
+or a reviewed artifact, and the job then fails without mutating the release.
+No quarantine JSON is attached to a release and no quarantine note is written.
 
 BuildKit provenance and SBOM publication is accepted only when the OCI index
 contains at least one subject-bound attestation descriptor and its child
@@ -133,6 +144,48 @@ predicates in one attestation manifest rather than two separate descriptors.
 `scripts/verify-oci-evidence.sh` derives the `provenance` and `sbom` fields in
 the release manifest from those layers; the workflow does not treat a
 handwritten boolean as evidence.
+
+### Recovery, rollback, and hosted evidence
+
+Complete-assets recovery is read-only through its first deep verification. The
+ordered boundaries are:
+
+1. deep-verify the observed canonical or generated-placeholder release;
+2. canonicalize the same numeric release ID with the complete canonical
+   metadata payload when the observed tag is a generated placeholder;
+3. deep-verify the canonical draft again;
+4. publish the same ID with the complete canonical metadata payload; and
+5. perform only read-only release/tag checks afterward.
+
+`scripts/mutate-release-metadata.sh` is the sole release PATCH caller. It
+derives the exact `CHANGELOG.md` section from the fetched source, sends
+`tag_name`, `target_commitish`, `name`, `body`, `draft`, `prerelease`, and
+explicit non-latest metadata, then re-fetches and proves the same ID,
+metadata, publication state, and unchanged four-asset fingerprint. It never
+compensates after an uncertain mutation.
+
+The read-only GHCR inventory uses scoped package-read access. It accepts one
+image digest with exactly `vVERSION`, `VERSION`, and `sha-SOURCE_SHA`, no
+`latest`, and only additional untagged or BuildKit subject-marker versions
+whose fetched OCI/referrer graph proves attribution to the image or its
+linux/amd64 subject. Foreign tags, partial aliases, divergent digests,
+unverifiable referrers, API errors, and ambiguity fail closed.
+
+For the hosted recovery run, use
+`scripts/capture-release-pr-fingerprint.sh` to record a sanitized stable
+fingerprint of PR #28 before the merge-triggered run and after it. The
+fingerprint includes the head
+OID/ref, base ref, draft/state fields, title hash, body hash, labels,
+assignees, requested reviewers, and milestone while excluding volatile fields.
+Require exact byte equality between the two normalized JSON files, retain the
+before snapshot in `docs/evidence/release-pr-28-before.json`, retain workflow
+evidence that `pre_action.route=recovery` and the Release Please step was
+skipped, and do not merge or modify PR #28.
+
+Before publication, revert the workflow code normally if verification fails.
+After canonicalization, retry from the same canonical draft. After a PATCH or
+publication uncertainty, stop and collect read-only evidence; do not issue a
+compensating release, tag, asset, or GHCR mutation.
 
 ## Production access prerequisites
 

@@ -1,8 +1,10 @@
 #!/bin/sh
 set -eu
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+
 usage() {
-  echo "usage: $0 <release-id> --repository owner/repo --version x.y.z --tag vX.Y.Z --source-sha sha --target sha --image registry/image [--fixture directory]" >&2
+  echo "usage: $0 <release-id> --repository owner/repo --version x.y.z --tag vX.Y.Z --source-sha sha --target sha --image registry/image [--observed-state canonical|generated_placeholder --observed-tag tag] [--fixture directory]" >&2
   exit 2
 }
 
@@ -21,6 +23,8 @@ SOURCE_SHA=
 TARGET=
 IMAGE=
 FIXTURE=
+OBSERVED_STATE=canonical
+OBSERVED_TAG=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repository) [ "$#" -ge 2 ] || usage; REPOSITORY=$2; shift 2 ;;
@@ -29,6 +33,8 @@ while [ "$#" -gt 0 ]; do
     --source-sha) [ "$#" -ge 2 ] || usage; SOURCE_SHA=$2; shift 2 ;;
     --target) [ "$#" -ge 2 ] || usage; TARGET=$2; shift 2 ;;
     --image) [ "$#" -ge 2 ] || usage; IMAGE=$2; shift 2 ;;
+    --observed-state) [ "$#" -ge 2 ] || usage; OBSERVED_STATE=$2; shift 2 ;;
+    --observed-tag) [ "$#" -ge 2 ] || usage; OBSERVED_TAG=$2; shift 2 ;;
     --fixture) [ "$#" -ge 2 ] || usage; FIXTURE=$2; shift 2 ;;
     *) usage ;;
   esac
@@ -46,6 +52,12 @@ case "$TARGET" in ''|*[!0-9a-f]*) usage ;; esac
 [ "${#TARGET}" -eq 40 ] || usage
 [ -n "$REPOSITORY" ] && [ -n "$TAG" ] && [ -n "$IMAGE" ] || usage
 [ "$TAG" = "v$VERSION" ] || usage
+[ "$OBSERVED_STATE" = canonical ] ||
+  [ "$OBSERVED_STATE" = generated_placeholder ] || usage
+if [ "$OBSERVED_STATE" = generated_placeholder ]; then
+  printf '%s\n' "$OBSERVED_TAG" |
+    grep -Eq '^untagged-[0-9a-f]{20}$' || usage
+fi
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -r "$WORK_DIR"' EXIT HUP INT TERM
@@ -69,10 +81,18 @@ fi
 jq -e \
   --argjson id "$RELEASE_ID" \
   --arg tag "$TAG" \
+  --arg observed_state "$OBSERVED_STATE" \
+  --arg observed_tag "$OBSERVED_TAG" \
   --arg target "$TARGET" '
     type == "object" and
     .id == $id and
-    .tag_name == $tag and
+    (
+      .tag_name == $tag or
+      (
+        $observed_state == "generated_placeholder" and
+        .tag_name == $observed_tag
+      )
+    ) and
     .target_commitish == $target and
     .draft == true and
     .published_at == null and
@@ -80,14 +100,19 @@ jq -e \
   ' "$RELEASE_JSON" >/dev/null || fail "release identity is not the expected unpublished draft"
 
 if [ -n "$FIXTURE" ]; then
-  jq -e --arg source "$SOURCE_SHA" '
-    type == "object" and
-    (
-      .exists == false or
-      (.exists == true and .targetSha == $source)
-    )
-  ' "$FIXTURE/tag.json" >/dev/null ||
-    fail "existing fixture tag does not resolve to the release source"
+  if [ "$OBSERVED_STATE" = generated_placeholder ]; then
+    jq -e '.exists == false' "$FIXTURE/tag.json" >/dev/null ||
+      fail "generated placeholder has a materialized canonical tag ref"
+  else
+    jq -e --arg source "$SOURCE_SHA" '
+      type == "object" and
+      (
+        .exists == false or
+        (.exists == true and .targetSha == $source)
+      )
+    ' "$FIXTURE/tag.json" >/dev/null ||
+      fail "existing fixture tag does not resolve to the release source"
+  fi
 else
   ENCODED_TAG=$(jq -nr --arg tag "$TAG" '$tag | @uri')
   TAG_OBJECT=$WORK_DIR/tag-object.json
@@ -148,11 +173,20 @@ download_asset() {
 
 for asset_name in release-manifest.json image-index.json image-inspect.txt SHA256SUMS; do
   asset_id=$(jq -r --arg name "$asset_name" \
-    '.assets[] | select(.name == $name) | .id' "$RELEASE_JSON")
+    '.assets[] | select(.name == $name) | .id' "$RELEASE_JSON" |
+    tr -d '\r')
   download_asset "$asset_id" "$asset_name"
 done
 
 CHECKSUMS=$ASSET_DIR/SHA256SUMS
+if [ -n "$FIXTURE" ]; then
+  for asset_name in release-manifest.json image-index.json image-inspect.txt; do
+    tr -d '\r' <"$ASSET_DIR/$asset_name" >"$ASSET_DIR/$asset_name.lf"
+    mv "$ASSET_DIR/$asset_name.lf" "$ASSET_DIR/$asset_name"
+  done
+fi
+tr -d '\r' <"$CHECKSUMS" >"$CHECKSUMS.lf"
+mv "$CHECKSUMS.lf" "$CHECKSUMS"
 [ "$(wc -l < "$CHECKSUMS" | tr -d ' ')" -eq 3 ] ||
   fail "checksum inventory must contain exactly three entries"
 jq -Rse '
@@ -190,7 +224,7 @@ jq -e \
     .artifactAttestation == true and
     .evidence == ["image-index.json", "image-inspect.txt"]
   ' "$MANIFEST" >/dev/null || fail "release manifest identity or evidence policy is invalid"
-DIGEST=$(jq -r '.digest' "$MANIFEST")
+DIGEST=$(jq -r '.digest' "$MANIFEST" | tr -d '\r')
 
 INDEX=$ASSET_DIR/image-index.json
 jq -e --arg digest "$DIGEST" '
@@ -262,6 +296,13 @@ fi
 
 if [ -n "$FIXTURE" ]; then
   REGISTRY_JSON=$FIXTURE/registry.json
+  "$SCRIPT_DIR/verify-ghcr-package-inventory.sh" \
+    --inventory-file "$REGISTRY_JSON" \
+    --digest "$DIGEST" \
+    --tag "$TAG" \
+    --version "$VERSION" \
+    --source-sha "$SOURCE_SHA" >/dev/null ||
+    fail "GHCR package inventory is not cryptographically closed"
   jq -e \
     --arg tag "$TAG" \
     --arg version "$VERSION" \
@@ -285,11 +326,7 @@ if [ -n "$FIXTURE" ]; then
       .identity.readiness == true and
       .ociEvidence.subjectDigest == $digest and
       .ociEvidence.provenance == true and
-      .ociEvidence.sbom == true and
-      .versions == [{
-        digest: $digest,
-        tags: [$tag, $version, ("sha-" + $source)]
-      }]
+      .ociEvidence.sbom == true
     ' "$REGISTRY_JSON" >/dev/null || fail "registry aliases, identity, or OCI evidence are incomplete"
   jq -e \
     --arg repository "$REPOSITORY" \
@@ -337,29 +374,47 @@ else
       > "$PACKAGE_VERSIONS" ||
       fail "GHCR package inventory lookup failed"
   fi
-  jq -e \
-    --arg digest "$DIGEST" \
-    --arg tag "$TAG" \
-    --arg version "$VERSION" \
-    --arg source "$SOURCE_SHA" '
-      [ .[][] ] as $versions |
-      [$versions[] | {
-        digest: .name,
-        tags: (.metadata.container.tags // [])
-      }] as $inventory |
-      [$inventory[] | select((.tags | length) > 0)] as $tagged |
-      ($tagged | length) == 1 and
-      $tagged[0].digest == $digest and
-      ($tagged[0].tags | sort) ==
-        ([$tag, $version, ("sha-" + $source)] | sort) and
-      all($inventory[]; all(.tags[]; . != "latest"))
-    ' "$PACKAGE_VERSIONS" >/dev/null ||
-    fail "GHCR package inventory is not exactly three aliases on one digest without latest"
   LIVE_INDEX=$WORK_DIR/live-index.json
   docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" > "$LIVE_INDEX" ||
     fail "registry OCI index inspection failed"
   [ "$(jq -S -c . "$LIVE_INDEX")" = "$(jq -S -c . "$INDEX")" ] ||
     fail "attached OCI index is not the live registry index"
+  PACKAGE_INVENTORY=$WORK_DIR/package-inventory.json
+  "$SCRIPT_DIR/normalize-ghcr-package-inventory.sh" \
+    --package-versions-file "$PACKAGE_VERSIONS" \
+    --digest "$DIGEST" \
+    --output "$PACKAGE_INVENTORY" ||
+    fail "GHCR package inventory normalization failed"
+  PLATFORM_SUBJECT=$(jq -r '
+    [
+      .manifests[]?
+      | select(
+          .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+          .platform.os == "linux" and
+          .platform.architecture == "amd64"
+        )
+      | .digest
+    ] | if length == 1 then .[0] else empty end
+  ' "$LIVE_INDEX")
+  [ -n "$PLATFORM_SUBJECT" ] ||
+    fail "live OCI index does not contain exactly one linux/amd64 subject manifest"
+  "$SCRIPT_DIR/verify-oci-referrer-closure.sh" \
+    --image "$IMAGE" \
+    --index-file "$LIVE_INDEX" \
+    --inventory-file "$PACKAGE_INVENTORY" \
+    --subject-digest "$DIGEST" \
+    --platform-subject "$PLATFORM_SUBJECT" \
+    --output "$PACKAGE_INVENTORY.attributed" ||
+    fail "subject-bound OCI referrer closure verification failed"
+  mv "$PACKAGE_INVENTORY.attributed" "$PACKAGE_INVENTORY"
+  "$SCRIPT_DIR/verify-ghcr-package-inventory.sh" \
+    --inventory-file "$PACKAGE_INVENTORY" \
+    --digest "$DIGEST" \
+    --tag "$TAG" \
+    --version "$VERSION" \
+    --source-sha "$SOURCE_SHA" \
+    --platform-subject "$PLATFORM_SUBJECT" >/dev/null ||
+    fail "GHCR package inventory is not cryptographically closed"
   docker pull "$IMAGE@$DIGEST" >/dev/null ||
     fail "verified image digest could not be pulled"
   LIVE_IMAGE=$WORK_DIR/live-image.json

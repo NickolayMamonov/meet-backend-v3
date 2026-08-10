@@ -11,6 +11,7 @@ usage() {
 usage:
   resolve-release-descriptor.sh created --release-id ID --tag TAG --version VERSION --source-sha SHA [options]
   resolve-release-descriptor.sh recover [options]
+  resolve-release-descriptor.sh pre-action [options]
   resolve-release-descriptor.sh verify --release-id ID --tag TAG --version VERSION --source-sha SHA --asset-inventory-fingerprint SHA256 [options]
 
 options:
@@ -32,7 +33,7 @@ command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 MODE=$1
 shift
 case "$MODE" in
-  created|recover|verify) ;;
+  created|recover|pre-action|verify) ;;
   *) usage ;;
 esac
 
@@ -342,6 +343,96 @@ validate_completed_release() {
   printf '%s\n' "$id"
 }
 
+validate_pre_action_candidate() {
+  local release=$1 id tag target draft prerelease published source_pair tag_target asset_data
+  id=$(jq -r '.id // empty' <<<"$release")
+  tag=$(jq -r '.tag_name // empty' <<<"$release")
+  target=$(jq -r '.target_commitish // empty' <<<"$release")
+  draft=$(jq -r 'if has("draft") then (.draft | tostring) else "missing" end' \
+    <<<"$release")
+  prerelease=$(jq -r 'if has("prerelease") then (.prerelease | tostring) else "missing" end' \
+    <<<"$release")
+  published=$(jq -r 'if has("published_at") and .published_at == null then "null"
+    else (.published_at // "missing") end' <<<"$release")
+
+  [[ "$id" =~ ^[1-9][0-9]*$ ]] ||
+    fail "pre-action candidate has an invalid release ID"
+  [ "$target" = "$AUTHORITY_SOURCE" ] ||
+    fail "pre-action candidate target does not match current authority"
+  [ "$draft" = true ] || fail "pre-action candidate is not a draft"
+  [ "$prerelease" = false ] ||
+    fail "pre-action candidate is a prerelease or has malformed state"
+  [ "$published" = null ] ||
+    fail "pre-action candidate is already published"
+  git -C "$REPO_DIR" cat-file -e "${target}^{commit}" 2>/dev/null ||
+    fail "pre-action candidate target is unavailable"
+  source_pair=$(read_pair "$target") ||
+    fail "pre-action candidate target authority files are unavailable"
+  [ "$source_pair" = "$AUTHORITY_VERSION"$'\t'"$AUTHORITY_VERSION" ] ||
+    fail "pre-action candidate target is not current authority"
+
+  case "$tag" in
+    "$AUTHORITY_TAG")
+      OBSERVED_STATE=canonical
+      tag_target=$(resolve_tag "$tag") || return 1
+      [ "$tag_target" = absent ] || [ "$tag_target" = "$target" ] ||
+        fail "canonical pre-action candidate tag diverges from source"
+      ;;
+    untagged-*)
+      [[ "$tag" =~ ^untagged-[0-9a-f]{20}$ ]] ||
+        fail "generated placeholder tag shape is invalid"
+      OBSERVED_STATE=generated_placeholder
+      tag_target=$(resolve_tag "$AUTHORITY_TAG") || return 1
+      [ "$tag_target" = absent ] ||
+        fail "generated placeholder candidate has a materialized canonical ref"
+      ;;
+    *)
+      fail "pre-action candidate tag is neither canonical nor generated placeholder"
+      ;;
+  esac
+
+  asset_data=$(normalize_assets "$release") || return 1
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$id" "$tag" "$target" "$asset_data" "$OBSERVED_STATE"
+}
+
+emit_pre_action_action() {
+  {
+    echo "route=action"
+    echo "active=false"
+    echo "origin=pre_action"
+    echo "observed_state=none"
+    echo "authority_version=$AUTHORITY_VERSION"
+    echo "authority_tag=$AUTHORITY_TAG"
+    echo "authority_source_sha=$AUTHORITY_SOURCE"
+  }
+}
+
+emit_pre_action_recovery() {
+  local validated=$1 id observed_tag source kind fingerprint inventory state
+  IFS=$'\t' read -r id observed_tag source kind fingerprint inventory state <<<"$validated"
+  {
+    echo "route=recovery"
+    echo "active=true"
+    echo "origin=pre_action"
+    echo "observed_state=$state"
+    echo "observed_tag=$observed_tag"
+    echo "release_id=$id"
+    echo "tag=$AUTHORITY_TAG"
+    echo "version=$AUTHORITY_VERSION"
+    echo "source_sha=$source"
+    echo "target_commitish=$source"
+    echo "draft=true"
+    echo "published_at=null"
+    echo "authority_version=$AUTHORITY_VERSION"
+    echo "authority_tag=$AUTHORITY_TAG"
+    echo "authority_source_sha=$AUTHORITY_SOURCE"
+    echo "asset_inventory_kind=$kind"
+    echo "asset_inventory_fingerprint=$fingerprint"
+    echo "asset_inventory_json=$inventory"
+  }
+}
+
 emit_active() {
   local origin=$1 validated=$2 id tag source kind fingerprint inventory
   IFS=$'\t' read -r id tag source kind fingerprint inventory <<<"$validated"
@@ -434,6 +525,41 @@ case "$MODE" in
       }
     else
       fail "multiple current-authority release objects are relevant"
+    fi
+    ;;
+  pre-action)
+    RELEASES=$(load_releases)
+    ELIGIBLE=()
+    while IFS= read -r release; do
+      tag=$(jq -r '.tag_name // empty' <<<"$release")
+      target=$(jq -r '.target_commitish // empty' <<<"$release")
+      relevant=false
+      if [ "$tag" = "$AUTHORITY_TAG" ] ||
+         [ "$target" = "$AUTHORITY_SOURCE" ] ||
+         [[ "$tag" =~ ^untagged- ]]; then
+        relevant=true
+      elif [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] &&
+           [ "$(semver_compare "${tag#v}" "$AUTHORITY_VERSION")" -gt 0 ]; then
+        relevant=true
+      fi
+      [ "$relevant" = true ] || continue
+      if jq -e '.draft == false and .published_at != null' >/dev/null <<<"$release"; then
+        fail "relevant published current or future release conflicts with authority"
+      fi
+      validated=$(validate_pre_action_candidate "$release") ||
+        fail "current-authority pre-action candidate is invalid"
+      ELIGIBLE+=("$validated")
+    done < <(jq -c '.[]' <<<"$RELEASES")
+
+    if [ "${#ELIGIBLE[@]}" -eq 0 ]; then
+      canonical_target=$(resolve_tag "$AUTHORITY_TAG") || return 1
+      [ "$canonical_target" = absent ] ||
+        fail "current canonical tag exists without a release candidate"
+      emit_pre_action_action
+    elif [ "${#ELIGIBLE[@]}" -eq 1 ]; then
+      emit_pre_action_recovery "${ELIGIBLE[0]}"
+    else
+      fail "multiple current-authority pre-action candidates are ambiguous"
     fi
     ;;
   verify)
