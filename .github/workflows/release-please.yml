@@ -397,6 +397,7 @@ jobs:
           ../tooling/scripts/verify-release-consistency.sh \
             "$VERSION" "$SOURCE_SHA" \
             --image "$IMAGE" \
+            --image-ref "$IMAGE@$digest" \
             --manifest release-manifest.json
           sha256sum \
             release-manifest.json \
