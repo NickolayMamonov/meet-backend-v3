@@ -156,6 +156,7 @@
     },
     "release-api-error": {
       "expected": "failure",
+      "profile": "action",
       "transport": "release_api_error",
       "releasePatches": [],
       "refs": {
@@ -165,6 +166,7 @@
     },
     "refs-api-error": {
       "expected": "failure",
+      "profile": "action",
       "transport": "refs_api_error",
       "releasePatches": [
         {}
@@ -175,7 +177,232 @@
       }
     },
     "no-candidate-action": {
+      "expected": "failure",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-genuine-empty": {
       "expected": "action",
+      "profile": "action",
+      "transport": "paginated_empty",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "injected-malformed-release-item": {
+      "expected": "failure",
+      "profile": "action",
+      "releases": [
+        null
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "injected-malformed-release-result": {
+      "expected": "failure",
+      "profile": "action",
+      "releases": {
+        "pages": []
+      },
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "live-malformed-page": {
+      "expected": "failure",
+      "profile": "action",
+      "transport": "live_malformed_page",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "live-malformed-release-item": {
+      "expected": "failure",
+      "profile": "action",
+      "transport": "live_malformed_item",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-canonical-recovery": {
+      "expected": "recovery",
+      "profile": "action",
+      "releasePatches": [
+        {}
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-placeholder-recovery": {
+      "expected": "recovery",
+      "profile": "action",
+      "releasePatches": [
+        {
+          "tag_name": "untagged-0123456789abcdef0123"
+        }
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-missing-token": {
+      "expected": "failure",
+      "profile": "action",
+      "token": "__missing__",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-empty-token": {
+      "expected": "failure",
+      "profile": "action",
+      "token": "",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-whitespace-token": {
+      "expected": "failure",
+      "profile": "action",
+      "token": "fixture token",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-repository-api-error": {
+      "expected": "failure",
+      "profile": "action",
+      "authorityTransport": "repository_api_error",
+      "transport": "authority_api_error",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-push-false": {
+      "expected": "failure",
+      "profile": "action",
+      "authority": {
+        "full_name": "fixture/repository",
+        "permissions": {
+          "push": false
+        }
+      },
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-permission-missing": {
+      "expected": "failure",
+      "profile": "action",
+      "authority": {
+        "full_name": "fixture/repository",
+        "permissions": {}
+      },
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-permission-null": {
+      "expected": "failure",
+      "profile": "action",
+      "authority": {
+        "full_name": "fixture/repository",
+        "permissions": {
+          "push": null
+        }
+      },
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-permission-malformed": {
+      "expected": "failure",
+      "profile": "action",
+      "authority": {
+        "full_name": "fixture/repository",
+        "permissions": {
+          "push": "true"
+        }
+      },
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-identity-mismatch": {
+      "expected": "failure",
+      "profile": "action",
+      "authority": {
+        "full_name": "other/repository",
+        "permissions": {
+          "push": true
+        }
+      },
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "action-filtered-empty": {
+      "expected": "failure",
+      "profile": "action",
+      "authority": {
+        "full_name": "fixture/repository",
+        "permissions": {
+          "push": false
+        }
+      },
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "recovery-only-visible-placeholder-audit": {
+      "expected": "recovery",
+      "releasePatches": [
+        {
+          "tag_name": "untagged-0123456789abcdef0123"
+        }
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "recovery-only-zero-candidate-safe-failure": {
+      "expected": "failure",
       "releasePatches": [],
       "refs": {
         "refs": {},
