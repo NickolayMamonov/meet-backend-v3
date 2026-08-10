@@ -69,11 +69,17 @@ GitHub attestation. Only this read-only sequence emits the ephemeral
 `resume_admission=verified` value.
 
 For `empty`, the publisher requires an empty registry, acquires the existing
-create-only lease, repeats the empty admission, and builds. Partial,
-divergent, identity-mismatched, raced, or `latest` registry state and any
-asset/content/evidence failure leave the release draft in place. Quarantine
-notes may be attached to the same numeric release ID, but the workflow never
-repairs, replaces, retags, deletes, or pre-populates registry state.
+create-only lease, repeats the empty admission, and builds. If an earlier
+attempt completed the immutable registry write but stopped before evidence
+assets were uploaded, the publisher admits the distinct `resume-registry`
+route only when the registry is complete, its digest is identity-verified, and
+`latest` is confirmed absent; that route reuses the digest, creates no image
+write, and continues with attestation, evidence, deep verification, and
+publish-last. Partial, divergent, identity-mismatched, raced, or `latest`
+registry state and any asset/content/evidence failure leave the release draft
+in place. Quarantine notes may be attached to the same numeric release ID, but
+the workflow never repairs, replaces, retags, deletes, or pre-populates
+registry state.
 
 The registry preflight explicitly inspects `IMAGE:latest` before the lease or
 any GHCR write. Only a confirmed not-found response emits `latest=absent`;
@@ -120,11 +126,13 @@ It is never allowed to terminate the shell before the draft receives the
 quarantine note.
 
 BuildKit provenance and SBOM publication is accepted only when the OCI index
-contains subject-bound attestation descriptors and their child manifests carry
-the expected in-toto predicate types (`slsa.dev/provenance` and SPDX or
-CycloneDX). `scripts/verify-oci-evidence.sh` derives the `provenance` and
-`sbom` fields in the release manifest from those descriptors; the workflow does
-not treat a handwritten boolean as evidence.
+contains at least one subject-bound attestation descriptor and its child
+manifest carries both expected in-toto predicate types
+(`slsa.dev/provenance` and SPDX or CycloneDX). BuildKit may place both
+predicates in one attestation manifest rather than two separate descriptors.
+`scripts/verify-oci-evidence.sh` derives the `provenance` and `sbom` fields in
+the release manifest from those layers; the workflow does not treat a
+handwritten boolean as evidence.
 
 ## Production access prerequisites
 

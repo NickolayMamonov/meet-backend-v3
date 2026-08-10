@@ -195,6 +195,7 @@ jobs:
           bash -n "$TOOLING_SCRIPTS"/*.sh
           shellcheck --severity=warning "$TOOLING_SCRIPTS"/*.sh
           "$TOOLING_SCRIPTS/test-release-registry-state.sh"
+          "$TOOLING_SCRIPTS/test-release-resume-state.sh"
       - name: Verify Release Please state
         env:
           RELEASE_REF: ${{ inputs.source_sha == '' && inputs.ref || '' }}

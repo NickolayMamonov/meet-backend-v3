@@ -205,6 +205,8 @@ require_text 'path: tooling'
 require_text 'path: source'
 require_text 'ASSET_INVENTORY_KIND'
 require_text 'complete_unverified'
+require_text 'resume-registry'
+require_text 'registry_digest'
 require_text 'verify-release-resume-state.sh'
 require_text 'revalidate-release-mutation.sh'
 require_text '[ "$latest" = absent ]'
@@ -261,6 +263,8 @@ publish_line=$(grep -n "jq -n '{draft: false}'" <<<"$WORKFLOW_TEXT" |
 CI_WORKFLOW=.github/workflows/ci.yml
 require_file "$CI_WORKFLOW"
 CI_TEXT=$(sed 's/\r$//' "$CI_WORKFLOW")
+grep -Fq 'test-release-resume-state.sh' <<<"$CI_TEXT" ||
+  fail "reusable CI does not run the release resume fixtures"
 for input in source_sha release_tag release_version release_id; do
   grep -Eq "^[[:space:]]+$input:" <<<"$CI_TEXT" ||
     fail "reusable CI is missing additive input: $input"

@@ -13,18 +13,7 @@
       "platform": {"os": "unknown", "architecture": "unknown"},
       "annotations": {
         "vnd.docker.reference.type": "attestation-manifest",
-        "vnd.docker.reference.digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "in-toto.io/predicate-type": "https://slsa.dev/provenance/v1"
-      }
-    },
-    {
-      "mediaType": "application/vnd.oci.image.manifest.v1+json",
-      "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "platform": {"os": "unknown", "architecture": "unknown"},
-      "annotations": {
-        "vnd.docker.reference.type": "attestation-manifest",
-        "vnd.docker.reference.digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "in-toto.io/predicate-type": "https://spdx.dev/Document"
+        "vnd.docker.reference.digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
       }
     }
   ]
