@@ -38,6 +38,22 @@ if grep -Eq \
   exit 1
 fi
 
+helper_line=$(grep -n \
+  'release-asset-inventory.sh" canonical-json --release-file "$RELEASE_JSON"' \
+  "$VERIFY" | head -1 | cut -d: -f1)
+download_line=$(grep -n '^[[:space:]]*download_asset "\$asset_id"' \
+  "$VERIFY" | head -1 | cut -d: -f1)
+[ -n "$helper_line" ] && [ -n "$download_line" ] &&
+  [ "$helper_line" -lt "$download_line" ] ||
+  {
+    echo "resume verifier does not admit through the helper before downloads" >&2
+    exit 1
+  }
+if grep -Eq 'EXPECTED_ASSETS|sort_by\(\.name\)|\.assets.*length.*4' "$VERIFY"; then
+  echo "resume verifier contains an independent exact inventory policy" >&2
+  exit 1
+fi
+
 verify_fixture() {
   fixture=$1
   expected_target=${2:-$TARGET}
@@ -86,7 +102,15 @@ make_case() {
       rm "$fixture/assets/103"
       ;;
     extra-asset)
-      update_json '.assets += [{"id":105,"name":"unexpected.txt"}]' "$fixture/release.json"
+      update_json '.assets += [{
+        "id":105,
+        "name":"unexpected.txt",
+        "size":10,
+        "state":"uploaded",
+        "created_at":"2026-08-10T01:00:00Z",
+        "updated_at":"2026-08-10T01:00:00Z",
+        "url":"https://api.github.test/releases/assets/105"
+      }]' "$fixture/release.json"
       echo unexpected > "$fixture/assets/105"
       ;;
     path-traversal)

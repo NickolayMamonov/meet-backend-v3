@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ASSET_INVENTORY_HELPER=$SCRIPT_DIR/release-asset-inventory.sh
+
 usage() {
   echo "usage: $0 canonicalize|publish --repository owner/repo --release-id ID --version X.Y.Z --tag vX.Y.Z --source-sha SHA --target SHA --expected-fingerprint SHA256 --repo-dir PATH [--observed-tag untagged-XXXXXXXXXXXXXXXXXXXX] [--release-file PATH]" >&2
   exit 2
@@ -48,7 +51,6 @@ while [ "$#" -gt 0 ]; do
 done
 
 command -v jq >/dev/null 2>&1 || fail "jq is required"
-command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 command -v gh >/dev/null 2>&1 || fail "gh is required"
 [[ "$REPOSITORY" =~ ^[^/]+/[^/]+$ ]] || usage
 [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || usage
@@ -97,10 +99,7 @@ load_release() {
 }
 
 fingerprint() {
-  jq -c '[.assets[] | {
-    name, id, size, state, created_at, updated_at, url
-  }] | sort_by(.name)' <<<"$1" |
-    sha256sum | awk '{print $1}'
+  "$ASSET_INVENTORY_HELPER" fingerprint <<<"$1"
 }
 
 if [ -z "$RELEASE_FILE" ]; then

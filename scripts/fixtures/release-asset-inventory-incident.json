@@ -1,0 +1,45 @@
+{
+  "id": 367640510,
+  "tag_name": "v1.0.1",
+  "target_commitish": "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc",
+  "draft": true,
+  "published_at": null,
+  "assets": [
+    {
+      "name": "image-index.json",
+      "id": 508490090,
+      "size": 856,
+      "state": "uploaded",
+      "created_at": "2026-08-10T08:13:10Z",
+      "updated_at": "2026-08-10T08:13:11Z",
+      "url": "https://api.github.com/repos/NickolayMamonov/meet-backend-v3/releases/assets/508490090"
+    },
+    {
+      "name": "release-manifest.json",
+      "id": 508490083,
+      "size": 661,
+      "state": "uploaded",
+      "created_at": "2026-08-10T08:13:10Z",
+      "updated_at": "2026-08-10T08:13:10Z",
+      "url": "https://api.github.com/repos/NickolayMamonov/meet-backend-v3/releases/assets/508490083"
+    },
+    {
+      "name": "SHA256SUMS",
+      "id": 508490119,
+      "size": 255,
+      "state": "uploaded",
+      "created_at": "2026-08-10T08:13:11Z",
+      "updated_at": "2026-08-10T08:13:12Z",
+      "url": "https://api.github.com/repos/NickolayMamonov/meet-backend-v3/releases/assets/508490119"
+    },
+    {
+      "name": "image-inspect.txt",
+      "id": 508490102,
+      "size": 1047,
+      "state": "uploaded",
+      "created_at": "2026-08-10T08:13:11Z",
+      "updated_at": "2026-08-10T08:13:11Z",
+      "url": "https://api.github.com/repos/NickolayMamonov/meet-backend-v3/releases/assets/508490102"
+    }
+  ]
+}

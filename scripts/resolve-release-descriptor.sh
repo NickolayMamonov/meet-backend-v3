@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ASSET_INVENTORY_HELPER=$SCRIPT_DIR/release-asset-inventory.sh
+
 fail() {
   echo "release descriptor resolution failed: $*" >&2
   exit 1
@@ -30,7 +33,6 @@ EOF
 
 command -v git >/dev/null 2>&1 || fail "git is required"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
-command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 
 [ "$#" -ge 1 ] || usage
 MODE=$1
@@ -297,43 +299,20 @@ resolve_tag() {
 }
 
 normalize_assets() {
-  local release=$1 assets count normalized kind fingerprint
-  assets=$(jq -c '.assets' <<<"$release")
-  jq -e 'type == "array"' >/dev/null <<<"$assets" ||
-    fail "release assets are not an array"
-  count=$(jq 'length' <<<"$assets")
+  local release=$1 normalized count kind fingerprint
+  normalized=$(
+    "$ASSET_INVENTORY_HELPER" canonical-json --allow-empty <<<"$release"
+  ) || fail "release asset inventory validation failed"
+  count=$(jq 'length' <<<"$normalized") ||
+    fail "release asset inventory canonicalization failed"
   if [ "$count" -eq 0 ]; then
-    normalized='[]'
     kind=empty
   else
-    jq -e '
-      length == 4 and
-      all(.[];
-        type == "object" and
-        (.name | type == "string") and
-        (.id | type == "number" and floor == . and . > 0) and
-        (.size | type == "number" and floor == . and . > 0) and
-        (.created_at | type == "string" and length > 0) and
-        (.updated_at | type == "string" and length > 0) and
-        (.url | type == "string" and length > 0) and
-        .state == "uploaded"
-      ) and
-      ([.[].name] | sort) == [
-        "SHA256SUMS",
-        "image-index.json",
-        "image-inspect.txt",
-        "release-manifest.json"
-      ] and
-      ([.[].name] | unique | length) == 4 and
-      ([.[].id] | unique | length) == 4
-    ' >/dev/null <<<"$assets" ||
-      fail "release asset metadata is partial, duplicate, foreign, or malformed"
-    normalized=$(jq -c '[.[] | {
-      name, id, size, state, created_at, updated_at, url
-    }] | sort_by(.name)' <<<"$assets")
     kind=complete_unverified
   fi
-  fingerprint=$(printf '%s' "$normalized" | sha256sum | awk '{print $1}')
+  fingerprint=$(
+    "$ASSET_INVENTORY_HELPER" fingerprint --allow-empty <<<"$release"
+  ) || fail "release asset inventory fingerprinting failed"
   printf '%s\t%s\t%s\n' "$kind" "$fingerprint" "$normalized"
 }
 

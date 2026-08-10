@@ -5,9 +5,41 @@
   "draft": true,
   "published_at": null,
   "assets": [
-    {"id": 101, "name": "release-manifest.json"},
-    {"id": 102, "name": "image-index.json"},
-    {"id": 103, "name": "image-inspect.txt"},
-    {"id": 104, "name": "SHA256SUMS"}
+    {
+      "id": 101,
+      "name": "release-manifest.json",
+      "size": 661,
+      "state": "uploaded",
+      "created_at": "2026-08-10T01:00:00Z",
+      "updated_at": "2026-08-10T01:00:00Z",
+      "url": "https://api.github.test/releases/assets/101"
+    },
+    {
+      "id": 102,
+      "name": "image-index.json",
+      "size": 856,
+      "state": "uploaded",
+      "created_at": "2026-08-10T01:00:00Z",
+      "updated_at": "2026-08-10T01:00:00Z",
+      "url": "https://api.github.test/releases/assets/102"
+    },
+    {
+      "id": 103,
+      "name": "image-inspect.txt",
+      "size": 1047,
+      "state": "uploaded",
+      "created_at": "2026-08-10T01:00:00Z",
+      "updated_at": "2026-08-10T01:00:00Z",
+      "url": "https://api.github.test/releases/assets/103"
+    },
+    {
+      "id": 104,
+      "name": "SHA256SUMS",
+      "size": 255,
+      "state": "uploaded",
+      "created_at": "2026-08-10T01:00:00Z",
+      "updated_at": "2026-08-10T01:00:00Z",
+      "url": "https://api.github.test/releases/assets/104"
+    }
   ]
 }
