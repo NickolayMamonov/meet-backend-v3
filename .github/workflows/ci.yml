@@ -76,8 +76,16 @@ jobs:
           set -euo pipefail
           bash -n scripts/*.sh
           shellcheck --severity=warning scripts/*.sh
-      - name: Verify Release Please bootstrap
-        run: scripts/verify-release-please-bootstrap.sh
+      - name: Verify Release Please state
+        env:
+          RELEASE_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RELEASE_REF" ]; then
+            scripts/verify-release-please-bootstrap.sh --release-state "$RELEASE_REF"
+          else
+            scripts/verify-release-please-bootstrap.sh --bootstrap-state
+          fi
       - name: Validate production Compose
         run: |
           set -euo pipefail
