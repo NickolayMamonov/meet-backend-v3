@@ -17,6 +17,7 @@ data class TimepadEvent(
     @param:JsonProperty("description_short") val descriptionShort: String? = null,
     @param:JsonProperty("description_html") val descriptionHtml: String? = null,
     @param:JsonProperty("starts_at") val startsAt: String? = null,
+    @param:JsonProperty("ends_at") val endsAt: String? = null,
     val url: String? = null,
     @param:JsonProperty("poster_image") val posterImage: JsonNode? = null,
     val location: JsonNode? = null,
