@@ -79,6 +79,19 @@ The resolver is metadata-only. Its asset state is either `empty` or
 non-empty metadata inventory never authorizes a build, registry write, asset
 upload, or publication.
 
+The sole asset inventory byte contract is
+`scripts/release-asset-inventory.sh`. It admits either an explicitly allowed
+empty inventory or the exact four uploaded assets, then projects each asset to
+`name,id,size,state,created_at,updated_at,url`, sorts the array by `name`, and
+serializes compact JSON with no terminal newline. The fingerprint is the
+SHA-256 of exactly those bytes. Raw GitHub asset order is non-semantic and
+normalizes to the same bytes; callers do not implement a second validator,
+serializer, or digest. Empty admission is resolver-only through
+`--allow-empty`; resume verification and mutation paths require the complete
+inventory. Any helper or comparison mismatch stops before metadata mutation;
+there is no fallback digest, dual-digest compatibility mode, or compensating
+write.
+
 The publisher owns the only deep resume admission. For
 `complete_unverified`, it downloads every asset by numeric asset ID into a
 temporary directory, requires exactly `release-manifest.json`,

@@ -63,6 +63,9 @@ for file in "$CONFIG" "$MANIFEST" "$VERSION_FILE" "$CHANGELOG" \
   require_file "$file"
 done
 require_file scripts/verify-release-resume-state.sh
+require_file scripts/release-asset-inventory.sh
+require_file scripts/test-release-asset-inventory.sh
+require_file scripts/fixtures/release-asset-inventory-incident.json
 require_file scripts/verify-ghcr-package-inventory.sh
 require_file scripts/verify-oci-referrer-closure.sh
 require_file scripts/test-oci-referrer-closure.sh
@@ -74,6 +77,7 @@ require_file scripts/test-release-metadata-mutation.sh
 
 WORKFLOW_TEXT=$(sed 's/\r$//' "$RELEASE_WORKFLOW")
 RESUME_TEXT=$(sed 's/\r$//' scripts/verify-release-resume-state.sh)
+ASSET_TEST_TEXT=$(sed 's/\r$//' scripts/test-release-asset-inventory.sh)
 CLOSURE_TEXT=$(sed 's/\r$//' scripts/verify-oci-referrer-closure.sh)
 INVENTORY_TEXT=$(sed 's/\r$//' scripts/verify-ghcr-package-inventory.sh)
 INVENTORY_TEST_TEXT=$(sed 's/\r$//' scripts/test-ghcr-package-inventory.sh)
@@ -257,6 +261,49 @@ grep -Fq '#!/bin/sh' <<<"$(head -1 scripts/verify-release-resume-state.sh)" ||
   fail "resume verifier must remain POSIX /bin/sh"
 if grep -Eq '(^|[[:space:]])\[\[[[:space:]]' <<<"$RESUME_TEXT"; then
   fail "POSIX resume verifier contains Bash conditional syntax"
+fi
+grep -Fq 'release-asset-inventory.sh' <<<"$RESUME_TEXT" ||
+  fail "resume verifier does not execute the shared asset inventory helper"
+grep -Fq 'canonical-json --release-file "$RELEASE_JSON"' <<<"$RESUME_TEXT" ||
+  fail "resume verifier does not admit assets through the shared helper"
+helper_line=$(grep -n 'canonical-json --release-file "$RELEASE_JSON"' \
+  <<<"$RESUME_TEXT" | head -1 | cut -d: -f1)
+download_line=$(grep -n '^[[:space:]]*download_asset "\$asset_id"' \
+  <<<"$RESUME_TEXT" | head -1 | cut -d: -f1)
+[ -n "$helper_line" ] && [ -n "$download_line" ] &&
+  [ "$helper_line" -lt "$download_line" ] ||
+  fail "resume helper admission must precede asset downloads"
+for forbidden in EXPECTED_ASSETS 'sort_by(.name)' \
+  '(.assets | length) == 4'; do
+  if grep -Fq -- "$forbidden" <<<"$RESUME_TEXT"; then
+    fail "resume verifier contains an independent asset admission predicate"
+  fi
+done
+asset_fingerprint_gate_count=$(
+  grep -F 'tooling/scripts/release-asset-inventory.sh fingerprint' \
+    <<<"$WORKFLOW_TEXT" | wc -l | tr -d '[:space:]'
+)
+[ "$asset_fingerprint_gate_count" -eq 4 ] &&
+grep -Fq -- '--release-file "$release_json"' <<<"$WORKFLOW_TEXT" ||
+  fail "release workflow does not use the shared asset fingerprint helper"
+for caller in scripts/resolve-release-descriptor.sh \
+  scripts/mutate-release-metadata.sh scripts/revalidate-release-mutation.sh; do
+  caller_text=$(sed 's/\r$//' "$caller")
+  grep -Fq 'release-asset-inventory.sh' <<<"$caller_text" ||
+    fail "$caller does not invoke the shared asset inventory helper"
+  if grep -Eq 'sort_by\(\.name\)|created_at.*updated_at|updated_at.*url' \
+      <<<"$caller_text"; then
+    fail "$caller contains duplicate asset canonicalization logic"
+  fi
+done
+grep -Fq 'a7a762e42d972e3131090effe5706265e03d21de8d47c7d2761f65096e7fa3f9' \
+  <<<"$ASSET_TEST_TEXT" ||
+  fail "asset inventory test does not pin the full incident fingerprint"
+FULL_INCIDENT_DIGEST=a7a762e42d972e3131090effe5706265e03d21de8d47c7d2761f65096e7fa3f9
+TRUNCATED_DIGEST_PATTERN="(^|[^0-9a-f])${FULL_INCIDENT_DIGEST%?}([^0-9a-f]|$)"
+if grep -R -E -n --exclude='verify-release-please-bootstrap.sh' \
+    "$TRUNCATED_DIGEST_PATTERN" scripts .github docs; then
+  fail "repository contains the truncated incident fingerprint"
 fi
 grep -Fq 'published-current-conflict' <<<"$PRE_ACTION_FIXTURES" ||
   fail "pre-action fixtures are missing the published current conflict"

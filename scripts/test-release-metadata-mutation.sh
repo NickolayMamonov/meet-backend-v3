@@ -88,10 +88,8 @@ touch "$PATCH_LOG"
 cp "$RELEASE_FILE" "$TMP/release-original.json"
 
 fingerprint=$(
-  jq -c '[.assets[] | {
-    name, id, size, state, created_at, updated_at, url
-  }] | sort_by(.name)' "$RELEASE_FILE" |
-    sha256sum | awk '{print $1}'
+  "$ROOT_DIR/scripts/release-asset-inventory.sh" fingerprint \
+    --release-file "$RELEASE_FILE"
 )
 
 common=(

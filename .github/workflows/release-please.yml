@@ -506,12 +506,8 @@ jobs:
           release_json="$RUNNER_TEMP/release/post-action-release.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
           post_action_fingerprint=$(
-            printf '%s' "$(jq -c '
-              [.assets[] | {
-                name, id, size, state, created_at, updated_at, url
-              }] | sort_by(.name)
-            ' "$release_json")" |
-              sha256sum | awk '{print $1}'
+            tooling/scripts/release-asset-inventory.sh fingerprint \
+              --release-file "$release_json"
           )
           if [ "$ASSET_INVENTORY_KIND" = empty ]; then
             echo "POST_ACTION_ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
@@ -532,12 +528,8 @@ jobs:
           release_json="$RUNNER_TEMP/release/final-release.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$release_json"
           fingerprint=$(
-            printf '%s' "$(jq -c '
-              [.assets[] | {
-                name, id, size, state, created_at, updated_at, url
-              }] | sort_by(.name)
-            ' "$release_json")" |
-              sha256sum | awk '{print $1}'
+            tooling/scripts/release-asset-inventory.sh fingerprint \
+              --release-file "$release_json"
           )
           test "$POST_ACTION_ASSET_INVENTORY_FINGERPRINT" = \
             "$ASSET_INVENTORY_FINGERPRINT"
@@ -658,12 +650,8 @@ jobs:
           release_json="$RUNNER_TEMP/recovery-observed-release.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
           post_action_fingerprint=$(
-            printf '%s' "$(jq -c '
-              [.assets[] | {
-                name, id, size, state, created_at, updated_at, url
-              }] | sort_by(.name)
-            ' "$release_json")" |
-              sha256sum | awk '{print $1}'
+            tooling/scripts/release-asset-inventory.sh fingerprint \
+              --release-file "$release_json"
           )
           test "$post_action_fingerprint" = \
             "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT"
@@ -707,12 +695,8 @@ jobs:
           release_json="$RUNNER_TEMP/recovery-release.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
           fingerprint=$(
-            printf '%s' "$(jq -c '
-              [.assets[] | {
-                name, id, size, state, created_at, updated_at, url
-              }] | sort_by(.name)
-            ' "$release_json")" |
-              sha256sum | awk '{print $1}'
+            tooling/scripts/release-asset-inventory.sh fingerprint \
+              --release-file "$release_json"
           )
           test "$POST_ACTION_ASSET_INVENTORY_FINGERPRINT" = \
             "$ASSET_INVENTORY_FINGERPRINT"

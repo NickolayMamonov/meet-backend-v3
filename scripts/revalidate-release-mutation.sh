@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ASSET_INVENTORY_HELPER=$SCRIPT_DIR/release-asset-inventory.sh
+
 usage() {
   echo "usage: $0 --repository owner/repo --release-id ID --tag vX.Y.Z --version X.Y.Z --source-sha SHA --expected-fingerprint SHA256 [--repo-dir PATH] [--dev-ref REF]" >&2
   exit 2
@@ -40,7 +43,6 @@ done
 
 command -v gh >/dev/null 2>&1 || fail "gh is required"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
-command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 
 [[ "$REPOSITORY" =~ ^[^/]+/[^/]+$ ]] || usage
 [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || usage
@@ -74,13 +76,8 @@ jq -e \
   fail "release is not the expected draft descriptor"
 
 fingerprint=$(
-  printf '%s' "$(jq -c '
-    [.assets[] | {
-      name, id, size, state, created_at, updated_at, url
-    }] | sort_by(.name)
-  ' "$release_file")" |
-    sha256sum | awk '{print $1}'
-)
+  "$ASSET_INVENTORY_HELPER" fingerprint --release-file "$release_file"
+) || fail "release asset inventory fingerprinting failed"
 [ "$fingerprint" = "$EXPECTED_FINGERPRINT" ] ||
   fail "release asset metadata fingerprint changed"
 

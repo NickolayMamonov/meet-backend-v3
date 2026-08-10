@@ -99,6 +99,11 @@ jq -e \
     (.assets | type == "array")
   ' "$RELEASE_JSON" >/dev/null || fail "release identity is not the expected unpublished draft"
 
+CANONICAL_ASSETS=$WORK_DIR/release-assets.json
+"$SCRIPT_DIR/release-asset-inventory.sh" canonical-json --release-file "$RELEASE_JSON" \
+  >"$CANONICAL_ASSETS" ||
+  fail "asset inventory is not the exact four-file evidence set"
+
 if [ -n "$FIXTURE" ]; then
   if [ "$OBSERVED_STATE" = generated_placeholder ]; then
     jq -e '.exists == false' "$FIXTURE/tag.json" >/dev/null ||
@@ -147,15 +152,6 @@ else
   fi
 fi
 
-EXPECTED_ASSETS='["SHA256SUMS","image-index.json","image-inspect.txt","release-manifest.json"]'
-jq -e --argjson expected "$EXPECTED_ASSETS" '
-  (.assets | length) == 4 and
-  ([.assets[].name] | sort) == $expected and
-  ([.assets[].name] | unique | length) == 4 and
-  ([.assets[].id] | unique | length) == 4 and
-  all(.assets[]; (.id | type == "number") and (.id > 0) and (.id | floor == .))
-' "$RELEASE_JSON" >/dev/null || fail "asset inventory is not the exact four-file evidence set"
-
 download_asset() {
   asset_id=$1
   asset_name=$2
@@ -173,7 +169,7 @@ download_asset() {
 
 for asset_name in release-manifest.json image-index.json image-inspect.txt SHA256SUMS; do
   asset_id=$(jq -r --arg name "$asset_name" \
-    '.assets[] | select(.name == $name) | .id' "$RELEASE_JSON" |
+    '.[] | select(.name == $name) | .id' "$CANONICAL_ASSETS" |
     tr -d '\r')
   download_asset "$asset_id" "$asset_name"
 done
