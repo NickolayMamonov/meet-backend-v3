@@ -318,9 +318,8 @@ else
   latest_output=
   if latest_output=$(docker buildx imagetools inspect "$IMAGE:latest" 2>&1); then
     fail "latest registry alias is forbidden"
-  elif ! grep -Eqi \
-    'manifest unknown|name unknown|repository does not exist|not found' \
-    <<<"$latest_output"; then
+  elif ! printf '%s\n' "$latest_output" |
+    grep -Eqi 'manifest unknown|name unknown|repository does not exist|not found'; then
     fail "latest registry alias inspection failed"
   fi
   registry_path=${IMAGE#ghcr.io/}
