@@ -2,6 +2,8 @@
   "release-type": "simple",
   "package-name": "meet-backend",
   "initial-version": "1.0.0",
+  "bootstrap-sha": "bea6672443c16ee7be2297cc39ad5cd4e2a077c4",
+  "include-component-in-tag": false,
   "include-v-in-tag": true,
   "draft": true,
   "changelog-sections": [
