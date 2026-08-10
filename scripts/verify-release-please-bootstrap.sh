@@ -16,21 +16,24 @@ fail() {
   exit 1
 }
 
-STATE_MODE=bootstrap
+STATE_MODE=auto
 RELEASE_REF=
 case "${1:-}" in
   "")
     ;;
+  --auto-state)
+    [ "$#" -eq 1 ] || fail "usage: $0 [--auto-state|--bootstrap-state|--release-state vVERSION]"
+    ;;
   --bootstrap-state)
-    [ "$#" -eq 1 ] || fail "usage: $0 [--bootstrap-state|--release-state vVERSION]"
+    [ "$#" -eq 1 ] || fail "usage: $0 [--auto-state|--bootstrap-state|--release-state vVERSION]"
     ;;
   --release-state)
-    [ "$#" -eq 2 ] || fail "usage: $0 [--bootstrap-state|--release-state vVERSION]"
+    [ "$#" -eq 2 ] || fail "usage: $0 [--auto-state|--bootstrap-state|--release-state vVERSION]"
     STATE_MODE=release
     RELEASE_REF=$2
     ;;
   *)
-    fail "usage: $0 [--bootstrap-state|--release-state vVERSION]"
+    fail "usage: $0 [--auto-state|--bootstrap-state|--release-state vVERSION]"
     ;;
 esac
 
@@ -40,13 +43,13 @@ require_file() {
 
 require_text() {
   local needle=$1
-  grep -Fq -- "$needle" "$RELEASE_WORKFLOW" ||
+  grep -Fq -- "$needle" <<<"$WORKFLOW_TEXT" ||
     fail "release workflow is missing a required invariant"
 }
 
 require_regex() {
   local pattern=$1
-  grep -Eq -- "$pattern" "$RELEASE_WORKFLOW" ||
+  grep -Eq -- "$pattern" <<<"$WORKFLOW_TEXT" ||
     fail "release workflow is missing a required structure"
 }
 
@@ -56,6 +59,8 @@ command -v jq >/dev/null 2>&1 ||
 for file in "$CONFIG" "$MANIFEST" "$VERSION_FILE" "$CHANGELOG" "$RELEASE_WORKFLOW"; do
   require_file "$file"
 done
+
+WORKFLOW_TEXT=$(sed 's/\r$//' "$RELEASE_WORKFLOW")
 
 jq empty "$CONFIG" "$MANIFEST" "$VERSION_FILE" >/dev/null ||
   fail "release configuration or bootstrap state is not valid JSON"
@@ -114,11 +119,8 @@ verify_bootstrap_state() {
     fail "CHANGELOG.md bootstrap state must remain unchanged"
 }
 
-verify_release_state() {
-  [[ "$RELEASE_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
-    fail "release-state mode requires a repository-local vVERSION tag"
-  release_version=${RELEASE_REF#v}
-
+verify_release_files() {
+  local release_version=$1
   jq -e --arg release_version "$release_version" '
     type == "object" and
     length == 1 and
@@ -141,11 +143,41 @@ verify_release_state() {
     fail "CHANGELOG.md does not contain the checked-out release version"
 }
 
-if [ "$STATE_MODE" = bootstrap ]; then
-  verify_bootstrap_state
-else
-  verify_release_state
-fi
+verify_release_state() {
+  [[ "$RELEASE_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    fail "release-state mode requires a repository-local vVERSION tag"
+  verify_release_files "${RELEASE_REF#v}"
+}
+
+verify_auto_state() {
+  local manifest_version version
+  manifest_version=$(jq -r '.["."]' "$MANIFEST")
+  version=$(jq -r '.version' "$VERSION_FILE")
+  [[ "$manifest_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    fail "manifest does not contain a canonical release version"
+  [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    fail "version.json does not contain a canonical release version"
+  [ "$manifest_version" = "$version" ] ||
+    fail "manifest and version.json release versions do not match"
+
+  if [ "$version" = "1.0.0" ]; then
+    verify_bootstrap_state
+  else
+    verify_release_files "$version"
+  fi
+}
+
+case "$STATE_MODE" in
+  auto)
+    verify_auto_state
+    ;;
+  bootstrap)
+    verify_bootstrap_state
+    ;;
+  release)
+    verify_release_state
+    ;;
+esac
 
 require_regex '^on:$'
 require_text '  push:'
@@ -171,7 +203,7 @@ require_text 'test "$(git show "$SOURCE_SHA:version.json" | jq -r '\''.version'\
 require_text 'test "$revision" = "$SOURCE_SHA"'
 image_tag_lines=()
 mapfile -t image_tag_lines < <(
-  grep -E '^[[:space:]]+--tag "\$IMAGE:[^"]+"' "$RELEASE_WORKFLOW" || true
+  grep -E '^[[:space:]]+--tag "\$IMAGE:[^"]+"' <<<"$WORKFLOW_TEXT" || true
 )
 [ "${#image_tag_lines[@]}" -eq 3 ] ||
   fail "release workflow must publish exactly three immutable image aliases"
@@ -179,15 +211,15 @@ for expected_tag in \
   '--tag "$IMAGE:$TAG"' \
   '--tag "$IMAGE:$VERSION"' \
   '--tag "$IMAGE:sha-$SOURCE_SHA"'; do
-  expected_count=$(grep -F -- "$expected_tag" "$RELEASE_WORKFLOW" |
+  expected_count=$(grep -F -- "$expected_tag" <<<"$WORKFLOW_TEXT" |
     wc -l | tr -d '[:space:]' || true)
   [ "$expected_count" -eq 1 ] ||
     fail "release workflow is missing or duplicating an immutable image alias"
 done
-if grep -Eiq '^[[:space:]]+--tag "\$IMAGE:latest"' "$RELEASE_WORKFLOW"; then
+if grep -Eiq '^[[:space:]]+--tag "\$IMAGE:latest"' <<<"$WORKFLOW_TEXT"; then
   fail "release workflow must not publish the latest image alias"
 fi
-alias_line_count=$(grep -E '^[[:space:]]+aliases:' "$RELEASE_WORKFLOW" |
+alias_line_count=$(grep -E '^[[:space:]]+aliases:' <<<"$WORKFLOW_TEXT" |
   wc -l | tr -d '[:space:]' || true)
 [ "$alias_line_count" -eq 1 ] ||
   fail "release manifest must declare exactly one alias list"
@@ -196,8 +228,14 @@ require_text 'publicationPolicy: "exactly-three-aliases-publish-last"'
 require_text 'gh release upload "$TAG" release-manifest.json image-index.json image-inspect.txt SHA256SUMS'
 require_text 'gh release edit "$TAG" --draft=false'
 
-if [ "$STATE_MODE" = bootstrap ]; then
-  echo "release-please bootstrap verified"
-else
-  echo "release-please release state verified: ref=$RELEASE_REF version=$release_version"
-fi
+case "$STATE_MODE" in
+  auto)
+    echo "release-please state verified: version=$(jq -r '.version' "$VERSION_FILE")"
+    ;;
+  bootstrap)
+    echo "release-please bootstrap verified"
+    ;;
+  release)
+    echo "release-please release state verified: ref=$RELEASE_REF version=${RELEASE_REF#v}"
+    ;;
+esac

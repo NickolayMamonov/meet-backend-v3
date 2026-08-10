@@ -84,7 +84,7 @@ jobs:
           if [ -n "$RELEASE_REF" ]; then
             scripts/verify-release-please-bootstrap.sh --release-state "$RELEASE_REF"
           else
-            scripts/verify-release-please-bootstrap.sh --bootstrap-state
+            scripts/verify-release-please-bootstrap.sh --auto-state
           fi
       - name: Validate production Compose
         run: |
