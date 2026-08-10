@@ -1,0 +1,157 @@
+{
+  "baseRelease": {
+    "id": 701,
+    "tag_name": "v1.0.1",
+    "name": "v1.0.1",
+    "body": "Sanitized fixture release notes.",
+    "target_commitish": "@SOURCE@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": [
+      {
+        "name": "release-manifest.json",
+        "id": 801,
+        "size": 101,
+        "state": "uploaded",
+        "created_at": "2026-08-10T01:00:00Z",
+        "updated_at": "2026-08-10T01:00:00Z",
+        "url": "https://api.github.invalid/releases/assets/801"
+      },
+      {
+        "name": "image-index.json",
+        "id": 802,
+        "size": 102,
+        "state": "uploaded",
+        "created_at": "2026-08-10T01:00:00Z",
+        "updated_at": "2026-08-10T01:00:00Z",
+        "url": "https://api.github.invalid/releases/assets/802"
+      },
+      {
+        "name": "image-inspect.txt",
+        "id": 803,
+        "size": 103,
+        "state": "uploaded",
+        "created_at": "2026-08-10T01:00:00Z",
+        "updated_at": "2026-08-10T01:00:00Z",
+        "url": "https://api.github.invalid/releases/assets/803"
+      },
+      {
+        "name": "SHA256SUMS",
+        "id": 804,
+        "size": 104,
+        "state": "uploaded",
+        "created_at": "2026-08-10T01:00:00Z",
+        "updated_at": "2026-08-10T01:00:00Z",
+        "url": "https://api.github.invalid/releases/assets/804"
+      }
+    ]
+  },
+  "cases": {
+    "canonical-recovery": {
+      "expected": "recovery",
+      "observedState": "canonical",
+      "releasePatches": [
+        {}
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "placeholder-recovery": {
+      "expected": "recovery",
+      "observedState": "generated_placeholder",
+      "releasePatches": [
+        {
+          "tag_name": "untagged-0123456789abcdef0123"
+        }
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "malformed-placeholder": {
+      "expected": "failure",
+      "releasePatches": [
+        {
+          "tag_name": "untagged-not-a-generated-id"
+        }
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "conflicting-source": {
+      "expected": "failure",
+      "releasePatches": [
+        {
+          "target_commitish": "@OLD@"
+        }
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "ambiguous-candidates": {
+      "expected": "failure",
+      "releasePatches": [
+        {},
+        {
+          "id": 702,
+          "tag_name": "untagged-abcdef0123456789abcd"
+        }
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "divergent-canonical-ref": {
+      "expected": "failure",
+      "releasePatches": [
+        {}
+      ],
+      "refs": {
+        "refs": {
+          "v1.0.1": {
+            "type": "commit",
+            "sha": "@OLD@"
+          }
+        },
+        "tags": {}
+      }
+    },
+    "release-api-error": {
+      "expected": "failure",
+      "transport": "release_api_error",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "refs-api-error": {
+      "expected": "failure",
+      "transport": "refs_api_error",
+      "releasePatches": [
+        {}
+      ],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    },
+    "no-candidate-action": {
+      "expected": "action",
+      "releasePatches": [],
+      "refs": {
+        "refs": {},
+        "tags": {}
+      }
+    }
+  }
+}

@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       release_id:
-        description: Numeric GitHub draft release ID to audit and quarantine
+        description: Numeric GitHub draft release ID to audit read-only
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
   packages: read
 
 jobs:
-  quarantine:
+  audit:
     if: github.ref == 'refs/heads/master'
     concurrency:
       group: backend-ghcr-recovery-${{ github.repository }}-${{ inputs.release_id }}
@@ -28,7 +28,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Resolve and verify the numeric draft
+      - name: Resolve and verify the numeric draft read-only
         id: descriptor
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,7 +37,7 @@ jobs:
           [[ "$REQUESTED_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
           git fetch --no-tags origin \
             '+refs/heads/dev:refs/remotes/origin/dev'
-          descriptor=$(scripts/resolve-release-descriptor.sh recover \
+          descriptor=$(scripts/resolve-release-descriptor.sh pre-action \
             --repository "$GITHUB_REPOSITORY" \
             --dev-ref origin/dev)
           value() {
@@ -46,19 +46,9 @@ jobs:
               print
             }' <<<"$descriptor"
           }
-          test "$(value active)" = true
+          test "$(value route)" = recovery
           test "$(value release_id)" = "$REQUESTED_RELEASE_ID"
-          verified=$(scripts/resolve-release-descriptor.sh verify \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$(value release_id)" \
-            --tag "$(value tag)" \
-            --version "$(value version)" \
-            --source-sha "$(value source_sha)" \
-            --asset-inventory-fingerprint \
-              "$(value asset_inventory_fingerprint)")
-          printf '%s\n' "$verified"
-          printf '%s\n' "$verified" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$descriptor" >> "$GITHUB_OUTPUT"
       - name: Set up read-only registry inspection
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       - name: Authenticate for read-only inspection
@@ -67,7 +57,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Audit and quarantine without registry mutation
+      - name: Collect read-only recovery evidence
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ steps.descriptor.outputs.release_id }}
@@ -85,26 +75,16 @@ jobs:
           status=$?
           set -e
           printf '%s\n' "$result"
-          if [ "$status" -ne 42 ]; then
-            echo "audit found no quarantinable partial or divergent registry state" >&2
-            exit 1
+          if [ "$status" -eq 42 ]; then
+            test -s "$quarantine"
+            jq -e '.registryWrites == 0' "$quarantine" >/dev/null
+            jq -c . "$quarantine" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          else
+            printf '%s\n' "$result" >> "$GITHUB_STEP_SUMMARY"
           fi
-          test -s "$quarantine"
-          jq -e '.registryWrites == 0' "$quarantine" >/dev/null
-          scripts/revalidate-release-mutation.sh \
-            --repository "$GITHUB_REPOSITORY" \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --repo-dir . \
-            --dev-ref origin/dev
-          jq -n --rawfile body "$quarantine" \
-            '{draft: true, body: $body}' |
-            gh api --method PATCH \
-              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-              --input - >/dev/null
+          echo "read-only recovery audit complete; no release mutation was attempted"
       - name: Logout from GHCR
         if: always()
         run: docker logout ghcr.io >/dev/null 2>&1 || true

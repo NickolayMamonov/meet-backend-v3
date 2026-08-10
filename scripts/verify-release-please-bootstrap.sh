@@ -60,8 +60,11 @@ command -v jq >/dev/null 2>&1 ||
 for file in "$CONFIG" "$MANIFEST" "$VERSION_FILE" "$CHANGELOG" "$RELEASE_WORKFLOW"; do
   require_file "$file"
 done
+require_file scripts/verify-release-resume-state.sh
+require_file scripts/verify-ghcr-package-inventory.sh
 
 WORKFLOW_TEXT=$(sed 's/\r$//' "$RELEASE_WORKFLOW")
+RESUME_TEXT=$(sed 's/\r$//' scripts/verify-release-resume-state.sh)
 
 jq empty "$CONFIG" "$MANIFEST" "$VERSION_FILE" >/dev/null ||
   fail "release configuration or bootstrap state is not valid JSON"
@@ -194,6 +197,12 @@ require_text 'config-file: release-please-config.json'
 require_text 'scripts/resolve-release-descriptor.sh recover'
 require_text 'scripts/resolve-release-descriptor.sh created'
 require_text 'scripts/resolve-release-descriptor.sh verify'
+require_text 'scripts/resolve-release-descriptor.sh pre-action'
+require_text 'if: steps.pre_action.outputs.route == '\''action'\'''
+require_text 'mutate-release-metadata.sh canonicalize'
+require_text 'mutate-release-metadata.sh publish'
+grep -Fq 'verify-ghcr-package-inventory.sh' <<<"$RESUME_TEXT" ||
+  fail "resume verifier is missing GHCR inventory closure"
 require_text 'if: needs.release.outputs.active == '\''true'\'''
 require_text 'source_sha: ${{ needs.release.outputs.source_sha }}'
 require_text 'release_tag: ${{ needs.release.outputs.release_tag }}'
@@ -225,7 +234,22 @@ require_text 'SHA256SUMS'
 require_text '--image-ref "$IMAGE@$digest"'
 require_text 'repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID'
 require_text 'repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$file'
-require_text 'jq -n '\''{draft: false}'\'''
+require_text 'Fetch exact origin/dev authority'
+require_text 'Read-only publication verification'
+
+pre_action_block=$(sed -n '/id: pre_action/,/id: action_descriptor/p' \
+  <<<"$WORKFLOW_TEXT")
+action_descriptor_block=$(sed -n '/id: action_descriptor/,/^  gates:/p' \
+  <<<"$WORKFLOW_TEXT")
+if grep -Fq 'steps.release.outputs' <<<"$pre_action_block"; then
+  fail "pre-action recovery classification consumes action outputs"
+fi
+grep -Fq 'steps.release.outputs' <<<"$action_descriptor_block" ||
+  fail "action descriptor does not consume Release Please outputs on action route"
+action_guard_count=$( (grep -F "if: steps.pre_action.outputs.route == 'action'" \
+  <<<"$WORKFLOW_TEXT" || true) | wc -l | tr -d '[:space:]')
+[ "$action_guard_count" -eq 2 ] ||
+  fail "Release Please and action normalization do not share the exact action guard"
 
 if grep -Fq 'release_created == '\''true'\''' <<<"$WORKFLOW_TEXT"; then
   fail "publication must be gated by the verified descriptor, not Release Please output"
@@ -247,19 +271,42 @@ alias_count=$(grep -E '^[[:space:]]+--tag "\$IMAGE:' <<<"$WORKFLOW_TEXT" |
 [ "$alias_count" -eq 3 ] ||
   fail "release workflow must publish exactly three immutable aliases"
 
-patch_count=$(grep -F 'gh api --method PATCH' <<<"$WORKFLOW_TEXT" |
+patch_count=$( (grep -F 'gh api --method PATCH' <<<"$WORKFLOW_TEXT" || true) |
   wc -l | tr -d '[:space:]')
-revalidation_count=$(grep -F 'revalidate-release-mutation.sh' <<<"$WORKFLOW_TEXT" |
-  wc -l | tr -d '[:space:]')
-[ "$patch_count" -eq "$revalidation_count" ] ||
-  fail "every release PATCH must have a shared full-descriptor revalidation"
+[ "$patch_count" -eq 0 ] ||
+  fail "workflow must not contain a direct release PATCH"
 
-resume_line=$(grep -n 'verify-release-resume-state.sh' <<<"$WORKFLOW_TEXT" |
+checkout_line=$(grep -n 'Checkout reviewed release tooling' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+fetch_line=$(grep -n 'Fetch exact origin/dev authority' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+pre_action_line=$(grep -n 'Classify current authority before Release Please' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+action_line=$(grep -n 'uses: googleapis/release-please-action@' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+deep_verify_first=$(grep -n 'verify-release-resume-state.sh' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+canonicalize_line=$(grep -n 'mutate-release-metadata.sh canonicalize' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+deep_verify_second=$(grep -n 'verify-release-resume-state.sh' <<<"$WORKFLOW_TEXT" |
   tail -1 | cut -d: -f1)
-publish_line=$(grep -n "jq -n '{draft: false}'" <<<"$WORKFLOW_TEXT" |
+publish_line=$(grep -n 'mutate-release-metadata.sh publish' <<<"$WORKFLOW_TEXT" |
   tail -1 | cut -d: -f1)
-[ -n "$resume_line" ] && [ -n "$publish_line" ] && [ "$resume_line" -lt "$publish_line" ] ||
-  fail "publish-last ordering is not statically provable"
+readonly_line=$(grep -n 'Read-only publication verification' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+[ -n "$checkout_line" ] && [ -n "$fetch_line" ] &&
+  [ -n "$pre_action_line" ] && [ -n "$action_line" ] &&
+  [ -n "$deep_verify_first" ] && [ -n "$canonicalize_line" ] &&
+  [ -n "$deep_verify_second" ] && [ -n "$publish_line" ] &&
+  [ -n "$readonly_line" ] &&
+  [ "$checkout_line" -lt "$fetch_line" ] &&
+  [ "$fetch_line" -lt "$pre_action_line" ] &&
+  [ "$pre_action_line" -lt "$action_line" ] &&
+  [ "$deep_verify_first" -lt "$canonicalize_line" ] &&
+  [ "$canonicalize_line" -lt "$deep_verify_second" ] &&
+  [ "$deep_verify_second" -lt "$publish_line" ] &&
+  [ "$publish_line" -lt "$readonly_line" ] ||
+  fail "release ordering is not statically provable"
 
 CI_WORKFLOW=.github/workflows/ci.yml
 require_file "$CI_WORKFLOW"
@@ -284,13 +331,25 @@ require_file "$RECOVERY_WORKFLOW"
 RECOVERY_TEXT=$(sed 's/\r$//' "$RECOVERY_WORKFLOW")
 grep -Fq 'release_id:' <<<"$RECOVERY_TEXT" ||
   fail "manual recovery must accept a numeric release ID"
-grep -Fq 'scripts/resolve-release-descriptor.sh recover' <<<"$RECOVERY_TEXT" ||
+grep -Fq 'scripts/resolve-release-descriptor.sh pre-action' <<<"$RECOVERY_TEXT" ||
   fail "manual recovery must use the shared resolver"
-grep -Fq 'releases/$RELEASE_ID' <<<"$RECOVERY_TEXT" ||
-  fail "manual recovery mutation must be bound to the release ID"
+grep -Fq 'REQUESTED_RELEASE_ID' <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery must bind evidence to the requested numeric ID"
+grep -Fq 'test "$(value release_id)" = "$REQUESTED_RELEASE_ID"' \
+  <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery must prove the requested numeric ID"
 if grep -Fq 'refs/tags/$TAG' <<<"$RECOVERY_TEXT"; then
   fail "manual recovery must not require a draft tag ref"
 fi
+if grep -Fq 'gh api --method PATCH' <<<"$RECOVERY_TEXT"; then
+  fail "manual recovery must remain read-only"
+fi
+
+patch_callers=$( (grep -R -l --exclude='verify-release-please-bootstrap.sh' \
+  'gh api --method PATCH' scripts || true) |
+  sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+[ "$patch_callers" = "scripts/mutate-release-metadata.sh" ] ||
+  fail "release metadata PATCH has more than the sole helper caller"
 
 case "$STATE_MODE" in
   auto)
