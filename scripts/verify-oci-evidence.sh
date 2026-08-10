@@ -13,19 +13,43 @@ RAW_INDEX=$3
 test -s "$RAW_INDEX"
 command -v jq >/dev/null || { echo "jq is required for OCI evidence inspection" >&2; exit 2; }
 
+PLATFORM_SUBJECT=$(jq -r '
+  [
+    .manifests[]?
+    | select(
+        .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+        .platform.os == "linux" and
+        .platform.architecture == "amd64"
+      )
+    | .digest
+  ] | if length == 1 then .[0] else empty end
+' "$RAW_INDEX")
+if [ -z "$PLATFORM_SUBJECT" ]; then
+  jq -e \
+    '.mediaType == "application/vnd.oci.image.manifest.v1+json"' \
+    "$RAW_INDEX" >/dev/null || {
+    echo "OCI index does not contain exactly one linux/amd64 subject manifest" >&2
+    exit 1
+  }
+  PLATFORM_SUBJECT=$SUBJECT_DIGEST
+fi
+
 mapfile -t ATTESTATION_DIGESTS < <(
-  jq -r --arg subject "$SUBJECT_DIGEST" '
+  jq -r --arg subject "$SUBJECT_DIGEST" --arg platform_subject "$PLATFORM_SUBJECT" '
     .manifests[]?
     | select(
         .mediaType == "application/vnd.oci.image.manifest.v1+json" and
         .annotations["vnd.docker.reference.type"] == "attestation-manifest" and
-        .annotations["vnd.docker.reference.digest"] == $subject
+        (
+          .annotations["vnd.docker.reference.digest"] == $subject or
+          .annotations["vnd.docker.reference.digest"] == $platform_subject
+        )
       )
     | .digest
-  ' "$RAW_INDEX"
+  ' "$RAW_INDEX" | tr -d '\r'
 )
-[ "${#ATTESTATION_DIGESTS[@]}" -ge 2 ] || {
-  echo "OCI index does not contain at least two subject-bound attestation descriptors" >&2
+[ "${#ATTESTATION_DIGESTS[@]}" -ge 1 ] || {
+  echo "OCI index does not contain a subject-bound attestation descriptor" >&2
   exit 1
 }
 

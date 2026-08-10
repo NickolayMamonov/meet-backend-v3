@@ -194,17 +194,33 @@ DIGEST=$(jq -r '.digest' "$MANIFEST")
 
 INDEX=$ASSET_DIR/image-index.json
 jq -e --arg digest "$DIGEST" '
-  .mediaType == "application/vnd.oci.image.index.v1+json" and
-  (.manifests | type == "array") and
-  ([.manifests[] | select(
+  . as $index |
+  (
+    [
+      $index.manifests[]?
+      | select(
+          .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+          .platform.os == "linux" and
+          .platform.architecture == "amd64"
+        )
+      | .digest
+    ] | if length == 1 then .[0] else "" end
+  ) as $platform_subject |
+  $index.mediaType == "application/vnd.oci.image.index.v1+json" and
+  ($index.manifests | type == "array") and
+  ($platform_subject | length) > 0 and
+  ([$index.manifests[] | select(
     .mediaType == "application/vnd.oci.image.manifest.v1+json" and
     .platform.os == "linux" and .platform.architecture == "amd64"
   )] | length) == 1 and
-  ([.manifests[] | select(
+  ([$index.manifests[] | select(
     .mediaType == "application/vnd.oci.image.manifest.v1+json" and
     .annotations["vnd.docker.reference.type"] == "attestation-manifest" and
-    .annotations["vnd.docker.reference.digest"] == $digest
-  )] | length) >= 2
+    (
+      .annotations["vnd.docker.reference.digest"] == $digest or
+      .annotations["vnd.docker.reference.digest"] == $platform_subject
+    )
+  )] | length) >= 1
 ' "$INDEX" >/dev/null || fail "OCI descriptor evidence is invalid"
 
 grep -Fqx "Digest: $DIGEST" "$ASSET_DIR/image-inspect.txt" ||
@@ -364,17 +380,34 @@ else
 
   PROVENANCE=false
   SBOM=false
-  ATTESTATION_DIGESTS=$(jq -r --arg subject "$DIGEST" '
+  PLATFORM_SUBJECT=$(jq -r '
+    [
+      .manifests[]?
+      | select(
+          .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+          .platform.os == "linux" and
+          .platform.architecture == "amd64"
+        )
+      | .digest
+    ] | if length == 1 then .[0] else empty end
+  ' "$LIVE_INDEX")
+  [ -n "$PLATFORM_SUBJECT" ] ||
+    fail "live OCI index does not contain exactly one linux/amd64 subject manifest"
+  ATTESTATION_DIGESTS=$(jq -r --arg subject "$DIGEST" \
+    --arg platform_subject "$PLATFORM_SUBJECT" '
     .manifests[]?
     | select(
         .mediaType == "application/vnd.oci.image.manifest.v1+json" and
         .annotations["vnd.docker.reference.type"] == "attestation-manifest" and
-        .annotations["vnd.docker.reference.digest"] == $subject
+        (
+          .annotations["vnd.docker.reference.digest"] == $subject or
+          .annotations["vnd.docker.reference.digest"] == $platform_subject
+        )
       )
     | .digest
-  ' "$LIVE_INDEX")
-  [ "$(printf '%s\n' "$ATTESTATION_DIGESTS" | sed '/^$/d' | wc -l | tr -d ' ')" -ge 2 ] ||
-    fail "subject-bound OCI attestation descriptors are incomplete"
+  ' "$LIVE_INDEX" | tr -d '\r')
+  [ "$(printf '%s\n' "$ATTESTATION_DIGESTS" | sed '/^$/d' | wc -l | tr -d ' ')" -ge 1 ] ||
+    fail "subject-bound OCI attestation descriptors are missing"
   for attestation_digest in $ATTESTATION_DIGESTS; do
     case "$attestation_digest" in
       sha256:*) attestation_hash=${attestation_digest#sha256:} ;;

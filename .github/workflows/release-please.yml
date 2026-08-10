@@ -164,6 +164,7 @@ jobs:
           printf '%s\n' "$result"
           state=$(awk -F= '/^state=/{print $2}' <<<"$result")
           latest=$(awk -F= '/^latest=/{print $2}' <<<"$result")
+          registry_digest=$(awk -F= '/^digest=/{print $2}' <<<"$result")
           if [ "$status" -eq 42 ]; then
             test -s "$quarantine"
             route=quarantine
@@ -177,6 +178,11 @@ jobs:
                [ "$state" = complete ] &&
                [ "$latest" = absent ]; then
             route=resume
+          elif [ "$ASSET_INVENTORY_KIND" = empty ] &&
+               [ "$state" = complete ] &&
+               [ "$latest" = absent ] &&
+               [[ "$registry_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            route=resume-registry
           else
             jq -n \
               --arg assets "$ASSET_INVENTORY_KIND" \
@@ -191,6 +197,7 @@ jobs:
             route=quarantine
           fi
           echo "route=$route" >> "$GITHUB_OUTPUT"
+          echo "registry_digest=$registry_digest" >> "$GITHUB_OUTPUT"
           echo "quarantine=$quarantine" >> "$GITHUB_OUTPUT"
       - name: Quarantine inadmissible state by numeric release ID
         if: steps.admission.outputs.route == 'quarantine'
@@ -275,30 +282,37 @@ jobs:
               --input - >/dev/null
           echo "registry changed after lease; no repair is attempted" >&2
           exit 1
-      - name: Build and publish exactly three aliases
-        if: steps.admission.outputs.route == 'fresh'
+      - name: Build or resume exactly three aliases
+        if: steps.admission.outputs.route == 'fresh' ||
+            steps.admission.outputs.route == 'resume-registry'
         id: publish-image
         working-directory: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLICATION_ROUTE: ${{ steps.admission.outputs.route }}
+          REGISTRY_DIGEST: ${{ steps.admission.outputs.registry_digest }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(jq -r '.version' version.json)" = "$VERSION"
-          docker buildx build \
-            --platform linux/amd64 \
-            --provenance=true \
-            --sbom=true \
-            --push \
-            --tag "$IMAGE:$TAG" \
-            --tag "$IMAGE:$VERSION" \
-            --tag "$IMAGE:sha-$SOURCE_SHA" \
-            --build-arg "BACKEND_VERSION=$VERSION" \
-            --build-arg "BACKEND_REVISION=$SOURCE_SHA" \
-            --metadata-file "$RUNNER_TEMP/release/build-metadata.json" \
-            .
-          digest=$(jq -r '."containerimage.digest"' \
-            "$RUNNER_TEMP/release/build-metadata.json")
+          if [ "$PUBLICATION_ROUTE" = fresh ]; then
+            docker buildx build \
+              --platform linux/amd64 \
+              --provenance=true \
+              --sbom=true \
+              --push \
+              --tag "$IMAGE:$TAG" \
+              --tag "$IMAGE:$VERSION" \
+              --tag "$IMAGE:sha-$SOURCE_SHA" \
+              --build-arg "BACKEND_VERSION=$VERSION" \
+              --build-arg "BACKEND_REVISION=$SOURCE_SHA" \
+              --metadata-file "$RUNNER_TEMP/release/build-metadata.json" \
+              .
+            digest=$(jq -r '."containerimage.digest"' \
+              "$RUNNER_TEMP/release/build-metadata.json")
+          else
+            digest=$REGISTRY_DIGEST
+          fi
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           docker pull "$IMAGE@$digest"
@@ -389,15 +403,17 @@ jobs:
             image-index.json \
             image-inspect.txt > SHA256SUMS
       - name: Create artifact attestation
-        if: steps.admission.outputs.route == 'fresh'
+        if: steps.admission.outputs.route == 'fresh' ||
+            steps.admission.outputs.route == 'resume-registry'
         id: attestation
         uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.publish-image.outputs.digest }}
           push-to-registry: true
-      - name: Verify fresh attestation and checksums
-        if: steps.admission.outputs.route == 'fresh'
+      - name: Verify attestation and checksums
+        if: steps.admission.outputs.route == 'fresh' ||
+            steps.admission.outputs.route == 'resume-registry'
         working-directory: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -408,7 +424,8 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
           sha256sum -c SHA256SUMS
       - name: Upload the exact evidence set by numeric release ID
-        if: steps.admission.outputs.route == 'fresh'
+        if: steps.admission.outputs.route == 'fresh' ||
+            steps.admission.outputs.route == 'resume-registry'
         working-directory: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
