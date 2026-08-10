@@ -64,6 +64,15 @@ expect_failure 2 "$HELPER" fingerprint --allow-empty --allow-empty
 expect_failure 2 "$HELPER" fingerprint --release-file
 expect_failure 2 "$HELPER" fingerprint --release-file --allow-empty
 expect_failure 2 "$HELPER" fingerprint positional
+set +e
+"$HELPER" fingerprint --release-file "" <"$FIXTURE" \
+  >"$TMP/stdout" 2>"$TMP/stderr"
+status=$?
+set -e
+[ "$status" -eq 2 ]
+[ ! -s "$TMP/stdout" ]
+[ -s "$TMP/stderr" ]
+! grep -Eq '/|unexpected|secret|Authorization' "$TMP/stderr"
 expect_failure 1 "$HELPER" fingerprint --release-file "$TMP/missing.json"
 mkdir "$TMP/directory"
 expect_failure 1 "$HELPER" fingerprint --release-file "$TMP/directory"

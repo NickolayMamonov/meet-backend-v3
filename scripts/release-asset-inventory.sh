@@ -30,6 +30,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --release-file)
       [ "$#" -ge 2 ] || usage
+      [ -n "$2" ] || usage
       case "$2" in --*) usage ;; esac
       [ -z "$RELEASE_FILE" ] || usage
       RELEASE_FILE=$2
