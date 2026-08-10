@@ -224,8 +224,23 @@ grep -Fq 'verify-release-tag-ref.sh' <<<"$WORKFLOW_TEXT" ||
   fail "release workflow is missing annotated/lightweight tag ref verification"
 grep -Fq -- '--observed-tag "$OBSERVED_TAG"' <<<"$WORKFLOW_TEXT" ||
   fail "recovery canonicalization does not bind the observed placeholder tag"
+grep -Fq 'ORIGINAL_ASSET_INVENTORY_FINGERPRINT' <<<"$WORKFLOW_TEXT" ||
+  fail "release workflow does not preserve the original asset fingerprint"
+grep -Fq 'POST_ACTION_ASSET_INVENTORY_FINGERPRINT' <<<"$WORKFLOW_TEXT" ||
+  fail "release workflow does not bind the post-action asset fingerprint"
+grep -Fq 'test "$POST_ACTION_ASSET_INVENTORY_FINGERPRINT" =' \
+  <<<"$WORKFLOW_TEXT" ||
+  fail "release workflow does not retain the post-action fingerprint expectation"
+grep -Fq 'test "$fingerprint" = "$ASSET_INVENTORY_FINGERPRINT"' \
+  <<<"$WORKFLOW_TEXT" ||
+  fail "release workflow does not compare final assets to the publish expectation"
+if grep -Fq -- '--expected-fingerprint "$fingerprint"' <<<"$WORKFLOW_TEXT"; then
+  fail "release workflow re-adopts a freshly recomputed fingerprint for publication"
+fi
 grep -Fq 'observed-tag' <<<"$METADATA_TEST_TEXT" ||
   fail "metadata mutation fixtures are missing exact placeholder-tag binding"
+grep -Fq 'same-name asset replacement' <<<"$METADATA_TEST_TEXT" ||
+  fail "metadata mutation fixtures are missing same-name asset drift coverage"
 grep -Fq 'depth=' <<<"$TAG_REF_TEXT" ||
   fail "tag ref verifier is missing annotated tag peeling"
 grep -Fq 'SUBJECT_MARKER' <<<"$INVENTORY_TEXT" ||

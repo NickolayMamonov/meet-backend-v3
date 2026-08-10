@@ -85,6 +85,7 @@ chmod +x "$MOCK_BIN/gh"
 export RELEASE_FILE PATCH_LOG
 export PATH="$MOCK_BIN:$PATH"
 touch "$PATCH_LOG"
+cp "$RELEASE_FILE" "$TMP/release-original.json"
 
 fingerprint=$(
   jq -c '[.assets[] | {
@@ -117,6 +118,22 @@ if "$MUTATOR" canonicalize "${common[@]}" \
   exit 1
 fi
 [ "$(wc -l <"$PATCH_LOG" | tr -d ' ')" -eq "$patch_count" ]
+cp "$TMP/release-original.json" "$RELEASE_FILE"
+
+jq '
+  .assets[0].id = 1801 |
+  .assets[0].size = 901 |
+  .assets[0].url = "https://api.invalid/replaced-with-same-name"
+' "$RELEASE_FILE" >"$RELEASE_FILE.next"
+mv "$RELEASE_FILE.next" "$RELEASE_FILE"
+if "$MUTATOR" canonicalize "${common[@]}" \
+    --observed-tag untagged-0123456789abcdef0123 >/dev/null 2>&1; then
+  echo "same-name asset replacement unexpectedly mutated a release" >&2
+  exit 1
+fi
+[ "$(wc -l <"$PATCH_LOG" | tr -d ' ')" -eq "$patch_count" ]
+cp "$TMP/release-original.json" "$RELEASE_FILE"
+
 jq --arg tag "untagged-0123456789abcdef0123" '
   .tag_name = $tag |
   .name = $tag
@@ -149,4 +166,4 @@ if "$MUTATOR" publish "${common[@]}" >/dev/null 2>&1; then
   exit 1
 fi
 [ "$(wc -l <"$PATCH_LOG" | tr -d ' ')" -eq "$patch_count" ]
-echo "release metadata mutation fixtures passed: full payload, notes, postconditions, zero-write drift"
+echo "release metadata mutation fixtures passed: full payload, notes, postconditions, zero-write suffix and same-name asset drift"
