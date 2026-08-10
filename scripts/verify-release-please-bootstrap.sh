@@ -266,6 +266,8 @@ require_file "$CI_WORKFLOW"
 CI_TEXT=$(sed 's/\r$//' "$CI_WORKFLOW")
 grep -Fq 'test-release-resume-state.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the release resume fixtures"
+grep -Fq 'test-release-mutation-revalidation.sh' <<<"$CI_TEXT" ||
+  fail "reusable CI does not run the mutation revalidation regression"
 for input in source_sha release_tag release_version release_id; do
   grep -Eq "^[[:space:]]+$input:" <<<"$CI_TEXT" ||
     fail "reusable CI is missing additive input: $input"
