@@ -1,0 +1,1 @@
+{"mutation":"corrupt-asset","expected":"reject checksum-corrupt content"}

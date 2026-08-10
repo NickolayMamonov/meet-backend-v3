@@ -1,0 +1,13 @@
+{
+  "id": 367640510,
+  "tag_name": "v1.0.1",
+  "target_commitish": "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc",
+  "draft": true,
+  "published_at": null,
+  "assets": [
+    {"id": 101, "name": "release-manifest.json"},
+    {"id": 102, "name": "image-index.json"},
+    {"id": 103, "name": "image-inspect.txt"},
+    {"id": 104, "name": "SHA256SUMS"}
+  ]
+}

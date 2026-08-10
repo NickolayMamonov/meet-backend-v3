@@ -1,10 +1,12 @@
 # Backend release publishing and production gate
 
-The backend has one independent SemVer authority in `version.json`. Gradle,
-Spring Boot build metadata, OpenAPI metadata, the OCI version label, Release
-Please, and the release manifest must agree on the same
-`MAJOR.MINOR.PATCH` tuple. The source identity is the exact lowercase
-40-character commit SHA.
+The backend has one independent SemVer authority in the agreeing
+`.release-please-manifest.json` and `version.json` files at the exact fetched
+`origin/dev` commit. Gradle, Spring Boot build metadata, OpenAPI metadata, the
+OCI version label, Release Please, and the release manifest must agree on the
+same `MAJOR.MINOR.PATCH` tuple. The source identity is the exact lowercase
+40-character commit SHA established by the unique first-parent commit that
+changed both authority files to that version.
 
 ## Release flow
 
@@ -16,18 +18,68 @@ Please PR and create its draft release. Record its owner, repository
 restriction, expiration, and rotation date in the operator's credential audit;
 never put the value in this repository or in logs.
 
-Merging the release PR causes the same `release-please.yml` run to receive
-`release_created=true`. That output is the only normal publication authority.
-The publication job reruns CI, validates the exact tag/source SHA/version
-tuple, builds only `linux/amd64`, and publishes exactly:
+Release Please remains the sole creator and tag authority. Each run first
+executes `scripts/resolve-release-descriptor.sh`, which recomputes
+`authority_version`, `authority_tag`, and `authority_source_sha` from exact
+`origin/dev` state. It finds the unique first-parent boundary that changed
+both authority files and proves every later first-parent commit retains the
+pair. Disagreement, missing or ambiguous boundaries, post-boundary drift, and
+current/future relevant conflicts fail closed.
+
+When Release Please creates no new release, the resolver can recover exactly
+one draft only when its numeric release ID, canonical tag/version,
+target/source SHA, draft/unpublished state, source files,
+absent-or-source-identical tag, and asset metadata all match that current
+authority tuple. A lower-version draft is ignored when its target predates the
+current boundary, even if it remains reachable from `dev`. Zero unrelated
+candidates is a successful no-publication run; duplicate current drafts and
+relevant-but-unverifiable drafts are errors.
+
+The publisher receives the immutable descriptor and reruns CI against the
+exact `source_sha`; the expected release tag is validated independently and is
+not checked out before publication. Current workflow tooling is checked out
+separately from the exact historical product source. The image build, if
+needed, runs only from the source checkout and publishes exactly:
 
 * `vMAJOR.MINOR.PATCH`
 * `MAJOR.MINOR.PATCH`
 * `sha-<full-source-sha>`
 
-There is no `latest` alias. The image digest is deployment authority. The
-release manifest and `SHA256SUMS` are attached before the draft is made public;
-the release publish operation is the final mutation.
+There is no `latest` alias. The image digest is deployment authority. Every
+release mutation is addressed by the numeric GitHub release ID. The release
+manifest, image evidence, and `SHA256SUMS` are attached and re-read before the
+draft is made public; the numeric `draft=false` update is the final mutation.
+
+### Resume and quarantine state machine
+
+The resolver is metadata-only. Its asset state is either `empty` or
+`complete_unverified`, with a deterministic inventory fingerprint. A
+non-empty metadata inventory never authorizes a build, registry write, asset
+upload, or publication.
+
+The publisher owns the only deep resume admission. For
+`complete_unverified`, it downloads every asset by numeric asset ID into a
+temporary directory, requires exactly `release-manifest.json`,
+`image-index.json`, `image-inspect.txt`, and `SHA256SUMS`, rejects extra,
+duplicate, malformed, or path-traversal checksum entries, and verifies every
+byte. It then proves release ID/tag/version/source/target identity, one digest
+for exactly `vVERSION`, `VERSION`, and `sha-SOURCE_SHA`, no `latest`, OCI
+`linux/amd64` identity and readiness, subject-bound provenance/SBOM, and
+GitHub attestation. Only this read-only sequence emits the ephemeral
+`resume_admission=verified` value.
+
+For `empty`, the publisher requires an empty registry, acquires the existing
+create-only lease, repeats the empty admission, and builds. Partial,
+divergent, identity-mismatched, raced, or `latest` registry state and any
+asset/content/evidence failure leave the release draft in place. Quarantine
+notes may be attached to the same numeric release ID, but the workflow never
+repairs, replaces, retags, deletes, or pre-populates registry state.
+
+All pre-write and pre-publication boundaries re-fetch and compare the complete
+descriptor and authority tuple from `origin/dev`. Evidence upload is numeric
+ID-bound, and publication occurs only after the final deep read-only
+verification. The manual `release-recovery.yml` workflow remains an audit and
+quarantine path; it does not own automatic recovery or publication.
 
 GHCR does not provide a compare-and-swap primitive in this publication flow.
 The accepted admission mechanism is therefore explicit and two-layered:

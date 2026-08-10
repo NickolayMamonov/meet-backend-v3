@@ -1,0 +1,5 @@
+Digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Platform: linux/amd64
+ org.opencontainers.image.version: 1.0.1
+ org.opencontainers.image.revision: d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
+ org.opencontainers.image.source: https://github.com/NickolayMamonov/meet-backend-v3

@@ -1,0 +1,20 @@
+{
+  "releaseId": 367640510,
+  "targetCommitish": "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc",
+  "version": "1.0.1",
+  "tag": "v1.0.1",
+  "sourceSha": "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc",
+  "image": "ghcr.io/nickolaymamonov/meet-backend-v3",
+  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "aliases": [
+    "v1.0.1",
+    "1.0.1",
+    "sha-d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc"
+  ],
+  "platform": "linux/amd64",
+  "publicationPolicy": "exactly-three-aliases-publish-last",
+  "provenance": true,
+  "sbom": true,
+  "artifactAttestation": true,
+  "evidence": ["image-index.json", "image-inspect.txt"]
+}

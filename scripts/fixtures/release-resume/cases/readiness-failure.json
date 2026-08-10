@@ -1,0 +1,1 @@
+{"mutation":"readiness-failure","expected":"reject an image without writable upload readiness"}
