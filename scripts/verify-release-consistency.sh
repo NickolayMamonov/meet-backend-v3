@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <version> <source-sha> [--tag tag] [--image image] [--manifest path]" >&2
+  echo "usage: $0 <version> <source-sha> [--tag tag] [--image image] [--image-ref image-ref] [--manifest path]" >&2
   exit 2
 }
 
@@ -12,11 +12,13 @@ SOURCE_SHA=$2
 shift 2
 TAG=
 IMAGE=
+IMAGE_REF=
 MANIFEST=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --tag) [ "$#" -ge 2 ] || usage; TAG=$2; shift 2 ;;
     --image) [ "$#" -ge 2 ] || usage; IMAGE=$2; shift 2 ;;
+    --image-ref) [ "$#" -ge 2 ] || usage; IMAGE_REF=$2; shift 2 ;;
     --manifest) [ "$#" -ge 2 ] || usage; MANIFEST=$2; shift 2 ;;
     *) usage ;;
   esac
@@ -44,14 +46,15 @@ if [ -n "$TAG" ]; then
 fi
 
 if [ -n "$IMAGE" ]; then
-  image_version=$(docker image inspect "$IMAGE" \
+  IMAGE_REF=${IMAGE_REF:-$IMAGE}
+  image_version=$(docker image inspect "$IMAGE_REF" \
     --format '{{index .Config.Labels "org.opencontainers.image.version"}}')
-  image_revision=$(docker image inspect "$IMAGE" \
+  image_revision=$(docker image inspect "$IMAGE_REF" \
     --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
-  image_source=$(docker image inspect "$IMAGE" \
+  image_source=$(docker image inspect "$IMAGE_REF" \
     --format '{{index .Config.Labels "org.opencontainers.image.source"}}')
-  image_platform=$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')
-  image_user=$(docker image inspect "$IMAGE" --format '{{.Config.User}}')
+  image_platform=$(docker image inspect "$IMAGE_REF" --format '{{.Os}}/{{.Architecture}}')
+  image_user=$(docker image inspect "$IMAGE_REF" --format '{{.Config.User}}')
   test "$image_version" = "$VERSION"
   test "$image_revision" = "$SOURCE_SHA"
   test "$image_source" = "https://github.com/NickolayMamonov/meet-backend-v3"
