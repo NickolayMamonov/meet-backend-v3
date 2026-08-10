@@ -84,6 +84,7 @@ EOF
 chmod +x "$MOCK_BIN/gh"
 export RELEASE_FILE PATCH_LOG
 export PATH="$MOCK_BIN:$PATH"
+touch "$PATCH_LOG"
 
 fingerprint=$(
   jq -c '[.assets[] | {
@@ -104,7 +105,26 @@ common=(
   --release-file "$RELEASE_FILE"
 )
 
-"$MUTATOR" canonicalize "${common[@]}" >/dev/null
+patch_count=$(wc -l <"$PATCH_LOG" | tr -d ' ')
+jq '
+  .tag_name = "untagged-fedcba9876543210fedc" |
+  .name = .tag_name
+' "$RELEASE_FILE" >"$RELEASE_FILE.next"
+mv "$RELEASE_FILE.next" "$RELEASE_FILE"
+if "$MUTATOR" canonicalize "${common[@]}" \
+    --observed-tag untagged-0123456789abcdef0123 >/dev/null 2>&1; then
+  echo "placeholder suffix drift unexpectedly mutated a release" >&2
+  exit 1
+fi
+[ "$(wc -l <"$PATCH_LOG" | tr -d ' ')" -eq "$patch_count" ]
+jq --arg tag "untagged-0123456789abcdef0123" '
+  .tag_name = $tag |
+  .name = $tag
+' "$RELEASE_FILE" >"$RELEASE_FILE.next"
+mv "$RELEASE_FILE.next" "$RELEASE_FILE"
+
+"$MUTATOR" canonicalize "${common[@]}" \
+  --observed-tag untagged-0123456789abcdef0123 >/dev/null
 head -n1 "$PATCH_LOG" | jq -e '
   .tag_name == "v1.0.1" and
   .target_commitish == "'"$SOURCE_SHA"'" and

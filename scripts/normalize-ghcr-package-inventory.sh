@@ -47,8 +47,10 @@ jq -e '
   all(.[][];
     type == "object" and
     (.name | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
-    ((.metadata.container.tags // []) |
-      type == "array" and all(.[]; type == "string"))
+    (.metadata | type == "object") and
+    (.metadata.container | type == "object") and
+    (.metadata.container.tags | type == "array" and
+      all(.[]; type == "string"))
   )
 ' "$PACKAGE_VERSIONS_FILE" >/dev/null ||
   fail "GitHub package API response is not an array of version pages"
@@ -60,17 +62,17 @@ normalized=$(jq --arg digest "$DIGEST" '
     error("expected exactly one package version for the image digest")
   else
     [$versions[] | select(.name == $digest) |
-      (.metadata.container.tags // [])] | add as $aliases |
+      .metadata.container.tags] | add as $aliases |
     {
       digest: $digest,
       aliases: (reduce ($aliases // [])[] as $alias
         ({}; .[$alias] = $digest)),
-      latest: (if any($versions[]; (.metadata.container.tags // []) |
+      latest: (if any($versions[]; .metadata.container.tags |
         index("latest")) then $digest else null end),
       versions: [$versions[] | {
         id: .id,
         digest: .name,
-        tags: (.metadata.container.tags // [])
+        tags: .metadata.container.tags
       }]
     }
   end

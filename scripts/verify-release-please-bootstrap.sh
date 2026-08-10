@@ -66,12 +66,17 @@ require_file scripts/verify-oci-referrer-closure.sh
 require_file scripts/test-oci-referrer-closure.sh
 require_file scripts/normalize-ghcr-package-inventory.sh
 require_file scripts/test-ghcr-package-normalization.sh
+require_file scripts/verify-release-tag-ref.sh
+require_file scripts/test-release-tag-ref.sh
+require_file scripts/test-release-metadata-mutation.sh
 
 WORKFLOW_TEXT=$(sed 's/\r$//' "$RELEASE_WORKFLOW")
 RESUME_TEXT=$(sed 's/\r$//' scripts/verify-release-resume-state.sh)
 CLOSURE_TEXT=$(sed 's/\r$//' scripts/verify-oci-referrer-closure.sh)
 INVENTORY_TEXT=$(sed 's/\r$//' scripts/verify-ghcr-package-inventory.sh)
 INVENTORY_TEST_TEXT=$(sed 's/\r$//' scripts/test-ghcr-package-inventory.sh)
+TAG_REF_TEXT=$(sed 's/\r$//' scripts/verify-release-tag-ref.sh)
+METADATA_TEST_TEXT=$(sed 's/\r$//' scripts/test-release-metadata-mutation.sh)
 PRE_ACTION_FIXTURES=$(sed 's/\r$//' scripts/fixtures/release-preaction-routing/scenarios.json)
 
 jq empty "$CONFIG" "$MANIFEST" "$VERSION_FILE" >/dev/null ||
@@ -215,6 +220,14 @@ grep -Fq 'verify-oci-referrer-closure.sh' <<<"$RESUME_TEXT" ||
   fail "resume verifier is missing subject-bound OCI referrer closure"
 grep -Fq 'normalize-ghcr-package-inventory.sh' <<<"$RESUME_TEXT" ||
   fail "resume verifier is missing page-array package normalization"
+grep -Fq 'verify-release-tag-ref.sh' <<<"$WORKFLOW_TEXT" ||
+  fail "release workflow is missing annotated/lightweight tag ref verification"
+grep -Fq -- '--observed-tag "$OBSERVED_TAG"' <<<"$WORKFLOW_TEXT" ||
+  fail "recovery canonicalization does not bind the observed placeholder tag"
+grep -Fq 'observed-tag' <<<"$METADATA_TEST_TEXT" ||
+  fail "metadata mutation fixtures are missing exact placeholder-tag binding"
+grep -Fq 'depth=' <<<"$TAG_REF_TEXT" ||
+  fail "tag ref verifier is missing annotated tag peeling"
 grep -Fq 'SUBJECT_MARKER' <<<"$INVENTORY_TEXT" ||
   fail "GHCR inventory verifier is missing subject-marker uniqueness"
 grep -Fq 'duplicate-subject-marker' <<<"$INVENTORY_TEST_TEXT" ||

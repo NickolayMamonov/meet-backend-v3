@@ -203,6 +203,7 @@ jobs:
           "$TOOLING_SCRIPTS/test-ghcr-package-normalization.sh"
           "$TOOLING_SCRIPTS/test-oci-referrer-closure.sh"
           "$TOOLING_SCRIPTS/test-release-pr-fingerprint.sh"
+          "$TOOLING_SCRIPTS/test-release-tag-ref.sh"
       - name: Verify Release Please state
         env:
           RELEASE_REF: ${{ inputs.source_sha == '' && inputs.ref || '' }}

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 canonicalize|publish --repository owner/repo --release-id ID --version X.Y.Z --tag vX.Y.Z --source-sha SHA --target SHA --expected-fingerprint SHA256 --repo-dir PATH [--release-file PATH]" >&2
+  echo "usage: $0 canonicalize|publish --repository owner/repo --release-id ID --version X.Y.Z --tag vX.Y.Z --source-sha SHA --target SHA --expected-fingerprint SHA256 --repo-dir PATH [--observed-tag untagged-XXXXXXXXXXXXXXXXXXXX] [--release-file PATH]" >&2
   exit 2
 }
 
@@ -25,6 +25,7 @@ TARGET=
 EXPECTED_FINGERPRINT=
 REPO_DIR=.
 RELEASE_FILE=
+OBSERVED_TAG=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -41,6 +42,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --repo-dir) [ "$#" -ge 2 ] || usage; REPO_DIR=$2; shift 2 ;;
     --release-file) [ "$#" -ge 2 ] || usage; RELEASE_FILE=$2; shift 2 ;;
+    --observed-tag) [ "$#" -ge 2 ] || usage; OBSERVED_TAG=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -55,6 +57,9 @@ command -v gh >/dev/null 2>&1 || fail "gh is required"
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || usage
 [ "$TARGET" = "$SOURCE_SHA" ] || usage
 [[ "$EXPECTED_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || usage
+if [ "$OP" = canonicalize ]; then
+  [[ "$OBSERVED_TAG" =~ ^untagged-[0-9a-f]{20}$ ]] || usage
+fi
 git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   fail "repo-dir is not a Git work tree"
 
@@ -120,7 +125,8 @@ if [ -z "$RELEASE_FILE" ]; then
     }
     [ "$(value route)" = recovery ] &&
       [ "$(value observed_state)" = generated_placeholder ] &&
-      [ "$(value release_id)" = "$RELEASE_ID" ] ||
+      [ "$(value release_id)" = "$RELEASE_ID" ] &&
+      [ "$(value observed_tag)" = "$OBSERVED_TAG" ] ||
       fail "generated placeholder authority changed before canonicalization"
   else
     "$resolver" verify \
@@ -144,17 +150,19 @@ jq -e \
   --arg tag "$TAG" \
   --arg target "$TARGET" \
   --arg fingerprint "$EXPECTED_FINGERPRINT" \
+  --arg observed_tag "$OBSERVED_TAG" \
   --arg op "$OP" '
     type == "object" and
     .id == $id and
-    (.tag_name == $tag or (.tag_name | test("^untagged-[0-9a-f]{20}$"))) and
+    (($op == "canonicalize" and .tag_name == $observed_tag) or
+     ($op == "publish" and .tag_name == $tag)) and
     .target_commitish == $target and
     .draft == true and
     .prerelease == false and
     .published_at == null and
     ($fingerprint | length == 64) and
-    (($op == "canonicalize" and (.tag_name | test("^untagged-[0-9a-f]{20}$"))) or
-     ($op == "publish" and .tag_name == $tag))
+    (($op == "canonicalize" and ($observed_tag | test("^untagged-[0-9a-f]{20}$"))) or
+     ($op == "publish"))
   ' <<<"$before" >/dev/null ||
   fail "release precondition is not the expected same-ID state"
 if [ "$before_fingerprint" != "$EXPECTED_FINGERPRINT" ]; then

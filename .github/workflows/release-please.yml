@@ -553,10 +553,10 @@ jobs:
               .draft == false and
               .published_at != null
             ' <<<"$published" >/dev/null
-          ref=$(gh api \
-            "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
-            --jq '.object.sha')
-          test "$ref" = "$SOURCE_SHA"
+          tooling/scripts/verify-release-tag-ref.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --source-sha "$SOURCE_SHA"
       - name: Logout from GHCR
         if: always()
         run: docker logout ghcr.io >/dev/null 2>&1 || true
@@ -632,6 +632,7 @@ jobs:
             --source-sha "$SOURCE_SHA" \
             --target "$SOURCE_SHA" \
             --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --observed-tag "$OBSERVED_TAG" \
             --repo-dir source
       - name: Re-verify canonical draft before publish
         env:
@@ -699,8 +700,10 @@ jobs:
                 .target_commitish == $source and
                 .draft == false and .published_at != null
               ' >/dev/null
-          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
-            --jq '.object.sha')" = "$SOURCE_SHA"
+          tooling/scripts/verify-release-tag-ref.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --source-sha "$SOURCE_SHA"
       - name: Logout from GHCR
         if: always()
         run: docker logout ghcr.io >/dev/null 2>&1 || true

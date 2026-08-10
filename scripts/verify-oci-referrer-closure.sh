@@ -139,6 +139,83 @@ fetch_raw() {
     fail "OCI child response is not a JSON object"
 }
 
+REACHABLE=$WORK_DIR/reachable
+VISITED=$WORK_DIR/visited
+: >"$REACHABLE"
+: >"$VISITED"
+
+mark_reachable() {
+  local digest=$1
+  grep -Fqx "$digest" "$REACHABLE" || printf '%s\n' "$digest" >>"$REACHABLE"
+}
+
+collect_reachable() {
+  local digest=$1 depth=$2 file media descriptor child child_media
+  [ "$depth" -le 8 ] || fail "OCI referrer graph exceeds the verification bound"
+  validate_digest "$digest"
+  mark_reachable "$digest"
+  if grep -Fqx "$digest" "$VISITED"; then
+    return
+  fi
+  printf '%s\n' "$digest" >>"$VISITED"
+  file=$WORK_DIR/node-${digest#sha256:}.json
+  fetch_raw "$digest" "$file"
+  media=$(jq -r '.mediaType // empty' "$file")
+  case "$media" in
+    application/vnd.oci.image.index.v1+json)
+      jq -e '
+        .schemaVersion == 2 and
+        (.manifests | type == "array" and length > 0)
+      ' "$file" >/dev/null || fail "reachable OCI referrer index is invalid"
+      while IFS= read -r descriptor; do
+        validate_descriptor "$descriptor"
+        child=$(jq -r '.digest' <<<"$descriptor")
+        child_media=$(jq -r '.mediaType' <<<"$descriptor")
+        case "$child_media" in
+          application/vnd.oci.image.manifest.v1+json|\
+          application/vnd.oci.image.index.v1+json) ;;
+          *) fail "reachable OCI child media type is foreign" ;;
+        esac
+        collect_reachable "$child" "$((depth + 1))"
+      done < <(jq -c '.manifests[]' "$file")
+      ;;
+    application/vnd.oci.image.manifest.v1+json)
+      jq -e '.schemaVersion == 2' "$file" >/dev/null ||
+        fail "reachable OCI manifest schema is invalid"
+      ;;
+    *) fail "reachable OCI node has an unsupported media type" ;;
+  esac
+}
+
+MARKER="sha256-${SUBJECT_DIGEST#sha256:}"
+MARKER_DIGESTS=$WORK_DIR/marker-digests
+jq -r --arg marker "$MARKER" '
+  .versions[] | select((.tags | index($marker)) != null) | .digest
+' "$INVENTORY_FILE" | tr -d '\r' | sort -u >"$MARKER_DIGESTS"
+[ "$(wc -l <"$MARKER_DIGESTS" | tr -d ' ')" -le 1 ] ||
+  fail "subject marker identifies multiple package versions"
+MARKER_ROOT=$(head -1 "$MARKER_DIGESTS" || true)
+
+mark_reachable "$PLATFORM_SUBJECT"
+collect_reachable "$PLATFORM_SUBJECT" 0
+while IFS= read -r digest; do
+  mark_reachable "$digest"
+  collect_reachable "$digest" 0
+done <"$REFERRERS"
+if [ -n "$MARKER_ROOT" ] &&
+   ! grep -Fqx "$MARKER_ROOT" "$REACHABLE"; then
+  collect_reachable "$MARKER_ROOT" 0
+  marker_file=$WORK_DIR/node-${MARKER_ROOT#sha256:}.json
+  jq -e '.mediaType == "application/vnd.oci.image.index.v1+json"' \
+    "$marker_file" >/dev/null ||
+    fail "subject marker does not identify a referrer index"
+fi
+
+while IFS= read -r digest; do
+  grep -Fqx "$digest" "$REACHABLE" ||
+    fail "package inventory version is absent from the referrer graph"
+done <"$INVENTORY_DIGESTS"
+
 NODE_PROVENANCE=0
 NODE_SBOM=0
 NODE_SIGNATURE=0
@@ -274,8 +351,10 @@ while IFS= read -r digest; do
       .annotations["vnd.docker.reference.digest"]
     ' "$INDEX_FILE")
     validate_node "$digest" "$subject" 0 1
-  else
+  elif [ "$digest" = "$MARKER_ROOT" ]; then
     validate_node "$digest" "$SUBJECT_DIGEST" 0 0
+  else
+    validate_node "$digest" "$SUBJECT_DIGEST" 0 1
   fi
   [ "$NODE_BOUND" -eq 1 ] ||
     fail "OCI package version is not subject-bound"

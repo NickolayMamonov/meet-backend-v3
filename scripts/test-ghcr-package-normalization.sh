@@ -31,4 +31,19 @@ if "$NORMALIZE" --package-versions-file "$TMP/not-page-array.json" \
   exit 1
 fi
 
-echo "GHCR package normalization fixtures passed: exact hosted page-array shape and reject"
+jq '.[0][0].metadata.container |= del(.tags)' "$FIXTURE" \
+  >"$TMP/missing-tags.json"
+if "$NORMALIZE" --package-versions-file "$TMP/missing-tags.json" \
+    --digest "$DIGEST" >"$TMP/missing-tags.out" 2>&1; then
+  echo "expected missing tags metadata rejection" >&2
+  exit 1
+fi
+
+jq '.[0][1] |= del(.metadata)' "$FIXTURE" >"$TMP/missing-metadata.json"
+if "$NORMALIZE" --package-versions-file "$TMP/missing-metadata.json" \
+    --digest "$DIGEST" >"$TMP/missing-metadata.out" 2>&1; then
+  echo "expected missing metadata rejection" >&2
+  exit 1
+fi
+
+echo "GHCR package normalization fixtures passed: exact hosted page-array shape and three rejects"

@@ -15,6 +15,7 @@ SIGNATURE_INDEX=sha256:ddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 SIGNATURE=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 FOREIGN=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 UNBOUND=sha256:1111111111111111111111111111111111111111111111111111111111111111
+UNLISTED=sha256:2222222222222222222222222222222222222222222222222222222222222222
 SOURCE=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
 FIXTURE=$TMP/oci
 mkdir "$FIXTURE"
@@ -65,7 +66,7 @@ jq -n \
       {digest:$root,tags:["v1.0.1","1.0.1",("sha-" + $source)]},
       {digest:$platform,tags:[]},
       {digest:$referrer,tags:[]},
-      {digest:$signature_index,tags:[]},
+      {digest:$signature_index,tags:[("sha256-" + ($root | sub("^sha256:";"")))]},
       {digest:$signature,tags:[]}
     ]
   }
@@ -149,6 +150,29 @@ jq -n --arg root "$ROOT" '
   }
 ' >"$FIXTURE/${SIGNATURE#sha256:}.json"
 
+jq -n --arg root "$ROOT" '
+  {
+    schemaVersion: 2,
+    mediaType: "application/vnd.oci.image.manifest.v1+json",
+    config: {
+      mediaType: "application/vnd.oci.empty.v1+json",
+      digest: "sha256:1919191919191919191919191919191919191919191919191919191919191919",
+      size: 2
+    },
+    layers: [{
+      mediaType: "application/vnd.in-toto+json",
+      digest: "sha256:2020202020202020202020202020202020202020202020202020202020202020",
+      size: 10,
+      annotations: {"in-toto.io/predicate-type":"https://slsa.dev/provenance/v1"}
+    }],
+    subject: {
+      mediaType: "application/vnd.oci.image.index.v1+json",
+      digest: $root,
+      size: 400
+    }
+  }
+' >"$FIXTURE/${UNLISTED#sha256:}.json"
+
 run_valid() {
   local inventory=$1 output=$2
   "$VERIFY" \
@@ -192,6 +216,9 @@ expect_failure unbound-version-shape \
   --arg digest "$UNBOUND" \
   '.versions += [{digest:$digest,tags:[]}]'
 rm "$FIXTURE/${UNBOUND#sha256:}.json"
+expect_failure unlisted-direct-subject \
+  --arg digest "$UNLISTED" \
+  '.versions += [{digest:$digest,tags:[]}]'
 
 jq --arg referrer "$REFERRER" '
   .manifests |= map(
@@ -220,4 +247,4 @@ if run_valid "$TMP/inventory.json" "$TMP/bad-child.json" \
   exit 1
 fi
 
-echo "OCI referrer closure fixtures passed: valid graph and five rejects"
+echo "OCI referrer closure fixtures passed: valid graph and six rejects"
