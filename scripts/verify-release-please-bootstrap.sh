@@ -26,6 +26,7 @@ case "${1:-}" in
     ;;
   --bootstrap-state)
     [ "$#" -eq 1 ] || fail "usage: $0 [--auto-state|--bootstrap-state|--release-state vVERSION]"
+    STATE_MODE=bootstrap
     ;;
   --release-state)
     [ "$#" -eq 2 ] || fail "usage: $0 [--auto-state|--bootstrap-state|--release-state vVERSION]"
