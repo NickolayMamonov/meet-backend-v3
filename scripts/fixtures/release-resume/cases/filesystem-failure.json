@@ -1,0 +1,1 @@
+{"mutation":"filesystem-failure","expected":"reject an image missing the required filesystem state"}

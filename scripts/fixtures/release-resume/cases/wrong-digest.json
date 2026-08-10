@@ -1,0 +1,1 @@
+{"mutation":"wrong-digest","expected":"reject a registry digest inconsistent with the manifest"}

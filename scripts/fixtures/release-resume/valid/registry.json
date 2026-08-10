@@ -1,0 +1,34 @@
+{
+  "image": "ghcr.io/nickolaymamonov/meet-backend-v3",
+  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "aliases": {
+    "v1.0.1": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "1.0.1": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sha-d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "latest": null,
+  "versions": [
+    {
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tags": [
+        "v1.0.1",
+        "1.0.1",
+        "sha-d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc"
+      ]
+    }
+  ],
+  "identity": {
+    "version": "1.0.1",
+    "revision": "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc",
+    "source": "https://github.com/NickolayMamonov/meet-backend-v3",
+    "platform": "linux/amd64",
+    "user": "10001:10001",
+    "filesystem": true,
+    "readiness": true
+  },
+  "ociEvidence": {
+    "subjectDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "provenance": true,
+    "sbom": true
+  }
+}

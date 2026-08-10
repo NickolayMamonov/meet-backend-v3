@@ -189,45 +189,101 @@ require_text 'target-branch: dev'
 require_text 'manifest-file: .release-please-manifest.json'
 require_text 'config-file: release-please-config.json'
 
-require_text 'needs: release'
-require_text "if: needs.release.outputs.created == 'true'"
-require_text 'uses: ./.github/workflows/ci.yml'
-require_text 'ref: ${{ needs.release.outputs.tag }}'
-require_text 'needs: [release, gates]'
-require_text 'TAG: ${{ needs.release.outputs.tag }}'
-require_text 'VERSION: ${{ needs.release.outputs.version }}'
-require_text 'SOURCE_SHA: ${{ needs.release.outputs.sha }}'
-
-require_text 'test "$TAG" = "v$VERSION"'
-require_text 'test "$SOURCE_SHA" = "$(git rev-list -n 1 "$TAG")"'
-require_text 'test "$(git show "$SOURCE_SHA:version.json" | jq -r '\''.version'\'')" = "$VERSION"'
-require_text 'test "$revision" = "$SOURCE_SHA"'
-image_tag_lines=()
-mapfile -t image_tag_lines < <(
-  grep -E '^[[:space:]]+--tag "\$IMAGE:[^"]+"' <<<"$WORKFLOW_TEXT" || true
-)
-[ "${#image_tag_lines[@]}" -eq 3 ] ||
-  fail "release workflow must publish exactly three immutable image aliases"
-for expected_tag in \
-  '--tag "$IMAGE:$TAG"' \
-  '--tag "$IMAGE:$VERSION"' \
-  '--tag "$IMAGE:sha-$SOURCE_SHA"'; do
-  expected_count=$(grep -F -- "$expected_tag" <<<"$WORKFLOW_TEXT" |
-    wc -l | tr -d '[:space:]' || true)
-  [ "$expected_count" -eq 1 ] ||
-    fail "release workflow is missing or duplicating an immutable image alias"
-done
-if grep -Eiq '^[[:space:]]+--tag "\$IMAGE:latest"' <<<"$WORKFLOW_TEXT"; then
-  fail "release workflow must not publish the latest image alias"
-fi
-alias_line_count=$(grep -E '^[[:space:]]+aliases:' <<<"$WORKFLOW_TEXT" |
-  wc -l | tr -d '[:space:]' || true)
-[ "$alias_line_count" -eq 1 ] ||
-  fail "release manifest must declare exactly one alias list"
-require_text 'aliases: ["v" + $version, $version, "sha-" + $sourceSha]'
+# Release Please is the creator/tag authority, while the resolver is the only
+# source of a release descriptor. A draft tag may be absent until publication.
+require_text 'scripts/resolve-release-descriptor.sh recover'
+require_text 'scripts/resolve-release-descriptor.sh created'
+require_text 'scripts/resolve-release-descriptor.sh verify'
+require_text 'if: needs.release.outputs.active == '\''true'\'''
+require_text 'source_sha: ${{ needs.release.outputs.source_sha }}'
+require_text 'release_tag: ${{ needs.release.outputs.release_tag }}'
+require_text 'release_version: ${{ needs.release.outputs.release_version }}'
+require_text 'release_id: ${{ needs.release.outputs.release_id }}'
+require_text 'ref: ${{ github.sha }}'
+require_text 'ref: ${{ env.SOURCE_SHA }}'
+require_text 'path: tooling'
+require_text 'path: source'
+require_text 'ASSET_INVENTORY_KIND'
+require_text 'complete_unverified'
+require_text 'verify-release-resume-state.sh'
+require_text 'revalidate-release-mutation.sh'
+require_text '[ "$latest" = absent ]'
+require_text 'acquire-release-lease.sh'
+require_text '--platform linux/amd64'
+require_text '--provenance=true'
+require_text '--sbom=true'
+require_text '--tag "$IMAGE:$TAG"'
+require_text '--tag "$IMAGE:$VERSION"'
+require_text '--tag "$IMAGE:sha-$SOURCE_SHA"'
 require_text 'publicationPolicy: "exactly-three-aliases-publish-last"'
-require_text 'gh release upload "$TAG" release-manifest.json image-index.json image-inspect.txt SHA256SUMS'
-require_text 'gh release edit "$TAG" --draft=false'
+require_text 'release-manifest.json'
+require_text 'image-index.json'
+require_text 'image-inspect.txt'
+require_text 'SHA256SUMS'
+require_text 'repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID'
+require_text 'repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$file'
+require_text 'jq -n '\''{draft: false}'\'''
+
+if grep -Fq 'release_created == '\''true'\''' <<<"$WORKFLOW_TEXT"; then
+  fail "publication must be gated by the verified descriptor, not Release Please output"
+fi
+for forbidden in \
+  'ref: ${{ needs.release.outputs.tag }}' \
+  'git rev-list -n 1 "$TAG"' \
+  'gh release upload' \
+  'gh release edit' \
+  'refs/tags/$TAG' \
+  '--tag "$IMAGE:latest"'; do
+  if grep -Fq -- "$forbidden" <<<"$WORKFLOW_TEXT"; then
+    fail "release workflow contains forbidden tag-first or mutable operation: $forbidden"
+  fi
+done
+
+alias_count=$(grep -E '^[[:space:]]+--tag "\$IMAGE:' <<<"$WORKFLOW_TEXT" |
+  sort -u | wc -l | tr -d '[:space:]')
+[ "$alias_count" -eq 3 ] ||
+  fail "release workflow must publish exactly three immutable aliases"
+
+patch_count=$(grep -F 'gh api --method PATCH' <<<"$WORKFLOW_TEXT" |
+  wc -l | tr -d '[:space:]')
+revalidation_count=$(grep -F 'revalidate-release-mutation.sh' <<<"$WORKFLOW_TEXT" |
+  wc -l | tr -d '[:space:]')
+[ "$patch_count" -eq "$revalidation_count" ] ||
+  fail "every release PATCH must have a shared full-descriptor revalidation"
+
+resume_line=$(grep -n 'verify-release-resume-state.sh' <<<"$WORKFLOW_TEXT" |
+  tail -1 | cut -d: -f1)
+publish_line=$(grep -n "jq -n '{draft: false}'" <<<"$WORKFLOW_TEXT" |
+  tail -1 | cut -d: -f1)
+[ -n "$resume_line" ] && [ -n "$publish_line" ] && [ "$resume_line" -lt "$publish_line" ] ||
+  fail "publish-last ordering is not statically provable"
+
+CI_WORKFLOW=.github/workflows/ci.yml
+require_file "$CI_WORKFLOW"
+CI_TEXT=$(sed 's/\r$//' "$CI_WORKFLOW")
+for input in source_sha release_tag release_version release_id; do
+  grep -Eq "^[[:space:]]+$input:" <<<"$CI_TEXT" ||
+    fail "reusable CI is missing additive input: $input"
+done
+grep -Fq 'ref: ${{ inputs.source_sha }}' <<<"$CI_TEXT" ||
+  fail "reusable CI does not check out the exact source SHA"
+grep -Fq 'path: tooling' <<<"$CI_TEXT" ||
+  fail "reusable CI is missing the current tooling checkout"
+grep -Fq 'path: source' <<<"$CI_TEXT" ||
+  fail "reusable CI is missing the exact source checkout"
+
+RECOVERY_WORKFLOW=.github/workflows/release-recovery.yml
+require_file "$RECOVERY_WORKFLOW"
+RECOVERY_TEXT=$(sed 's/\r$//' "$RECOVERY_WORKFLOW")
+grep -Fq 'release_id:' <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery must accept a numeric release ID"
+grep -Fq 'scripts/resolve-release-descriptor.sh recover' <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery must use the shared resolver"
+grep -Fq 'releases/$RELEASE_ID' <<<"$RECOVERY_TEXT" ||
+  fail "manual recovery mutation must be bound to the release ID"
+if grep -Fq 'refs/tags/$TAG' <<<"$RECOVERY_TEXT"; then
+  fail "manual recovery must not require a draft tag ref"
+fi
 
 case "$STATE_MODE" in
   auto)

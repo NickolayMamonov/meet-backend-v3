@@ -3,16 +3,8 @@ name: Backend release recovery audit
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing draft tag to quarantine
-        required: true
-        type: string
-      version:
-        description: Canonical SemVer for the draft
-        required: true
-        type: string
-      source_sha:
-        description: Full source SHA recorded by Release Please
+      release_id:
+        description: Numeric GitHub draft release ID to audit and quarantine
         required: true
         type: string
 
@@ -24,20 +16,49 @@ jobs:
   quarantine:
     if: github.ref == 'refs/heads/master'
     concurrency:
-      group: backend-ghcr-recovery-${{ github.repository }}-${{ inputs.tag }}
+      group: backend-ghcr-recovery-${{ github.repository }}-${{ inputs.release_id }}
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     env:
-      TAG: ${{ inputs.tag }}
-      VERSION: ${{ inputs.version }}
-      SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_RELEASE_ID: ${{ inputs.release_id }}
       IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
     steps:
-      - name: Checkout default-branch recovery tooling
+      - name: Checkout reviewed recovery tooling
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: master
+          ref: ${{ github.sha }}
           fetch-depth: 0
+      - name: Resolve and verify the numeric draft
+        id: descriptor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          git fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          descriptor=$(scripts/resolve-release-descriptor.sh recover \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev)
+          value() {
+            awk -F= -v key="$1" '$1 == key {
+              sub(/^[^=]*=/, "")
+              print
+            }' <<<"$descriptor"
+          }
+          test "$(value active)" = true
+          test "$(value release_id)" = "$REQUESTED_RELEASE_ID"
+          verified=$(scripts/resolve-release-descriptor.sh verify \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev \
+            --release-id "$(value release_id)" \
+            --tag "$(value tag)" \
+            --version "$(value version)" \
+            --source-sha "$(value source_sha)" \
+            --asset-inventory-fingerprint \
+              "$(value asset_inventory_fingerprint)")
+          printf '%s\n' "$verified"
+          printf '%s\n' "$verified" >> "$GITHUB_OUTPUT"
       - name: Set up read-only registry inspection
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       - name: Authenticate for read-only inspection
@@ -46,23 +67,44 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Quarantine without registry mutation
+      - name: Audit and quarantine without registry mutation
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.descriptor.outputs.release_id }}
+          TAG: ${{ steps.descriptor.outputs.tag }}
+          VERSION: ${{ steps.descriptor.outputs.version }}
+          SOURCE_SHA: ${{ steps.descriptor.outputs.source_sha }}
+          ASSET_INVENTORY_FINGERPRINT: ${{ steps.descriptor.outputs.asset_inventory_fingerprint }}
         run: |
           set -euo pipefail
-          test "$TAG" = "v$VERSION"
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --no-tags origin dev "refs/tags/$TAG:refs/tags/$TAG"
-          test "$(git rev-list -n 1 "$TAG")" = "$SOURCE_SHA"
-          test "$(git show "$SOURCE_SHA:version.json" | jq -r '.version')" = "$VERSION"
-          git merge-base --is-ancestor "$SOURCE_SHA" origin/dev
-          gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -Fx true
+          quarantine="$RUNNER_TEMP/release-quarantine.json"
           set +e
-          scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
-            --quarantine-file "$RUNNER_TEMP/quarantine.json"
+          result=$(scripts/release-registry-state.sh inspect \
+            "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+            --quarantine-file "$quarantine")
           status=$?
           set -e
-          test "$status" -eq 42
-          gh release edit "$TAG" --draft --notes-file "$RUNNER_TEMP/quarantine.json"
-          jq -e '.registryWrites == 0' "$RUNNER_TEMP/quarantine.json"
+          printf '%s\n' "$result"
+          if [ "$status" -ne 42 ]; then
+            echo "audit found no quarantinable partial or divergent registry state" >&2
+            exit 1
+          fi
+          test -s "$quarantine"
+          jq -e '.registryWrites == 0' "$quarantine" >/dev/null
+          scripts/revalidate-release-mutation.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --repo-dir . \
+            --dev-ref origin/dev
+          jq -n --rawfile body "$quarantine" \
+            '{draft: true, body: $body}' |
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              --input - >/dev/null
+      - name: Logout from GHCR
+        if: always()
+        run: docker logout ghcr.io >/dev/null 2>&1 || true

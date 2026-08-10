@@ -10,6 +10,22 @@ on:
       ref:
         required: false
         type: string
+      source_sha:
+        description: Exact release source commit; requires the complete release tuple
+        required: false
+        type: string
+      release_tag:
+        description: Release tag associated with source_sha
+        required: false
+        type: string
+      release_version:
+        description: Canonical release SemVer associated with source_sha
+        required: false
+        type: string
+      release_id:
+        description: Numeric GitHub release ID associated with source_sha
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -18,75 +34,180 @@ env:
   JAVA_VERSION: "21"
 
 jobs:
+  validate-call:
+    name: Validate reusable call
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require a complete release tuple
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          set -euo pipefail
+          populated=0
+          for value in "$SOURCE_SHA" "$RELEASE_TAG" "$RELEASE_VERSION" "$RELEASE_ID"; do
+            [ -z "$value" ] || populated=$((populated + 1))
+          done
+          if [ "$populated" -eq 0 ]; then
+            exit 0
+          fi
+          [ "$populated" -eq 4 ] || {
+            echo "source_sha, release_tag, release_version, and release_id must be supplied together" >&2
+            exit 1
+          }
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$RELEASE_TAG" = "v$RELEASE_VERSION"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+
   gradle:
     name: Gradle tests and build
     runs-on: ubuntu-24.04
+    needs: validate-call
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_VERSION: ${{ inputs.release_version }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      TOOLING_SCRIPTS: ${{ inputs.source_sha != '' && '../tooling/scripts' || 'scripts' }}
     steps:
       - name: Checkout reviewed source
+        if: inputs.source_sha == ''
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
+      - name: Checkout reviewed CI tooling
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: tooling
+      - name: Checkout exact release source
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          path: source
       - name: Set up Java
         uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
+          cache-dependency-path: ${{ inputs.source_sha != '' && 'source/**/*.gradle*' || '**/*.gradle*' }}
       - name: Run non-PostgreSQL tests
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: ./gradlew test -PskipPostgresTests
       - name: Build and verify
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: ./gradlew clean build -PskipPostgresTests
       - name: Verify version authority
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version=$(jq -r '.version' version.json)
           [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          scripts/verify-release-consistency.sh "$version" "$(git rev-parse HEAD)"
+          revision=$(git rev-parse HEAD)
+          if [ -n "$SOURCE_SHA" ]; then
+            test "$revision" = "$SOURCE_SHA"
+            test "$version" = "$RELEASE_VERSION"
+            test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .tag_name)" = "$RELEASE_TAG"
+            "$TOOLING_SCRIPTS/verify-release-consistency.sh" \
+              "$RELEASE_VERSION" "$SOURCE_SHA" --tag "$RELEASE_TAG"
+          else
+            "$TOOLING_SCRIPTS/verify-release-consistency.sh" "$version" "$revision"
+          fi
 
   postgres:
     name: PostgreSQL tests
     runs-on: ubuntu-24.04
+    needs: validate-call
     steps:
       - name: Checkout reviewed source
+        if: inputs.source_sha == ''
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
+      - name: Checkout reviewed CI tooling
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: tooling
+      - name: Checkout exact release source
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          path: source
       - name: Set up Java
         uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
+          cache-dependency-path: ${{ inputs.source_sha != '' && 'source/**/*.gradle*' || '**/*.gradle*' }}
       - name: Run PostgreSQL suite
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: ./gradlew postgresTest
 
   scripts:
     name: Compose, Bash, and ShellCheck
     runs-on: ubuntu-24.04
+    needs: validate-call
+    env:
+      TOOLING_SCRIPTS: ${{ inputs.source_sha != '' && '../tooling/scripts' || 'scripts' }}
     steps:
       - name: Checkout reviewed source
+        if: inputs.source_sha == ''
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
+      - name: Checkout reviewed CI tooling
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: tooling
+      - name: Checkout exact release source
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          path: source
       - name: Validate shell scripts
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
           set -euo pipefail
-          bash -n scripts/*.sh
-          shellcheck --severity=warning scripts/*.sh
+          bash -n "$TOOLING_SCRIPTS"/*.sh
+          shellcheck --severity=warning "$TOOLING_SCRIPTS"/*.sh
+          "$TOOLING_SCRIPTS/test-release-registry-state.sh"
       - name: Verify Release Please state
         env:
-          RELEASE_REF: ${{ inputs.ref }}
+          RELEASE_REF: ${{ inputs.source_sha != '' && '' || inputs.ref }}
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
           set -euo pipefail
           if [ -n "$RELEASE_REF" ]; then
-            scripts/verify-release-please-bootstrap.sh --release-state "$RELEASE_REF"
+            "$TOOLING_SCRIPTS/verify-release-please-bootstrap.sh" --release-state "$RELEASE_REF"
           else
-            scripts/verify-release-please-bootstrap.sh --auto-state
+            "$TOOLING_SCRIPTS/verify-release-please-bootstrap.sh" --auto-state
           fi
       - name: Validate production Compose
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
           set -euo pipefail
           validation_env="$RUNNER_TEMP/meet-production.env"
@@ -114,22 +235,48 @@ jobs:
   docker:
     name: Docker image verification
     runs-on: ubuntu-24.04
-    needs: [gradle]
+    needs: [validate-call, gradle]
     permissions:
       contents: read
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_VERSION: ${{ inputs.release_version }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      TOOLING_SCRIPTS: ${{ inputs.source_sha != '' && '../tooling/scripts' || 'scripts' }}
     steps:
       - name: Checkout reviewed source
+        if: inputs.source_sha == ''
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
+      - name: Checkout reviewed CI tooling
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: tooling
+      - name: Checkout exact release source
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          path: source
       - name: Set up Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       - name: Build image
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
           set -euo pipefail
           version=$(jq -r '.version' version.json)
           revision=$(git rev-parse HEAD)
+          if [ -n "$SOURCE_SHA" ]; then
+            test "$revision" = "$SOURCE_SHA"
+            test "$version" = "$RELEASE_VERSION"
+          fi
           docker buildx build \
             --platform linux/amd64 \
             --load \
@@ -143,4 +290,11 @@ jobs:
           docker image inspect meet-backend:ci --format '{{json .Config.Labels}}' | jq -e 'has("org.opencontainers.image.source")'
           docker run --rm --entrypoint sh meet-backend:ci -ec \
             'test -f /app/app.jar && test -d /data/uploads && test -w /data/uploads'
-          scripts/verify-release-consistency.sh "$version" "$revision" --image meet-backend:ci
+          if [ -n "$SOURCE_SHA" ]; then
+            "$TOOLING_SCRIPTS/verify-release-consistency.sh" \
+              "$RELEASE_VERSION" "$SOURCE_SHA" \
+              --tag "$RELEASE_TAG" --image meet-backend:ci
+          else
+            "$TOOLING_SCRIPTS/verify-release-consistency.sh" \
+              "$version" "$revision" --image meet-backend:ci
+          fi

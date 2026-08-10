@@ -10,14 +10,16 @@ permissions:
 
 jobs:
   release:
-    name: Release Please
+    name: Release Please and resolve draft
     runs-on: ubuntu-24.04
     outputs:
-      created: ${{ steps.release.outputs.release_created }}
-      tag: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
-      sha: ${{ steps.release.outputs.sha }}
-      release-id: ${{ steps.release.outputs.release_id }}
+      active: ${{ steps.descriptor.outputs.active }}
+      source_sha: ${{ steps.descriptor.outputs.source_sha }}
+      release_tag: ${{ steps.descriptor.outputs.tag }}
+      release_version: ${{ steps.descriptor.outputs.version }}
+      release_id: ${{ steps.descriptor.outputs.release_id }}
+      asset_inventory_kind: ${{ steps.descriptor.outputs.asset_inventory_kind }}
+      asset_inventory_fingerprint: ${{ steps.descriptor.outputs.asset_inventory_fingerprint }}
     steps:
       - name: Release Please manifest
         id: release
@@ -27,19 +29,56 @@ jobs:
           target-branch: dev
           manifest-file: .release-please-manifest.json
           config-file: release-please-config.json
+      - name: Checkout reviewed release tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Resolve the active numeric draft
+        id: descriptor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+          CREATED_RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          CREATED_TAG: ${{ steps.release.outputs.tag_name }}
+          CREATED_VERSION: ${{ steps.release.outputs.version }}
+          CREATED_SOURCE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          if [ "$RELEASE_CREATED" = true ]; then
+            descriptor=$(scripts/resolve-release-descriptor.sh created \
+              --repository "$GITHUB_REPOSITORY" \
+              --dev-ref origin/dev \
+              --release-id "$CREATED_RELEASE_ID" \
+              --tag "$CREATED_TAG" \
+              --version "$CREATED_VERSION" \
+              --source-sha "$CREATED_SOURCE_SHA")
+          else
+            descriptor=$(scripts/resolve-release-descriptor.sh recover \
+              --repository "$GITHUB_REPOSITORY" \
+              --dev-ref origin/dev)
+          fi
+          printf '%s\n' "$descriptor"
+          printf '%s\n' "$descriptor" >> "$GITHUB_OUTPUT"
 
   gates:
     name: Re-run release gates
     needs: release
-    if: needs.release.outputs.created == 'true'
+    if: needs.release.outputs.active == 'true'
     uses: ./.github/workflows/ci.yml
     with:
-      ref: ${{ needs.release.outputs.tag }}
+      ref: ${{ github.sha }}
+      source_sha: ${{ needs.release.outputs.source_sha }}
+      release_tag: ${{ needs.release.outputs.release_tag }}
+      release_version: ${{ needs.release.outputs.release_version }}
+      release_id: ${{ needs.release.outputs.release_id }}
 
   publish:
     name: Publish immutable release
     needs: [release, gates]
-    if: needs.release.outputs.created == 'true'
+    if: needs.release.outputs.active == 'true'
     concurrency:
       group: backend-ghcr-publication-${{ github.repository }}
       cancel-in-progress: false
@@ -50,16 +89,58 @@ jobs:
       attestations: write
       id-token: write
     env:
-      TAG: ${{ needs.release.outputs.tag }}
-      VERSION: ${{ needs.release.outputs.version }}
-      SOURCE_SHA: ${{ needs.release.outputs.sha }}
+      RELEASE_ID: ${{ needs.release.outputs.release_id }}
+      TAG: ${{ needs.release.outputs.release_tag }}
+      VERSION: ${{ needs.release.outputs.release_version }}
+      SOURCE_SHA: ${{ needs.release.outputs.source_sha }}
+      ASSET_INVENTORY_KIND: ${{ needs.release.outputs.asset_inventory_kind }}
+      ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
       IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
     steps:
+      - name: Checkout reviewed publication tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: tooling
       - name: Checkout exact release source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ needs.release.outputs.tag }}
+          ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
+          path: source
+      - name: Independently verify the numeric draft descriptor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git -C tooling fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT")
+          value() {
+            awk -F= -v key="$1" '$1 == key {
+              sub(/^[^=]*=/, "")
+              print
+            }' <<<"$descriptor"
+          }
+          test "$(value active)" = true
+          test "$(value origin)" = verified
+          test "$(value release_id)" = "$RELEASE_ID"
+          test "$(value tag)" = "$TAG"
+          test "$(value version)" = "$VERSION"
+          test "$(value source_sha)" = "$SOURCE_SHA"
+          test "$(value asset_inventory_kind)" = "$ASSET_INVENTORY_KIND"
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(jq -r '.version' source/version.json)" = "$VERSION"
+          test "$TAG" = "v$VERSION"
       - name: Set up Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       - name: Authenticate to GHCR
@@ -68,113 +149,192 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Inspect registry before publication
-        id: registry
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Classify publication route
+        id: admission
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/release"
           quarantine="$RUNNER_TEMP/release/preflight-quarantine.json"
           set +e
-          result=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+          result=$(tooling/scripts/release-registry-state.sh inspect \
+            "$IMAGE" "$VERSION" "$SOURCE_SHA" \
             --quarantine-file "$quarantine")
           status=$?
           set -e
           printf '%s\n' "$result"
-          state=$(printf '%s\n' "$result" | awk -F= '/^state=/{print $2}')
-          echo "state=$state" >> "$GITHUB_OUTPUT"
-          if [ "$state" = complete ]; then
-            digest=$(printf '%s\n' "$result" | awk -F= '/^digest=/{print $2}')
-            echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          fi
+          state=$(awk -F= '/^state=/{print $2}' <<<"$result")
+          latest=$(awk -F= '/^latest=/{print $2}' <<<"$result")
           if [ "$status" -eq 42 ]; then
             test -s "$quarantine"
-            gh release edit "$TAG" --draft --notes-file "$quarantine"
-            echo "partial/divergent/raced aliases are quarantined; no GHCR repair is attempted" >&2
-            exit 1
-          fi
-          [ "$status" -eq 0 ] && [ "$state" = empty -o "$state" = complete ]
-      - name: Acquire create-only publication lease
-        if: steps.registry.outputs.state == 'empty'
-        run: scripts/acquire-release-lease.sh "$VERSION" "$SOURCE_SHA"
-      - name: Build and publish exactly three aliases
-        id: publish-image
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REGISTRY_STATE: ${{ steps.registry.outputs.state }}
-          REGISTRY_DIGEST: ${{ steps.registry.outputs.digest }}
-        run: |
-          set -euo pipefail
-          test "$TAG" = "v$VERSION"
-          test "$SOURCE_SHA" = "$(git rev-list -n 1 "$TAG")"
-          test "$(jq -r '.version' version.json)" = "$VERSION"
-          test "$(git show "$SOURCE_SHA:version.json" | jq -r '.version')" = "$VERSION"
-          revision=$(git rev-parse HEAD)
-          test "$revision" = "$SOURCE_SHA"
-          mkdir -p "$RUNNER_TEMP/release"
-          if [ "$REGISTRY_STATE" = complete ]; then
-            digest="$REGISTRY_DIGEST"
+            route=quarantine
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          elif [ "$ASSET_INVENTORY_KIND" = empty ] &&
+               [ "$state" = empty ] &&
+               [ "$latest" = absent ]; then
+            route=fresh
+          elif [ "$ASSET_INVENTORY_KIND" = complete_unverified ] &&
+               [ "$state" = complete ] &&
+               [ "$latest" = absent ]; then
+            route=resume
           else
-            test "$REGISTRY_STATE" = empty
-            admission_quarantine="$RUNNER_TEMP/release/lease-quarantine.json"
-            set +e
-            admission=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
-              --quarantine-file "$admission_quarantine")
-            status=$?
-            set -e
-            printf '%s\n' "$admission"
-            if [ "$status" -eq 42 ]; then
-              test -s "$admission_quarantine"
-              gh release edit "$TAG" --draft --notes-file "$admission_quarantine"
-              echo "registry changed after lease acquisition; no GHCR repair is attempted" >&2
-              exit 1
-            fi
-            [ "$status" -eq 0 ]
-            admission_state=$(awk -F= '/^state=/{print $2}' <<<"$admission")
-            if [ "$admission_state" != empty ]; then
-              jq -n --arg state "$admission_state" '{
+            jq -n \
+              --arg assets "$ASSET_INVENTORY_KIND" \
+              --arg registry "$state" \
+              '{
                 status: "quarantined",
                 registryWrites: 0,
-                observedState: $state,
-                reason: "registry changed after publication lease"
-              }' > "$admission_quarantine"
-              gh release edit "$TAG" --draft --notes-file "$admission_quarantine"
-              echo "registry was not empty after lease acquisition; no GHCR repair is attempted" >&2
-              exit 1
-            fi
-            docker buildx build \
-              --platform linux/amd64 \
-              --provenance=true \
-              --sbom=true \
-              --push \
-              --tag "$IMAGE:$TAG" \
-              --tag "$IMAGE:$VERSION" \
-              --tag "$IMAGE:sha-$SOURCE_SHA" \
-              --build-arg "BACKEND_VERSION=$VERSION" \
-              --build-arg "BACKEND_REVISION=$SOURCE_SHA" \
-              --metadata-file "$RUNNER_TEMP/release/build-metadata.json" \
-              .
-            digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/release/build-metadata.json")
+                assetInventory: $assets,
+                registryState: $registry,
+                reason: "release assets and registry state do not form an admissible publication route"
+              }' > "$quarantine"
+            route=quarantine
           fi
+          echo "route=$route" >> "$GITHUB_OUTPUT"
+          echo "quarantine=$quarantine" >> "$GITHUB_OUTPUT"
+      - name: Quarantine inadmissible state by numeric release ID
+        if: steps.admission.outputs.route == 'quarantine'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QUARANTINE_FILE: ${{ steps.admission.outputs.quarantine }}
+        run: |
+          set -euo pipefail
+          tooling/scripts/revalidate-release-mutation.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --repo-dir tooling \
+            --dev-ref origin/dev
+          jq -n --rawfile body "$QUARANTINE_FILE" \
+            '{draft: true, body: $body}' |
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              --input - >/dev/null
+          echo "release quarantined; registry repair is forbidden" >&2
+          exit 1
+      - name: Acquire create-only publication lease
+        if: steps.admission.outputs.route == 'fresh'
+        working-directory: source
+        run: ../tooling/scripts/acquire-release-lease.sh "$VERSION" "$SOURCE_SHA"
+      - name: Recheck empty registry after lease
+        if: steps.admission.outputs.route == 'fresh'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          quarantine="$RUNNER_TEMP/release/lease-quarantine.json"
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT")
+          printf '%s\n' "$descriptor" | grep -Fx 'asset_inventory_kind=empty'
+          set +e
+          result=$(tooling/scripts/release-registry-state.sh inspect \
+            "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+            --quarantine-file "$quarantine")
+          status=$?
+          set -e
+          printf '%s\n' "$result"
+          state=$(awk -F= '/^state=/{print $2}' <<<"$result")
+          latest=$(awk -F= '/^latest=/{print $2}' <<<"$result")
+          if [ "$status" -eq 0 ] &&
+             [ "$state" = empty ] &&
+             [ "$latest" = absent ]; then
+            exit 0
+          fi
+          if [ "$status" -ne 42 ]; then
+            jq -n --arg state "$state" '{
+              status: "quarantined",
+              registryWrites: 0,
+              observedState: $state,
+              reason: "registry changed after publication lease"
+            }' > "$quarantine"
+          fi
+          test -s "$quarantine"
+          tooling/scripts/revalidate-release-mutation.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --repo-dir tooling \
+            --dev-ref origin/dev
+          jq -n --rawfile body "$quarantine" \
+            '{draft: true, body: $body}' |
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              --input - >/dev/null
+          echo "registry changed after lease; no repair is attempted" >&2
+          exit 1
+      - name: Build and publish exactly three aliases
+        if: steps.admission.outputs.route == 'fresh'
+        id: publish-image
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(jq -r '.version' version.json)" = "$VERSION"
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=true \
+            --sbom=true \
+            --push \
+            --tag "$IMAGE:$TAG" \
+            --tag "$IMAGE:$VERSION" \
+            --tag "$IMAGE:sha-$SOURCE_SHA" \
+            --build-arg "BACKEND_VERSION=$VERSION" \
+            --build-arg "BACKEND_REVISION=$SOURCE_SHA" \
+            --metadata-file "$RUNNER_TEMP/release/build-metadata.json" \
+            .
+          digest=$(jq -r '."containerimage.digest"' \
+            "$RUNNER_TEMP/release/build-metadata.json")
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           docker pull "$IMAGE@$digest"
-          test "$(docker image inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
-          test "$(docker image inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
-          test "$(docker image inspect "$IMAGE@$digest" --format '{{.Config.User}}')" = "10001:10001"
+          test "$(docker image inspect "$IMAGE@$digest" \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
+          test "$(docker image inspect "$IMAGE@$digest" \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
+          test "$(docker image inspect "$IMAGE@$digest" \
+            --format '{{.Config.User}}')" = "10001:10001"
           docker run --rm --entrypoint sh "$IMAGE@$digest" -ec \
             'test -f /app/app.jar && test -d /data/uploads && test -w /data/uploads'
           quarantine="$RUNNER_TEMP/release/post-publish-quarantine.json"
           set +e
-          final_state=$(scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+          final_state=$(../tooling/scripts/release-registry-state.sh inspect \
+            "$IMAGE" "$VERSION" "$SOURCE_SHA" \
             --quarantine-file "$quarantine")
           status=$?
           set -e
           printf '%s\n' "$final_state"
           if [ "$status" -eq 42 ]; then
             test -s "$quarantine"
-            gh release edit "$TAG" --draft --notes-file "$quarantine"
-            echo "post-publish registry race quarantined; no GHCR repair is attempted" >&2
+            ../tooling/scripts/revalidate-release-mutation.sh \
+              --repository "$GITHUB_REPOSITORY" \
+              --release-id "$RELEASE_ID" \
+              --tag "$TAG" \
+              --version "$VERSION" \
+              --source-sha "$SOURCE_SHA" \
+              --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+              --repo-dir ../tooling \
+              --dev-ref origin/dev
+            jq -n --rawfile body "$quarantine" \
+              '{draft: true, body: $body}' |
+              gh api --method PATCH \
+                "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+                --input - >/dev/null
+            echo "post-publish registry race quarantined; no repair is attempted" >&2
             exit 1
           fi
           [ "$status" -eq 0 ]
@@ -182,12 +342,21 @@ jobs:
           test "$(awk -F= '/^digest=/{print $2}' <<<"$final_state")" = "$digest"
           docker buildx imagetools inspect --raw "$IMAGE@$digest" > image-index.json
           docker buildx imagetools inspect "$IMAGE@$digest" > image-inspect.txt
-          evidence=$(scripts/verify-oci-evidence.sh "$IMAGE" "$digest" image-index.json)
+          {
+            echo "Platform: linux/amd64"
+            echo "Version: $VERSION"
+            echo "Revision: $SOURCE_SHA"
+            echo "Source: https://github.com/$GITHUB_REPOSITORY"
+          } >> image-inspect.txt
+          evidence=$(../tooling/scripts/verify-oci-evidence.sh \
+            "$IMAGE" "$digest" image-index.json)
           provenance=$(awk -F= '/^provenance=/{print $2}' <<<"$evidence")
           sbom=$(awk -F= '/^sbom=/{print $2}' <<<"$evidence")
           test "$provenance" = true
           test "$sbom" = true
           jq -n \
+            --argjson releaseId "$RELEASE_ID" \
+            --arg targetCommitish "$SOURCE_SHA" \
             --arg version "$VERSION" \
             --arg tag "$TAG" \
             --arg sourceSha "$SOURCE_SHA" \
@@ -196,6 +365,8 @@ jobs:
             --argjson provenance "$provenance" \
             --argjson sbom "$sbom" \
             '{
+              releaseId: $releaseId,
+              targetCommitish: $targetCommitish,
               version: $version,
               tag: $tag,
               sourceSha: $sourceSha,
@@ -209,31 +380,182 @@ jobs:
               artifactAttestation: true,
               evidence: ["image-index.json", "image-inspect.txt"]
             }' > release-manifest.json
-          scripts/verify-release-consistency.sh "$VERSION" "$SOURCE_SHA" \
-            --tag "$TAG" --image "$IMAGE@$digest" --manifest release-manifest.json
-          sha256sum release-manifest.json image-index.json image-inspect.txt > SHA256SUMS
+          ../tooling/scripts/verify-release-consistency.sh \
+            "$VERSION" "$SOURCE_SHA" \
+            --image "$IMAGE@$digest" \
+            --manifest release-manifest.json
+          sha256sum \
+            release-manifest.json \
+            image-index.json \
+            image-inspect.txt > SHA256SUMS
       - name: Create artifact attestation
+        if: steps.admission.outputs.route == 'fresh'
         id: attestation
         uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.publish-image.outputs.digest }}
           push-to-registry: true
-      - name: Verify artifact attestation and evidence
+      - name: Verify fresh attestation and checksums
+        if: steps.admission.outputs.route == 'fresh'
+        working-directory: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh attestation verify "oci://$IMAGE@${{ steps.publish-image.outputs.digest }}" \
+          gh attestation verify \
+            "oci://$IMAGE@${{ steps.publish-image.outputs.digest }}" \
             --repo "$GITHUB_REPOSITORY"
           sha256sum -c SHA256SUMS
-      - name: Attach evidence and publish last
+      - name: Upload the exact evidence set by numeric release ID
+        if: steps.admission.outputs.route == 'fresh'
+        working-directory: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" release-manifest.json image-index.json image-inspect.txt SHA256SUMS
-          gh release edit "$TAG" --draft=false
+          quarantine_upload_failure() {
+            status=$?
+            trap - ERR
+            set +e
+            assets=$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              --jq '[.assets[] | {name, id, size}]' 2>/dev/null)
+            [ -n "$assets" ] || assets=null
+            quarantine="$RUNNER_TEMP/release/upload-quarantine.json"
+            jq -n --argjson assets "$assets" '{
+              status: "quarantined",
+              repairWrites: 0,
+              observedAssets: $assets,
+              reason: "exact evidence upload did not complete"
+            }' > "$quarantine"
+            if ! ../tooling/scripts/revalidate-release-mutation.sh \
+                --repository "$GITHUB_REPOSITORY" \
+                --release-id "$RELEASE_ID" \
+                --tag "$TAG" \
+                --version "$VERSION" \
+                --source-sha "$SOURCE_SHA" \
+                --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+                --repo-dir ../tooling \
+                --dev-ref origin/dev
+            then
+              echo "upload failure changed the release descriptor; no quarantine mutation is safe" >&2
+              exit "$status"
+            fi
+            jq -n --rawfile body "$quarantine" \
+              '{draft: true, body: $body}' |
+              gh api --method PATCH \
+                "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+                --input - >/dev/null
+            exit "$status"
+          }
+          trap quarantine_upload_failure ERR
+          descriptor=$(../tooling/scripts/resolve-release-descriptor.sh verify \
+            --repo-dir ../tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT")
+          printf '%s\n' "$descriptor" | grep -Fx 'asset_inventory_kind=empty'
+          test "$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --jq '.assets | length')" -eq 0
+          for file in \
+            release-manifest.json \
+            image-index.json \
+            image-inspect.txt \
+            SHA256SUMS
+          do
+            curl --fail-with-body --silent --show-error --location \
+              --request POST \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Content-Type: application/octet-stream' \
+              --data-binary "@$file" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$file" \
+              >/dev/null
+          done
+          trap - ERR
+      - name: Deep-verify resumable release state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLICATION_ROUTE: ${{ steps.admission.outputs.route }}
+        run: |
+          set -euo pipefail
+          if ! tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
+              --repository "$GITHUB_REPOSITORY" \
+              --version "$VERSION" \
+              --tag "$TAG" \
+              --source-sha "$SOURCE_SHA" \
+              --target "$SOURCE_SHA" \
+              --image "$IMAGE"
+          then
+            quarantine="$RUNNER_TEMP/release/verification-quarantine.json"
+            jq -n --arg route "$PUBLICATION_ROUTE" '{
+              status: "quarantined",
+              repairWrites: 0,
+              publicationRoute: $route,
+              reason: "deep release resume verification failed"
+            }' > "$quarantine"
+            release_json="$RUNNER_TEMP/release/deep-failure-release.json"
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$release_json"
+            fingerprint=$(jq -c '
+              [.assets[] | {
+                name, id, size, state, created_at, updated_at, url
+              }] | sort_by(.name)
+            ' "$release_json" | sha256sum | awk '{print $1}')
+            tooling/scripts/revalidate-release-mutation.sh \
+              --repository "$GITHUB_REPOSITORY" \
+              --release-id "$RELEASE_ID" \
+              --tag "$TAG" \
+              --version "$VERSION" \
+              --source-sha "$SOURCE_SHA" \
+              --expected-fingerprint "$fingerprint" \
+              --repo-dir tooling \
+              --dev-ref origin/dev
+            jq -n --rawfile body "$quarantine" \
+              '{draft: true, body: $body}' |
+              gh api --method PATCH \
+                "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+                --input - >/dev/null
+            echo "deep verification failed; release quarantined without repair" >&2
+            exit 1
+          fi
+      - name: Final descriptor and deep admission, then publish last
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_json="$RUNNER_TEMP/release/final-release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$release_json"
+          fingerprint=$(jq -c '
+            [.assets[] | {
+              name, id, size, state, created_at, updated_at, url
+            }] | sort_by(.name)
+          ' "$release_json" | sha256sum | awk '{print $1}')
+          tooling/scripts/revalidate-release-mutation.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --expected-fingerprint "$fingerprint" \
+            --repo-dir tooling \
+            --dev-ref origin/dev
+          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
+            --repository "$GITHUB_REPOSITORY" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --source-sha "$SOURCE_SHA" \
+            --target "$SOURCE_SHA" \
+            --image "$IMAGE"
+          jq -n '{draft: false}' |
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              --input - >/dev/null
       - name: Logout from GHCR
         if: always()
         run: docker logout ghcr.io >/dev/null 2>&1 || true

@@ -37,7 +37,9 @@ grep -Fx "build.version=$VERSION" "$build_info"
 
 if [ -n "$TAG" ]; then
   test "$TAG" = "v$VERSION"
-  test "$(git rev-list -n 1 "$TAG")" = "$SOURCE_SHA"
+  if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+    test "$(git rev-list -n 1 "$TAG")" = "$SOURCE_SHA"
+  fi
   test "$(git show "$SOURCE_SHA:version.json" | jq -r '.version')" = "$VERSION"
 fi
 

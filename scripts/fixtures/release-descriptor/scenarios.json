@@ -1,0 +1,140 @@
+{
+  "emptyCurrent": {
+    "id": 101,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@SOURCE@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": []
+  },
+  "completeCurrent": {
+    "id": 102,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@SOURCE@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": [
+      {"name":"release-manifest.json","id":201,"size":101,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/201"},
+      {"name":"image-index.json","id":202,"size":102,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/202"},
+      {"name":"image-inspect.txt","id":203,"size":103,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/203"},
+      {"name":"SHA256SUMS","id":204,"size":104,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/204"}
+    ]
+  },
+  "oldReachable": {
+    "id": 90,
+    "tag_name": "v1.0.0",
+    "target_commitish": "@OLD@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": []
+  },
+  "wrongSourceCurrentTag": {
+    "id": 103,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@OLD@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": []
+  },
+  "future": {
+    "id": 104,
+    "tag_name": "v1.0.2",
+    "target_commitish": "@TIP@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": []
+  },
+  "partialAssets": {
+    "id": 105,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@SOURCE@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": [
+      {"name":"SHA256SUMS","id":205,"size":20,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/205"}
+    ]
+  },
+  "foreignAssets": {
+    "id": 106,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@SOURCE@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": [
+      {"name":"release-manifest.json","id":211,"size":101,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/211"},
+      {"name":"image-index.json","id":212,"size":102,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/212"},
+      {"name":"image-inspect.txt","id":213,"size":103,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/213"},
+      {"name":"unexpected.txt","id":214,"size":104,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/214"}
+    ]
+  },
+  "unpublishedNonDraft": {
+    "id": 107,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@SOURCE@",
+    "draft": false,
+    "prerelease": false,
+    "published_at": null,
+    "assets": []
+  },
+  "publishedWrongSourceCurrent": {
+    "id": 108,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@OLD@",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-08-10T02:00:00Z",
+    "assets": []
+  },
+  "publishedFuture": {
+    "id": 109,
+    "tag_name": "v1.0.2",
+    "target_commitish": "@TIP@",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-08-10T02:00:00Z",
+    "assets": []
+  },
+  "driftTag": {
+    "id": 102,
+    "tag_name": "v1.0.2",
+    "target_commitish": "@SOURCE@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": []
+  },
+  "driftTarget": {
+    "id": 102,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@OLD@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": []
+  },
+  "driftPublishedState": {
+    "id": 102,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@SOURCE@",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-08-10T02:00:00Z",
+    "assets": []
+  },
+  "driftReleaseId": {
+    "id": 999,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@SOURCE@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": []
+  }
+}
