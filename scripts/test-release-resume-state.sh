@@ -62,9 +62,10 @@ refresh_checksums() {
   fixture=$1
   (
     cd "$fixture/assets"
-    sha256sum 101 | awk '{print $1 "  release-manifest.json"}' > 104
-    sha256sum 102 | awk '{print $1 "  image-index.json"}' >> 104
-    sha256sum 103 | awk '{print $1 "  image-inspect.txt"}' >> 104
+    checksum_file=104
+    sha256sum 101 | awk '{print $1 "  release-manifest.json"}' > "$checksum_file"
+    sha256sum 102 | awk '{print $1 "  image-index.json"}' >> "$checksum_file"
+    sha256sum 103 | awk '{print $1 "  image-inspect.txt"}' >> "$checksum_file"
   )
 }
 
