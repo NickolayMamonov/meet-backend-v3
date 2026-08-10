@@ -163,15 +163,19 @@ jobs:
           set -e
           printf '%s\n' "$result"
           state=$(awk -F= '/^state=/{print $2}' <<<"$result")
+          latest=$(awk -F= '/^latest=/{print $2}' <<<"$result")
           if [ "$status" -eq 42 ]; then
             test -s "$quarantine"
             route=quarantine
           elif [ "$status" -ne 0 ]; then
             exit "$status"
-          elif [ "$ASSET_INVENTORY_KIND" = empty ] && [ "$state" = empty ]; then
+          elif [ "$ASSET_INVENTORY_KIND" = empty ] &&
+               [ "$state" = empty ] &&
+               [ "$latest" = absent ]; then
             route=fresh
           elif [ "$ASSET_INVENTORY_KIND" = complete_unverified ] &&
-               [ "$state" = complete ]; then
+               [ "$state" = complete ] &&
+               [ "$latest" = absent ]; then
             route=resume
           else
             jq -n \
@@ -195,6 +199,15 @@ jobs:
           QUARANTINE_FILE: ${{ steps.admission.outputs.quarantine }}
         run: |
           set -euo pipefail
+          tooling/scripts/revalidate-release-mutation.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --repo-dir tooling \
+            --dev-ref origin/dev
           jq -n --rawfile body "$QUARANTINE_FILE" \
             '{draft: true, body: $body}' |
             gh api --method PATCH \
@@ -231,7 +244,10 @@ jobs:
           set -e
           printf '%s\n' "$result"
           state=$(awk -F= '/^state=/{print $2}' <<<"$result")
-          if [ "$status" -eq 0 ] && [ "$state" = empty ]; then
+          latest=$(awk -F= '/^latest=/{print $2}' <<<"$result")
+          if [ "$status" -eq 0 ] &&
+             [ "$state" = empty ] &&
+             [ "$latest" = absent ]; then
             exit 0
           fi
           if [ "$status" -ne 42 ]; then
@@ -243,6 +259,15 @@ jobs:
             }' > "$quarantine"
           fi
           test -s "$quarantine"
+          tooling/scripts/revalidate-release-mutation.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --repo-dir tooling \
+            --dev-ref origin/dev
           jq -n --rawfile body "$quarantine" \
             '{draft: true, body: $body}' |
             gh api --method PATCH \
@@ -295,6 +320,15 @@ jobs:
           printf '%s\n' "$final_state"
           if [ "$status" -eq 42 ]; then
             test -s "$quarantine"
+            ../tooling/scripts/revalidate-release-mutation.sh \
+              --repository "$GITHUB_REPOSITORY" \
+              --release-id "$RELEASE_ID" \
+              --tag "$TAG" \
+              --version "$VERSION" \
+              --source-sha "$SOURCE_SHA" \
+              --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+              --repo-dir ../tooling \
+              --dev-ref origin/dev
             jq -n --rawfile body "$quarantine" \
               '{draft: true, body: $body}' |
               gh api --method PATCH \
@@ -395,6 +429,19 @@ jobs:
               observedAssets: $assets,
               reason: "exact evidence upload did not complete"
             }' > "$quarantine"
+            if ! ../tooling/scripts/revalidate-release-mutation.sh \
+                --repository "$GITHUB_REPOSITORY" \
+                --release-id "$RELEASE_ID" \
+                --tag "$TAG" \
+                --version "$VERSION" \
+                --source-sha "$SOURCE_SHA" \
+                --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+                --repo-dir ../tooling \
+                --dev-ref origin/dev
+            then
+              echo "upload failure changed the release descriptor; no quarantine mutation is safe" >&2
+              exit "$status"
+            fi
             jq -n --rawfile body "$quarantine" \
               '{draft: true, body: $body}' |
               gh api --method PATCH \
@@ -453,6 +500,22 @@ jobs:
               publicationRoute: $route,
               reason: "deep release resume verification failed"
             }' > "$quarantine"
+            release_json="$RUNNER_TEMP/release/deep-failure-release.json"
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$release_json"
+            fingerprint=$(jq -c '
+              [.assets[] | {
+                name, id, size, state, created_at, updated_at, url
+              }] | sort_by(.name)
+            ' "$release_json" | sha256sum | awk '{print $1}')
+            tooling/scripts/revalidate-release-mutation.sh \
+              --repository "$GITHUB_REPOSITORY" \
+              --release-id "$RELEASE_ID" \
+              --tag "$TAG" \
+              --version "$VERSION" \
+              --source-sha "$SOURCE_SHA" \
+              --expected-fingerprint "$fingerprint" \
+              --repo-dir tooling \
+              --dev-ref origin/dev
             jq -n --rawfile body "$quarantine" \
               '{draft: true, body: $body}' |
               gh api --method PATCH \
@@ -461,7 +524,7 @@ jobs:
             echo "deep verification failed; release quarantined without repair" >&2
             exit 1
           fi
-      - name: Revalidate descriptor before final publication
+      - name: Final descriptor and deep admission, then publish last
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -470,19 +533,18 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$release_json"
           fingerprint=$(jq -c '
             [.assets[] | {
-              name, id, size, created_at, updated_at, url
+              name, id, size, state, created_at, updated_at, url
             }] | sort_by(.name)
           ' "$release_json" | sha256sum | awk '{print $1}')
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
+          tooling/scripts/revalidate-release-mutation.sh \
             --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
             --release-id "$RELEASE_ID" \
             --tag "$TAG" \
             --version "$VERSION" \
             --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$fingerprint")
-          printf '%s\n' "$descriptor" | grep -Fx 'asset_inventory_kind=complete_unverified'
+            --expected-fingerprint "$fingerprint" \
+            --repo-dir tooling \
+            --dev-ref origin/dev
           tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
             --repository "$GITHUB_REPOSITORY" \
             --version "$VERSION" \
@@ -490,11 +552,6 @@ jobs:
             --source-sha "$SOURCE_SHA" \
             --target "$SOURCE_SHA" \
             --image "$IMAGE"
-      - name: Publish last by numeric release ID
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
           jq -n '{draft: false}' |
             gh api --method PATCH \
               "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \

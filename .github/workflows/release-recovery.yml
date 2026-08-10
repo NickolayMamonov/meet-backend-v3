@@ -71,8 +71,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ steps.descriptor.outputs.release_id }}
+          TAG: ${{ steps.descriptor.outputs.tag }}
           VERSION: ${{ steps.descriptor.outputs.version }}
           SOURCE_SHA: ${{ steps.descriptor.outputs.source_sha }}
+          ASSET_INVENTORY_FINGERPRINT: ${{ steps.descriptor.outputs.asset_inventory_fingerprint }}
         run: |
           set -euo pipefail
           quarantine="$RUNNER_TEMP/release-quarantine.json"
@@ -89,6 +91,15 @@ jobs:
           fi
           test -s "$quarantine"
           jq -e '.registryWrites == 0' "$quarantine" >/dev/null
+          scripts/revalidate-release-mutation.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --repo-dir . \
+            --dev-ref origin/dev
           jq -n --rawfile body "$quarantine" \
             '{draft: true, body: $body}' |
             gh api --method PATCH \

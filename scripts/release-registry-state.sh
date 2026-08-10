@@ -35,6 +35,7 @@ present=0
 missing=0
 identity_mismatch=0
 inspection_failure=0
+latest_present=0
 
 inspect_ref() {
   local ref=$1 output digest
@@ -63,9 +64,36 @@ for ref in "${refs[@]}"; do
   inspect_ref "$ref"
 done
 
+latest_output=
+if latest_output=$(docker buildx imagetools inspect "$IMAGE:latest" 2>&1); then
+  printf 'latest=present\n'
+  latest_present=1
+else
+  if grep -Eqi 'manifest unknown|name unknown|repository does not exist|not found' \
+    <<<"$latest_output"; then
+    printf 'latest=absent\n'
+  else
+    printf 'latest=inspection-failed\n'
+    inspection_failure=1
+  fi
+fi
+
 if [ "$inspection_failure" -ne 0 ]; then
   echo "state=inspection-failed"
   exit 1
+fi
+if [ "$latest_present" -ne 0 ]; then
+  {
+    printf '{\n'
+    printf '  "status": "quarantined",\n'
+    printf '  "latestPresent": true,\n'
+    printf '  "registryWrites": 0,\n'
+    printf '  "reason": "latest-alias-is-forbidden"\n'
+    printf '}\n'
+  } > "$QUARANTINE_FILE"
+  echo "state=quarantined"
+  echo "quarantine=$QUARANTINE_FILE"
+  exit 42
 fi
 if [ "$present" -eq 0 ]; then
   echo "state=empty"

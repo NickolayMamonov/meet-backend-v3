@@ -75,6 +75,11 @@ asset/content/evidence failure leave the release draft in place. Quarantine
 notes may be attached to the same numeric release ID, but the workflow never
 repairs, replaces, retags, deletes, or pre-populates registry state.
 
+The registry preflight explicitly inspects `IMAGE:latest` before the lease or
+any GHCR write. Only a confirmed not-found response emits `latest=absent`;
+successful inspection emits a quarantine state, and authentication, network,
+or any other inspection error fails closed as `latest=inspection-failed`.
+
 All pre-write and pre-publication boundaries re-fetch and compare the complete
 descriptor and authority tuple from `origin/dev`. Evidence upload is numeric
 ID-bound, and publication occurs only after the final deep read-only

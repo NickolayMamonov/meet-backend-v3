@@ -206,6 +206,8 @@ require_text 'path: source'
 require_text 'ASSET_INVENTORY_KIND'
 require_text 'complete_unverified'
 require_text 'verify-release-resume-state.sh'
+require_text 'revalidate-release-mutation.sh'
+require_text '[ "$latest" = absent ]'
 require_text 'acquire-release-lease.sh'
 require_text '--platform linux/amd64'
 require_text '--provenance=true'
@@ -241,6 +243,13 @@ alias_count=$(grep -E '^[[:space:]]+--tag "\$IMAGE:' <<<"$WORKFLOW_TEXT" |
   sort -u | wc -l | tr -d '[:space:]')
 [ "$alias_count" -eq 3 ] ||
   fail "release workflow must publish exactly three immutable aliases"
+
+patch_count=$(grep -F 'gh api --method PATCH' <<<"$WORKFLOW_TEXT" |
+  wc -l | tr -d '[:space:]')
+revalidation_count=$(grep -F 'revalidate-release-mutation.sh' <<<"$WORKFLOW_TEXT" |
+  wc -l | tr -d '[:space:]')
+[ "$patch_count" -eq "$revalidation_count" ] ||
+  fail "every release PATCH must have a shared full-descriptor revalidation"
 
 resume_line=$(grep -n 'verify-release-resume-state.sh' <<<"$WORKFLOW_TEXT" |
   tail -1 | cut -d: -f1)
