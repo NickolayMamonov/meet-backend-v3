@@ -223,7 +223,7 @@ jq -e --arg digest "$DIGEST" '
   )] | length) >= 1
 ' "$INDEX" >/dev/null || fail "OCI descriptor evidence is invalid"
 
-grep -Fqx "Digest: $DIGEST" "$ASSET_DIR/image-inspect.txt" ||
+grep -Eq "^Digest:[[:space:]]+$DIGEST$" "$ASSET_DIR/image-inspect.txt" ||
   fail "image inspection digest is inconsistent"
 
 inspect_field() {

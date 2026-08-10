@@ -520,11 +520,14 @@ jobs:
             }' > "$quarantine"
             release_json="$RUNNER_TEMP/release/deep-failure-release.json"
             gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$release_json"
-            fingerprint=$(jq -c '
-              [.assets[] | {
-                name, id, size, state, created_at, updated_at, url
-              }] | sort_by(.name)
-            ' "$release_json" | sha256sum | awk '{print $1}')
+            fingerprint=$(
+              printf '%s' "$(jq -c '
+                [.assets[] | {
+                  name, id, size, state, created_at, updated_at, url
+                }] | sort_by(.name)
+              ' "$release_json")" |
+                sha256sum | awk '{print $1}'
+            )
             tooling/scripts/revalidate-release-mutation.sh \
               --repository "$GITHUB_REPOSITORY" \
               --release-id "$RELEASE_ID" \
@@ -549,11 +552,14 @@ jobs:
           set -euo pipefail
           release_json="$RUNNER_TEMP/release/final-release.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$release_json"
-          fingerprint=$(jq -c '
-            [.assets[] | {
-              name, id, size, state, created_at, updated_at, url
-            }] | sort_by(.name)
-          ' "$release_json" | sha256sum | awk '{print $1}')
+          fingerprint=$(
+            printf '%s' "$(jq -c '
+              [.assets[] | {
+                name, id, size, state, created_at, updated_at, url
+              }] | sort_by(.name)
+            ' "$release_json")" |
+              sha256sum | awk '{print $1}'
+          )
           tooling/scripts/revalidate-release-mutation.sh \
             --repository "$GITHUB_REPOSITORY" \
             --release-id "$RELEASE_ID" \
