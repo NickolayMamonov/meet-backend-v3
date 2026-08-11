@@ -331,6 +331,9 @@ for marker in \
   'draft-string' \
   'prerelease-string' \
   'published-number' \
+  'published-object' \
+  'published-empty' \
+  'published-missing' \
   'published empty assets fail closed' \
   'published malformed assets fail closed' \
   'published wrong assets fail closed' \

@@ -6,4 +6,7 @@
 - [x] Wire resolver suite into CI and bootstrap structural checks.
 - [x] Replace contradictory operations guidance.
 - [x] Run focused and reusable checks; inspect diff and scope.
-- [ ] Commit, push, create/update PR, comment on task, and complete task.
+- [x] Clarify fresh versus completed-predecessor action ref cardinality.
+- [x] Add completed published_at object, empty, and missing-field regressions with bootstrap markers.
+- [x] Re-run focused checks and relevant Gradle verification.
+- [ ] Commit, push, update PR #40, comment on task, and complete task.

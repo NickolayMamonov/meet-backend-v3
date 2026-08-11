@@ -33,10 +33,14 @@ fetches the exact `origin/dev` head, and executes the resolver's read-only
 Please. The explicit `--require-action-authority` profile first proves a
 non-empty credential, the exact authenticated repository identity, and an
 explicit `permissions.push == true` value. It then completes paginated release
-enumeration and proves that the canonical ref is absent before it may emit
-`route=action`. Missing, rejected, under-scoped, malformed, identity-mismatched,
-filtered-empty, incomplete, or API-failing authority state fails before a
-route, Release Please, or any hosted write.
+enumeration. With `ACTIVE=0, COMPLETED=0` (fresh authority), it requires the
+canonical ref to be absent before emitting `route=action`; with
+`ACTIVE=0, COMPLETED=1`, it requires one strictly validated completed
+predecessor and requires the canonical ref to exist and peel exactly to that
+predecessor source before emitting `route=action`. Missing, rejected,
+under-scoped, malformed, identity-mismatched, filtered-empty, incomplete, or
+API-failing authority state fails before a route, Release Please, or any
+hosted write.
 
 The default `pre-action` profile is recovery-only. A single
 current-authority canonical draft or strict GitHub generated

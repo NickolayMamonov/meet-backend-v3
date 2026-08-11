@@ -320,7 +320,8 @@ for publication_case in \
   target-number target-null target-array \
   draft-string draft-number draft-null draft-array \
   prerelease-string prerelease-number prerelease-null prerelease-array \
-  published-number published-boolean published-null published-array; do
+  published-number published-boolean published-null published-array \
+  published-object published-empty published-missing; do
   case "$publication_case" in
     id-string) mutation='.id = "108"' ;;
     id-null) mutation='.id = null' ;;
@@ -343,6 +344,9 @@ for publication_case in \
     published-boolean) mutation='.published_at = false' ;;
     published-null) mutation='.published_at = null' ;;
     published-array) mutation='.published_at = []' ;;
+    published-object) mutation='.published_at = {}' ;;
+    published-empty) mutation='.published_at = ""' ;;
+    published-missing) mutation='del(.published_at)' ;;
   esac
   mutated="$TMP/published-$publication_case.json"
   mutated_array="$TMP/published-$publication_case-array.json"
