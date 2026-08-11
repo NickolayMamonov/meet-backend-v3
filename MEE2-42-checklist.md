@@ -8,7 +8,7 @@
 - [x] Preserve canonical-empty materialize, complete-only deep recovery, lease, assets, aliases,
   attestations, and publish-last contracts.
 - [x] Run focused fixtures and Gradle verification; ShellCheck is unavailable in this environment.
-- [ ] Require ordinary hosted CI.
+- [x] Require ordinary hosted CI; PR checks passed including hosted ShellCheck.
 - [ ] Inspect the reviewed merge-triggered run and hosted release/registry evidence read-only.
 
 ## Rework findings
