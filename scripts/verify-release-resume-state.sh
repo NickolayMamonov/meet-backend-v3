@@ -4,7 +4,7 @@ set -eu
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 
 usage() {
-  echo "usage: $0 <release-id> --repository owner/repo --version x.y.z --tag vX.Y.Z --source-sha sha --target sha --image registry/image [--observed-state canonical|generated_placeholder --observed-tag tag] [--fixture directory]" >&2
+  echo "usage: $0 <release-id> --repository owner/repo --version x.y.z --tag vX.Y.Z --source-sha sha --target sha --image registry/image [--observed-state canonical|generated_placeholder --observed-tag tag] [--release-file path] [--fixture directory]" >&2
   exit 2
 }
 
@@ -23,6 +23,7 @@ SOURCE_SHA=
 TARGET=
 IMAGE=
 FIXTURE=
+RELEASE_FILE=
 OBSERVED_STATE=canonical
 OBSERVED_TAG=
 while [ "$#" -gt 0 ]; do
@@ -36,6 +37,7 @@ while [ "$#" -gt 0 ]; do
     --observed-state) [ "$#" -ge 2 ] || usage; OBSERVED_STATE=$2; shift 2 ;;
     --observed-tag) [ "$#" -ge 2 ] || usage; OBSERVED_TAG=$2; shift 2 ;;
     --fixture) [ "$#" -ge 2 ] || usage; FIXTURE=$2; shift 2 ;;
+    --release-file) [ "$#" -ge 2 ] || usage; RELEASE_FILE=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -69,7 +71,19 @@ if [ -n "$FIXTURE" ]; then
   [ -f "$FIXTURE/tag.json" ] || fail "fixture tag evidence is missing"
   [ -f "$FIXTURE/registry.json" ] || fail "fixture registry evidence is missing"
   [ -f "$FIXTURE/attestation.json" ] || fail "fixture attestation evidence is missing"
-  RELEASE_JSON=$FIXTURE/release.json
+  if [ -n "$RELEASE_FILE" ]; then
+    [ -f "$RELEASE_FILE" ] || fail "release snapshot is missing"
+    jq -e 'type == "object"' "$RELEASE_FILE" >/dev/null ||
+      fail "release snapshot is not a JSON object"
+    RELEASE_JSON=$RELEASE_FILE
+  else
+    RELEASE_JSON=$FIXTURE/release.json
+  fi
+elif [ -n "$RELEASE_FILE" ]; then
+  [ -f "$RELEASE_FILE" ] || fail "release snapshot is missing"
+  jq -e 'type == "object"' "$RELEASE_FILE" >/dev/null ||
+    fail "release snapshot is not a JSON object"
+  RELEASE_JSON=$RELEASE_FILE
 else
   command -v gh >/dev/null 2>&1 || { echo "gh is required in live mode" >&2; exit 2; }
   command -v docker >/dev/null 2>&1 || { echo "docker is required in live mode" >&2; exit 2; }

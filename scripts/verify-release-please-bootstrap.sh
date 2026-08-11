@@ -580,10 +580,52 @@ grep -Fq 'path: source' <<<"$CI_TEXT" ||
 RECOVERY_WORKFLOW=.github/workflows/release-recovery.yml
 require_file "$RECOVERY_WORKFLOW"
 RECOVERY_TEXT=$(sed 's/\r$//' "$RECOVERY_WORKFLOW")
-if [ "$(grep -F 'GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}' \
-    <<<"$WORKFLOW_TEXT" | wc -l | tr -d '[:space:]')" -ne 1 ]; then
-  fail "release workflow must have one dedicated pre-action token expression"
-fi
+PAT_STEP_NAMES=(
+  "Normalize action descriptor with Release Please visibility"
+  "Bind canonical-empty materialize entry (read-only Release Please visibility)"
+  "Bind canonical-empty materialize upload snapshot (read-only Release Please visibility)"
+  "Rebind canonical-empty materialize upload snapshot (read-only Release Please visibility)"
+  "Bind post-upload complete snapshot (read-only Release Please visibility)"
+  "Bind final materialize publication snapshot (read-only Release Please visibility)"
+  "Bind complete deep-recovery entry (read-only Release Please visibility)"
+  "Bind observed recovery asset fingerprint"
+  "Bind generated-placeholder canonicalization snapshot (read-only Release Please visibility)"
+  "Bind canonicalized recovery snapshot (read-only Release Please visibility)"
+  "Bind final deep-recovery publication snapshot (read-only Release Please visibility)"
+)
+step_block() {
+  local name=$1
+  awk -v wanted="$name" '
+    $0 == "      - name: " wanted { found=1; next }
+    found && $0 ~ /^      - name:/ { exit }
+    found && $0 ~ /^  (gates|publish|recovery):/ { exit }
+    found { print }
+  ' <<<"$WORKFLOW_TEXT"
+}
+for pat_step in "${PAT_STEP_NAMES[@]}"; do
+  pat_block=$(step_block "$pat_step")
+  [ -n "$pat_block" ] ||
+    fail "missing named Release Please visibility step: $pat_step"
+  grep -Fq 'GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}' <<<"$pat_block" ||
+    fail "visibility step is not scoped to RELEASE_PLEASE_TOKEN: $pat_step"
+  if grep -Eiq \
+      'gh api --method (PATCH|POST|PUT|DELETE)|uploads\.github\.com|gh release (create|edit|upload)|mutate-release-metadata|docker (build|push|tag)|attest|actions/attest' \
+      <<<"$pat_block"; then
+    fail "Release Please visibility step contains a mutation capability: $pat_step"
+  fi
+  grep -Fq 'sha256sum' <<<"$pat_block" ||
+    fail "visibility step does not bind a digest-checked snapshot: $pat_step"
+done
+pat_step_count=$(
+  grep -F 'GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}' \
+    <<<"$WORKFLOW_TEXT" | wc -l | tr -d '[:space:]'
+)
+[ "$pat_step_count" -eq "$(( ${#PAT_STEP_NAMES[@]} + 1 ))" ] ||
+  fail "release workflow has an unexpected number of PAT capability steps"
+pre_action_token_count=$(grep -F 'GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}' \
+  <<<"$pre_action_block" | wc -l | tr -d '[:space:]')
+[ "$pre_action_token_count" -eq 1 ] ||
+  fail "pre-action authority does not have exactly one step-scoped PAT"
 if [ "$(grep -F 'token: ${{ secrets.RELEASE_PLEASE_TOKEN }}' \
     <<<"$WORKFLOW_TEXT" | wc -l | tr -d '[:space:]')" -ne 1 ]; then
   fail "Release Please must have one dedicated token expression"
@@ -593,6 +635,110 @@ grep -Fq -- '--require-action-authority' <<<"$pre_action_block" ||
 if grep -Fq 'GITHUB_TOKEN' <<<"$pre_action_block"; then
   fail "action-admission pre-action contains a GITHUB_TOKEN fallback"
 fi
+MUTATION_STEP_NAMES=(
+  "Verify admitted materialize snapshot with GITHUB_TOKEN evidence"
+  "Independently verify the numeric draft descriptor from admitted snapshot"
+  "Upload the exact evidence set by numeric release ID"
+  "Verify post-upload snapshot with GITHUB_TOKEN evidence"
+  "Final descriptor and deep admission, then publish last"
+  "Verify admitted deep-recovery snapshot with GITHUB_TOKEN evidence"
+  "Deep-verify observed recovery state"
+  "Canonicalize generated placeholder metadata"
+  "Re-verify canonical draft before publish"
+  "Publish canonical release metadata last"
+)
+for mutation_step in "${MUTATION_STEP_NAMES[@]}"; do
+  mutation_block=$(step_block "$mutation_step")
+  [ -n "$mutation_block" ] ||
+    fail "missing named GITHUB_TOKEN mutation/evidence step: $mutation_step"
+  grep -Fq 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' <<<"$mutation_block" ||
+    fail "mutation/evidence step is not GITHUB_TOKEN-backed: $mutation_step"
+  if grep -Fq 'RELEASE_PLEASE_TOKEN' <<<"$mutation_block"; then
+    fail "mutation/evidence step receives the release PAT: $mutation_step"
+  fi
+  if grep -Eq 'resolve-release-descriptor\.sh|revalidate-release-mutation\.sh' \
+      <<<"$mutation_block" &&
+     ! grep -Fq -- '--release-file "$RELEASE_SNAPSHOT"' <<<"$mutation_block"; then
+    fail "mutation/evidence step performs live release admission: $mutation_step"
+  fi
+done
+while IFS= read -r consumer_name; do
+  [ -n "$consumer_name" ] || continue
+  consumer_block=$(step_block "$consumer_name")
+  if grep -Fq 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' <<<"$consumer_block" &&
+     grep -Fq -- '--release-file "$RELEASE_SNAPSHOT"' <<<"$consumer_block"; then
+    if grep -Fq 'RELEASE_PLEASE_TOKEN' <<<"$consumer_block"; then
+      fail "supplied snapshot consumer receives the release PAT: $consumer_name"
+    fi
+    grep -Fq 'sha256sum "$RELEASE_SNAPSHOT"' <<<"$consumer_block" ||
+      fail "supplied snapshot consumer lacks digest verification: $consumer_name"
+    grep -Fq 'RELEASE_SNAPSHOT_SHA' <<<"$consumer_block" ||
+      fail "supplied snapshot consumer lacks stored digest comparison: $consumer_name"
+  fi
+done < <(
+  awk '
+    /^      - name: / {
+      name=$0
+      sub(/^      - name: /, "", name)
+      print name
+    }
+  ' <<<"$WORKFLOW_TEXT"
+)
+post_lease_visibility_line=$(grep -n \
+  'Rebind canonical-empty materialize upload snapshot' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+upload_line=$(grep -n 'Upload the exact evidence set by numeric release ID' \
+  <<<"$WORKFLOW_TEXT" | head -1 | cut -d: -f1)
+final_materialize_visibility_line=$(grep -n \
+  'Bind final materialize publication snapshot' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+final_materialize_mutation_line=$(grep -n \
+  'Final descriptor and deep admission, then publish last' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+canonicalize_visibility_line=$(grep -n \
+  'Bind generated-placeholder canonicalization snapshot' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+canonicalize_mutation_line=$(grep -n \
+  'Canonicalize generated placeholder metadata' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+final_recovery_visibility_line=$(grep -n \
+  'Bind final deep-recovery publication snapshot' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+final_recovery_mutation_line=$(grep -n \
+  'Publish canonical release metadata last' <<<"$WORKFLOW_TEXT" |
+  head -1 | cut -d: -f1)
+[ -n "$post_lease_visibility_line" ] && [ -n "$upload_line" ] &&
+  [ "$post_lease_visibility_line" -lt "$upload_line" ] ||
+  fail "materialize upload has no fresh post-lease PAT admission"
+adjacent_step_count=$(
+  sed -n "${post_lease_visibility_line},${upload_line}p" <<<"$WORKFLOW_TEXT" |
+    grep -E '^[[:space:]]+- name:' | wc -l | tr -d '[:space:]'
+)
+[ "$adjacent_step_count" -eq 2 ] ||
+  fail "materialize upload PAT admission is not immediately adjacent"
+[ -n "$final_materialize_visibility_line" ] &&
+  [ -n "$final_materialize_mutation_line" ] &&
+  [ "$final_materialize_visibility_line" -lt "$final_materialize_mutation_line" ] ||
+  fail "materialize publication has no immediate PAT admission"
+[ -n "$canonicalize_visibility_line" ] &&
+  [ -n "$canonicalize_mutation_line" ] &&
+  [ "$canonicalize_visibility_line" -lt "$canonicalize_mutation_line" ] ||
+  fail "placeholder canonicalization has no immediate PAT admission"
+[ -n "$final_recovery_visibility_line" ] &&
+  [ -n "$final_recovery_mutation_line" ] &&
+  [ "$final_recovery_visibility_line" -lt "$final_recovery_mutation_line" ] ||
+  fail "deep recovery publication has no immediate PAT admission"
+for snapshot_consumer in \
+  "Deep-verify observed recovery state" \
+  "Canonicalize generated placeholder metadata" \
+  "Re-verify canonical draft before publish" \
+  "Publish canonical release metadata last"; do
+  consumer_block=$(step_block "$snapshot_consumer")
+  grep -Fq 'sha256sum "$RELEASE_SNAPSHOT"' <<<"$consumer_block" ||
+    fail "deep-recovery snapshot consumer lacks digest verification: $snapshot_consumer"
+  grep -Fq 'RELEASE_SNAPSHOT_SHA' <<<"$consumer_block" ||
+    fail "deep-recovery snapshot consumer lacks stored digest comparison: $snapshot_consumer"
+done
 workflow_action_option_count=$(
   grep -R -h --include='*.yml' --include='*.yaml' \
     -- '--require-action-authority' .github/workflows |

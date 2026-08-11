@@ -74,6 +74,15 @@ if [ "$method" != PATCH ]; then
   exit 1
 fi
 jq -c . "$input" >>"$PATCH_LOG"
+if [ "${RESPONSE_DRIFT:-false}" = true ]; then
+  jq --slurpfile patch "$input" \
+    --arg zero "0000000000000000000000000000000000000000" '
+    . + $patch[0] |
+    .target_commitish = $zero |
+    if .draft == false then .published_at = "2026-08-10T02:00:00Z" else . end
+  ' "$RELEASE_FILE"
+  exit 0
+fi
 jq --slurpfile patch "$input" '
   . + $patch[0] |
   if .draft == false then .published_at = "2026-08-10T02:00:00Z" else . end
@@ -164,4 +173,19 @@ if "$MUTATOR" publish "${common[@]}" >/dev/null 2>&1; then
   exit 1
 fi
 [ "$(wc -l <"$PATCH_LOG" | tr -d ' ')" -eq "$patch_count" ]
+
+cp "$TMP/release-original.json" "$RELEASE_FILE"
+jq --arg tag "v1.0.1" '
+  .tag_name = $tag |
+  .name = $tag
+' "$RELEASE_FILE" >"$RELEASE_FILE.next"
+mv "$RELEASE_FILE.next" "$RELEASE_FILE"
+export RESPONSE_DRIFT=true
+before_response_drift=$(wc -l <"$PATCH_LOG" | tr -d ' ')
+if "$MUTATOR" publish "${common[@]}" >/dev/null 2>&1; then
+  echo "mutation-between-boundaries response drift unexpectedly passed" >&2
+  exit 1
+fi
+[ "$(wc -l <"$PATCH_LOG" | tr -d ' ')" -eq $((before_response_drift + 1)) ]
+unset RESPONSE_DRIFT
 echo "release metadata mutation fixtures passed: full payload, notes, postconditions, zero-write suffix and same-name asset drift"

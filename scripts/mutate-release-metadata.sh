@@ -90,14 +90,6 @@ awk -v version="$VERSION" '
   fail "canonical changelog must contain exactly one release section"
 [ -s "$notes" ] || fail "canonical changelog section is empty"
 
-load_release() {
-  if [ -n "$RELEASE_FILE" ]; then
-    jq -c . "$RELEASE_FILE"
-  else
-    gh api "repos/$REPOSITORY/releases/$RELEASE_ID"
-  fi
-}
-
 fingerprint() {
   "$ASSET_INVENTORY_HELPER" fingerprint <<<"$1"
 }
@@ -141,7 +133,15 @@ if [ -z "$RELEASE_FILE" ]; then
   fi
 fi
 
-before=$(load_release) || fail "release descriptor lookup failed"
+if [ -n "$RELEASE_FILE" ]; then
+  [ -f "$RELEASE_FILE" ] || fail "release snapshot is missing"
+  jq -e 'type == "object"' "$RELEASE_FILE" >/dev/null ||
+    fail "release snapshot is not a JSON object"
+  before=$(jq -c . "$RELEASE_FILE")
+else
+  before=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID") ||
+    fail "release descriptor lookup failed"
+fi
 before_fingerprint=$(fingerprint "$before")
 jq -e \
   --argjson id "$RELEASE_ID" \
@@ -188,12 +188,11 @@ jq -n \
     generate_release_notes: false
   }' >"$payload"
 
-gh api --method PATCH \
-    "repos/$REPOSITORY/releases/$RELEASE_ID" \
-    --input "$payload" >/dev/null ||
+after=$(gh api --method PATCH \
+  "repos/$REPOSITORY/releases/$RELEASE_ID" \
+  --input "$payload") ||
   fail "release metadata PATCH failed"
-
-after=$(load_release) || fail "release descriptor re-fetch failed"
+[ -n "$after" ] || fail "release metadata PATCH returned an empty response"
 after_fingerprint=$(fingerprint "$after")
 jq -e \
   --argjson id "$RELEASE_ID" \

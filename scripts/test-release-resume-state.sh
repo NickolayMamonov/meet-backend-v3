@@ -67,6 +67,19 @@ verify_fixture() {
     --fixture "$1"
 }
 
+verify_supplied_fixture() {
+  fixture=$1
+  "$VERIFY" "$RELEASE_ID" \
+    --repository "$REPOSITORY" \
+    --version "$VERSION" \
+    --tag "$TAG" \
+    --source-sha "$SOURCE_SHA" \
+    --target "$TARGET" \
+    --image "$IMAGE" \
+    --fixture "$fixture" \
+    --release-file "$fixture/release.json"
+}
+
 update_json() {
   filter=$1
   file=$2
@@ -193,6 +206,20 @@ valid_output=$(verify_fixture "$VALID")
 [ "$valid_output" = "resume_admission=verified" ]
 [ ! -s "$MUTATION_LOG" ]
 
+supplied_output=$(verify_supplied_fixture "$VALID")
+[ "$supplied_output" = "resume_admission=verified" ]
+[ ! -s "$MUTATION_LOG" ]
+
+supplied_stale="$WORK_DIR/supplied-stale"
+cp -R "$VALID" "$supplied_stale"
+update_json '.target_commitish = "0000000000000000000000000000000000000000"' \
+  "$supplied_stale/release.json"
+if verify_supplied_fixture "$supplied_stale" >/dev/null 2>&1; then
+  echo "stale supplied release snapshot unexpectedly passed" >&2
+  exit 1
+fi
+[ ! -s "$MUTATION_LOG" ]
+
 tag_present_fixture=$(make_case tag-present-valid)
 tag_present_output=$(verify_fixture "$tag_present_fixture")
 [ "$tag_present_output" = "resume_admission=verified" ]
@@ -242,4 +269,4 @@ for case_file in "$FIXTURES"/cases/*.json; do
 done
 
 [ "$failures" -eq 20 ]
-echo "release resume verifier fixtures passed: 3 valid, $failures rejected, 0 mutation commands"
+echo "release resume verifier fixtures passed: 4 valid, $failures rejected, 0 mutation commands"
