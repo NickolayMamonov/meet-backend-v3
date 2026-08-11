@@ -44,15 +44,18 @@ hosted write.
 
 The default `pre-action` profile is recovery-only. A single
 current-authority canonical draft or strict GitHub generated
-`untagged-<20 lowercase hex>` placeholder draft selects recovery; the action is
-skipped and the normalized recovery descriptor is used directly. Zero visible
-candidates fails closed and can never select action. This profile is used by
+`untagged-<20 lowercase hex>` placeholder draft selects a typed publication
+route; the action is skipped and the normalized descriptor is used directly.
+Canonical empty inventory selects `materialize`; canonical or generated-
+placeholder complete inventory selects `deep-recover`. Generated-placeholder
+empty or partial inventory is rejected. Zero visible candidates fails closed
+and can never select action. This profile is used by
 `release-recovery.yml` and `mutate-release-metadata.sh` with the read-only
 `GITHUB_TOKEN`; neither caller receives the release PAT or can authorize
 Release Please. A visible generated placeholder therefore remains a recovery
 state even when the action-admission profile is used.
 
-When Release Please creates no new release, the resolver can recover exactly
+When Release Please creates no new release, the resolver can admit exactly
 one draft only when its numeric release ID, canonical tag/version,
 target/source SHA, draft/unpublished state, source files,
 absent-or-source-identical tag, and asset metadata all match that current
@@ -123,7 +126,7 @@ inventory. Any helper or comparison mismatch stops before metadata mutation;
 there is no fallback digest, dual-digest compatibility mode, or compensating
 write.
 
-The publisher owns the only deep resume admission. For
+The publisher owns the only materialization and deep-resume admissions. For
 `complete_unverified`, it downloads every asset by numeric asset ID into a
 temporary directory, requires exactly `release-manifest.json`,
 `image-index.json`, `image-inspect.txt`, and `SHA256SUMS`, rejects extra,
@@ -134,7 +137,8 @@ for exactly `vVERSION`, `VERSION`, and `sha-SOURCE_SHA`, no `latest`, OCI
 GitHub attestation. Only this read-only sequence emits the ephemeral
 `resume_admission=verified` value.
 
-For `empty`, the publisher requires an empty registry, acquires the existing
+For a `materialize` descriptor with `empty` inventory, the publisher requires
+an empty registry, acquires the existing
 create-only lease, repeats the empty admission, and builds. If an earlier
 attempt completed the immutable registry write but stopped before evidence
 assets were uploaded, the publisher admits the distinct `resume-registry`
@@ -191,6 +195,36 @@ The publication workflow captures the registry inspection exit status under
 or a reviewed artifact, and the job then fails without mutating the release.
 No quarantine JSON is attached to a release and no quarantine note is written.
 
+### Typed admission and the empty-to-complete transition
+
+The resolver emits a deterministic `admission_fingerprint` over the stable
+write-entry fields: publication route, observed state and tag, positive
+numeric release ID, canonical tag/version, source and target SHA, draft and
+prerelease state, null publication time, inventory kind, and inventory
+fingerprint. Diagnostic `origin` is excluded. Therefore a fresh
+`post_action` descriptor may bind to a recovery-only `pre_action` recheck, and
+an existing continuation may bind `pre_action` to `pre_action`, only when
+every stable field and the fingerprint match.
+
+Initial `materialize` admission is canonical and empty only. The execution
+retains that empty proof and revalidates it immediately before the numeric
+asset upload. After exactly four assets are confirmed, the same execution may
+continue only through the resolver-proven transition
+`materialize/empty` to `deep-recover/complete_unverified` with the expected
+complete inventory fingerprint. Release identity and draft state remain
+unchanged. A newly observed complete descriptor is always a new
+`deep-recover` admission and cannot build, push, attest, or upload. Partial,
+foreign, divergent, raced, or uncertain observations quarantine without
+adoption or compensation.
+
+Deep recovery has no direct tag or ref mutation path. For a generated
+placeholder, the canonical ref is proven absent before canonicalization,
+remains absent after same-ID metadata canonicalization, and is proven absent
+again immediately before publication. The final same-ID `draft=false` PATCH is
+the only permitted tag-creating side effect; exact read-only peel verification
+must succeed afterward. Early, divergent, missing, wrong, or uncertain tag
+results fail closed.
+
 BuildKit provenance and SBOM publication is accepted only when the OCI index
 contains at least one subject-bound attestation descriptor and its child
 manifest carries both expected in-toto predicate types
@@ -235,7 +269,8 @@ Please remain the only authorities for release metadata and tags.
 
 For MEE2-39, hosted state remains read-only before the reviewed fix is merged.
 The first merge-triggered run is expected to find the exact v1.1.0 draft
-`368531227` in pre-action and use the ordinary recovery route; operators must
+`368531227` in pre-action and use the canonical-empty `materialize` route;
+operators must
 not edit, delete, recreate, or manually publish that draft. After the reviewed
 merge, inspect read-only evidence for source
 `36ffd11ea4d35147f1df9c1cafa6a330300c1339`, exact tag peeling, one digest,

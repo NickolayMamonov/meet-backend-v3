@@ -122,7 +122,7 @@ if [ -z "$RELEASE_FILE" ]; then
         print
       }' <<<"$authority"
     }
-    [ "$(value route)" = recovery ] &&
+    [ "$(value route)" = deep-recover ] &&
       [ "$(value observed_state)" = generated_placeholder ] &&
       [ "$(value release_id)" = "$RELEASE_ID" ] &&
       [ "$(value observed_tag)" = "$OBSERVED_TAG" ] ||

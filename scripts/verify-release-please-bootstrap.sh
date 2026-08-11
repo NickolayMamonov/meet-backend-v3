@@ -221,6 +221,11 @@ require_text 'scripts/resolve-release-descriptor.sh recover'
 require_text 'scripts/resolve-release-descriptor.sh post-action'
 require_text 'scripts/resolve-release-descriptor.sh verify'
 require_text 'scripts/resolve-release-descriptor.sh pre-action'
+require_text 'admission_fingerprint'
+require_text 'expected-route materialize'
+require_text 'expected-route deep-recover'
+require_text 'Bind canonical-empty materialize entry'
+require_text 'Bind complete deep-recovery entry'
 require_text 'RELEASE_CREATED: ${{ steps.release.outputs.release_created }}'
 require_text 'CREATED_TAG: ${{ steps.release.outputs.tag_name }}'
 require_text 'CREATED_VERSION: ${{ steps.release.outputs.version }}'
@@ -400,13 +405,13 @@ require_text 'Read-only publication verification'
 
 PUBLISH_BLOCK=$(sed -n '/^  publish:/,/^  recovery:/p' <<<"$WORKFLOW_TEXT")
 RECOVERY_BLOCK=$(sed -n '/^  recovery:/,$p' <<<"$WORKFLOW_TEXT")
-grep -Fq "needs.release.outputs.route == 'action'" <<<"$PUBLISH_BLOCK" ||
-  fail "publish job is not action-only"
+grep -Fq "needs.release.outputs.route == 'materialize'" <<<"$PUBLISH_BLOCK" ||
+  fail "publish job is not materialize-only"
 if grep -Fq 'mutate-release-metadata.sh canonicalize' <<<"$PUBLISH_BLOCK"; then
   fail "action-only publish job contains recovery canonicalization"
 fi
-grep -Fq "needs.release.outputs.route == 'recovery'" <<<"$RECOVERY_BLOCK" ||
-  fail "recovery job does not require the recovery route"
+grep -Fq "needs.release.outputs.route == 'deep-recover'" <<<"$RECOVERY_BLOCK" ||
+  fail "recovery job does not require the deep-recover route"
 grep -Fq 'contents: write' <<<"$RECOVERY_BLOCK" ||
   fail "recovery job cannot publish release metadata"
 grep -Fq 'packages: read' <<<"$RECOVERY_BLOCK" ||
@@ -415,6 +420,24 @@ if grep -Eq 'packages: write|attestations: write|id-token: write' \
     <<<"$RECOVERY_BLOCK"; then
   fail "recovery job has package, attestation, or OIDC write permission"
 fi
+for forbidden in \
+  'git push' \
+  'git tag' \
+  'gh release create' \
+  'gh release upload' \
+  'gh api --method POST' \
+  'gh api --method PUT' \
+  'gh api --method DELETE'; do
+  if grep -Fq -- "$forbidden" <<<"$RECOVERY_BLOCK"; then
+    fail "deep recovery contains direct tag/ref or release mutation: $forbidden"
+  fi
+done
+grep -Fq 'recovery-canonical-ref-before' <<<"$RECOVERY_BLOCK" ||
+  fail "generated-placeholder recovery does not prove ref absence before canonicalization"
+grep -Fq 'recovery-canonical-ref-after' <<<"$RECOVERY_BLOCK" ||
+  fail "generated-placeholder recovery does not re-prove ref absence after canonicalization"
+grep -Fq 'recovery-canonical-ref-final' <<<"$RECOVERY_BLOCK" ||
+  fail "generated-placeholder recovery does not prove ref absence before publication"
 if grep -Eiq \
     '(attach|upload)[^.!?]*quarantine JSON' \
     <<<"$(sed 's/\r$//' docs/operations/backend-release-publishing.md)"; then

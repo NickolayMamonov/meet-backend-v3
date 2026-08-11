@@ -4,7 +4,8 @@ set -euo pipefail
 # Contract exercised by this suite:
 #   resolve-release-descriptor.sh pre-action [common resolver options]
 # emits exactly one route:
-#   route=recovery  - one canonical/current generated-placeholder draft exists
+#   route=materialize - one canonical empty draft exists
+#   route=deep-recover - one complete canonical/generated-placeholder draft exists
 #   route=action    - action authority is proven, no candidate exists, and the
 #                     canonical ref is absent
 # Any malformed, conflicting, ambiguous, ref-divergent, or API-unverifiable
@@ -216,6 +217,13 @@ run_case() {
   token=$(jq -r --arg case_name "$case_name" \
     '.cases[$case_name].token // "fixture-token"' "$FIXTURES")
   materialize_case "$case_name" "$releases_file" "$refs_file" "$authority_file"
+  if [ "$expected" = recovery ]; then
+    if [ "$(jq -r '.[0].assets | length' "$releases_file")" -eq 0 ]; then
+      expected=materialize
+    else
+      expected=deep-recover
+    fi
+  fi
   printf '0\n' >"$ACTION_COUNT"
   : >"$WRITE_LOG"
 
@@ -262,7 +270,7 @@ run_case() {
     }
 
     case "$route" in
-      recovery)
+      materialize|deep-recover)
         observed_state=$(jq -r --arg case_name "$case_name" \
           '.cases[$case_name].observedState' "$FIXTURES")
         [ "$(value active "$descriptor")" = true ]
@@ -271,6 +279,16 @@ run_case() {
         [ "$(value tag "$descriptor")" = v1.0.1 ]
         [ "$(value version "$descriptor")" = 1.0.1 ]
         [ "$(value source_sha "$descriptor")" = "$SOURCE" ]
+        expected_kind=$(jq -r '.[0].assets | length' "$releases_file")
+        if [ "$expected_kind" -eq 0 ]; then
+          [ "$route" = materialize ]
+          [ "$(value asset_inventory_kind "$descriptor")" = empty ]
+        else
+          [ "$route" = deep-recover ]
+          [ "$(value asset_inventory_kind "$descriptor")" = complete_unverified ]
+        fi
+        [ "$(value admission_fingerprint "$descriptor")" \
+          != "" ]
         assert_no_action_or_write "$case_name"
         ;;
       action)
