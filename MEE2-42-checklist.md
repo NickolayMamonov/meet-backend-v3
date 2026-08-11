@@ -19,7 +19,7 @@
 - [x] Add supplied resume, stale-state, mutation-between-boundaries, and ordering coverage.
 - [x] Tighten bootstrap assertions to exact named PAT capability blocks.
 - [x] Re-run local focused fixtures, shell syntax, bootstrap, Gradle test/build, and unchanged manual recovery checks.
-- [ ] Re-run local and hosted verification; update PR and implementation result comment.
+- [x] Re-run local and hosted verification; update PR and implementation result comment.
 
 ## Final review findings
 
