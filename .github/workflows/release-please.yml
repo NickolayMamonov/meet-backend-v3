@@ -77,38 +77,91 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
-          CREATED_RELEASE_ID: ${{ steps.release.outputs.release_id }}
           CREATED_TAG: ${{ steps.release.outputs.tag_name }}
           CREATED_VERSION: ${{ steps.release.outputs.version }}
           CREATED_SOURCE_SHA: ${{ steps.release.outputs.sha }}
         run: |
           set -euo pipefail
-          if [ "$RELEASE_CREATED" = true ]; then
-            descriptor=$(scripts/resolve-release-descriptor.sh created \
-              --repository "$GITHUB_REPOSITORY" \
-              --dev-ref origin/dev \
-              --release-id "$CREATED_RELEASE_ID" \
-              --tag "$CREATED_TAG" \
-              --version "$CREATED_VERSION" \
-              --source-sha "$CREATED_SOURCE_SHA")
-          else
-            descriptor=$(scripts/resolve-release-descriptor.sh recover \
-              --repository "$GITHUB_REPOSITORY" \
-              --dev-ref origin/dev)
-          fi
-          printf '%s\n' "$descriptor"
           value() {
             awk -F= -v key="$1" '$1 == key {
               sub(/^[^=]*=/, "")
               print
             }' <<<"$descriptor"
           }
-          echo "route=action" >> "$GITHUB_OUTPUT"
-          for key in active origin observed_state observed_tag release_id tag \
-              version source_sha target_commitish draft published_at \
-              asset_inventory_kind asset_inventory_fingerprint; do
-            echo "$key=$(value "$key")" >> "$GITHUB_OUTPUT"
-          done
+          positive_id() {
+            [[ "$1" =~ ^[1-9][0-9]*$ ]]
+          }
+          authority_fields() {
+            [[ "$(value authority_version)" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            [[ "$(value authority_source_sha)" =~ ^[0-9a-f]{40}$ ]]
+            test "$(value authority_tag)" = "v$(value authority_version)"
+          }
+          authority_tuple() {
+            authority_fields
+            test "$(value tag)" = "$(value authority_tag)"
+            test "$(value version)" = "$(value authority_version)"
+            test "$(value source_sha)" = "$(value authority_source_sha)"
+            test "$(value target_commitish)" = "$(value source_sha)"
+            test "$(value tag)" = "v$(value version)"
+            test "$(value draft)" = true
+            test "$(value published_at)" = null
+          }
+
+          case "$RELEASE_CREATED" in
+            true)
+              descriptor=$(scripts/resolve-release-descriptor.sh post-action \
+                --repository "$GITHUB_REPOSITORY" \
+                --dev-ref origin/dev \
+                --tag "$CREATED_TAG" \
+                --version "$CREATED_VERSION" \
+                --source-sha "$CREATED_SOURCE_SHA")
+              test "$(value active)" = true
+              test "$(value origin)" = post_action
+              positive_id "$(value release_id)"
+              test "$(value tag)" = "$CREATED_TAG"
+              test "$(value version)" = "$CREATED_VERSION"
+              test "$(value source_sha)" = "$CREATED_SOURCE_SHA"
+              authority_tuple
+              ;;
+            false)
+              descriptor=$(scripts/resolve-release-descriptor.sh recover \
+                --repository "$GITHUB_REPOSITORY" \
+                --dev-ref origin/dev)
+              case "$(value active)" in
+                true)
+                  test "$(value origin)" = recovered
+                  positive_id "$(value release_id)"
+                  authority_tuple
+                  ;;
+                false)
+                  case "$(value origin)" in
+                    completed|none) ;;
+                    *) echo "recover returned an invalid inactive origin" >&2; exit 1 ;;
+                  esac
+                  authority_fields
+                  test -z "$(value release_id)"
+                  ;;
+                *) echo "recover returned an invalid active state" >&2; exit 1 ;;
+              esac
+              ;;
+            *)
+              echo "Release Please returned a non-boolean release_created value" >&2
+              exit 1
+              ;;
+          esac
+
+          output_block=$(
+            {
+              echo "route=action"
+              for key in active origin observed_state observed_tag release_id tag \
+                  version source_sha target_commitish draft published_at \
+                  asset_inventory_kind asset_inventory_fingerprint; do
+                echo "$key=$(value "$key")"
+              done
+            }
+          )
+          printf '%s\n' "$output_block" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$descriptor"
 
   gates:
     name: Re-run release gates

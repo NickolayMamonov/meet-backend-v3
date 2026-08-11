@@ -13,6 +13,7 @@ usage() {
   cat >&2 <<'EOF'
 usage:
   resolve-release-descriptor.sh created --release-id ID --tag TAG --version VERSION --source-sha SHA [options]
+  resolve-release-descriptor.sh post-action --tag TAG --version VERSION --source-sha SHA [options]
   resolve-release-descriptor.sh recover [options]
   resolve-release-descriptor.sh pre-action [options]
   resolve-release-descriptor.sh verify --release-id ID --tag TAG --version VERSION --source-sha SHA --asset-inventory-fingerprint SHA256 [options]
@@ -38,7 +39,7 @@ command -v jq >/dev/null 2>&1 || fail "jq is required"
 MODE=$1
 shift
 case "$MODE" in
-  created|recover|pre-action|verify) ;;
+  created|post-action|recover|pre-action|verify) ;;
   *) usage ;;
 esac
 
@@ -55,6 +56,8 @@ EXPECTED_TAG=
 EXPECTED_VERSION=
 EXPECTED_SOURCE=
 EXPECTED_FINGERPRINT=
+RELEASE_ID_OPTION=false
+RELEASE_FILE_OPTION=false
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -62,11 +65,21 @@ while [ "$#" -gt 0 ]; do
     --dev-ref) [ "$#" -ge 2 ] || usage; DEV_REF=$2; shift 2 ;;
     --repository) [ "$#" -ge 2 ] || usage; REPOSITORY=$2; shift 2 ;;
     --repository-file) [ "$#" -ge 2 ] || usage; REPOSITORY_FILE=$2; shift 2 ;;
-    --release-file) [ "$#" -ge 2 ] || usage; RELEASE_FILE=$2; shift 2 ;;
+    --release-file)
+      [ "$#" -ge 2 ] || usage
+      RELEASE_FILE=$2
+      RELEASE_FILE_OPTION=true
+      shift 2
+      ;;
     --releases-file) [ "$#" -ge 2 ] || usage; RELEASES_FILE=$2; shift 2 ;;
     --refs-file) [ "$#" -ge 2 ] || usage; REFS_FILE=$2; shift 2 ;;
     --require-action-authority) REQUIRE_ACTION_AUTHORITY=true; shift ;;
-    --release-id) [ "$#" -ge 2 ] || usage; EXPECTED_ID=$2; shift 2 ;;
+    --release-id)
+      [ "$#" -ge 2 ] || usage
+      EXPECTED_ID=$2
+      RELEASE_ID_OPTION=true
+      shift 2
+      ;;
     --tag) [ "$#" -ge 2 ] || usage; EXPECTED_TAG=$2; shift 2 ;;
     --version) [ "$#" -ge 2 ] || usage; EXPECTED_VERSION=$2; shift 2 ;;
     --source-sha) [ "$#" -ge 2 ] || usage; EXPECTED_SOURCE=$2; shift 2 ;;
@@ -82,6 +95,9 @@ done
 [ "$MODE" = pre-action ] || [ "$REQUIRE_ACTION_AUTHORITY" = false ] ||
   usage
 [ "$MODE" = pre-action ] || [ -z "$REPOSITORY_FILE" ] ||
+  usage
+[ "$MODE" != post-action ] ||
+  { [ "$RELEASE_ID_OPTION" = false ] && [ "$RELEASE_FILE_OPTION" = false ]; } ||
   usage
 
 git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
@@ -318,6 +334,19 @@ normalize_assets() {
 
 validate_release() {
   local release=$1 id tag target draft prerelease published source_pair tag_target asset_data
+  jq -e '
+    type == "object" and
+    (has("id") and has("tag_name") and has("target_commitish") and
+      has("draft") and has("prerelease") and has("published_at") and
+      has("assets")) and
+    (.id | type == "number" and floor == . and . > 0) and
+    (.tag_name | type == "string") and
+    (.target_commitish | type == "string") and
+    (.draft | type == "boolean") and
+    (.prerelease | type == "boolean") and
+    (.published_at | type == "null")
+  ' <<<"$release" >/dev/null ||
+    fail "release has malformed current-draft field types"
   id=$(jq -r '.id // empty' <<<"$release")
   tag=$(jq -r '.tag_name // empty' <<<"$release")
   target=$(jq -r '.target_commitish // empty' <<<"$release")
@@ -354,6 +383,9 @@ validate_completed_release() {
   local release=$1 id tag target draft prerelease published source_pair tag_target asset_data
   jq -e '
     type == "object" and
+    (has("id") and has("tag_name") and has("target_commitish") and
+      has("draft") and has("prerelease") and has("published_at") and
+      has("assets")) and
     (.id | type == "number" and floor == . and . > 0) and
     (.tag_name | type == "string") and
     (.target_commitish | type == "string") and
@@ -506,8 +538,7 @@ emit_active() {
   }
 }
 
-require_expected_tuple() {
-  [[ "$EXPECTED_ID" =~ ^[1-9][0-9]*$ ]] || usage
+require_expected_authority_tuple() {
   canonical_version "$EXPECTED_VERSION" || usage
   [ "$EXPECTED_TAG" = "v$EXPECTED_VERSION" ] || usage
   [[ "$EXPECTED_SOURCE" =~ ^[0-9a-f]{40}$ ]] || usage
@@ -517,6 +548,28 @@ require_expected_tuple() {
     fail "requested tag does not match current authority"
   [ "$EXPECTED_SOURCE" = "$AUTHORITY_SOURCE" ] ||
     fail "requested source does not match current authority boundary"
+}
+
+require_expected_tuple() {
+  [[ "$EXPECTED_ID" =~ ^[1-9][0-9]*$ ]] || usage
+  require_expected_authority_tuple
+}
+
+is_relevant_release() {
+  local release=$1 tag target
+  jq -e 'type == "object"' <<<"$release" >/dev/null ||
+    fail "release enumeration contains a malformed release item"
+  tag=$(jq -r \
+    'if (.tag_name | type) == "string" then .tag_name else "" end' \
+    <<<"$release")
+  target=$(jq -r \
+    'if (.target_commitish | type) == "string" then .target_commitish else "" end' \
+    <<<"$release")
+  [ "$tag" = "$AUTHORITY_TAG" ] || [ "$target" = "$AUTHORITY_SOURCE" ] ||
+    {
+      [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] &&
+        [ "$(semver_compare "${tag#v}" "$AUTHORITY_VERSION")" -gt 0 ]
+    }
 }
 
 case "$MODE" in
@@ -529,21 +582,33 @@ case "$MODE" in
       fail "created release ID drifted"
     emit_active created "$VALIDATED"
     ;;
+  post-action)
+    require_expected_authority_tuple
+    RELEASES=$(load_releases)
+    ELIGIBLE=()
+    while IFS= read -r release; do
+      is_relevant_release "$release" || continue
+      validated=$(validate_release "$release") ||
+        fail "post-action relevant release failed descriptor validation"
+      ELIGIBLE+=("$validated")
+    done < <(jq -c '.[]' <<<"$RELEASES")
+    [ "${#ELIGIBLE[@]}" -eq 1 ] ||
+      fail "post-action requires exactly one current-authority draft"
+    IFS=$'\t' read -r actual_id actual_tag actual_source _ <<<"${ELIGIBLE[0]}"
+    [[ "$actual_id" =~ ^[1-9][0-9]*$ ]] ||
+      fail "post-action returned a non-positive release ID"
+    [ "$actual_tag" = "$EXPECTED_TAG" ] ||
+      fail "post-action tag does not match the action output"
+    [ "$actual_source" = "$EXPECTED_SOURCE" ] ||
+      fail "post-action source SHA does not match the action output"
+    emit_active post_action "${ELIGIBLE[0]}"
+    ;;
   recover)
     RELEASES=$(load_releases)
     ELIGIBLE=()
     COMPLETED=()
     while IFS= read -r release; do
-      tag=$(jq -r '.tag_name // empty' <<<"$release")
-      target=$(jq -r '.target_commitish // empty' <<<"$release")
-      relevant=false
-      if [ "$tag" = "$AUTHORITY_TAG" ] || [ "$target" = "$AUTHORITY_SOURCE" ]; then
-        relevant=true
-      elif [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] &&
-           [ "$(semver_compare "${tag#v}" "$AUTHORITY_VERSION")" -gt 0 ]; then
-        relevant=true
-      fi
-      [ "$relevant" = true ] || continue
+      is_relevant_release "$release" || continue
       if jq -e '.draft == false and .published_at != null' \
           >/dev/null <<<"$release"; then
         completed=$(validate_completed_release "$release") ||

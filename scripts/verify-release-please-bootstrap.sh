@@ -218,9 +218,18 @@ require_text 'config-file: release-please-config.json'
 # Release Please is the creator/tag authority, while the resolver is the only
 # source of a release descriptor. A draft tag may be absent until publication.
 require_text 'scripts/resolve-release-descriptor.sh recover'
-require_text 'scripts/resolve-release-descriptor.sh created'
+require_text 'scripts/resolve-release-descriptor.sh post-action'
 require_text 'scripts/resolve-release-descriptor.sh verify'
 require_text 'scripts/resolve-release-descriptor.sh pre-action'
+require_text 'RELEASE_CREATED: ${{ steps.release.outputs.release_created }}'
+require_text 'CREATED_TAG: ${{ steps.release.outputs.tag_name }}'
+require_text 'CREATED_VERSION: ${{ steps.release.outputs.version }}'
+require_text 'CREATED_SOURCE_SHA: ${{ steps.release.outputs.sha }}'
+require_text 'case "$RELEASE_CREATED" in'
+require_text 'positive_id "$(value release_id)"'
+require_text 'test -z "$(value release_id)"'
+require_text 'output_block=$('
+require_text 'printf '\''%s\n'\'' "$output_block" >> "$GITHUB_OUTPUT"'
 require_text 'if: steps.pre_action.outputs.route == '\''action'\'''
 require_text 'mutate-release-metadata.sh canonicalize'
 require_text 'mutate-release-metadata.sh publish'
@@ -421,6 +430,22 @@ if grep -Fq 'steps.release.outputs' <<<"$pre_action_block"; then
 fi
 grep -Fq 'steps.release.outputs' <<<"$action_descriptor_block" ||
   fail "action descriptor does not consume Release Please outputs on action route"
+if grep -Fq 'steps.release.outputs.release_id' <<<"$WORKFLOW_TEXT" ||
+   grep -Fq 'CREATED_RELEASE_ID' <<<"$WORKFLOW_TEXT"; then
+  fail "action descriptor relies on the nonexistent Release Please release_id output"
+fi
+if grep -Eiq 'html_url|upload_url|releases\?[^[:space:]]*' \
+    <<<"$action_descriptor_block"; then
+  fail "action descriptor contains URL identity or YAML release enumeration"
+fi
+if [ "$(grep -F '>> "$GITHUB_OUTPUT"' <<<"$action_descriptor_block" |
+    wc -l | tr -d '[:space:]')" -ne 1 ]; then
+  fail "action descriptor does not append its complete output exactly once"
+fi
+grep -Fq 'post-action' <<<"$action_descriptor_block" ||
+  fail "true Release Please results do not use the dedicated post-action resolver"
+grep -Fq 'recover' <<<"$action_descriptor_block" ||
+  fail "false Release Please results do not use recovery"
 action_guard_count=$( (grep -F "if: steps.pre_action.outputs.route == 'action'" \
   <<<"$WORKFLOW_TEXT" || true) | wc -l | tr -d '[:space:]')
 [ "$action_guard_count" -eq 2 ] ||

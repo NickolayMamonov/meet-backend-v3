@@ -22,6 +22,15 @@
       {"name":"SHA256SUMS","id":204,"size":104,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/204"}
     ]
   },
+  "postActionCurrent": {
+    "id": 111,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@SOURCE@",
+    "draft": true,
+    "prerelease": false,
+    "published_at": null,
+    "assets": []
+  },
   "publishedExactCurrent": {
     "id": 110,
     "tag_name": "v1.0.1",
