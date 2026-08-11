@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ASSET_INVENTORY_HELPER=$SCRIPT_DIR/release-asset-inventory.sh
 
 usage() {
-  echo "usage: $0 --repository owner/repo --release-id ID --tag vX.Y.Z --version X.Y.Z --source-sha SHA --expected-fingerprint SHA256 [--expected-route ROUTE] [--expected-admission-fingerprint SHA256] [--repo-dir PATH] [--dev-ref REF]" >&2
+  echo "usage: $0 --repository owner/repo --release-id ID --tag vX.Y.Z --version X.Y.Z --source-sha SHA --expected-fingerprint SHA256 [--expected-route ROUTE] [--expected-admission-fingerprint SHA256] [--release-file PATH] [--repo-dir PATH] [--dev-ref REF]" >&2
   exit 2
 }
 
@@ -24,6 +24,7 @@ EXPECTED_ROUTE=
 EXPECTED_ADMISSION_FINGERPRINT=
 REPO_DIR=.
 DEV_REF=origin/dev
+RELEASE_FILE=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -49,12 +50,19 @@ while [ "$#" -gt 0 ]; do
       ;;
     --repo-dir) [ "$#" -ge 2 ] || usage; REPO_DIR=$2; shift 2 ;;
     --dev-ref) [ "$#" -ge 2 ] || usage; DEV_REF=$2; shift 2 ;;
+    --release-file) [ "$#" -ge 2 ] || usage; RELEASE_FILE=$2; shift 2 ;;
     *) usage ;;
   esac
 done
 
-command -v gh >/dev/null 2>&1 || fail "gh is required"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
+if [ -n "$RELEASE_FILE" ]; then
+  [ -f "$RELEASE_FILE" ] || fail "release snapshot is missing"
+  jq -e 'type == "object"' "$RELEASE_FILE" >/dev/null ||
+    fail "release snapshot is not a JSON object"
+else
+  command -v gh >/dev/null 2>&1 || fail "gh is required"
+fi
 
 [[ "$REPOSITORY" =~ ^[^/]+/[^/]+$ ]] || usage
 [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || usage
@@ -65,13 +73,19 @@ command -v jq >/dev/null 2>&1 || fail "jq is required"
 
 git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   fail "repo-dir is not a Git work tree"
-git -C "$REPO_DIR" fetch --no-tags origin \
-  '+refs/heads/dev:refs/remotes/origin/dev' >/dev/null
+if [ -z "$RELEASE_FILE" ]; then
+  git -C "$REPO_DIR" fetch --no-tags origin \
+    '+refs/heads/dev:refs/remotes/origin/dev' >/dev/null
+fi
 
-release_file=$(mktemp)
-trap 'rm -f "$release_file"' EXIT HUP INT TERM
-gh api "repos/$REPOSITORY/releases/$RELEASE_ID" >"$release_file" ||
-  fail "release descriptor lookup failed"
+if [ -z "$RELEASE_FILE" ]; then
+  release_file=$(mktemp)
+  trap 'rm -f "$release_file"' EXIT HUP INT TERM
+  gh api "repos/$REPOSITORY/releases/$RELEASE_ID" >"$release_file" ||
+    fail "release descriptor lookup failed"
+else
+  release_file=$RELEASE_FILE
+fi
 
 jq -e \
   --argjson id "$RELEASE_ID" \

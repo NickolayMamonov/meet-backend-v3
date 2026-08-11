@@ -104,15 +104,12 @@ mkdir "$TMP/bin"
   echo '#!/bin/sh'
   echo 'set -eu'
   echo 'case "$*" in'
-  echo "*releases/123*) cat \"$RELEASE_FILE\" ;;"
+  echo '*releases/123*) echo "unexpected supplied-mode release lookup" >&2; exit 1 ;;'
   echo '*git/ref/tags/v1.0.1*)'
   echo '  echo "gh: Not Found (HTTP 404)" >&2'
   echo '  exit 1'
   echo '  ;;'
-  echo '*)'
-  echo '  echo "unexpected fixture gh call: $*" >&2'
-  echo '  exit 1'
-  echo '  ;;'
+  echo '*) echo "unexpected supplied-mode gh call: $*" >&2; exit 1 ;;'
   echo 'esac'
 } >"$TMP/bin/gh"
 chmod +x "$TMP/bin/gh"
@@ -126,6 +123,7 @@ output=$(
     --version 1.0.1 \
     --source-sha "$SOURCE_SHA" \
     --expected-fingerprint "$fingerprint" \
+    --release-file "$RELEASE_FILE" \
     --repo-dir "$REPO" \
     --dev-ref origin/dev
 )

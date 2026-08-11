@@ -42,6 +42,26 @@ under-scoped, malformed, identity-mismatched, filtered-empty, incomplete, or
 API-failing authority state fails before a route, Release Please, or any
 hosted write.
 
+### Resolver visibility and mutation credentials
+
+Automatic release jobs use two explicit capability domains. Named
+`RELEASE_PLEASE_TOKEN` steps are read-only resolver visibility boundaries:
+they enumerate or bind the numeric release, validate the immutable
+source/tag/version/route tuple, and write only an exact JSON snapshot below
+`$RUNNER_TEMP`. Each snapshot is validated immediately, hashed with SHA-256,
+and consumed only in the same job. It is not logged, uploaded, placed in an
+artifact, or used as a credential. Supplied snapshot modes never perform a
+fallback release lookup.
+
+Separate `GITHUB_TOKEN` steps consume the digest-checked snapshot for registry,
+asset, checksum, attestation, tag, and runtime evidence, and for the existing
+metadata mutation and publication operations. The job permissions and all
+mutation authority remain unchanged. A GITHUB-token step must not rediscover a
+draft after a visibility boundary; missing, altered, stale, wrong-ID, or
+route/fingerprint-mismatched snapshots fail closed before mutation. The pinned
+Release Please action remains the only explicit PAT mutation-authority
+exception, and the manual recovery workflow remains unchanged and PAT-free.
+
 The default `pre-action` profile is recovery-only. A single
 current-authority canonical draft or strict GitHub generated
 `untagged-<20 lowercase hex>` placeholder draft selects a typed publication

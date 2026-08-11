@@ -580,10 +580,43 @@ grep -Fq 'path: source' <<<"$CI_TEXT" ||
 RECOVERY_WORKFLOW=.github/workflows/release-recovery.yml
 require_file "$RECOVERY_WORKFLOW"
 RECOVERY_TEXT=$(sed 's/\r$//' "$RECOVERY_WORKFLOW")
-if [ "$(grep -F 'GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}' \
-    <<<"$WORKFLOW_TEXT" | wc -l | tr -d '[:space:]')" -ne 1 ]; then
-  fail "release workflow must have one dedicated pre-action token expression"
-fi
+PAT_STEP_NAMES=(
+  "Normalize action descriptor with Release Please visibility"
+  "Bind canonical-empty materialize entry (read-only Release Please visibility)"
+  "Bind post-upload complete snapshot (read-only Release Please visibility)"
+  "Bind complete deep-recovery entry (read-only Release Please visibility)"
+  "Bind observed recovery asset fingerprint"
+  "Bind canonicalized recovery snapshot (read-only Release Please visibility)"
+)
+step_block() {
+  local name=$1
+  awk -v wanted="$name" '
+    $0 == "      - name: " wanted { found=1; next }
+    found && $0 ~ /^      - name:/ { exit }
+    found && $0 ~ /^  (gates|publish|recovery):/ { exit }
+    found { print }
+  ' <<<"$WORKFLOW_TEXT"
+}
+for pat_step in "${PAT_STEP_NAMES[@]}"; do
+  pat_block=$(step_block "$pat_step")
+  [ -n "$pat_block" ] ||
+    fail "missing named Release Please visibility step: $pat_step"
+  grep -Fq 'GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}' <<<"$pat_block" ||
+    fail "visibility step is not scoped to RELEASE_PLEASE_TOKEN: $pat_step"
+  if grep -Eiq \
+      'gh api --method (PATCH|POST|PUT|DELETE)|uploads\.github\.com|gh release (create|edit|upload)|mutate-release-metadata|docker (build|push|tag)|attest|actions/attest' \
+      <<<"$pat_block"; then
+    fail "Release Please visibility step contains a mutation capability: $pat_step"
+  fi
+  grep -Fq 'sha256sum' <<<"$pat_block" ||
+    fail "visibility step does not bind a digest-checked snapshot: $pat_step"
+done
+pat_step_count=$(
+  grep -F 'GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}' \
+    <<<"$WORKFLOW_TEXT" | wc -l | tr -d '[:space:]'
+)
+[ "$pat_step_count" -ge "${#PAT_STEP_NAMES[@]}" ] ||
+  fail "release workflow is missing named step-scoped visibility capabilities"
 if [ "$(grep -F 'token: ${{ secrets.RELEASE_PLEASE_TOKEN }}' \
     <<<"$WORKFLOW_TEXT" | wc -l | tr -d '[:space:]')" -ne 1 ]; then
   fail "Release Please must have one dedicated token expression"
@@ -592,6 +625,11 @@ grep -Fq -- '--require-action-authority' <<<"$pre_action_block" ||
   fail "only the Release Please pre-action must request action admission"
 if grep -Fq 'GITHUB_TOKEN' <<<"$pre_action_block"; then
   fail "action-admission pre-action contains a GITHUB_TOKEN fallback"
+fi
+if grep -Eq 'resolve-release-descriptor\.sh (pre-action|verify|recover|post-action)|revalidate-release-mutation\.sh' \
+    <<<"$(sed -n '/GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}/,/^      - name:/p' <<<"$WORKFLOW_TEXT")" &&
+   ! grep -Fq -- '--release-file "$RELEASE_SNAPSHOT"' <<<"$WORKFLOW_TEXT"; then
+  fail "a GITHUB_TOKEN capability performs live release discovery without an admitted snapshot"
 fi
 workflow_action_option_count=$(
   grep -R -h --include='*.yml' --include='*.yaml' \
