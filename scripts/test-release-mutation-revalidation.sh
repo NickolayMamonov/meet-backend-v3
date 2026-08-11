@@ -130,4 +130,23 @@ output=$(
 
 grep -Fx 'mutation_admission=verified' <<<"$output"
 grep -Fx "asset_inventory_fingerprint=$fingerprint" <<<"$output"
+
+cp "$RELEASE_FILE" "$TMP/release-snapshot-original.json"
+jq '.target_commitish = "0000000000000000000000000000000000000000"' \
+  "$RELEASE_FILE" >"$RELEASE_FILE.next"
+mv "$RELEASE_FILE.next" "$RELEASE_FILE"
+if PATH="$TMP/bin:$PATH" "$REVALIDATOR" \
+    --repository fixture/repo \
+    --release-id 123 \
+    --tag v1.0.1 \
+    --version 1.0.1 \
+    --source-sha "$SOURCE_SHA" \
+    --expected-fingerprint "$fingerprint" \
+    --release-file "$RELEASE_FILE" \
+    --repo-dir "$REPO" \
+    --dev-ref origin/dev >/dev/null 2>&1; then
+  echo "stale supplied release snapshot unexpectedly passed" >&2
+  exit 1
+fi
+mv "$TMP/release-snapshot-original.json" "$RELEASE_FILE"
 echo "release mutation revalidation fingerprint regression passed"

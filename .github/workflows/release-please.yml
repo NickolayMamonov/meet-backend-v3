@@ -440,6 +440,56 @@ jobs:
           jq -c . "$quarantine" >> "$GITHUB_STEP_SUMMARY"
           echo "registry changed after lease; no release mutation was attempted" >&2
           exit 1
+      - name: Bind canonical-empty materialize upload snapshot (read-only Release Please visibility)
+        if: steps.admission.outputs.route == 'fresh' ||
+            steps.admission.outputs.route == 'resume-registry'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git -C tooling fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev)
+          value() {
+            awk -F= -v key="$1" '$1 == key {
+              sub(/^[^=]*=/, "")
+              print
+            }' <<<"$descriptor"
+          }
+          test "$(value route)" = materialize
+          test "$(value active)" = true
+          test "$(value observed_state)" = canonical
+          test "$(value observed_tag)" = "$TAG"
+          test "$(value release_id)" = "$RELEASE_ID"
+          test "$(value tag)" = "$TAG"
+          test "$(value version)" = "$VERSION"
+          test "$(value source_sha)" = "$SOURCE_SHA"
+          test "$(value target_commitish)" = "$SOURCE_SHA"
+          test "$(value draft)" = true
+          test "$(value published_at)" = null
+          test "$(value asset_inventory_kind)" = empty
+          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
+          release_json="$RUNNER_TEMP/release/materialize-upload.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --asset-inventory-fingerprint "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT" \
+            --expected-route materialize \
+            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
+            --release-file "$release_json")
+          grep -Fx 'asset_inventory_kind=empty' <<<"$descriptor"
+          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
+          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
+          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
       - name: Build or resume exactly three aliases
         if: steps.admission.outputs.route == 'fresh' ||
             steps.admission.outputs.route == 'resume-registry'
@@ -701,6 +751,59 @@ jobs:
             --target "$SOURCE_SHA" \
             --image "$IMAGE" \
             --release-file "$RELEASE_SNAPSHOT"
+      - name: Bind final materialize publication snapshot (read-only Release Please visibility)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git -C tooling fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev)
+          value() {
+            awk -F= -v key="$1" '$1 == key {
+              sub(/^[^=]*=/, "")
+              print
+            }' <<<"$descriptor"
+          }
+          test "$(value route)" = deep-recover
+          test "$(value active)" = true
+          test "$(value observed_state)" = canonical
+          test "$(value observed_tag)" = "$TAG"
+          test "$(value release_id)" = "$RELEASE_ID"
+          test "$(value tag)" = "$TAG"
+          test "$(value version)" = "$VERSION"
+          test "$(value source_sha)" = "$SOURCE_SHA"
+          test "$(value target_commitish)" = "$SOURCE_SHA"
+          test "$(value draft)" = true
+          test "$(value published_at)" = null
+          test "$(value asset_inventory_kind)" = complete_unverified
+          release_json="$RUNNER_TEMP/release/materialize-final.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --expected-route deep-recover \
+            --release-file "$release_json")
+          grep -Fx 'asset_inventory_kind=complete_unverified' <<<"$descriptor"
+          final_admission_fingerprint=$(awk -F= '$1 == "admission_fingerprint" {
+            sub(/^[^=]*=/, "")
+            print
+          }' <<<"$descriptor")
+          [[ "$final_admission_fingerprint" =~ ^[0-9a-f]{64}$ ]]
+          echo "FINAL_ADMISSION_FINGERPRINT=$final_admission_fingerprint" \
+            >>"$GITHUB_ENV"
+          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
+          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
+          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
       - name: Final descriptor and deep admission, then publish last
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -734,6 +837,7 @@ jobs:
             --source-sha "$SOURCE_SHA" \
             --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
             --expected-route deep-recover \
+            --expected-admission-fingerprint "$FINAL_ADMISSION_FINGERPRINT" \
             --repo-dir tooling \
             --dev-ref origin/dev \
             --release-file "$RELEASE_SNAPSHOT"
@@ -928,12 +1032,62 @@ jobs:
           snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
           echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
           echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
+      - name: Bind generated-placeholder canonicalization snapshot (read-only Release Please visibility)
+        if: env.OBSERVED_STATE == 'generated_placeholder'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git -C tooling fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev)
+          value() {
+            awk -F= -v key="$1" '$1 == key {
+              sub(/^[^=]*=/, "")
+              print
+            }' <<<"$descriptor"
+          }
+          test "$(value route)" = deep-recover
+          test "$(value active)" = true
+          test "$(value observed_state)" = generated_placeholder
+          test "$(value observed_tag)" = "$OBSERVED_TAG"
+          test "$(value release_id)" = "$RELEASE_ID"
+          test "$(value tag)" = "$TAG"
+          test "$(value version)" = "$VERSION"
+          test "$(value source_sha)" = "$SOURCE_SHA"
+          test "$(value target_commitish)" = "$SOURCE_SHA"
+          test "$(value draft)" = true
+          test "$(value published_at)" = null
+          test "$(value asset_inventory_kind)" = complete_unverified
+          release_json="$RUNNER_TEMP/release/recovery-canonicalize.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --expected-route deep-recover \
+            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
+            --release-file "$release_json")
+          grep -Fx 'observed_state=generated_placeholder' <<<"$descriptor"
+          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
+          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
+          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
       - name: Canonicalize generated placeholder metadata
         if: env.OBSERVED_STATE == 'generated_placeholder'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
+            "$RELEASE_SNAPSHOT_SHA"
           ref_error="$RUNNER_TEMP/recovery-canonical-ref-before"
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
               >/dev/null 2>"$ref_error"; then
@@ -994,6 +1148,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
+            "$RELEASE_SNAPSHOT_SHA"
           tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
             --repository "$GITHUB_REPOSITORY" \
             --version "$VERSION" \
@@ -1002,11 +1158,66 @@ jobs:
             --target "$SOURCE_SHA" \
             --image "$IMAGE" \
             --release-file "$RELEASE_SNAPSHOT"
+      - name: Bind final deep-recovery publication snapshot (read-only Release Please visibility)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git -C tooling fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev)
+          value() {
+            awk -F= -v key="$1" '$1 == key {
+              sub(/^[^=]*=/, "")
+              print
+            }' <<<"$descriptor"
+          }
+          test "$(value route)" = deep-recover
+          test "$(value active)" = true
+          test "$(value observed_state)" = canonical
+          test "$(value observed_tag)" = "$TAG"
+          test "$(value release_id)" = "$RELEASE_ID"
+          test "$(value tag)" = "$TAG"
+          test "$(value version)" = "$VERSION"
+          test "$(value source_sha)" = "$SOURCE_SHA"
+          test "$(value target_commitish)" = "$SOURCE_SHA"
+          test "$(value draft)" = true
+          test "$(value published_at)" = null
+          test "$(value asset_inventory_kind)" = complete_unverified
+          release_json="$RUNNER_TEMP/release/recovery-final.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --expected-route deep-recover \
+            --release-file "$release_json")
+          grep -Fx 'asset_inventory_kind=complete_unverified' <<<"$descriptor"
+          final_admission_fingerprint=$(awk -F= '$1 == "admission_fingerprint" {
+            sub(/^[^=]*=/, "")
+            print
+          }' <<<"$descriptor")
+          [[ "$final_admission_fingerprint" =~ ^[0-9a-f]{64}$ ]]
+          echo "FINAL_ADMISSION_FINGERPRINT=$final_admission_fingerprint" \
+            >>"$GITHUB_ENV"
+          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
+          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
+          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
       - name: Publish canonical release metadata last
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
+            "$RELEASE_SNAPSHOT_SHA"
           fingerprint=$(
             tooling/scripts/release-asset-inventory.sh fingerprint \
               --release-file "$RELEASE_SNAPSHOT"
@@ -1031,6 +1242,7 @@ jobs:
             --source-sha "$SOURCE_SHA" \
             --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
             --expected-route deep-recover \
+            --expected-admission-fingerprint "$FINAL_ADMISSION_FINGERPRINT" \
             --repo-dir tooling \
             --dev-ref origin/dev \
             --release-file "$RELEASE_SNAPSHOT"

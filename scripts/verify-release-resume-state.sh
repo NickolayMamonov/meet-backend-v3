@@ -71,7 +71,14 @@ if [ -n "$FIXTURE" ]; then
   [ -f "$FIXTURE/tag.json" ] || fail "fixture tag evidence is missing"
   [ -f "$FIXTURE/registry.json" ] || fail "fixture registry evidence is missing"
   [ -f "$FIXTURE/attestation.json" ] || fail "fixture attestation evidence is missing"
-  RELEASE_JSON=$FIXTURE/release.json
+  if [ -n "$RELEASE_FILE" ]; then
+    [ -f "$RELEASE_FILE" ] || fail "release snapshot is missing"
+    jq -e 'type == "object"' "$RELEASE_FILE" >/dev/null ||
+      fail "release snapshot is not a JSON object"
+    RELEASE_JSON=$RELEASE_FILE
+  else
+    RELEASE_JSON=$FIXTURE/release.json
+  fi
 elif [ -n "$RELEASE_FILE" ]; then
   [ -f "$RELEASE_FILE" ] || fail "release snapshot is missing"
   jq -e 'type == "object"' "$RELEASE_FILE" >/dev/null ||

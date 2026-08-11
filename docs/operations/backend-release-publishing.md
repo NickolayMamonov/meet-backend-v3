@@ -61,6 +61,11 @@ draft after a visibility boundary; missing, altered, stale, wrong-ID, or
 route/fingerprint-mismatched snapshots fail closed before mutation. The pinned
 Release Please action remains the only explicit PAT mutation-authority
 exception, and the manual recovery workflow remains unchanged and PAT-free.
+Materialize takes a fresh PAT empty-state admission after the create-only
+lease and immediately before evidence upload. Placeholder canonicalization and
+each final publication mutation likewise take a fresh PAT admission immediately
+before the GITHUB_TOKEN mutation boundary, preventing a valid but stale
+snapshot from authorizing a later write.
 
 The default `pre-action` profile is recovery-only. A single
 current-authority canonical draft or strict GitHub generated
