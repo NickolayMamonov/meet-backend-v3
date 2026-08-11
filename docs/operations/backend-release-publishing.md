@@ -33,10 +33,14 @@ fetches the exact `origin/dev` head, and executes the resolver's read-only
 Please. The explicit `--require-action-authority` profile first proves a
 non-empty credential, the exact authenticated repository identity, and an
 explicit `permissions.push == true` value. It then completes paginated release
-enumeration and proves that the canonical ref is absent before it may emit
-`route=action`. Missing, rejected, under-scoped, malformed, identity-mismatched,
-filtered-empty, incomplete, or API-failing authority state fails before a
-route, Release Please, or any hosted write.
+enumeration. With `ACTIVE=0, COMPLETED=0` (fresh authority), it requires the
+canonical ref to be absent before emitting `route=action`; with
+`ACTIVE=0, COMPLETED=1`, it requires one strictly validated completed
+predecessor and requires the canonical ref to exist and peel exactly to that
+predecessor source before emitting `route=action`. Missing, rejected,
+under-scoped, malformed, identity-mismatched, filtered-empty, incomplete, or
+API-failing authority state fails before a route, Release Please, or any
+hosted write.
 
 The default `pre-action` profile is recovery-only. A single
 current-authority canonical draft or strict GitHub generated
@@ -56,6 +60,12 @@ authority tuple. A lower-version draft is ignored when its target predates the
 current boundary, even if it remains reachable from `dev`. Zero unrelated
 candidates is a successful no-publication run; duplicate current drafts and
 relevant-but-unverifiable drafts are errors.
+
+A validated published predecessor is an action-authority state, not a
+recovery state. The pre-action resolver emits `route=action` only when the
+dedicated action credential is positively proven; Release Please then owns
+regeneration of the exact `v1.0.2` draft release PR and its review. The
+read-only recovery profile never receives that route.
 
 The publisher receives the immutable descriptor and reruns CI against the
 exact `source_sha`; the expected release tag is validated independently and is
@@ -195,16 +205,12 @@ whose fetched OCI/referrer graph proves attribution to the image or its
 linux/amd64 subject. Foreign tags, partial aliases, divergent digests,
 unverifiable referrers, API errors, and ambiguity fail closed.
 
-For the hosted recovery run, use
-`scripts/capture-release-pr-fingerprint.sh` to record a sanitized stable
-fingerprint of PR #28 before the merge-triggered run and after it. The
-fingerprint includes the head
-OID/ref, base ref, draft/state fields, title hash, body hash, labels,
-assignees, requested reviewers, and milestone while excluding volatile fields.
-Require exact byte equality between the two normalized JSON files, retain the
-before snapshot in `docs/evidence/release-pr-28-before.json`, retain workflow
-evidence that `pre_action.route=recovery` and the Release Please step was
-skipped, and do not merge or modify PR #28.
+For the hosted predecessor canary, retain evidence that the validated
+predecessor selected `pre_action.route=action`, that the dedicated action
+credential admitted Release Please, and that Release Please regenerated the
+exact `v1.0.2` draft release PR for review. Review the regenerated PR and its
+ordinary CI gates before any publication decision; the resolver and Release
+Please remain the only authorities for release metadata and tags.
 
 Before publication, revert the workflow code normally if verification fails.
 After canonicalization, retry from the same canonical draft. After a PATCH or
