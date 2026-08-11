@@ -75,8 +75,12 @@ if [ "$method" != PATCH ]; then
 fi
 jq -c . "$input" >>"$PATCH_LOG"
 if [ "${RESPONSE_DRIFT:-false}" = true ]; then
-  jq --arg zero "0000000000000000000000000000000000000000" \
-    '.target_commitish = $zero' "$RELEASE_FILE"
+  jq --slurpfile patch "$input" \
+    --arg zero "0000000000000000000000000000000000000000" '
+    . + $patch[0] |
+    .target_commitish = $zero |
+    if .draft == false then .published_at = "2026-08-10T02:00:00Z" else . end
+  ' "$RELEASE_FILE"
   exit 0
 fi
 jq --slurpfile patch "$input" '

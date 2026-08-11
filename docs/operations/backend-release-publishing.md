@@ -274,8 +274,9 @@ ordered boundaries are:
 `scripts/mutate-release-metadata.sh` is the sole release PATCH caller. It
 derives the exact `CHANGELOG.md` section from the fetched source, sends
 `tag_name`, `target_commitish`, `name`, `body`, `draft`, `prerelease`, and
-explicit non-latest metadata, then re-fetches and proves the same ID,
-metadata, publication state, and unchanged four-asset fingerprint. It never
+explicit non-latest metadata, then validates the direct response from that
+single PATCH for the same ID, metadata, publication state, and unchanged
+four-asset fingerprint. It never performs a post-PATCH release GET or
 compensates after an uncertain mutation.
 
 The read-only GHCR inventory uses scoped package-read access. It accepts one

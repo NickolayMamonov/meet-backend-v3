@@ -619,6 +619,56 @@ jobs:
             "oci://$IMAGE@${{ steps.publish-image.outputs.digest }}" \
             --repo "$GITHUB_REPOSITORY"
           sha256sum -c SHA256SUMS
+      - name: Rebind canonical-empty materialize upload snapshot (read-only Release Please visibility)
+        if: steps.admission.outputs.route == 'fresh' ||
+            steps.admission.outputs.route == 'resume-registry'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git -C tooling fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev)
+          value() {
+            awk -F= -v key="$1" '$1 == key {
+              sub(/^[^=]*=/, "")
+              print
+            }' <<<"$descriptor"
+          }
+          test "$(value route)" = materialize
+          test "$(value active)" = true
+          test "$(value observed_state)" = canonical
+          test "$(value observed_tag)" = "$TAG"
+          test "$(value release_id)" = "$RELEASE_ID"
+          test "$(value tag)" = "$TAG"
+          test "$(value version)" = "$VERSION"
+          test "$(value source_sha)" = "$SOURCE_SHA"
+          test "$(value target_commitish)" = "$SOURCE_SHA"
+          test "$(value draft)" = true
+          test "$(value published_at)" = null
+          test "$(value asset_inventory_kind)" = empty
+          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
+          release_json="$RUNNER_TEMP/release/materialize-upload-adjacent.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev \
+            --release-id "$RELEASE_ID" \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --asset-inventory-fingerprint "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT" \
+            --expected-route materialize \
+            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
+            --release-file "$release_json")
+          grep -Fx 'asset_inventory_kind=empty' <<<"$descriptor"
+          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
+          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
+          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
       - name: Upload the exact evidence set by numeric release ID
         if: steps.admission.outputs.route == 'fresh' ||
             steps.admission.outputs.route == 'resume-registry'
@@ -995,6 +1045,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
+            "$RELEASE_SNAPSHOT_SHA"
           test "$SOURCE_SHA" = "$(git -C source rev-parse HEAD)"
           tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
             --repository "$GITHUB_REPOSITORY" \

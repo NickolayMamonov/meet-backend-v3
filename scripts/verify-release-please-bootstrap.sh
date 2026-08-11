@@ -584,6 +584,7 @@ PAT_STEP_NAMES=(
   "Normalize action descriptor with Release Please visibility"
   "Bind canonical-empty materialize entry (read-only Release Please visibility)"
   "Bind canonical-empty materialize upload snapshot (read-only Release Please visibility)"
+  "Rebind canonical-empty materialize upload snapshot (read-only Release Please visibility)"
   "Bind post-upload complete snapshot (read-only Release Please visibility)"
   "Bind final materialize publication snapshot (read-only Release Please visibility)"
   "Bind complete deep-recovery entry (read-only Release Please visibility)"
@@ -661,8 +662,30 @@ for mutation_step in "${MUTATION_STEP_NAMES[@]}"; do
     fail "mutation/evidence step performs live release admission: $mutation_step"
   fi
 done
+while IFS= read -r consumer_name; do
+  [ -n "$consumer_name" ] || continue
+  consumer_block=$(step_block "$consumer_name")
+  if grep -Fq 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' <<<"$consumer_block" &&
+     grep -Fq -- '--release-file "$RELEASE_SNAPSHOT"' <<<"$consumer_block"; then
+    if grep -Fq 'RELEASE_PLEASE_TOKEN' <<<"$consumer_block"; then
+      fail "supplied snapshot consumer receives the release PAT: $consumer_name"
+    fi
+    grep -Fq 'sha256sum "$RELEASE_SNAPSHOT"' <<<"$consumer_block" ||
+      fail "supplied snapshot consumer lacks digest verification: $consumer_name"
+    grep -Fq 'RELEASE_SNAPSHOT_SHA' <<<"$consumer_block" ||
+      fail "supplied snapshot consumer lacks stored digest comparison: $consumer_name"
+  fi
+done < <(
+  awk '
+    /^      - name: / {
+      name=$0
+      sub(/^      - name: /, "", name)
+      print name
+    }
+  ' <<<"$WORKFLOW_TEXT"
+)
 post_lease_visibility_line=$(grep -n \
-  'Bind canonical-empty materialize upload snapshot' <<<"$WORKFLOW_TEXT" |
+  'Rebind canonical-empty materialize upload snapshot' <<<"$WORKFLOW_TEXT" |
   head -1 | cut -d: -f1)
 upload_line=$(grep -n 'Upload the exact evidence set by numeric release ID' \
   <<<"$WORKFLOW_TEXT" | head -1 | cut -d: -f1)
@@ -687,6 +710,12 @@ final_recovery_mutation_line=$(grep -n \
 [ -n "$post_lease_visibility_line" ] && [ -n "$upload_line" ] &&
   [ "$post_lease_visibility_line" -lt "$upload_line" ] ||
   fail "materialize upload has no fresh post-lease PAT admission"
+adjacent_step_count=$(
+  sed -n "${post_lease_visibility_line},${upload_line}p" <<<"$WORKFLOW_TEXT" |
+    grep -E '^[[:space:]]+- name:' | wc -l | tr -d '[:space:]'
+)
+[ "$adjacent_step_count" -eq 2 ] ||
+  fail "materialize upload PAT admission is not immediately adjacent"
 [ -n "$final_materialize_visibility_line" ] &&
   [ -n "$final_materialize_mutation_line" ] &&
   [ "$final_materialize_visibility_line" -lt "$final_materialize_mutation_line" ] ||
@@ -700,6 +729,7 @@ final_recovery_mutation_line=$(grep -n \
   [ "$final_recovery_visibility_line" -lt "$final_recovery_mutation_line" ] ||
   fail "deep recovery publication has no immediate PAT admission"
 for snapshot_consumer in \
+  "Deep-verify observed recovery state" \
   "Canonicalize generated placeholder metadata" \
   "Re-verify canonical draft before publish" \
   "Publish canonical release metadata last"; do

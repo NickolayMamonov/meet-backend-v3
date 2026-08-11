@@ -20,3 +20,10 @@
 - [x] Tighten bootstrap assertions to exact named PAT capability blocks.
 - [x] Re-run local focused fixtures, shell syntax, bootstrap, Gradle test/build, and unchanged manual recovery checks.
 - [ ] Re-run local and hosted verification; update PR and implementation result comment.
+
+## Final review findings
+
+- [x] Add and verify the deep-recovery observed-state snapshot digest check.
+- [x] Make the PAT upload admission directly adjacent to the materialize upload.
+- [x] Ensure response-drift fixtures return a non-empty PATCH response.
+- [x] Correct documentation to describe direct PATCH-response validation.
