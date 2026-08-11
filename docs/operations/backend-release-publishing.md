@@ -67,6 +67,27 @@ dedicated action credential is positively proven; Release Please then owns
 regeneration of the exact `v1.0.2` draft release PR and its review. The
 read-only recovery profile never receives that route.
 
+After Release Please reports `release_created=true`, the workflow does not
+consume a release ID or derive one from a URL. It passes only the official
+`tag_name`, `version`, and `sha` outputs to the resolver's dedicated
+`post-action` mode. That mode recomputes the exact `origin/dev` authority,
+enumerates every release page, strictly validates every current or future
+relevant object, and requires one positive numeric-ID draft whose canonical
+tag, version, lowercase full source SHA, target, state, source files, tag ref,
+and asset inventory all bind to that authority. It emits the existing
+descriptor schema with `origin=post_action`; no output is appended before all
+checks pass.
+
+The action output `release_created` value is an exact Boolean contract. The
+workflow invokes `post-action` only for `true` and the existing `recover` mode
+only for `false`; empty, malformed, or any other value fails closed. A false
+result may return one active `origin=recovered` descriptor with a positive
+numeric ID and exact authority tuple, or an inactive `origin=completed` or
+`origin=none` no-op without a release ID. The route and descriptor are
+appended once, after these returned-shape checks. A missing or duplicate draft,
+wrong tuple, malformed object/page, invalid state, divergent ref, or invalid
+asset inventory produces no partial output and no retry or manual repair.
+
 The publisher receives the immutable descriptor and reruns CI against the
 exact `source_sha`; the expected release tag is validated independently and is
 not checked out before publication. Current workflow tooling is checked out
@@ -211,6 +232,19 @@ credential admitted Release Please, and that Release Please regenerated the
 exact `v1.0.2` draft release PR for review. Review the regenerated PR and its
 ordinary CI gates before any publication decision; the resolver and Release
 Please remain the only authorities for release metadata and tags.
+
+For MEE2-39, hosted state remains read-only before the reviewed fix is merged.
+The first merge-triggered run is expected to find the exact v1.1.0 draft
+`368531227` in pre-action and use the ordinary recovery route; operators must
+not edit, delete, recreate, or manually publish that draft. After the reviewed
+merge, inspect read-only evidence for source
+`36ffd11ea4d35147f1df9c1cafa6a330300c1339`, exact tag peeling, one digest,
+aliases `v1.1.0`, `1.1.0`, and
+`sha-36ffd11ea4d35147f1df9c1cafa6a330300c1339`, no `latest`, all four
+evidence assets and checksums, runtime/OCI identity, provenance, SBOM,
+attestation, publish-last ordering, and unchanged immutable v1.0.1. If code
+verification fails, use a reviewed code-only rollback; never repair hosted
+release, tag, asset, or GHCR state manually.
 
 Before publication, revert the workflow code normally if verification fails.
 After canonicalization, retry from the same canonical draft. After a PATCH or

@@ -158,6 +158,7 @@ BASE="$TMP/base"
 make_valid_repo "$BASE"
 EMPTY="$TMP/empty.json"
 COMPLETE="$TMP/complete.json"
+POST_ACTION="$TMP/post-action.json"
 OLD_RELEASE="$TMP/old.json"
 WRONG="$TMP/wrong.json"
 FUTURE="$TMP/future.json"
@@ -172,6 +173,7 @@ DRIFT_PUBLISHED="$TMP/drift-published.json"
 DRIFT_ID="$TMP/drift-id.json"
 materialize emptyCurrent "$EMPTY"
 materialize completeCurrent "$COMPLETE"
+materialize postActionCurrent "$POST_ACTION"
 materialize oldReachable "$OLD_RELEASE"
 materialize wrongSourceCurrentTag "$WRONG"
 materialize future "$FUTURE"
@@ -192,6 +194,7 @@ refs_matching "$MATCHING"
 refs_conflicting "$CONFLICTING"
 EMPTY_ARRAY="$TMP/empty-array.json"
 COMPLETE_ARRAY="$TMP/complete-array.json"
+POST_ACTION_ARRAY="$TMP/post-action-array.json"
 OLD_ARRAY="$TMP/old-array.json"
 OLD_CURRENT_ARRAY="$TMP/old-current-array.json"
 WRONG_ARRAY="$TMP/wrong-array.json"
@@ -210,6 +213,7 @@ PUBLISHED_WRONG_ASSETS="$TMP/published-wrong-assets.json"
 PUBLISHED_DUPLICATE_ASSETS="$TMP/published-duplicate-assets.json"
 make_array "$EMPTY_ARRAY" "$EMPTY"
 make_array "$COMPLETE_ARRAY" "$COMPLETE"
+make_array "$POST_ACTION_ARRAY" "$POST_ACTION"
 make_array "$OLD_ARRAY" "$OLD_RELEASE"
 make_array "$OLD_CURRENT_ARRAY" "$OLD_RELEASE" "$EMPTY"
 make_array "$WRONG_ARRAY" "$WRONG"
@@ -240,6 +244,8 @@ refs_unsupported_object "$REFS_UNSUPPORTED"
 refs_divergent_peeled_object "$REFS_DIVERGENT_PEELED"
 refs_malformed_peeled_object "$REFS_MALFORMED_PEELED"
 refs_overdeep_peeled_object "$REFS_OVERDEEP"
+NO_CANDIDATES="$TMP/no-candidates.json"
+printf '[]\n' >"$NO_CANDIDATES"
 
 common=(--repo-dir "$BASE" --dev-ref HEAD --refs-file "$ABSENT")
 expect_success "created draft without materialized tag" \
@@ -247,9 +253,122 @@ expect_success "created draft without materialized tag" \
   --release-id 101 --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
   --release-file "$EMPTY" "${common[@]}"
 
+POST_ACTION_OUTPUT=$("$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$POST_ACTION_ARRAY" "${common[@]}")
+if grep -Fx 'active=true' <<<"$POST_ACTION_OUTPUT" >/dev/null &&
+   grep -Fx 'origin=post_action' <<<"$POST_ACTION_OUTPUT" >/dev/null &&
+   grep -Fx 'release_id=111' <<<"$POST_ACTION_OUTPUT" >/dev/null &&
+   grep -Fx "source_sha=$SOURCE" <<<"$POST_ACTION_OUTPUT" >/dev/null &&
+   ! grep -q '^route=' <<<"$POST_ACTION_OUTPUT"; then
+  echo "ok - post-action resolves one exact draft identity"
+  pass=$((pass + 1))
+else
+  echo "not ok - post-action did not emit the bound active descriptor" >&2
+  echo "$POST_ACTION_OUTPUT" >&2
+  failures=$((failures + 1))
+fi
+
+expect_failure "post-action rejects release ID input" "$RESOLVER" post-action \
+  --release-id 111 --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$POST_ACTION_ARRAY" "${common[@]}"
+expect_failure "post-action rejects release file input" "$RESOLVER" post-action \
+  --release-file "$POST_ACTION" \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$POST_ACTION_ARRAY" "${common[@]}"
+expect_failure "post-action rejects noncanonical action tuple" "$RESOLVER" post-action \
+  --tag v01.0.1 --version 01.0.1 --source-sha "$SOURCE" \
+  --releases-file "$POST_ACTION_ARRAY" "${common[@]}"
+expect_failure "post-action rejects action tuple source mismatch" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$OLD" \
+  --releases-file "$POST_ACTION_ARRAY" "${common[@]}"
+expect_failure "post-action rejects action tuple tag mismatch" "$RESOLVER" post-action \
+  --tag v1.0.2 --version 1.0.2 --source-sha "$SOURCE" \
+  --releases-file "$POST_ACTION_ARRAY" "${common[@]}"
+expect_success "post-action accepts source-identical materialized tag" \
+  '^origin=post_action$' "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$POST_ACTION_ARRAY" \
+  --repo-dir "$BASE" --dev-ref HEAD --refs-file "$MATCHING"
+expect_failure "post-action zero candidates fails closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$NO_CANDIDATES" "${common[@]}"
+expect_failure "post-action duplicate drafts fail closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$DUPLICATE_ARRAY" "${common[@]}"
+expect_failure "post-action wrong-source draft fails closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$WRONG_ARRAY" "${common[@]}"
+expect_failure "post-action future conflict fails closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$FUTURE_ARRAY" "${common[@]}"
+expect_failure "post-action non-draft state fails closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$NON_DRAFT_ARRAY" "${common[@]}"
+expect_failure "post-action published state fails closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$PUBLISHED_EXACT_ARRAY" "${common[@]}"
+expect_failure "post-action partial assets fail closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$PARTIAL_ARRAY" "${common[@]}"
+expect_failure "post-action foreign assets fail closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$FOREIGN_ARRAY" "${common[@]}"
+expect_failure "post-action conflicting peeled ref fails closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$POST_ACTION_ARRAY" \
+  --repo-dir "$BASE" --dev-ref HEAD --refs-file "$CONFLICTING"
+expect_failure "post-action malformed peeled ref fails closed" "$RESOLVER" post-action \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --releases-file "$POST_ACTION_ARRAY" \
+  --repo-dir "$BASE" --dev-ref HEAD --refs-file "$REFS_MALFORMED"
+
+POST_ACTION_LIVE="$TMP/post-action-pages.json"
+mkdir "$TMP/post-action-bin"
+jq -n --slurpfile current "$POST_ACTION" --slurpfile old "$OLD_RELEASE" \
+  '[[$current[0]],[$old[0]]]' >"$POST_ACTION_LIVE"
+cat >"$TMP/post-action-bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+endpoint=${!#}
+case "$endpoint" in
+  repos/fixture/repository/releases*) cat "$POST_ACTION_LIVE" ;;
+  *) echo "unexpected post-action API endpoint: $endpoint" >&2; exit 1 ;;
+esac
+EOF
+chmod +x "$TMP/post-action-bin/gh"
+export POST_ACTION_LIVE
+expect_success "post-action enumerates every live page" \
+  '^origin=post_action$' env PATH="$TMP/post-action-bin:$PATH" \
+  "$RESOLVER" post-action \
+  --repository fixture/repository \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --repo-dir "$BASE" --dev-ref HEAD --refs-file "$ABSENT"
+printf '[null]\n' >"$POST_ACTION_LIVE"
+expect_failure "post-action malformed page fails closed" env \
+  PATH="$TMP/post-action-bin:$PATH" "$RESOLVER" post-action \
+  --repository fixture/repository \
+  --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --repo-dir "$BASE" --dev-ref HEAD --refs-file "$ABSENT"
+
 expect_success "recovered empty draft" \
   '^asset_inventory_kind=empty$' "$RESOLVER" recover \
   --releases-file "$EMPTY_ARRAY" "${common[@]}"
+RECOVERED_FALSE_OUTPUT=$("$RESOLVER" recover \
+  --releases-file "$EMPTY_ARRAY" "${common[@]}")
+if grep -Fx 'active=true' <<<"$RECOVERED_FALSE_OUTPUT" >/dev/null &&
+   grep -Fx 'origin=recovered' <<<"$RECOVERED_FALSE_OUTPUT" >/dev/null &&
+   grep -Fx 'release_id=101' <<<"$RECOVERED_FALSE_OUTPUT" >/dev/null &&
+   grep -Fx "tag=v1.0.1" <<<"$RECOVERED_FALSE_OUTPUT" >/dev/null &&
+   grep -Fx "version=1.0.1" <<<"$RECOVERED_FALSE_OUTPUT" >/dev/null &&
+   grep -Fx "source_sha=$SOURCE" <<<"$RECOVERED_FALSE_OUTPUT" >/dev/null; then
+  echo "ok - false-branch active recovery shape is exact"
+  pass=$((pass + 1))
+else
+  echo "not ok - false-branch active recovery shape drifted" >&2
+  echo "$RECOVERED_FALSE_OUTPUT" >&2
+  failures=$((failures + 1))
+fi
 
 COMPLETE_RECOVERY_OUTPUT=$("$RESOLVER" recover \
   --releases-file "$COMPLETE_ARRAY" "${common[@]}")
@@ -393,7 +512,8 @@ COMPLETED_CONTROL_OUTPUT=$("$RESOLVER" recover \
   --releases-file "$PUBLISHED_EXACT_ARRAY" \
   --repo-dir "$BASE" --dev-ref HEAD --refs-file "$MATCHING")
 if grep -Fx 'active=false' <<<"$COMPLETED_CONTROL_OUTPUT" >/dev/null &&
-   grep -Fx 'origin=completed' <<<"$COMPLETED_CONTROL_OUTPUT" >/dev/null; then
+   grep -Fx 'origin=completed' <<<"$COMPLETED_CONTROL_OUTPUT" >/dev/null &&
+   ! grep -q '^release_id=' <<<"$COMPLETED_CONTROL_OUTPUT"; then
   echo "ok - exact published authority tuple is a completed no-op"
   pass=$((pass + 1))
 else
@@ -402,11 +522,21 @@ else
   failures=$((failures + 1))
 fi
 
-NO_CANDIDATES="$TMP/no-candidates.json"
-printf '[]\n' >"$NO_CANDIDATES"
 expect_success "zero candidates is an unrelated no-op" \
   '^active=false$' "$RESOLVER" recover \
   --releases-file "$NO_CANDIDATES" "${common[@]}"
+NO_CANDIDATE_OUTPUT=$("$RESOLVER" recover \
+  --releases-file "$NO_CANDIDATES" "${common[@]}")
+if grep -Fx 'active=false' <<<"$NO_CANDIDATE_OUTPUT" >/dev/null &&
+   grep -Fx 'origin=none' <<<"$NO_CANDIDATE_OUTPUT" >/dev/null &&
+   ! grep -q '^release_id=' <<<"$NO_CANDIDATE_OUTPUT"; then
+  echo "ok - false-branch inactive no-op shape is exact"
+  pass=$((pass + 1))
+else
+  echo "not ok - false-branch inactive no-op shape drifted" >&2
+  echo "$NO_CANDIDATE_OUTPUT" >&2
+  failures=$((failures + 1))
+fi
 
 CREATED_OUTPUT=$("$RESOLVER" created \
   --release-id 102 --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
