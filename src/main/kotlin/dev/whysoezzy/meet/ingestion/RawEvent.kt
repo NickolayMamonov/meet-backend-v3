@@ -16,4 +16,5 @@ data class RawEvent(
     val externalUrl: String?,       // ссылка на страницу события на площадке
     val isOnline: Boolean,
     val topicKeywords: Set<String> = emptySet(), // категории источника → тегирование в W3
+    val endsAtEpochMs: Long? = null,
 )

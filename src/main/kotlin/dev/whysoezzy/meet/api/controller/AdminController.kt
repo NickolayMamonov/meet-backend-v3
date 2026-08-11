@@ -20,7 +20,6 @@ class AdminController(
     @PostMapping("/ingest")
     fun triggerIngest(): ResponseEntity<IngestTriggerResponse> {
         val runs = ingestionService.runAll()
-        val purgedPast = ingestionService.purgePastEvents()
         val summary = runs.map {
             IngestRunSummary(
                 source = it.source.name,
@@ -32,7 +31,7 @@ class AdminController(
                 errorMessage = it.errorMessage,
             )
         }
-        return ResponseEntity.ok(IngestTriggerResponse(runs = summary, purgedPast = purgedPast))
+        return ResponseEntity.ok(IngestTriggerResponse(runs = summary))
     }
 
     @DeleteMapping("/purge")
