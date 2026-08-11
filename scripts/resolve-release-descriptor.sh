@@ -352,6 +352,16 @@ validate_release() {
 
 validate_completed_release() {
   local release=$1 id tag target draft prerelease published source_pair tag_target asset_data
+  jq -e '
+    type == "object" and
+    (.id | type == "number" and floor == . and . > 0) and
+    (.tag_name | type == "string") and
+    (.target_commitish | type == "string") and
+    (.draft | type == "boolean" and . == false) and
+    (.prerelease | type == "boolean" and . == false) and
+    (.published_at | type == "string" and length > 0)
+  ' <<<"$release" >/dev/null ||
+    fail "published release has malformed field types"
   id=$(jq -r '.id // empty' <<<"$release")
   tag=$(jq -r '.tag_name // empty' <<<"$release")
   target=$(jq -r '.target_commitish // empty' <<<"$release")
@@ -436,11 +446,13 @@ validate_pre_action_candidate() {
 }
 
 emit_pre_action_action() {
+  local origin=${1:-pre_action} observed_state=${2:-none} completed_id=${3:-}
   {
     echo "route=action"
     echo "active=false"
-    echo "origin=pre_action"
-    echo "observed_state=none"
+    echo "origin=$origin"
+    echo "observed_state=$observed_state"
+    [ -z "$completed_id" ] || echo "release_id=$completed_id"
     echo "authority_version=$AUTHORITY_VERSION"
     echo "authority_tag=$AUTHORITY_TAG"
     echo "authority_source_sha=$AUTHORITY_SOURCE"
@@ -570,6 +582,7 @@ case "$MODE" in
     prove_action_authority
     RELEASES=$(load_releases)
     ELIGIBLE=()
+    COMPLETED=()
     while IFS= read -r release; do
       tag=$(jq -r '.tag_name // empty' <<<"$release")
       target=$(jq -r '.target_commitish // empty' <<<"$release")
@@ -583,15 +596,30 @@ case "$MODE" in
         relevant=true
       fi
       [ "$relevant" = true ] || continue
-      if jq -e '.draft == false and .published_at != null' >/dev/null <<<"$release"; then
-        fail "relevant published current or future release conflicts with authority"
+      if jq -e '
+        type == "object" and
+        (.draft | type == "boolean" and . == false) and
+        (.published_at | type == "string" and length > 0)
+      ' >/dev/null <<<"$release"; then
+        completed=$(validate_completed_release "$release") ||
+          fail "relevant published release conflicts with current authority"
+        COMPLETED+=("$completed")
+        continue
       fi
       validated=$(validate_pre_action_candidate "$release") ||
         fail "current-authority pre-action candidate is invalid"
       ELIGIBLE+=("$validated")
     done < <(jq -c '.[]' <<<"$RELEASES")
 
-    if [ "${#ELIGIBLE[@]}" -eq 0 ]; then
+    if [ "${#ELIGIBLE[@]}" -eq 0 ] &&
+       [ "${#COMPLETED[@]}" -eq 1 ]; then
+      if [ "$REQUIRE_ACTION_AUTHORITY" = true ]; then
+        emit_pre_action_action completed completed "${COMPLETED[0]}"
+      else
+        fail "published predecessor requires action authority"
+      fi
+    elif [ "${#ELIGIBLE[@]}" -eq 0 ] &&
+         [ "${#COMPLETED[@]}" -eq 0 ]; then
       canonical_target=$(resolve_tag "$AUTHORITY_TAG") || return 1
       [ "$canonical_target" = absent ] ||
         fail "current canonical tag exists without a release candidate"
@@ -600,10 +628,11 @@ case "$MODE" in
       else
         fail "no visible recovery candidate; action admission is disabled"
       fi
-    elif [ "${#ELIGIBLE[@]}" -eq 1 ]; then
+    elif [ "${#ELIGIBLE[@]}" -eq 1 ] &&
+         [ "${#COMPLETED[@]}" -eq 0 ]; then
       emit_pre_action_recovery "${ELIGIBLE[0]}"
     else
-      fail "multiple current-authority pre-action candidates are ambiguous"
+      fail "multiple current-authority pre-action states are ambiguous"
     fi
     ;;
   verify)

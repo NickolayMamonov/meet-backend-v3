@@ -154,6 +154,89 @@
         "tags": {}
       }
     },
+    "published-predecessor-action": {
+      "expected": "action",
+      "profile": "action",
+      "preActionOrigin": "completed",
+      "preActionObservedState": "completed",
+      "releasePatches": [
+        {
+          "draft": false,
+          "published_at": "2026-08-10T02:00:00Z"
+        }
+      ],
+      "refs": {
+        "refs": {
+          "v1.0.1": {
+            "type": "commit",
+            "sha": "@SOURCE@"
+          }
+        },
+        "tags": {}
+      }
+    },
+    "recovery-only-published-predecessor": {
+      "expected": "failure",
+      "releasePatches": [
+        {
+          "draft": false,
+          "published_at": "2026-08-10T02:00:00Z"
+        }
+      ],
+      "refs": {
+        "refs": {
+          "v1.0.1": {
+            "type": "commit",
+            "sha": "@SOURCE@"
+          }
+        },
+        "tags": {}
+      }
+    },
+    "canonical-active-completed-mix": {
+      "expected": "failure",
+      "profile": "action",
+      "releasePatches": [
+        {},
+        {
+          "id": 702,
+          "draft": false,
+          "published_at": "2026-08-10T02:00:00Z"
+        }
+      ],
+      "refs": {
+        "refs": {
+          "v1.0.1": {
+            "type": "commit",
+            "sha": "@SOURCE@"
+          }
+        },
+        "tags": {}
+      }
+    },
+    "placeholder-active-completed-mix": {
+      "expected": "failure",
+      "profile": "action",
+      "releasePatches": [
+        {
+          "tag_name": "untagged-0123456789abcdef0123"
+        },
+        {
+          "id": 702,
+          "draft": false,
+          "published_at": "2026-08-10T02:00:00Z"
+        }
+      ],
+      "refs": {
+        "refs": {
+          "v1.0.1": {
+            "type": "commit",
+            "sha": "@SOURCE@"
+          }
+        },
+        "tags": {}
+      }
+    },
     "release-api-error": {
       "expected": "failure",
       "profile": "action",

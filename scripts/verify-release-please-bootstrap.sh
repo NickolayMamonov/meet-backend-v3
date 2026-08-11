@@ -74,6 +74,8 @@ require_file scripts/test-ghcr-package-normalization.sh
 require_file scripts/verify-release-tag-ref.sh
 require_file scripts/test-release-tag-ref.sh
 require_file scripts/test-release-metadata-mutation.sh
+require_file scripts/test-resolve-release-descriptor.sh
+require_file scripts/fixtures/release-descriptor/scenarios.json
 
 WORKFLOW_TEXT=$(sed 's/\r$//' "$RELEASE_WORKFLOW")
 RESUME_TEXT=$(sed 's/\r$//' scripts/verify-release-resume-state.sh)
@@ -84,6 +86,8 @@ INVENTORY_TEST_TEXT=$(sed 's/\r$//' scripts/test-ghcr-package-inventory.sh)
 TAG_REF_TEXT=$(sed 's/\r$//' scripts/verify-release-tag-ref.sh)
 METADATA_TEST_TEXT=$(sed 's/\r$//' scripts/test-release-metadata-mutation.sh)
 PRE_ACTION_FIXTURES=$(sed 's/\r$//' scripts/fixtures/release-preaction-routing/scenarios.json)
+RESOLVER_TEST_TEXT=$(sed 's/\r$//' scripts/test-resolve-release-descriptor.sh)
+DESCRIPTOR_FIXTURES=$(sed 's/\r$//' scripts/fixtures/release-descriptor/scenarios.json)
 
 jq empty "$CONFIG" "$MANIFEST" "$VERSION_FILE" >/dev/null ||
   fail "release configuration or bootstrap state is not valid JSON"
@@ -309,6 +313,41 @@ grep -Fq 'published-current-conflict' <<<"$PRE_ACTION_FIXTURES" ||
   fail "pre-action fixtures are missing the published current conflict"
 grep -Fq 'published-future-conflict' <<<"$PRE_ACTION_FIXTURES" ||
   fail "pre-action fixtures are missing the published future conflict"
+for fixture in \
+  published-predecessor-action \
+  recovery-only-published-predecessor \
+  canonical-active-completed-mix \
+  placeholder-active-completed-mix; do
+  grep -Fq "\"$fixture\"" <<<"$PRE_ACTION_FIXTURES" ||
+    fail "pre-action fixtures are missing predecessor cardinality case: $fixture"
+done
+for marker in \
+  'published predecessor missing peeled ref fails closed' \
+  'published predecessor divergent peeled ref fails closed' \
+  'published predecessor malformed ref fails closed' \
+  'published predecessor unsupported ref fails closed' \
+  'published predecessor malformed peeled ref fails closed' \
+  'published predecessor overdeep peeled ref fails closed' \
+  'draft-string' \
+  'prerelease-string' \
+  'published-number' \
+  'published empty assets fail closed' \
+  'published malformed assets fail closed' \
+  'published wrong assets fail closed' \
+  'published duplicate assets fail closed' \
+  'duplicate completed predecessors fail closed' \
+  'canonical active plus completed fails closed' \
+  'placeholder active plus completed fails closed' \
+  'exact published authority tuple is a completed no-op'; do
+  grep -Fq "$marker" <<<"$RESOLVER_TEST_TEXT" ||
+    fail "shared resolver fixtures are missing critical marker: $marker"
+done
+for marker in \
+  'publishedExactCurrent' \
+  'completeCurrent'; do
+  grep -Fq "\"$marker\"" <<<"$DESCRIPTOR_FIXTURES" ||
+    fail "shared resolver fixture data is missing marker: $marker"
+done
 grep -Fq 'no-candidate-canonical-ref' <<<"$PRE_ACTION_FIXTURES" ||
   fail "pre-action fixtures are missing the orphan canonical-ref conflict"
 grep -Fq 'no-candidate-refs-api-error' <<<"$PRE_ACTION_FIXTURES" ||
@@ -464,6 +503,8 @@ grep -Fq 'test-release-mutation-revalidation.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the mutation revalidation regression"
 grep -Fq 'test-release-preaction-routing.sh' <<<"$CI_TEXT" ||
   fail "hosted CI does not run the mock-only pre-action authority matrix"
+grep -Fq 'test-resolve-release-descriptor.sh' <<<"$CI_TEXT" ||
+  fail "reusable CI does not run the shared resolver fixtures"
 grep -Fq 'contents: read' <<<"$CI_TEXT" ||
   fail "hosted pre-action matrix does not have read-only job permissions"
 if grep -Fq 'RELEASE_PLEASE_TOKEN' <<<"$CI_TEXT" ||

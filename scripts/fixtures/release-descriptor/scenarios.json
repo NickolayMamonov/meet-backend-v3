@@ -22,6 +22,20 @@
       {"name":"SHA256SUMS","id":204,"size":104,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/204"}
     ]
   },
+  "publishedExactCurrent": {
+    "id": 110,
+    "tag_name": "v1.0.1",
+    "target_commitish": "@SOURCE@",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-08-10T02:00:00Z",
+    "assets": [
+      {"name":"release-manifest.json","id":201,"size":101,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/201"},
+      {"name":"image-index.json","id":202,"size":102,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/202"},
+      {"name":"image-inspect.txt","id":203,"size":103,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/203"},
+      {"name":"SHA256SUMS","id":204,"size":104,"state":"uploaded","created_at":"2026-08-10T01:00:00Z","updated_at":"2026-08-10T01:00:00Z","url":"https://api.github.test/releases/assets/204"}
+    ]
+  },
   "oldReachable": {
     "id": 90,
     "tag_name": "v1.0.0",

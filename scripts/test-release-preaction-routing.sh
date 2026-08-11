@@ -278,6 +278,16 @@ run_case() {
           echo "not ok - $case_name used action in recovery-only profile" >&2
           return 1
         }
+        expected_origin=$(jq -r --arg case_name "$case_name" \
+          '.cases[$case_name].preActionOrigin // empty' "$FIXTURES")
+        expected_observed_state=$(jq -r --arg case_name "$case_name" \
+          '.cases[$case_name].preActionObservedState // empty' "$FIXTURES")
+        if [ -n "$expected_origin" ]; then
+          [ "$(value origin "$descriptor")" = "$expected_origin" ] || return 1
+          [ "$(value observed_state "$descriptor")" = \
+            "$expected_observed_state" ] || return 1
+          [ "$(value release_id "$descriptor")" = 701 ] || return 1
+        fi
         "$TMP/bin/mock-release-please"
         [ "$(cat "$ACTION_COUNT")" -eq 1 ]
         [ ! -s "$WRITE_LOG" ]
