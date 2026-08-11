@@ -258,14 +258,43 @@ POST_ACTION_OUTPUT=$("$RESOLVER" post-action \
   --releases-file "$POST_ACTION_ARRAY" "${common[@]}")
 if grep -Fx 'active=true' <<<"$POST_ACTION_OUTPUT" >/dev/null &&
    grep -Fx 'origin=post_action' <<<"$POST_ACTION_OUTPUT" >/dev/null &&
+   grep -Fx 'route=materialize' <<<"$POST_ACTION_OUTPUT" >/dev/null &&
    grep -Fx 'release_id=111' <<<"$POST_ACTION_OUTPUT" >/dev/null &&
    grep -Fx "source_sha=$SOURCE" <<<"$POST_ACTION_OUTPUT" >/dev/null &&
-   ! grep -q '^route=' <<<"$POST_ACTION_OUTPUT"; then
-  echo "ok - post-action resolves one exact draft identity"
+   grep -Eq '^admission_fingerprint=[0-9a-f]{64}$' \
+     <<<"$POST_ACTION_OUTPUT"; then
+  echo "ok - post-action resolves one exact materialize admission"
   pass=$((pass + 1))
 else
   echo "not ok - post-action did not emit the bound active descriptor" >&2
   echo "$POST_ACTION_OUTPUT" >&2
+  failures=$((failures + 1))
+fi
+POST_ACTION_ADMISSION_FINGERPRINT=$(awk -F= \
+  '$1 == "admission_fingerprint" {print $2}' <<<"$POST_ACTION_OUTPUT")
+PRE_ACTION_OUTPUT=$("$RESOLVER" pre-action \
+  --releases-file "$POST_ACTION_ARRAY" "${common[@]}")
+PRE_ACTION_ADMISSION_FINGERPRINT=$(awk -F= \
+  '$1 == "admission_fingerprint" {print $2}' <<<"$PRE_ACTION_OUTPUT")
+if grep -Fx 'route=materialize' <<<"$PRE_ACTION_OUTPUT" >/dev/null &&
+   [ "$PRE_ACTION_ADMISSION_FINGERPRINT" = \
+     "$POST_ACTION_ADMISSION_FINGERPRINT" ] &&
+   ! grep -Fx 'origin=post_action' <<<"$PRE_ACTION_OUTPUT" >/dev/null; then
+  echo "ok - post-action to pre-action binding excludes diagnostic origin"
+  pass=$((pass + 1))
+else
+  echo "not ok - post-action to pre-action binding drifted" >&2
+  failures=$((failures + 1))
+fi
+PRE_ACTION_CONTINUATION_OUTPUT=$("$RESOLVER" pre-action \
+  --releases-file "$POST_ACTION_ARRAY" "${common[@]}")
+if [ "$(awk -F= '$1 == "admission_fingerprint" {print $2}' \
+    <<<"$PRE_ACTION_CONTINUATION_OUTPUT")" = \
+   "$PRE_ACTION_ADMISSION_FINGERPRINT" ]; then
+  echo "ok - pre-action continuation binding is stable"
+  pass=$((pass + 1))
+else
+  echo "not ok - pre-action continuation binding drifted" >&2
   failures=$((failures + 1))
 fi
 
@@ -543,10 +572,26 @@ CREATED_OUTPUT=$("$RESOLVER" created \
   --release-file "$COMPLETE" "${common[@]}")
 FINGERPRINT=$(awk -F= '$1 == "asset_inventory_fingerprint" {print $2}' \
   <<<"$CREATED_OUTPUT")
+ADMISSION_FINGERPRINT=$(awk -F= \
+  '$1 == "admission_fingerprint" {print $2}' <<<"$CREATED_OUTPUT")
 expect_success "unchanged descriptor verifies" '^origin=verified$' \
   "$RESOLVER" verify \
   --release-id 102 --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
   --asset-inventory-fingerprint "$FINGERPRINT" \
+  --expected-route deep-recover \
+  --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
+  --release-file "$COMPLETE" "${common[@]}"
+expect_failure "descriptor route drift fails closed" "$RESOLVER" verify \
+  --release-id 102 --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --asset-inventory-fingerprint "$FINGERPRINT" \
+  --expected-route materialize \
+  --release-file "$COMPLETE" "${common[@]}"
+expect_failure "descriptor admission fingerprint drift fails closed" \
+  "$RESOLVER" verify \
+  --release-id 102 --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \
+  --asset-inventory-fingerprint "$FINGERPRINT" \
+  --expected-route deep-recover \
+  --expected-admission-fingerprint "$(printf '0%.0s' {1..64})" \
   --release-file "$COMPLETE" "${common[@]}"
 expect_failure "descriptor asset drift fails closed" "$RESOLVER" verify \
   --release-id 102 --tag v1.0.1 --version 1.0.1 --source-sha "$SOURCE" \

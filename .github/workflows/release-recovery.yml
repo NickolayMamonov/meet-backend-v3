@@ -46,7 +46,7 @@ jobs:
               print
             }' <<<"$descriptor"
           }
-          test "$(value route)" = recovery
+          test "$(value route)" = deep-recover
           test "$(value release_id)" = "$REQUESTED_RELEASE_ID"
           printf '%s\n' "$descriptor" >> "$GITHUB_OUTPUT"
       - name: Set up read-only registry inspection

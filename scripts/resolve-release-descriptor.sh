@@ -28,6 +28,10 @@ options:
   --refs-file PATH      injected tag/ref object; omitted means live GitHub API
   --require-action-authority
                          action-admission proof (pre-action only)
+  --expected-route ROUTE
+                         verify the resolver-owned publication route
+  --expected-admission-fingerprint SHA256
+                         verify the stable write-entry admission fingerprint
 EOF
   exit 2
 }
@@ -56,6 +60,8 @@ EXPECTED_TAG=
 EXPECTED_VERSION=
 EXPECTED_SOURCE=
 EXPECTED_FINGERPRINT=
+EXPECTED_ROUTE=
+EXPECTED_ADMISSION_FINGERPRINT=
 RELEASE_ID_OPTION=false
 RELEASE_FILE_OPTION=false
 
@@ -86,6 +92,16 @@ while [ "$#" -gt 0 ]; do
     --asset-inventory-fingerprint)
       [ "$#" -ge 2 ] || usage
       EXPECTED_FINGERPRINT=$2
+      shift 2
+      ;;
+    --expected-route)
+      [ "$#" -ge 2 ] || usage
+      EXPECTED_ROUTE=$2
+      shift 2
+      ;;
+    --expected-admission-fingerprint)
+      [ "$#" -ge 2 ] || usage
+      EXPECTED_ADMISSION_FINGERPRINT=$2
       shift 2
       ;;
     *) usage ;;
@@ -332,8 +348,59 @@ normalize_assets() {
   printf '%s\t%s\t%s\n' "$kind" "$fingerprint" "$normalized"
 }
 
+publication_route() {
+  local state=$1 kind=$2
+  case "$state:$kind" in
+    canonical:empty)
+      echo materialize
+      ;;
+    canonical:complete_unverified|generated_placeholder:complete_unverified)
+      echo deep-recover
+      ;;
+    *)
+      fail "observed state and asset inventory do not form an admissible publication route"
+      ;;
+  esac
+}
+
+admission_fingerprint() {
+  local route=$1 state=$2 observed_tag=$3 id=$4 tag=$5 version=$6
+  local source=$7 target=$8 draft=$9 prerelease=${10} published=${11}
+  local kind=${12} inventory_fingerprint=${13}
+  jq -nc \
+    --arg publication_route "$route" \
+    --arg observed_state "$state" \
+    --arg observed_tag "$observed_tag" \
+    --arg release_id "$id" \
+    --arg tag "$tag" \
+    --arg version "$version" \
+    --arg source_sha "$source" \
+    --arg target_commitish "$target" \
+    --arg draft "$draft" \
+    --arg prerelease "$prerelease" \
+    --arg published_at "$published" \
+    --arg asset_inventory_kind "$kind" \
+    --arg asset_inventory_fingerprint "$inventory_fingerprint" \
+    '{
+      publication_route: $publication_route,
+      observed_state: $observed_state,
+      observed_tag: $observed_tag,
+      release_id: $release_id,
+      tag: $tag,
+      version: $version,
+      source_sha: $source_sha,
+      target_commitish: $target_commitish,
+      draft: $draft,
+      prerelease: $prerelease,
+      published_at: $published_at,
+      asset_inventory_kind: $asset_inventory_kind,
+      asset_inventory_fingerprint: $asset_inventory_fingerprint
+    }' | sha256sum | awk '{print $1}'
+}
+
 validate_release() {
-  local release=$1 id tag target draft prerelease published source_pair tag_target asset_data
+  local release=$1 id tag target draft prerelease published source_pair tag_target
+  local asset_data kind
   jq -e '
     type == "object" and
     (has("id") and has("tag_name") and has("target_commitish") and
@@ -376,11 +443,11 @@ validate_release() {
   [ "$tag_target" = absent ] || [ "$tag_target" = "$target" ] ||
     fail "existing tag does not resolve to the release source"
   asset_data=$(normalize_assets "$release") || return 1
-  printf '%s\t%s\t%s\t%s\n' "$id" "$tag" "$target" "$asset_data"
+  printf '%s\t%s\t%s\t%s\tcanonical\n' "$id" "$tag" "$target" "$asset_data"
 }
 
 validate_completed_release() {
-  local release=$1 id tag target draft prerelease published source_pair tag_target asset_data
+  local release=$1 id tag target draft prerelease published source_pair tag_target asset_data kind
   jq -e '
     type == "object" and
     (has("id") and has("tag_name") and has("target_commitish") and
@@ -473,6 +540,8 @@ validate_pre_action_candidate() {
   esac
 
   asset_data=$(normalize_assets "$release") || return 1
+  kind=${asset_data%%$'\t'*}
+  publication_route "$OBSERVED_STATE" "$kind" >/dev/null
   printf '%s\t%s\t%s\t%s\t%s\n' \
     "$id" "$tag" "$target" "$asset_data" "$OBSERVED_STATE"
 }
@@ -492,10 +561,11 @@ emit_pre_action_action() {
 }
 
 emit_pre_action_recovery() {
-  local validated=$1 id observed_tag source kind fingerprint inventory state
+  local validated=$1 id observed_tag source kind fingerprint inventory state route
   IFS=$'\t' read -r id observed_tag source kind fingerprint inventory state <<<"$validated"
+  route=$(publication_route "$state" "$kind")
   {
-    echo "route=recovery"
+    echo "route=$route"
     echo "active=true"
     echo "origin=pre_action"
     echo "observed_state=$state"
@@ -513,15 +583,23 @@ emit_pre_action_recovery() {
     echo "asset_inventory_kind=$kind"
     echo "asset_inventory_fingerprint=$fingerprint"
     echo "asset_inventory_json=$inventory"
+    echo "admission_fingerprint=$(admission_fingerprint \
+      "$route" "$state" "$observed_tag" "$id" "$AUTHORITY_TAG" \
+      "$AUTHORITY_VERSION" "$source" "$source" true false null "$kind" \
+      "$fingerprint")"
   }
 }
 
 emit_active() {
-  local origin=$1 validated=$2 id tag source kind fingerprint inventory
-  IFS=$'\t' read -r id tag source kind fingerprint inventory <<<"$validated"
+  local origin=$1 validated=$2 id tag source kind fingerprint inventory state route
+  IFS=$'\t' read -r id tag source kind fingerprint inventory state <<<"$validated"
+  route=$(publication_route "$state" "$kind")
   {
     echo "active=true"
     echo "origin=$origin"
+    echo "route=$route"
+    echo "observed_state=$state"
+    echo "observed_tag=$tag"
     echo "release_id=$id"
     echo "tag=$tag"
     echo "version=$AUTHORITY_VERSION"
@@ -535,6 +613,9 @@ emit_active() {
     echo "asset_inventory_kind=$kind"
     echo "asset_inventory_fingerprint=$fingerprint"
     echo "asset_inventory_json=$inventory"
+    echo "admission_fingerprint=$(admission_fingerprint \
+      "$route" "$state" "$tag" "$id" "$tag" "$AUTHORITY_VERSION" \
+      "$source" "$source" true false null "$kind" "$fingerprint")"
   }
 }
 
@@ -616,13 +697,14 @@ case "$MODE" in
         COMPLETED+=("$completed")
         continue
       fi
-      validated=$(validate_release "$release") ||
+      validated=$(validate_pre_action_candidate "$release") ||
         fail "relevant release failed descriptor validation"
       ELIGIBLE+=("$validated")
     done < <(jq -c '.[]' <<<"$RELEASES")
 
     if [ "$(( ${#ELIGIBLE[@]} + ${#COMPLETED[@]} ))" -eq 0 ]; then
       {
+        echo "route=none"
         echo "active=false"
         echo "origin=none"
         echo "authority_version=$AUTHORITY_VERSION"
@@ -633,6 +715,7 @@ case "$MODE" in
       emit_active recovered "${ELIGIBLE[0]}"
     elif [ "${#ELIGIBLE[@]}" -eq 0 ] && [ "${#COMPLETED[@]}" -eq 1 ]; then
       {
+        echo "route=none"
         echo "active=false"
         echo "origin=completed"
         echo "authority_version=$AUTHORITY_VERSION"
@@ -703,6 +786,12 @@ case "$MODE" in
   verify)
     require_expected_tuple
     [[ "$EXPECTED_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || usage
+    if [ -n "$EXPECTED_ROUTE" ]; then
+      case "$EXPECTED_ROUTE" in materialize|deep-recover) ;; *) usage ;; esac
+    fi
+    if [ -n "$EXPECTED_ADMISSION_FINGERPRINT" ]; then
+      [[ "$EXPECTED_ADMISSION_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || usage
+    fi
     RELEASE=$(load_release_by_id "$EXPECTED_ID")
     VALIDATED=$(validate_release "$RELEASE") ||
       fail "release failed descriptor revalidation"
@@ -710,6 +799,16 @@ case "$MODE" in
     [ "$actual_id" = "$EXPECTED_ID" ] || fail "release ID drifted"
     [ "$actual_fingerprint" = "$EXPECTED_FINGERPRINT" ] ||
       fail "release asset descriptor drifted"
-    emit_active verified "$VALIDATED"
+    OUTPUT=$(emit_active verified "$VALIDATED")
+    if [ -n "$EXPECTED_ROUTE" ] &&
+       ! grep -Fx "route=$EXPECTED_ROUTE" <<<"$OUTPUT" >/dev/null; then
+      fail "release publication route drifted"
+    fi
+    if [ -n "$EXPECTED_ADMISSION_FINGERPRINT" ] &&
+       ! grep -Fx "admission_fingerprint=$EXPECTED_ADMISSION_FINGERPRINT" \
+         <<<"$OUTPUT" >/dev/null; then
+      fail "release admission fingerprint drifted"
+    fi
+    printf '%s\n' "$OUTPUT"
     ;;
 esac

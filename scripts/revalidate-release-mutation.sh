@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ASSET_INVENTORY_HELPER=$SCRIPT_DIR/release-asset-inventory.sh
 
 usage() {
-  echo "usage: $0 --repository owner/repo --release-id ID --tag vX.Y.Z --version X.Y.Z --source-sha SHA --expected-fingerprint SHA256 [--repo-dir PATH] [--dev-ref REF]" >&2
+  echo "usage: $0 --repository owner/repo --release-id ID --tag vX.Y.Z --version X.Y.Z --source-sha SHA --expected-fingerprint SHA256 [--expected-route ROUTE] [--expected-admission-fingerprint SHA256] [--repo-dir PATH] [--dev-ref REF]" >&2
   exit 2
 }
 
@@ -20,6 +20,8 @@ TAG=
 VERSION=
 SOURCE_SHA=
 EXPECTED_FINGERPRINT=
+EXPECTED_ROUTE=
+EXPECTED_ADMISSION_FINGERPRINT=
 REPO_DIR=.
 DEV_REF=origin/dev
 
@@ -33,6 +35,16 @@ while [ "$#" -gt 0 ]; do
     --expected-fingerprint)
       [ "$#" -ge 2 ] || usage
       EXPECTED_FINGERPRINT=$2
+      shift 2
+      ;;
+    --expected-route)
+      [ "$#" -ge 2 ] || usage
+      EXPECTED_ROUTE=$2
+      shift 2
+      ;;
+    --expected-admission-fingerprint)
+      [ "$#" -ge 2 ] || usage
+      EXPECTED_ADMISSION_FINGERPRINT=$2
       shift 2
       ;;
     --repo-dir) [ "$#" -ge 2 ] || usage; REPO_DIR=$2; shift 2 ;;
@@ -81,16 +93,23 @@ fingerprint=$(
 [ "$fingerprint" = "$EXPECTED_FINGERPRINT" ] ||
   fail "release asset metadata fingerprint changed"
 
+resolver_args=(
+  --repo-dir "$REPO_DIR"
+  --repository "$REPOSITORY"
+  --dev-ref "$DEV_REF"
+  --release-id "$RELEASE_ID"
+  --tag "$TAG"
+  --version "$VERSION"
+  --source-sha "$SOURCE_SHA"
+  --asset-inventory-fingerprint "$fingerprint"
+)
+[ -z "$EXPECTED_ROUTE" ] ||
+  resolver_args+=(--expected-route "$EXPECTED_ROUTE")
+[ -z "$EXPECTED_ADMISSION_FINGERPRINT" ] ||
+  resolver_args+=(--expected-admission-fingerprint "$EXPECTED_ADMISSION_FINGERPRINT")
 descriptor=$(
   "$(dirname "${BASH_SOURCE[0]}")/resolve-release-descriptor.sh" verify \
-    --repo-dir "$REPO_DIR" \
-    --repository "$REPOSITORY" \
-    --dev-ref "$DEV_REF" \
-    --release-id "$RELEASE_ID" \
-    --tag "$TAG" \
-    --version "$VERSION" \
-    --source-sha "$SOURCE_SHA" \
-    --asset-inventory-fingerprint "$fingerprint" \
+    "${resolver_args[@]}" \
     --release-file "$release_file"
 )
 

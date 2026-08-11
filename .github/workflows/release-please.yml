@@ -16,16 +16,17 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      route: ${{ steps.pre_action.outputs.route == 'recovery' && 'recovery' || steps.action_descriptor.outputs.route }}
-      active: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.active || steps.action_descriptor.outputs.active }}
-      source_sha: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.source_sha || steps.action_descriptor.outputs.source_sha }}
-      release_tag: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.tag || steps.action_descriptor.outputs.tag }}
-      release_version: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.version || steps.action_descriptor.outputs.version }}
-      release_id: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.release_id || steps.action_descriptor.outputs.release_id }}
-      observed_state: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.observed_state || steps.action_descriptor.outputs.observed_state }}
-      observed_tag: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.observed_tag || steps.action_descriptor.outputs.observed_tag }}
-      asset_inventory_kind: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.asset_inventory_kind || steps.action_descriptor.outputs.asset_inventory_kind }}
-      asset_inventory_fingerprint: ${{ steps.pre_action.outputs.route == 'recovery' && steps.pre_action.outputs.asset_inventory_fingerprint || steps.action_descriptor.outputs.asset_inventory_fingerprint }}
+      route: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.route || steps.pre_action.outputs.route }}
+      active: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.active || steps.pre_action.outputs.active }}
+      source_sha: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.source_sha || steps.pre_action.outputs.source_sha }}
+      release_tag: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.tag || steps.pre_action.outputs.tag }}
+      release_version: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.version || steps.pre_action.outputs.version }}
+      release_id: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.release_id || steps.pre_action.outputs.release_id }}
+      observed_state: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.observed_state || steps.pre_action.outputs.observed_state }}
+      observed_tag: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.observed_tag || steps.pre_action.outputs.observed_tag }}
+      asset_inventory_kind: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.asset_inventory_kind || steps.pre_action.outputs.asset_inventory_kind }}
+      asset_inventory_fingerprint: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.asset_inventory_fingerprint || steps.pre_action.outputs.asset_inventory_fingerprint }}
+      admission_fingerprint: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.admission_fingerprint || steps.pre_action.outputs.admission_fingerprint }}
     steps:
       - name: Checkout reviewed release tooling
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -59,7 +60,8 @@ jobs:
           for key in route active origin observed_state observed_tag release_id \
               tag version source_sha target_commitish draft published_at \
               authority_version authority_tag authority_source_sha \
-              asset_inventory_kind asset_inventory_fingerprint; do
+              asset_inventory_kind asset_inventory_fingerprint \
+              admission_fingerprint; do
             echo "$key=$(value "$key")" >> "$GITHUB_OUTPUT"
           done
       - name: Release Please manifest
@@ -152,10 +154,10 @@ jobs:
 
           output_block=$(
             {
-              echo "route=action"
-              for key in active origin observed_state observed_tag release_id tag \
+              for key in route active origin observed_state observed_tag release_id tag \
                   version source_sha target_commitish draft published_at \
-                  asset_inventory_kind asset_inventory_fingerprint; do
+                  asset_inventory_kind asset_inventory_fingerprint \
+                  admission_fingerprint; do
                 echo "$key=$(value "$key")"
               done
             }
@@ -179,7 +181,7 @@ jobs:
     name: Publish immutable release
     needs: [release, gates]
     if: needs.release.outputs.active == 'true' &&
-        needs.release.outputs.route == 'action'
+        needs.release.outputs.route == 'materialize'
     concurrency:
       group: backend-ghcr-publication-${{ github.repository }}
       cancel-in-progress: false
@@ -197,6 +199,7 @@ jobs:
       ASSET_INVENTORY_KIND: ${{ needs.release.outputs.asset_inventory_kind }}
       ORIGINAL_ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
       ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
+      ADMISSION_FINGERPRINT: ${{ needs.release.outputs.admission_fingerprint }}
       IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
     steps:
       - name: Checkout reviewed publication tooling
@@ -211,6 +214,39 @@ jobs:
           ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
           path: source
+      - name: Bind canonical-empty materialize entry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git -C tooling fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev)
+          value() {
+            awk -F= -v key="$1" '$1 == key {
+              sub(/^[^=]*=/, "")
+              print
+            }' <<<"$descriptor"
+          }
+          test "$(value route)" = materialize
+          test "$(value active)" = true
+          test "$(value observed_state)" = canonical
+          test "$(value observed_tag)" = "$TAG"
+          test "$(value release_id)" = "$RELEASE_ID"
+          test "$(value tag)" = "$TAG"
+          test "$(value version)" = "$VERSION"
+          test "$(value source_sha)" = "$SOURCE_SHA"
+          test "$(value target_commitish)" = "$SOURCE_SHA"
+          test "$(value draft)" = true
+          test "$(value prerelease)" = false
+          test "$(value published_at)" = null
+          test "$(value asset_inventory_kind)" = empty
+          test "$(value asset_inventory_fingerprint)" = \
+            "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT"
+          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
       - name: Independently verify the numeric draft descriptor
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -226,7 +262,9 @@ jobs:
             --tag "$TAG" \
             --version "$VERSION" \
             --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT")
+            --asset-inventory-fingerprint "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT" \
+            --expected-route materialize \
+            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT")
           value() {
             awk -F= -v key="$1" '$1 == key {
               sub(/^[^=]*=/, "")
@@ -240,6 +278,8 @@ jobs:
           test "$(value version)" = "$VERSION"
           test "$(value source_sha)" = "$SOURCE_SHA"
           test "$(value asset_inventory_kind)" = "$ASSET_INVENTORY_KIND"
+          test "$(value route)" = materialize
+          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(jq -r '.version' source/version.json)" = "$VERSION"
           test "$TAG" = "v$VERSION"
@@ -523,21 +563,29 @@ jobs:
           test "$(gh api \
             "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             --jq '.assets | length')" -eq 0
+          upload_responses="$RUNNER_TEMP/release/upload-responses.jsonl"
+          : >"$upload_responses"
           for file in \
             release-manifest.json \
             image-index.json \
             image-inspect.txt \
             SHA256SUMS
           do
-            curl --fail-with-body --silent --show-error --location \
+            response=$(curl --fail-with-body --silent --show-error --location \
               --request POST \
               --header 'Accept: application/vnd.github+json' \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header 'Content-Type: application/octet-stream' \
               --data-binary "@$file" \
-              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$file" \
-              >/dev/null
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$file")
+            printf '%s\n' "$response" >>"$upload_responses"
           done
+          jq -s -e '
+            length == 4 and
+            (map(.name) | sort) ==
+              ["SHA256SUMS","image-index.json","image-inspect.txt","release-manifest.json"] and
+            (map(.id) | unique | length) == 4
+          ' "$upload_responses" >/dev/null
           trap - ERR
       - name: Deep-verify resumable release state
         env:
@@ -563,7 +611,40 @@ jobs:
               --release-file "$release_json"
           )
           if [ "$ASSET_INVENTORY_KIND" = empty ]; then
+            transition_descriptor=$(
+              tooling/scripts/resolve-release-descriptor.sh verify \
+                --repo-dir tooling \
+                --repository "$GITHUB_REPOSITORY" \
+                --dev-ref origin/dev \
+                --release-id "$RELEASE_ID" \
+                --tag "$TAG" \
+                --version "$VERSION" \
+                --source-sha "$SOURCE_SHA" \
+                --asset-inventory-fingerprint "$post_action_fingerprint" \
+                --expected-route deep-recover
+            )
+            value() {
+              awk -F= -v key="$1" '$1 == key {
+                sub(/^[^=]*=/, "")
+                print
+              }' <<<"$transition_descriptor"
+            }
+            test "$(value route)" = deep-recover
+            test "$(value observed_state)" = canonical
+            test "$(value observed_tag)" = "$TAG"
+            test "$(value release_id)" = "$RELEASE_ID"
+            test "$(value tag)" = "$TAG"
+            test "$(value version)" = "$VERSION"
+            test "$(value source_sha)" = "$SOURCE_SHA"
+            test "$(value target_commitish)" = "$SOURCE_SHA"
+            test "$(value draft)" = true
+            test "$(value prerelease)" = false
+            test "$(value published_at)" = null
+            test "$(value asset_inventory_kind)" = complete_unverified
             echo "POST_ACTION_ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
+              >>"$GITHUB_ENV"
+            echo "POST_UPLOAD_ROUTE=deep-recover" >>"$GITHUB_ENV"
+            echo "EXPECTED_COMPLETE_ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
               >>"$GITHUB_ENV"
             echo "ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
               >>"$GITHUB_ENV"
@@ -587,6 +668,41 @@ jobs:
           test "$POST_ACTION_ASSET_INVENTORY_FINGERPRINT" = \
             "$ASSET_INVENTORY_FINGERPRINT"
           test "$fingerprint" = "$ASSET_INVENTORY_FINGERPRINT"
+          if [ "$ASSET_INVENTORY_KIND" = empty ]; then
+            test "${EXPECTED_COMPLETE_ASSET_INVENTORY_FINGERPRINT:-}" = \
+              "$fingerprint"
+          fi
+          final_descriptor=$(
+            tooling/scripts/resolve-release-descriptor.sh verify \
+              --repo-dir tooling \
+              --repository "$GITHUB_REPOSITORY" \
+              --dev-ref origin/dev \
+              --release-id "$RELEASE_ID" \
+              --tag "$TAG" \
+              --version "$VERSION" \
+              --source-sha "$SOURCE_SHA" \
+              --asset-inventory-fingerprint "$fingerprint" \
+              --expected-route deep-recover
+          )
+          grep -Fx 'route=deep-recover' <<<"$final_descriptor"
+          transition_descriptor=$(
+            tooling/scripts/resolve-release-descriptor.sh verify \
+              --repo-dir tooling \
+              --repository "$GITHUB_REPOSITORY" \
+              --dev-ref origin/dev \
+              --release-id "$RELEASE_ID" \
+              --tag "$TAG" \
+              --version "$VERSION" \
+              --source-sha "$SOURCE_SHA" \
+              --asset-inventory-fingerprint "$fingerprint" \
+              --expected-route deep-recover
+          )
+          grep -Fx 'route=deep-recover' <<<"$transition_descriptor"
+          if [ "$ASSET_INVENTORY_KIND" = empty ]; then
+            test "${POST_UPLOAD_ROUTE:-}" = deep-recover
+            grep -Fx 'asset_inventory_kind=complete_unverified' \
+              <<<"$transition_descriptor"
+          fi
           tooling/scripts/revalidate-release-mutation.sh \
             --repository "$GITHUB_REPOSITORY" \
             --release-id "$RELEASE_ID" \
@@ -594,6 +710,7 @@ jobs:
             --version "$VERSION" \
             --source-sha "$SOURCE_SHA" \
             --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --expected-route deep-recover \
             --repo-dir tooling \
             --dev-ref origin/dev
           tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
@@ -641,7 +758,7 @@ jobs:
     name: Recover immutable release
     needs: [release, gates]
     if: needs.release.outputs.active == 'true' &&
-        needs.release.outputs.route == 'recovery'
+        needs.release.outputs.route == 'deep-recover'
     concurrency:
       group: backend-ghcr-publication-${{ github.repository }}
       cancel-in-progress: false
@@ -658,6 +775,7 @@ jobs:
       OBSERVED_TAG: ${{ needs.release.outputs.observed_tag }}
       ORIGINAL_ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
       ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
+      ADMISSION_FINGERPRINT: ${{ needs.release.outputs.admission_fingerprint }}
       IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
     steps:
       - name: Checkout reviewed recovery tooling
@@ -672,6 +790,38 @@ jobs:
           ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
           path: source
+      - name: Bind complete deep-recovery entry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git -C tooling fetch --no-tags origin \
+            '+refs/heads/dev:refs/remotes/origin/dev'
+          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
+            --repo-dir tooling \
+            --repository "$GITHUB_REPOSITORY" \
+            --dev-ref origin/dev)
+          value() {
+            awk -F= -v key="$1" '$1 == key {
+              sub(/^[^=]*=/, "")
+              print
+            }' <<<"$descriptor"
+          }
+          test "$(value route)" = deep-recover
+          test "$(value active)" = true
+          test "$(value observed_state)" = "$OBSERVED_STATE"
+          test "$(value observed_tag)" = "$OBSERVED_TAG"
+          test "$(value release_id)" = "$RELEASE_ID"
+          test "$(value tag)" = "$TAG"
+          test "$(value version)" = "$VERSION"
+          test "$(value source_sha)" = "$SOURCE_SHA"
+          test "$(value target_commitish)" = "$SOURCE_SHA"
+          test "$(value draft)" = true
+          test "$(value published_at)" = null
+          test "$(value asset_inventory_kind)" = complete_unverified
+          test "$(value asset_inventory_fingerprint)" = \
+            "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT"
+          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
       - name: Set up Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       - name: Authenticate for read-only registry inspection
@@ -718,6 +868,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          ref_error="$RUNNER_TEMP/recovery-canonical-ref-before"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+              >/dev/null 2>"$ref_error"; then
+            echo "canonical tag appeared before placeholder canonicalization" >&2
+            exit 1
+          fi
+          grep -Eq '\(HTTP 404\)|[[:space:]]404([[:space:]]|$)' "$ref_error"
           tooling/scripts/mutate-release-metadata.sh canonicalize \
             --repository "$GITHUB_REPOSITORY" \
             --release-id "$RELEASE_ID" \
@@ -728,6 +885,19 @@ jobs:
             --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
             --observed-tag "$OBSERVED_TAG" \
             --repo-dir source
+      - name: Prove generated-placeholder ref remains absent after canonicalization
+        if: env.OBSERVED_STATE == 'generated_placeholder'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ref_error="$RUNNER_TEMP/recovery-canonical-ref-after"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+              >/dev/null 2>"$ref_error"; then
+            echo "canonical tag was created before final publication" >&2
+            exit 1
+          fi
+          grep -Eq '\(HTTP 404\)|[[:space:]]404([[:space:]]|$)' "$ref_error"
       - name: Re-verify canonical draft before publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -754,6 +924,15 @@ jobs:
           test "$POST_ACTION_ASSET_INVENTORY_FINGERPRINT" = \
             "$ASSET_INVENTORY_FINGERPRINT"
           test "$fingerprint" = "$ASSET_INVENTORY_FINGERPRINT"
+          if [ "$OBSERVED_STATE" = generated_placeholder ]; then
+            ref_error="$RUNNER_TEMP/recovery-canonical-ref-final"
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+                >/dev/null 2>"$ref_error"; then
+              echo "canonical tag was created before the final publish PATCH" >&2
+              exit 1
+            fi
+            grep -Eq '\(HTTP 404\)|[[:space:]]404([[:space:]]|$)' "$ref_error"
+          fi
           tooling/scripts/revalidate-release-mutation.sh \
             --repository "$GITHUB_REPOSITORY" \
             --release-id "$RELEASE_ID" \
@@ -761,6 +940,7 @@ jobs:
             --version "$VERSION" \
             --source-sha "$SOURCE_SHA" \
             --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
+            --expected-route deep-recover \
             --repo-dir tooling \
             --dev-ref origin/dev
           tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \

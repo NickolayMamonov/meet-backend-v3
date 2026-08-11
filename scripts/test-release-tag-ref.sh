@@ -37,4 +37,13 @@ jq --arg source "$SOURCE" '
   --source-sha "$SOURCE" --fixture "$TMP/lightweight.json" |
   grep -Fx 'tag_ref=verified'
 
-echo "release tag ref fixtures passed: annotated peel, missing object, lightweight tag"
+jq -n '{refs:{},tags:{}}' >"$TMP/generated-placeholder-before-publish.json"
+if "$VERIFY" --repository fixture/repo --tag v1.0.1 \
+    --source-sha "$SOURCE" \
+    --fixture "$TMP/generated-placeholder-before-publish.json" \
+    >"$TMP/absent.out" 2>&1; then
+  echo "expected canonical tag absence rejection before publication" >&2
+  exit 1
+fi
+
+echo "release tag ref fixtures passed: generated-placeholder absence, annotated peel, missing object, lightweight tag"
