@@ -162,7 +162,7 @@ legacy_admission_fingerprint() {
   state=$(value observed_state "$descriptor")
   observed_tag=$(value observed_tag "$descriptor")
   id=$(value release_id "$descriptor")
-  tag=$(value tag "$descriptor")
+  tag=$(value observed_tag "$descriptor")
   version=$(value version "$descriptor")
   source=$(value source_sha "$descriptor")
   target=$(value target_commitish "$descriptor")
