@@ -1,7 +1,7 @@
-- [ ] Refactor resolver to one validated active constructor and ordered serializer.
-- [ ] Add active descriptor schema fixtures and contract suite.
-- [ ] Update resolver consumers and explicitly partition workflow routes.
-- [ ] Strengthen bootstrap and CI assertions.
-- [ ] Run focused verification and diff checks.
-- [ ] Commit, push, open PR, and add implementation result task comment.
+- [x] Refactor resolver to one validated active constructor and ordered serializer.
+- [x] Add active descriptor schema fixtures and contract suite.
+- [x] Update resolver consumers and explicitly partition workflow routes.
+- [x] Strengthen bootstrap and CI assertions.
+- [x] Run focused verification and diff checks.
+- [x] Commit, push, open PR, and add implementation result task comment.
 - [ ] Complete task with implementation-ready evidence.
