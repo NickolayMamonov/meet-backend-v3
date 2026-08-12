@@ -279,6 +279,7 @@ run_case() {
         [ "$(value tag "$descriptor")" = v1.0.1 ]
         [ "$(value version "$descriptor")" = 1.0.1 ]
         [ "$(value source_sha "$descriptor")" = "$SOURCE" ]
+        [ "$(value prerelease "$descriptor")" = false ]
         expected_kind=$(jq -r '.[0].assets | length' "$releases_file")
         if [ "$expected_kind" -eq 0 ]; then
           [ "$route" = materialize ]

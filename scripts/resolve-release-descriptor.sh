@@ -498,8 +498,13 @@ validate_pre_action_candidate() {
   target=$(jq -r '.target_commitish // empty' <<<"$release")
   draft=$(jq -r 'if has("draft") then (.draft | tostring) else "missing" end' \
     <<<"$release")
-  prerelease=$(jq -r 'if has("prerelease") then (.prerelease | tostring) else "missing" end' \
-    <<<"$release")
+  jq -e '
+    type == "object" and
+    has("prerelease") and
+    (.prerelease | type == "boolean" and . == false)
+  ' <<<"$release" >/dev/null ||
+    fail "pre-action candidate has malformed prerelease state"
+  prerelease=$(jq -r '.prerelease' <<<"$release")
   published=$(jq -r 'if has("published_at") and .published_at == null then "null"
     else (.published_at // "missing") end' <<<"$release")
 
@@ -576,6 +581,7 @@ emit_pre_action_recovery() {
     echo "source_sha=$source"
     echo "target_commitish=$source"
     echo "draft=true"
+    echo "prerelease=false"
     echo "published_at=null"
     echo "authority_version=$AUTHORITY_VERSION"
     echo "authority_tag=$AUTHORITY_TAG"
