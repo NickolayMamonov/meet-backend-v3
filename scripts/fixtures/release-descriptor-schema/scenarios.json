@@ -1,4 +1,12 @@
 {
+  "negativeCases": [
+    "missing",
+    "extra",
+    "duplicate",
+    "reordered",
+    "divergent",
+    "partial"
+  ],
   "created-materialize": {
     "mode": "created",
     "release": "empty",

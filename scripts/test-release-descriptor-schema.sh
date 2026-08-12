@@ -134,6 +134,74 @@ validate_contract() {
   fi
 }
 
+validate_shape() {
+  local name=$1 descriptor=$2 actual_keys unique_keys
+  actual_keys=$TMP/$name-keys
+  unique_keys=$TMP/$name-unique-keys
+  sed -n 's/^\([^=]*\)=.*$/\1/p' <<<"$descriptor" >"$actual_keys"
+  cmp -s "$EXPECTED_KEYS" "$actual_keys" || return 1
+  [ "$(wc -l <"$actual_keys" | tr -d '[:space:]')" -eq 20 ] || return 1
+  sort "$actual_keys" | uniq >"$unique_keys"
+  [ "$(wc -l <"$unique_keys" | tr -d '[:space:]')" -eq 20 ]
+}
+
+expect_invalid_shape() {
+  local name=$1 descriptor=$2
+  if validate_contract "$name" "$descriptor" materialize created canonical empty \
+      >/dev/null 2>&1; then
+    fail "negative contract case unexpectedly passed: $name"
+  fi
+  echo "ok - negative $name"
+}
+
+legacy_admission_fingerprint() {
+  local descriptor=$1
+  local route state observed_tag id tag version source target draft prerelease published
+  local kind inventory_fingerprint
+  route=$(value route "$descriptor")
+  state=$(value observed_state "$descriptor")
+  observed_tag=$(value observed_tag "$descriptor")
+  id=$(value release_id "$descriptor")
+  tag=$(value tag "$descriptor")
+  version=$(value version "$descriptor")
+  source=$(value source_sha "$descriptor")
+  target=$(value target_commitish "$descriptor")
+  draft=$(value draft "$descriptor")
+  prerelease=$(value prerelease "$descriptor")
+  published=$(value published_at "$descriptor")
+  kind=$(value asset_inventory_kind "$descriptor")
+  inventory_fingerprint=$(value asset_inventory_fingerprint "$descriptor")
+  jq -nc \
+    --arg publication_route "$route" \
+    --arg observed_state "$state" \
+    --arg observed_tag "$observed_tag" \
+    --arg release_id "$id" \
+    --arg tag "$tag" \
+    --arg version "$version" \
+    --arg source_sha "$source" \
+    --arg target_commitish "$target" \
+    --arg draft "$draft" \
+    --arg prerelease "$prerelease" \
+    --arg published_at "$published" \
+    --arg asset_inventory_kind "$kind" \
+    --arg asset_inventory_fingerprint "$inventory_fingerprint" \
+    '{
+      publication_route: $publication_route,
+      observed_state: $observed_state,
+      observed_tag: $observed_tag,
+      release_id: $release_id,
+      tag: $tag,
+      version: $version,
+      source_sha: $source_sha,
+      target_commitish: $target_commitish,
+      draft: $draft,
+      prerelease: $prerelease,
+      published_at: $published_at,
+      asset_inventory_kind: $asset_inventory_kind,
+      asset_inventory_fingerprint: $asset_inventory_fingerprint
+    }' | sha256sum | awk '{print $1}'
+}
+
 while IFS= read -r name; do
   name=${name%$'\r'}
   mode=$(jq_value --arg name "$name" '.[$name].mode' "$SCENARIOS")
@@ -178,7 +246,30 @@ while IFS= read -r name; do
   esac
   validate_contract "$name" "$descriptor" "$expected_route" "$expected_origin" \
     "$expected_state" "$expected_kind"
+  if [ "$expected_state" = generated_placeholder ]; then
+    [ "$(value admission_fingerprint "$descriptor")" = \
+      "$(legacy_admission_fingerprint "$descriptor")" ] ||
+      fail "$name changed generated-placeholder admission fingerprint semantics"
+  fi
   echo "ok - $name"
-done < <(jq -r 'keys_unsorted[]' "$SCENARIOS" | tr -d '\r')
+done < <(jq -r 'to_entries[] | select(.value | type == "object" and has("mode")) | .key' \
+  "$SCENARIOS" | tr -d '\r')
 
-echo "$(jq 'length' "$SCENARIOS") active descriptor schema contracts passed"
+BASE_DESCRIPTOR=$("$RESOLVER" created \
+  --release-id 102 --tag v1.0.1 --version 1.0.1 \
+  --source-sha "$SOURCE" --release-file "$EMPTY" \
+  --repo-dir "$REPO" --dev-ref HEAD --refs-file "$REFS")
+expect_invalid_shape missing "$(sed '/^prerelease=/d' <<<"$BASE_DESCRIPTOR")"
+expect_invalid_shape extra "$(printf '%s\nunknown=field' "$BASE_DESCRIPTOR")"
+expect_invalid_shape duplicate "$(printf '%s\n' "$BASE_DESCRIPTOR" \
+  "$(sed -n '1p' <<<"$BASE_DESCRIPTOR")")"
+expect_invalid_shape reordered "$(printf '%s\n' \
+  "$(sed -n '2p' <<<"$BASE_DESCRIPTOR")" \
+  "$(sed -n '1p' <<<"$BASE_DESCRIPTOR")" \
+  "$(sed -n '3,$p' <<<"$BASE_DESCRIPTOR")")"
+expect_invalid_shape divergent "$(sed 's/^tag=.*/tag=v9.9.9/' \
+  <<<"$BASE_DESCRIPTOR")"
+expect_invalid_shape partial "$(sed 's/^.*$//' <<<"$BASE_DESCRIPTOR")"
+
+echo "$(jq '[to_entries[] | select(.value | type == "object" and has("mode"))] | length' \
+  "$SCENARIOS") active descriptor schema contracts passed"

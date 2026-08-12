@@ -601,7 +601,7 @@ construct_active_record() {
 
   route=$(publication_route "$state" "$kind")
   admission=$(admission_fingerprint \
-    "$route" "$state" "$observed_tag" "$id" "$AUTHORITY_TAG" \
+    "$route" "$state" "$observed_tag" "$id" "$observed_tag" \
     "$AUTHORITY_VERSION" "$AUTHORITY_SOURCE" "$AUTHORITY_SOURCE" \
     true false null "$kind" "$fingerprint")
   [[ "$admission" =~ ^[0-9a-f]{64}$ ]] ||

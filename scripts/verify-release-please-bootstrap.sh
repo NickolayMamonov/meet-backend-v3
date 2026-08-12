@@ -263,6 +263,17 @@ SERIALIZER_KEYS=$(
 )
 [ "$SERIALIZER_KEYS" = "$EXPECTED_ACTIVE_KEYS" ] ||
   fail "active serializer does not emit the exact ordered 20-key contract"
+for constructor_call in \
+  'construct_active_record created' \
+  'construct_active_record post_action' \
+  'construct_active_record recovered' \
+  'construct_active_record pre_action' \
+  'construct_active_record verified'; do
+  grep -Fq "$constructor_call" <<<"$RESOLVER_TEXT" ||
+    fail "active mode does not use the shared constructor: $constructor_call"
+done
+[ "$(grep -Ec '^[[:space:]]+serialize_active_record$' <<<"$RESOLVER_TEXT")" -ge 5 ] ||
+  fail "active modes do not use the shared serializer"
 grep -Fq 'verify-ghcr-package-inventory.sh' <<<"$RESUME_TEXT" ||
   fail "resume verifier is missing GHCR inventory closure"
 grep -Fq 'verify-oci-referrer-closure.sh' <<<"$RESUME_TEXT" ||
