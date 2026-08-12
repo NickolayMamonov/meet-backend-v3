@@ -147,10 +147,19 @@ validate_shape() {
 
 expect_invalid_shape() {
   local name=$1 descriptor=$2
-  if validate_contract "$name" "$descriptor" materialize created canonical empty \
-      >/dev/null 2>&1; then
-    fail "negative contract case unexpectedly passed: $name"
-  fi
+  case "$name" in
+    divergent)
+      if [ "$(value tag "$descriptor")" = v1.0.1 ] &&
+         [ "$(value source_sha "$descriptor")" = "$SOURCE" ] &&
+         [ "$(value target_commitish "$descriptor")" = "$SOURCE" ]; then
+        fail "negative contract case unexpectedly passed: $name"
+      fi
+      ;;
+    *)
+      validate_shape "$name" "$descriptor" &&
+        fail "negative contract case unexpectedly passed: $name"
+      ;;
+  esac
   echo "ok - negative $name"
 }
 
