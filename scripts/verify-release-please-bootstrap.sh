@@ -76,6 +76,9 @@ require_file scripts/test-release-tag-ref.sh
 require_file scripts/test-release-metadata-mutation.sh
 require_file scripts/test-resolve-release-descriptor.sh
 require_file scripts/fixtures/release-descriptor/scenarios.json
+require_file scripts/test-release-descriptor-schema.sh
+require_file scripts/fixtures/release-descriptor-schema/active-keys.txt
+require_file scripts/fixtures/release-descriptor-schema/scenarios.json
 
 WORKFLOW_TEXT=$(sed 's/\r$//' "$RELEASE_WORKFLOW")
 RESUME_TEXT=$(sed 's/\r$//' scripts/verify-release-resume-state.sh)
@@ -88,6 +91,9 @@ METADATA_TEST_TEXT=$(sed 's/\r$//' scripts/test-release-metadata-mutation.sh)
 PRE_ACTION_FIXTURES=$(sed 's/\r$//' scripts/fixtures/release-preaction-routing/scenarios.json)
 RESOLVER_TEST_TEXT=$(sed 's/\r$//' scripts/test-resolve-release-descriptor.sh)
 DESCRIPTOR_FIXTURES=$(sed 's/\r$//' scripts/fixtures/release-descriptor/scenarios.json)
+ACTIVE_SCHEMA_KEYS=$(sed 's/\r$//' \
+  scripts/fixtures/release-descriptor-schema/active-keys.txt)
+RESOLVER_TEXT=$(sed 's/\r$//' scripts/resolve-release-descriptor.sh)
 
 jq empty "$CONFIG" "$MANIFEST" "$VERSION_FILE" >/dev/null ||
   fail "release configuration or bootstrap state is not valid JSON"
@@ -238,6 +244,36 @@ require_text 'printf '\''%s\n'\'' "$output_block" >> "$GITHUB_OUTPUT"'
 require_text 'if: steps.pre_action.outputs.route == '\''action'\'''
 require_text 'mutate-release-metadata.sh canonicalize'
 require_text 'mutate-release-metadata.sh publish'
+
+EXPECTED_ACTIVE_KEYS=$'route\nactive\norigin\nobserved_state\nobserved_tag\nrelease_id\ntag\nversion\nsource_sha\ntarget_commitish\ndraft\nprerelease\npublished_at\nauthority_version\nauthority_tag\nauthority_source_sha\nasset_inventory_kind\nasset_inventory_fingerprint\nasset_inventory_json\nadmission_fingerprint'
+[ "$ACTIVE_SCHEMA_KEYS" = "$EXPECTED_ACTIVE_KEYS" ] ||
+  fail "active descriptor schema must pin the exact ordered 20-key contract"
+[ "$(grep -Ec '^[[:space:]]*construct_active_record\(\)' <<<"$RESOLVER_TEXT")" -eq 1 ] ||
+  fail "resolver must define exactly one active descriptor constructor"
+[ "$(grep -Ec '^[[:space:]]*serialize_active_record\(\)' <<<"$RESOLVER_TEXT")" -eq 1 ] ||
+  fail "resolver must define exactly one active descriptor serializer"
+if grep -Eq '^[[:space:]]*(emit_active|emit_pre_action_recovery)\(\)' \
+    <<<"$RESOLVER_TEXT"; then
+  fail "resolver retains a route-specific active descriptor emitter"
+fi
+SERIALIZER_BLOCK=$(sed -n \
+  '/^serialize_active_record()/,/^}/p' <<<"$RESOLVER_TEXT")
+SERIALIZER_KEYS=$(
+  sed -n 's/^[[:space:]]*echo "\([^=]*\)=.*$/\1/p' <<<"$SERIALIZER_BLOCK"
+)
+[ "$SERIALIZER_KEYS" = "$EXPECTED_ACTIVE_KEYS" ] ||
+  fail "active serializer does not emit the exact ordered 20-key contract"
+for constructor_call in \
+  'construct_active_record created' \
+  'construct_active_record post_action' \
+  'construct_active_record recovered' \
+  'construct_active_record pre_action' \
+  'construct_active_record verified'; do
+  grep -Fq "$constructor_call" <<<"$RESOLVER_TEXT" ||
+    fail "active mode does not use the shared constructor: $constructor_call"
+done
+[ "$(grep -Ec '^[[:space:]]+serialize_active_record$' <<<"$RESOLVER_TEXT")" -ge 5 ] ||
+  fail "active modes do not use the shared serializer"
 grep -Fq 'verify-ghcr-package-inventory.sh' <<<"$RESUME_TEXT" ||
   fail "resume verifier is missing GHCR inventory closure"
 grep -Fq 'verify-oci-referrer-closure.sh' <<<"$RESUME_TEXT" ||
@@ -405,6 +441,10 @@ require_text 'Read-only publication verification'
 
 PUBLISH_BLOCK=$(sed -n '/^  publish:/,/^  recovery:/p' <<<"$WORKFLOW_TEXT")
 RECOVERY_BLOCK=$(sed -n '/^  recovery:/,$p' <<<"$WORKFLOW_TEXT")
+GATES_BLOCK=$(sed -n '/^  gates:/,/^  publish:/p' <<<"$WORKFLOW_TEXT")
+RELEASE_BLOCK=$(sed -n '/^  release:/,/^  gates:/p' <<<"$WORKFLOW_TEXT")
+grep -Fq "needs.release.outputs.route == 'materialize'" <<<"$GATES_BLOCK" ||
+  fail "reusable build gates are not materialize-only"
 grep -Fq "needs.release.outputs.route == 'materialize'" <<<"$PUBLISH_BLOCK" ||
   fail "publish job is not materialize-only"
 if grep -Fq 'mutate-release-metadata.sh canonicalize' <<<"$PUBLISH_BLOCK"; then
@@ -412,6 +452,21 @@ if grep -Fq 'mutate-release-metadata.sh canonicalize' <<<"$PUBLISH_BLOCK"; then
 fi
 grep -Fq "needs.release.outputs.route == 'deep-recover'" <<<"$RECOVERY_BLOCK" ||
   fail "recovery job does not require the deep-recover route"
+grep -Eq '^[[:space:]]+needs: release$' <<<"$RECOVERY_BLOCK" ||
+  fail "deep recovery is reachable through build/upload gates"
+if grep -Eiq \
+    'docker (build|push)|build-push-action|gradlew|gh release upload|uploads\.github\.com|Upload the exact evidence set' \
+    <<<"$RECOVERY_BLOCK"; then
+  fail "deep recovery contains a build or asset-upload path"
+fi
+if grep -Fq 'googleapis/release-please-action@' <<<"$RECOVERY_BLOCK" ||
+   grep -Fq 'googleapis/release-please-action@' <<<"$PUBLISH_BLOCK" ||
+   grep -Fq 'googleapis/release-please-action@' <<<"$GATES_BLOCK"; then
+  fail "Release Please action is reachable outside the action-classification job"
+fi
+[ "$(grep -F 'googleapis/release-please-action@' <<<"$RELEASE_BLOCK" |
+  wc -l | tr -d '[:space:]')" -eq 1 ] ||
+  fail "release job must contain exactly one Release Please action"
 grep -Fq 'contents: write' <<<"$RECOVERY_BLOCK" ||
   fail "recovery job cannot publish release metadata"
 grep -Fq 'packages: read' <<<"$RECOVERY_BLOCK" ||
@@ -556,6 +611,8 @@ grep -Fq 'test-release-preaction-routing.sh' <<<"$CI_TEXT" ||
   fail "hosted CI does not run the mock-only pre-action authority matrix"
 grep -Fq 'test-resolve-release-descriptor.sh' <<<"$CI_TEXT" ||
   fail "reusable CI does not run the shared resolver fixtures"
+grep -Fq 'test-release-descriptor-schema.sh' <<<"$CI_TEXT" ||
+  fail "reusable CI does not run the active descriptor schema contract"
 grep -Fq 'contents: read' <<<"$CI_TEXT" ||
   fail "hosted pre-action matrix does not have read-only job permissions"
 if grep -Fq 'RELEASE_PLEASE_TOKEN' <<<"$CI_TEXT" ||

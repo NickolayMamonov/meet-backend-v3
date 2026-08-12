@@ -565,63 +565,81 @@ emit_pre_action_action() {
   }
 }
 
-emit_pre_action_recovery() {
-  local validated=$1 id observed_tag source kind fingerprint inventory state route
-  IFS=$'\t' read -r id observed_tag source kind fingerprint inventory state <<<"$validated"
+construct_active_record() {
+  local origin=$1 validated=$2 extra
+  local id observed_tag source kind fingerprint inventory state route admission
+  IFS=$'\t' read -r id observed_tag source kind fingerprint inventory state extra \
+    <<<"$validated"
+
+  [ -z "$extra" ] || fail "validated active descriptor has unexpected fields"
+  [[ "$id" =~ ^[1-9][0-9]*$ ]] ||
+    fail "validated active descriptor has an invalid release ID"
+  [[ "$source" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "validated active descriptor has an invalid source SHA"
+  [ "$source" = "$AUTHORITY_SOURCE" ] ||
+    fail "validated active descriptor source does not match authority"
+  case "$state" in
+    canonical)
+      [ "$observed_tag" = "$AUTHORITY_TAG" ] ||
+        fail "canonical active descriptor tag does not match authority"
+      ;;
+    generated_placeholder)
+      [[ "$observed_tag" =~ ^untagged-[0-9a-f]{20}$ ]] ||
+        fail "active descriptor placeholder tag is invalid"
+      ;;
+    *)
+      fail "validated active descriptor has an unsupported observed state"
+      ;;
+  esac
+  case "$kind" in empty|complete_unverified) ;; *)
+    fail "validated active descriptor has an unsupported asset inventory kind"
+  esac
+  [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "validated active descriptor has an invalid asset inventory fingerprint"
+  jq -e 'type == "array"' >/dev/null <<<"$inventory" ||
+    fail "validated active descriptor has an invalid asset inventory"
+
   route=$(publication_route "$state" "$kind")
+  admission=$(admission_fingerprint \
+    "$route" "$state" "$observed_tag" "$id" "$observed_tag" \
+    "$AUTHORITY_VERSION" "$AUTHORITY_SOURCE" "$AUTHORITY_SOURCE" \
+    true false null "$kind" "$fingerprint")
+  [[ "$admission" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "active descriptor admission fingerprint construction failed"
+
+  ACTIVE_ROUTE=$route
+  ACTIVE_ORIGIN=$origin
+  ACTIVE_OBSERVED_STATE=$state
+  ACTIVE_OBSERVED_TAG=$observed_tag
+  ACTIVE_RELEASE_ID=$id
+  ACTIVE_ASSET_INVENTORY_KIND=$kind
+  ACTIVE_ASSET_INVENTORY_FINGERPRINT=$fingerprint
+  ACTIVE_ASSET_INVENTORY_JSON=$inventory
+  ACTIVE_ADMISSION_FINGERPRINT=$admission
+}
+
+serialize_active_record() {
   {
-    echo "route=$route"
+    echo "route=$ACTIVE_ROUTE"
     echo "active=true"
-    echo "origin=pre_action"
-    echo "observed_state=$state"
-    echo "observed_tag=$observed_tag"
-    echo "release_id=$id"
+    echo "origin=$ACTIVE_ORIGIN"
+    echo "observed_state=$ACTIVE_OBSERVED_STATE"
+    echo "observed_tag=$ACTIVE_OBSERVED_TAG"
+    echo "release_id=$ACTIVE_RELEASE_ID"
     echo "tag=$AUTHORITY_TAG"
     echo "version=$AUTHORITY_VERSION"
-    echo "source_sha=$source"
-    echo "target_commitish=$source"
+    echo "source_sha=$AUTHORITY_SOURCE"
+    echo "target_commitish=$AUTHORITY_SOURCE"
     echo "draft=true"
     echo "prerelease=false"
     echo "published_at=null"
     echo "authority_version=$AUTHORITY_VERSION"
     echo "authority_tag=$AUTHORITY_TAG"
     echo "authority_source_sha=$AUTHORITY_SOURCE"
-    echo "asset_inventory_kind=$kind"
-    echo "asset_inventory_fingerprint=$fingerprint"
-    echo "asset_inventory_json=$inventory"
-    echo "admission_fingerprint=$(admission_fingerprint \
-      "$route" "$state" "$observed_tag" "$id" "$AUTHORITY_TAG" \
-      "$AUTHORITY_VERSION" "$source" "$source" true false null "$kind" \
-      "$fingerprint")"
-  }
-}
-
-emit_active() {
-  local origin=$1 validated=$2 id tag source kind fingerprint inventory state route
-  IFS=$'\t' read -r id tag source kind fingerprint inventory state <<<"$validated"
-  route=$(publication_route "$state" "$kind")
-  {
-    echo "active=true"
-    echo "origin=$origin"
-    echo "route=$route"
-    echo "observed_state=$state"
-    echo "observed_tag=$tag"
-    echo "release_id=$id"
-    echo "tag=$tag"
-    echo "version=$AUTHORITY_VERSION"
-    echo "source_sha=$source"
-    echo "target_commitish=$source"
-    echo "draft=true"
-    echo "published_at=null"
-    echo "authority_version=$AUTHORITY_VERSION"
-    echo "authority_tag=$AUTHORITY_TAG"
-    echo "authority_source_sha=$AUTHORITY_SOURCE"
-    echo "asset_inventory_kind=$kind"
-    echo "asset_inventory_fingerprint=$fingerprint"
-    echo "asset_inventory_json=$inventory"
-    echo "admission_fingerprint=$(admission_fingerprint \
-      "$route" "$state" "$tag" "$id" "$tag" "$AUTHORITY_VERSION" \
-      "$source" "$source" true false null "$kind" "$fingerprint")"
+    echo "asset_inventory_kind=$ACTIVE_ASSET_INVENTORY_KIND"
+    echo "asset_inventory_fingerprint=$ACTIVE_ASSET_INVENTORY_FINGERPRINT"
+    echo "asset_inventory_json=$ACTIVE_ASSET_INVENTORY_JSON"
+    echo "admission_fingerprint=$ACTIVE_ADMISSION_FINGERPRINT"
   }
 }
 
@@ -667,7 +685,8 @@ case "$MODE" in
       fail "created release failed descriptor validation"
     [ "${VALIDATED%%$'\t'*}" = "$EXPECTED_ID" ] ||
       fail "created release ID drifted"
-    emit_active created "$VALIDATED"
+    construct_active_record created "$VALIDATED"
+    serialize_active_record
     ;;
   post-action)
     require_expected_authority_tuple
@@ -688,7 +707,8 @@ case "$MODE" in
       fail "post-action tag does not match the action output"
     [ "$actual_source" = "$EXPECTED_SOURCE" ] ||
       fail "post-action source SHA does not match the action output"
-    emit_active post_action "${ELIGIBLE[0]}"
+    construct_active_record post_action "${ELIGIBLE[0]}"
+    serialize_active_record
     ;;
   recover)
     RELEASES=$(load_releases)
@@ -718,7 +738,8 @@ case "$MODE" in
         echo "authority_source_sha=$AUTHORITY_SOURCE"
       }
     elif [ "${#ELIGIBLE[@]}" -eq 1 ] && [ "${#COMPLETED[@]}" -eq 0 ]; then
-      emit_active recovered "${ELIGIBLE[0]}"
+      construct_active_record recovered "${ELIGIBLE[0]}"
+      serialize_active_record
     elif [ "${#ELIGIBLE[@]}" -eq 0 ] && [ "${#COMPLETED[@]}" -eq 1 ]; then
       {
         echo "route=none"
@@ -784,7 +805,8 @@ case "$MODE" in
       fi
     elif [ "${#ELIGIBLE[@]}" -eq 1 ] &&
          [ "${#COMPLETED[@]}" -eq 0 ]; then
-      emit_pre_action_recovery "${ELIGIBLE[0]}"
+      construct_active_record pre_action "${ELIGIBLE[0]}"
+      serialize_active_record
     else
       fail "multiple current-authority pre-action states are ambiguous"
     fi
@@ -805,16 +827,16 @@ case "$MODE" in
     [ "$actual_id" = "$EXPECTED_ID" ] || fail "release ID drifted"
     [ "$actual_fingerprint" = "$EXPECTED_FINGERPRINT" ] ||
       fail "release asset descriptor drifted"
-    OUTPUT=$(emit_active verified "$VALIDATED")
+    construct_active_record verified "$VALIDATED"
     if [ -n "$EXPECTED_ROUTE" ] &&
-       ! grep -Fx "route=$EXPECTED_ROUTE" <<<"$OUTPUT" >/dev/null; then
+       [ "$ACTIVE_ROUTE" != "$EXPECTED_ROUTE" ]; then
       fail "release publication route drifted"
     fi
     if [ -n "$EXPECTED_ADMISSION_FINGERPRINT" ] &&
-       ! grep -Fx "admission_fingerprint=$EXPECTED_ADMISSION_FINGERPRINT" \
-         <<<"$OUTPUT" >/dev/null; then
+       [ "$ACTIVE_ADMISSION_FINGERPRINT" != \
+         "$EXPECTED_ADMISSION_FINGERPRINT" ]; then
       fail "release admission fingerprint drifted"
     fi
-    printf '%s\n' "$OUTPUT"
+    serialize_active_record
     ;;
 esac
