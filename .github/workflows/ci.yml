@@ -200,6 +200,7 @@ jobs:
           "$TOOLING_SCRIPTS/test-release-mutation-revalidation.sh"
           "$TOOLING_SCRIPTS/test-release-preaction-routing.sh"
           "$TOOLING_SCRIPTS/test-resolve-release-descriptor.sh"
+          bash "$TOOLING_SCRIPTS/test-release-descriptor-schema.sh"
           "$TOOLING_SCRIPTS/test-release-metadata-mutation.sh"
           "$TOOLING_SCRIPTS/test-ghcr-package-inventory.sh"
           "$TOOLING_SCRIPTS/test-ghcr-package-normalization.sh"

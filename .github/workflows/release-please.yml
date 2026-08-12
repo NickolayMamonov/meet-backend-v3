@@ -26,6 +26,7 @@ jobs:
       observed_tag: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.observed_tag || steps.pre_action.outputs.observed_tag }}
       asset_inventory_kind: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.asset_inventory_kind || steps.pre_action.outputs.asset_inventory_kind }}
       asset_inventory_fingerprint: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.asset_inventory_fingerprint || steps.pre_action.outputs.asset_inventory_fingerprint }}
+      asset_inventory_json: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.asset_inventory_json || steps.pre_action.outputs.asset_inventory_json }}
       admission_fingerprint: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.admission_fingerprint || steps.pre_action.outputs.admission_fingerprint }}
     steps:
       - name: Checkout reviewed release tooling
@@ -58,10 +59,10 @@ jobs:
             }' <<<"$descriptor"
           }
           for key in route active origin observed_state observed_tag release_id \
-              tag version source_sha target_commitish draft published_at \
+              tag version source_sha target_commitish draft prerelease published_at \
               authority_version authority_tag authority_source_sha \
               asset_inventory_kind asset_inventory_fingerprint \
-              admission_fingerprint; do
+              asset_inventory_json admission_fingerprint; do
             echo "$key=$(value "$key")" >> "$GITHUB_OUTPUT"
           done
       - name: Release Please manifest
@@ -155,8 +156,9 @@ jobs:
           output_block=$(
             {
               for key in route active origin observed_state observed_tag release_id tag \
-                  version source_sha target_commitish draft published_at \
-                  asset_inventory_kind asset_inventory_fingerprint \
+                  version source_sha target_commitish draft prerelease published_at \
+                  authority_version authority_tag authority_source_sha \
+                  asset_inventory_kind asset_inventory_fingerprint asset_inventory_json \
                   admission_fingerprint; do
                 echo "$key=$(value "$key")"
               done
@@ -180,7 +182,8 @@ jobs:
   gates:
     name: Re-run release gates
     needs: release
-    if: needs.release.outputs.active == 'true'
+    if: needs.release.outputs.active == 'true' &&
+        needs.release.outputs.route == 'materialize'
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ github.sha }}
@@ -936,7 +939,7 @@ jobs:
 
   recovery:
     name: Recover immutable release
-    needs: [release, gates]
+    needs: release
     if: needs.release.outputs.active == 'true' &&
         needs.release.outputs.route == 'deep-recover'
     concurrency:

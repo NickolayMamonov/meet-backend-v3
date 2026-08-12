@@ -1,0 +1,90 @@
+{
+  "created-materialize": {
+    "mode": "created",
+    "release": "empty",
+    "expectedRoute": "materialize",
+    "expectedOrigin": "created",
+    "expectedState": "canonical",
+    "expectedInventoryKind": "empty"
+  },
+  "created-deep-recover": {
+    "mode": "created",
+    "release": "complete",
+    "expectedRoute": "deep-recover",
+    "expectedOrigin": "created",
+    "expectedState": "canonical",
+    "expectedInventoryKind": "complete_unverified"
+  },
+  "post-action-materialize": {
+    "mode": "post-action",
+    "release": "empty",
+    "expectedRoute": "materialize",
+    "expectedOrigin": "post_action",
+    "expectedState": "canonical",
+    "expectedInventoryKind": "empty"
+  },
+  "recover-materialize": {
+    "mode": "recover",
+    "release": "empty",
+    "expectedRoute": "materialize",
+    "expectedOrigin": "recovered",
+    "expectedState": "canonical",
+    "expectedInventoryKind": "empty"
+  },
+  "recover-deep-canonical": {
+    "mode": "recover",
+    "release": "complete",
+    "expectedRoute": "deep-recover",
+    "expectedOrigin": "recovered",
+    "expectedState": "canonical",
+    "expectedInventoryKind": "complete_unverified"
+  },
+  "recover-deep-placeholder": {
+    "mode": "recover",
+    "release": "placeholder",
+    "expectedRoute": "deep-recover",
+    "expectedOrigin": "recovered",
+    "expectedState": "generated_placeholder",
+    "expectedInventoryKind": "complete_unverified"
+  },
+  "pre-action-materialize": {
+    "mode": "pre-action",
+    "release": "empty",
+    "expectedRoute": "materialize",
+    "expectedOrigin": "pre_action",
+    "expectedState": "canonical",
+    "expectedInventoryKind": "empty"
+  },
+  "pre-action-deep-canonical": {
+    "mode": "pre-action",
+    "release": "complete",
+    "expectedRoute": "deep-recover",
+    "expectedOrigin": "pre_action",
+    "expectedState": "canonical",
+    "expectedInventoryKind": "complete_unverified"
+  },
+  "pre-action-deep-placeholder": {
+    "mode": "pre-action",
+    "release": "placeholder",
+    "expectedRoute": "deep-recover",
+    "expectedOrigin": "pre_action",
+    "expectedState": "generated_placeholder",
+    "expectedInventoryKind": "complete_unverified"
+  },
+  "verify-materialize": {
+    "mode": "verify",
+    "release": "empty",
+    "expectedRoute": "materialize",
+    "expectedOrigin": "verified",
+    "expectedState": "canonical",
+    "expectedInventoryKind": "empty"
+  },
+  "verify-deep-recover": {
+    "mode": "verify",
+    "release": "complete",
+    "expectedRoute": "deep-recover",
+    "expectedOrigin": "verified",
+    "expectedState": "canonical",
+    "expectedInventoryKind": "complete_unverified"
+  }
+}
