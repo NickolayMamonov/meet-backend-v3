@@ -277,6 +277,7 @@ PRE_ACTION_OUTPUT=$("$RESOLVER" pre-action \
 PRE_ACTION_ADMISSION_FINGERPRINT=$(awk -F= \
   '$1 == "admission_fingerprint" {print $2}' <<<"$PRE_ACTION_OUTPUT")
 if grep -Fx 'route=materialize' <<<"$PRE_ACTION_OUTPUT" >/dev/null &&
+   grep -Fx 'prerelease=false' <<<"$PRE_ACTION_OUTPUT" >/dev/null &&
    [ "$PRE_ACTION_ADMISSION_FINGERPRINT" = \
      "$POST_ACTION_ADMISSION_FINGERPRINT" ] &&
    ! grep -Fx 'origin=post_action' <<<"$PRE_ACTION_OUTPUT" >/dev/null; then
@@ -286,6 +287,42 @@ else
   echo "not ok - post-action to pre-action binding drifted" >&2
   failures=$((failures + 1))
 fi
+
+PRE_ACTION_COMPLETE_OUTPUT=$("$RESOLVER" pre-action \
+  --releases-file "$COMPLETE_ARRAY" "${common[@]}")
+if grep -Fx 'route=deep-recover' <<<"$PRE_ACTION_COMPLETE_OUTPUT" >/dev/null &&
+   grep -Fx 'active=true' <<<"$PRE_ACTION_COMPLETE_OUTPUT" >/dev/null &&
+   grep -Fx 'observed_state=canonical' <<<"$PRE_ACTION_COMPLETE_OUTPUT" >/dev/null &&
+   grep -Fx 'asset_inventory_kind=complete_unverified' \
+     <<<"$PRE_ACTION_COMPLETE_OUTPUT" >/dev/null &&
+   grep -Fx 'prerelease=false' <<<"$PRE_ACTION_COMPLETE_OUTPUT" >/dev/null; then
+  echo "ok - pre-action complete recovery emits exact prerelease state"
+  pass=$((pass + 1))
+else
+  echo "not ok - pre-action complete recovery descriptor drifted" >&2
+  echo "$PRE_ACTION_COMPLETE_OUTPUT" >&2
+  failures=$((failures + 1))
+fi
+
+for pre_action_case in \
+  prerelease-missing prerelease-true prerelease-string \
+  prerelease-number prerelease-null prerelease-array; do
+  case "$pre_action_case" in
+    prerelease-missing) mutation='del(.prerelease)' ;;
+    prerelease-true) mutation='.prerelease = true' ;;
+    prerelease-string) mutation='.prerelease = "false"' ;;
+    prerelease-number) mutation='.prerelease = 0' ;;
+    prerelease-null) mutation='.prerelease = null' ;;
+    prerelease-array) mutation='.prerelease = []' ;;
+  esac
+  mutated="$TMP/pre-action-$pre_action_case.json"
+  mutated_array="$TMP/pre-action-$pre_action_case-array.json"
+  jq "$mutation" "$EMPTY" >"$mutated"
+  make_array "$mutated_array" "$mutated"
+  expect_failure "pre-action $pre_action_case fails before emission" \
+    "$RESOLVER" pre-action --releases-file "$mutated_array" "${common[@]}"
+done
+
 PRE_ACTION_CONTINUATION_OUTPUT=$("$RESOLVER" pre-action \
   --releases-file "$POST_ACTION_ARRAY" "${common[@]}")
 if [ "$(awk -F= '$1 == "admission_fingerprint" {print $2}' \
