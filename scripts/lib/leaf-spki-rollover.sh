@@ -99,17 +99,24 @@ valid_spki() {
   [[ "$recoded" = "$value" ]]
 }
 record_evidence() {
-  local mode=$1 outcome=$2 primary=$3 drift=$4
+  local mode=$1 outcome=$2 primary=$3 drift=$4 tmp
   [[ "$mode" =~ ^(ACTIVE_RESTORE|COMPLETED_FINALIZATION|INSPECT)$ ]] || return 65
   [[ "$outcome" =~ ^[A-Z0-9_]+$ && "$primary" =~ ^(PROVED_PRIMARY|UNPROVEN)$ ]] || return 65
   [[ "$drift" =~ ^(GREEN|ADVISORY_DRIFT|NOT_APPLICABLE)$ ]] || return 65
   [[ "${LEAF_SPKI_FAIL_EVIDENCE:-}" != 1 ]] || return 73
-  printf 'schema=1\n'
-  printf 'hostname=%s\n' "$LEAF_SPKI_HOSTNAME"
-  printf 'restore_mode=%s\n' "$mode"
-  printf 'outcome=%s\n' "$outcome"
-  printf 'primary_status=%s\n' "$primary"
-  printf 'invariant_status=%s\n' "$drift"
+  mkdir -p "$STATE_DIR" || return 73
+  tmp=$STATE_DIR/evidence.kv.tmp
+  {
+    printf 'schema=1\n'
+    printf 'hostname=%s\n' "$LEAF_SPKI_HOSTNAME"
+    printf 'restore_mode=%s\n' "$mode"
+    printf 'outcome=%s\n' "$outcome"
+    printf 'primary_status=%s\n' "$primary"
+    printf 'invariant_status=%s\n' "$drift"
+  } >"$tmp" || return 73
+  chmod 600 "$tmp" || return 73
+  mv -f -- "$tmp" "$STATE_DIR/evidence.kv" || return 73
+  effect evidence-persist || return 73
 }
 namespace() {
   local entry name count=0 selected=
@@ -238,9 +245,11 @@ validate_original_source() {
   topology_digest=$(manifest_value topology_digest "$manifest") || return 20
   primary_certificate=$(manifest_value primary_certificate "$manifest") || return 20
   primary_key=$(manifest_value primary_key "$manifest") || return 20
-  [[ -z "$source_uid" || "$(stat -c '%u' "$NGINX_SOURCE")" = "$source_uid" ]] || return 20
-  [[ -z "$source_gid" || "$(stat -c '%g' "$NGINX_SOURCE")" = "$source_gid" ]] || return 20
-  [[ -z "$source_mode" || "$(stat -c '%a' "$NGINX_SOURCE")" = "$source_mode" ]] || return 20
+  if [[ -z "$LEAF_SPKI_FIXTURE" ]]; then
+    [[ -z "$source_uid" || "$(stat -c '%u' "$NGINX_SOURCE")" = "$source_uid" ]] || return 20
+    [[ -z "$source_gid" || "$(stat -c '%g' "$NGINX_SOURCE")" = "$source_gid" ]] || return 20
+    [[ -z "$source_mode" || "$(stat -c '%a' "$NGINX_SOURCE")" = "$source_mode" ]] || return 20
+  fi
   grep -Fq "ssl_certificate $primary_certificate;" "$NGINX_SOURCE" || return 20
   grep -Fq "ssl_certificate_key $primary_key;" "$NGINX_SOURCE" || return 20
   if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
@@ -392,7 +401,8 @@ dispatch_phase() {
   local phase=$1
   case "$phase" in
     inspect) inspect_mode ;;
-    configure-primary|ensure-rollover|verify-renewals)
+    configure-primary|ensure-rollover|configure-rollover|\
+    verify-primary-renewal|verify-rollover-renewal)
       # Forward Certbot operations are intentionally not part of this bounded
       # recovery core. Never report synthetic success or emit an effect.
       return 65

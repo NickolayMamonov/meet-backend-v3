@@ -4,7 +4,8 @@ IFS=$'\n\t'
 umask 077
 
 usage() {
-  printf 'usage: %s inspect|configure-primary|ensure-rollover|verify-renewals|drill\n' "$0" >&2
+  printf 'usage: %s inspect|configure-primary|ensure-rollover|configure-rollover\n' "$0" >&2
+  printf '       %s verify-primary-renewal|verify-rollover-renewal|drill\n' "$0" >&2
   printf '       %s restore --confirm-restore=RESTORE-PRIMARY\n' "$0" >&2
   exit 64
 }
@@ -13,7 +14,8 @@ usage() {
 command=$1
 shift
 case "$command" in
-  inspect|configure-primary|ensure-rollover|verify-renewals|drill|restore) ;;
+  inspect|configure-primary|ensure-rollover|configure-rollover|\
+  verify-primary-renewal|verify-rollover-renewal|drill|restore) ;;
   *) usage ;;
 esac
 if [[ "$command" = restore ]]; then
