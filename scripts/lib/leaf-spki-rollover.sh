@@ -18,6 +18,10 @@ readonly LEAF_SPKI_PRIMARY_LINEAGE=api.whysoezzy.online
 readonly LEAF_SPKI_ROLLOVER_LINEAGE=api.whysoezzy.online-rollover
 readonly LEAF_SPKI_BACKEND_SOURCE=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
 readonly LEAF_SPKI_BACKEND_IMAGE_DIGEST=sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
+readonly LEAF_SPKI_PRIMARY_CERT=/etc/letsencrypt/live/api.whysoezzy.online/fullchain.pem
+readonly LEAF_SPKI_PRIMARY_KEY=/etc/letsencrypt/live/api.whysoezzy.online/privkey.pem
+readonly LEAF_SPKI_ROLLOVER_CERT=/etc/letsencrypt/live/api.whysoezzy.online-rollover/fullchain.pem
+readonly LEAF_SPKI_ROLLOVER_KEY=/etc/letsencrypt/live/api.whysoezzy.online-rollover/privkey.pem
 
 LEAF_SPKI_FIXTURE=${LEAF_SPKI_FIXTURE_ROOT:-}
 if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
@@ -61,6 +65,14 @@ effect() {
   mkdir -p "$(dirname "$EFFECT_LOG")" || return 73
   printf '%s\n' "$1" >>"$EFFECT_LOG" || return 73
 }
+effect_detail() {
+  [[ "$EFFECT_LOG" = /dev/null ]] && return 0
+  mkdir -p "$(dirname "$EFFECT_LOG")" || return 73
+  printf '%s' "$1" >>"$EFFECT_LOG" || return 73
+  shift
+  printf '\t%s' "$@" >>"$EFFECT_LOG" || return 73
+  printf '\n' >>"$EFFECT_LOG" || return 73
+}
 sha256_file() { sha256sum -- "$1" | awk '{print $1}'; }
 is_regular_safe() {
   local path=$1
@@ -85,27 +97,169 @@ manifest_value() {
   ' "$file"
 }
 valid_digest() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
-valid_spki() {
-  local value=$1 decoded recoded
-  [[ "$value" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
-  decoded=$(mktemp) || return 1
-  if ! printf '%s' "$value" | base64 -d >"$decoded" 2>/dev/null ||
-    [[ "$(wc -c <"$decoded")" -ne 32 ]]; then
-    rm -f -- "$decoded"
-    return 1
+valid_spki() { [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
+ensure_state_dir() {
+  local parent
+  if [[ -L "$STATE_DIR" ]]; then
+    return 65
   fi
-  recoded=$(base64 <"$decoded" | tr -d '\r\n')
-  rm -f -- "$decoded"
-  [[ "$recoded" = "$value" ]]
+  if [[ -e "$STATE_DIR" ]]; then
+    is_directory_safe "$STATE_DIR" || return 65
+    return 0
+  fi
+  parent=${STATE_DIR%/*}
+  [[ -d "$parent" && ! -L "$parent" ]] || return 73
+  if [[ -z "$LEAF_SPKI_FIXTURE" ]]; then
+    [[ "$(stat -c '%u:%g' "$parent")" = 0:0 ]] || return 65
+    [[ $((8#$(stat -c '%a' "$parent") & 8#022)) -eq 0 ]] || return 65
+  fi
+  mkdir -- "$STATE_DIR" || return 73
+  chmod 700 "$STATE_DIR" || return 73
+  is_directory_safe "$STATE_DIR" || return 73
+}
+atomic_state_file() {
+  local destination=$1 tmp=$2
+  [[ "$destination" = "$STATE_DIR"/* && "$tmp" = "$STATE_DIR"/* ]] || return 70
+  if [[ -L "$destination" || (-e "$destination" && ! -f "$destination") ]]; then
+    return 65
+  fi
+  if [[ -e "$destination" ]]; then
+    is_regular_safe "$destination" || return 65
+  fi
+  is_regular_safe "$tmp" || return 65
+  chmod 600 "$tmp" || return 73
+  mv -f -- "$tmp" "$destination" || return 73
+}
+new_state_temp() {
+  local stem=$1 tmp
+  [[ "$stem" =~ ^[a-z][a-z0-9.-]+$ ]] || return 70
+  tmp=$(mktemp "$STATE_DIR/$stem.XXXXXXXX") || return 73
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 73; }
+  is_regular_safe "$tmp" || { rm -f -- "$tmp"; return 65; }
+  printf '%s\n' "$tmp"
+}
+fixture_observation() {
+  local key=$1 file=$ROOT_DIR/observations/leaf-spki.kv
+  [[ -n "$LEAF_SPKI_FIXTURE" ]] || return 70
+  [[ -f "$file" && ! -L "$file" ]] || return 69
+  manifest_value "$key" "$file" || return 69
+}
+certbot_account() {
+  local environment=$1 root value
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    value=$(fixture_observation "${environment}_account") || return $?
+    [[ "$value" =~ ^[A-Za-z0-9_-]{8,128}$ ]] || return 69
+    printf '%s\n' "$value"
+    return 0
+  fi
+  case "$environment" in
+    production) root=/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory ;;
+    staging) root=/etc/letsencrypt/accounts/acme-staging-v02.api.letsencrypt.org/directory ;;
+    *) return 70 ;;
+  esac
+  [[ -d "$root" && ! -L "$root" ]] || return 69
+  mapfile -t accounts < <(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
+  [[ "${#accounts[@]}" = 1 && "${accounts[0]}" =~ ^[A-Za-z0-9_-]{8,128}$ ]] || return 65
+  printf '%s\n' "${accounts[0]}"
+}
+certbot_webroot() {
+  local value file=/etc/letsencrypt/renewal/$LEAF_SPKI_PRIMARY_LINEAGE.conf
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    value=$(fixture_observation webroot) || return $?
+  else
+    [[ -f "$file" && ! -L "$file" ]] || return 69
+    value=$(awk -F' = ' '/^webroot_path = / { print $2 }' "$file")
+  fi
+  [[ "$value" = /* && "$value" != / && "$value" != *$'\n'* ]] || return 65
+  printf '%s\n' "$value"
+}
+lineage_spki() {
+  local lineage=$1 value certificate
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    case "$lineage" in
+      "$LEAF_SPKI_PRIMARY_LINEAGE") value=$(fixture_observation primary_spki) || return $? ;;
+      "$LEAF_SPKI_ROLLOVER_LINEAGE") value=$(fixture_observation rollover_spki) || return $? ;;
+      *) return 70 ;;
+    esac
+  else
+    case "$lineage" in
+      "$LEAF_SPKI_PRIMARY_LINEAGE") certificate=$LEAF_SPKI_PRIMARY_CERT ;;
+      "$LEAF_SPKI_ROLLOVER_LINEAGE") certificate=$LEAF_SPKI_ROLLOVER_CERT ;;
+      *) return 70 ;;
+    esac
+    [[ -r "$certificate" ]] || return 69
+    command -v openssl >/dev/null 2>&1 || return 69
+    value=$(openssl x509 -in "$certificate" -pubkey -noout 2>/dev/null |
+      openssl pkey -pubin -outform DER 2>/dev/null |
+      openssl dgst -sha256 -binary 2>/dev/null |
+      base64 | tr -d '\r\n') || return 69
+  fi
+  valid_spki "$value" || return 69
+  printf '%s\n' "$value"
+}
+rollover_presence() {
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    local value
+    value=$(fixture_observation rollover_present) || return $?
+    [[ "$value" = YES || "$value" = NO ]] || return 69
+    printf '%s\n' "$value"
+    return 0
+  fi
+  local live=/etc/letsencrypt/live/$LEAF_SPKI_ROLLOVER_LINEAGE
+  local archive=/etc/letsencrypt/archive/$LEAF_SPKI_ROLLOVER_LINEAGE
+  local renewal=/etc/letsencrypt/renewal/$LEAF_SPKI_ROLLOVER_LINEAGE.conf
+  if [[ ! -e "$live" && ! -L "$live" && ! -e "$archive" && ! -L "$archive" &&
+    ! -e "$renewal" && ! -L "$renewal" ]]; then
+    printf 'NO\n'
+  elif [[ -d "$live" && ! -L "$live" && -d "$archive" && ! -L "$archive" &&
+    -f "$renewal" && ! -L "$renewal" ]]; then
+    printf 'YES\n'
+  else
+    return 65
+  fi
+}
+prove_rollover_dormant() {
+  local source=$NGINX_SOURCE
+  [[ -f "$source" && ! -L "$source" ]] || return 69
+  ! grep -Fq "$LEAF_SPKI_ROLLOVER_LINEAGE" "$source" || return 65
+}
+validate_rollover_configuration() {
+  local file=/etc/letsencrypt/renewal/$LEAF_SPKI_ROLLOVER_LINEAGE.conf
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    [[ "$(fixture_observation rollover_configuration)" = VALID ]] || return 65
+    return 0
+  fi
+  [[ -f "$file" && ! -L "$file" ]] || return 65
+  grep -Eq '^authenticator = webroot$' "$file" || return 65
+  grep -Eq '^key_type = ecdsa$' "$file" || return 65
+  grep -Eq '^elliptic_curve = secp256r1$' "$file" || return 65
+  grep -Eq '^reuse_key = True$' "$file" || return 65
+  [[ "$(awk -F' = ' '/^webroot_path = / { print $2 }' "$file")" = "$(certbot_webroot)" ]] ||
+    return 65
+  ! grep -Eq '^(pre_hook|post_hook|renew_hook|deploy_hook) = ' "$file" || return 65
+}
+run_certbot() {
+  local operation=$1 rc=0
+  shift
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    effect certbot-"$operation" || return 73
+    effect_detail certbot-argv /usr/bin/certbot "$@" || return 73
+    [[ "${LEAF_SPKI_FAIL_CERTBOT:-}" != 1 &&
+      "${LEAF_SPKI_FAIL_CERTBOT_OPERATION:-}" != "$operation" ]] || return 74
+    return 0
+  fi
+  command -v /usr/bin/certbot >/dev/null 2>&1 || return 69
+  /usr/bin/certbot "$@" || rc=$?
+  [[ "$rc" = 0 ]] || return 74
 }
 record_evidence() {
   local mode=$1 outcome=$2 primary=$3 drift=$4 tmp
-  [[ "$mode" =~ ^(ACTIVE_RESTORE|COMPLETED_FINALIZATION|INSPECT)$ ]] || return 65
+  [[ "$mode" =~ ^(ACTIVE_RESTORE|COMPLETED_FINALIZATION|INSPECT|FORWARD|DRILL)$ ]] || return 65
   [[ "$outcome" =~ ^[A-Z0-9_]+$ && "$primary" =~ ^(PROVED_PRIMARY|UNPROVEN)$ ]] || return 65
   [[ "$drift" =~ ^(GREEN|ADVISORY_DRIFT|NOT_APPLICABLE)$ ]] || return 65
   [[ "${LEAF_SPKI_FAIL_EVIDENCE:-}" != 1 ]] || return 73
-  mkdir -p "$STATE_DIR" || return 73
-  tmp=$STATE_DIR/evidence.kv.tmp
+  ensure_state_dir || return $?
+  tmp=$(new_state_temp evidence.kv.tmp) || return $?
   {
     printf 'schema=1\n'
     printf 'hostname=%s\n' "$LEAF_SPKI_HOSTNAME"
@@ -114,18 +268,22 @@ record_evidence() {
     printf 'primary_status=%s\n' "$primary"
     printf 'invariant_status=%s\n' "$drift"
   } >"$tmp" || return 73
-  chmod 600 "$tmp" || return 73
-  mv -f -- "$tmp" "$STATE_DIR/evidence.kv" || return 73
+  atomic_state_file "$STATE_DIR/evidence.kv" "$tmp" || return $?
   effect evidence-persist || return 73
 }
 namespace() {
   local entry name count=0 selected=
+  local -a entries=()
+  [[ ! -L "$RECOVERY_PARENT" ]] || return 65
   if [[ ! -e "$RECOVERY_PARENT" ]]; then
     printf 'NONE\n'
     return 0
   fi
   is_directory_safe "$RECOVERY_PARENT" || return 65
-  while IFS= read -r -d '' entry; do
+  shopt -s nullglob
+  entries=("$RECOVERY_PARENT"/*)
+  shopt -u nullglob
+  for entry in "${entries[@]}"; do
     name=${entry##*/}
     case "$name" in
       preparing|active|completed)
@@ -135,7 +293,7 @@ namespace() {
         ;;
       *) return 65 ;;
     esac
-  done < <(find "$RECOVERY_PARENT" -mindepth 1 -maxdepth 1 -print0)
+  done
   if (( count == 0 )); then printf 'NONE\n'
   elif (( count == 1 )); then printf '%s\n' "$selected"
   else printf 'CONFLICT\n'
@@ -144,14 +302,24 @@ namespace() {
 validate_package() {
   local name=$1 dir="$RECOVERY_PARENT/$1" manifest rollback key value
   local -A seen=()
+  local entry entry_count=0 has_manifest=0 has_rollback=0
   [[ "$name" = preparing || "$name" = active || "$name" = completed ]] || return 65
   is_directory_safe "$dir" || return 65
   manifest=$dir/manifest.kv
   rollback=$dir/nginx-source.rollback
   is_regular_safe "$manifest" || return 65
   is_regular_safe "$rollback" || return 65
-  [[ "$(find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')" = \
-    "manifest.kv nginx-source.rollback " ]] || return 65
+  shopt -s nullglob
+  for entry in "$dir"/*; do
+    entry_count=$((entry_count + 1))
+    case "${entry##*/}" in
+      manifest.kv) has_manifest=1 ;;
+      nginx-source.rollback) has_rollback=1 ;;
+      *) return 65 ;;
+    esac
+  done
+  shopt -u nullglob
+  [[ "$entry_count" = 2 && "$has_manifest" = 1 && "$has_rollback" = 1 ]] || return 65
   while IFS= read -r line; do
     [[ "$line" =~ ^[a-z][a-z0-9_]*=[^[:cntrl:]]*$ ]] || return 65
     key=${line%%=*}; value=${line#*=}
@@ -222,14 +390,24 @@ validate_package() {
 }
 validate_package_shape() {
   local name=$1 dir="$RECOVERY_PARENT/$1" manifest rollback
+  local entry entry_count=0 has_manifest=0 has_rollback=0
   [[ "$name" = preparing || "$name" = active || "$name" = completed ]] || return 1
   is_directory_safe "$dir" || return 1
   manifest=$dir/manifest.kv
   rollback=$dir/nginx-source.rollback
   is_regular_safe "$manifest" || return 1
   is_regular_safe "$rollback" || return 1
-  [[ "$(find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')" = \
-    "manifest.kv nginx-source.rollback " ]] || return 1
+  shopt -s nullglob
+  for entry in "$dir"/*; do
+    entry_count=$((entry_count + 1))
+    case "${entry##*/}" in
+      manifest.kv) has_manifest=1 ;;
+      nginx-source.rollback) has_rollback=1 ;;
+      *) return 1 ;;
+    esac
+  done
+  shopt -u nullglob
+  [[ "$entry_count" = 2 && "$has_manifest" = 1 && "$has_rollback" = 1 ]] || return 1
   [[ "$(stat -c '%d' "$manifest")" = "$(stat -c '%d' "$dir")" &&
     "$(stat -c '%d' "$rollback")" = "$(stat -c '%d' "$dir")" ]]
 }
@@ -271,6 +449,12 @@ prove_external_primary() {
     observed_hostname=$(manifest_value hostname "$observation") || return 69
     observed_chain=$(manifest_value chain "$observation") || return 69
     observed_spki=$(manifest_value spki "$observation") || return 69
+    case "${LEAF_SPKI_FIXTURE_EXTERNAL_ROLE:-primary}" in
+      primary) ;;
+      rollover) observed_spki=$(fixture_observation external_rollover_spki) || return $? ;;
+      unavailable) return 69 ;;
+      *) return 65 ;;
+    esac
     [[ "$observed_hostname" = "$LEAF_SPKI_HOSTNAME" ]] || return 20
     [[ "$observed_chain" = VERIFIED ]] || return 20
     valid_spki "$observed_spki" || return 69
@@ -286,6 +470,23 @@ prove_external_primary() {
     openssl dgst -sha256 -binary 2>/dev/null |
     base64 | tr -d '\r\n') || return 69
   [[ "$actual" = "$expected" ]] || return 20
+}
+prove_external_rollover() {
+  local expected=$1
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    local observation=$ROOT_DIR/observations/external-rollover.kv
+    local observed_hostname observed_chain observed_spki
+    [[ -f "$observation" && ! -L "$observation" ]] || return 69
+    observed_hostname=$(manifest_value hostname "$observation") || return 69
+    observed_chain=$(manifest_value chain "$observation") || return 69
+    observed_spki=$(manifest_value spki "$observation") || return 69
+    [[ "$observed_hostname" = "$LEAF_SPKI_HOSTNAME" && "$observed_chain" = VERIFIED ]] ||
+      return 20
+    valid_spki "$observed_spki" || return 69
+    [[ "$observed_spki" = "$expected" ]] || return 20
+    return 0
+  fi
+  prove_external_primary "$expected"
 }
 observe_advisory_status() {
   if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
@@ -380,37 +581,309 @@ active_restore() {
     return 20
   }
   prove_external_primary "$(manifest_value primary_spki "$manifest")" || return $?
-  local active_identity
-  active_identity=$(stat -c '%d:%i' "$RECOVERY_PARENT/active") || return 73
   [[ ! -e "$RECOVERY_PARENT/completed" && ! -L "$RECOVERY_PARENT/completed" ]] || return 73
-  mv -T -n --no-copy "$RECOVERY_PARENT/active" "$RECOVERY_PARENT/completed" || return 73
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    mv -T -n "$RECOVERY_PARENT/active" "$RECOVERY_PARENT/completed" || return 73
+  else
+    mv -T -n --no-copy "$RECOVERY_PARENT/active" "$RECOVERY_PARENT/completed" || return 73
+  fi
   [[ ! -e "$RECOVERY_PARENT/active" && ! -L "$RECOVERY_PARENT/active" &&
-    -d "$RECOVERY_PARENT/completed" && ! -L "$RECOVERY_PARENT/completed" &&
-    "$(stat -c '%d:%i' "$RECOVERY_PARENT/completed")" = "$active_identity" ]] || return 73
+    -d "$RECOVERY_PARENT/completed" && ! -L "$RECOVERY_PARENT/completed" ]] || return 73
   effect active-to-completed || return 73
   sync_parent || return 73
   completed_finalize
 }
+render_rollover_candidate() {
+  local source=$1 destination=$2 cert_count key_count normalized_source normalized_destination
+  cert_count=$(awk -v expected="$LEAF_SPKI_PRIMARY_CERT" '
+    $1 == "ssl_certificate" && $2 == expected ";" && NF == 2 { count++ }
+    END { print count + 0 }
+  ' "$source")
+  key_count=$(awk -v expected="$LEAF_SPKI_PRIMARY_KEY" '
+    $1 == "ssl_certificate_key" && $2 == expected ";" && NF == 2 { count++ }
+    END { print count + 0 }
+  ' "$source")
+  [[ "$cert_count" = 1 && "$key_count" = 1 ]] || return 65
+  awk -v cert="$LEAF_SPKI_ROLLOVER_CERT" -v key="$LEAF_SPKI_ROLLOVER_KEY" '
+    $1 == "ssl_certificate" { sub($2, cert ";") }
+    $1 == "ssl_certificate_key" { sub($2, key ";") }
+    { print }
+  ' "$source" >"$destination" || return 73
+  normalized_source=$(mktemp) || return 73
+  normalized_destination=$(mktemp) || { rm -f -- "$normalized_source"; return 73; }
+  awk '$1 == "ssl_certificate" { $2 = "<CERT>;" }
+       $1 == "ssl_certificate_key" { $2 = "<KEY>;" }
+       { print }' "$source" >"$normalized_source" || return 73
+  awk '$1 == "ssl_certificate" { $2 = "<CERT>;" }
+       $1 == "ssl_certificate_key" { $2 = "<KEY>;" }
+       { print }' "$destination" >"$normalized_destination" || return 73
+  cmp -s "$normalized_source" "$normalized_destination" || {
+    rm -f -- "$normalized_source" "$normalized_destination"
+    return 65
+  }
+  rm -f -- "$normalized_source" "$normalized_destination"
+}
+render_mixed_candidate() {
+  local source=$1 destination=$2 kind=$3
+  case "$kind" in
+    certificate)
+      sed "s#^\([[:space:]]*ssl_certificate[[:space:]]\+\)$LEAF_SPKI_PRIMARY_CERT;\([[:space:]]*\)\$#\1$LEAF_SPKI_ROLLOVER_CERT;\2#" \
+        "$source" >"$destination" || return 73
+      ;;
+    key)
+      sed "s#^\([[:space:]]*ssl_certificate_key[[:space:]]\+\)$LEAF_SPKI_PRIMARY_KEY;\([[:space:]]*\)\$#\1$LEAF_SPKI_ROLLOVER_KEY;\2#" \
+        "$source" >"$destination" || return 73
+      ;;
+    *) return 70 ;;
+  esac
+}
+install_nginx_source() {
+  local source=$1
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    cp -- "$source" "$NGINX_SOURCE" || return 20
+  else
+    install -o "$(stat -c '%u' "$NGINX_SOURCE")" \
+      -g "$(stat -c '%g' "$NGINX_SOURCE")" \
+      -m "$(stat -c '%a' "$NGINX_SOURCE")" \
+      "$source" "$NGINX_SOURCE" || return 20
+  fi
+  effect nginx-install || return 20
+}
+nginx_test_reload() {
+  [[ -z "$LEAF_SPKI_FIXTURE" || "${LEAF_SPKI_FAIL_NGINX_TEST:-}" != 1 ]] || return 20
+  effect nginx-test || return 20
+  [[ -n "$LEAF_SPKI_FIXTURE" ]] || nginx -t || return 20
+  [[ -z "$LEAF_SPKI_FIXTURE" || "${LEAF_SPKI_FAIL_NGINX_RELOAD:-}" != 1 ]] || return 20
+  effect nginx-reload || return 20
+  [[ -n "$LEAF_SPKI_FIXTURE" ]] || systemctl reload nginx || return 20
+}
+prepare_recovery_package() {
+  local primary=$1 candidate=$2 mixed_certificate=$3 mixed_key=$4
+  local preparing=$RECOVERY_PARENT/preparing manifest rollback source_digest rollback_digest
+  local source_uid source_gid source_mode topology_digest self_sha256 active_identity
+  [[ "$(namespace)" = NONE ]] || return 65
+  mkdir -- "$RECOVERY_PARENT" || return 73
+  chmod 700 "$RECOVERY_PARENT" || return 73
+  is_directory_safe "$RECOVERY_PARENT" || return 73
+  mkdir -- "$preparing" || return 73
+  chmod 700 "$preparing" || return 73
+  rollback=$preparing/nginx-source.rollback
+  cp -- "$NGINX_SOURCE" "$rollback" || return 73
+  chmod 600 "$rollback" || return 73
+  source_digest=$(sha256_file "$NGINX_SOURCE") || return 73
+  rollback_digest=$(sha256_file "$rollback") || return 73
+  source_uid=$(stat -c '%u' "$NGINX_SOURCE") || return 73
+  source_gid=$(stat -c '%g' "$NGINX_SOURCE") || return 73
+  source_mode=$(stat -c '%a' "$NGINX_SOURCE") || return 73
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    [[ -f "$ROOT_DIR/topology.digest" && ! -L "$ROOT_DIR/topology.digest" ]] || return 69
+    topology_digest=$(<"$ROOT_DIR/topology.digest")
+  else
+    topology_digest=$(nginx -T 2>/dev/null | sha256sum | awk '{print $1}') || return 69
+  fi
+  valid_digest "$topology_digest" || return 69
+  manifest=$preparing/manifest.kv
+  {
+    printf 'schema=1\nhostname=%s\nsource_path=%s\n' "$LEAF_SPKI_HOSTNAME" "$NGINX_SOURCE"
+    printf 'source_digest=%s\nrollback_digest=%s\nprimary_spki=%s\n' \
+      "$source_digest" "$rollback_digest" "$primary"
+    printf 'source_uid=%s\nsource_gid=%s\nsource_mode=%s\n' \
+      "$source_uid" "$source_gid" "$source_mode"
+    printf 'tool_revision=%s\ntopology_digest=%s\n' "$LEAF_SPKI_BACKEND_SOURCE" "$topology_digest"
+    printf 'primary_certificate=%s\nprimary_key=%s\n' \
+      "$LEAF_SPKI_PRIMARY_CERT" "$LEAF_SPKI_PRIMARY_KEY"
+    printf 'candidate_digest=%s\nmixed_certificate_digest=%s\nmixed_key_digest=%s\n' \
+      "$(sha256_file "$candidate")" "$(sha256_file "$mixed_certificate")" "$(sha256_file "$mixed_key")"
+  } >"$manifest" || return 73
+  self_sha256=$(sha256_file "$manifest") || return 73
+  printf 'self_sha256=%s\n' "$self_sha256" >>"$manifest" || return 73
+  chmod 600 "$manifest" || return 73
+  validate_package preparing >/dev/null || return 73
+  active_identity=$(stat -c '%d:%i' "$preparing") || return 73
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    mv -T -n "$preparing" "$RECOVERY_PARENT/active" || return 73
+  else
+    mv -T -n --no-copy "$preparing" "$RECOVERY_PARENT/active" || return 73
+  fi
+  [[ "$(stat -c '%d:%i' "$RECOVERY_PARENT/active")" = "$active_identity" ]] || return 73
+  effect preparing-to-active || return 73
+  [[ "${LEAF_SPKI_FAIL_ACTIVE_PERSIST:-}" != 1 ]] || return 73
+}
+drill_mode() {
+  local primary rollover work candidate mixed_certificate mixed_key rc=0 restored_rc
+  [[ "$(namespace)" = NONE ]] || return 65
+  primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
+  rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
+  [[ "$primary" != "$rollover" ]] || return 65
+  prove_external_primary "$primary" || return $?
+  prove_rollover_dormant || return $?
+  run_certbot primary-renew-dry-run renew \
+    --non-interactive --cert-name "$LEAF_SPKI_PRIMARY_LINEAGE" \
+    --dry-run --no-directory-hooks || return $?
+  run_certbot rollover-renew-dry-run renew \
+    --non-interactive --cert-name "$LEAF_SPKI_ROLLOVER_LINEAGE" \
+    --dry-run --no-directory-hooks || return $?
+  work=$(mktemp -d) || return 73
+  candidate=$work/candidate
+  mixed_certificate=$work/mixed-certificate
+  mixed_key=$work/mixed-key
+  render_rollover_candidate "$NGINX_SOURCE" "$candidate" || { rm -r -- "$work"; return $?; }
+  render_mixed_candidate "$NGINX_SOURCE" "$mixed_certificate" certificate ||
+    { rm -r -- "$work"; return $?; }
+  render_mixed_candidate "$NGINX_SOURCE" "$mixed_key" key || { rm -r -- "$work"; return $?; }
+  prepare_recovery_package "$primary" "$candidate" "$mixed_certificate" "$mixed_key" ||
+    { rc=$?; rm -r -- "$work"; return "$rc"; }
+  if ! install_nginx_source "$candidate"; then
+    rc=1
+  elif ! nginx_test_reload; then
+    rc=1
+  elif [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    [[ "${LEAF_SPKI_FAIL_ROLLOVER_PROOF:-}" != 1 ]] || rc=1
+    prove_external_rollover "$rollover" || rc=1
+  else
+    prove_external_rollover "$rollover" || rc=1
+  fi
+  rm -r -- "$work"
+  if active_restore; then
+    restored_rc=0
+  else
+    restored_rc=$?
+  fi
+  [[ "$restored_rc" = 0 || "$restored_rc" = 10 ]] || return 20
+  if [[ "$rc" = 0 && "$restored_rc" = 0 ]]; then
+    record_evidence DRILL PRIMARY_RESTORED PROVED_PRIMARY GREEN || return 73
+    return 0
+  fi
+  record_evidence DRILL DRILL_FAILED_PRIMARY_RESTORED PROVED_PRIMARY ADVISORY_DRIFT || return 73
+  return 10
+}
 inspect_mode() {
-  local state
-  state=$(namespace) || return 65
-  record_evidence INSPECT INSPECT_COMPLETE UNPROVEN NOT_APPLICABLE || return 73
-  printf 'namespace=%s\n' "$state"
+  local recovery primary rollover=
+  recovery=$(namespace) || return 65
+  primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
+  prove_external_primary "$primary" || return $?
+  if [[ "$recovery" = active || "$recovery" = preparing || "$recovery" = CONFLICT ]]; then
+    return 65
+  fi
+  if [[ "$(rollover_presence)" = YES ]]; then
+    rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
+    [[ "$primary" != "$rollover" ]] || return 65
+    prove_rollover_dormant || return $?
+  fi
+  record_evidence INSPECT INSPECT_COMPLETE UNPROVEN NOT_APPLICABLE || return $?
+  printf 'namespace=%s\nprimary_spki=%s\n' "$recovery" "$primary"
+  [[ -z "$rollover" ]] || printf 'rollover_spki=%s\n' "$rollover"
+}
+configure_primary() {
+  local primary webroot
+  primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
+  prove_external_primary "$primary" || return $?
+  webroot=$(certbot_webroot) || return $?
+  run_certbot primary-reconfigure reconfigure \
+    --non-interactive \
+    --cert-name "$LEAF_SPKI_PRIMARY_LINEAGE" \
+    --webroot \
+    --webroot-path "$webroot" \
+    --key-type ecdsa \
+    --elliptic-curve secp256r1 \
+    --reuse-key \
+    --no-directory-hooks || return $?
+  [[ "$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE")" = "$primary" ]] || return 65
+  prove_external_primary "$primary" || return $?
+  record_evidence FORWARD PRIMARY_REUSE_VERIFIED PROVED_PRIMARY GREEN || return $?
+  printf 'primary_spki=%s\n' "$primary"
+}
+ensure_rollover() {
+  local primary rollover presence webroot production_account
+  primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
+  prove_external_primary "$primary" || return $?
+  webroot=$(certbot_webroot) || return $?
+  production_account=$(certbot_account production) || return $?
+  presence=$(rollover_presence) || return $?
+  if [[ "$presence" = NO ]]; then
+    run_certbot rollover-certonly certonly \
+      --non-interactive \
+      --server https://acme-v02.api.letsencrypt.org/directory \
+      --account "$production_account" \
+      --webroot \
+      --webroot-path "$webroot" \
+      --domains "$LEAF_SPKI_HOSTNAME" \
+      --cert-name "$LEAF_SPKI_ROLLOVER_LINEAGE" \
+      --key-type ecdsa \
+      --elliptic-curve secp256r1 \
+      --new-key \
+      --reuse-key \
+      --no-directory-hooks || return $?
+    if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+      [[ "$(fixture_observation rollover_present_after_certbot)" = YES ]] || return 65
+    else
+      [[ "$(rollover_presence)" = YES ]] || return 65
+    fi
+  else
+    run_certbot rollover-reconfigure reconfigure \
+      --non-interactive \
+      --cert-name "$LEAF_SPKI_ROLLOVER_LINEAGE" \
+      --webroot \
+      --webroot-path "$webroot" \
+      --key-type ecdsa \
+      --elliptic-curve secp256r1 \
+      --reuse-key \
+      --no-directory-hooks || return $?
+    validate_rollover_configuration || return $?
+  fi
+  rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
+  [[ "$primary" != "$rollover" ]] || return 65
+  prove_rollover_dormant || return $?
+  prove_external_primary "$primary" || return $?
+  record_evidence FORWARD ROLLOVER_VERIFIED PROVED_PRIMARY GREEN || return $?
+  printf 'primary_spki=%s\nrollover_spki=%s\n' "$primary" "$rollover"
+}
+configure_rollover() {
+  local primary rollover
+  [[ "$(rollover_presence)" = YES ]] || return 65
+  validate_rollover_configuration || return $?
+  primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
+  rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
+  [[ "$primary" != "$rollover" ]] || return 65
+  prove_rollover_dormant || return $?
+  prove_external_primary "$primary" || return $?
+  record_evidence FORWARD ROLLOVER_VERIFIED PROVED_PRIMARY GREEN || return $?
+  printf 'primary_spki=%s\nrollover_spki=%s\n' "$primary" "$rollover"
+}
+verify_renewal() {
+  local lineage=$1 operation primary rollover staging_account
+  primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
+  rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
+  [[ "$primary" != "$rollover" ]] || return 65
+  prove_rollover_dormant || return $?
+  prove_external_primary "$primary" || return $?
+  staging_account=$(certbot_account staging) || return $?
+  [[ "$lineage" = "$LEAF_SPKI_PRIMARY_LINEAGE" ]] &&
+    operation=primary-renew-dry-run || operation=rollover-renew-dry-run
+  run_certbot "$operation" renew \
+    --non-interactive \
+    --cert-name "$lineage" \
+    --dry-run \
+    --server https://acme-staging-v02.api.letsencrypt.org/directory \
+    --account "$staging_account" \
+    --no-directory-hooks || return $?
+  [[ "$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE")" = "$primary" &&
+    "$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE")" = "$rollover" ]] || return 65
+  prove_rollover_dormant || return $?
+  prove_external_primary "$primary" || return $?
+  record_evidence FORWARD RENEWAL_VERIFIED PROVED_PRIMARY GREEN || return $?
+  printf 'primary_spki=%s\nrollover_spki=%s\n' "$primary" "$rollover"
 }
 dispatch_phase() {
   local phase=$1
   case "$phase" in
     inspect) inspect_mode ;;
-    configure-primary|ensure-rollover|configure-rollover|\
-    verify-primary-renewal|verify-rollover-renewal)
-      # Forward Certbot operations are intentionally not part of this bounded
-      # recovery core. Never report synthetic success or emit an effect.
-      return 65
-      ;;
-    drill)
-      [[ "$(namespace)" = NONE ]] || return 65
-      return 65
-      ;;
+    configure-primary) configure_primary ;;
+    ensure-rollover) ensure_rollover ;;
+    configure-rollover) configure_rollover ;;
+    verify-primary-renewal) verify_renewal "$LEAF_SPKI_PRIMARY_LINEAGE" ;;
+    verify-rollover-renewal) verify_renewal "$LEAF_SPKI_ROLLOVER_LINEAGE" ;;
+    drill) drill_mode ;;
     restore)
       local state
       state=$(namespace) || return 65
@@ -424,7 +897,7 @@ dispatch_phase() {
   esac
 }
 run_rollover() {
-  local phase=$1 fd lock_dir=
+  local phase=$1 fd lock_dir= rc
   if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
     mkdir -p "$(dirname "$LOCK_FILE")"
   else
@@ -437,8 +910,12 @@ run_rollover() {
     [[ -n "$LEAF_SPKI_FIXTURE" ]] || return 75
     lock_dir="${LOCK_FILE}.d"
     mkdir "$lock_dir" 2>/dev/null || return 75
-    LEAF_SPKI_FIXTURE_LOCK_DIR=$lock_dir
-    trap 'rmdir -- "${LEAF_SPKI_FIXTURE_LOCK_DIR:?}" 2>/dev/null || true' EXIT
+  fi
+  if [[ -n "$lock_dir" ]]; then
+    dispatch_phase "$phase" || rc=$?
+    rc=${rc:-0}
+    rmdir -- "$lock_dir" 2>/dev/null || true
+    return "$rc"
   fi
   dispatch_phase "$phase"
 }
