@@ -1,220 +1,113 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ASSET_INVENTORY_HELPER=$SCRIPT_DIR/release-asset-inventory.sh
-
+fail() { echo "release metadata mutation failed: $*" >&2; exit 1; }
 usage() {
-  echo "usage: $0 canonicalize|publish --repository owner/repo --release-id ID --version X.Y.Z --tag vX.Y.Z --source-sha SHA --target SHA --expected-fingerprint SHA256 --repo-dir PATH [--observed-tag untagged-XXXXXXXXXXXXXXXXXXXX] [--release-file PATH]" >&2
+  echo "usage: $0 publish --repository OWNER/REPO --release-id ID --version X.Y.Z --tag vX.Y.Z --source-sha SHA [--release-file PATH] [--policy-token-file PATH] [--credential-proof PATH]" >&2
   exit 2
 }
-
-fail() {
-  echo "release metadata mutation failed: $*" >&2
-  exit 1
-}
-
-[ "$#" -ge 1 ] || usage
-OP=$1
+[ "${1:-}" = publish ] || usage
 shift
-case "$OP" in canonicalize|publish) ;; *) usage ;; esac
-
-REPOSITORY=${GITHUB_REPOSITORY:-}
-RELEASE_ID=
-VERSION=
-TAG=
-SOURCE_SHA=
-TARGET=
-EXPECTED_FINGERPRINT=
-REPO_DIR=.
-RELEASE_FILE=
-OBSERVED_TAG=
-
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repository=${GITHUB_REPOSITORY:-}
+release_id=
+version=
+tag=
+source_sha=
+release_file=
+policy_token_file=
+credential_proof=
+repo_dir=.
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --repository) [ "$#" -ge 2 ] || usage; REPOSITORY=$2; shift 2 ;;
-    --release-id) [ "$#" -ge 2 ] || usage; RELEASE_ID=$2; shift 2 ;;
-    --version) [ "$#" -ge 2 ] || usage; VERSION=$2; shift 2 ;;
-    --tag) [ "$#" -ge 2 ] || usage; TAG=$2; shift 2 ;;
-    --source-sha) [ "$#" -ge 2 ] || usage; SOURCE_SHA=$2; shift 2 ;;
-    --target) [ "$#" -ge 2 ] || usage; TARGET=$2; shift 2 ;;
-    --expected-fingerprint)
-      [ "$#" -ge 2 ] || usage
-      EXPECTED_FINGERPRINT=$2
-      shift 2
-      ;;
-    --repo-dir) [ "$#" -ge 2 ] || usage; REPO_DIR=$2; shift 2 ;;
-    --release-file) [ "$#" -ge 2 ] || usage; RELEASE_FILE=$2; shift 2 ;;
-    --observed-tag) [ "$#" -ge 2 ] || usage; OBSERVED_TAG=$2; shift 2 ;;
+    --repository) repository=${2:?}; shift 2 ;;
+    --release-id) release_id=${2:?}; shift 2 ;;
+    --version) version=${2:?}; shift 2 ;;
+    --tag) tag=${2:?}; shift 2 ;;
+    --source-sha) source_sha=${2:?}; shift 2 ;;
+    --release-file) release_file=${2:?}; shift 2 ;;
+    --policy-token-file) policy_token_file=${2:?}; shift 2 ;;
+    --credential-proof) credential_proof=${2:?}; shift 2 ;;
+    --repo-dir) repo_dir=${2:?}; shift 2 ;;
     *) usage ;;
   esac
 done
+[[ "$repository" =~ ^[^/]+/[^/]+$ ]] || usage
+[[ "$release_id" =~ ^[1-9][0-9]*$ ]] || usage
+[[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
+[ "$tag" = "v$version" ] || usage
+[[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || usage
+[ -z "$policy_token_file" ] || [ -s "$policy_token_file" ] ||
+  fail "policy reader token file is missing"
 
-command -v jq >/dev/null 2>&1 || fail "jq is required"
-command -v gh >/dev/null 2>&1 || fail "gh is required"
-[[ "$REPOSITORY" =~ ^[^/]+/[^/]+$ ]] || usage
-[[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || usage
-[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
-[ "$TAG" = "v$VERSION" ] || usage
-[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || usage
-[ "$TARGET" = "$SOURCE_SHA" ] || usage
-[[ "$EXPECTED_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || usage
-if [ "$OP" = canonicalize ]; then
-  [[ "$OBSERVED_TAG" =~ ^untagged-[0-9a-f]{20}$ ]] || usage
+if [ -n "$release_file" ]; then
+  before=$(jq -c . "$release_file") || fail "release fixture is malformed"
+else
+  command -v gh >/dev/null 2>&1 || fail "gh is required"
+  before=$(gh api "repos/$repository/releases/$release_id") ||
+    fail "release descriptor lookup failed"
 fi
-git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
-  fail "repo-dir is not a Git work tree"
+"$script_dir/release-mutation-policy.sh" check \
+  --repository "$repository" --release-id "$release_id" --version "$version" \
+  --tag "$tag" --source-sha "$source_sha" --operation publish >/dev/null
+if [ -n "$policy_token_file" ]; then
+  policy_args=(--repository "$repository" --token-file "$policy_token_file")
+  [ -z "$credential_proof" ] || policy_args+=(--credential-proof "$credential_proof")
+  "$script_dir/verify-immutable-release-policy.sh" \
+    "${policy_args[@]}" >/dev/null
+fi
+jq -e --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" '
+  type == "object" and .id == $id and .tag_name == $tag and
+  .target_commitish == $source and .draft == true and .prerelease == false and
+  (.published_at == null) and (.assets | type == "array")
+' <<<"$before" >/dev/null || fail "release is not an exact empty draft"
+[ "$(jq '.assets | length' <<<"$before")" -eq 4 ] ||
+  fail "publication requires four uploaded assets"
 
 tmp=$(mktemp -d)
 trap 'rm -r -- "$tmp"' EXIT HUP INT TERM
-notes=$tmp/notes
-
-git -C "$REPO_DIR" show "$SOURCE_SHA:CHANGELOG.md" >"$tmp/changelog" 2>/dev/null ||
-  fail "canonical changelog is unavailable at the release source"
-awk -v version="$VERSION" '
-  index($0, "## [" version "]") == 1 ||
-  index($0, "## " version) == 1 {
-    if (found) { exit 2 }
-    found=1
-  }
-  found && $0 ~ /^## / &&
-    index($0, "## [" version "]") != 1 &&
-    index($0, "## " version) != 1 {
-    exit
-  }
+notes="$tmp/notes"
+git -C "$repo_dir" show "$source_sha:CHANGELOG.md" >"$tmp/changelog" 2>/dev/null ||
+  fail "source changelog is unavailable"
+awk -v version="$version" '
+  index($0, "## [" version "]") == 1 || index($0, "## " version) == 1 { found=1 }
+  found && $0 ~ /^## / && index($0, "## [" version "]") != 1 &&
+    index($0, "## " version) != 1 { exit }
   found { print }
-  END {
-    if (!found) exit 3
-  }
-' "$tmp/changelog" >"$notes" ||
-  fail "canonical changelog must contain exactly one release section"
-[ -s "$notes" ] || fail "canonical changelog section is empty"
-
-fingerprint() {
-  "$ASSET_INVENTORY_HELPER" fingerprint <<<"$1"
-}
-
-if [ -z "$RELEASE_FILE" ]; then
-  git -C "$REPO_DIR" fetch --no-tags origin \
-    '+refs/heads/dev:refs/remotes/origin/dev' >/dev/null ||
-    fail "authoritative origin/dev fetch failed"
-fi
-if [ -z "$RELEASE_FILE" ]; then
-  resolver="$(dirname "${BASH_SOURCE[0]}")/resolve-release-descriptor.sh"
-  if [ "$OP" = canonicalize ]; then
-    authority=$(
-      "$resolver" pre-action \
-        --repo-dir "$REPO_DIR" \
-        --repository "$REPOSITORY" \
-        --dev-ref origin/dev
-    ) || fail "current authority could not be revalidated"
-    value() {
-      awk -F= -v key="$1" '$1 == key {
-        sub(/^[^=]*=/, "")
-        print
-      }' <<<"$authority"
-    }
-    [ "$(value route)" = deep-recover ] &&
-      [ "$(value observed_state)" = generated_placeholder ] &&
-      [ "$(value release_id)" = "$RELEASE_ID" ] &&
-      [ "$(value observed_tag)" = "$OBSERVED_TAG" ] ||
-      fail "generated placeholder authority changed before canonicalization"
-  else
-    "$resolver" verify \
-      --repo-dir "$REPO_DIR" \
-      --repository "$REPOSITORY" \
-      --dev-ref origin/dev \
-      --release-id "$RELEASE_ID" \
-      --tag "$TAG" \
-      --version "$VERSION" \
-      --source-sha "$SOURCE_SHA" \
-      --asset-inventory-fingerprint "$EXPECTED_FINGERPRINT" >/dev/null ||
-      fail "canonical draft authority changed before publication"
-  fi
-fi
-
-if [ -n "$RELEASE_FILE" ]; then
-  [ -f "$RELEASE_FILE" ] || fail "release snapshot is missing"
-  jq -e 'type == "object"' "$RELEASE_FILE" >/dev/null ||
-    fail "release snapshot is not a JSON object"
-  before=$(jq -c . "$RELEASE_FILE")
+  END { if (!found) exit 3 }
+' "$tmp/changelog" >"$notes" || fail "release changelog section is missing"
+payload="$tmp/payload.json"
+jq -n --arg tag "$tag" --arg target "$source_sha" --rawfile body "$notes" '
+  {tag_name:$tag,target_commitish:$target,name:$tag,body:$body,draft:false,
+   prerelease:false,make_latest:false,generate_release_notes:false}
+' >"$payload"
+if [ -n "$release_file" ]; then
+  jq --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" '
+    .id=$id | .tag_name=$tag | .target_commitish=$source | .draft=false |
+    .prerelease=false | .name=$tag
+  ' <<<"$before"
 else
-  before=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID") ||
-    fail "release descriptor lookup failed"
+  if [ -n "$policy_token_file" ]; then
+    "$script_dir/verify-immutable-release-policy.sh" \
+      "${policy_args[@]}" >/dev/null
+  fi
+  "$script_dir/verify-release-tag-ref.sh" \
+    --repository "$repository" --tag v1.1.0 \
+    --source-sha 36ffd11ea4d35147f1df9c1cafa6a330300c1339 \
+    --expect-absent
+  "$script_dir/verify-release-tag-ref.sh" \
+    --repository "$repository" --tag "$tag" \
+    --source-sha "$source_sha" --expect-absent
+  after=$(gh api --method PATCH "repos/$repository/releases/$release_id" --input "$payload") ||
+    fail "release publication PATCH failed"
+  jq -e --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" '
+    .id == $id and .tag_name == $tag and .target_commitish == $source and
+    .draft == false and .prerelease == false and
+    (.published_at | type == "string" and length > 0) and
+    (.assets | type == "array" and length == 4)
+  ' <<<"$after" >/dev/null || fail "release publication response failed its postcondition"
 fi
-before_fingerprint=$(fingerprint "$before")
-jq -e \
-  --argjson id "$RELEASE_ID" \
-  --arg version "$VERSION" \
-  --arg tag "$TAG" \
-  --arg target "$TARGET" \
-  --arg fingerprint "$EXPECTED_FINGERPRINT" \
-  --arg observed_tag "$OBSERVED_TAG" \
-  --arg op "$OP" '
-    type == "object" and
-    .id == $id and
-    (($op == "canonicalize" and .tag_name == $observed_tag) or
-     ($op == "publish" and .tag_name == $tag)) and
-    .target_commitish == $target and
-    .draft == true and
-    .prerelease == false and
-    .published_at == null and
-    ($fingerprint | length == 64) and
-    (($op == "canonicalize" and ($observed_tag | test("^untagged-[0-9a-f]{20}$"))) or
-     ($op == "publish"))
-  ' <<<"$before" >/dev/null ||
-  fail "release precondition is not the expected same-ID state"
-if [ "$before_fingerprint" != "$EXPECTED_FINGERPRINT" ]; then
-  fail "release asset fingerprint changed before mutation"
-fi
-
-payload=$tmp/payload.json
-draft=true
-[ "$OP" = publish ] && draft=false
-jq -n \
-  --arg tag "$TAG" \
-  --arg target "$TARGET" \
-  --arg name "$TAG" \
-  --rawfile body "$notes" \
-  --argjson draft "$draft" \
-  '{
-    tag_name: $tag,
-    target_commitish: $target,
-    name: $name,
-    body: $body,
-    draft: $draft,
-    prerelease: false,
-    make_latest: "false",
-    generate_release_notes: false
-  }' >"$payload"
-
-after=$(gh api --method PATCH \
-  "repos/$REPOSITORY/releases/$RELEASE_ID" \
-  --input "$payload") ||
-  fail "release metadata PATCH failed"
-[ -n "$after" ] || fail "release metadata PATCH returned an empty response"
-after_fingerprint=$(fingerprint "$after")
-jq -e \
-  --argjson id "$RELEASE_ID" \
-  --arg tag "$TAG" \
-  --arg target "$TARGET" \
-  --argjson draft "$draft" \
-  --rawfile body "$notes" \
-  --arg op "$OP" '
-    type == "object" and
-    .id == $id and
-    .tag_name == $tag and
-    .target_commitish == $target and
-    .name == $tag and
-    .body == $body and
-    .draft == $draft and
-    .prerelease == false and
-    (($op == "canonicalize" and .published_at == null) or
-     ($op == "publish" and (.published_at | type == "string" and length > 0)))
-  ' <<<"$after" >/dev/null ||
-  fail "release metadata postcondition failed"
-[ "$after_fingerprint" = "$EXPECTED_FINGERPRINT" ] ||
-  fail "release assets changed during metadata mutation"
-
-printf 'mutation=verified\noperation=%s\nrelease_id=%s\nasset_inventory_fingerprint=%s\n' \
-  "$OP" "$RELEASE_ID" "$after_fingerprint"
+echo "mutation=verified"
+echo "operation=publish"
+echo "release_id=$release_id"
+echo "post_patch_writers=none"

@@ -42,6 +42,10 @@ Run commands from the repository root on a Linux host with Docker Engine and
 Compose, `age`, an off-host backup target, DNS, and a TLS reverse proxy. The
 backend binds only to loopback; PostgreSQL is not published.
 
+Immutable artifact publication is independent from VPS deployment. Follow
+[`docs/operations/backend-release-publishing.md`](operations/backend-release-publishing.md)
+to publish and verify a release before using the deployment steps below.
+
 ## 1. First installation
 
 This is the only flow that creates `.env.production`; it fails if the file

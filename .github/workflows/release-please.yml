@@ -8,64 +8,85 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  group: backend-release-${{ github.repository }}
+  queue: max
+  cancel-in-progress: false
+
+env:
+  IMMUTABLE_POLICY_READER_APP_ID: ${{ vars.IMMUTABLE_POLICY_READER_APP_ID }}
+
 jobs:
-  release:
-    name: Release Please and resolve draft
+  controller:
+    name: Serialized future-only release controller
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
-      contents: read
-      pull-requests: read
+      contents: write
+      pull-requests: write
     outputs:
-      route: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.route || steps.pre_action.outputs.route }}
-      active: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.active || steps.pre_action.outputs.active }}
-      source_sha: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.source_sha || steps.pre_action.outputs.source_sha }}
-      release_tag: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.tag || steps.pre_action.outputs.tag }}
-      release_version: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.version || steps.pre_action.outputs.version }}
-      release_id: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.release_id || steps.pre_action.outputs.release_id }}
-      observed_state: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.observed_state || steps.pre_action.outputs.observed_state }}
-      observed_tag: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.observed_tag || steps.pre_action.outputs.observed_tag }}
-      asset_inventory_kind: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.asset_inventory_kind || steps.pre_action.outputs.asset_inventory_kind }}
-      asset_inventory_fingerprint: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.asset_inventory_fingerprint || steps.pre_action.outputs.asset_inventory_fingerprint }}
-      asset_inventory_json: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.asset_inventory_json || steps.pre_action.outputs.asset_inventory_json }}
-      admission_fingerprint: ${{ steps.pre_action.outputs.route == 'action' && steps.action_descriptor.outputs.admission_fingerprint || steps.pre_action.outputs.admission_fingerprint }}
+      route: ${{ steps.route.outputs.route }}
+      release_id: ${{ steps.route.outputs.release_id }}
+      release_tag: ${{ steps.route.outputs.release_tag }}
+      release_version: ${{ steps.route.outputs.release_version }}
+      source_sha: ${{ steps.route.outputs.source_sha }}
     steps:
       - name: Checkout reviewed release tooling
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Fetch exact origin/dev authority
+
+      - name: Fetch exact current-action authority
         run: |
           set -euo pipefail
-          git fetch --no-tags origin \
-            '+refs/heads/dev:refs/remotes/origin/dev'
+          git fetch --no-tags origin '+refs/heads/dev:refs/remotes/origin/dev'
           test "$(git rev-parse origin/dev)" = \
             "$(git ls-remote origin refs/heads/dev | awk '{print $1}')"
-      - name: Classify current authority before Release Please
+
+      - name: Mint and verify immutable-policy reader
+        env:
+          IMMUTABLE_POLICY_READER_PRIVATE_KEY: ${{ secrets.IMMUTABLE_POLICY_READER_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/immutable-policy-reader.pem"
+          umask 077
+          test -n "${IMMUTABLE_POLICY_READER_APP_ID:-}"
+          test -n "${IMMUTABLE_POLICY_READER_PRIVATE_KEY:-}"
+          printf '%s\n' "$IMMUTABLE_POLICY_READER_PRIVATE_KEY" >"$key_file"
+          token="$RUNNER_TEMP/immutable-policy-reader-token"
+          scripts/verify-immutable-policy-reader-credential.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --app-id "$IMMUTABLE_POLICY_READER_APP_ID" \
+            --private-key-file "$key_file" \
+            --token-file "$token" \
+            --output "$RUNNER_TEMP/immutable-policy-reader.json"
+          test -s "$token"
+
+      - name: Admit live immutable-release policy
+        run: |
+          set -euo pipefail
+          scripts/verify-immutable-release-policy.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --token-file "$RUNNER_TEMP/immutable-policy-reader-token" \
+            --credential-proof "$RUNNER_TEMP/immutable-policy-reader.json"
+
+      - name: Classify current action before Release Please
         id: pre_action
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         run: |
           set -euo pipefail
+          releases_before="$RUNNER_TEMP/release-relevant-before.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -c 'add // []' >"$releases_before"
+          printf 'RELEASES_BEFORE_FILE=%s\n' "$releases_before" >>"$GITHUB_ENV"
           descriptor=$(scripts/resolve-release-descriptor.sh pre-action \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --require-action-authority)
+            --repository "$GITHUB_REPOSITORY" --dev-ref origin/dev \
+            --releases-file "$releases_before")
           printf '%s\n' "$descriptor"
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          for key in route active origin observed_state observed_tag release_id \
-              tag version source_sha target_commitish draft prerelease published_at \
-              authority_version authority_tag authority_source_sha \
-              asset_inventory_kind asset_inventory_fingerprint \
-              asset_inventory_json admission_fingerprint; do
-            echo "$key=$(value "$key")" >> "$GITHUB_OUTPUT"
-          done
-      - name: Release Please manifest
+          awk -F= '{print $1 "=" $2}' <<<"$descriptor" >>"$GITHUB_OUTPUT"
+
+      - name: Release Please current action
         id: release
         if: steps.pre_action.outputs.route == 'action'
         uses: googleapis/release-please-action@c2a5a2bd6a758a0937f1ddb1e8950609867ed15c
@@ -74,1269 +95,226 @@ jobs:
           target-branch: dev
           manifest-file: .release-please-manifest.json
           config-file: release-please-config.json
-      - name: Normalize action descriptor with Release Please visibility
-        id: action_descriptor
-        if: steps.pre_action.outputs.route == 'action'
+
+      - name: Normalize action result and current-action set difference
+        id: route
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
-          CREATED_TAG: ${{ steps.release.outputs.tag_name }}
-          CREATED_VERSION: ${{ steps.release.outputs.version }}
-          CREATED_SOURCE_SHA: ${{ steps.release.outputs.sha }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_SOURCE_SHA: ${{ steps.release.outputs.sha }}
+          PRE_ROUTE: ${{ steps.pre_action.outputs.route }}
+          PRE_TAG: ${{ steps.pre_action.outputs.tag }}
+          PRE_VERSION: ${{ steps.pre_action.outputs.version }}
+          PRE_SOURCE_SHA: ${{ steps.pre_action.outputs.source_sha }}
+          PRE_RELEASE_ID: ${{ steps.pre_action.outputs.release_id }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         run: |
           set -euo pipefail
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          positive_id() {
-            [[ "$1" =~ ^[1-9][0-9]*$ ]]
-          }
-          authority_fields() {
-            [[ "$(value authority_version)" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-            [[ "$(value authority_source_sha)" =~ ^[0-9a-f]{40}$ ]]
-            test "$(value authority_tag)" = "v$(value authority_version)"
-          }
-          authority_tuple() {
-            authority_fields
-            test "$(value tag)" = "$(value authority_tag)"
-            test "$(value version)" = "$(value authority_version)"
-            test "$(value source_sha)" = "$(value authority_source_sha)"
-            test "$(value target_commitish)" = "$(value source_sha)"
-            test "$(value tag)" = "v$(value version)"
-            test "$(value draft)" = true
-            test "$(value published_at)" = null
-          }
-
+          if [ "$PRE_ROUTE" != action ]; then
+            test "$PRE_ROUTE" = materialize || test "$PRE_ROUTE" = completed
+            echo "route=$PRE_ROUTE" >>"$GITHUB_OUTPUT"
+            echo "release_id=$PRE_RELEASE_ID" >>"$GITHUB_OUTPUT"
+            echo "release_tag=$PRE_TAG" >>"$GITHUB_OUTPUT"
+            echo "release_version=$PRE_VERSION" >>"$GITHUB_OUTPUT"
+            echo "source_sha=$PRE_SOURCE_SHA" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
           case "$RELEASE_CREATED" in
             true)
+              releases_after="$RUNNER_TEMP/release-relevant-after.json"
+              gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+                jq -c 'add // []' >"$releases_after"
               descriptor=$(scripts/resolve-release-descriptor.sh post-action \
-                --repository "$GITHUB_REPOSITORY" \
-                --dev-ref origin/dev \
-                --tag "$CREATED_TAG" \
-                --version "$CREATED_VERSION" \
-                --source-sha "$CREATED_SOURCE_SHA")
-              test "$(value active)" = true
-              test "$(value origin)" = post_action
-              positive_id "$(value release_id)"
-              test "$(value tag)" = "$CREATED_TAG"
-              test "$(value version)" = "$CREATED_VERSION"
-              test "$(value source_sha)" = "$CREATED_SOURCE_SHA"
-              authority_tuple
+                --repository "$GITHUB_REPOSITORY" --dev-ref origin/dev \
+                --tag "$RELEASE_TAG" --version "$RELEASE_VERSION" \
+                --source-sha "$RELEASE_SOURCE_SHA" \
+                --before-releases-file "$RELEASES_BEFORE_FILE" \
+                --after-releases-file "$releases_after" \
+                --release-created true)
               ;;
             false)
-              descriptor=$(scripts/resolve-release-descriptor.sh recover \
-                --repository "$GITHUB_REPOSITORY" \
-                --dev-ref origin/dev)
-              case "$(value active)" in
-                true)
-                  test "$(value origin)" = recovered
-                  positive_id "$(value release_id)"
-                  authority_tuple
-                  ;;
-                false)
-                  case "$(value origin)" in
-                    completed|none) ;;
-                    *) echo "recover returned an invalid inactive origin" >&2; exit 1 ;;
-                  esac
-                  authority_fields
-                  test -z "$(value release_id)"
-                  ;;
-                *) echo "recover returned an invalid active state" >&2; exit 1 ;;
-              esac
+              releases_after="$RUNNER_TEMP/release-relevant-after.json"
+              gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+                jq -c 'add // []' >"$releases_after"
+              descriptor=$(scripts/resolve-release-descriptor.sh post-action \
+                --repository "$GITHUB_REPOSITORY" --dev-ref origin/dev \
+                --tag "$PRE_TAG" --version "$PRE_VERSION" \
+                --source-sha "$PRE_SOURCE_SHA" --allow-completed \
+                --before-releases-file "$RELEASES_BEFORE_FILE" \
+                --after-releases-file "$releases_after" \
+                --release-created false)
               ;;
             *)
-              echo "Release Please returned a non-boolean release_created value" >&2
+              echo "release_created must be an explicit Boolean" >&2
               exit 1
               ;;
           esac
-
-          output_block=$(
-            {
-              for key in route active origin observed_state observed_tag release_id tag \
-                  version source_sha target_commitish draft prerelease published_at \
-                  authority_version authority_tag authority_source_sha \
-                  asset_inventory_kind asset_inventory_fingerprint asset_inventory_json \
-                  admission_fingerprint; do
-                echo "$key=$(value "$key")"
-              done
-            }
-          )
-          printf '%s\n' "$output_block" >> "$GITHUB_OUTPUT"
-          if [ "$(value active)" = true ]; then
-            mkdir -p "$RUNNER_TEMP/release"
-            action_release_json="$RUNNER_TEMP/release/action-descriptor.json"
-            gh api "repos/$GITHUB_REPOSITORY/releases/$(value release_id)" \
-              >"$action_release_json"
-            jq -e --argjson id "$(value release_id)" '
-              type == "object" and .id == $id and
-              .draft == true and .published_at == null and
-              (.assets | type == "array")
-            ' "$action_release_json" >/dev/null
-            sha256sum "$action_release_json" >/dev/null
-          fi
           printf '%s\n' "$descriptor"
+          awk -F= '{print $1 "=" $2}' <<<"$descriptor" >>"$GITHUB_OUTPUT"
 
   gates:
-    name: Re-run release gates
-    needs: release
-    if: needs.release.outputs.active == 'true' &&
-        needs.release.outputs.route == 'materialize'
+    name: Backend CI for exact release source
+    needs: controller
+    if: needs.controller.outputs.route == 'materialize'
     uses: ./.github/workflows/ci.yml
     with:
-      ref: ${{ github.sha }}
-      source_sha: ${{ needs.release.outputs.source_sha }}
-      release_tag: ${{ needs.release.outputs.release_tag }}
-      release_version: ${{ needs.release.outputs.release_version }}
-      release_id: ${{ needs.release.outputs.release_id }}
+      ref: ${{ needs.controller.outputs.source_sha }}
+      source_sha: ${{ needs.controller.outputs.source_sha }}
+      release_tag: ${{ needs.controller.outputs.release_tag }}
+      release_version: ${{ needs.controller.outputs.release_version }}
+      release_id: ${{ needs.controller.outputs.release_id }}
 
   publish:
-    name: Publish immutable release
-    needs: [release, gates]
-    if: needs.release.outputs.active == 'true' &&
-        needs.release.outputs.route == 'materialize'
-    concurrency:
-      group: backend-ghcr-publication-${{ github.repository }}
-      cancel-in-progress: false
+    name: One-shot publish-last materialization
+    needs: [controller, gates]
+    if: needs.controller.outputs.route == 'materialize'
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: write
       packages: write
-      attestations: write
       id-token: write
     env:
-      RELEASE_ID: ${{ needs.release.outputs.release_id }}
-      TAG: ${{ needs.release.outputs.release_tag }}
-      VERSION: ${{ needs.release.outputs.release_version }}
-      SOURCE_SHA: ${{ needs.release.outputs.source_sha }}
-      ASSET_INVENTORY_KIND: ${{ needs.release.outputs.asset_inventory_kind }}
-      ORIGINAL_ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
-      ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
-      ADMISSION_FINGERPRINT: ${{ needs.release.outputs.admission_fingerprint }}
+      RELEASE_ID: ${{ needs.controller.outputs.release_id }}
+      TAG: ${{ needs.controller.outputs.release_tag }}
+      VERSION: ${{ needs.controller.outputs.release_version }}
+      SOURCE_SHA: ${{ needs.controller.outputs.source_sha }}
       IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
+      IMMUTABLE_POLICY_READER_APP_ID: ${{ vars.IMMUTABLE_POLICY_READER_APP_ID }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout reviewed publication tooling
+      - name: Checkout exact publication source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.controller.outputs.source_sha }}
           fetch-depth: 0
-          path: tooling
-      - name: Checkout exact release source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ env.SOURCE_SHA }}
-          fetch-depth: 0
-          path: source
-      - name: Bind canonical-empty materialize entry (read-only Release Please visibility)
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release"
-          git -C tooling fetch --no-tags origin \
-            '+refs/heads/dev:refs/remotes/origin/dev'
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev)
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          test "$(value route)" = materialize
-          test "$(value active)" = true
-          test "$(value observed_state)" = canonical
-          test "$(value observed_tag)" = "$TAG"
-          test "$(value release_id)" = "$RELEASE_ID"
-          test "$(value tag)" = "$TAG"
-          test "$(value version)" = "$VERSION"
-          test "$(value source_sha)" = "$SOURCE_SHA"
-          test "$(value target_commitish)" = "$SOURCE_SHA"
-          test "$(value draft)" = true
-          test "$(value prerelease)" = false
-          test "$(value published_at)" = null
-          test "$(value asset_inventory_kind)" = empty
-          test "$(value asset_inventory_fingerprint)" = \
-            "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT"
-          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
-          release_json="$RUNNER_TEMP/release/materialize-entry.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" \
-            --arg source "$SOURCE_SHA" '
-              type == "object" and .id == $id and .tag_name == $tag and
-              .target_commitish == $source and .draft == true and
-              .published_at == null and (.assets | type == "array")
-            ' "$release_json" >/dev/null
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Verify admitted materialize snapshot with GITHUB_TOKEN evidence
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          test -f "$RELEASE_SNAPSHOT"
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route materialize \
-            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
-            --release-file "$RELEASE_SNAPSHOT")
-          grep -Fx 'route=materialize' <<<"$descriptor"
-      - name: Independently verify the numeric draft descriptor from admitted snapshot
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git -C tooling fetch --no-tags origin \
-            '+refs/heads/dev:refs/remotes/origin/dev'
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route materialize \
-            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
-            --release-file "$RELEASE_SNAPSHOT")
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          test "$(value active)" = true
-          test "$(value origin)" = verified
-          test "$(value release_id)" = "$RELEASE_ID"
-          test "$(value tag)" = "$TAG"
-          test "$(value version)" = "$VERSION"
-          test "$(value source_sha)" = "$SOURCE_SHA"
-          test "$(value asset_inventory_kind)" = "$ASSET_INVENTORY_KIND"
-          test "$(value route)" = materialize
-          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
-          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(jq -r '.version' source/version.json)" = "$VERSION"
-          test "$TAG" = "v$VERSION"
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
-      - name: Authenticate to GHCR
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Classify publication route
-        id: admission
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release"
-          quarantine="$RUNNER_TEMP/release/preflight-quarantine.json"
-          set +e
-          result=$(tooling/scripts/release-registry-state.sh inspect \
-            "$IMAGE" "$VERSION" "$SOURCE_SHA" \
-            --quarantine-file "$quarantine")
-          status=$?
-          set -e
-          printf '%s\n' "$result"
-          state=$(awk -F= '/^state=/{print $2}' <<<"$result")
-          latest=$(awk -F= '/^latest=/{print $2}' <<<"$result")
-          registry_digest=$(awk -F= '/^digest=/{print $2}' <<<"$result")
-          if [ "$status" -eq 42 ]; then
-            test -s "$quarantine"
-            route=quarantine
-          elif [ "$status" -ne 0 ]; then
-            exit "$status"
-          elif [ "$ASSET_INVENTORY_KIND" = empty ] &&
-               [ "$state" = empty ] &&
-               [ "$latest" = absent ]; then
-            route=fresh
-          elif [ "$ASSET_INVENTORY_KIND" = complete_unverified ] &&
-               [ "$state" = complete ] &&
-               [ "$latest" = absent ]; then
-            route=resume
-          elif [ "$ASSET_INVENTORY_KIND" = empty ] &&
-               [ "$state" = complete ] &&
-               [ "$latest" = absent ] &&
-               [[ "$registry_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            route=resume-registry
-          else
-            jq -n \
-              --arg assets "$ASSET_INVENTORY_KIND" \
-              --arg registry "$state" \
-              '{
-                status: "quarantined",
-                registryWrites: 0,
-                assetInventory: $assets,
-                registryState: $registry,
-                reason: "release assets and registry state do not form an admissible publication route"
-              }' > "$quarantine"
-            route=quarantine
-          fi
-          echo "route=$route" >> "$GITHUB_OUTPUT"
-          echo "registry_digest=$registry_digest" >> "$GITHUB_OUTPUT"
-          echo "quarantine=$quarantine" >> "$GITHUB_OUTPUT"
-      - name: Quarantine inadmissible state by numeric release ID
-        if: steps.admission.outputs.route == 'quarantine'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          QUARANTINE_FILE: ${{ steps.admission.outputs.quarantine }}
-        run: |
-          set -euo pipefail
-          jq -c . "$QUARANTINE_FILE" >> "$GITHUB_STEP_SUMMARY"
-          echo "inadmissible release state; no release mutation was attempted" >&2
-          exit 1
-      - name: Acquire create-only publication lease
-        if: steps.admission.outputs.route == 'fresh'
-        working-directory: source
-        run: ../tooling/scripts/acquire-release-lease.sh "$VERSION" "$SOURCE_SHA"
-      - name: Recheck empty registry after lease
-        if: steps.admission.outputs.route == 'fresh'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          quarantine="$RUNNER_TEMP/release/lease-quarantine.json"
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          jq -e '.assets | type == "array" and length == 0' \
-            "$RELEASE_SNAPSHOT" >/dev/null
-          set +e
-          result=$(tooling/scripts/release-registry-state.sh inspect \
-            "$IMAGE" "$VERSION" "$SOURCE_SHA" \
-            --quarantine-file "$quarantine")
-          status=$?
-          set -e
-          printf '%s\n' "$result"
-          state=$(awk -F= '/^state=/{print $2}' <<<"$result")
-          latest=$(awk -F= '/^latest=/{print $2}' <<<"$result")
-          if [ "$status" -eq 0 ] &&
-             [ "$state" = empty ] &&
-             [ "$latest" = absent ]; then
-            exit 0
-          fi
-          if [ "$status" -ne 42 ]; then
-            jq -n --arg state "$state" '{
-              status: "quarantined",
-              registryWrites: 0,
-              observedState: $state,
-              reason: "registry changed after publication lease"
-            }' > "$quarantine"
-          fi
-          test -s "$quarantine"
-          jq -c . "$quarantine" >> "$GITHUB_STEP_SUMMARY"
-          echo "registry changed after lease; no release mutation was attempted" >&2
-          exit 1
-      - name: Bind canonical-empty materialize upload snapshot (read-only Release Please visibility)
-        if: steps.admission.outputs.route == 'fresh' ||
-            steps.admission.outputs.route == 'resume-registry'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          git -C tooling fetch --no-tags origin \
-            '+refs/heads/dev:refs/remotes/origin/dev'
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev)
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          test "$(value route)" = materialize
-          test "$(value active)" = true
-          test "$(value observed_state)" = canonical
-          test "$(value observed_tag)" = "$TAG"
-          test "$(value release_id)" = "$RELEASE_ID"
-          test "$(value tag)" = "$TAG"
-          test "$(value version)" = "$VERSION"
-          test "$(value source_sha)" = "$SOURCE_SHA"
-          test "$(value target_commitish)" = "$SOURCE_SHA"
-          test "$(value draft)" = true
-          test "$(value published_at)" = null
-          test "$(value asset_inventory_kind)" = empty
-          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
-          release_json="$RUNNER_TEMP/release/materialize-upload.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route materialize \
-            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
-            --release-file "$release_json")
-          grep -Fx 'asset_inventory_kind=empty' <<<"$descriptor"
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Build or resume exactly three aliases
-        if: steps.admission.outputs.route == 'fresh' ||
-            steps.admission.outputs.route == 'resume-registry'
-        id: publish-image
-        working-directory: source
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PUBLICATION_ROUTE: ${{ steps.admission.outputs.route }}
-          REGISTRY_DIGEST: ${{ steps.admission.outputs.registry_digest }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(jq -r '.version' version.json)" = "$VERSION"
-          if [ "$PUBLICATION_ROUTE" = fresh ]; then
-            docker buildx build \
-              --platform linux/amd64 \
-              --provenance=true \
-              --sbom=true \
-              --push \
-              --tag "$IMAGE:$TAG" \
-              --tag "$IMAGE:$VERSION" \
-              --tag "$IMAGE:sha-$SOURCE_SHA" \
-              --build-arg "BACKEND_VERSION=$VERSION" \
-              --build-arg "BACKEND_REVISION=$SOURCE_SHA" \
-              --metadata-file "$RUNNER_TEMP/release/build-metadata.json" \
-              .
-            digest=$(jq -r '."containerimage.digest"' \
-              "$RUNNER_TEMP/release/build-metadata.json")
-          else
-            digest=$REGISTRY_DIGEST
-          fi
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          docker pull "$IMAGE@$digest"
-          test "$(docker image inspect "$IMAGE@$digest" \
-            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
-          test "$(docker image inspect "$IMAGE@$digest" \
-            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
-          test "$(docker image inspect "$IMAGE@$digest" \
-            --format '{{.Config.User}}')" = "10001:10001"
-          docker run --rm --entrypoint sh "$IMAGE@$digest" -ec \
-            'test -f /app/app.jar && test -d /data/uploads && test -w /data/uploads'
-          quarantine="$RUNNER_TEMP/release/post-publish-quarantine.json"
-          set +e
-          final_state=$(../tooling/scripts/release-registry-state.sh inspect \
-            "$IMAGE" "$VERSION" "$SOURCE_SHA" \
-            --quarantine-file "$quarantine")
-          status=$?
-          set -e
-          printf '%s\n' "$final_state"
-          if [ "$status" -eq 42 ]; then
-            test -s "$quarantine"
-            jq -c . "$quarantine" >> "$GITHUB_STEP_SUMMARY"
-            echo "post-publish registry race; no release mutation was attempted" >&2
-            exit 1
-          fi
-          [ "$status" -eq 0 ]
-          grep -Fx 'state=complete' <<<"$final_state"
-          test "$(awk -F= '/^digest=/{print $2}' <<<"$final_state")" = "$digest"
-          docker buildx imagetools inspect --raw "$IMAGE@$digest" > image-index.json
-          docker buildx imagetools inspect "$IMAGE@$digest" > image-inspect.txt
-          {
-            echo "Platform: linux/amd64"
-            echo "Version: $VERSION"
-            echo "Revision: $SOURCE_SHA"
-            echo "Source: https://github.com/$GITHUB_REPOSITORY"
-          } >> image-inspect.txt
-          evidence=$(../tooling/scripts/verify-oci-evidence.sh \
-            "$IMAGE" "$digest" image-index.json)
-          provenance=$(awk -F= '/^provenance=/{print $2}' <<<"$evidence")
-          sbom=$(awk -F= '/^sbom=/{print $2}' <<<"$evidence")
-          test "$provenance" = true
-          test "$sbom" = true
-          jq -n \
-            --argjson releaseId "$RELEASE_ID" \
-            --arg targetCommitish "$SOURCE_SHA" \
-            --arg version "$VERSION" \
-            --arg tag "$TAG" \
-            --arg sourceSha "$SOURCE_SHA" \
-            --arg image "$IMAGE" \
-            --arg digest "$digest" \
-            --argjson provenance "$provenance" \
-            --argjson sbom "$sbom" \
-            '{
-              releaseId: $releaseId,
-              targetCommitish: $targetCommitish,
-              version: $version,
-              tag: $tag,
-              sourceSha: $sourceSha,
-              image: $image,
-              digest: $digest,
-              aliases: ["v" + $version, $version, "sha-" + $sourceSha],
-              platform: "linux/amd64",
-              publicationPolicy: "exactly-three-aliases-publish-last",
-              provenance: $provenance,
-              sbom: $sbom,
-              artifactAttestation: true,
-              evidence: ["image-index.json", "image-inspect.txt"]
-            }' > release-manifest.json
-          ../tooling/scripts/verify-release-consistency.sh \
-            "$VERSION" "$SOURCE_SHA" \
-            --image "$IMAGE" \
-            --image-ref "$IMAGE@$digest" \
-            --manifest release-manifest.json
-          sha256sum \
-            release-manifest.json \
-            image-index.json \
-            image-inspect.txt > SHA256SUMS
-      - name: Create artifact attestation
-        if: steps.admission.outputs.route == 'fresh' ||
-            steps.admission.outputs.route == 'resume-registry'
-        id: attestation
-        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.publish-image.outputs.digest }}
-          push-to-registry: true
-      - name: Verify attestation and checksums
-        if: steps.admission.outputs.route == 'fresh' ||
-            steps.admission.outputs.route == 'resume-registry'
-        working-directory: source
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh attestation verify \
-            "oci://$IMAGE@${{ steps.publish-image.outputs.digest }}" \
-            --repo "$GITHUB_REPOSITORY"
-          sha256sum -c SHA256SUMS
-      - name: Rebind canonical-empty materialize upload snapshot (read-only Release Please visibility)
-        if: steps.admission.outputs.route == 'fresh' ||
-            steps.admission.outputs.route == 'resume-registry'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          git -C tooling fetch --no-tags origin \
-            '+refs/heads/dev:refs/remotes/origin/dev'
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev)
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          test "$(value route)" = materialize
-          test "$(value active)" = true
-          test "$(value observed_state)" = canonical
-          test "$(value observed_tag)" = "$TAG"
-          test "$(value release_id)" = "$RELEASE_ID"
-          test "$(value tag)" = "$TAG"
-          test "$(value version)" = "$VERSION"
-          test "$(value source_sha)" = "$SOURCE_SHA"
-          test "$(value target_commitish)" = "$SOURCE_SHA"
-          test "$(value draft)" = true
-          test "$(value published_at)" = null
-          test "$(value asset_inventory_kind)" = empty
-          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
-          release_json="$RUNNER_TEMP/release/materialize-upload-adjacent.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route materialize \
-            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
-            --release-file "$release_json")
-          grep -Fx 'asset_inventory_kind=empty' <<<"$descriptor"
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Upload the exact evidence set by numeric release ID
-        if: steps.admission.outputs.route == 'fresh' ||
-            steps.admission.outputs.route == 'resume-registry'
-        working-directory: source
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          quarantine_upload_failure() {
-            status=$?
-            trap - ERR
-            set +e
-            quarantine="$RUNNER_TEMP/release/upload-quarantine.json"
-            jq -n '{
-              status: "quarantined",
-              repairWrites: 0,
-              reason: "exact evidence upload did not complete"
-            }' > "$quarantine"
-            jq -c . "$quarantine" >> "$GITHUB_STEP_SUMMARY"
-            echo "evidence upload failed; no release mutation was attempted" >&2
-            exit "$status"
-          }
-          trap quarantine_upload_failure ERR
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          jq -e '.assets | type == "array" and length == 0' \
-            "$RELEASE_SNAPSHOT" >/dev/null
-          upload_responses="$RUNNER_TEMP/release/upload-responses.jsonl"
-          : >"$upload_responses"
-          for file in \
-            release-manifest.json \
-            image-index.json \
-            image-inspect.txt \
-            SHA256SUMS
-          do
-            response=$(curl --fail-with-body --silent --show-error --location \
-              --request POST \
-              --header 'Accept: application/vnd.github+json' \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header 'Content-Type: application/octet-stream' \
-              --data-binary "@$file" \
-              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$file")
-            printf '%s\n' "$response" >>"$upload_responses"
-          done
-          jq -s -e '
-            length == 4 and
-            (map(.name) | sort) ==
-              ["SHA256SUMS","image-index.json","image-inspect.txt","release-manifest.json"] and
-            (map(.id) | unique | length) == 4
-          ' "$upload_responses" >/dev/null
-          trap - ERR
-      - name: Bind post-upload complete snapshot (read-only Release Please visibility)
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release"
-          release_json="$RUNNER_TEMP/release/post-action-release.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" \
-            --arg source "$SOURCE_SHA" '
-              type == "object" and .id == $id and .tag_name == $tag and
-              .target_commitish == $source and .draft == true and
-              .published_at == null and (.assets | type == "array")
-            ' "$release_json" >/dev/null
-          post_action_fingerprint=$(
-            tooling/scripts/release-asset-inventory.sh fingerprint \
-              --release-file "$release_json"
-          )
-          if [ "$ASSET_INVENTORY_KIND" = empty ]; then
-            transition_descriptor=$(
-              tooling/scripts/resolve-release-descriptor.sh verify \
-                --repo-dir tooling \
-                --repository "$GITHUB_REPOSITORY" \
-                --dev-ref origin/dev \
-                --release-id "$RELEASE_ID" \
-                --tag "$TAG" \
-                --version "$VERSION" \
-                --source-sha "$SOURCE_SHA" \
-                --asset-inventory-fingerprint "$post_action_fingerprint" \
-                --expected-route deep-recover \
-                --release-file "$release_json"
-            )
-            value() {
-              awk -F= -v key="$1" '$1 == key {
-                sub(/^[^=]*=/, "")
-                print
-              }' <<<"$transition_descriptor"
-            }
-            test "$(value route)" = deep-recover
-            test "$(value observed_state)" = canonical
-            test "$(value observed_tag)" = "$TAG"
-            test "$(value release_id)" = "$RELEASE_ID"
-            test "$(value tag)" = "$TAG"
-            test "$(value version)" = "$VERSION"
-            test "$(value source_sha)" = "$SOURCE_SHA"
-            test "$(value target_commitish)" = "$SOURCE_SHA"
-            test "$(value draft)" = true
-            test "$(value prerelease)" = false
-            test "$(value published_at)" = null
-            test "$(value asset_inventory_kind)" = complete_unverified
-            echo "POST_ACTION_ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
-              >>"$GITHUB_ENV"
-            echo "POST_UPLOAD_ROUTE=deep-recover" >>"$GITHUB_ENV"
-            echo "EXPECTED_COMPLETE_ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
-              >>"$GITHUB_ENV"
-            echo "ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
-              >>"$GITHUB_ENV"
-          else
-            test "$post_action_fingerprint" = \
-              "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT"
-            echo "POST_ACTION_ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
-              >>"$GITHUB_ENV"
-          fi
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Verify post-upload snapshot with GITHUB_TOKEN evidence
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
-            --repository "$GITHUB_REPOSITORY" \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA" \
-            --target "$SOURCE_SHA" \
-            --image "$IMAGE" \
-            --release-file "$RELEASE_SNAPSHOT"
-      - name: Bind final materialize publication snapshot (read-only Release Please visibility)
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          git -C tooling fetch --no-tags origin \
-            '+refs/heads/dev:refs/remotes/origin/dev'
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev)
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          test "$(value route)" = deep-recover
-          test "$(value active)" = true
-          test "$(value observed_state)" = canonical
-          test "$(value observed_tag)" = "$TAG"
-          test "$(value release_id)" = "$RELEASE_ID"
-          test "$(value tag)" = "$TAG"
-          test "$(value version)" = "$VERSION"
-          test "$(value source_sha)" = "$SOURCE_SHA"
-          test "$(value target_commitish)" = "$SOURCE_SHA"
-          test "$(value draft)" = true
-          test "$(value published_at)" = null
-          test "$(value asset_inventory_kind)" = complete_unverified
-          release_json="$RUNNER_TEMP/release/materialize-final.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route deep-recover \
-            --release-file "$release_json")
-          grep -Fx 'asset_inventory_kind=complete_unverified' <<<"$descriptor"
-          final_admission_fingerprint=$(awk -F= '$1 == "admission_fingerprint" {
-            sub(/^[^=]*=/, "")
-            print
-          }' <<<"$descriptor")
-          [[ "$final_admission_fingerprint" =~ ^[0-9a-f]{64}$ ]]
-          echo "FINAL_ADMISSION_FINGERPRINT=$final_admission_fingerprint" \
-            >>"$GITHUB_ENV"
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Final descriptor and deep admission, then publish last
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          fingerprint=$(
-            tooling/scripts/release-asset-inventory.sh fingerprint \
-              --release-file "$RELEASE_SNAPSHOT"
-          )
-          test "$POST_ACTION_ASSET_INVENTORY_FINGERPRINT" = \
-            "$ASSET_INVENTORY_FINGERPRINT"
-          test "$fingerprint" = "$ASSET_INVENTORY_FINGERPRINT"
-          if [ "$ASSET_INVENTORY_KIND" = empty ]; then
-            test "${EXPECTED_COMPLETE_ASSET_INVENTORY_FINGERPRINT:-}" = \
-              "$fingerprint"
-          fi
-          jq -e --argjson id "$RELEASE_ID" \
-            '.id == $id and .draft == true and .published_at == null' \
-            "$RELEASE_SNAPSHOT" >/dev/null
-          if [ "$ASSET_INVENTORY_KIND" = empty ]; then
-            test "${POST_UPLOAD_ROUTE:-}" = deep-recover
-            test "$(jq -r '.assets | length' "$RELEASE_SNAPSHOT")" -eq 4
-          fi
-          tooling/scripts/revalidate-release-mutation.sh \
-            --repository "$GITHUB_REPOSITORY" \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route deep-recover \
-            --expected-admission-fingerprint "$FINAL_ADMISSION_FINGERPRINT" \
-            --repo-dir tooling \
-            --dev-ref origin/dev \
-            --release-file "$RELEASE_SNAPSHOT"
-          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
-            --repository "$GITHUB_REPOSITORY" \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA" \
-            --target "$SOURCE_SHA" \
-            --image "$IMAGE" \
-            --release-file "$RELEASE_SNAPSHOT"
-          tooling/scripts/mutate-release-metadata.sh publish \
-            --repository "$GITHUB_REPOSITORY" \
-            --release-id "$RELEASE_ID" \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA" \
-            --target "$SOURCE_SHA" \
-            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --repo-dir source \
-            --release-file "$RELEASE_SNAPSHOT"
-      - name: Read-only publication verification
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          published=$(gh api \
-            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
-          jq -e \
-            --argjson id "$RELEASE_ID" \
-            --arg tag "$TAG" \
-            --arg target "$SOURCE_SHA" '
-              .id == $id and
-              .tag_name == $tag and
-              .target_commitish == $target and
-              .draft == false and
-              .published_at != null
-            ' <<<"$published" >/dev/null
-          tooling/scripts/verify-release-tag-ref.sh \
-            --repository "$GITHUB_REPOSITORY" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA"
-      - name: Logout from GHCR
-        if: always()
-        run: docker logout ghcr.io >/dev/null 2>&1 || true
 
-  recovery:
-    name: Recover immutable release
-    needs: release
-    if: needs.release.outputs.active == 'true' &&
-        needs.release.outputs.route == 'deep-recover'
-    concurrency:
-      group: backend-ghcr-publication-${{ github.repository }}
-      cancel-in-progress: false
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-      packages: read
-    env:
-      RELEASE_ID: ${{ needs.release.outputs.release_id }}
-      TAG: ${{ needs.release.outputs.release_tag }}
-      VERSION: ${{ needs.release.outputs.release_version }}
-      SOURCE_SHA: ${{ needs.release.outputs.source_sha }}
-      OBSERVED_STATE: ${{ needs.release.outputs.observed_state }}
-      OBSERVED_TAG: ${{ needs.release.outputs.observed_tag }}
-      ORIGINAL_ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
-      ASSET_INVENTORY_FINGERPRINT: ${{ needs.release.outputs.asset_inventory_fingerprint }}
-      ADMISSION_FINGERPRINT: ${{ needs.release.outputs.admission_fingerprint }}
-      IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
-    steps:
-      - name: Checkout reviewed recovery tooling
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify reader and policy before every writer
+        env:
+          IMMUTABLE_POLICY_READER_PRIVATE_KEY: ${{ secrets.IMMUTABLE_POLICY_READER_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/immutable-policy-reader.pem"
+          umask 077
+          printf '%s\n' "$IMMUTABLE_POLICY_READER_PRIVATE_KEY" >"$key_file"
+          scripts/verify-immutable-policy-reader-credential.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --app-id "$IMMUTABLE_POLICY_READER_APP_ID" \
+            --private-key-file "$key_file" \
+            --token-file "$RUNNER_TEMP/reader-token" \
+            --output "$RUNNER_TEMP/reader-proof.json"
+          scripts/verify-immutable-release-policy.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --token-file "$RUNNER_TEMP/reader-token" \
+            --credential-proof "$RUNNER_TEMP/reader-proof.json"
+
+      - name: Verify exact v1.2.0 publication tuple
+        run: |
+          set -euo pipefail
+          test "$TAG" = "v1.2.0"
+          test "$VERSION" = "1.2.0"
+          test "$TAG" = "v$VERSION"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+
+      - name: Revalidate policy before image writer
+        run: |
+          set -euo pipefail
+          scripts/verify-immutable-release-policy.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --token-file "$RUNNER_TEMP/reader-token" \
+            --credential-proof "$RUNNER_TEMP/reader-proof.json"
+
+      - name: Build and attest exact image
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --provenance=true --sbom=true \
+            --tag "$IMAGE:$TAG" --tag "$IMAGE:$VERSION" \
+            --tag "$IMAGE:sha-$SOURCE_SHA" --push \
+            --build-arg "BACKEND_VERSION=$VERSION" \
+            --build-arg "BACKEND_REVISION=$SOURCE_SHA" .
+          # The workflow-created attestation is pre-PATCH evidence only.
+
+      - name: Generate deterministic release evidence
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          docker buildx imagetools inspect "$IMAGE:$TAG" --raw \
+            >"$RUNNER_TEMP/release-assets/image-index.json"
+          docker buildx imagetools inspect "$IMAGE:$TAG" \
+            >"$RUNNER_TEMP/release-assets/image-inspect.txt"
+          jq -n --arg repository "$GITHUB_REPOSITORY" --arg image "$IMAGE" \
+            --arg tag "$TAG" --arg version "$VERSION" --arg source "$SOURCE_SHA" \
+            --argjson release_id "$RELEASE_ID" '{
+              schema:"meet-backend/release-evidence/v1",
+              repository:$repository,image:$image,tag:$tag,version:$version,
+              releaseId:$release_id,sourceSha:$source,
+              provenance:true,sbom:true
+            }' >"$RUNNER_TEMP/release-assets/release-manifest.json"
+          sha256sum "$RUNNER_TEMP/release-assets/release-manifest.json" \
+            "$RUNNER_TEMP/release-assets/image-index.json" \
+            "$RUNNER_TEMP/release-assets/image-inspect.txt" |
+            sed "s#  $RUNNER_TEMP/release-assets/##" \
+            >"$RUNNER_TEMP/release-assets/SHA256SUMS"
+
+      - name: Upload deterministic release assets
+        run: |
+          set -euo pipefail
+          # Fixed, closed evidence inventory:
+          # release-manifest.json image-index.json image-inspect.txt SHA256SUMS
+          scripts/upload-release-assets.sh \
+            --repository "$GITHUB_REPOSITORY" --release-id "$RELEASE_ID" \
+            --assets-dir "$RUNNER_TEMP/release-assets" \
+            --policy-token-file "$RUNNER_TEMP/reader-token" \
+            --credential-proof "$RUNNER_TEMP/reader-proof.json"
+
+      - name: Revalidate policy and publish last
+        env:
+          IMMUTABLE_POLICY_READER_TOKEN_FILE: ${{ runner.temp }}/reader-token
+        run: |
+          set -euo pipefail
+          scripts/revalidate-release-mutation.sh \
+            --repository "$GITHUB_REPOSITORY" --release-id "$RELEASE_ID" \
+            --tag "$TAG" --version "$VERSION" --source-sha "$SOURCE_SHA" \
+            --expected-route materialize --policy-token-file "$IMMUTABLE_POLICY_READER_TOKEN_FILE" \
+            --credential-proof "$RUNNER_TEMP/reader-proof.json"
+          scripts/verify-release-tag-ref.sh \
+            --repository "$GITHUB_REPOSITORY" --tag v1.1.0 \
+            --source-sha 36ffd11ea4d35147f1df9c1cafa6a330300c1339 \
+            --expect-absent
+          scripts/verify-release-tag-ref.sh \
+            --repository "$GITHUB_REPOSITORY" --tag "$TAG" \
+            --source-sha "$SOURCE_SHA" --expect-absent
+          scripts/mutate-release-metadata.sh publish \
+            --repository "$GITHUB_REPOSITORY" --release-id "$RELEASE_ID" \
+            --tag "$TAG" --version "$VERSION" --source-sha "$SOURCE_SHA" \
+            --policy-token-file "$IMMUTABLE_POLICY_READER_TOKEN_FILE" \
+            --credential-proof "$RUNNER_TEMP/reader-proof.json"
+
+      - name: Read-only immutable release proof
+        run: |
+          set -euo pipefail
+          scripts/verify-immutable-release-proof.sh \
+            --repository "$GITHUB_REPOSITORY" --tag "$TAG" \
+            --release-id "$RELEASE_ID" --source-sha "$SOURCE_SHA" \
+            --assets-dir "$RUNNER_TEMP/release-assets" \
+            >"$RUNNER_TEMP/MEE2-48-v1.2.0-immutability-proof.json"
+          sha256sum "$RUNNER_TEMP/MEE2-48-v1.2.0-immutability-proof.json" \
+            >"$RUNNER_TEMP/MEE2-48-v1.2.0-immutability-proof.json.sha256"
+
+      - name: Upload normalized proof only
+        uses: actions/upload-artifact@v4
         with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-          path: tooling
-      - name: Checkout exact release source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ env.SOURCE_SHA }}
-          fetch-depth: 0
-          path: source
-      - name: Bind complete deep-recovery entry (read-only Release Please visibility)
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release"
-          git -C tooling fetch --no-tags origin \
-            '+refs/heads/dev:refs/remotes/origin/dev'
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev)
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          test "$(value route)" = deep-recover
-          test "$(value active)" = true
-          test "$(value observed_state)" = "$OBSERVED_STATE"
-          test "$(value observed_tag)" = "$OBSERVED_TAG"
-          test "$(value release_id)" = "$RELEASE_ID"
-          test "$(value tag)" = "$TAG"
-          test "$(value version)" = "$VERSION"
-          test "$(value source_sha)" = "$SOURCE_SHA"
-          test "$(value target_commitish)" = "$SOURCE_SHA"
-          test "$(value draft)" = true
-          test "$(value published_at)" = null
-          test "$(value asset_inventory_kind)" = complete_unverified
-          test "$(value asset_inventory_fingerprint)" = \
-            "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT"
-          test "$(value admission_fingerprint)" = "$ADMISSION_FINGERPRINT"
-          release_json="$RUNNER_TEMP/release/recovery-entry.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          jq -e --argjson id "$RELEASE_ID" --arg source "$SOURCE_SHA" '
-            type == "object" and .id == $id and
-            .target_commitish == $source and .draft == true and
-            .published_at == null and (.assets | type == "array")
-          ' "$release_json" >/dev/null
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Verify admitted deep-recovery snapshot with GITHUB_TOKEN evidence
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route deep-recover \
-            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
-            --release-file "$RELEASE_SNAPSHOT" >/dev/null
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
-      - name: Authenticate for read-only registry inspection
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Deep-verify observed recovery state
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          test "$SOURCE_SHA" = "$(git -C source rev-parse HEAD)"
-          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
-            --repository "$GITHUB_REPOSITORY" \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA" \
-            --target "$SOURCE_SHA" \
-            --image "$IMAGE" \
-            --observed-state "$OBSERVED_STATE" \
-            --observed-tag "$OBSERVED_TAG" \
-            --release-file "$RELEASE_SNAPSHOT"
-      - name: Bind observed recovery asset fingerprint
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release"
-          release_json="$RUNNER_TEMP/recovery-observed-release.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          jq -e --argjson id "$RELEASE_ID" --arg source "$SOURCE_SHA" '
-            type == "object" and .id == $id and
-            .target_commitish == $source and .draft == true and
-            .published_at == null and (.assets | type == "array")
-          ' "$release_json" >/dev/null
-          post_action_fingerprint=$(
-            tooling/scripts/release-asset-inventory.sh fingerprint \
-              --release-file "$release_json"
-          )
-          test "$post_action_fingerprint" = \
-            "$ORIGINAL_ASSET_INVENTORY_FINGERPRINT"
-          echo "POST_ACTION_ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
-            >>"$GITHUB_ENV"
-          echo "ASSET_INVENTORY_FINGERPRINT=$post_action_fingerprint" \
-            >>"$GITHUB_ENV"
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Bind generated-placeholder canonicalization snapshot (read-only Release Please visibility)
-        if: env.OBSERVED_STATE == 'generated_placeholder'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          git -C tooling fetch --no-tags origin \
-            '+refs/heads/dev:refs/remotes/origin/dev'
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev)
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          test "$(value route)" = deep-recover
-          test "$(value active)" = true
-          test "$(value observed_state)" = generated_placeholder
-          test "$(value observed_tag)" = "$OBSERVED_TAG"
-          test "$(value release_id)" = "$RELEASE_ID"
-          test "$(value tag)" = "$TAG"
-          test "$(value version)" = "$VERSION"
-          test "$(value source_sha)" = "$SOURCE_SHA"
-          test "$(value target_commitish)" = "$SOURCE_SHA"
-          test "$(value draft)" = true
-          test "$(value published_at)" = null
-          test "$(value asset_inventory_kind)" = complete_unverified
-          release_json="$RUNNER_TEMP/release/recovery-canonicalize.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route deep-recover \
-            --expected-admission-fingerprint "$ADMISSION_FINGERPRINT" \
-            --release-file "$release_json")
-          grep -Fx 'observed_state=generated_placeholder' <<<"$descriptor"
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Canonicalize generated placeholder metadata
-        if: env.OBSERVED_STATE == 'generated_placeholder'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          ref_error="$RUNNER_TEMP/recovery-canonical-ref-before"
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
-              >/dev/null 2>"$ref_error"; then
-            echo "canonical tag appeared before placeholder canonicalization" >&2
-            exit 1
-          fi
-          grep -Eq '\(HTTP 404\)|[[:space:]]404([[:space:]]|$)' "$ref_error"
-          tooling/scripts/mutate-release-metadata.sh canonicalize \
-            --repository "$GITHUB_REPOSITORY" \
-            --release-id "$RELEASE_ID" \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA" \
-            --target "$SOURCE_SHA" \
-            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --observed-tag "$OBSERVED_TAG" \
-            --repo-dir source \
-            --release-file "$RELEASE_SNAPSHOT"
-      - name: Prove generated-placeholder ref remains absent after canonicalization
-        if: env.OBSERVED_STATE == 'generated_placeholder'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          ref_error="$RUNNER_TEMP/recovery-canonical-ref-after"
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
-              >/dev/null 2>"$ref_error"; then
-            echo "canonical tag was created before final publication" >&2
-            exit 1
-          fi
-          grep -Eq '\(HTTP 404\)|[[:space:]]404([[:space:]]|$)' "$ref_error"
-      - name: Bind canonicalized recovery snapshot (read-only Release Please visibility)
-        if: env.OBSERVED_STATE == 'generated_placeholder'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          release_json="$RUNNER_TEMP/recovery-canonicalized-release.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route deep-recover \
-            --release-file "$release_json")
-          grep -Fx 'route=deep-recover' <<<"$descriptor"
-          test "$(awk -F= '$1 == "observed_state" {print $2}' <<<"$descriptor")" = canonical
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Re-verify canonical draft before publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
-            --repository "$GITHUB_REPOSITORY" \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA" \
-            --target "$SOURCE_SHA" \
-            --image "$IMAGE" \
-            --release-file "$RELEASE_SNAPSHOT"
-      - name: Bind final deep-recovery publication snapshot (read-only Release Please visibility)
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          git -C tooling fetch --no-tags origin \
-            '+refs/heads/dev:refs/remotes/origin/dev'
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh pre-action \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev)
-          value() {
-            awk -F= -v key="$1" '$1 == key {
-              sub(/^[^=]*=/, "")
-              print
-            }' <<<"$descriptor"
-          }
-          test "$(value route)" = deep-recover
-          test "$(value active)" = true
-          test "$(value observed_state)" = canonical
-          test "$(value observed_tag)" = "$TAG"
-          test "$(value release_id)" = "$RELEASE_ID"
-          test "$(value tag)" = "$TAG"
-          test "$(value version)" = "$VERSION"
-          test "$(value source_sha)" = "$SOURCE_SHA"
-          test "$(value target_commitish)" = "$SOURCE_SHA"
-          test "$(value draft)" = true
-          test "$(value published_at)" = null
-          test "$(value asset_inventory_kind)" = complete_unverified
-          release_json="$RUNNER_TEMP/release/recovery-final.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$release_json"
-          descriptor=$(tooling/scripts/resolve-release-descriptor.sh verify \
-            --repo-dir tooling \
-            --repository "$GITHUB_REPOSITORY" \
-            --dev-ref origin/dev \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --asset-inventory-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route deep-recover \
-            --release-file "$release_json")
-          grep -Fx 'asset_inventory_kind=complete_unverified' <<<"$descriptor"
-          final_admission_fingerprint=$(awk -F= '$1 == "admission_fingerprint" {
-            sub(/^[^=]*=/, "")
-            print
-          }' <<<"$descriptor")
-          [[ "$final_admission_fingerprint" =~ ^[0-9a-f]{64}$ ]]
-          echo "FINAL_ADMISSION_FINGERPRINT=$final_admission_fingerprint" \
-            >>"$GITHUB_ENV"
-          snapshot_sha=$(sha256sum "$release_json" | awk '{print $1}')
-          echo "RELEASE_SNAPSHOT=$release_json" >>"$GITHUB_ENV"
-          echo "RELEASE_SNAPSHOT_SHA=$snapshot_sha" >>"$GITHUB_ENV"
-      - name: Publish canonical release metadata last
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          test "$(sha256sum "$RELEASE_SNAPSHOT" | awk '{print $1}')" = \
-            "$RELEASE_SNAPSHOT_SHA"
-          fingerprint=$(
-            tooling/scripts/release-asset-inventory.sh fingerprint \
-              --release-file "$RELEASE_SNAPSHOT"
-          )
-          test "$POST_ACTION_ASSET_INVENTORY_FINGERPRINT" = \
-            "$ASSET_INVENTORY_FINGERPRINT"
-          test "$fingerprint" = "$ASSET_INVENTORY_FINGERPRINT"
-          if [ "$OBSERVED_STATE" = generated_placeholder ]; then
-            ref_error="$RUNNER_TEMP/recovery-canonical-ref-final"
-            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
-                >/dev/null 2>"$ref_error"; then
-              echo "canonical tag was created before the final publish PATCH" >&2
-              exit 1
-            fi
-            grep -Eq '\(HTTP 404\)|[[:space:]]404([[:space:]]|$)' "$ref_error"
-          fi
-          tooling/scripts/revalidate-release-mutation.sh \
-            --repository "$GITHUB_REPOSITORY" \
-            --release-id "$RELEASE_ID" \
-            --tag "$TAG" \
-            --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" \
-            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --expected-route deep-recover \
-            --expected-admission-fingerprint "$FINAL_ADMISSION_FINGERPRINT" \
-            --repo-dir tooling \
-            --dev-ref origin/dev \
-            --release-file "$RELEASE_SNAPSHOT"
-          tooling/scripts/verify-release-resume-state.sh "$RELEASE_ID" \
-            --repository "$GITHUB_REPOSITORY" \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA" \
-            --target "$SOURCE_SHA" \
-            --image "$IMAGE" \
-            --release-file "$RELEASE_SNAPSHOT"
-          tooling/scripts/mutate-release-metadata.sh publish \
-            --repository "$GITHUB_REPOSITORY" \
-            --release-id "$RELEASE_ID" \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA" \
-            --target "$SOURCE_SHA" \
-            --expected-fingerprint "$ASSET_INVENTORY_FINGERPRINT" \
-            --repo-dir source \
-            --release-file "$RELEASE_SNAPSHOT"
-      - name: Read-only recovery verification
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" |
-            jq -e \
-              --argjson id "$RELEASE_ID" \
-              --arg tag "$TAG" \
-              --arg source "$SOURCE_SHA" '
-                .id == $id and .tag_name == $tag and
-                .target_commitish == $source and
-                .draft == false and .published_at != null
-              ' >/dev/null
-          tooling/scripts/verify-release-tag-ref.sh \
-            --repository "$GITHUB_REPOSITORY" \
-            --tag "$TAG" \
-            --source-sha "$SOURCE_SHA"
-      - name: Logout from GHCR
-        if: always()
-        run: docker logout ghcr.io >/dev/null 2>&1 || true
+          name: MEE2-48-v1.2.0-immutability-proof
+          path: |
+            ${{ runner.temp }}/MEE2-48-v1.2.0-immutability-proof.json
+            ${{ runner.temp }}/MEE2-48-v1.2.0-immutability-proof.json.sha256

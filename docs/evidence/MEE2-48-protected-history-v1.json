@@ -1,0 +1,95 @@
+{
+  "image": "ghcr.io/nickolaymamonov/meet-backend-v3",
+  "objects": {
+    "blockedV1_1_0": {
+      "assets": [
+        {
+          "digest": "sha256:c156a8a1436b008eea2980711b233b6f800cf60a36cdbe08faf480a2c97e6570",
+          "id": 510854811,
+          "label": "",
+          "name": "image-index.json",
+          "size": 856
+        },
+        {
+          "digest": "sha256:f34aa9eaaf8fe0a927414424372847f0fea14ca611310c388b413466680f9dc0",
+          "id": 510854825,
+          "label": "",
+          "name": "image-inspect.txt",
+          "size": 1047
+        },
+        {
+          "digest": "sha256:ad95ba3324d0d6cea4decff17f9a651b3af302823736663ce129290a5dd5e94d",
+          "id": 510854798,
+          "label": "",
+          "name": "release-manifest.json",
+          "size": 661
+        },
+        {
+          "digest": "sha256:78a552d9df5157582425893e63a703ae7f25e24fa8e83d2c79013e46031e141d",
+          "id": 510854837,
+          "label": "",
+          "name": "SHA256SUMS",
+          "size": 255
+        }
+      ],
+      "identity": {
+        "releaseId": 368531227,
+        "tag": "v1.1.0",
+        "version": "1.1.0"
+      },
+      "release": {
+        "draft": true,
+        "immutable": false,
+        "prerelease": false,
+        "publishedAt": null,
+        "targetCommitish": "36ffd11ea4d35147f1df9c1cafa6a330300c1339"
+      }
+    },
+    "immutableV1_0_1": {
+      "assets": [
+        {
+          "digest": "sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6",
+          "id": 508490090,
+          "label": "",
+          "name": "image-index.json",
+          "size": 856
+        },
+        {
+          "digest": "sha256:a2ff224f6dbdc2663c87564f24568002b8030ddb700bcfc6861ca9200a3bc51a",
+          "id": 508490102,
+          "label": "",
+          "name": "image-inspect.txt",
+          "size": 1047
+        },
+        {
+          "digest": "sha256:4be0a48ef10060dba16abd453db9dbaa152e47a4712386c60400a861249ae5f1",
+          "id": 508490083,
+          "label": "",
+          "name": "release-manifest.json",
+          "size": 661
+        },
+        {
+          "digest": "sha256:9ae626bc71084895f2706f9e1dcc9443cbefba6fdfbeda67b3693aa9fb8b3dfb",
+          "id": 508490119,
+          "label": "",
+          "name": "SHA256SUMS",
+          "size": 255
+        }
+      ],
+      "identity": {
+        "releaseId": 367640510,
+        "tag": "v1.0.1",
+        "version": "1.0.1"
+      },
+      "release": {
+        "draft": false,
+        "immutable": false,
+        "prerelease": false,
+        "publishedAt": "2026-08-10T23:02:54Z",
+        "targetCommitish": "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc"
+      }
+    }
+  },
+  "repository": "nickolaymamonov/meet-backend-v3",
+  "schema": "meet-backend/protected-release-history/v1"
+}

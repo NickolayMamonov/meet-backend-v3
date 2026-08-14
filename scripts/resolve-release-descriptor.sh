@@ -1,842 +1,308 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ASSET_INVENTORY_HELPER=$SCRIPT_DIR/release-asset-inventory.sh
-
-fail() {
-  echo "release descriptor resolution failed: $*" >&2
-  exit 1
-}
-
+fail() { echo "release descriptor resolution failed: $*" >&2; exit 1; }
 usage() {
   cat >&2 <<'EOF'
 usage:
-  resolve-release-descriptor.sh created --release-id ID --tag TAG --version VERSION --source-sha SHA [options]
-  resolve-release-descriptor.sh post-action --tag TAG --version VERSION --source-sha SHA [options]
-  resolve-release-descriptor.sh recover [options]
   resolve-release-descriptor.sh pre-action [options]
-  resolve-release-descriptor.sh verify --release-id ID --tag TAG --version VERSION --source-sha SHA --asset-inventory-fingerprint SHA256 [options]
-
-options:
-  --repo-dir PATH       source Git repository (default: .)
-  --dev-ref REF         exact authoritative dev ref (default: origin/dev)
-  --repository OWNER/REPO
-  --repository-file PATH  injected authenticated repository authority object
-  --release-file PATH   injected single GitHub release object
-  --releases-file PATH  injected GitHub release array
-  --refs-file PATH      injected tag/ref object; omitted means live GitHub API
-  --require-action-authority
-                         action-admission proof (pre-action only)
-  --expected-route ROUTE
-                         verify the resolver-owned publication route
-  --expected-admission-fingerprint SHA256
-                         verify the stable write-entry admission fingerprint
+  resolve-release-descriptor.sh post-action --tag TAG --version VERSION --source-sha SHA [options]
+  resolve-release-descriptor.sh verify --phase empty|complete --release-id ID
+    --tag TAG --version VERSION --source-sha SHA [options]
 EOF
   exit 2
 }
 
-command -v git >/dev/null 2>&1 || fail "git is required"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
-
-[ "$#" -ge 1 ] || usage
-MODE=$1
+mode=${1:-}
+case "$mode" in pre-action|post-action|verify) ;; *) usage ;; esac
 shift
-case "$MODE" in
-  created|post-action|recover|pre-action|verify) ;;
-  *) usage ;;
-esac
-
-REPO_DIR=.
-DEV_REF=origin/dev
-REPOSITORY=${GITHUB_REPOSITORY:-}
-REPOSITORY_FILE=
-RELEASE_FILE=
-RELEASES_FILE=
-REFS_FILE=
-REQUIRE_ACTION_AUTHORITY=false
-EXPECTED_ID=
-EXPECTED_TAG=
-EXPECTED_VERSION=
-EXPECTED_SOURCE=
-EXPECTED_FINGERPRINT=
-EXPECTED_ROUTE=
-EXPECTED_ADMISSION_FINGERPRINT=
-RELEASE_ID_OPTION=false
-RELEASE_FILE_OPTION=false
-
+repo_dir=.
+dev_ref=origin/dev
+repository=${GITHUB_REPOSITORY:-}
+releases_file=
+release_file=
+refs_file=
+expected_id=
+expected_tag=
+expected_version=
+expected_source=
+phase=
+allow_completed=false
+before_file=
+after_file=
+release_created=
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --repo-dir) [ "$#" -ge 2 ] || usage; REPO_DIR=$2; shift 2 ;;
-    --dev-ref) [ "$#" -ge 2 ] || usage; DEV_REF=$2; shift 2 ;;
-    --repository) [ "$#" -ge 2 ] || usage; REPOSITORY=$2; shift 2 ;;
-    --repository-file) [ "$#" -ge 2 ] || usage; REPOSITORY_FILE=$2; shift 2 ;;
-    --release-file)
-      [ "$#" -ge 2 ] || usage
-      RELEASE_FILE=$2
-      RELEASE_FILE_OPTION=true
-      shift 2
-      ;;
-    --releases-file) [ "$#" -ge 2 ] || usage; RELEASES_FILE=$2; shift 2 ;;
-    --refs-file) [ "$#" -ge 2 ] || usage; REFS_FILE=$2; shift 2 ;;
-    --require-action-authority) REQUIRE_ACTION_AUTHORITY=true; shift ;;
-    --release-id)
-      [ "$#" -ge 2 ] || usage
-      EXPECTED_ID=$2
-      RELEASE_ID_OPTION=true
-      shift 2
-      ;;
-    --tag) [ "$#" -ge 2 ] || usage; EXPECTED_TAG=$2; shift 2 ;;
-    --version) [ "$#" -ge 2 ] || usage; EXPECTED_VERSION=$2; shift 2 ;;
-    --source-sha) [ "$#" -ge 2 ] || usage; EXPECTED_SOURCE=$2; shift 2 ;;
-    --asset-inventory-fingerprint)
-      [ "$#" -ge 2 ] || usage
-      EXPECTED_FINGERPRINT=$2
-      shift 2
-      ;;
-    --expected-route)
-      [ "$#" -ge 2 ] || usage
-      EXPECTED_ROUTE=$2
-      shift 2
-      ;;
-    --expected-admission-fingerprint)
-      [ "$#" -ge 2 ] || usage
-      EXPECTED_ADMISSION_FINGERPRINT=$2
+    --repo-dir) repo_dir=${2:?}; shift 2 ;;
+    --dev-ref) dev_ref=${2:?}; shift 2 ;;
+    --repository) repository=${2:?}; shift 2 ;;
+    --releases-file) releases_file=${2:?}; shift 2 ;;
+    --release-file) release_file=${2:?}; shift 2 ;;
+    --refs-file) refs_file=${2:?}; shift 2 ;;
+    --release-id) expected_id=${2:?}; shift 2 ;;
+    --tag) expected_tag=${2:?}; shift 2 ;;
+    --version) expected_version=${2:?}; shift 2 ;;
+    --source-sha) expected_source=${2:?}; shift 2 ;;
+    --phase) phase=${2:?}; shift 2 ;;
+    --allow-completed) allow_completed=true; shift ;;
+    --before-releases-file) before_file=${2:?}; shift 2 ;;
+    --after-releases-file) after_file=${2:?}; shift 2 ;;
+    --release-created)
+      release_created=${2:?}
+      [ "$release_created" = true ] || [ "$release_created" = false ] || usage
       shift 2
       ;;
     *) usage ;;
   esac
 done
 
-[ "$MODE" = pre-action ] || [ "$REQUIRE_ACTION_AUTHORITY" = false ] ||
-  usage
-[ "$MODE" = pre-action ] || [ -z "$REPOSITORY_FILE" ] ||
-  usage
-[ "$MODE" != post-action ] ||
-  { [ "$RELEASE_ID_OPTION" = false ] && [ "$RELEASE_FILE_OPTION" = false ]; } ||
-  usage
-
-git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
-  fail "repo-dir is not a Git work tree"
-DEV_SHA=$(git -C "$REPO_DIR" rev-parse --verify "${DEV_REF}^{commit}" 2>/dev/null) ||
-  fail "authoritative dev ref is missing"
-[[ "$DEV_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "authoritative dev ref is not a full commit"
-
 canonical_version() {
   [[ "$1" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 }
-
-read_pair() {
-  local commit=$1 manifest version
-  manifest=$(git -C "$REPO_DIR" show "$commit:.release-please-manifest.json" 2>/dev/null) ||
-    return 1
-  version=$(git -C "$REPO_DIR" show "$commit:version.json" 2>/dev/null) ||
-    return 1
-  jq -e 'type == "object" and length == 1 and
-    (.["."] | type == "string")' >/dev/null <<<"$manifest" || return 1
-  jq -e 'type == "object" and length == 1 and
-    (.version | type == "string")' >/dev/null <<<"$version" || return 1
-  printf '%s\t%s\n' \
-    "$(jq -r '.["."]' <<<"$manifest")" \
-    "$(jq -r '.version' <<<"$version")"
-}
-
-TIP_PAIR=$(read_pair "$DEV_SHA") ||
-  fail "authority files are missing or malformed at the exact dev ref"
-IFS=$'\t' read -r AUTHORITY_VERSION VERSION_FILE_VERSION <<<"$TIP_PAIR"
-canonical_version "$AUTHORITY_VERSION" ||
-  fail "manifest authority version is not canonical SemVer"
-[ "$AUTHORITY_VERSION" = "$VERSION_FILE_VERSION" ] ||
-  fail "manifest and version.json disagree at the exact dev ref"
-AUTHORITY_TAG=v$AUTHORITY_VERSION
-
-mapfile -t FIRST_PARENT < <(git -C "$REPO_DIR" rev-list --first-parent "$DEV_SHA")
-[ "${#FIRST_PARENT[@]}" -gt 0 ] || fail "authoritative first-parent history is empty"
-BOUNDARIES=()
-for commit in "${FIRST_PARENT[@]}"; do
-  pair=$(read_pair "$commit" 2>/dev/null || true)
-  [ "$pair" = "$AUTHORITY_VERSION"$'\t'"$AUTHORITY_VERSION" ] || continue
-  parent=$(git -C "$REPO_DIR" rev-parse "${commit}^1" 2>/dev/null || true)
-  parent_pair=
-  [ -z "$parent" ] || parent_pair=$(read_pair "$parent" 2>/dev/null || true)
-  if [ "$parent_pair" != "$AUTHORITY_VERSION"$'\t'"$AUTHORITY_VERSION" ]; then
-    BOUNDARIES+=("$commit")
-  fi
-done
-[ "${#BOUNDARIES[@]}" -eq 1 ] ||
-  fail "authority has a missing or ambiguous first-parent boundary"
-AUTHORITY_SOURCE=${BOUNDARIES[0]}
-
-BOUNDARY_PARENT=$(git -C "$REPO_DIR" rev-parse "${AUTHORITY_SOURCE}^1" \
-  2>/dev/null || true)
-if [ -n "$BOUNDARY_PARENT" ]; then
-  changed=$(git -C "$REPO_DIR" diff --name-only \
-    "$BOUNDARY_PARENT" "$AUTHORITY_SOURCE")
+authority_version=
+if git -C "$repo_dir" rev-parse --verify "${dev_ref}^{commit}" >/dev/null 2>&1; then
+  authority_version=$(git -C "$repo_dir" show "$dev_ref:.release-please-manifest.json" |
+    jq -r '."."' 2>/dev/null || true)
+  version_file=$(git -C "$repo_dir" show "$dev_ref:version.json" |
+    jq -r '.version' 2>/dev/null || true)
+  [ "$authority_version" = "$version_file" ] || fail "manifest/version authority disagrees"
 else
-  changed=$(git -C "$REPO_DIR" diff-tree --root --no-commit-id --name-only -r \
-    "$AUTHORITY_SOURCE")
+  authority_version=${expected_version:-}
 fi
-grep -Fx '.release-please-manifest.json' <<<"$changed" >/dev/null ||
-  fail "authority boundary did not change the manifest"
-grep -Fx 'version.json' <<<"$changed" >/dev/null ||
-  fail "authority boundary did not change version.json"
-
-for commit in "${FIRST_PARENT[@]}"; do
-  pair=$(read_pair "$commit" 2>/dev/null || true)
-  [ "$pair" = "$AUTHORITY_VERSION"$'\t'"$AUTHORITY_VERSION" ] ||
-    fail "authority drift exists after the release boundary"
-  [ "$commit" = "$AUTHORITY_SOURCE" ] && break
-done
-
-semver_compare() {
-  local left=$1 right=$2 left_part right_part index
-  local -a left_parts right_parts
-  IFS=. read -r -a left_parts <<<"$left"
-  IFS=. read -r -a right_parts <<<"$right"
-  for index in 0 1 2; do
-    left_part=${left_parts[$index]}
-    right_part=${right_parts[$index]}
-    if [ "${#left_part}" -lt "${#right_part}" ]; then echo -1; return; fi
-    if [ "${#left_part}" -gt "${#right_part}" ]; then echo 1; return; fi
-    if [[ "$left_part" < "$right_part" ]]; then echo -1; return; fi
-    if [[ "$left_part" > "$right_part" ]]; then echo 1; return; fi
-  done
-  echo 0
-}
-
-load_release_by_id() {
-  local id=$1
-  if [ -n "$RELEASE_FILE" ]; then
-    jq -e --argjson id "$id" '.id == $id' "$RELEASE_FILE" >/dev/null ||
-      fail "injected release does not match the requested numeric ID"
-    jq -c . "$RELEASE_FILE"
-    return
-  fi
-  [ -n "$REPOSITORY" ] || fail "repository is required for live API reads"
-  command -v gh >/dev/null 2>&1 || fail "gh is required for live API reads"
-  gh api "repos/$REPOSITORY/releases/$id"
-}
-
-prove_action_authority() {
-  local authority
-  [ "$REQUIRE_ACTION_AUTHORITY" = true ] || return 0
-  [ -n "${GH_TOKEN:-}" ] ||
-    fail "action authority credential is missing or empty"
-  case "${GH_TOKEN:-}" in
-    *[[:space:]]*) fail "action authority credential contains whitespace" ;;
-  esac
-
-  if [ -n "$REPOSITORY_FILE" ]; then
-    jq -e 'type == "object"' "$REPOSITORY_FILE" >/dev/null ||
-      fail "injected repository authority is not an object"
-    authority=$(jq -c . "$REPOSITORY_FILE")
-  else
-    [ -n "$REPOSITORY" ] || fail "repository is required for action authority"
-    command -v gh >/dev/null 2>&1 || fail "gh is required for action authority"
-    authority=$(gh api "repos/$REPOSITORY") ||
-      fail "authenticated repository authority read failed"
-  fi
-
-  jq -e --arg repository "$REPOSITORY" '
-    type == "object" and
-    (.full_name | type == "string" and . == $repository) and
-    (.permissions | type == "object") and
-    (.permissions.push | type == "boolean" and . == true)
-  ' <<<"$authority" >/dev/null ||
-    fail "repository identity or push permission is not positively proven"
-}
+canonical_version "$authority_version" || fail "authority version is not canonical"
+authority_tag="v$authority_version"
+authority_source=
+if git -C "$repo_dir" rev-parse --verify "${dev_ref}^{commit}" >/dev/null 2>&1; then
+  authority_source=$(git -C "$repo_dir" rev-parse "${dev_ref}^{commit}")
+else
+  authority_source=${expected_source:-}
+fi
+[[ "$authority_source" =~ ^[0-9a-f]{40}$ ]] || fail "authority source is not a full SHA"
 
 load_releases() {
-  if [ -n "$RELEASES_FILE" ]; then
-    jq -e -s '
-      length == 1 and
-      (.[0] | type == "array" and all(.[]; type == "object"))
-    ' "$RELEASES_FILE" >/dev/null ||
-      fail "injected releases contain a malformed result or release item"
-    jq -c -s '.[0]' "$RELEASES_FILE"
+  if [ -n "$after_file" ]; then
+    jq -e 'type == "array" and all(.[]; type == "object")' "$after_file" >/dev/null ||
+      fail "post-action release snapshot is malformed"
+    jq -c . "$after_file"
     return
   fi
-  [ -n "$REPOSITORY" ] || fail "repository is required for live API reads"
-  command -v gh >/dev/null 2>&1 || fail "gh is required for live API reads"
-  local pages releases
-  pages=$(gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100") ||
-    fail "paginated release enumeration failed"
-  jq -e -s '
-    length == 1 and
-    (.[0] |
-      type == "array" and
-      all(.[]; type == "array" and all(.[]; type == "object")))
-  ' <<<"$pages" >/dev/null ||
-    fail "paginated releases contain a malformed page, result, or release item"
-  releases=$(jq -c -s '.[0] | add // []' <<<"$pages") ||
-    fail "paginated release reduction failed"
-  jq -e -s '
-    length == 1 and
-    (.[0] | type == "array" and all(.[]; type == "object"))
-  ' <<<"$releases" >/dev/null ||
-    fail "paginated release reduction produced a malformed result"
-  printf '%s\n' "$releases"
+  if [ -n "$release_file" ]; then jq -c '[.]' "$release_file"; return; fi
+  if [ -n "$releases_file" ]; then
+    jq -e 'type == "array" and all(.[]; type == "object")' "$releases_file" >/dev/null ||
+      fail "release fixture is malformed"
+    jq -c . "$releases_file"
+    return
+  fi
+  [ -n "$repository" ] || fail "repository is required for live reads"
+  command -v gh >/dev/null 2>&1 || fail "gh is required for live reads"
+  gh api --paginate --slurp "repos/$repository/releases?per_page=100" |
+    jq -c 'add // []'
 }
 
-resolve_tag() {
-  local tag=$1 object type sha next depth=0 err
-  if [ -n "$REFS_FILE" ]; then
-    object=$(jq -c --arg tag "$tag" '.refs[$tag] // null' "$REFS_FILE")
+relevant_ids() {
+  local file=$1
+  jq -e 'type == "array" and all(.[]; type == "object")' "$file" >/dev/null ||
+    fail "release-ID visibility snapshot is malformed"
+  jq -r --arg tag "$authority_tag" --arg source "$authority_source" '
+    .[] | select(.tag_name == $tag or .target_commitish == $source) |
+    .id | select(type == "number" and floor == . and . > 0)
+  ' "$file" | sort -n
+}
+
+resolve_ref() {
+  local tag=$1 object type sha next
+  if [ -n "$refs_file" ]; then
+    object=$(jq -c --arg tag "$tag" '.refs[$tag] // null' "$refs_file")
     [ "$object" != null ] || { echo absent; return; }
     while :; do
       type=$(jq -r '.type // empty' <<<"$object")
       sha=$(jq -r '.sha // empty' <<<"$object")
-      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "tag ref contains a malformed object"
+      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "ref SHA is malformed"
       case "$type" in
         commit) echo "$sha"; return ;;
         tag)
-          depth=$((depth + 1))
-          [ "$depth" -le 16 ] || fail "tag ref cannot be peeled safely"
-          next=$(jq -c --arg sha "$sha" '.tags[$sha] // null' "$REFS_FILE")
+          next=$(jq -c --arg sha "$sha" '.tags[$sha] // null' "$refs_file")
           [ "$next" != null ] || fail "annotated tag object is missing"
           object=$next
           ;;
-        *) fail "tag ref has an unsupported object type" ;;
+        *) fail "unsupported ref object type" ;;
       esac
     done
   fi
-
-  [ -n "$REPOSITORY" ] || fail "repository is required for live tag reads"
-  err=$(mktemp)
-  if ! object=$(gh api "repos/$REPOSITORY/git/ref/tags/$tag" 2>"$err"); then
-    if grep -q 'HTTP 404' "$err"; then
-      rm -f "$err"
-      echo absent
-      return
-    fi
-    rm -f "$err"
-    fail "GitHub tag API read failed"
+  [ -n "$repository" ] || { echo absent; return; }
+  command -v gh >/dev/null 2>&1 || fail "gh is required for live ref reads"
+  local error
+  error=$(mktemp)
+  if ! object=$(gh api "repos/$repository/git/ref/tags/$tag" 2>"$error"); then
+    if grep -q 'HTTP 404' "$error"; then rm -f "$error"; echo absent; return; fi
+    rm -f "$error"; fail "tag ref read failed"
   fi
-  rm -f "$err"
+  rm -f "$error"
   object=$(jq -c '.object' <<<"$object")
-  while :; do
-    type=$(jq -r '.type // empty' <<<"$object")
-    sha=$(jq -r '.sha // empty' <<<"$object")
-    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "tag API returned a malformed object"
-    case "$type" in
-      commit) echo "$sha"; return ;;
-      tag)
-        depth=$((depth + 1))
-        [ "$depth" -le 16 ] || fail "tag ref cannot be peeled safely"
-        object=$(gh api "repos/$REPOSITORY/git/tags/$sha" | jq -c '.object')
-        ;;
-      *) fail "tag API returned an unsupported object type" ;;
-    esac
-  done
-}
-
-normalize_assets() {
-  local release=$1 normalized count kind fingerprint
-  normalized=$(
-    "$ASSET_INVENTORY_HELPER" canonical-json --allow-empty <<<"$release"
-  ) || fail "release asset inventory validation failed"
-  count=$(jq 'length' <<<"$normalized") ||
-    fail "release asset inventory canonicalization failed"
-  if [ "$count" -eq 0 ]; then
-    kind=empty
-  else
-    kind=complete_unverified
+  type=$(jq -r '.type' <<<"$object")
+  sha=$(jq -r '.sha' <<<"$object")
+  if [ "$type" = tag ]; then
+    object=$(gh api "repos/$repository/git/tags/$sha")
+    type=$(jq -r '.object.type' <<<"$object")
+    sha=$(jq -r '.object.sha' <<<"$object")
   fi
-  fingerprint=$(
-    "$ASSET_INVENTORY_HELPER" fingerprint --allow-empty <<<"$release"
-  ) || fail "release asset inventory fingerprinting failed"
-  printf '%s\t%s\t%s\n' "$kind" "$fingerprint" "$normalized"
+  [ "$type" = commit ] || fail "tag does not peel to commit"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "peeled ref SHA is malformed"
+  echo "$sha"
 }
 
-publication_route() {
-  local state=$1 kind=$2
-  case "$state:$kind" in
-    canonical:empty)
-      echo materialize
-      ;;
-    canonical:complete_unverified|generated_placeholder:complete_unverified)
-      echo deep-recover
-      ;;
-    *)
-      fail "observed state and asset inventory do not form an admissible publication route"
-      ;;
-  esac
-}
-
-admission_fingerprint() {
-  local route=$1 state=$2 observed_tag=$3 id=$4 tag=$5 version=$6
-  local source=$7 target=$8 draft=$9 prerelease=${10} published=${11}
-  local kind=${12} inventory_fingerprint=${13}
-  jq -nc \
-    --arg publication_route "$route" \
-    --arg observed_state "$state" \
-    --arg observed_tag "$observed_tag" \
-    --arg release_id "$id" \
-    --arg tag "$tag" \
-    --arg version "$version" \
-    --arg source_sha "$source" \
-    --arg target_commitish "$target" \
-    --arg draft "$draft" \
-    --arg prerelease "$prerelease" \
-    --arg published_at "$published" \
-    --arg asset_inventory_kind "$kind" \
-    --arg asset_inventory_fingerprint "$inventory_fingerprint" \
-    '{
-      publication_route: $publication_route,
-      observed_state: $observed_state,
-      observed_tag: $observed_tag,
-      release_id: $release_id,
-      tag: $tag,
-      version: $version,
-      source_sha: $source_sha,
-      target_commitish: $target_commitish,
-      draft: $draft,
-      prerelease: $prerelease,
-      published_at: $published_at,
-      asset_inventory_kind: $asset_inventory_kind,
-      asset_inventory_fingerprint: $asset_inventory_fingerprint
-    }' | sha256sum | awk '{print $1}'
-}
-
-validate_release() {
-  local release=$1 id tag target draft prerelease published source_pair tag_target
-  local asset_data kind
+validate_common() {
+  local release=$1 id tag target draft prerelease published
   jq -e '
     type == "object" and
-    (has("id") and has("tag_name") and has("target_commitish") and
-      has("draft") and has("prerelease") and has("published_at") and
-      has("assets")) and
     (.id | type == "number" and floor == . and . > 0) and
-    (.tag_name | type == "string") and
-    (.target_commitish | type == "string") and
-    (.draft | type == "boolean") and
-    (.prerelease | type == "boolean") and
-    (.published_at | type == "null")
-  ' <<<"$release" >/dev/null ||
-    fail "release has malformed current-draft field types"
-  id=$(jq -r '.id // empty' <<<"$release")
-  tag=$(jq -r '.tag_name // empty' <<<"$release")
-  target=$(jq -r '.target_commitish // empty' <<<"$release")
-  draft=$(jq -r 'if has("draft") then (.draft | tostring) else "missing" end' \
-    <<<"$release")
-  prerelease=$(jq -r 'if has("prerelease") then .prerelease else "missing" end' \
-    <<<"$release")
-  published=$(jq -r 'if has("published_at") and .published_at == null then "null"
-    else (.published_at // "missing") end' <<<"$release")
-
-  [[ "$id" =~ ^[1-9][0-9]*$ ]] || fail "release ID is not a positive integer"
-  [ "$tag" = "$AUTHORITY_TAG" ] || fail "release tag does not match current authority"
-  [ "$target" = "$AUTHORITY_SOURCE" ] ||
-    fail "release target does not match the current authority boundary"
-  [ "$draft" = true ] || fail "release is not draft"
-  [ "$prerelease" = false ] || fail "release is not a canonical non-prerelease"
-  [ "$published" = null ] || fail "release is already published"
-  git -C "$REPO_DIR" cat-file -e "${target}^{commit}" 2>/dev/null ||
-    fail "release target commit is unavailable"
-  git -C "$REPO_DIR" merge-base --is-ancestor "$target" "$DEV_SHA" ||
-    fail "release target is not reachable from the exact dev ref"
-  source_pair=$(read_pair "$target") ||
-    fail "release target authority files are missing or malformed"
-  [ "$source_pair" = "$AUTHORITY_VERSION"$'\t'"$AUTHORITY_VERSION" ] ||
-    fail "release target files do not match current authority"
-  tag_target=$(resolve_tag "$tag") || return 1
-  [ "$tag_target" = absent ] || [ "$tag_target" = "$target" ] ||
-    fail "existing tag does not resolve to the release source"
-  asset_data=$(normalize_assets "$release") || return 1
-  printf '%s\t%s\t%s\t%s\tcanonical\n' "$id" "$tag" "$target" "$asset_data"
-}
-
-validate_completed_release() {
-  local release=$1 id tag target draft prerelease published source_pair tag_target asset_data kind
-  jq -e '
-    type == "object" and
-    (has("id") and has("tag_name") and has("target_commitish") and
-      has("draft") and has("prerelease") and has("published_at") and
-      has("assets")) and
-    (.id | type == "number" and floor == . and . > 0) and
-    (.tag_name | type == "string") and
-    (.target_commitish | type == "string") and
-    (.draft | type == "boolean" and . == false) and
-    (.prerelease | type == "boolean" and . == false) and
-    (.published_at | type == "string" and length > 0)
-  ' <<<"$release" >/dev/null ||
-    fail "published release has malformed field types"
-  id=$(jq -r '.id // empty' <<<"$release")
-  tag=$(jq -r '.tag_name // empty' <<<"$release")
-  target=$(jq -r '.target_commitish // empty' <<<"$release")
-  draft=$(jq -r 'if has("draft") then (.draft | tostring) else "missing" end' \
-    <<<"$release")
-  prerelease=$(jq -r 'if has("prerelease") then .prerelease else "missing" end' \
-    <<<"$release")
-  published=$(jq -r '.published_at // empty' <<<"$release")
-
-  [[ "$id" =~ ^[1-9][0-9]*$ ]] || fail "published release ID is not a positive integer"
-  [ "$tag" = "$AUTHORITY_TAG" ] ||
-    fail "published release tag does not match current authority"
-  [ "$target" = "$AUTHORITY_SOURCE" ] ||
-    fail "published release target does not match current authority"
-  [ "$draft" = false ] || fail "completed release still reports draft state"
-  [ "$prerelease" = false ] || fail "completed release is a prerelease"
-  [ -n "$published" ] || fail "completed release has no publication timestamp"
-  source_pair=$(read_pair "$target") ||
-    fail "published release target authority files are missing or malformed"
-  [ "$source_pair" = "$AUTHORITY_VERSION"$'\t'"$AUTHORITY_VERSION" ] ||
-    fail "published release source files do not match current authority"
-  tag_target=$(resolve_tag "$tag") || return 1
-  [ "$tag_target" = "$target" ] ||
-    fail "published release tag does not resolve to its authority source"
-  asset_data=$(normalize_assets "$release") || return 1
-  [ "${asset_data%%$'\t'*}" = complete_unverified ] ||
-    fail "published authority release lacks the complete evidence inventory"
-  printf '%s\n' "$id"
-}
-
-validate_pre_action_candidate() {
-  local release=$1 id tag target draft prerelease published source_pair tag_target asset_data
-  id=$(jq -r '.id // empty' <<<"$release")
-  tag=$(jq -r '.tag_name // empty' <<<"$release")
-  target=$(jq -r '.target_commitish // empty' <<<"$release")
-  draft=$(jq -r 'if has("draft") then (.draft | tostring) else "missing" end' \
-    <<<"$release")
-  jq -e '
-    type == "object" and
-    has("prerelease") and
-    (.prerelease | type == "boolean" and . == false)
-  ' <<<"$release" >/dev/null ||
-    fail "pre-action candidate has malformed prerelease state"
+    (.tag_name | type == "string") and (.target_commitish | type == "string") and
+    (.draft | type == "boolean") and (.prerelease | type == "boolean") and
+    (.assets | type == "array")
+  ' <<<"$release" >/dev/null || fail "release object is malformed"
+  id=$(jq -r '.id' <<<"$release")
+  tag=$(jq -r '.tag_name' <<<"$release")
+  target=$(jq -r '.target_commitish' <<<"$release")
+  draft=$(jq -r '.draft' <<<"$release")
   prerelease=$(jq -r '.prerelease' <<<"$release")
-  published=$(jq -r 'if has("published_at") and .published_at == null then "null"
-    else (.published_at // "missing") end' <<<"$release")
+  published=$(jq -r '.published_at // "null"' <<<"$release")
+  [ "$id" != 368531227 ] || fail "permanently denied release ID"
+  [ "$tag" != v1.1.0 ] || fail "permanently denied tag"
+  [ "$target" != 36ffd11ea4d35147f1df9c1cafa6a330300c1339 ] ||
+    fail "permanently denied source"
+  [ "$tag" = "$authority_tag" ] || fail "release tag is not current authority"
+  [ "$target" = "$authority_source" ] || fail "release source is not current authority"
+  [ "$draft" = true ] || [ "$published" != null ] ||
+    fail "unpublished release has invalid publication state"
+  [ "$prerelease" = false ] || fail "release is a prerelease"
+}
 
-  [[ "$id" =~ ^[1-9][0-9]*$ ]] ||
-    fail "pre-action candidate has an invalid release ID"
-  [ "$target" = "$AUTHORITY_SOURCE" ] ||
-    fail "pre-action candidate target does not match current authority"
-  [ "$draft" = true ] || fail "pre-action candidate is not a draft"
-  [ "$prerelease" = false ] ||
-    fail "pre-action candidate is a prerelease or has malformed state"
-  [ "$published" = null ] ||
-    fail "pre-action candidate is already published"
-  git -C "$REPO_DIR" cat-file -e "${target}^{commit}" 2>/dev/null ||
-    fail "pre-action candidate target is unavailable"
-  source_pair=$(read_pair "$target") ||
-    fail "pre-action candidate target authority files are unavailable"
-  [ "$source_pair" = "$AUTHORITY_VERSION"$'\t'"$AUTHORITY_VERSION" ] ||
-    fail "pre-action candidate target is not current authority"
+emit() {
+  local route=$1 release=$2 origin=$3 id tag target kind
+  id=$(jq -r '.id' <<<"$release")
+  tag=$(jq -r '.tag_name' <<<"$release")
+  target=$(jq -r '.target_commitish' <<<"$release")
+  if [ "$(jq '.assets | length' <<<"$release")" -eq 0 ]; then kind=empty; else kind=complete; fi
+  printf 'route=%s\nactive=%s\norigin=%s\nrelease_id=%s\ntag=%s\nversion=%s\nsource_sha=%s\ntarget_commitish=%s\ndraft=%s\nprerelease=%s\npublished_at=%s\nasset_inventory_kind=%s\n' \
+    "$route" "$([ "$route" = completed ] && echo false || echo true)" "$origin" \
+    "$id" "$tag" "$authority_version" "$target" \
+    "$(jq -r '.draft' <<<"$release")" "$(jq -r '.prerelease' <<<"$release")" \
+    "$(jq -c '.published_at // null' <<<"$release")" "$kind"
+}
 
-  case "$tag" in
-    "$AUTHORITY_TAG")
-      OBSERVED_STATE=canonical
-      tag_target=$(resolve_tag "$tag") || return 1
-      [ "$tag_target" = absent ] || [ "$tag_target" = "$target" ] ||
-        fail "canonical pre-action candidate tag diverges from source"
-      ;;
-    untagged-*)
-      [[ "$tag" =~ ^untagged-[0-9a-f]{20}$ ]] ||
-        fail "generated placeholder tag shape is invalid"
-      OBSERVED_STATE=generated_placeholder
-      tag_target=$(resolve_tag "$AUTHORITY_TAG") || return 1
-      [ "$tag_target" = absent ] ||
-        fail "generated placeholder candidate has a materialized canonical ref"
-      ;;
-    *)
-      fail "pre-action candidate tag is neither canonical nor generated placeholder"
-      ;;
+releases=$(load_releases)
+if [ -n "$before_file" ] || [ -n "$after_file" ]; then
+  [ -n "$before_file" ] && [ -n "$after_file" ] ||
+    fail "current-action set difference requires both visibility snapshots"
+  before_ids=$(relevant_ids "$before_file")
+  after_ids=$(relevant_ids "$after_file")
+  removed_ids=$(comm -23 \
+    <(printf '%s\n' "$before_ids" | sed '/^$/d') \
+    <(printf '%s\n' "$after_ids" | sed '/^$/d'))
+  new_ids=$(comm -13 \
+    <(printf '%s\n' "$before_ids" | sed '/^$/d') \
+    <(printf '%s\n' "$after_ids" | sed '/^$/d'))
+  [ -z "$removed_ids" ] || fail "current-action relevant release disappeared"
+  new_count=$(sed '/^$/d' <<<"$new_ids" | wc -l | tr -d ' ')
+  case "$release_created" in
+    true) [ "$new_count" -eq 1 ] || fail "release_created=true requires exactly one new release ID" ;;
+    false) [ "$new_count" -eq 0 ] || fail "release_created=false forbids a new release ID" ;;
+    *) [ "$new_count" -eq 1 ] || fail "current-action set difference is not exactly one new release ID" ;;
   esac
+fi
+mapfile -t candidates < <(jq -c --arg tag "$authority_tag" --arg source "$authority_source" '
+  .[] | select(.tag_name == $tag or .target_commitish == $source)
+' <<<"$releases")
+for candidate in "${candidates[@]}"; do validate_common "$candidate"; done
 
-  asset_data=$(normalize_assets "$release") || return 1
-  kind=${asset_data%%$'\t'*}
-  publication_route "$OBSERVED_STATE" "$kind" >/dev/null
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$id" "$tag" "$target" "$asset_data" "$OBSERVED_STATE"
-}
+before_has_published=false
+if [ -n "$before_file" ]; then
+  mapfile -t before_candidates < <(jq -c --arg tag "$authority_tag" --arg source "$authority_source" '
+    .[] | select(.tag_name == $tag or .target_commitish == $source)
+  ' "$before_file")
+  for candidate in "${before_candidates[@]}"; do
+    validate_common "$candidate"
+    if [ "$(jq -r '.published_at // "null"' <<<"$candidate")" != null ]; then
+      before_has_published=true
+    fi
+  done
+fi
 
-emit_pre_action_action() {
-  local origin=${1:-pre_action} observed_state=${2:-none} completed_id=${3:-}
-  {
-    echo "route=action"
-    echo "active=false"
-    echo "origin=$origin"
-    echo "observed_state=$observed_state"
-    [ -z "$completed_id" ] || echo "release_id=$completed_id"
-    echo "authority_version=$AUTHORITY_VERSION"
-    echo "authority_tag=$AUTHORITY_TAG"
-    echo "authority_source_sha=$AUTHORITY_SOURCE"
-  }
-}
-
-construct_active_record() {
-  local origin=$1 validated=$2 extra
-  local id observed_tag source kind fingerprint inventory state route admission
-  IFS=$'\t' read -r id observed_tag source kind fingerprint inventory state extra \
-    <<<"$validated"
-
-  [ -z "$extra" ] || fail "validated active descriptor has unexpected fields"
-  [[ "$id" =~ ^[1-9][0-9]*$ ]] ||
-    fail "validated active descriptor has an invalid release ID"
-  [[ "$source" =~ ^[0-9a-f]{40}$ ]] ||
-    fail "validated active descriptor has an invalid source SHA"
-  [ "$source" = "$AUTHORITY_SOURCE" ] ||
-    fail "validated active descriptor source does not match authority"
-  case "$state" in
-    canonical)
-      [ "$observed_tag" = "$AUTHORITY_TAG" ] ||
-        fail "canonical active descriptor tag does not match authority"
-      ;;
-    generated_placeholder)
-      [[ "$observed_tag" =~ ^untagged-[0-9a-f]{20}$ ]] ||
-        fail "active descriptor placeholder tag is invalid"
-      ;;
-    *)
-      fail "validated active descriptor has an unsupported observed state"
-      ;;
-  esac
-  case "$kind" in empty|complete_unverified) ;; *)
-    fail "validated active descriptor has an unsupported asset inventory kind"
-  esac
-  [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] ||
-    fail "validated active descriptor has an invalid asset inventory fingerprint"
-  jq -e 'type == "array"' >/dev/null <<<"$inventory" ||
-    fail "validated active descriptor has an invalid asset inventory"
-
-  route=$(publication_route "$state" "$kind")
-  admission=$(admission_fingerprint \
-    "$route" "$state" "$observed_tag" "$id" "$observed_tag" \
-    "$AUTHORITY_VERSION" "$AUTHORITY_SOURCE" "$AUTHORITY_SOURCE" \
-    true false null "$kind" "$fingerprint")
-  [[ "$admission" =~ ^[0-9a-f]{64}$ ]] ||
-    fail "active descriptor admission fingerprint construction failed"
-
-  ACTIVE_ROUTE=$route
-  ACTIVE_ORIGIN=$origin
-  ACTIVE_OBSERVED_STATE=$state
-  ACTIVE_OBSERVED_TAG=$observed_tag
-  ACTIVE_RELEASE_ID=$id
-  ACTIVE_ASSET_INVENTORY_KIND=$kind
-  ACTIVE_ASSET_INVENTORY_FINGERPRINT=$fingerprint
-  ACTIVE_ASSET_INVENTORY_JSON=$inventory
-  ACTIVE_ADMISSION_FINGERPRINT=$admission
-}
-
-serialize_active_record() {
-  {
-    echo "route=$ACTIVE_ROUTE"
-    echo "active=true"
-    echo "origin=$ACTIVE_ORIGIN"
-    echo "observed_state=$ACTIVE_OBSERVED_STATE"
-    echo "observed_tag=$ACTIVE_OBSERVED_TAG"
-    echo "release_id=$ACTIVE_RELEASE_ID"
-    echo "tag=$AUTHORITY_TAG"
-    echo "version=$AUTHORITY_VERSION"
-    echo "source_sha=$AUTHORITY_SOURCE"
-    echo "target_commitish=$AUTHORITY_SOURCE"
-    echo "draft=true"
-    echo "prerelease=false"
-    echo "published_at=null"
-    echo "authority_version=$AUTHORITY_VERSION"
-    echo "authority_tag=$AUTHORITY_TAG"
-    echo "authority_source_sha=$AUTHORITY_SOURCE"
-    echo "asset_inventory_kind=$ACTIVE_ASSET_INVENTORY_KIND"
-    echo "asset_inventory_fingerprint=$ACTIVE_ASSET_INVENTORY_FINGERPRINT"
-    echo "asset_inventory_json=$ACTIVE_ASSET_INVENTORY_JSON"
-    echo "admission_fingerprint=$ACTIVE_ADMISSION_FINGERPRINT"
-  }
-}
-
-require_expected_authority_tuple() {
-  canonical_version "$EXPECTED_VERSION" || usage
-  [ "$EXPECTED_TAG" = "v$EXPECTED_VERSION" ] || usage
-  [[ "$EXPECTED_SOURCE" =~ ^[0-9a-f]{40}$ ]] || usage
-  [ "$EXPECTED_VERSION" = "$AUTHORITY_VERSION" ] ||
-    fail "requested version does not match current authority"
-  [ "$EXPECTED_TAG" = "$AUTHORITY_TAG" ] ||
-    fail "requested tag does not match current authority"
-  [ "$EXPECTED_SOURCE" = "$AUTHORITY_SOURCE" ] ||
-    fail "requested source does not match current authority boundary"
-}
-
-require_expected_tuple() {
-  [[ "$EXPECTED_ID" =~ ^[1-9][0-9]*$ ]] || usage
-  require_expected_authority_tuple
-}
-
-is_relevant_release() {
-  local release=$1 tag target
-  jq -e 'type == "object"' <<<"$release" >/dev/null ||
-    fail "release enumeration contains a malformed release item"
-  tag=$(jq -r \
-    'if (.tag_name | type) == "string" then .tag_name else "" end' \
-    <<<"$release")
-  target=$(jq -r \
-    'if (.target_commitish | type) == "string" then .target_commitish else "" end' \
-    <<<"$release")
-  [ "$tag" = "$AUTHORITY_TAG" ] || [ "$target" = "$AUTHORITY_SOURCE" ] ||
-    {
-      [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] &&
-        [ "$(semver_compare "${tag#v}" "$AUTHORITY_VERSION")" -gt 0 ]
-    }
-}
-
-case "$MODE" in
-  created)
-    require_expected_tuple
-    RELEASE=$(load_release_by_id "$EXPECTED_ID")
-    VALIDATED=$(validate_release "$RELEASE") ||
-      fail "created release failed descriptor validation"
-    [ "${VALIDATED%%$'\t'*}" = "$EXPECTED_ID" ] ||
-      fail "created release ID drifted"
-    construct_active_record created "$VALIDATED"
-    serialize_active_record
+case "$mode" in
+  pre-action)
+    if [ "${#candidates[@]}" -eq 0 ]; then
+      printf 'route=action\nactive=false\norigin=pre_action\nrelease_id=\ntag=%s\nversion=%s\nsource_sha=%s\n' \
+        "$authority_tag" "$authority_version" "$authority_source"
+      exit 0
+    fi
+    [ "${#candidates[@]}" -eq 1 ] || fail "ambiguous current-action release set"
+    candidate=${candidates[0]}
+    if [ -n "${new_ids:-}" ]; then
+      [ "$(jq -r '.id' <<<"$candidate")" = "$(sed '/^$/d' <<<"$new_ids")" ] ||
+        fail "post-action release is not the one new current-action release ID"
+    fi
+    if [ "$(jq -r '.draft' <<<"$candidate")" = true ] &&
+       [ "$(jq -r '.published_at // "null"' <<<"$candidate")" = null ]; then
+      [ "$(resolve_ref "$authority_tag")" = absent ] || fail "pre-existing current ref"
+      emit materialize "$candidate" pre_action
+    else
+      printf 'route=action\nactive=false\norigin=pre_action_published\nrelease_id=\ntag=%s\nversion=%s\nsource_sha=%s\n' \
+        "$authority_tag" "$authority_version" "$authority_source"
+    fi
     ;;
   post-action)
-    require_expected_authority_tuple
-    RELEASES=$(load_releases)
-    ELIGIBLE=()
-    while IFS= read -r release; do
-      is_relevant_release "$release" || continue
-      validated=$(validate_release "$release") ||
-        fail "post-action relevant release failed descriptor validation"
-      ELIGIBLE+=("$validated")
-    done < <(jq -c '.[]' <<<"$RELEASES")
-    [ "${#ELIGIBLE[@]}" -eq 1 ] ||
-      fail "post-action requires exactly one current-authority draft"
-    IFS=$'\t' read -r actual_id actual_tag actual_source _ <<<"${ELIGIBLE[0]}"
-    [[ "$actual_id" =~ ^[1-9][0-9]*$ ]] ||
-      fail "post-action returned a non-positive release ID"
-    [ "$actual_tag" = "$EXPECTED_TAG" ] ||
-      fail "post-action tag does not match the action output"
-    [ "$actual_source" = "$EXPECTED_SOURCE" ] ||
-      fail "post-action source SHA does not match the action output"
-    construct_active_record post_action "${ELIGIBLE[0]}"
-    serialize_active_record
-    ;;
-  recover)
-    RELEASES=$(load_releases)
-    ELIGIBLE=()
-    COMPLETED=()
-    while IFS= read -r release; do
-      is_relevant_release "$release" || continue
-      if jq -e '.draft == false and .published_at != null' \
-          >/dev/null <<<"$release"; then
-        completed=$(validate_completed_release "$release") ||
-          fail "relevant published release conflicts with current authority"
-        COMPLETED+=("$completed")
-        continue
+    [ "$expected_tag" = "$authority_tag" ] || fail "action returned wrong tag"
+    [ "$expected_version" = "$authority_version" ] || fail "action returned wrong version"
+    [ "$expected_source" = "$authority_source" ] || fail "action returned wrong source"
+    if [ "$release_created" = false ]; then
+      [ "${#candidates[@]}" -eq 0 ] || [ "${#candidates[@]}" -eq 1 ] ||
+        fail "release_created=false produced ambiguous current release set"
+      if [ "${#candidates[@]}" -eq 1 ] &&
+         [ "$(jq -r '.published_at // "null"' <<<"${candidates[0]}")" = null ]; then
+        fail "release_created=false cannot adopt an unpublished current draft"
       fi
-      validated=$(validate_pre_action_candidate "$release") ||
-        fail "relevant release failed descriptor validation"
-      ELIGIBLE+=("$validated")
-    done < <(jq -c '.[]' <<<"$RELEASES")
-
-    if [ "$(( ${#ELIGIBLE[@]} + ${#COMPLETED[@]} ))" -eq 0 ]; then
-      {
-        echo "route=none"
-        echo "active=false"
-        echo "origin=none"
-        echo "authority_version=$AUTHORITY_VERSION"
-        echo "authority_tag=$AUTHORITY_TAG"
-        echo "authority_source_sha=$AUTHORITY_SOURCE"
-      }
-    elif [ "${#ELIGIBLE[@]}" -eq 1 ] && [ "${#COMPLETED[@]}" -eq 0 ]; then
-      construct_active_record recovered "${ELIGIBLE[0]}"
-      serialize_active_record
-    elif [ "${#ELIGIBLE[@]}" -eq 0 ] && [ "${#COMPLETED[@]}" -eq 1 ]; then
-      {
-        echo "route=none"
-        echo "active=false"
-        echo "origin=completed"
-        echo "authority_version=$AUTHORITY_VERSION"
-        echo "authority_tag=$AUTHORITY_TAG"
-        echo "authority_source_sha=$AUTHORITY_SOURCE"
-      }
-    else
-      fail "multiple current-authority release objects are relevant"
     fi
-    ;;
-  pre-action)
-    prove_action_authority
-    RELEASES=$(load_releases)
-    ELIGIBLE=()
-    COMPLETED=()
-    while IFS= read -r release; do
-      tag=$(jq -r '.tag_name // empty' <<<"$release")
-      target=$(jq -r '.target_commitish // empty' <<<"$release")
-      relevant=false
-      if [ "$tag" = "$AUTHORITY_TAG" ] ||
-         [ "$target" = "$AUTHORITY_SOURCE" ] ||
-         [[ "$tag" =~ ^untagged- ]]; then
-        relevant=true
-      elif [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] &&
-           [ "$(semver_compare "${tag#v}" "$AUTHORITY_VERSION")" -gt 0 ]; then
-        relevant=true
+    [ "${#candidates[@]}" -eq 1 ] || {
+      if [ "$allow_completed" = true ] &&
+         { [ "$before_has_published" = true ] ||
+           { [ -z "$before_file" ] && [ "${#candidates[@]}" -eq 0 ]; }; }; then
+        printf 'route=completed\nactive=false\norigin=completed\nrelease_id=\ntag=%s\nversion=%s\nsource_sha=%s\n' \
+          "$authority_tag" "$authority_version" "$authority_source"
+        exit 0
       fi
-      [ "$relevant" = true ] || continue
-      if jq -e '
-        type == "object" and
-        (.draft | type == "boolean" and . == false) and
-        (.published_at | type == "string" and length > 0)
-      ' >/dev/null <<<"$release"; then
-        completed=$(validate_completed_release "$release") ||
-          fail "relevant published release conflicts with current authority"
-        COMPLETED+=("$completed")
-        continue
+      if [ "$release_created" = false ] && [ "${#candidates[@]}" -eq 0 ]; then
+        printf 'route=action\nactive=false\norigin=post_action_noop\nrelease_id=\ntag=%s\nversion=%s\nsource_sha=%s\n' \
+          "$authority_tag" "$authority_version" "$authority_source"
+        exit 0
       fi
-      validated=$(validate_pre_action_candidate "$release") ||
-        fail "current-authority pre-action candidate is invalid"
-      ELIGIBLE+=("$validated")
-    done < <(jq -c '.[]' <<<"$RELEASES")
-
-    if [ "${#ELIGIBLE[@]}" -eq 0 ] &&
-       [ "${#COMPLETED[@]}" -eq 1 ]; then
-      if [ "$REQUIRE_ACTION_AUTHORITY" = true ]; then
-        emit_pre_action_action completed completed "${COMPLETED[0]}"
-      else
-        fail "published predecessor requires action authority"
-      fi
-    elif [ "${#ELIGIBLE[@]}" -eq 0 ] &&
-         [ "${#COMPLETED[@]}" -eq 0 ]; then
-      canonical_target=$(resolve_tag "$AUTHORITY_TAG") || return 1
-      [ "$canonical_target" = absent ] ||
-        fail "current canonical tag exists without a release candidate"
-      if [ "$REQUIRE_ACTION_AUTHORITY" = true ]; then
-        emit_pre_action_action
-      else
-        fail "no visible recovery candidate; action admission is disabled"
-      fi
-    elif [ "${#ELIGIBLE[@]}" -eq 1 ] &&
-         [ "${#COMPLETED[@]}" -eq 0 ]; then
-      construct_active_record pre_action "${ELIGIBLE[0]}"
-      serialize_active_record
+      fail "post-action did not produce exactly one current release"
+    }
+    candidate=${candidates[0]}
+    if [ "$release_created" = false ]; then
+      [ "$(jq -r '.published_at // "null"' <<<"$candidate")" != null ] ||
+        fail "release_created=false left an unpublished current release"
+      [ "$allow_completed" = true ] || fail "published result requires completed admission"
+      emit completed "$candidate" post_action
+    elif [ "$(jq -r '.published_at // "null"' <<<"$candidate")" != null ]; then
+      [ "$allow_completed" = true ] || fail "published result requires completed admission"
+      emit completed "$candidate" post_action
     else
-      fail "multiple current-authority pre-action states are ambiguous"
+      emit materialize "$candidate" post_action
     fi
     ;;
   verify)
-    require_expected_tuple
-    [[ "$EXPECTED_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || usage
-    if [ -n "$EXPECTED_ROUTE" ]; then
-      case "$EXPECTED_ROUTE" in materialize|deep-recover) ;; *) usage ;; esac
-    fi
-    if [ -n "$EXPECTED_ADMISSION_FINGERPRINT" ]; then
-      [[ "$EXPECTED_ADMISSION_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || usage
-    fi
-    RELEASE=$(load_release_by_id "$EXPECTED_ID")
-    VALIDATED=$(validate_release "$RELEASE") ||
-      fail "release failed descriptor revalidation"
-    IFS=$'\t' read -r actual_id _ _ _ actual_fingerprint _ <<<"$VALIDATED"
-    [ "$actual_id" = "$EXPECTED_ID" ] || fail "release ID drifted"
-    [ "$actual_fingerprint" = "$EXPECTED_FINGERPRINT" ] ||
-      fail "release asset descriptor drifted"
-    construct_active_record verified "$VALIDATED"
-    if [ -n "$EXPECTED_ROUTE" ] &&
-       [ "$ACTIVE_ROUTE" != "$EXPECTED_ROUTE" ]; then
-      fail "release publication route drifted"
-    fi
-    if [ -n "$EXPECTED_ADMISSION_FINGERPRINT" ] &&
-       [ "$ACTIVE_ADMISSION_FINGERPRINT" != \
-         "$EXPECTED_ADMISSION_FINGERPRINT" ]; then
-      fail "release admission fingerprint drifted"
-    fi
-    serialize_active_record
+    [ "$phase" = empty ] || [ "$phase" = complete ] || usage
+    [[ "$expected_id" =~ ^[1-9][0-9]*$ ]] || fail "numeric release ID is required"
+    [ "$expected_tag" = "$authority_tag" ] || fail "wrong explicit tag"
+    [ "$expected_version" = "$authority_version" ] || fail "wrong version"
+    [ "$expected_source" = "$authority_source" ] || fail "wrong source"
+    candidate=$(jq -c --argjson id "$expected_id" '.[] | select(.id == $id)' <<<"$releases")
+    [ -n "$candidate" ] || fail "numeric release was not found"
+    validate_common "$candidate"
+    [ "$phase" = empty ] && [ "$(jq '.assets | length' <<<"$candidate")" -eq 0 ] ||
+      [ "$phase" = complete ] && [ "$(jq '.assets | length' <<<"$candidate")" -eq 4 ] ||
+      fail "asset phase does not match"
+    emit materialize "$candidate" verified
     ;;
 esac
