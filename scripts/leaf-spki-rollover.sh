@@ -10,6 +10,18 @@ usage() {
   exit 64
 }
 
+validate_secure_install_root() {
+  local path=$1 mode
+  while [[ "$path" != / ]]; do
+    [[ -d "$path" && ! -L "$path" ]] || return 65
+    [[ "$(stat -c '%u:%g' "$path")" = 0:0 ]] || return 65
+    mode=$(stat -c '%a' "$path") || return 65
+    [[ $((8#$mode & 8#022)) -eq 0 ]] || return 65
+    path=${path%/*}
+    [[ -n "$path" ]] || path=/
+  done
+}
+
 [[ "$#" -ge 1 ]] || usage
 command=$1
 shift
@@ -29,6 +41,8 @@ if [[ "${LEAF_SPKI_FIXTURE_ROOT:-}" = "" ]]; then
   [[ "$script_dir/leaf-spki-rollover.sh" = \
     /usr/local/libexec/meet-leaf-spki-rollover/leaf-spki-rollover.sh ]] ||
     { echo "live entry point is not installed at the fixed path" >&2; exit 65; }
+  validate_secure_install_root "$script_dir" ||
+    { echo "live entry point is outside the trusted root" >&2; exit 65; }
   [[ "$(stat -c '%u:%g:%a:%h' "$script_dir/leaf-spki-rollover.sh")" = 0:0:755:1 ]] ||
     { echo "live entry point metadata is unsafe" >&2; exit 65; }
 fi

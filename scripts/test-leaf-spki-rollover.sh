@@ -89,7 +89,6 @@ make_fixture() {
     printf 'api.whysoezzy.online_pairing=VALID\n'
     printf 'api.whysoezzy.online_san=VALID\n'
     printf 'api.whysoezzy.online_hooks=NONE\n'
-    printf 'api.whysoezzy.online-rollover_configuration=VALID\n'
     printf 'api.whysoezzy.online-rollover_permissions=VALID\n'
     printf 'api.whysoezzy.online-rollover_pairing=VALID\n'
     printf 'api.whysoezzy.online-rollover_san=VALID\n'
@@ -97,6 +96,19 @@ make_fixture() {
     printf 'webroot=/var/www/certbot\n'
     printf 'production_account=production_account\n'
     printf 'staging_account=staging_account\n'
+    printf 'api_status=200\napi_shape=VALID\n'
+    printf 'actuator_status=403\nadmin_status=403\n'
+    printf 'backend_source=%s\nbackend_image_digest=%s\nbackend_version=1.0.1\n' \
+      "$TOOL_REVISION" \
+      'sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6'
+    printf 'backend_user=10001:10001\nbackend_listener=127.0.0.1:8080\n'
+    printf 'backend_health=healthy\ncompose_project=meet-production\ncompose_service=backend\n'
+    printf 'postgres_image_digest=%s\npostgres_published=NO\n' \
+      'sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2'
+    printf 'backend_volume=meet-production_uploads_data\n'
+    printf 'postgres_volume=meet-production_postgres_data\n'
+    printf 'flyway_migration_digest=%s\n' \
+      '8bdd5aa46f7efe03882e787b36eb701423d35c24eb2681759375b7f360b3277c'
   } >"$fixture/observations/leaf-spki.kv"
   printf 'hostname=%s\nchain=VERIFIED\nspki=%s\n' \
     "$HOSTNAME" "$PRIMARY_SPKI" >"$fixture/observations/external-primary.kv"
@@ -529,8 +541,10 @@ fixture=$TMP/evidence-persist-crash
 make_fixture "$fixture"
 expect_status 73 evidence-persist-crash env \
   LEAF_SPKI_FIXTURE_ROOT="$fixture" LEAF_SPKI_FAIL_EVIDENCE=1 "$TOOL" inspect
-! grep -Fx evidence-persist "$fixture/effects.log" >/dev/null ||
+if [[ -e "$fixture/effects.log" ]] &&
+  grep -Fx evidence-persist "$fixture/effects.log" >/dev/null; then
   fail "failed evidence persistence claimed success"
+fi
 
 for knob in LEAF_SPKI_FAIL_SYNC LEAF_SPKI_FAIL_REOPEN; do
   fixture=$TMP/${knob#LEAF_SPKI_FAIL_}-completed

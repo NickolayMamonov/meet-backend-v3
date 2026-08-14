@@ -40,6 +40,61 @@ tooling file blocks the operation. The sanitized gate record contains only
 `B`, `H`, `T`, `M`, `C`, check IDs/conclusions, allowlisted file SHA-256 values,
 and owner/mode status.
 
+The following is the minimum executable operator gate. It is run outside the
+installed tool and immediately before every live invocation; it is not a
+runtime manifest and is not replaced by a branch or tag check. `B`, `H`, `M`,
+and `C` must be supplied from the hosted merge record for the current retry.
+The hosted check conclusions are recorded separately from this shell check and
+must identify the same `M`.
+
+```bash
+set -euo pipefail
+repo=/srv/meet-backend-v3
+installed=/usr/local/libexec/meet-leaf-spki-rollover
+: "${B:?target dev base commit}"
+: "${H:?approved head commit}"
+: "${M:?hosted synthetic merge commit}"
+: "${C:?actual merge commit}"
+: "${HOSTED_CHECK_RECORD:?sanitized hosted check record for M}"
+
+cd "$repo"
+test -z "$(git status --porcelain)"
+test "$(git rev-parse --verify "$B^{commit}")" = "$B"
+test "$(git rev-parse --verify "$H^{commit}")" = "$H"
+test "$(git rev-parse --verify "$M^{commit}")" = "$M"
+test "$(git rev-parse --verify "$C^{commit}")" = "$C"
+T=$(git merge-tree --write-tree "$B" "$H")
+test "$(git rev-parse "$M^1")" = "$B"
+test "$(git rev-parse "$M^2")" = "$H"
+test "$(git rev-parse "$M^{tree}")" = "$T"
+test "$(git rev-parse "$C^1")" = "$B"
+test "$(git rev-parse "$C^2")" = "$H"
+test "$(git rev-parse "$C^{tree}")" = "$T"
+test -s "$HOSTED_CHECK_RECORD"
+grep -F "merge=$M" "$HOSTED_CHECK_RECORD" >/dev/null
+grep -F "conclusion=success" "$HOSTED_CHECK_RECORD" >/dev/null
+
+tmp=$(mktemp -d)
+trap 'rm -r -- "$tmp"' EXIT
+git show "$C:scripts/leaf-spki-rollover.sh" >"$tmp/leaf-spki-rollover.sh"
+git show "$C:scripts/lib/leaf-spki-rollover.sh" >"$tmp/lib-leaf-spki-rollover.sh"
+test "$(sha256sum "$tmp/leaf-spki-rollover.sh" | awk '{print tolower($1)}')" =
+  "$(sha256sum "$installed/leaf-spki-rollover.sh" | awk '{print tolower($1)}')"
+test "$(sha256sum "$tmp/lib-leaf-spki-rollover.sh" | awk '{print tolower($1)}')" =
+  "$(sha256sum "$installed/lib/leaf-spki-rollover.sh" | awk '{print tolower($1)}')"
+test "$(stat -c '%u:%g:%a:%h' "$installed/leaf-spki-rollover.sh")" = 0:0:755:1
+test "$(stat -c '%u:%g:%a:%h' "$installed/lib/leaf-spki-rollover.sh")" = 0:0:644:1
+for directory in /usr/local /usr/local/libexec "$installed" "$installed/lib"; do
+  test -d "$directory" && test ! -L "$directory"
+  test "$(stat -c '%u:%g' "$directory")" = 0:0
+  test $((8#$(stat -c '%a' "$directory") & 8#022)) -eq 0
+done
+```
+
+The operator signs the sanitized output with the run identifier and stores
+only the commit IDs, `T`, check IDs/conclusions, two installed-file hashes,
+and metadata results. A failure stops the phase before the CLI is started.
+
 ## Closed CLI and operator sequence
 
 The interface has exactly eight commands:
@@ -155,6 +210,40 @@ raw certificate/private-key material, and authorization, cookie, JWT, OTP,
 password, credential, or provider-token patterns. State/evidence directories
 must already be the expected root-owned restricted directories; unsafe
 pre-existing paths fail closed.
+
+The exact runtime observation contract is:
+
+```text
+api_status=200
+api_shape=VALID
+actuator_status=401|403|404
+admin_status=401|403|404
+backend_source=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
+backend_image_digest=sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
+backend_version=1.0.1
+backend_user=10001:10001
+backend_listener=127.0.0.1:8080
+backend_health=healthy
+compose_project=meet-production
+compose_service=backend
+postgres_image_digest=sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2
+postgres_published=NO
+backend_volume=meet-production_uploads_data
+postgres_volume=meet-production_postgres_data
+flyway_migration_digest=8bdd5aa46f7efe03882e787b36eb701423d35c24eb2681759375b7f360b3277c
+```
+
+Live values are obtained from public HTTPS probes and `docker inspect`,
+Compose labels/configuration, container health and published-port metadata,
+named-volume mounts, and the immutable application artifact/migration
+inventory. The observer must not inspect or emit container environments,
+command-line secrets, or application credentials. `api_shape=VALID` means the
+public canary response has the reviewed JSON shape; `actuator_status` and
+`admin_status` must be independently denied. The PostgreSQL publication value
+must be `NO`, and the backend listener must be exactly loopback-only
+`127.0.0.1:8080`. Fixture mode must provide every key above and applies the
+same value validation; missing, duplicate, malformed, or unexpected
+observations block the phase.
 
 ## Recovery, drill, and exit statuses
 

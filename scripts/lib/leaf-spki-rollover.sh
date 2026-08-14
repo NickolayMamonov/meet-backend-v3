@@ -18,6 +18,9 @@ readonly LEAF_SPKI_PRIMARY_LINEAGE=api.whysoezzy.online
 readonly LEAF_SPKI_ROLLOVER_LINEAGE=api.whysoezzy.online-rollover
 readonly LEAF_SPKI_BACKEND_SOURCE=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
 readonly LEAF_SPKI_BACKEND_IMAGE_DIGEST=sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
+readonly LEAF_SPKI_BACKEND_VERSION=1.0.1
+readonly LEAF_SPKI_POSTGRES_IMAGE_DIGEST=sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2
+readonly LEAF_SPKI_FLYWAY_MIGRATION_DIGEST=8bdd5aa46f7efe03882e787b36eb701423d35c24eb2681759375b7f360b3277c
 readonly LEAF_SPKI_PRIMARY_CERT=/etc/letsencrypt/live/api.whysoezzy.online/fullchain.pem
 readonly LEAF_SPKI_PRIMARY_KEY=/etc/letsencrypt/live/api.whysoezzy.online/privkey.pem
 readonly LEAF_SPKI_ROLLOVER_CERT=/etc/letsencrypt/live/api.whysoezzy.online-rollover/fullchain.pem
@@ -73,43 +76,81 @@ effect_detail() {
   printf '\t%s' "$@" >>"$EFFECT_LOG" || return 73
   printf '\n' >>"$EFFECT_LOG" || return 73
 }
-sha256_file() { sha256sum -- "$1" | awk '{print $1}'; }
+declare -A LEAF_SPKI_DIGEST_CACHE=()
+sha256_file() {
+  local path=$1 digest
+  if [[ -v "LEAF_SPKI_DIGEST_CACHE[$path]" ]]; then
+    printf '%s\n' "${LEAF_SPKI_DIGEST_CACHE[$path]}"
+    return 0
+  fi
+  digest=$(sha256sum -- "$path" | awk '{print $1}') || return 1
+  LEAF_SPKI_DIGEST_CACHE[$path]=$digest
+  printf '%s\n' "$digest"
+}
+clear_digest_cache() { LEAF_SPKI_DIGEST_CACHE=(); }
+declare -A LEAF_SPKI_METADATA_CACHE=()
 is_regular_safe() {
-  local path=$1
+  local path=$1 mode links owner
   [[ -f "$path" && ! -L "$path" ]] || return 1
-  [[ "$(stat -c '%a' "$path")" = 600 ]] || return 1
-  [[ "$(stat -c '%h' "$path")" = 1 ]] || return 1
-  [[ -n "$LEAF_SPKI_FIXTURE" ||
-    "$(stat -c '%u:%g' "$path")" = 0:0 ]] || return 1
+  [[ "${LEAF_SPKI_METADATA_CACHE[regular:$path]:-}" = 1 ]] && return 0
+  IFS=' ' read -r mode links owner < <(stat -c '%a %h %u:%g' "$path") || return 1
+  [[ "$mode" = 600 && "$links" = 1 ]] || return 1
+  [[ -n "$LEAF_SPKI_FIXTURE" || "$owner" = 0:0 ]] || return 1
+  LEAF_SPKI_METADATA_CACHE[regular:$path]=1
 }
 is_directory_safe() {
-  local path=$1
+  local path=$1 mode owner
   [[ -d "$path" && ! -L "$path" ]] || return 1
-  [[ "$(stat -c '%a' "$path")" = 700 ]] || return 1
-  [[ -n "$LEAF_SPKI_FIXTURE" ||
-    "$(stat -c '%u:%g' "$path")" = 0:0 ]] || return 1
+  [[ "${LEAF_SPKI_METADATA_CACHE[directory:$path]:-}" = 1 ]] && return 0
+  IFS=' ' read -r mode owner < <(stat -c '%a %u:%g' "$path") || return 1
+  [[ "$mode" = 700 ]] || return 1
+  [[ -n "$LEAF_SPKI_FIXTURE" || "$owner" = 0:0 ]] || return 1
+  LEAF_SPKI_METADATA_CACHE[directory:$path]=1
 }
+declare -A LEAF_SPKI_VALUE_CACHE=()
+declare -A LEAF_SPKI_PACKAGE_VALID_CACHE=()
 manifest_value() {
-  local key=$1 file=$2
-  awk -F= -v wanted="$key" '
-    $1 == wanted { if (++count > 1) exit 2; print substr($0, length($1) + 2) }
-    END { if (count != 1) exit 3 }
-  ' "$file"
+  local key=$1 file=$2 cache_key line found='' count=0
+  cache_key=$file$'\x1f'$key
+  if [[ -v "LEAF_SPKI_VALUE_CACHE[$cache_key]" ]]; then
+    printf '%s\n' "${LEAF_SPKI_VALUE_CACHE[$cache_key]}"
+    return 0
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" != *$'\r' ]] || return 65
+    [[ "${line%%=*}" = "$key" ]] || continue
+    count=$((count + 1))
+    found=${line#*=}
+  done <"$file"
+  [[ "$count" = 1 ]] || return 3
+  LEAF_SPKI_VALUE_CACHE[$cache_key]=$found
+  printf '%s\n' "$found"
 }
 valid_digest() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
 declare -A LEAF_SPKI_VALID_CACHE=()
+declare -A LEAF_SPKI_FIXTURE_CACHE=()
+LEAF_SPKI_FIXTURE_CACHE_LOADED=0
+load_fixture_observations() {
+  local file="$ROOT_DIR/observations/leaf-spki.kv" line key value
+  [[ "$LEAF_SPKI_FIXTURE_CACHE_LOADED" = 1 ]] && return 0
+  [[ -f "$file" && ! -L "$file" ]] || return 69
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[a-zA-Z0-9._-]+=[^[:cntrl:]]*$ ]] || return 69
+    key=${line%%=*}
+    value=${line#*=}
+    [[ ! -v "LEAF_SPKI_FIXTURE_CACHE[$key]" ]] || return 69
+    LEAF_SPKI_FIXTURE_CACHE[$key]=$value
+  done <"$file"
+  LEAF_SPKI_FIXTURE_CACHE_LOADED=1
+}
 valid_spki() {
-  local value=$1 decoded recoded
+  local value=$1 recoded
   [[ "$value" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
   [[ "${LEAF_SPKI_VALID_CACHE[$value]:-}" = 1 ]] && return 0
-  decoded=$(mktemp) || return 1
-  if ! printf '%s' "$value" | base64 --decode >"$decoded" 2>/dev/null ||
-    [[ "$(wc -c <"$decoded")" -ne 32 ]]; then
-    rm -f -- "$decoded"
+  [[ "$(printf '%s' "$value" | base64 --decode 2>/dev/null | wc -c)" -eq 32 ]] ||
     return 1
-  fi
-  recoded=$(base64 -w 0 "$decoded")
-  rm -f -- "$decoded"
+  recoded=$(printf '%s' "$value" | base64 --decode 2>/dev/null | base64 -w 0) ||
+    return 1
   [[ "$recoded" = "$value" ]] || return 1
   LEAF_SPKI_VALID_CACHE[$value]=1
 }
@@ -144,7 +185,11 @@ atomic_state_file() {
   is_regular_safe "$tmp" || return 65
   chmod 600 "$tmp" || return 73
   mv -f -- "$tmp" "$destination" || return 73
-  [[ -n "$LEAF_SPKI_FIXTURE" ]] || sync -f "$destination" || return 73
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    return 0
+  fi
+  sync -f "$destination" || return 73
+  sync -f "$STATE_DIR" || return 73
 }
 new_state_temp() {
   local stem=$1 tmp
@@ -155,19 +200,18 @@ new_state_temp() {
   printf '%s\n' "$tmp"
 }
 fixture_observation() {
-  local key=$1 file=$ROOT_DIR/observations/leaf-spki.kv
+  local key=$1
   [[ -n "$LEAF_SPKI_FIXTURE" ]] || return 70
-  [[ -f "$file" && ! -L "$file" ]] || return 69
-  manifest_value "$key" "$file" || return 69
+  load_fixture_observations || return $?
+  [[ -v "LEAF_SPKI_FIXTURE_CACHE[$key]" ]] || return 69
+  printf '%s\n' "${LEAF_SPKI_FIXTURE_CACHE[$key]}"
 }
 optional_fixture_observation() {
-  local key=$1 file=$ROOT_DIR/observations/leaf-spki.kv
+  local key=$1
   [[ -n "$LEAF_SPKI_FIXTURE" ]] || return 70
-  [[ -f "$file" && ! -L "$file" ]] || return 69
-  awk -F= -v wanted="$key" '
-    $1 == wanted { if (++count > 1) exit 2; print substr($0, length($1) + 2) }
-    END { if (count > 1) exit 3 }
-  ' "$file"
+  load_fixture_observations || return $?
+  [[ -v "LEAF_SPKI_FIXTURE_CACHE[$key]" ]] &&
+    printf '%s\n' "${LEAF_SPKI_FIXTURE_CACHE[$key]}"
 }
 validate_certbot_contract() {
   local version file line key primary_hooks rollover_hooks hook_dirs
@@ -195,11 +239,63 @@ validate_certbot_contract() {
       esac
     done <"$file"
   done
-  for file in /etc/letsencrypt/renewal-hooks/pre/* \
-    /etc/letsencrypt/renewal-hooks/deploy/* \
-    /etc/letsencrypt/renewal-hooks/post/*; do
-    [[ ! -e "$file" && ! -L "$file" ]] || return 65
+  for file in /etc/letsencrypt/renewal-hooks/pre \
+    /etc/letsencrypt/renewal-hooks/deploy \
+    /etc/letsencrypt/renewal-hooks/post; do
+    [[ -d "$file" && ! -L "$file" ]] || return 65
+    [[ "$(stat -c '%u:%g' "$file")" = 0:0 ]] || return 65
+    [[ $((8#$(stat -c '%a' "$file") & 8#022)) -eq 0 ]] || return 65
+    [[ -z "$(find "$file" -mindepth 1 -maxdepth 1 -print -quit)" ]] || return 65
   done
+}
+validate_live_lineage_layout() {
+  local lineage=$1 live archive renewal name path resolved cert key cert_spki key_spki
+  local mode owner
+  live=/etc/letsencrypt/live/$lineage
+  archive=/etc/letsencrypt/archive/$lineage
+  renewal=/etc/letsencrypt/renewal/$lineage.conf
+  [[ -d "$live" && ! -L "$live" && -d "$archive" && ! -L "$archive" ]] || return 65
+  [[ -f "$renewal" && ! -L "$renewal" ]] || return 65
+  [[ "$(stat -c '%u:%g:%a:%h' "$live")" = 0:0:755:1 &&
+    "$(stat -c '%u:%g:%a:%h' "$archive")" = 0:0:755:1 &&
+    "$(stat -c '%u:%g:%a:%h' "$renewal")" = 0:0:644:1 ]] || return 65
+  command -v realpath >/dev/null 2>&1 || return 69
+  for name in cert fullchain privkey; do
+    path=$live/$name.pem
+    [[ -L "$path" ]] || return 65
+    [[ "$(stat -c '%u:%g:%a:%h' "$path")" = 0:0:777:1 ]] || return 65
+    resolved=$(realpath -e "$path") || return 65
+    case "$name:$resolved" in
+      cert:"$archive"/cert[0-9]*.pem|fullchain:"$archive"/fullchain[0-9]*.pem|\
+      privkey:"$archive"/privkey[0-9]*.pem) ;;
+      *) return 65 ;;
+    esac
+    mode=$(stat -c '%a' "$resolved") || return 65
+    owner=$(stat -c '%u:%g' "$resolved") || return 65
+    [[ "$owner" = 0:0 ]] || return 65
+    if [[ "$name" = privkey ]]; then
+      [[ "$mode" = 600 ]] || return 65
+    else
+      [[ "$mode" = 644 ]] || return 65
+    fi
+  done
+  cert=$(realpath -e "$live/cert.pem") || return 65
+  key=$(realpath -e "$live/privkey.pem") || return 65
+  openssl x509 -in "$cert" -noout -checkhost "$LEAF_SPKI_HOSTNAME" >/dev/null 2>&1 ||
+    return 65
+  openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null |
+    grep -Eq "DNS:${LEAF_SPKI_HOSTNAME}([,[:space:]]|$)" || return 65
+  openssl x509 -in "$cert" -text -noout 2>/dev/null |
+    grep -Fq 'Public Key Algorithm: id-ecPublicKey' || return 65
+  openssl x509 -in "$cert" -text -noout 2>/dev/null |
+    grep -Fq 'ASN1 OID: prime256v1' || return 65
+  cert_spki=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null |
+    openssl pkey -pubin -outform DER 2>/dev/null |
+    openssl dgst -sha256 -binary 2>/dev/null | base64 | tr -d '\r\n') || return 65
+  key_spki=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null |
+    openssl dgst -sha256 -binary 2>/dev/null | base64 | tr -d '\r\n') || return 65
+  [[ "$cert_spki" = "$key_spki" ]] || return 65
+  valid_spki "$cert_spki" || return 65
 }
 validate_lineage_observation() {
   local lineage=$1 configuration permissions pairing san hooks
@@ -219,7 +315,8 @@ validate_lineage_observation() {
   [[ "$(grep -Ec '^key_type = ecdsa$' "$file")" = 1 ]] || return 65
   [[ "$(grep -Ec '^elliptic_curve = secp256r1$' "$file")" = 1 ]] || return 65
   ! grep -Eq '^(pre_hook|post_hook|renew_hook|deploy_hook) = ' "$file" || return 65
-  [[ "$(stat -c '%a' "$file")" = 600 ]] || return 65
+  [[ "$(stat -c '%a' "$file")" = 644 ]] || return 65
+  validate_live_lineage_layout "$lineage" || return $?
 }
 certbot_account() {
   local environment=$1 root value
@@ -300,6 +397,24 @@ prove_rollover_dormant() {
   [[ -f "$source" && ! -L "$source" ]] || return 69
   ! grep -Fq "$LEAF_SPKI_ROLLOVER_LINEAGE" "$source" || return 65
 }
+validate_primary_nginx_source() {
+  local source=$NGINX_SOURCE cert_count key_count server_count
+  [[ -f "$source" && ! -L "$source" ]] || return 69
+  server_count=$(awk -v host="$LEAF_SPKI_HOSTNAME" '
+    $1 == "server_name" && $2 == host ";" && NF == 2 { count++ }
+    END { print count + 0 }
+  ' "$source")
+  cert_count=$(awk -v cert="$LEAF_SPKI_PRIMARY_CERT" '
+    $1 == "ssl_certificate" && $2 == cert ";" && NF == 2 { count++ }
+    END { print count + 0 }
+  ' "$source")
+  key_count=$(awk -v key="$LEAF_SPKI_PRIMARY_KEY" '
+    $1 == "ssl_certificate_key" && $2 == key ";" && NF == 2 { count++ }
+    END { print count + 0 }
+  ' "$source")
+  [[ "$server_count" = 1 && "$cert_count" = 1 && "$key_count" = 1 ]] || return 65
+  ! grep -Fq "$LEAF_SPKI_ROLLOVER_LINEAGE" "$source" || return 65
+}
 validate_rollover_configuration() {
   local file=/etc/letsencrypt/renewal/$LEAF_SPKI_ROLLOVER_LINEAGE.conf
   if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
@@ -313,6 +428,21 @@ validate_rollover_configuration() {
   grep -Eq '^reuse_key = True$' "$file" || return 65
   [[ "$(awk -F' = ' '/^webroot_path = / { print $2 }' "$file")" = "$(certbot_webroot)" ]] ||
     return 65
+  ! grep -Eq '^(pre_hook|post_hook|renew_hook|deploy_hook) = ' "$file" || return 65
+  validate_live_lineage_layout "$lineage" || return $?
+}
+validate_primary_reuse_configuration() {
+  local file=/etc/letsencrypt/renewal/$LEAF_SPKI_PRIMARY_LINEAGE.conf
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    [[ "$(fixture_observation "${LEAF_SPKI_PRIMARY_LINEAGE}_configuration")" = VALID ]] ||
+      return 65
+    return 0
+  fi
+  [[ -f "$file" && ! -L "$file" ]] || return 69
+  grep -Eq '^reuse_key = True$' "$file" || return 65
+  grep -Eq '^authenticator = webroot$' "$file" || return 65
+  grep -Eq '^key_type = ecdsa$' "$file" || return 65
+  grep -Eq '^elliptic_curve = secp256r1$' "$file" || return 65
   ! grep -Eq '^(pre_hook|post_hook|renew_hook|deploy_hook) = ' "$file" || return 65
 }
 require_empty_recovery() {
@@ -344,6 +474,32 @@ run_certbot() {
     return 76
   }
   [[ "${LEAF_SPKI_CERTBOT_POST_STATE:-unchanged}" = unchanged ]] || return 76
+}
+certbot_post_presence() {
+  local lineage=$1
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    if [[ "$lineage" = "$LEAF_SPKI_ROLLOVER_LINEAGE" ]]; then
+      fixture_observation rollover_present_after_certbot
+    else
+      printf 'YES\n'
+    fi
+    return
+  fi
+  rollover_presence
+}
+reconcile_lineage_after_certbot() {
+  local lineage=$1 before_presence=$2 before_spki=$3 after_presence after_spki
+  after_presence=$(certbot_post_presence "$lineage") || return 76
+  after_spki=$(lineage_spki "$lineage") || return 76
+  if [[ "$lineage" = "$LEAF_SPKI_PRIMARY_LINEAGE" ]]; then
+    [[ "$before_presence" = YES && "$after_presence" = YES ]] || return 76
+    validate_primary_reuse_configuration || return 76
+  else
+    [[ "$after_presence" = YES ]] || return 76
+    validate_lineage_observation "$lineage" || return 76
+    validate_rollover_configuration || return 76
+  fi
+  [[ "$after_spki" = "$before_spki" || "$before_presence" = NO ]] || return 76
 }
 record_evidence() {
   local mode=$1 outcome=$2 primary=$3 drift=$4 tmp
@@ -402,7 +558,7 @@ validate_package() {
   rollback=$dir/nginx-source.rollback
   is_regular_safe "$manifest" || return 65
   is_regular_safe "$rollback" || return 65
-  shopt -s nullglob
+  shopt -s nullglob dotglob
   for entry in "$dir"/*; do
     entry_count=$((entry_count + 1))
     case "${entry##*/}" in
@@ -411,8 +567,16 @@ validate_package() {
       *) return 65 ;;
     esac
   done
-  shopt -u nullglob
+  shopt -u nullglob dotglob
   [[ "$entry_count" = 2 && "$has_manifest" = 1 && "$has_rollback" = 1 ]] || return 65
+  local package_identity
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    package_identity=$(stat -c '%d:%i' "$manifest") || return 65
+    if [[ "${LEAF_SPKI_PACKAGE_VALID_CACHE[$package_identity]:-}" = "$manifest" ]]; then
+      printf '%s\n' "$manifest"
+      return 0
+    fi
+  fi
   while IFS= read -r line; do
     [[ "$line" =~ ^[a-z][a-z0-9_]*=[^[:cntrl:]]*$ ]] || return 65
     key=${line%%=*}; value=${line#*=}
@@ -468,8 +632,10 @@ validate_package() {
   [[ "$tool_revision" = "$LEAF_SPKI_BACKEND_SOURCE" &&
       "$primary_certificate" = /etc/letsencrypt/live/api.whysoezzy.online/fullchain.pem &&
       "$primary_key" = /etc/letsencrypt/live/api.whysoezzy.online/privkey.pem ]] || return 65
-  [[ "$(stat -c '%d' "$manifest")" = "$(stat -c '%d' "$dir")" &&
-      "$(stat -c '%d' "$rollback")" = "$(stat -c '%d' "$dir")" ]] || return 65
+  local -a devices
+  mapfile -t devices < <(stat -c '%d' "$dir" "$manifest" "$rollback") || return 65
+  [[ "${#devices[@]}" = 3 && "${devices[0]}" = "${devices[1]}" &&
+    "${devices[0]}" = "${devices[2]}" ]] || return 65
   [[ "$(sha256_file "$rollback")" = "$rollback_digest" ]] || return 65
   [[ "$(tail -n 1 "$manifest")" = "self_sha256=$self_sha256" ]] || return 65
   manifest_without_self=$(mktemp) || return 65
@@ -479,6 +645,9 @@ validate_package() {
     return 65
   }
   rm -f -- "$manifest_without_self"
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    LEAF_SPKI_PACKAGE_VALID_CACHE[$package_identity]=$manifest
+  fi
   printf '%s\n' "$manifest"
 }
 validate_package_shape() {
@@ -490,7 +659,7 @@ validate_package_shape() {
   rollback=$dir/nginx-source.rollback
   is_regular_safe "$manifest" || return 1
   is_regular_safe "$rollback" || return 1
-  shopt -s nullglob
+  shopt -s nullglob dotglob
   for entry in "$dir"/*; do
     entry_count=$((entry_count + 1))
     case "${entry##*/}" in
@@ -499,10 +668,12 @@ validate_package_shape() {
       *) return 1 ;;
     esac
   done
-  shopt -u nullglob
+  shopt -u nullglob dotglob
   [[ "$entry_count" = 2 && "$has_manifest" = 1 && "$has_rollback" = 1 ]] || return 1
-  [[ "$(stat -c '%d' "$manifest")" = "$(stat -c '%d' "$dir")" &&
-    "$(stat -c '%d' "$rollback")" = "$(stat -c '%d' "$dir")" ]]
+  local -a devices
+  mapfile -t devices < <(stat -c '%d' "$dir" "$manifest" "$rollback") || return 1
+  [[ "${#devices[@]}" = 3 && "${devices[0]}" = "${devices[1]}" &&
+    "${devices[0]}" = "${devices[2]}" ]]
 }
 validate_original_source() {
   local manifest=$1 source_digest current_digest source_uid source_gid source_mode
@@ -552,6 +723,7 @@ prove_external_primary() {
     [[ "$observed_chain" = VERIFIED ]] || return 20
     valid_spki "$observed_spki" || return 69
     [[ "$observed_spki" = "$expected" ]] || return 20
+    validate_runtime_invariants || return $?
     return 0
   fi
   command -v openssl >/dev/null 2>&1 || return 69
@@ -563,6 +735,7 @@ prove_external_primary() {
     openssl dgst -sha256 -binary 2>/dev/null |
     base64 | tr -d '\r\n') || return 69
   [[ "$actual" = "$expected" ]] || return 20
+  validate_runtime_invariants || return $?
 }
 prove_external_rollover() {
   local expected=$1
@@ -577,9 +750,91 @@ prove_external_rollover() {
       return 20
     valid_spki "$observed_spki" || return 69
     [[ "$observed_spki" = "$expected" ]] || return 20
+    validate_runtime_invariants || return $?
     return 0
   fi
   prove_external_primary "$expected"
+}
+validate_runtime_invariants() {
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    local key value
+    for key in api_status api_shape actuator_status admin_status backend_source \
+      backend_image_digest backend_version backend_user backend_listener backend_health \
+      compose_project compose_service postgres_image_digest postgres_published \
+      backend_volume postgres_volume flyway_migration_digest; do
+      value=$(fixture_observation "$key") || return 69
+      case "$key" in
+        api_status) [[ "$value" = 200 ]] || return 20 ;;
+        api_shape) [[ "$value" = VALID ]] || return 20 ;;
+        actuator_status|admin_status) [[ "$value" =~ ^(401|403|404)$ ]] || return 20 ;;
+        backend_source) [[ "$value" = "$LEAF_SPKI_BACKEND_SOURCE" ]] || return 20 ;;
+        backend_image_digest) [[ "$value" = "$LEAF_SPKI_BACKEND_IMAGE_DIGEST" ]] || return 20 ;;
+        backend_version) [[ "$value" = "$LEAF_SPKI_BACKEND_VERSION" ]] || return 20 ;;
+        backend_user) [[ "$value" = 10001:10001 ]] || return 20 ;;
+        backend_listener) [[ "$value" = 127.0.0.1:8080 ]] || return 20 ;;
+        backend_health) [[ "$value" = healthy ]] || return 20 ;;
+        compose_project) [[ "$value" = meet-production ]] || return 20 ;;
+        compose_service) [[ "$value" = backend ]] || return 20 ;;
+        postgres_image_digest) [[ "$value" = "$LEAF_SPKI_POSTGRES_IMAGE_DIGEST" ]] || return 20 ;;
+        postgres_published) [[ "$value" = NO ]] || return 20 ;;
+        backend_volume) [[ "$value" = meet-production_uploads_data ]] || return 20 ;;
+        postgres_volume) [[ "$value" = meet-production_postgres_data ]] || return 20 ;;
+        flyway_migration_digest) [[ "$value" = "$LEAF_SPKI_FLYWAY_MIGRATION_DIGEST" ]] || return 20 ;;
+      esac
+    done
+    return 0
+  fi
+
+  command -v docker >/dev/null 2>&1 || return 69
+  command -v curl >/dev/null 2>&1 || return 69
+  command -v jq >/dev/null 2>&1 || return 69
+  local backend postgres image source version user health project service
+  local listener postgres_ports backend_volume postgres_volume
+  backend=$(docker compose -p meet-production ps -q backend) || return 69
+  postgres=$(docker compose -p meet-production ps -q postgres) || return 69
+  [[ "$backend" =~ ^[0-9a-f]{12,64}$ && "$postgres" =~ ^[0-9a-f]{12,64}$ ]] || return 20
+  image=$(docker inspect --format '{{.Image}}' "$backend") || return 69
+  [[ "$image" = "$LEAF_SPKI_BACKEND_IMAGE_DIGEST" ]] || return 20
+  source=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$backend") || return 69
+  version=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$backend") || return 69
+  [[ "$source" = "$LEAF_SPKI_BACKEND_SOURCE" && "$version" = "$LEAF_SPKI_BACKEND_VERSION" ]] ||
+    return 20
+  user=$(docker inspect --format '{{.Config.User}}' "$backend") || return 69
+  [[ "$user" = 10001:10001 ]] || return 20
+  project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$backend") ||
+    return 69
+  service=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$backend") ||
+    return 69
+  [[ "$project" = meet-production && "$service" = backend ]] || return 20
+  health=$(docker inspect --format '{{.State.Health.Status}}' "$backend") || return 69
+  [[ "$health" = healthy ]] || return 20
+  listener=$(docker inspect --format \
+    '{{range $p, $b := .NetworkSettings.Ports}}{{if eq $p "8080/tcp"}}{{range $b}}{{.HostIp}}:{{.HostPort}}{{end}}{{end}}{{end}}' \
+    "$backend") || return 69
+  [[ "$listener" = 127.0.0.1:8080 ]] || return 20
+  postgres_ports=$(docker inspect --format '{{json .NetworkSettings.Ports}}' "$postgres") || return 69
+  [[ "$postgres_ports" = null || "$postgres_ports" = "{}" ]] || return 20
+  local postgres_image
+  postgres_image=$(docker inspect --format '{{.Image}}' "$postgres") || return 69
+  [[ "$postgres_image" = "$LEAF_SPKI_POSTGRES_IMAGE_DIGEST" ]] || return 20
+  backend_volume=$(docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/data/uploads"}}{{.Type}}|{{.Name}}{{end}}{{end}}' \
+    "$backend") || return 69
+  postgres_volume=$(docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Type}}|{{.Name}}{{end}}{{end}}' \
+    "$postgres") || return 69
+  [[ "$backend_volume" = volume\|meet-production_uploads_data &&
+    "$postgres_volume" = volume\|meet-production_postgres_data ]] || return 20
+  curl --silent --show-error --fail --max-time 15 \
+    "https://$LEAF_SPKI_HOSTNAME/api/v1/tags" | jq -e 'type == "array"' >/dev/null || return 20
+  [[ "$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --max-time 15 "https://$LEAF_SPKI_HOSTNAME/actuator")" =~ ^(401|403|404)$ ]] || return 20
+  [[ "$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --request POST --max-time 15 "https://$LEAF_SPKI_HOSTNAME/admin/ingest")" =~ ^(401|403|404)$ ]] ||
+    return 20
+  docker exec "$backend" sh -ec \
+    'test -r /app/app.jar && jar tf /app/app.jar | grep -F "db/migration/V8__add_meeting_end_time.sql" >/dev/null' ||
+    return 20
 }
 observe_advisory_status() {
   if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
@@ -609,6 +864,15 @@ sync_parent() {
   [[ -n "$LEAF_SPKI_FIXTURE" && "${LEAF_SPKI_FAIL_SYNC:-}" = 1 ]] && return 73
   [[ -n "$LEAF_SPKI_FIXTURE" ]] || sync -f "$RECOVERY_PARENT" || return 73
 }
+sync_recovery_package() {
+  local package=$1
+  [[ -d "$package" && ! -L "$package" ]] || return 73
+  [[ -n "$LEAF_SPKI_FIXTURE" ]] && return 0
+  sync -f "$package/nginx-source.rollback" || return 73
+  sync -f "$package/manifest.kv" || return 73
+  sync -f "$package" || return 73
+  sync -f "$RECOVERY_PARENT" || return 73
+}
 reopen_completed() {
   [[ -z "$LEAF_SPKI_FIXTURE" || "${LEAF_SPKI_FAIL_REOPEN:-}" != 1 ]] || return 73
   [[ "$(namespace)" = completed ]] || return 73
@@ -619,7 +883,6 @@ reopen_completed() {
 }
 completed_finalize() {
   local manifest drift rc
-  validate_package_shape completed || return 65
   manifest=$(validate_package completed) || return 20
   validate_original_source "$manifest" || {
     rc=$?
@@ -648,15 +911,8 @@ active_restore() {
     [[ "$current_digest" = "$candidate_digest" ||
       "$current_digest" = "$mixed_certificate_digest" ||
       "$current_digest" = "$mixed_key_digest" ]] || return 20
-    if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
-      cp -- "$rollback" "$NGINX_SOURCE" || return 20
-    else
-      install -o "$(manifest_value source_uid "$manifest")" \
-        -g "$(manifest_value source_gid "$manifest")" \
-        -m "$(manifest_value source_mode "$manifest")" \
-        "$rollback" "$NGINX_SOURCE" || return 20
-    fi
-    effect nginx-install || return 20
+    install_nginx_source "$rollback" "$current_digest" \
+      "$(manifest_value rollback_digest "$manifest")" || return 20
     [[ -z "$LEAF_SPKI_FIXTURE" || "${LEAF_SPKI_FAIL_NGINX_TEST:-}" != 1 ]] || return 20
     effect nginx-test || return 20
     if [[ -z "$LEAF_SPKI_FIXTURE" ]]; then
@@ -736,12 +992,13 @@ render_mixed_candidate() {
   esac
 }
 install_nginx_source() {
-  local source=$1
+  local source=$1 expected_current=$2 expected_source=$3
   local target_dir target_tmp
   [[ -f "$NGINX_SOURCE" && ! -L "$NGINX_SOURCE" ]] || return 20
   [[ -f "$source" && ! -L "$source" ]] || return 20
-  [[ -z "${LEAF_SPKI_INSTALL_EXPECTED_DIGEST:-}" ||
-    "$(sha256_file "$NGINX_SOURCE")" = "$LEAF_SPKI_INSTALL_EXPECTED_DIGEST" ]] || return 20
+  valid_digest "$expected_current" && valid_digest "$expected_source" || return 20
+  [[ "$(sha256_file "$NGINX_SOURCE")" = "$expected_current" ]] || return 20
+  [[ "$(sha256_file "$source")" = "$expected_source" ]] || return 20
   target_dir=$(dirname "$NGINX_SOURCE") || return 20
   target_tmp=$(mktemp "$target_dir/.leaf-spki.XXXXXXXX") || return 20
   cp -- "$source" "$target_tmp" || { rm -f -- "$target_tmp"; return 20; }
@@ -758,6 +1015,7 @@ install_nginx_source() {
     }
     mv -f -- "$target_tmp" "$NGINX_SOURCE" || { rm -f -- "$target_tmp"; return 20; }
   fi
+  clear_digest_cache
   [[ -n "$LEAF_SPKI_FIXTURE" ]] || sync -f "$target_dir" || return 20
   effect nginx-install || return 20
 }
@@ -811,6 +1069,7 @@ prepare_recovery_package() {
   printf 'self_sha256=%s\n' "$self_sha256" >>"$manifest" || return 73
   chmod 600 "$manifest" || return 73
   validate_package preparing >/dev/null || return 73
+  sync_recovery_package "$preparing" || return 73
   active_identity=$(stat -c '%d:%i' "$preparing") || return 73
   if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
     mv -T -n "$preparing" "$RECOVERY_PARENT/active" || return 73
@@ -818,6 +1077,7 @@ prepare_recovery_package() {
     mv -T -n --no-copy "$preparing" "$RECOVERY_PARENT/active" || return 73
   fi
   [[ "$(stat -c '%d:%i' "$RECOVERY_PARENT/active")" = "$active_identity" ]] || return 73
+  [[ -n "$LEAF_SPKI_FIXTURE" ]] || sync -f "$RECOVERY_PARENT" || return 73
   effect preparing-to-active || return 73
   [[ "${LEAF_SPKI_FAIL_ACTIVE_PERSIST:-}" != 1 ]] || return 73
 }
@@ -845,7 +1105,16 @@ drill_mode() {
   render_mixed_candidate "$NGINX_SOURCE" "$mixed_key" key || { rm -r -- "$work"; return $?; }
   prepare_recovery_package "$primary" "$candidate" "$mixed_certificate" "$mixed_key" ||
     { rc=$?; rm -r -- "$work"; return "$rc"; }
-  if ! install_nginx_source "$candidate"; then
+  local source_digest candidate_digest
+  source_digest=$(manifest_value source_digest "$RECOVERY_PARENT/active/manifest.kv") || {
+    rm -r -- "$work"
+    return 73
+  }
+  candidate_digest=$(manifest_value candidate_digest "$RECOVERY_PARENT/active/manifest.kv") || {
+    rm -r -- "$work"
+    return 73
+  }
+  if ! install_nginx_source "$candidate" "$source_digest" "$candidate_digest"; then
     rc=1
   elif ! nginx_test_reload; then
     rc=1
@@ -881,19 +1150,23 @@ inspect_mode() {
   fi
   if [[ "$(rollover_presence)" = YES ]]; then
     rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
+    validate_lineage_observation "$LEAF_SPKI_ROLLOVER_LINEAGE" || return $?
+    validate_rollover_configuration || return $?
     [[ "$primary" != "$rollover" ]] || return 65
     prove_rollover_dormant || return $?
   fi
+  validate_primary_nginx_source || return $?
   record_evidence INSPECT INSPECT_COMPLETE UNPROVEN NOT_APPLICABLE || return $?
   printf 'namespace=%s\nprimary_spki=%s\n' "$recovery" "$primary"
   [[ -z "$rollover" ]] || printf 'rollover_spki=%s\n' "$rollover"
 }
 configure_primary() {
-  local primary webroot
+  local primary webroot before_presence
   require_empty_recovery || return $?
   validate_certbot_contract || return $?
   validate_lineage_observation "$LEAF_SPKI_PRIMARY_LINEAGE" || return $?
   primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
+  before_presence=YES
   prove_external_primary "$primary" || return $?
   webroot=$(certbot_webroot) || return $?
   run_certbot primary-reconfigure reconfigure \
@@ -905,6 +1178,8 @@ configure_primary() {
     --elliptic-curve secp256r1 \
     --reuse-key \
     --no-directory-hooks || return $?
+  reconcile_lineage_after_certbot "$LEAF_SPKI_PRIMARY_LINEAGE" \
+    "$before_presence" "$primary" || return $?
   [[ "$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE")" = "$primary" ]] || return 65
   prove_external_primary "$primary" || return $?
   record_evidence FORWARD PRIMARY_REUSE_VERIFIED PROVED_PRIMARY GREEN || return $?
@@ -939,7 +1214,10 @@ ensure_rollover() {
     else
       [[ "$(rollover_presence)" = YES ]] || return 65
     fi
+    reconcile_lineage_after_certbot "$LEAF_SPKI_ROLLOVER_LINEAGE" \
+      "$presence" "$primary" || return $?
   else
+    rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
     validate_lineage_observation "$LEAF_SPKI_ROLLOVER_LINEAGE" || return $?
     run_certbot rollover-reconfigure reconfigure \
       --non-interactive \
@@ -950,7 +1228,8 @@ ensure_rollover() {
       --elliptic-curve secp256r1 \
       --reuse-key \
       --no-directory-hooks || return $?
-    validate_rollover_configuration || return $?
+    reconcile_lineage_after_certbot "$LEAF_SPKI_ROLLOVER_LINEAGE" \
+      "$presence" "$rollover" || return $?
   fi
   rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
   [[ "$primary" != "$rollover" ]] || return 65
@@ -986,8 +1265,11 @@ verify_renewal() {
   prove_rollover_dormant || return $?
   prove_external_primary "$primary" || return $?
   staging_account=$(certbot_account staging) || return $?
-  [[ "$lineage" = "$LEAF_SPKI_PRIMARY_LINEAGE" ]] &&
-    operation=primary-renew-dry-run || operation=rollover-renew-dry-run
+  if [[ "$lineage" = "$LEAF_SPKI_PRIMARY_LINEAGE" ]]; then
+    operation='primary-renew-dry-run'
+  else
+    operation='rollover-renew-dry-run'
+  fi
   run_certbot "$operation" renew \
     --non-interactive \
     --cert-name "$lineage" \
@@ -1025,14 +1307,23 @@ dispatch_phase() {
   esac
 }
 run_rollover() {
-  local phase=$1 fd lock_dir= rc
+  local phase=$1 fd lock_dir='' rc
   if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
     mkdir -p "$(dirname "$LOCK_FILE")"
   else
     [[ -d "$(dirname "$LOCK_FILE")" && ! -L "$(dirname "$LOCK_FILE")" ]] || return 65
+    [[ "$(stat -c '%u:%g' "$(dirname "$LOCK_FILE")")" = 0:0 ]] || return 65
+    [[ $((8#$(stat -c '%a' "$(dirname "$LOCK_FILE")") & 8#022)) -eq 0 ]] || return 65
+    if [[ -e "$LOCK_FILE" || -L "$LOCK_FILE" ]]; then
+      [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] || return 65
+      [[ "$(stat -c '%u:%g:%a:%h' "$LOCK_FILE")" = 0:0:600:1 ]] || return 65
+    fi
   fi
   if command -v flock >/dev/null 2>&1; then
     exec {fd}>"$LOCK_FILE" || return 75
+    if [[ -z "$LEAF_SPKI_FIXTURE" ]]; then
+      [[ "$(stat -c '%u:%g:%a:%h' "$LOCK_FILE")" = 0:0:600:1 ]] || return 65
+    fi
     flock -n "$fd" || return 75
   else
     [[ -n "$LEAF_SPKI_FIXTURE" ]] || return 75
