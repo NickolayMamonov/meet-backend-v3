@@ -8,10 +8,11 @@ artifact. The only repository change authorized by this task is this file.
 The drill does not change backend source or API/DTO behavior, TIMEPAD
 mapping/upsert behavior, Flyway history, Android artifacts (including Android
 PR #67), release metadata or images, deployment configuration, DNS,
-environment values, database data, or volumes. Immutable backend release
-`368531227`, its tag, assets, GHCR aliases, and attestations are a permanent
-no-mutation boundary. The backend remains v1.0.1, runs as `10001:10001`, and
-is published only on `127.0.0.1:8080`; PostgreSQL remains unpublished.
+environment values, database data, or volumes. Unpublished backend v1.1.0
+draft release `368531227`, its tag, assets, GHCR aliases, and attestations are
+a permanent no-mutation boundary and remain untouched. The backend remains
+v1.0.1, runs as `10001:10001`, and is published only on `127.0.0.1:8080`;
+PostgreSQL remains unpublished.
 
 ## Stop rules and evidence boundary
 
@@ -143,7 +144,11 @@ the same session.
 | Deploy hook | `/etc/letsencrypt/renewal-hooks/deploy/reload-nginx`, SHA-256 `342a163b2e884ec7ba68a2a3ff08fc9461b5c672050c71f5f4f19465b9e9ec63` |
 | Backend listener | `127.0.0.1:8080` |
 | Backend version | `1.0.1` |
-| Immutable release | `368531227` |
+| Backend release | `367640510` |
+| Backend source | `d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc` |
+| Backend `Config.Image` | `ghcr.io/nickolaymamonov/meet-backend-v3@sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6` |
+| Backend container image ID | `sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6` |
+| Unpublished no-touch boundary | v1.1.0 draft release `368531227`, untouched |
 | Backend user | `10001:10001` |
 | Public meetings probe | `GET /meetings` |
 | Public actuator probe | `GET /actuator/health/readiness` must be `404` |
@@ -422,6 +427,10 @@ test "$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{if eq $p 
   127.0.0.1:8080
 test -z "$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{if eq $p "5432/tcp"}}{{$p}}{{end}}{{end}}' "$pgid")"
 test "$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$cid")" = 1.0.1
+test "$(docker inspect -f '{{.Config.Image}}' "$cid")" =
+  ghcr.io/nickolaymamonov/meet-backend-v3@sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
+test "$(docker inspect -f '{{.Image}}' "$cid")" =
+  sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
 test "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data/uploads"}}{{.Type}}|{{.Name}}{{end}}{{end}}' "$cid")" =
   volume\|meet-production_uploads_data
 test "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Type}}|{{.Name}}{{end}}{{end}}' "$pgid")" =
@@ -433,11 +442,14 @@ docker exec "$pgid" psql -Atqc \
 
 The formatted `docker inspect` calls are identity assertions, not permission
 to print full container objects or environments. The operator must also check
-the already-reviewed deployment/release record for immutable release
-`368531227` without fetching, changing, or printing release assets. If that
-record, the image label, the migration inventory, the two named volumes,
-published-PostgreSQL absence, or any runtime identity differs, stop. Do not
-inspect container environment variables.
+the already-reviewed deployment/release record for running v1.0.1 release
+`367640510`, source `d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc`, and the exact
+`Config.Image` and container image ID above, without fetching, changing, or
+printing release assets. The unpublished v1.1.0 draft release `368531227`
+remains untouched. If that record, the image label or digest, the migration
+inventory, the two named volumes, published-PostgreSQL absence, or any
+runtime identity differs, stop. Do not inspect container environment
+variables.
 
 Capture the primary SPKI from the canonical primary `cert.pem` and from the
 public HTTPS edge; they must match. The HTTPS certificate must pass normal CA
@@ -574,18 +586,17 @@ copy restore, one `nginx -t`, one reload, and a complete external primary
 proof. It returns success only after that proof.
 
 `RELEASE_RECORD` must name a pre-existing, separately reviewed, sanitized
-one-line record. The routine accepts only this exact binding format, with the
-two image values obtained from the running backend container at proof time:
-`release=368531227 image=<Config.Image> image_id=<container Image ID>`.
-The record is read-only evidence; it is not a release asset, deployment
-command, or authorization to mutate release `368531227`.
+one-line record. The routine accepts only this exact running binding format:
+`release=367640510 source=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc image=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6 image_id=sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6`.
+The record is read-only evidence. The unpublished v1.1.0 draft release
+`368531227` remains untouched and is not a deployment target.
 
 ```bash
 set -euo pipefail
 readonly NGINX_SOURCE=/etc/nginx/sites-available/api.whysoezzy.online
 readonly ROLLBACK_DIR=/run/meet-spki-rollover
 readonly ROLLBACK=/run/meet-spki-rollover.nginx.rollback
-: "${RELEASE_RECORD:?sanitized reviewed release record for immutable 368531227}"
+: "${RELEASE_RECORD:?sanitized reviewed running v1.0.1 release record}"
 armed=0
 restore_attempted=0
 restore_in_progress=0
@@ -632,6 +643,10 @@ prove_primary_external() (
 prove_service_invariants() (
   set -e
   local expected_migration=$1 current_migration running_image running_image_id
+  readonly expected_release=367640510
+  readonly expected_source=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
+  readonly expected_image=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
+  readonly expected_image_id=sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
   test -f "$RELEASE_RECORD"
   test "$(wc -l < "$RELEASE_RECORD")" = 1
   test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -648,10 +663,11 @@ prove_service_invariants() (
   running_image=$(docker inspect -f '{{.Config.Image}}' "$cid")
   running_image_id=$(docker inspect -f '{{.Image}}' "$cid")
   test -n "$running_image" && test -n "$running_image_id"
-  test "$(docker image inspect -f '{{.Id}}' "$running_image")" =
-    "$running_image_id"
+  test "$running_image" = "$expected_image"
+  test "$running_image_id" = "$expected_image_id"
+  test "$(docker image inspect -f '{{.Id}}' "$running_image")" = "$expected_image_id"
   test "$(grep -Fxc \
-    "release=368531227 image=$running_image image_id=$running_image_id" \
+    "release=$expected_release source=$expected_source image=$expected_image image_id=$expected_image_id" \
     "$RELEASE_RECORD")" = 1
   test "$(docker inspect -f '{{.Config.User}}' "$cid")" = 10001:10001
   test "$(docker inspect -f \
@@ -923,10 +939,13 @@ fi
 The rollover proof must include the exact public hostname, valid chain, exact
 rollover SPKI, `GET /meetings` 200 JSON, external actuator `404`, invalid or
 unauthenticated admin `403`, backend v1.0.1, and the exact
-`release=368531227 image=<Config.Image> image_id=<container Image ID>`
+`release=367640510 source=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
+image=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
+image_id=sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6`
 binding, plus user `10001:10001`, loopback binding, unpublished PostgreSQL,
-named volumes, and unchanged Flyway inventory. The final proof must repeat
-all of those checks with the exact primary SPKI, primary Nginx source
+named volumes, and unchanged Flyway inventory. The unpublished v1.1.0 draft
+release `368531227` is a separate no-touch boundary. The final proof must
+repeat all of those checks with the exact primary SPKI, primary Nginx source
 directives, unchanged enabled symlink, and both retained lineages.
 
 If the switch or any proof fails, call `finish_failure <status> <stage>` while
@@ -988,7 +1007,11 @@ meetings_status=200
 actuator_status=404
 admin_status=403
 backend_version=1.0.1
-release=368531227
+release=367640510
+source=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
+config_image=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
+container_image_id=sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
+unpublished_release_boundary=368531227:v1.1.0:untouched
 release_running_image_binding=pass
 backend_user=10001:10001
 backend_listener=127.0.0.1:8080
