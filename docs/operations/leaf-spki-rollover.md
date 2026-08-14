@@ -29,6 +29,17 @@ root, Nginx path, webroot, release, mode, or dependency arguments. Fixture
 mode is unprivileged, temporary-root-only, offline, and cannot address live
 paths.
 
+The merge gate is an actual-object check, not a branch-name check. Record
+target base `B`, approved head `H`, expected tree
+`T = git merge-tree --write-tree B H`, hosted synthetic merge `M` with exactly
+parents `B,H` and tree `T`, and the successful required checks attached to
+`M`. After merge, the installed/reviewed commit `C` must have exactly those
+parents and tree. A squash/rebase merge, stale approval, check rerun on a
+different SHA, base drift, dirty working tree, or extra/missing installed
+tooling file blocks the operation. The sanitized gate record contains only
+`B`, `H`, `T`, `M`, `C`, check IDs/conclusions, allowlisted file SHA-256 values,
+and owner/mode status.
+
 ## Closed CLI and operator sequence
 
 The interface has exactly eight commands:
@@ -103,6 +114,16 @@ Before any Certbot operation, reject saved `pre_hook`, `post_hook`,
 without executing them. Every command must prove no Nginx, backend, Docker,
 Compose, or database effect. Certbot failure is `74`; rerun the same
 independently idempotent phase only after a fresh observation.
+
+Every Certbot invocation must first validate Certbot 2.9.x, both target
+lineages' exact renewal settings, certificate/key pairing, ECDSA P-256
+identity, SAN, permissions, symlink/archive containment, saved hook fields,
+and the pre/deploy/post hook directories. A non-zero result with a proven
+unchanged lineage is `74 CERTBOT_OPERATION_FAILED`; a child interruption,
+partial lineage, changed SPKI/configuration, or any state that cannot be
+classified as unchanged is `76 FORWARD_RECONCILIATION_REQUIRED`. Exit `76`
+leaves forward phases blocked until a separate read-only reconciliation/manual
+recovery establishes either wholly absent or wholly valid intended state.
 
 Canonical leaf identity is public leaf certificate -> public key -> DER
 SubjectPublicKeyInfo -> SHA-256 binary -> Base64. It must decode to exactly

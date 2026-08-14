@@ -97,7 +97,22 @@ manifest_value() {
   ' "$file"
 }
 valid_digest() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
-valid_spki() { [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
+declare -A LEAF_SPKI_VALID_CACHE=()
+valid_spki() {
+  local value=$1 decoded recoded
+  [[ "$value" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+  [[ "${LEAF_SPKI_VALID_CACHE[$value]:-}" = 1 ]] && return 0
+  decoded=$(mktemp) || return 1
+  if ! printf '%s' "$value" | base64 --decode >"$decoded" 2>/dev/null ||
+    [[ "$(wc -c <"$decoded")" -ne 32 ]]; then
+    rm -f -- "$decoded"
+    return 1
+  fi
+  recoded=$(base64 -w 0 "$decoded")
+  rm -f -- "$decoded"
+  [[ "$recoded" = "$value" ]] || return 1
+  LEAF_SPKI_VALID_CACHE[$value]=1
+}
 ensure_state_dir() {
   local parent
   if [[ -L "$STATE_DIR" ]]; then
@@ -129,6 +144,7 @@ atomic_state_file() {
   is_regular_safe "$tmp" || return 65
   chmod 600 "$tmp" || return 73
   mv -f -- "$tmp" "$destination" || return 73
+  [[ -n "$LEAF_SPKI_FIXTURE" ]] || sync -f "$destination" || return 73
 }
 new_state_temp() {
   local stem=$1 tmp
@@ -143,6 +159,67 @@ fixture_observation() {
   [[ -n "$LEAF_SPKI_FIXTURE" ]] || return 70
   [[ -f "$file" && ! -L "$file" ]] || return 69
   manifest_value "$key" "$file" || return 69
+}
+optional_fixture_observation() {
+  local key=$1 file=$ROOT_DIR/observations/leaf-spki.kv
+  [[ -n "$LEAF_SPKI_FIXTURE" ]] || return 70
+  [[ -f "$file" && ! -L "$file" ]] || return 69
+  awk -F= -v wanted="$key" '
+    $1 == wanted { if (++count > 1) exit 2; print substr($0, length($1) + 2) }
+    END { if (count > 1) exit 3 }
+  ' "$file"
+}
+validate_certbot_contract() {
+  local version file line key primary_hooks rollover_hooks hook_dirs
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    version=$(fixture_observation certbot_version) || return $?
+    primary_hooks=$(fixture_observation primary_hooks) || return $?
+    rollover_hooks=$(fixture_observation rollover_hooks) || return $?
+    hook_dirs=$(fixture_observation hook_directories) || return $?
+    [[ "$version" =~ ^(certbot[[:space:]]+)?2\.9\.[0-9]+$ ]] || return 65
+    [[ "$primary_hooks" = NONE && "$rollover_hooks" = NONE &&
+      "$hook_dirs" = EMPTY ]] || return 65
+    return 0
+  fi
+  version=$(/usr/bin/certbot --version 2>&1) || return 69
+  [[ "$version" =~ ^certbot[[:space:]]+2\.9\.[0-9]+$ ]] || return 65
+  for file in \
+    /etc/letsencrypt/renewal/$LEAF_SPKI_PRIMARY_LINEAGE.conf \
+    /etc/letsencrypt/renewal/$LEAF_SPKI_ROLLOVER_LINEAGE.conf; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    while IFS= read -r line; do
+      key=${line%% = *}
+      case "$key" in
+        pre_hook|post_hook|renew_hook|deploy_hook) return 65 ;;
+        *) ;;
+      esac
+    done <"$file"
+  done
+  for file in /etc/letsencrypt/renewal-hooks/pre/* \
+    /etc/letsencrypt/renewal-hooks/deploy/* \
+    /etc/letsencrypt/renewal-hooks/post/*; do
+    [[ ! -e "$file" && ! -L "$file" ]] || return 65
+  done
+}
+validate_lineage_observation() {
+  local lineage=$1 configuration permissions pairing san hooks
+  if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
+    configuration=$(fixture_observation "${lineage}_configuration") || return $?
+    permissions=$(fixture_observation "${lineage}_permissions") || return $?
+    pairing=$(fixture_observation "${lineage}_pairing") || return $?
+    san=$(fixture_observation "${lineage}_san") || return $?
+    hooks=$(fixture_observation "${lineage}_hooks") || return $?
+    [[ "$configuration" = VALID && "$permissions" = VALID &&
+      "$pairing" = VALID && "$san" = VALID && "$hooks" = NONE ]] || return 65
+    return 0
+  fi
+  local file=/etc/letsencrypt/renewal/$lineage.conf
+  [[ -f "$file" && ! -L "$file" ]] || return 69
+  [[ "$(grep -Ec '^authenticator = webroot$' "$file")" = 1 ]] || return 65
+  [[ "$(grep -Ec '^key_type = ecdsa$' "$file")" = 1 ]] || return 65
+  [[ "$(grep -Ec '^elliptic_curve = secp256r1$' "$file")" = 1 ]] || return 65
+  ! grep -Eq '^(pre_hook|post_hook|renew_hook|deploy_hook) = ' "$file" || return 65
+  [[ "$(stat -c '%a' "$file")" = 600 ]] || return 65
 }
 certbot_account() {
   local environment=$1 root value
@@ -194,7 +271,7 @@ lineage_spki() {
       openssl dgst -sha256 -binary 2>/dev/null |
       base64 | tr -d '\r\n') || return 69
   fi
-  valid_spki "$value" || return 69
+  valid_spki "$value" || return 20
   printf '%s\n' "$value"
 }
 rollover_presence() {
@@ -238,6 +315,9 @@ validate_rollover_configuration() {
     return 65
   ! grep -Eq '^(pre_hook|post_hook|renew_hook|deploy_hook) = ' "$file" || return 65
 }
+require_empty_recovery() {
+  [[ "$(namespace)" = NONE ]] || return 65
+}
 run_certbot() {
   local operation=$1 rc=0
   shift
@@ -245,12 +325,25 @@ run_certbot() {
     effect certbot-"$operation" || return 73
     effect_detail certbot-argv /usr/bin/certbot "$@" || return 73
     [[ "${LEAF_SPKI_FAIL_CERTBOT:-}" != 1 &&
-      "${LEAF_SPKI_FAIL_CERTBOT_OPERATION:-}" != "$operation" ]] || return 74
+      "${LEAF_SPKI_FAIL_CERTBOT_OPERATION:-}" != "$operation" ]] || {
+      case "${LEAF_SPKI_CERTBOT_POST_STATE:-}" in
+        partial|ambiguous) return 76 ;;
+        *) return 74 ;;
+      esac
+    }
+    case "${LEAF_SPKI_CERTBOT_POST_STATE:-}" in
+      partial|ambiguous) return 76 ;;
+      *) ;;
+    esac
     return 0
   fi
   command -v /usr/bin/certbot >/dev/null 2>&1 || return 69
   /usr/bin/certbot "$@" || rc=$?
-  [[ "$rc" = 0 ]] || return 74
+  [[ "$rc" = 0 ]] || {
+    [[ "${LEAF_SPKI_CERTBOT_POST_STATE:-unchanged}" = unchanged ]] && return 74
+    return 76
+  }
+  [[ "${LEAF_SPKI_CERTBOT_POST_STATE:-unchanged}" = unchanged ]] || return 76
 }
 record_evidence() {
   local mode=$1 outcome=$2 primary=$3 drift=$4 tmp
@@ -280,9 +373,9 @@ namespace() {
     return 0
   fi
   is_directory_safe "$RECOVERY_PARENT" || return 65
-  shopt -s nullglob
+  shopt -s nullglob dotglob
   entries=("$RECOVERY_PARENT"/*)
-  shopt -u nullglob
+  shopt -u nullglob dotglob
   for entry in "${entries[@]}"; do
     name=${entry##*/}
     case "$name" in
@@ -604,19 +697,24 @@ render_rollover_candidate() {
     END { print count + 0 }
   ' "$source")
   [[ "$cert_count" = 1 && "$key_count" = 1 ]] || return 65
-  awk -v cert="$LEAF_SPKI_ROLLOVER_CERT" -v key="$LEAF_SPKI_ROLLOVER_KEY" '
-    $1 == "ssl_certificate" { sub($2, cert ";") }
-    $1 == "ssl_certificate_key" { sub($2, key ";") }
+  awk -v primary_cert="$LEAF_SPKI_PRIMARY_CERT" \
+    -v primary_key="$LEAF_SPKI_PRIMARY_KEY" \
+    -v cert="$LEAF_SPKI_ROLLOVER_CERT" \
+    -v key="$LEAF_SPKI_ROLLOVER_KEY" '
+    $1 == "ssl_certificate" && $2 == primary_cert ";" && NF == 2 { $2 = cert ";" }
+    $1 == "ssl_certificate_key" && $2 == primary_key ";" && NF == 2 { $2 = key ";" }
     { print }
   ' "$source" >"$destination" || return 73
   normalized_source=$(mktemp) || return 73
   normalized_destination=$(mktemp) || { rm -f -- "$normalized_source"; return 73; }
-  awk '$1 == "ssl_certificate" { $2 = "<CERT>;" }
-       $1 == "ssl_certificate_key" { $2 = "<KEY>;" }
-       { print }' "$source" >"$normalized_source" || return 73
-  awk '$1 == "ssl_certificate" { $2 = "<CERT>;" }
-       $1 == "ssl_certificate_key" { $2 = "<KEY>;" }
-       { print }' "$destination" >"$normalized_destination" || return 73
+  sed -E \
+    -e "s#^([[:space:]]*ssl_certificate[[:space:]]+)$LEAF_SPKI_PRIMARY_CERT;([[:space:]]*)\$#\1<CERT>;\2#" \
+    -e "s#^([[:space:]]*ssl_certificate_key[[:space:]]+)$LEAF_SPKI_PRIMARY_KEY;([[:space:]]*)\$#\1<KEY>;\2#" \
+    "$source" >"$normalized_source" || return 73
+  sed -E \
+    -e "s#^([[:space:]]*ssl_certificate[[:space:]]+)$LEAF_SPKI_ROLLOVER_CERT;([[:space:]]*)\$#\1<CERT>;\2#" \
+    -e "s#^([[:space:]]*ssl_certificate_key[[:space:]]+)$LEAF_SPKI_ROLLOVER_KEY;([[:space:]]*)\$#\1<KEY>;\2#" \
+    "$destination" >"$normalized_destination" || return 73
   cmp -s "$normalized_source" "$normalized_destination" || {
     rm -f -- "$normalized_source" "$normalized_destination"
     return 65
@@ -639,14 +737,28 @@ render_mixed_candidate() {
 }
 install_nginx_source() {
   local source=$1
+  local target_dir target_tmp
+  [[ -f "$NGINX_SOURCE" && ! -L "$NGINX_SOURCE" ]] || return 20
+  [[ -f "$source" && ! -L "$source" ]] || return 20
+  [[ -z "${LEAF_SPKI_INSTALL_EXPECTED_DIGEST:-}" ||
+    "$(sha256_file "$NGINX_SOURCE")" = "$LEAF_SPKI_INSTALL_EXPECTED_DIGEST" ]] || return 20
+  target_dir=$(dirname "$NGINX_SOURCE") || return 20
+  target_tmp=$(mktemp "$target_dir/.leaf-spki.XXXXXXXX") || return 20
+  cp -- "$source" "$target_tmp" || { rm -f -- "$target_tmp"; return 20; }
+  chmod "$(stat -c '%a' "$NGINX_SOURCE")" "$target_tmp" || {
+    rm -f -- "$target_tmp"
+    return 20
+  }
   if [[ -n "$LEAF_SPKI_FIXTURE" ]]; then
-    cp -- "$source" "$NGINX_SOURCE" || return 20
+    mv -f -- "$target_tmp" "$NGINX_SOURCE" || { rm -f -- "$target_tmp"; return 20; }
   else
-    install -o "$(stat -c '%u' "$NGINX_SOURCE")" \
-      -g "$(stat -c '%g' "$NGINX_SOURCE")" \
-      -m "$(stat -c '%a' "$NGINX_SOURCE")" \
-      "$source" "$NGINX_SOURCE" || return 20
+    chown "$(stat -c '%u:%g' "$NGINX_SOURCE")" "$target_tmp" || {
+      rm -f -- "$target_tmp"
+      return 20
+    }
+    mv -f -- "$target_tmp" "$NGINX_SOURCE" || { rm -f -- "$target_tmp"; return 20; }
   fi
+  [[ -n "$LEAF_SPKI_FIXTURE" ]] || sync -f "$target_dir" || return 20
   effect nginx-install || return 20
 }
 nginx_test_reload() {
@@ -760,7 +872,9 @@ drill_mode() {
 inspect_mode() {
   local recovery primary rollover=
   recovery=$(namespace) || return 65
+  validate_certbot_contract || return $?
   primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
+  validate_lineage_observation "$LEAF_SPKI_PRIMARY_LINEAGE" || return $?
   prove_external_primary "$primary" || return $?
   if [[ "$recovery" = active || "$recovery" = preparing || "$recovery" = CONFLICT ]]; then
     return 65
@@ -776,6 +890,9 @@ inspect_mode() {
 }
 configure_primary() {
   local primary webroot
+  require_empty_recovery || return $?
+  validate_certbot_contract || return $?
+  validate_lineage_observation "$LEAF_SPKI_PRIMARY_LINEAGE" || return $?
   primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
   prove_external_primary "$primary" || return $?
   webroot=$(certbot_webroot) || return $?
@@ -795,6 +912,9 @@ configure_primary() {
 }
 ensure_rollover() {
   local primary rollover presence webroot production_account
+  require_empty_recovery || return $?
+  validate_certbot_contract || return $?
+  validate_lineage_observation "$LEAF_SPKI_PRIMARY_LINEAGE" || return $?
   primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
   prove_external_primary "$primary" || return $?
   webroot=$(certbot_webroot) || return $?
@@ -820,6 +940,7 @@ ensure_rollover() {
       [[ "$(rollover_presence)" = YES ]] || return 65
     fi
   else
+    validate_lineage_observation "$LEAF_SPKI_ROLLOVER_LINEAGE" || return $?
     run_certbot rollover-reconfigure reconfigure \
       --non-interactive \
       --cert-name "$LEAF_SPKI_ROLLOVER_LINEAGE" \
@@ -840,7 +961,10 @@ ensure_rollover() {
 }
 configure_rollover() {
   local primary rollover
+  require_empty_recovery || return $?
+  validate_certbot_contract || return $?
   [[ "$(rollover_presence)" = YES ]] || return 65
+  validate_lineage_observation "$LEAF_SPKI_ROLLOVER_LINEAGE" || return $?
   validate_rollover_configuration || return $?
   primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
   rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
@@ -852,6 +976,10 @@ configure_rollover() {
 }
 verify_renewal() {
   local lineage=$1 operation primary rollover staging_account
+  require_empty_recovery || return $?
+  validate_certbot_contract || return $?
+  validate_lineage_observation "$LEAF_SPKI_PRIMARY_LINEAGE" || return $?
+  validate_lineage_observation "$LEAF_SPKI_ROLLOVER_LINEAGE" || return $?
   primary=$(lineage_spki "$LEAF_SPKI_PRIMARY_LINEAGE") || return $?
   rollover=$(lineage_spki "$LEAF_SPKI_ROLLOVER_LINEAGE") || return $?
   [[ "$primary" != "$rollover" ]] || return 65

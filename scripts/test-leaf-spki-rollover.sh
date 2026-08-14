@@ -81,6 +81,19 @@ make_fixture() {
     printf 'rollover_present=YES\n'
     printf 'rollover_present_after_certbot=YES\n'
     printf 'rollover_configuration=VALID\n'
+    printf 'api.whysoezzy.online-rollover_configuration=VALID\n'
+    printf 'certbot_version=2.9.0\n'
+    printf 'primary_hooks=NONE\nrollover_hooks=NONE\nhook_directories=EMPTY\n'
+    printf 'api.whysoezzy.online_configuration=VALID\n'
+    printf 'api.whysoezzy.online_permissions=VALID\n'
+    printf 'api.whysoezzy.online_pairing=VALID\n'
+    printf 'api.whysoezzy.online_san=VALID\n'
+    printf 'api.whysoezzy.online_hooks=NONE\n'
+    printf 'api.whysoezzy.online-rollover_configuration=VALID\n'
+    printf 'api.whysoezzy.online-rollover_permissions=VALID\n'
+    printf 'api.whysoezzy.online-rollover_pairing=VALID\n'
+    printf 'api.whysoezzy.online-rollover_san=VALID\n'
+    printf 'api.whysoezzy.online-rollover_hooks=NONE\n'
     printf 'webroot=/var/www/certbot\n'
     printf 'production_account=production_account\n'
     printf 'staging_account=staging_account\n'
@@ -422,6 +435,21 @@ sed -i "s#^primary_spki=.*#primary_spki=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
   "$fixture/observations/leaf-spki.kv"
 expect_status 20 noncanonical-spki run_tool "$fixture" inspect
 assert_no_effects "$fixture" noncanonical-spki
+
+fixture=$TMP/hidden-unknown-recovery
+make_fixture "$fixture"
+mkdir -p "$fixture/recovery"
+chmod 700 "$fixture/recovery"
+printf 'hidden\n' >"$fixture/recovery/.unknown"
+expect_status 65 hidden-unknown-recovery run_tool "$fixture" inspect
+assert_no_effects "$fixture" hidden-unknown-recovery
+
+fixture=$TMP/certbot-ambiguous
+make_fixture "$fixture"
+expect_status 76 certbot-ambiguous env \
+  LEAF_SPKI_FIXTURE_ROOT="$fixture" \
+  LEAF_SPKI_FAIL_CERTBOT_OPERATION=primary-reconfigure \
+  LEAF_SPKI_CERTBOT_POST_STATE=partial "$TOOL" configure-primary
 
 # Recovery namespace/package ambiguity is rejected before effects.
 fixture=$TMP/partial-package
