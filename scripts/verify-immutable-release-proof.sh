@@ -197,7 +197,7 @@ main() {
     (.attestation.bundle | type == "object") and
     (.attestation.bundle.dsseEnvelope.payload |
       type == "string" and length > 0) and
-    (.verificationResult | type == "object")
+    (.verificationResult | type == "object" and .verified == true)
   ' "$attestation" >/dev/null 2>&1 ||
     fail "release attestation result is missing verified bundle data"
 

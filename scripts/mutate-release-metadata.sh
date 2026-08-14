@@ -79,7 +79,7 @@ awk -v version="$version" '
 payload="$tmp/payload.json"
 jq -n --arg tag "$tag" --arg target "$source_sha" --rawfile body "$notes" '
   {tag_name:$tag,target_commitish:$target,name:$tag,body:$body,draft:false,
-   prerelease:false,make_latest:false,generate_release_notes:false}
+   prerelease:false,make_latest:"false",generate_release_notes:false}
 ' >"$payload"
 if [ -n "$release_file" ]; then
   jq --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" '

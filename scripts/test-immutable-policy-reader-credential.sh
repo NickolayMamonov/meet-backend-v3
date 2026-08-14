@@ -25,7 +25,9 @@ case "${1:-}" in
     exit 0
     ;;
   dgst)
-    cat >/dev/null
+    signing_input=$(cat)
+    IFS=. read -r jwt_header jwt_payload jwt_extra <<<"$signing_input"
+    [ -n "$jwt_header" ] && [ -n "$jwt_payload" ] && [ -z "${jwt_extra:-}" ]
     printf 'fixture-signature'
     ;;
   *) exit 1 ;;
@@ -55,7 +57,6 @@ while [ "$#" -gt 0 ]; do
     *) exit 91 ;;
   esac
 done
-
 printf '%s %s\n' "$method" "$url" >>"$CURL_LOG"
 scenario=${CREDENTIAL_SCENARIO:-success}
 permissions='{"administration":"read","metadata":"read"}'
@@ -209,16 +210,7 @@ grep -Fx 'POST https://api.github.com/app/installations/42/access_tokens' \
 ! grep -Eq '^(PUT|PATCH|DELETE) ' "$CURL_LOG"
 ! grep -Fq 'fixture-installation-token' "$TMP/success.json"
 
-: >"$CURL_LOG"
-run_scenario extra-non-write >"$TMP/extra-non-write.json"
-jq -e '
-  .permissions == {
-    administration:"read",
-    contents:"read",
-    issues:"none",
-    metadata:"read"
-  }
-' "$TMP/extra-non-write.json" >/dev/null
+expect_failure extra-non-write run_scenario extra-non-write
 
 printf '12345\n' >"$TMP/app-id"
 printf '%s\n%s\n' fixture-key fixture-key-continuation >"$TMP/private-key"

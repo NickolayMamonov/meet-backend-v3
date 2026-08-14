@@ -47,9 +47,11 @@ issue_installation_token() {
 validate_permissions() {
   local file=$1
   jq -e '
-    type == "object" and .administration == "read" and .metadata == "read" and
-    (to_entries | all(.[]; .value == "read" or .value == "none")) and
-    (to_entries | all(.[]; .value != "write"))
+    type == "object" and
+    ((keys | sort) == ["administration"] or
+      (keys | sort) == ["administration","metadata"]) and
+    .administration == "read" and
+    (.metadata == null or .metadata == "read")
   ' "$file" >/dev/null || fail "effective permissions are not read-only"
 }
 
@@ -63,7 +65,7 @@ normalize() {
       schema:"meet-backend/immutable-policy-reader-credential/v1",
       repository:$repository,authority:"github-app-installation",
       repositorySelection:"selected",
-      permissions:{administration:.administration,metadata:.metadata},
+      permissions:{administration:.administration,metadata:(.metadata // "read")},
       configurableWritePermissions:[]
     }
   ' "$permissions")
@@ -136,9 +138,11 @@ main() {
   payload=$(jq -cn --argjson iat "$((now - 60))" --argjson exp "$((now + 540))" \
     --arg iss "$app_id" '{iat:$iat,exp:$exp,iss:$iss}' |
     base64 | tr -d '\n=' | tr '/+' '_-')
-  jwt=$(printf '%s.%s' "$header" "$payload" |
+  signing_input=$(printf '%s.%s' "$header" "$payload")
+  signature=$(printf '%s' "$signing_input" |
     openssl dgst -sha256 -sign "$WORK_DIR/private-key.pem" -binary |
     base64 | tr -d '\n=' | tr '/+' '_-')
+  jwt="$signing_input.$signature"
   api_request GET https://api.github.com/app/installations \
     "Bearer $jwt" "$WORK_DIR/installations.json"
   installations=$(jq -c --arg owner "$owner" '

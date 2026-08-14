@@ -30,8 +30,12 @@ jq -n --arg source "$SOURCE" '[{
   id:120,tag_name:"v1.0.0",target_commitish:$source,draft:true,prerelease:false,
   published_at:null,assets:[]
 }]' >"$TMP/draft.json"
-assert_output 'route=materialize' pre-action --repo-dir "$REPO" \
-  --dev-ref HEAD --releases-file "$TMP/draft.json" --refs-file "$TMP/refs.json"
+if "$RESOLVER" pre-action --repo-dir "$REPO" \
+  --dev-ref HEAD --releases-file "$TMP/draft.json" --refs-file "$TMP/refs.json" \
+  >"$TMP/stale.out" 2>"$TMP/stale.err"; then
+  echo "stale pre-existing draft was incorrectly materialized" >&2
+  exit 1
+fi
 jq -n --arg source "$SOURCE" '[{
   id:120,tag_name:"v1.0.0",target_commitish:$source,draft:false,prerelease:false,
   published_at:"2026-08-14T00:00:00Z",assets:[]

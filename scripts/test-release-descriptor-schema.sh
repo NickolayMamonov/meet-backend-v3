@@ -19,8 +19,21 @@ jq -n --arg source "$source_sha" '[{
   published_at:null,assets:[]
 }]' >"$TMP/releases.json"
 jq -n '{refs:{},tags:{}}' >"$TMP/refs.json"
-descriptor=$(scripts/resolve-release-descriptor.sh pre-action --repo-dir "$REPO" \
-  --dev-ref HEAD --releases-file "$TMP/releases.json" --refs-file "$TMP/refs.json")
+if scripts/resolve-release-descriptor.sh pre-action --repo-dir "$REPO" \
+  --dev-ref HEAD --releases-file "$TMP/releases.json" --refs-file "$TMP/refs.json" \
+  >"$TMP/stale.out" 2>"$TMP/stale.err"; then
+  echo "pre-existing draft was incorrectly materialized" >&2
+  exit 1
+fi
+jq -n --arg source "$source_sha" '[{
+  id:121,tag_name:"v1.0.0",target_commitish:$source,draft:true,prerelease:false,
+  published_at:null,assets:[]
+}]' >"$TMP/fresh-after.json"
+jq -n '[]' >"$TMP/fresh-before.json"
+descriptor=$(scripts/resolve-release-descriptor.sh post-action --repo-dir "$REPO" \
+  --dev-ref HEAD --tag v1.0.0 --version 1.0.0 --source-sha "$source_sha" \
+  --before-releases-file "$TMP/fresh-before.json" \
+  --after-releases-file "$TMP/fresh-after.json" --release-created true)
 grep -Fx 'route=materialize' <<<"$descriptor"
-grep -Fx "release_id=120" <<<"$descriptor"
+grep -Fx "release_id=121" <<<"$descriptor"
 echo "release descriptor schema fixtures passed"

@@ -14,6 +14,14 @@ EOF
 }
 
 command -v jq >/dev/null 2>&1 || fail "jq is required"
+path_arg() {
+  case "$1" in
+    [A-Za-z]:/*)
+      command -v cygpath >/dev/null 2>&1 && cygpath -u "$1" || printf '%s' "$1"
+      ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 mode=${1:-}
 case "$mode" in pre-action|post-action|verify) ;; *) usage ;; esac
 shift
@@ -34,20 +42,20 @@ after_file=
 release_created=
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --repo-dir) repo_dir=${2:?}; shift 2 ;;
+    --repo-dir) repo_dir=$(path_arg "${2:?}"); shift 2 ;;
     --dev-ref) dev_ref=${2:?}; shift 2 ;;
     --repository) repository=${2:?}; shift 2 ;;
-    --releases-file) releases_file=${2:?}; shift 2 ;;
-    --release-file) release_file=${2:?}; shift 2 ;;
-    --refs-file) refs_file=${2:?}; shift 2 ;;
+    --releases-file) releases_file=$(path_arg "${2:?}"); shift 2 ;;
+    --release-file) release_file=$(path_arg "${2:?}"); shift 2 ;;
+    --refs-file) refs_file=$(path_arg "${2:?}"); shift 2 ;;
     --release-id) expected_id=${2:?}; shift 2 ;;
     --tag) expected_tag=${2:?}; shift 2 ;;
     --version) expected_version=${2:?}; shift 2 ;;
     --source-sha) expected_source=${2:?}; shift 2 ;;
     --phase) phase=${2:?}; shift 2 ;;
     --allow-completed) allow_completed=true; shift ;;
-    --before-releases-file) before_file=${2:?}; shift 2 ;;
-    --after-releases-file) after_file=${2:?}; shift 2 ;;
+    --before-releases-file) before_file=$(path_arg "${2:?}"); shift 2 ;;
+    --after-releases-file) after_file=$(path_arg "${2:?}"); shift 2 ;;
     --release-created)
       release_created=${2:?}
       [ "$release_created" = true ] || [ "$release_created" = false ] || usage
@@ -105,7 +113,13 @@ relevant_ids() {
   jq -e 'type == "array" and all(.[]; type == "object")' "$file" >/dev/null ||
     fail "release-ID visibility snapshot is malformed"
   jq -r --arg tag "$authority_tag" --arg source "$authority_source" '
-    .[] | select(.tag_name == $tag or .target_commitish == $source) |
+    .[] |
+    select(
+      (.tag_name == $tag or .target_commitish == $source) and
+      (.id != 368531227) and
+      ((.tag_name == "v1.1.0" and
+        .target_commitish == "36ffd11ea4d35147f1df9c1cafa6a330300c1339") | not)
+    ) |
     .id | select(type == "number" and floor == . and . > 0)
   ' "$file" | sort -n
 }
@@ -212,14 +226,24 @@ if [ -n "$before_file" ] || [ -n "$after_file" ]; then
   esac
 fi
 mapfile -t candidates < <(jq -c --arg tag "$authority_tag" --arg source "$authority_source" '
-  .[] | select(.tag_name == $tag or .target_commitish == $source)
+  .[] | select(
+    (.tag_name == $tag or .target_commitish == $source) and
+    (.id != 368531227) and
+    ((.tag_name == "v1.1.0" and
+      .target_commitish == "36ffd11ea4d35147f1df9c1cafa6a330300c1339") | not)
+  )
 ' <<<"$releases")
 for candidate in "${candidates[@]}"; do validate_common "$candidate"; done
 
 before_has_published=false
 if [ -n "$before_file" ]; then
   mapfile -t before_candidates < <(jq -c --arg tag "$authority_tag" --arg source "$authority_source" '
-    .[] | select(.tag_name == $tag or .target_commitish == $source)
+    .[] | select(
+      (.tag_name == $tag or .target_commitish == $source) and
+      (.id != 368531227) and
+      ((.tag_name == "v1.1.0" and
+        .target_commitish == "36ffd11ea4d35147f1df9c1cafa6a330300c1339") | not)
+    )
   ' "$before_file")
   for candidate in "${before_candidates[@]}"; do
     validate_common "$candidate"
@@ -244,8 +268,7 @@ case "$mode" in
     fi
     if [ "$(jq -r '.draft' <<<"$candidate")" = true ] &&
        [ "$(jq -r '.published_at // "null"' <<<"$candidate")" = null ]; then
-      [ "$(resolve_ref "$authority_tag")" = absent ] || fail "pre-existing current ref"
-      emit materialize "$candidate" pre_action
+      fail "pre-existing current draft is stale; only a current-action fresh draft may materialize"
     else
       printf 'route=action\nactive=false\norigin=pre_action_published\nrelease_id=\ntag=%s\nversion=%s\nsource_sha=%s\n' \
         "$authority_tag" "$authority_version" "$authority_source"
