@@ -99,12 +99,11 @@ test "$(git diff --name-only "$BASE_COMMIT" "$APPROVED_HEAD")" = "$EXPECTED_PATH
 test "$(git cat-file -t "$ACTUAL_MERGE:$EXPECTED_PATH")" = blob
 readonly RUNBOOK_BLOB=$(git rev-parse "$ACTUAL_MERGE:$EXPECTED_PATH")
 test "$(git hash-object --no-filters "$RUNBOOK")" = "$RUNBOOK_BLOB"
-test "$(git hash-object --path="$EXPECTED_PATH" --no-filters "$RUNBOOK")" =
-  "$RUNBOOK_BLOB"
 git cat-file blob "$ACTUAL_MERGE:$EXPECTED_PATH" | cmp - "$RUNBOOK"
 ```
 
-The gate produces only the commit IDs, tree, blob, check conclusion, and
+The no-filter hash and byte-for-byte `cmp` are the raw installed-file proof;
+the gate produces only the commit IDs, tree, blob, check conclusion, and
 boolean gate result. It does not create a token or a durable authorization
 file. The merge/blob comment is separate from this file and must include the
 actual PR head, target base, merge tree, merge commit, runbook blob, and
@@ -114,11 +113,9 @@ installed Git blob hash.
 
 The values below are the only reviewed literals permitted in the command
 sheet. The host inventory must be captured read-only immediately before the
-first live block and compared literally. Any value marked
-`REVIEWED_LITERAL_REQUIRED` is an explicit admission block: it must be
-replaced with the observed literal through a new reviewed merge before any
-live execution. Do not discover a value and substitute it in the same
-session.
+first live block and compared literally. A mismatch is a stop condition that
+requires a new reviewed merge; do not discover a value and substitute it in
+the same session.
 
 | Item | Reviewed literal |
 | --- | --- |
@@ -132,16 +129,18 @@ session.
 | Certbot archive root | `/etc/letsencrypt/archive` |
 | Certbot renewal root | `/etc/letsencrypt/renewal` |
 | Certbot hook roots | `/etc/letsencrypt/renewal-hooks/{pre,deploy,post}` |
-| Certbot version | `REVIEWED_LITERAL_REQUIRED` (`2.9.x`) |
-| Primary live `cert.pem` link target | `REVIEWED_LITERAL_REQUIRED` |
-| Primary live `chain.pem` link target | `REVIEWED_LITERAL_REQUIRED` |
-| Primary live `fullchain.pem` link target | `REVIEWED_LITERAL_REQUIRED` |
-| Primary live `privkey.pem` link target | `REVIEWED_LITERAL_REQUIRED` |
-| Rollover live `cert.pem` link target | `REVIEWED_LITERAL_REQUIRED` |
-| Rollover live `chain.pem` link target | `REVIEWED_LITERAL_REQUIRED` |
-| Rollover live `fullchain.pem` link target | `REVIEWED_LITERAL_REQUIRED` |
-| Rollover live `privkey.pem` link target | `REVIEWED_LITERAL_REQUIRED` |
-| ACME webroot | `REVIEWED_LITERAL_REQUIRED` |
+| Certbot version | `2.9.0` |
+| Primary live `cert.pem` link target | `../../archive/api.whysoezzy.online/cert1.pem` |
+| Primary live `chain.pem` link target | `../../archive/api.whysoezzy.online/chain1.pem` |
+| Primary live `fullchain.pem` link target | `../../archive/api.whysoezzy.online/fullchain1.pem` |
+| Primary live `privkey.pem` link target | `../../archive/api.whysoezzy.online/privkey1.pem` |
+| Rollover live `cert.pem` link target | `../../archive/api.whysoezzy.online-rollover/cert1.pem` |
+| Rollover live `chain.pem` link target | `../../archive/api.whysoezzy.online-rollover/chain1.pem` |
+| Rollover live `fullchain.pem` link target | `../../archive/api.whysoezzy.online-rollover/fullchain1.pem` |
+| Rollover live `privkey.pem` link target | `../../archive/api.whysoezzy.online-rollover/privkey1.pem` |
+| ACME webroot | `/var/www/certbot` |
+| ACME webroot root | `/var/www` |
+| Deploy hook | `/etc/letsencrypt/renewal-hooks/deploy/reload-nginx`, SHA-256 `342a163b2e884ec7ba68a2a3ff08fc9461b5c672050c71f5f4f19465b9e9ec63` |
 | Backend listener | `127.0.0.1:8080` |
 | Backend version | `1.0.1` |
 | Immutable release | `368531227` |
@@ -171,7 +170,7 @@ group/other write bit, and have exactly one hardlink.
 | --- | --- | --- |
 | Exact reviewed symlink | Nginx enabled link and Certbot `live/<lineage>/{cert,chain,fullchain,privkey}.pem` links | `-L`, exact `readlink` text, root-owned link, link mode `0777`, one hardlink, safe canonical parent, target contained in the reviewed root |
 | Canonical directory | Nginx parents, `/etc/letsencrypt` roots, each lineage `live`/`archive` directory, hook directories | `-d` and not `-L`, `realpath -e` containment, owner `0:0`, exact reviewed mode `0755`, no group/other write |
-| Canonical regular file | Nginx source, renewal files, archive cert/chain/fullchain/key targets, rollback copy | `-f` and not `-L`, contained canonical path, owner `0:0`, reviewed mode (`0644` public/source/renewal, `0600` key/rollback), no group/other write, hardlink count `1` |
+| Canonical regular file | Nginx source, renewal files, deploy hook, archive cert/chain/fullchain/key targets, rollback copy | `-f` and not `-L`, contained canonical path, owner `0:0`, reviewed mode (`0644` public/source/renewal, `0755` deploy hook, `0600` key/rollback), no group/other write, hardlink count `1` |
 
 The following is the required positive gate. `WEBROOT` is not inferred by
 this command; it must be the reviewed literal from the inventory.
@@ -183,23 +182,16 @@ readonly PRIMARY=api.whysoezzy.online
 readonly ROLLOVER=api.whysoezzy.online-rollover
 readonly NGINX_SOURCE=/etc/nginx/sites-available/api.whysoezzy.online
 readonly NGINX_ENABLED=/etc/nginx/sites-enabled/api.whysoezzy.online
-readonly WEBROOT=REVIEWED_LITERAL_REQUIRED
-readonly PRIMARY_CERT_TARGET=REVIEWED_LITERAL_REQUIRED
-readonly PRIMARY_CHAIN_TARGET=REVIEWED_LITERAL_REQUIRED
-readonly PRIMARY_FULLCHAIN_TARGET=REVIEWED_LITERAL_REQUIRED
-readonly PRIMARY_PRIVKEY_TARGET=REVIEWED_LITERAL_REQUIRED
-readonly ROLLOVER_CERT_TARGET=REVIEWED_LITERAL_REQUIRED
-readonly ROLLOVER_CHAIN_TARGET=REVIEWED_LITERAL_REQUIRED
-readonly ROLLOVER_FULLCHAIN_TARGET=REVIEWED_LITERAL_REQUIRED
-readonly ROLLOVER_PRIVKEY_TARGET=REVIEWED_LITERAL_REQUIRED
-test "$WEBROOT" != REVIEWED_LITERAL_REQUIRED
-for target in \
-  "$PRIMARY_CERT_TARGET" "$PRIMARY_CHAIN_TARGET" \
-  "$PRIMARY_FULLCHAIN_TARGET" "$PRIMARY_PRIVKEY_TARGET" \
-  "$ROLLOVER_CERT_TARGET" "$ROLLOVER_CHAIN_TARGET" \
-  "$ROLLOVER_FULLCHAIN_TARGET" "$ROLLOVER_PRIVKEY_TARGET"; do
-  test "$target" != REVIEWED_LITERAL_REQUIRED
-done
+readonly WEBROOT=/var/www/certbot
+readonly WEBROOT_ROOT=/var/www
+readonly PRIMARY_CERT_TARGET=../../archive/api.whysoezzy.online/cert1.pem
+readonly PRIMARY_CHAIN_TARGET=../../archive/api.whysoezzy.online/chain1.pem
+readonly PRIMARY_FULLCHAIN_TARGET=../../archive/api.whysoezzy.online/fullchain1.pem
+readonly PRIMARY_PRIVKEY_TARGET=../../archive/api.whysoezzy.online/privkey1.pem
+readonly ROLLOVER_CERT_TARGET=../../archive/api.whysoezzy.online-rollover/cert1.pem
+readonly ROLLOVER_CHAIN_TARGET=../../archive/api.whysoezzy.online-rollover/chain1.pem
+readonly ROLLOVER_FULLCHAIN_TARGET=../../archive/api.whysoezzy.online-rollover/fullchain1.pem
+readonly ROLLOVER_PRIVKEY_TARGET=../../archive/api.whysoezzy.online-rollover/privkey1.pem
 
 assert_dir() {
   local path=$1 root=$2
@@ -239,14 +231,20 @@ assert_dir /etc/letsencrypt /etc
 assert_dir /etc/letsencrypt/live /etc/letsencrypt
 assert_dir /etc/letsencrypt/archive /etc/letsencrypt
 assert_dir /etc/letsencrypt/renewal /etc/letsencrypt
-for hook in pre deploy post; do
+assert_dir "$WEBROOT" "$WEBROOT_ROOT"
+for hook in pre post; do
   assert_dir "/etc/letsencrypt/renewal-hooks/$hook" /etc/letsencrypt
   test -z "$(find "/etc/letsencrypt/renewal-hooks/$hook" -mindepth 1 -maxdepth 1 -print -quit)"
 done
+assert_dir /etc/letsencrypt/renewal-hooks/deploy /etc/letsencrypt
+assert_file /etc/letsencrypt/renewal-hooks/deploy/reload-nginx 755 /etc/letsencrypt
+test "$(sha256sum /etc/letsencrypt/renewal-hooks/deploy/reload-nginx | awk '{print $1}')" =
+  342a163b2e884ec7ba68a2a3ff08fc9461b5c672050c71f5f4f19465b9e9ec63
 assert_file "$NGINX_SOURCE" 644 /etc/nginx
 assert_link "$NGINX_ENABLED" "$NGINX_SOURCE" /etc/nginx
 
-for lineage in "$PRIMARY" "$ROLLOVER"; do
+assert_lineage() {
+  local lineage=$1 live archive renewal name link target expected resolved
   live="/etc/letsencrypt/live/$lineage"
   archive="/etc/letsencrypt/archive/$lineage"
   renewal="/etc/letsencrypt/renewal/$lineage.conf"
@@ -276,7 +274,8 @@ for lineage in "$PRIMARY" "$ROLLOVER"; do
       *) exit 65 ;;
     esac
   done
-done
+}
+assert_lineage "$PRIMARY"
 ```
 
 The link itself is validated by `assert_link`; its resolved target is
@@ -284,6 +283,27 @@ validated separately. The operator must run the following target checks
 instead of weakening the class distinction:
 
 ```bash
+for lineage in "$PRIMARY"; do
+  archive="/etc/letsencrypt/archive/$lineage"
+  for name in cert chain fullchain; do
+    assert_file "$(realpath -e -- "/etc/letsencrypt/live/$lineage/$name.pem")" \
+      644 /etc/letsencrypt
+  done
+  assert_file "$(realpath -e -- "/etc/letsencrypt/live/$lineage/privkey.pem")" \
+    600 /etc/letsencrypt
+done
+```
+
+The primary-only gate above is the pre-creation topology gate: the rollover
+lineage is intentionally absent at that point. After the creation block
+below succeeds, rerun the following post-creation topology gate in the same
+reviewed shell. It uses the same `assert_lineage` helper and now requires
+both complete lineages and their reviewed first archive targets:
+
+```bash
+set -euo pipefail
+assert_lineage "$PRIMARY"
+assert_lineage "$ROLLOVER"
 for lineage in "$PRIMARY" "$ROLLOVER"; do
   archive="/etc/letsencrypt/archive/$lineage"
   for name in cert chain fullchain; do
@@ -310,11 +330,12 @@ in preflight.
 
 ### Certificate and renewal observations
 
-For each lineage, prove the persisted renewal file contains exactly one
-`key_type = ecdsa`, `elliptic_curve = secp256r1`, and `reuse_key = True` entry.
-Reject any `pre_hook`, `post_hook`, `renew_hook`, or `deploy_hook` setting and
-do not execute hook directories. Verify Certbot is version `2.9.x`; a
-different version is a stop condition.
+At this pre-creation stage, prove the primary renewal file contains exactly
+one `key_type = ecdsa`, `elliptic_curve = secp256r1`, and `reuse_key = True`
+entry. The rollover lineage is intentionally absent and is checked only after
+the creation block. Reject any `pre_hook`, `post_hook`, `renew_hook`, or
+`deploy_hook` setting and do not execute hook directories. Verify Certbot is
+version `2.9.x`; a different version is a stop condition.
 
 The only accepted public-key identity is:
 
@@ -351,7 +372,7 @@ assert_p256_pair() {
   printf '%s\n' "$cert_spki"
 }
 
-for lineage in api.whysoezzy.online api.whysoezzy.online-rollover; do
+for lineage in api.whysoezzy.online; do
   renewal="/etc/letsencrypt/renewal/$lineage.conf"
   test "$(grep -Ec '^key_type = ecdsa$' "$renewal")" = 1
   test "$(grep -Ec '^elliptic_curve = secp256r1$' "$renewal")" = 1
@@ -361,14 +382,12 @@ for lineage in api.whysoezzy.online api.whysoezzy.online-rollover; do
     "/etc/letsencrypt/live/$lineage/cert.pem" \
     "/etc/letsencrypt/live/$lineage/privkey.pem" >/dev/null
 done
-readonly CERTBOT_VERSION=REVIEWED_LITERAL_REQUIRED
-test "$CERTBOT_VERSION" != REVIEWED_LITERAL_REQUIRED
+readonly CERTBOT_VERSION=2.9.0
 test "$(certbot --version 2>&1)" = "certbot $CERTBOT_VERSION"
 ```
 
-The reviewed inventory must record the exact installed `2.9.x` version and
-replace `REVIEWED_LITERAL_REQUIRED` with that literal in a new reviewed merge.
-A range check is not a substitute for inventory.
+The reviewed inventory binds the exact installed Certbot version to `2.9.0`;
+a range check is not a substitute for inventory.
 
 ### Public edge and runtime invariants
 
@@ -457,7 +476,7 @@ set -euo pipefail
 certbot reconfigure --non-interactive \
   --cert-name api.whysoezzy.online \
   --reuse-key --key-type ecdsa --elliptic-curve secp256r1 \
-  --webroot --webroot-path REVIEWED_LITERAL_REQUIRED \
+  --webroot --webroot-path "$WEBROOT" \
   --preferred-challenges http-01 \
   --no-random-sleep-on-renew --no-directory-hooks
 test "$(grep -Ec '^key_type = ecdsa$' \
@@ -474,11 +493,15 @@ The rollover lineage must be wholly absent before this block:
 
 ```bash
 set -euo pipefail
-test ! -e /etc/letsencrypt/live/api.whysoezzy.online-rollover
-test ! -e /etc/letsencrypt/archive/api.whysoezzy.online-rollover
-test ! -e /etc/letsencrypt/renewal/api.whysoezzy.online-rollover.conf
+for path in \
+  /etc/letsencrypt/live/api.whysoezzy.online-rollover \
+  /etc/letsencrypt/archive/api.whysoezzy.online-rollover \
+  /etc/letsencrypt/renewal/api.whysoezzy.online-rollover.conf; do
+  test ! -e "$path"
+  test ! -L "$path"
+done
 certbot certonly --non-interactive --webroot \
-  --webroot-path REVIEWED_LITERAL_REQUIRED \
+  --webroot-path "$WEBROOT" \
   --domains api.whysoezzy.online \
   --cert-name api.whysoezzy.online-rollover \
   --key-type ecdsa --elliptic-curve secp256r1 \
@@ -492,9 +515,15 @@ test "$(grep -Ec '^reuse_key = True$' \
   /etc/letsencrypt/renewal/api.whysoezzy.online-rollover.conf)" = 1
 ```
 
-If any rollover path exists, do not delete, overwrite, or adopt it. Stop for
-review. The creation command uses a new lineage and a new P-256 key; it does
-not copy the primary key.
+If any rollover path exists, including a dangling symlink, do not delete,
+overwrite, or adopt it. Stop for review. The creation command uses a new
+lineage and a new P-256 key; it does not copy the primary key.
+
+Run the post-creation topology gate above immediately after this block. It
+must pass before any staging dry-run or later live block. In particular, the
+new `live` links must have the reviewed `../../archive/.../{cert1,chain1,
+fullchain1,privkey1}.pem` targets and their canonical targets must pass the
+regular-file checks.
 
 ### Per-lineage staging dry-runs
 
@@ -544,6 +573,13 @@ disables all traps and implicit errexit before calling it. It performs one
 copy restore, one `nginx -t`, one reload, and a complete external primary
 proof. It returns success only after that proof.
 
+`RELEASE_RECORD` must name a pre-existing, separately reviewed, sanitized
+one-line record. The routine accepts only this exact binding format, with the
+two image values obtained from the running backend container at proof time:
+`release=368531227 image=<Config.Image> image_id=<container Image ID>`.
+The record is read-only evidence; it is not a release asset, deployment
+command, or authorization to mutate release `368531227`.
+
 ```bash
 set -euo pipefail
 readonly NGINX_SOURCE=/etc/nginx/sites-available/api.whysoezzy.online
@@ -552,14 +588,19 @@ readonly ROLLBACK=/run/meet-spki-rollover.nginx.rollback
 : "${RELEASE_RECORD:?sanitized reviewed release record for immutable 368531227}"
 armed=0
 restore_attempted=0
+restore_in_progress=0
 stage=pre-switch
 candidate=
 cid=
 pgid=
 migration_before=
+primary_spki_before_switch=
+rollover_spki_before_switch=
 
 prove_primary_external() (
   set -e
+  local expected_spki=$1
+  test -n "$expected_spki"
   test ! -L "$NGINX_SOURCE"
   test "$(stat -c '%u:%g:%a:%h' -- "$NGINX_SOURCE")" = 0:0:644:1
   test -L "$NGINX_ENABLED"
@@ -577,7 +618,9 @@ prove_primary_external() (
     -verify_return_error </dev/null 2>/dev/null |
     openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER |
     openssl dgst -sha256 -binary | base64 | tr -d '\r\n')" =
-    "$(spki_from_cert /etc/letsencrypt/live/api.whysoezzy.online/cert.pem)"
+    "$expected_spki"
+  test "$(spki_from_cert \
+    /etc/letsencrypt/live/api.whysoezzy.online/cert.pem)" = "$expected_spki"
   grep -Fq \
     'ssl_certificate /etc/letsencrypt/live/api.whysoezzy.online/fullchain.pem;' \
     "$NGINX_SOURCE"
@@ -588,8 +631,9 @@ prove_primary_external() (
 
 prove_service_invariants() (
   set -e
-  local expected_migration=$1 current_migration
-  test "$(grep -Fxc 'release=368531227' "$RELEASE_RECORD")" = 1
+  local expected_migration=$1 current_migration running_image running_image_id
+  test -f "$RELEASE_RECORD"
+  test "$(wc -l < "$RELEASE_RECORD")" = 1
   test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
     https://api.whysoezzy.online/meetings)" = 200
   curl --silent --show-error --fail \
@@ -601,6 +645,14 @@ prove_service_invariants() (
   cid=$(/usr/local/libexec/meet-production/production-compose.sh ps -q backend)
   pgid=$(/usr/local/libexec/meet-production/production-compose.sh ps -q postgres)
   test -n "$cid" && test -n "$pgid"
+  running_image=$(docker inspect -f '{{.Config.Image}}' "$cid")
+  running_image_id=$(docker inspect -f '{{.Image}}' "$cid")
+  test -n "$running_image" && test -n "$running_image_id"
+  test "$(docker image inspect -f '{{.Id}}' "$running_image")" =
+    "$running_image_id"
+  test "$(grep -Fxc \
+    "release=368531227 image=$running_image image_id=$running_image_id" \
+    "$RELEASE_RECORD")" = 1
   test "$(docker inspect -f '{{.Config.User}}' "$cid")" = 10001:10001
   test "$(docker inspect -f \
     '{{index .Config.Labels "org.opencontainers.image.version"}}' "$cid")" = 1.0.1
@@ -620,9 +672,12 @@ prove_service_invariants() (
 prove_lineages_retained() (
   set -e
   for lineage in "$PRIMARY" "$ROLLOVER"; do
-    test -d "/etc/letsencrypt/live/$lineage"
-    test -d "/etc/letsencrypt/archive/$lineage"
-    test -f "/etc/letsencrypt/renewal/$lineage.conf"
+    test -d "/etc/letsencrypt/live/$lineage" &&
+      test ! -L "/etc/letsencrypt/live/$lineage"
+    test -d "/etc/letsencrypt/archive/$lineage" &&
+      test ! -L "/etc/letsencrypt/archive/$lineage"
+    test -f "/etc/letsencrypt/renewal/$lineage.conf" &&
+      test ! -L "/etc/letsencrypt/renewal/$lineage.conf"
     for name in cert chain fullchain privkey; do
       test -L "/etc/letsencrypt/live/$lineage/$name.pem"
       test -e "/etc/letsencrypt/live/$lineage/$name.pem"
@@ -630,11 +685,24 @@ prove_lineages_retained() (
   done
 )
 
+prove_saved_spkis() (
+  set -e
+  test -n "$primary_spki_before_switch"
+  test -n "$rollover_spki_before_switch"
+  test "$(spki_from_cert \
+    /etc/letsencrypt/live/api.whysoezzy.online/cert.pem)" =
+    "$primary_spki_before_switch"
+  test "$(spki_from_cert \
+    /etc/letsencrypt/live/api.whysoezzy.online-rollover/cert.pem)" =
+    "$rollover_spki_before_switch"
+)
+
 restore_primary_once() {
   if test "$restore_attempted" -ne 0; then
     return 90
   fi
   restore_attempted=1
+  restore_in_progress=1
   local status=0
   cp -- "$ROLLBACK" "$NGINX_SOURCE" || status=$?
   if test "$status" -eq 0; then
@@ -651,7 +719,7 @@ restore_primary_once() {
     systemctl reload nginx || status=$?
   fi
   if test "$status" -eq 0; then
-    prove_primary_external
+    prove_primary_external "$primary_spki_before_switch"
     status=$?
   fi
   if test "$status" -eq 0; then
@@ -662,6 +730,11 @@ restore_primary_once() {
     prove_lineages_retained
     status=$?
   fi
+  if test "$status" -eq 0; then
+    prove_saved_spkis
+    status=$?
+  fi
+  restore_in_progress=0
   return "$status"
 }
 
@@ -699,18 +772,44 @@ finish_failure() {
 on_exit() {
   local status=$?
   test "$status" -ne 0 || status=70
+  if test "$restore_in_progress" -eq 1; then
+    trap - EXIT INT TERM
+    armed=0
+    printf 'restore_failure original_status=%s stage=restore-interrupted\n' \
+      "$status" >&2
+    exit 91
+  fi
   test "$armed" -eq 1 || exit "$status"
   finish_failure "$status" "$stage"
 }
-on_int() { finish_failure 130 "$stage"; }
-on_term() { finish_failure 143 "$stage"; }
+on_int() {
+  if test "$restore_in_progress" -eq 1; then
+    trap - EXIT INT TERM
+    armed=0
+    printf 'restore_failure original_status=130 stage=restore-interrupted\n' >&2
+    exit 91
+  fi
+  finish_failure 130 "$stage"
+}
+on_term() {
+  if test "$restore_in_progress" -eq 1; then
+    trap - EXIT INT TERM
+    armed=0
+    printf 'restore_failure original_status=143 stage=restore-interrupted\n' >&2
+    exit 91
+  fi
+  finish_failure 143 "$stage"
+}
 ```
 
-The `finish_failure` function disables traps before restore and runs with
-`set +e`. A successful restore exits with the original nonzero trigger. A
-restore failure exits `91`, reports only sanitized status/stage values, and
-retains the rollback copy and both lineages. An armed zero-status `EXIT` is
-treated as trigger `70`. The handlers make exactly one restore attempt.
+The `finish_failure` function disables traps before failure restoration and
+runs with `set +e`. The normal path keeps all traps armed while the checked
+restore runs; `restore_in_progress` makes a signal during that proof a
+critical failure without recursively invoking restoration. A successful
+restore exits with the original nonzero trigger. A restore failure exits `91`,
+reports only sanitized status/stage values, and retains the rollback copy and
+both lineages. An armed zero-status `EXIT` is treated as trigger `70`. The
+handlers make exactly one restore attempt.
 
 ### Switch, proof, and normal restoration
 
@@ -721,6 +820,12 @@ has been reviewed in the current shell:
 set -euo pipefail
 cid=$(/usr/local/libexec/meet-production/production-compose.sh ps -q backend)
 pgid=$(/usr/local/libexec/meet-production/production-compose.sh ps -q postgres)
+primary_spki_before_switch=$(spki_from_cert \
+  /etc/letsencrypt/live/api.whysoezzy.online/cert.pem)
+rollover_spki_before_switch=$(spki_from_cert \
+  /etc/letsencrypt/live/api.whysoezzy.online-rollover/cert.pem)
+test "$primary_spki_before_switch" = "$primary_spki"
+test "$rollover_spki_before_switch" = "$rollover_spki"
 migration_before=$(docker exec "$pgid" psql -Atqc \
   'SELECT installed_rank,version,description,type,script,checksum,success FROM flyway_schema_history ORDER BY installed_rank' |
   sha256sum | awk '{print $1}')
@@ -787,10 +892,10 @@ test "$(grep -c \
   "$NGINX_SOURCE")" = 1
 
 stage=normal-restore
-trap - EXIT INT TERM
 set +e
 if restore_primary_once; then
   armed=0
+  trap - EXIT INT TERM
   cleanup_status=0
   if test -n "$candidate"; then
     rm -f -- "$candidate" || cleanup_status=$?
@@ -807,6 +912,8 @@ if restore_primary_once; then
   fi
 else
   restore_status=$?
+  armed=0
+  trap - EXIT INT TERM
   printf 'restore_failure original_status=0 stage=normal-restore restore_status=%s\n' \
     "$restore_status" >&2
   exit 91
@@ -815,11 +922,12 @@ fi
 
 The rollover proof must include the exact public hostname, valid chain, exact
 rollover SPKI, `GET /meetings` 200 JSON, external actuator `404`, invalid or
-unauthenticated admin `403`, backend v1.0.1/release `368531227`, user
-`10001:10001`, loopback binding, unpublished PostgreSQL, named volumes, and
-unchanged Flyway inventory. The final proof must repeat all of those checks
-with the exact primary SPKI, primary Nginx source directives, unchanged
-enabled symlink, and both retained lineages.
+unauthenticated admin `403`, backend v1.0.1, and the exact
+`release=368531227 image=<Config.Image> image_id=<container Image ID>`
+binding, plus user `10001:10001`, loopback binding, unpublished PostgreSQL,
+named volumes, and unchanged Flyway inventory. The final proof must repeat
+all of those checks with the exact primary SPKI, primary Nginx source
+directives, unchanged enabled symlink, and both retained lineages.
 
 If the switch or any proof fails, call `finish_failure <status> <stage>` while
 the traps are armed; do not call `restore_primary_once` a second time. If
@@ -881,6 +989,7 @@ actuator_status=404
 admin_status=403
 backend_version=1.0.1
 release=368531227
+release_running_image_binding=pass
 backend_user=10001:10001
 backend_listener=127.0.0.1:8080
 postgres_published=no
