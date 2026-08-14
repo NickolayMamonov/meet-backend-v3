@@ -195,7 +195,7 @@ registry_referrers() {
 
 registry_state() {
   local version=$1 source=$2 versions_file=$work_dir/versions.json
-  local versions subject digest digest_json bindings protected_versions referrers
+  local versions subject digest bindings protected_versions referrers
   registry_versions >"$versions_file"
   versions=$(jq -cS . "$versions_file")
   subject=$(jq -c --arg version "$version" --arg source "$source" '
@@ -207,11 +207,6 @@ registry_state() {
     ] | first // {}
   ' <<<"$versions")
   digest=$(jq -r '.digest // empty' <<<"$subject")
-  if [ -n "$digest" ]; then
-    digest_json=$(jq -cn --arg digest "$digest" '$digest')
-  else
-    digest_json=null
-  fi
   bindings=$(jq -cn --arg version "$version" --arg source "$source" \
     --argjson versions "$versions" '
     reduce [("v"+$version),$version,("sha-"+$source),"latest"][] as $alias
