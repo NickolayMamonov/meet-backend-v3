@@ -90,10 +90,11 @@ test -s "$HOSTED_CHECK_RECORD"
 grep -F "merge=$ACTUAL_MERGE" "$HOSTED_CHECK_RECORD" >/dev/null
 grep -F "conclusion=success" "$HOSTED_CHECK_RECORD" >/dev/null
 
-for parent in "$ACTUAL_MERGE^1" "$ACTUAL_MERGE^2"; do
-  changed=$(git diff --name-only "$parent" "$ACTUAL_MERGE")
-  test "$changed" = "$EXPECTED_PATH"
-done
+test "$(git diff --name-only "$ACTUAL_MERGE^1" "$ACTUAL_MERGE")" =
+  "$EXPECTED_PATH"
+test -z "$(git diff --name-only "$ACTUAL_MERGE^2" "$ACTUAL_MERGE")"
+test "$(git diff --name-only "$BASE_COMMIT" "$ACTUAL_MERGE")" =
+  "$EXPECTED_PATH"
 test "$(git diff --name-only "$BASE_COMMIT" "$APPROVED_HEAD")" = "$EXPECTED_PATH"
 test "$(git cat-file -t "$ACTUAL_MERGE:$EXPECTED_PATH")" = blob
 readonly RUNBOOK_BLOB=$(git rev-parse "$ACTUAL_MERGE:$EXPECTED_PATH")
@@ -427,15 +428,17 @@ validation, hostname validation, and chain validation:
 set -euo pipefail
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
-openssl s_client -connect api.whysoezzy.online:443 \
-  -servername api.whysoezzy.online \
-  -verify_hostname api.whysoezzy.online \
-  -verify_return_error </dev/null 2>"$tmp/tls.stderr" |
-  openssl x509 -out "$tmp/public-leaf.pem" -outform PEM
-test -s "$tmp/public-leaf.pem"
-spki_from_cert "$tmp/public-leaf.pem" |
-  grep -Eq '^[A-Za-z0-9+/]{43}=$'
-test "$(spki_from_cert "$tmp/public-leaf.pem")" =
+public_spki=$(
+  openssl s_client -connect api.whysoezzy.online:443 \
+    -servername api.whysoezzy.online \
+    -verify_hostname api.whysoezzy.online \
+    -verify_return_error </dev/null 2>"$tmp/tls.stderr" |
+    openssl x509 -pubkey -noout |
+    openssl pkey -pubin -outform DER |
+    openssl dgst -sha256 -binary | base64 | tr -d '\r\n'
+)
+printf '%s\n' "$public_spki" | grep -Eq '^[A-Za-z0-9+/]{43}=$'
+test "$public_spki" =
   "$(spki_from_cert /etc/letsencrypt/live/api.whysoezzy.online/cert.pem)"
 ```
 
@@ -545,7 +548,8 @@ proof. It returns success only after that proof.
 set -euo pipefail
 readonly NGINX_SOURCE=/etc/nginx/sites-available/api.whysoezzy.online
 readonly ROLLBACK_DIR=/run/meet-spki-rollover
-readonly ROLLBACK="$ROLLBACK_DIR/api.whysoezzy.online.nginx.rollback"
+readonly ROLLBACK=/run/meet-spki-rollover.nginx.rollback
+: "${RELEASE_RECORD:?sanitized reviewed release record for immutable 368531227}"
 armed=0
 restore_attempted=0
 stage=pre-switch
@@ -554,7 +558,14 @@ cid=
 pgid=
 migration_before=
 
-prove_primary_external() {
+prove_primary_external() (
+  set -e
+  test ! -L "$NGINX_SOURCE"
+  test "$(stat -c '%u:%g:%a:%h' -- "$NGINX_SOURCE")" = 0:0:644:1
+  test -L "$NGINX_ENABLED"
+  test "$(readlink -- "$NGINX_ENABLED")" = "$NGINX_SOURCE"
+  test "$(realpath -e -- "$NGINX_ENABLED")" = "$NGINX_SOURCE"
+  test "$(stat -c '%u:%g:%a:%h' -- "$NGINX_ENABLED")" = 0:0:777:1
   test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
     https://api.whysoezzy.online/meetings)" = 200
   test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -573,10 +584,12 @@ prove_primary_external() {
   grep -Fq \
     'ssl_certificate_key /etc/letsencrypt/live/api.whysoezzy.online/privkey.pem;' \
     "$NGINX_SOURCE"
-}
+)
 
-prove_service_invariants() {
+prove_service_invariants() (
+  set -e
   local expected_migration=$1 current_migration
+  test "$(grep -Fxc 'release=368531227' "$RELEASE_RECORD")" = 1
   test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
     https://api.whysoezzy.online/meetings)" = 200
   curl --silent --show-error --fail \
@@ -602,10 +615,25 @@ prove_service_invariants() {
     'SELECT installed_rank,version,description,type,script,checksum,success FROM flyway_schema_history ORDER BY installed_rank' |
     sha256sum | awk '{print $1}')
   test "$current_migration" = "$expected_migration"
-}
+)
+
+prove_lineages_retained() (
+  set -e
+  for lineage in "$PRIMARY" "$ROLLOVER"; do
+    test -d "/etc/letsencrypt/live/$lineage"
+    test -d "/etc/letsencrypt/archive/$lineage"
+    test -f "/etc/letsencrypt/renewal/$lineage.conf"
+    for name in cert chain fullchain privkey; do
+      test -L "/etc/letsencrypt/live/$lineage/$name.pem"
+      test -e "/etc/letsencrypt/live/$lineage/$name.pem"
+    done
+  done
+)
 
 restore_primary_once() {
-  test "$restore_attempted" = 0
+  if test "$restore_attempted" -ne 0; then
+    return 90
+  fi
   restore_attempted=1
   local status=0
   cp -- "$ROLLBACK" "$NGINX_SOURCE" || status=$?
@@ -614,16 +642,25 @@ restore_primary_once() {
     chmod 0644 -- "$NGINX_SOURCE" || status=$?
   fi
   if test "$status" -eq 0; then
+    cmp -- "$NGINX_SOURCE" "$ROLLBACK" || status=$?
+  fi
+  if test "$status" -eq 0; then
     nginx -t || status=$?
   fi
   if test "$status" -eq 0; then
     systemctl reload nginx || status=$?
   fi
   if test "$status" -eq 0; then
-    prove_primary_external || status=$?
+    prove_primary_external
+    status=$?
   fi
   if test "$status" -eq 0; then
-    prove_service_invariants "$migration_before" || status=$?
+    prove_service_invariants "$migration_before"
+    status=$?
+  fi
+  if test "$status" -eq 0; then
+    prove_lineages_retained
+    status=$?
   fi
   return "$status"
 }
@@ -640,10 +677,10 @@ finish_failure() {
       rm -f -- "$candidate" || cleanup_status=$?
     fi
     if test "$cleanup_status" -eq 0; then
-      rm -f -- "$ROLLBACK" || cleanup_status=$?
+      rmdir -- "$ROLLBACK_DIR" || cleanup_status=$?
     fi
     if test "$cleanup_status" -eq 0; then
-      rmdir -- "$ROLLBACK_DIR" || cleanup_status=$?
+      rm -f -- "$ROLLBACK" || cleanup_status=$?
     fi
     if test "$cleanup_status" -ne 0; then
       printf 'restore_failure original_status=%s stage=cleanup\n' \
@@ -688,8 +725,14 @@ migration_before=$(docker exec "$pgid" psql -Atqc \
   'SELECT installed_rank,version,description,type,script,checksum,success FROM flyway_schema_history ORDER BY installed_rank' |
   sha256sum | awk '{print $1}')
 [[ "$migration_before" =~ ^[0-9a-f]{64}$ ]]
-install -d -o 0 -g 0 -m 0700 "$ROLLBACK_DIR"
+test ! -e "$ROLLBACK_DIR"
+test ! -L "$ROLLBACK_DIR"
+test ! -e "$ROLLBACK"
+test ! -L "$ROLLBACK"
+mkdir --mode=0700 -- "$ROLLBACK_DIR"
 test "$(stat -c '%u:%g:%a' -- "$ROLLBACK_DIR")" = 0:0:700
+test ! -e "$ROLLBACK"
+test ! -L "$ROLLBACK"
 test "$(stat -c '%h' -- "$NGINX_SOURCE")" = 1
 cp -- "$NGINX_SOURCE" "$ROLLBACK"
 chown 0:0 -- "$ROLLBACK"
@@ -730,12 +773,6 @@ systemctl reload nginx
 
 stage=rollover-proof
 prove_service_invariants "$migration_before"
-test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
-  https://api.whysoezzy.online/meetings)" = 200
-test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
-  https://api.whysoezzy.online/actuator/health/readiness)" = 404
-test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
-  https://api.whysoezzy.online/admin/ingest)" = 403
 test "$(openssl s_client -connect api.whysoezzy.online:443 \
   -servername api.whysoezzy.online -verify_hostname api.whysoezzy.online \
   -verify_return_error </dev/null 2>/dev/null |
@@ -750,23 +787,26 @@ test "$(grep -c \
   "$NGINX_SOURCE")" = 1
 
 stage=normal-restore
+trap - EXIT INT TERM
+set +e
 if restore_primary_once; then
   armed=0
-  trap - EXIT INT TERM
   cleanup_status=0
-  rm -f -- "$ROLLBACK" || cleanup_status=$?
+  if test -n "$candidate"; then
+    rm -f -- "$candidate" || cleanup_status=$?
+  fi
   if test "$cleanup_status" -eq 0; then
     rmdir -- "$ROLLBACK_DIR" || cleanup_status=$?
   fi
+  if test "$cleanup_status" -eq 0; then
+    rm -f -- "$ROLLBACK" || cleanup_status=$?
+  fi
   if test "$cleanup_status" -ne 0; then
     printf 'restore_failure original_status=0 stage=cleanup\n' >&2
-    set +e
     exit 91
   fi
 else
   restore_status=$?
-  trap - EXIT INT TERM
-  set +e
   printf 'restore_failure original_status=0 stage=normal-restore restore_status=%s\n' \
     "$restore_status" >&2
   exit 91
