@@ -21,7 +21,7 @@ version=
 tag=
 source_sha=
 ref=
-operation=read
+operation='read'
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repository) repository=${2:?}; shift 2 ;;

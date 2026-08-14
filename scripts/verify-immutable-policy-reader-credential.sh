@@ -87,7 +87,7 @@ main() {
   local token_file=
   local output_file=
   local private_key=${IMMUTABLE_POLICY_READER_PRIVATE_KEY:-}
-  local owner repo now header payload jwt installations installation_id token
+  local owner repo now header payload signing_input signature jwt installations installation_id token
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --repository) repository=${2:?}; shift 2 ;;

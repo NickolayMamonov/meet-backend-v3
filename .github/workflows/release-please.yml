@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  attestations: read
 
 concurrency:
   group: backend-release-${{ github.repository }}
@@ -24,6 +25,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      attestations: read
     outputs:
       route: ${{ steps.route.outputs.route }}
       release_id: ${{ steps.route.outputs.release_id }}
@@ -207,6 +209,7 @@ jobs:
       contents: write
       packages: write
       id-token: write
+      attestations: read
     env:
       RELEASE_ID: ${{ needs.controller.outputs.release_id }}
       TAG: ${{ needs.controller.outputs.release_tag }}
@@ -277,6 +280,19 @@ jobs:
             --token-file "$RUNNER_TEMP/reader-token" \
             --credential-proof "$RUNNER_TEMP/reader-proof.json"
 
+      - name: Admit empty candidate registry
+        run: |
+          set -euo pipefail
+          registry_state="$RUNNER_TEMP/registry-before-image.txt"
+          scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+            --quarantine-file "$RUNNER_TEMP/registry-quarantine.json" \
+            >"$registry_state"
+          grep -Fx "v$VERSION absent" "$registry_state"
+          grep -Fx "$VERSION absent" "$registry_state"
+          grep -Fx "sha-$SOURCE_SHA absent" "$registry_state"
+          latest=$(awk -F= '$1 == "latest" { print $2 }' "$registry_state")
+          [ "$latest" = absent ]
+
       - name: Build and attest exact image
         run: |
           set -euo pipefail
@@ -287,10 +303,26 @@ jobs:
             --build-arg "BACKEND_REVISION=$SOURCE_SHA" .
           # The workflow-created attestation is pre-PATCH evidence only.
 
+      - name: Verify exact candidate registry convergence
+        run: |
+          set -euo pipefail
+          registry_state="$RUNNER_TEMP/registry-after-image.txt"
+          scripts/release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA" \
+            --quarantine-file "$RUNNER_TEMP/registry-quarantine-after-image.json" \
+            >"$registry_state"
+          digest=$(awk -v alias="v$VERSION" '$1 == alias { print $2 }' "$registry_state")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          for alias in "v$VERSION" "$VERSION" "sha-$SOURCE_SHA"; do
+            grep -Fx "$alias $digest" "$registry_state"
+          done
+          latest=$(awk -F= '$1 == "latest" { print $2 }' "$registry_state")
+          [ "$latest" = absent ]
+
       - name: Generate deterministic release evidence
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/release-assets"
+          docker pull "$IMAGE:$TAG"
           docker buildx imagetools inspect "$IMAGE:$TAG" --raw \
             >"$RUNNER_TEMP/release-assets/image-index.json"
           docker buildx imagetools inspect "$IMAGE:$TAG" \
@@ -309,11 +341,10 @@ jobs:
               platform:"linux/amd64",
               publicationPolicy:"exactly-three-aliases-publish-last",
               provenance:true,sbom:true,artifactAttestation:true,
-              evidence:["release-manifest.json","image-index.json",
-                "image-inspect.txt","SHA256SUMS"]
+              evidence:["image-index.json","image-inspect.txt"]
             }' >"$RUNNER_TEMP/release-assets/release-manifest.json"
           scripts/verify-release-consistency.sh "$VERSION" "$SOURCE_SHA" \
-            --tag "$TAG" \
+            --tag "$TAG" --image "$IMAGE" --image-ref "$IMAGE:$TAG" \
             --manifest "$RUNNER_TEMP/release-assets/release-manifest.json"
           sha256sum "$RUNNER_TEMP/release-assets/release-manifest.json" \
             "$RUNNER_TEMP/release-assets/image-index.json" \

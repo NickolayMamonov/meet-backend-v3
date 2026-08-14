@@ -78,6 +78,7 @@ if [ -n "$MANIFEST" ]; then
       .provenance == true and
       .sbom == true and
       .artifactAttestation == true and
+      .evidence == ["image-index.json", "image-inspect.txt"] and
       .aliases == [$tag, $version, ("sha-" + $source)] and
       (.digest | test("^sha256:[0-9a-f]{64}$"))
     ' "$MANIFEST"

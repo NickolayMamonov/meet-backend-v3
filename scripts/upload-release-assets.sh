@@ -52,7 +52,7 @@ if [ -n "$policy_token_file" ]; then
 fi
 
 validate_prefix() {
-  local phase=$1 release asset index expected_name expected_sha
+  local phase=$1 release asset index expected_sha
   release=$(gh api "repos/$repository/releases/$release_id") ||
     fail "live release read failed before asset phase $phase"
   jq -e --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" \
@@ -89,7 +89,7 @@ for asset in "${assets[@]}"; do
     "$script_dir/verify-immutable-release-policy.sh" \
       "${policy_args[@]}" >/dev/null
   fi
-  gh release upload "$release_id" "$assets_dir/$asset" --repo "$repository" ||
+  gh release upload "$tag" "$assets_dir/$asset" --repo "$repository" ||
     fail "asset upload failed: $asset"
   phase=$((phase + 1))
 done

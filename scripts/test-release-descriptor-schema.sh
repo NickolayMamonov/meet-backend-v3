@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -r -- "$TMP"' EXIT HUP INT TERM
 REPO=$TMP/repo
@@ -35,5 +34,15 @@ descriptor=$(scripts/resolve-release-descriptor.sh post-action --repo-dir "$REPO
   --before-releases-file "$TMP/fresh-before.json" \
   --after-releases-file "$TMP/fresh-after.json" --release-created true)
 grep -Fx 'route=materialize' <<<"$descriptor"
+grep -Fx 'active=true' <<<"$descriptor"
+grep -Fx 'origin=post_action' <<<"$descriptor"
 grep -Fx "release_id=121" <<<"$descriptor"
+grep -Fx 'tag=v1.0.0' <<<"$descriptor"
+grep -Fx 'version=1.0.0' <<<"$descriptor"
+grep -Fx "source_sha=$source_sha" <<<"$descriptor"
+grep -Fx "target_commitish=$source_sha" <<<"$descriptor"
+grep -Fx 'draft=true' <<<"$descriptor"
+grep -Fx 'prerelease=false' <<<"$descriptor"
+grep -Fx 'published_at=null' <<<"$descriptor"
+grep -Fx 'asset_inventory_kind=empty' <<<"$descriptor"
 echo "release descriptor schema fixtures passed"

@@ -18,6 +18,8 @@ if "$VERIFY" --repository FixtureOwner/repo --policy-file "$TMP/disabled.json" \
 fi
 for method in PUT PATCH DELETE; do
   if (
+    # shellcheck source=verify-immutable-release-policy.sh
+    # shellcheck disable=SC1090
     source "$VERIFY"
     api_request "$method" https://api.github.com/forbidden token "$TMP/out"
   ) >/dev/null 2>&1; then

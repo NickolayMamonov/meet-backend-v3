@@ -52,7 +52,6 @@ if [ -n "$assets_dir" ]; then
   [ -d "$assets_dir" ] || fail "asset directory is missing"
   for asset in "${assets[@]}"; do
     [ -f "$assets_dir/$asset" ] || fail "expected asset is missing: $asset"
-    digest=$(sha256sum "$assets_dir/$asset" | awk '{print $1}')
   done
 fi
 jq_filter='

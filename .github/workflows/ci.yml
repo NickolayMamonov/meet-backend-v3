@@ -196,6 +196,7 @@ jobs:
           shellcheck --severity=warning "$TOOLING_SCRIPTS"/*.sh
           "$TOOLING_SCRIPTS/test-release-asset-inventory.sh"
           "$TOOLING_SCRIPTS/test-release-registry-state.sh"
+          "$TOOLING_SCRIPTS/test-upload-release-assets.sh"
           "$TOOLING_SCRIPTS/test-release-evidence.sh"
           "$TOOLING_SCRIPTS/test-immutable-policy-reader-credential.sh"
           "$TOOLING_SCRIPTS/test-immutable-release-policy.sh"

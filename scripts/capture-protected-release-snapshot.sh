@@ -213,9 +213,14 @@ registry_state() {
     digest_json=null
   fi
   bindings=$(jq -cn --arg version "$version" --arg source "$source" \
-    --argjson digest "$digest_json" '
-    {("v"+$version):$digest,($version):$digest,
-     ("sha-"+$source):$digest,latest:$digest}
+    --argjson versions "$versions" '
+    reduce [("v"+$version),$version,("sha-"+$source),"latest"][] as $alias
+      ({};
+       .[$alias] = (
+         [$versions[] | select(.tags | index($alias)) | .digest] |
+         unique |
+         if length == 1 then .[0] else null end
+       ))
   ')
   protected_versions=$(jq -cS --arg digest "$digest" '
     if $digest == "" then [] else map(select(.digest == $digest)) end
@@ -238,7 +243,7 @@ registry_state() {
 attestation_state() {
   local digest=$1 file=$work_dir/attestations.json
   [ "$digest" != null ] || { printf '[]'; return; }
-  if ! gh api "repos/$repository/attestations/sha/${digest#sha256:}" \
+  if ! gh api "repos/$repository/attestations/$digest" \
       >"$file" 2>"$work_dir/attestation-error"; then
     grep -Eq 'HTTP 404|Not Found' "$work_dir/attestation-error" ||
       fail "GitHub attestation read failed"

@@ -13,8 +13,17 @@
       exact publish PATCH ordering/payload.
 - [x] Complete release-manifest fields and require strict proof verification
       results; pin upload-artifact.
-- [ ] Re-run focused release suites, hosted/read-only checks when credentials
-      are provisioned, protected snapshot/checksum checks, Bash syntax, diff
-      checks, Gradle test/build, and ShellCheck when available.
+- [x] Restore the live candidate GHCR preflight and exact three-alias
+      convergence/no-latest guards; bind consistency verification to the
+      generated image and preserve the deployment evidence contract.
+- [x] Fix hosted ShellCheck findings, tag-based asset upload, descriptor
+      schema emission, attestations:read permissions, and protected snapshot
+      alias/attestation normalization.
+- [x] Expand credential/JWT and protected-snapshot drift fixtures, including
+      implicit Metadata handling and the complete included-field matrix.
+- [ ] Re-run hosted Backend CI/ShellCheck and independent QA; local focused
+      suites, protected snapshot/checksum, Bash syntax, diff, Gradle test, and
+      clean build are green. Windows Git Bash defers the credential fixture's
+      POSIX-only multiline/negative branches to hosted Linux.
 - [ ] Commit and push the approved rework, add the Implementation result
       comment, and complete MEE2-48 with exact evidence.

@@ -200,7 +200,7 @@ emit() {
   if [ "$(jq '.assets | length' <<<"$release")" -eq 0 ]; then kind=empty; else kind=complete; fi
   printf 'route=%s\nactive=%s\norigin=%s\nrelease_id=%s\ntag=%s\nversion=%s\nsource_sha=%s\ntarget_commitish=%s\ndraft=%s\nprerelease=%s\npublished_at=%s\nasset_inventory_kind=%s\n' \
     "$route" "$([ "$route" = completed ] && echo false || echo true)" "$origin" \
-    "$id" "$tag" "$authority_version" "$target" \
+    "$id" "$tag" "$authority_version" "$authority_source" "$target" \
     "$(jq -r '.draft' <<<"$release")" "$(jq -r '.prerelease' <<<"$release")" \
     "$(jq -c '.published_at // null' <<<"$release")" "$kind"
 }
