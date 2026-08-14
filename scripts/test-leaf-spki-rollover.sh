@@ -28,6 +28,28 @@ digest() {
   sha256sum -- "$1" | awk '{print $1}'
 }
 
+observation() {
+  local fixture=$1 key=$2
+  awk -F= -v wanted="$key" '$1 == wanted { print substr($0, length($1) + 2) }' \
+    "$fixture/observations/leaf-spki.kv"
+}
+
+fixture_invariant_digest() {
+  local fixture=$1 source key
+  source=${2:-"$fixture/nginx-source.conf"}
+  {
+    digest "$source"
+    cat "$fixture/topology.digest"
+    for key in api_status api_shape api_digest actuator_status admin_status backend_source \
+      backend_image_digest backend_version backend_user backend_listener backend_health \
+      compose_project compose_service postgres_image_digest postgres_published \
+      backend_volume postgres_volume flyway_migration_digest; do
+      printf '%s=' "$key"
+      observation "$fixture" "$key"
+    done
+  } | sha256sum | awk '{print $1}'
+}
+
 write_primary_source() {
   printf '%s\n' \
     "server_name $HOSTNAME;" \
@@ -71,7 +93,8 @@ write_mixed_source() {
 
 make_fixture() {
   local fixture=$1
-  mkdir -p "$fixture/observations"
+  mkdir -p "$fixture/observations" "$fixture/recovery" "$fixture/state"
+  chmod 700 "$fixture/recovery" "$fixture/state"
   write_primary_source "$fixture/nginx-source.conf"
   printf '%064d\n' 0 >"$fixture/topology.digest"
   {
@@ -97,6 +120,7 @@ make_fixture() {
     printf 'production_account=production_account\n'
     printf 'staging_account=staging_account\n'
     printf 'api_status=200\napi_shape=VALID\n'
+    printf 'api_digest=%064d\n' 1
     printf 'actuator_status=403\nadmin_status=403\n'
     printf 'backend_source=%s\nbackend_image_digest=%s\nbackend_version=1.0.1\n' \
       "$TOOL_REVISION" \
@@ -119,7 +143,7 @@ make_fixture() {
 
 make_package() {
   local fixture=$1 name=$2 installed=${3:-primary}
-  local package="$fixture/recovery/$name" source_path manifest
+  local package="$fixture/recovery/$name" source_path manifest invariant_digest
   local original candidate mixed_certificate mixed_key
   mkdir -p "$package" "$fixture/state"
   chmod 700 "$fixture/recovery" "$package" "$fixture/state"
@@ -140,6 +164,7 @@ make_package() {
     *) fail "unknown installed package source $installed" ;;
   esac
   source_path=$(cd "$fixture" && pwd -P)/nginx-source.conf
+  invariant_digest=$(fixture_invariant_digest "$fixture" "$original")
   manifest=$package/manifest.kv
   {
     printf 'schema=1\nhostname=%s\nsource_path=%s\n' "$HOSTNAME" "$source_path"
@@ -151,6 +176,7 @@ make_package() {
       "$(stat -c '%a' "$original")"
     printf 'tool_revision=%s\n' "$TOOL_REVISION"
     printf 'topology_digest=%s\n' "$(<"$fixture/topology.digest")"
+    printf 'invariant_digest=%s\n' "$invariant_digest"
     printf 'primary_certificate=%s\nprimary_key=%s\n' "$PRIMARY_CERT" "$PRIMARY_KEY"
     printf 'candidate_digest=%s\n' "$(digest "$candidate")"
     printf 'mixed_certificate_digest=%s\n' "$(digest "$mixed_certificate")"
@@ -271,7 +297,8 @@ expect_status 0 configure-primary run_tool "$fixture" configure-primary
 assert_argv "$fixture" configure-primary \
   /usr/bin/certbot reconfigure --non-interactive --cert-name "$PRIMARY_LINEAGE" \
   --webroot --webroot-path /var/www/certbot \
-  --key-type ecdsa --elliptic-curve secp256r1 --reuse-key --no-directory-hooks
+  --key-type ecdsa --elliptic-curve secp256r1 --reuse-key \
+  --preferred-challenges http-01 --no-random-sleep-on-renew --no-directory-hooks
 
 : >"$fixture/effects.log"
 expect_status 0 ensure-rollover-existing run_tool "$fixture" ensure-rollover
@@ -279,7 +306,8 @@ assert_output "rollover_spki=$ROLLOVER_SPKI" ensure-rollover-existing
 assert_argv "$fixture" ensure-rollover-existing \
   /usr/bin/certbot reconfigure --non-interactive --cert-name "$ROLLOVER_LINEAGE" \
   --webroot --webroot-path /var/www/certbot \
-  --key-type ecdsa --elliptic-curve secp256r1 --reuse-key --no-directory-hooks
+  --key-type ecdsa --elliptic-curve secp256r1 --reuse-key \
+  --preferred-challenges http-01 --no-random-sleep-on-renew --no-directory-hooks
 
 : >"$fixture/effects.log"
 expect_status 0 configure-rollover run_tool "$fixture" configure-rollover
@@ -291,14 +319,16 @@ expect_status 0 verify-primary-renewal run_tool "$fixture" verify-primary-renewa
 assert_argv "$fixture" verify-primary-renewal \
   /usr/bin/certbot renew --non-interactive --cert-name "$PRIMARY_LINEAGE" \
   --dry-run --server https://acme-staging-v02.api.letsencrypt.org/directory \
-  --account staging_account --no-directory-hooks
+  --account staging_account --preferred-challenges http-01 \
+  --no-random-sleep-on-renew --no-directory-hooks
 
 : >"$fixture/effects.log"
 expect_status 0 verify-rollover-renewal run_tool "$fixture" verify-rollover-renewal
 assert_argv "$fixture" verify-rollover-renewal \
   /usr/bin/certbot renew --non-interactive --cert-name "$ROLLOVER_LINEAGE" \
   --dry-run --server https://acme-staging-v02.api.letsencrypt.org/directory \
-  --account staging_account --no-directory-hooks
+  --account staging_account --preferred-challenges http-01 \
+  --no-random-sleep-on-renew --no-directory-hooks
 
 : >"$fixture/effects.log"
 expect_status 0 drill run_tool "$fixture" drill
@@ -314,10 +344,14 @@ assert_effect "$fixture" nginx-reload drill
 assert_effect "$fixture" parent-sync drill
 assert_argv "$fixture" drill-primary-renewal \
   /usr/bin/certbot renew --non-interactive --cert-name "$PRIMARY_LINEAGE" \
-  --dry-run --no-directory-hooks
+  --dry-run --server https://acme-staging-v02.api.letsencrypt.org/directory \
+  --account staging_account --preferred-challenges http-01 \
+  --no-random-sleep-on-renew --no-directory-hooks
 assert_argv "$fixture" drill-rollover-renewal \
   /usr/bin/certbot renew --non-interactive --cert-name "$ROLLOVER_LINEAGE" \
-  --dry-run --no-directory-hooks
+  --dry-run --server https://acme-staging-v02.api.letsencrypt.org/directory \
+  --account staging_account --preferred-challenges http-01 \
+  --no-random-sleep-on-renew --no-directory-hooks
 grep -Fx restore_mode=DRILL "$fixture/state/evidence.kv" >/dev/null ||
   fail "drill evidence did not supersede restore evidence"
 
@@ -332,7 +366,8 @@ assert_argv "$fixture" ensure-rollover-absent \
   --account production_account --webroot --webroot-path /var/www/certbot \
   --domains "$HOSTNAME" \
   --cert-name "$ROLLOVER_LINEAGE" --key-type ecdsa \
-  --elliptic-curve secp256r1 --new-key --reuse-key --no-directory-hooks
+  --elliptic-curve secp256r1 --new-key --reuse-key \
+  --preferred-challenges http-01 --no-random-sleep-on-renew --no-directory-hooks
 
 # Active-only restore accepts each explicitly bound intermediate and ends in
 # completed. Completed-only finalization has a deliberately tiny effect set.
@@ -413,7 +448,8 @@ expect_status 74 certbot-failure env \
 assert_argv "$fixture" certbot-failure \
   /usr/bin/certbot reconfigure --non-interactive --cert-name "$PRIMARY_LINEAGE" \
   --webroot --webroot-path /var/www/certbot \
-  --key-type ecdsa --elliptic-curve secp256r1 --reuse-key --no-directory-hooks
+  --key-type ecdsa --elliptic-curve secp256r1 --reuse-key \
+  --preferred-challenges http-01 --no-random-sleep-on-renew --no-directory-hooks
 ! grep -E 'nginx|preparing-to-active|active-to-completed' "$fixture/effects.log" >/dev/null ||
   fail "Certbot failure crossed a forbidden boundary"
 
@@ -510,9 +546,23 @@ fi
 
 fixture=$TMP/state-mode
 make_fixture "$fixture"
+rmdir "$fixture/state"
 printf 'unsafe\n' >"$fixture/state"
 expect_status 65 state-mode run_tool "$fixture" inspect
 assert_no_effects "$fixture" state-mode
+
+fixture=$TMP/state-missing
+make_fixture "$fixture"
+rmdir "$fixture/state"
+expect_status 65 state-missing run_tool "$fixture" inspect
+assert_no_effects "$fixture" state-missing
+
+fixture=$TMP/extra-tls-directive
+make_fixture "$fixture"
+printf 'ssl_certificate /etc/letsencrypt/live/extra/fullchain.pem;\n' \
+  >>"$fixture/nginx-source.conf"
+expect_status 65 extra-tls-directive run_tool "$fixture" drill
+assert_no_effects "$fixture" extra-tls-directive
 
 fixture=$TMP/evidence-symlink
 make_fixture "$fixture"

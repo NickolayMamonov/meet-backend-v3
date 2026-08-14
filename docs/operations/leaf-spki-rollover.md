@@ -70,6 +70,32 @@ test "$(git rev-parse "$M^{tree}")" = "$T"
 test "$(git rev-parse "$C^1")" = "$B"
 test "$(git rev-parse "$C^2")" = "$H"
 test "$(git rev-parse "$C^{tree}")" = "$T"
+expected_tooling=$(printf '%s\n' \
+  scripts/leaf-spki-rollover.sh scripts/lib/leaf-spki-rollover.sh \
+  scripts/test-leaf-spki-rollover.sh docs/operations/leaf-spki-rollover.md | sort)
+actual_tooling=$(git ls-tree -r --name-only "$C" -- \
+  scripts/leaf-spki-rollover.sh scripts/lib/leaf-spki-rollover.sh \
+  scripts/test-leaf-spki-rollover.sh docs/operations/leaf-spki-rollover.md | sort)
+test "$actual_tooling" = "$expected_tooling"
+while IFS= read -r record; do
+  mode=${record%% *}
+  rest=${record#* }
+  type=${rest%% *}
+  rest=${rest#* }
+  object=${rest%%$'\t'*}
+  path=${rest#*$'\t'}
+  test "$type" = blob
+  case "$path" in
+    scripts/leaf-spki-rollover.sh|scripts/test-leaf-spki-rollover.sh)
+      test "$mode" = 100755 ;;
+    scripts/lib/leaf-spki-rollover.sh|docs/operations/leaf-spki-rollover.md)
+      test "$mode" = 100644 ;;
+    *) exit 65 ;;
+  esac
+  test "$(git cat-file -t "$C:$path")" = blob
+done < <(git ls-tree -r "$C" -- \
+  scripts/leaf-spki-rollover.sh scripts/lib/leaf-spki-rollover.sh \
+  scripts/test-leaf-spki-rollover.sh docs/operations/leaf-spki-rollover.md)
 test -s "$HOSTED_CHECK_RECORD"
 grep -F "merge=$M" "$HOSTED_CHECK_RECORD" >/dev/null
 grep -F "conclusion=success" "$HOSTED_CHECK_RECORD" >/dev/null
@@ -88,6 +114,14 @@ for directory in /usr/local /usr/local/libexec "$installed" "$installed/lib"; do
   test -d "$directory" && test ! -L "$directory"
   test "$(stat -c '%u:%g' "$directory")" = 0:0
   test $((8#$(stat -c '%a' "$directory") & 8#022)) -eq 0
+done
+test "$(find "$installed" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" =
+  $'leaf-spki-rollover.sh\nlib'
+test "$(find "$installed/lib" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" =
+  'leaf-spki-rollover.sh'
+for file in "$installed/leaf-spki-rollover.sh" "$installed/lib/leaf-spki-rollover.sh"; do
+  test -f "$file" && test ! -L "$file"
+  test "$(stat -c '%h' "$file")" = 1
 done
 ```
 
@@ -144,7 +178,8 @@ primary command is:
 ```text
 certbot reconfigure --non-interactive --cert-name api.whysoezzy.online \
   --reuse-key --key-type ecdsa --elliptic-curve secp256r1 --webroot \
-  --webroot-path <DISCOVERED_WEBROOT> --no-directory-hooks
+  --webroot-path <DISCOVERED_WEBROOT> --preferred-challenges http-01 \
+  --no-random-sleep-on-renew --no-directory-hooks
 ```
 
 When the rollover lineage is wholly absent, use:
@@ -153,7 +188,8 @@ When the rollover lineage is wholly absent, use:
 certbot certonly --non-interactive --webroot \
   --webroot-path <DISCOVERED_WEBROOT> --domains api.whysoezzy.online \
   --cert-name api.whysoezzy.online-rollover --key-type ecdsa \
-  --elliptic-curve secp256r1 --new-key --reuse-key --no-directory-hooks
+  --elliptic-curve secp256r1 --new-key --reuse-key \
+  --preferred-challenges http-01 --no-random-sleep-on-renew --no-directory-hooks
 ```
 
 An existing rollover lineage uses the same `reconfigure` form with its exact
@@ -161,7 +197,8 @@ An existing rollover lineage uses the same `reconfigure` form with its exact
 
 ```text
 certbot renew --non-interactive --cert-name <EXACT_LINEAGE> \
-  --dry-run --no-directory-hooks
+  --dry-run --preferred-challenges http-01 --no-random-sleep-on-renew \
+  --no-directory-hooks
 ```
 
 Before any Certbot operation, reject saved `pre_hook`, `post_hook`,
@@ -199,7 +236,10 @@ At every gate, prove the external SNI/hostname/normal CA chain, public API
 JSON canary, denied public Actuator and admin probes, immutable backend
 source/version/image digest, UID/GID, health, loopback-only `127.0.0.1:8080`
 publication, Compose identity, unpublished PostgreSQL, named volumes, and
-Flyway migration digest. Never inspect or emit container environments.
+Flyway migration digest. The fixed live Compose observer is
+`/usr/local/libexec/meet-production/production-compose.sh`; it must be a
+root-owned, non-symlink regular executable and is the only Compose entry
+point. Never inspect or emit container environments.
 
 Evidence is a fixed, bounded, sanitized key/value schema containing only
 phase/outcome, hostname/lineage, public SPKI and approved certificate
@@ -216,8 +256,9 @@ The exact runtime observation contract is:
 ```text
 api_status=200
 api_shape=VALID
-actuator_status=401|403|404
-admin_status=401|403|404
+api_digest=<SHA-256 of canonical /api/v1/tags JSON>
+actuator_status=401
+admin_status=401
 backend_source=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
 backend_image_digest=sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6
 backend_version=1.0.1
@@ -234,16 +275,27 @@ flyway_migration_digest=8bdd5aa46f7efe03882e787b36eb701423d35c24eb2681759375b7f3
 ```
 
 Live values are obtained from public HTTPS probes and `docker inspect`,
-Compose labels/configuration, container health and published-port metadata,
-named-volume mounts, and the immutable application artifact/migration
-inventory. The observer must not inspect or emit container environments,
-command-line secrets, or application credentials. `api_shape=VALID` means the
-public canary response has the reviewed JSON shape; `actuator_status` and
-`admin_status` must be independently denied. The PostgreSQL publication value
-must be `NO`, and the backend listener must be exactly loopback-only
-`127.0.0.1:8080`. Fixture mode must provide every key above and applies the
-same value validation; missing, duplicate, malformed, or unexpected
-observations block the phase.
+the fixed Compose helper, container health and published-port metadata,
+named-volume mounts, and the immutable database migration inventory. The
+public `/api/v1/tags` response must be an object with exactly
+`success,data,message,error`; `success=true`, `message=null`, `error=null`,
+and `data` is an array of objects whose exact keys are positive integral `id`
+and string `text`. The public `/meetings` canary must return HTTP 200 and a
+JSON array. `api_digest` is the SHA-256 of the sorted canonical tags object.
+The public readiness and admin probes are unauthenticated `GET` requests and
+must each return the reviewed 401 JSON shape with the request path, fixed
+`Authentication is required` message, `UNAUTHORIZED` code, and a validated
+RFC-3339 timestamp normalized to a sentinel before hashing. Internal readiness
+is obtained only through the Compose helper and must be exactly
+`{"status":"UP"}`. The Flyway digest is computed from the ordered
+`flyway_schema_history` rows through the PostgreSQL container's `psql`; it is
+captured before and after every effect and must remain equal to
+`LEAF_SPKI_FLYWAY_MIGRATION_DIGEST`. The observer must not inspect or emit
+container environments, command-line secrets, or application credentials.
+The PostgreSQL publication value must be `NO`, and the backend listener must
+be exactly loopback-only `127.0.0.1:8080`. Fixture mode must provide every
+key above and applies the same value validation; missing, duplicate,
+malformed, or unexpected observations block the phase.
 
 ## Recovery, drill, and exit statuses
 
