@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT_DIR"
 WORKFLOW=.github/workflows/release-please.yml
 controller=$(sed -n '/^  controller:/,/^  gates:/p' "$WORKFLOW")
 route_step=$(awk '
