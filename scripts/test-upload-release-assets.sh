@@ -42,7 +42,7 @@ case "${1:-}" in
     digest=$(sha256sum "$file" | awk '{print $1}')
     name=$(basename "$file")
     jq --arg name "$name" --arg digest "sha256:$digest" \
-      '.assets += [{id:(.assets|length)+1,name:$name,state:"uploaded",digest:$digest}]' \
+      '.assets += [{id:((.assets | length) + 1),name:$name,state:"uploaded",digest:$digest}]' \
       "$state" >"$state.tmp"
     mv "$state.tmp" "$state"
     ;;
