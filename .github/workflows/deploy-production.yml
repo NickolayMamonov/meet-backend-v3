@@ -1,0 +1,382 @@
+name: Deploy backend release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published backend SemVer (without the v prefix)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+  attestations: read
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/master'
+    concurrency:
+      group: production-deploy-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    environment:
+      name: production
+    env:
+      VERSION: ${{ inputs.version }}
+      HOST: ${{ vars.PRODUCTION_HOST }}
+      PORT: ${{ vars.PRODUCTION_PORT }}
+      USER: ${{ vars.PRODUCTION_USER }}
+      PATH_ON_HOST: ${{ vars.PRODUCTION_PATH }}
+      HOST_FINGERPRINT: ${{ vars.PRODUCTION_SSH_HOST_FINGERPRINT }}
+      SSH_PRIVATE_KEY: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+      IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
+    steps:
+      # Keep this as the first step: it must fail before repository-controlled
+      # network access when the protected Environment is empty.
+      - name: Protected-empty fail-before-network preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "invalid release version" >&2
+            exit 1
+          }
+          test -n "$HOST" || { echo "PRODUCTION_HOST is absent" >&2; exit 1; }
+          test -n "$PORT" || { echo "PRODUCTION_PORT is absent" >&2; exit 1; }
+          test -n "$USER" || { echo "PRODUCTION_USER is absent" >&2; exit 1; }
+          test -n "$PATH_ON_HOST" || { echo "PRODUCTION_PATH is absent" >&2; exit 1; }
+          test -n "$HOST_FINGERPRINT" || {
+            echo "PRODUCTION_SSH_HOST_FINGERPRINT is absent" >&2
+            exit 1
+          }
+          test -n "$SSH_PRIVATE_KEY" || {
+            echo "PRODUCTION_SSH_PRIVATE_KEY is absent" >&2
+            exit 1
+          }
+          [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || {
+            echo "PRODUCTION_PORT is invalid" >&2
+            exit 1
+          }
+          [[ "$HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "PRODUCTION_HOST is invalid" >&2; exit 1; }
+          [[ "$USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || {
+            echo "PRODUCTION_USER is invalid" >&2
+            exit 1
+          }
+          [[ "$PATH_ON_HOST" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$PATH_ON_HOST" != *..* ]] || {
+            echo "PRODUCTION_PATH must be a safe absolute path" >&2
+            exit 1
+          }
+          [[ "$HOST_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]+$ ]] || {
+            echo "SSH host fingerprint must be SHA256 format" >&2
+            exit 1
+          }
+          grep -Eq '^-----BEGIN (OPENSSH|RSA) PRIVATE KEY-----$' <<<"$SSH_PRIVATE_KEY" || {
+            echo "SSH private key envelope is invalid" >&2
+            exit 1
+          }
+          echo "preflight=approved"
+
+      - name: Checkout promotion-reviewed tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Set up Buildx for descriptor verification
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - name: Resolve and verify published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          gh release view "$tag" --json isDraft --jq '.isDraft' | grep -Fx false
+          mkdir -p "$RUNNER_TEMP/release"
+          gh release download "$tag" \
+            --pattern release-manifest.json \
+            --pattern image-index.json \
+            --pattern image-inspect.txt \
+            --pattern SHA256SUMS \
+            --dir "$RUNNER_TEMP/release"
+          (
+            cd "$RUNNER_TEMP/release"
+            sha256sum -c SHA256SUMS
+          )
+          jq -e --arg version "$VERSION" --arg image "$IMAGE" '
+            .version == $version and
+            .tag == ("v" + $version) and
+            .image == $image and
+            (.digest | test("^sha256:[0-9a-f]{64}$")) and
+            .aliases == [("v" + $version), $version, ("sha-" + .sourceSha)] and
+            .platform == "linux/amd64" and
+            .publicationPolicy == "exactly-three-aliases-publish-last" and
+            .provenance == true and .sbom == true and .artifactAttestation == true and
+            .evidence == ["image-index.json", "image-inspect.txt"]
+          ' "$RUNNER_TEMP/release/release-manifest.json"
+          jq -e '
+            ([.manifests[]? | select(.platform.architecture == "unknown" and .platform.os == "unknown")] | length) >= 2
+          ' "$RUNNER_TEMP/release/image-index.json"
+          source_sha=$(jq -r '.sourceSha' "$RUNNER_TEMP/release/release-manifest.json")
+          digest=$(jq -r '.digest' "$RUNNER_TEMP/release/release-manifest.json")
+          grep -F "Digest: $digest" "$RUNNER_TEMP/release/image-inspect.txt"
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin dev "$tag"
+          test "$(git rev-list -n 1 "$tag")" = "$source_sha"
+          test "$(git show "$source_sha:version.json" | jq -r '.version')" = "$VERSION"
+          git merge-base --is-ancestor "$source_sha" origin/dev
+          gh attestation verify "oci://$IMAGE@$digest" --repo "$GITHUB_REPOSITORY"
+          {
+            echo "SOURCE_SHA=$source_sha"
+            echo "DIGEST=$digest"
+          } >> "$GITHUB_ENV"
+      - name: Authenticate to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and verify deployment digest
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE@$DIGEST"
+          test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{.Os}}/{{.Architecture}}')" = "linux/amd64"
+          test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
+          test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
+          test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{.Config.User}}')" = "10001:10001"
+      - name: Verify subject-bound provenance and SBOM descriptors
+        run: |
+          set -euo pipefail
+          evidence=$(scripts/verify-oci-evidence.sh "$IMAGE" "$DIGEST" "$RUNNER_TEMP/release/image-index.json")
+          provenance=$(awk -F= '/^provenance=/{print $2}' <<<"$evidence")
+          sbom=$(awk -F= '/^sbom=/{print $2}' <<<"$evidence")
+          jq -e --argjson provenance "$provenance" --argjson sbom "$sbom" \
+            '.provenance == $provenance and .sbom == $sbom' \
+            "$RUNNER_TEMP/release/release-manifest.json"
+      - name: Establish strict host trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/production-key"
+          known_hosts="$RUNNER_TEMP/production-known-hosts"
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          : > "$known_hosts"
+          matched=0
+          while IFS= read -r key_line; do
+            fingerprint=$(printf '%s\n' "$key_line" | ssh-keygen -lf - -E sha256 | awk '{print $2}')
+            if [ "$fingerprint" = "$HOST_FINGERPRINT" ]; then
+              printf '%s\n' "$key_line" >> "$known_hosts"
+              matched=$((matched + 1))
+            fi
+          done < <(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null)
+          [ "$matched" -eq 1 ] || {
+            echo "host fingerprint did not match exactly one key" >&2
+            exit 1
+          }
+          echo "KEY_FILE=$key_file" >> "$GITHUB_ENV"
+          echo "KNOWN_HOSTS=$known_hosts" >> "$GITHUB_ENV"
+      - name: Stage and verify reviewed deployment tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          tooling_root="$RUNNER_TEMP/production-tooling"
+          archive="$RUNNER_TEMP/production-tooling.tar"
+          test ! -e "$tooling_root"
+          mkdir -p "$tooling_root/scripts"
+          tooling_files=(
+            docker-compose.production.yml
+            scripts/production-compose.sh
+            scripts/production-config-digest.sh
+            scripts/prepare-production-release.sh
+            scripts/backup-production.sh
+            scripts/update-production-release.sh
+            scripts/deploy-production-release.sh
+            scripts/rollback-production-release.sh
+          )
+          for file in "${tooling_files[@]}"; do
+            mkdir -p "$tooling_root/$(dirname "$file")"
+            cp -- "$file" "$tooling_root/$file"
+          done
+          chmod 755 "$tooling_root"/scripts/*.sh
+          (
+            cd "$tooling_root"
+            sha256sum "${tooling_files[@]}" > SHA256SUMS
+          )
+          tar -C "$tooling_root" -cf "$archive" "${tooling_files[@]}" SHA256SUMS
+          ssh_opts=(-p "$PORT" -i "$KEY_FILE" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
+            -o ConnectionAttempts=1)
+          scp_opts=(-P "$PORT" -i "$KEY_FILE" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
+            -o ConnectionAttempts=1)
+          remote_archive="$PATH_ON_HOST/.production-tooling-$SOURCE_SHA-$GITHUB_RUN_ID.tar"
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- "$PATH_ON_HOST" <<'REMOTE'
+          set -euo pipefail
+          test -d "$1"
+          REMOTE
+          scp "${scp_opts[@]}" "$archive" "$USER@$HOST:$remote_archive"
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- \
+            "$PATH_ON_HOST" "$remote_archive" "$SOURCE_SHA" "$GITHUB_RUN_ID" <<'REMOTE'
+          set -euo pipefail
+          path=$1
+          archive=$2
+          source_sha=$3
+          run_id=$4
+          stage="$path/.release-tooling-$source_sha-$run_id"
+          test ! -e "$stage"
+          install -d -m 700 "$stage"
+          tar -xf "$archive" -C "$stage"
+          (
+            cd "$stage"
+            sha256sum -c SHA256SUMS
+          )
+          for script in production-compose.sh production-config-digest.sh \
+            prepare-production-release.sh backup-production.sh \
+            update-production-release.sh deploy-production-release.sh \
+            rollback-production-release.sh; do
+            test -x "$stage/scripts/$script"
+          done
+          test -s "$stage/docker-compose.production.yml"
+          rm -f "$archive"
+          REMOTE
+          printf 'TOOLING_ROOT=%s\n' \
+            "$PATH_ON_HOST/.release-tooling-$SOURCE_SHA-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+      - name: Remote read-only preflight and digest pull
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ssh_opts=(-p "$PORT" -i "$KEY_FILE" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
+            -o ConnectionAttempts=1)
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- \
+            "$PATH_ON_HOST" "$TOOLING_ROOT" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
+          set -euo pipefail
+          path=$1
+          tooling_root=$2
+          image=$3
+          revision=$4
+          version=$5
+          test -d "$path"
+          test -d "$tooling_root"
+          (
+            cd "$tooling_root"
+            sha256sum -c SHA256SUMS
+          )
+          for script in production-compose.sh production-config-digest.sh \
+            prepare-production-release.sh backup-production.sh \
+            update-production-release.sh deploy-production-release.sh \
+            rollback-production-release.sh; do
+            test -x "$tooling_root/scripts/$script"
+          done
+          test -s "$tooling_root/docker-compose.production.yml"
+          test -s "$path/.env.production"
+          test -s "$path/.backup.env"
+          command -v docker >/dev/null
+          docker compose version >/dev/null
+          command -v flock >/dev/null
+          command -v age >/dev/null
+          command -v curl >/dev/null
+          [ "$(grep -c '^AGE_RECIPIENT=' "$path/.backup.env")" -eq 1 ]
+          age_recipient=$(sed -n 's/^AGE_RECIPIENT=//p' "$path/.backup.env")
+          case "$age_recipient" in
+            ""|*[[:space:]]*) echo "AGE_RECIPIENT is invalid" >&2; exit 1 ;;
+          esac
+          [ "$(grep -c '^BACKUP_DIR=' "$path/.backup.env")" -le 1 ]
+          backup_dir=$(sed -n 's/^BACKUP_DIR=//p' "$path/.backup.env")
+          if [ -n "$backup_dir" ]; then
+            [[ "$backup_dir" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+              [[ "$backup_dir" != *..* ]] || {
+              echo "BACKUP_DIR is invalid" >&2
+              exit 1
+            }
+          fi
+          cd "$path"
+          REMOTE
+          {
+            printf '%s\n' "$GHCR_TOKEN"
+            cat <<'REMOTE'
+          set -euo pipefail
+          IFS= read -r token
+          path=$1
+          image=$2
+          revision=$3
+          version=$4
+          cleanup() {
+            docker logout ghcr.io >/dev/null 2>&1 || true
+            unset token
+          }
+          trap cleanup EXIT
+          cd "$path"
+          printf '%s' "$token" | docker login ghcr.io --username github-actions --password-stdin
+          docker pull "$image"
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision"
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
+          REMOTE
+          } | ssh "${ssh_opts[@]}" "$USER@$HOST" \
+            bash -s -- "$PATH_ON_HOST" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION"
+      - name: Capture, back up, deploy, and rollback on failure
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_opts=(-p "$PORT" -i "$KEY_FILE" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$KNOWN_HOSTS" -o ConnectTimeout=10
+            -o ConnectionAttempts=1)
+          set +e
+          ssh "${ssh_opts[@]}" "$USER@$HOST" bash -s -- \
+            "$PATH_ON_HOST" "$TOOLING_ROOT" "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
+          set -euo pipefail
+          path=$1
+          tooling_root=$2
+          image=$3
+          revision=$4
+          version=$5
+          export PRODUCTION_ROOT="$path"
+          export PRODUCTION_SCRIPTS_DIR="$tooling_root/scripts"
+          export PRODUCTION_BASE_COMPOSE="$tooling_root/docker-compose.production.yml"
+          cd "$path"
+          exec 9>"$path/.production-release.lock"
+          flock -n 9 || { echo "another production release is active" >&2; exit 75; }
+          "$PRODUCTION_SCRIPTS_DIR/prepare-production-release.sh" >/dev/null
+          [ "$(grep -c '^AGE_RECIPIENT=' "$path/.backup.env")" -eq 1 ]
+          AGE_RECIPIENT=$(sed -n 's/^AGE_RECIPIENT=//p' "$path/.backup.env")
+          case "$AGE_RECIPIENT" in
+            ""|*[[:space:]]*) echo "AGE_RECIPIENT is invalid" >&2; exit 1 ;;
+          esac
+          export AGE_RECIPIENT
+          [ "$(grep -c '^BACKUP_DIR=' "$path/.backup.env")" -le 1 ]
+          if grep -q '^BACKUP_DIR=' "$path/.backup.env"; then
+            BACKUP_DIR=$(sed -n 's/^BACKUP_DIR=//p' "$path/.backup.env")
+            [[ "$BACKUP_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+              [[ "$BACKUP_DIR" != *..* ]] || {
+              echo "BACKUP_DIR is invalid" >&2
+              exit 1
+            }
+            export BACKUP_DIR
+          else
+            unset BACKUP_DIR
+          fi
+          "$PRODUCTION_SCRIPTS_DIR/backup-production.sh" >/dev/null
+          mutation_started=0
+          trap 'status=$?; if [ "$status" -ne 0 ] && [ "$mutation_started" -eq 1 ]; then "$PRODUCTION_SCRIPTS_DIR/rollback-production-release.sh" || echo rollback_failed >&2; fi; exit "$status"' EXIT
+          "$PRODUCTION_SCRIPTS_DIR/update-production-release.sh" "$image" "$revision" "$version" >/dev/null
+          mutation_started=1
+          "$PRODUCTION_SCRIPTS_DIR/deploy-production-release.sh" >/dev/null
+          REMOTE
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "deployment failed; remote rollback was attempted after mutation" >&2
+            exit "$status"
+          fi
+          echo "deployment=ready digest=$DIGEST"
+      - name: Logout from GHCR
+        if: always()
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
