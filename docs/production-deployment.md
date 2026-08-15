@@ -45,6 +45,10 @@ backend binds only to loopback; PostgreSQL is not published.
 Immutable artifact publication is independent from VPS deployment. Follow
 [`docs/operations/backend-release-publishing.md`](operations/backend-release-publishing.md)
 to publish and verify a release before using the deployment steps below.
+The current test edge has a separate bounded manual path documented in
+[`docs/operations/test-vps-deployment.md`](operations/test-vps-deployment.md);
+it does not satisfy the backup and off-host recovery requirements in this
+production runbook.
 
 ## 1. First installation
 

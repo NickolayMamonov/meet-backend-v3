@@ -1,0 +1,449 @@
+name: Deploy backend release to test VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published immutable backend release tag
+        required: true
+        default: v1.2.0
+        type: string
+      run_rollback_drill:
+        description: Prove automatic rollback before the final deployment
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: read
+  attestations: read
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: test-vps-deploy-${{ github.repository }}
+      cancel-in-progress: false
+    environment:
+      name: test-vps
+    env:
+      TAG: ${{ inputs.release_tag }}
+      RUN_ROLLBACK_DRILL: ${{ inputs.run_rollback_drill }}
+      HOST: ${{ vars.TEST_VPS_HOST }}
+      PORT: ${{ vars.TEST_VPS_PORT }}
+      SSH_USER: ${{ vars.TEST_VPS_USER }}
+      PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}
+      HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
+      SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+      IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
+      PUBLIC_URL: https://api.whysoezzy.online
+    steps:
+      - name: Protected test-VPS preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          case "$RUN_ROLLBACK_DRILL" in true|false) ;; *) exit 1 ;; esac
+          [[ "$HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]
+          [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]]
+          [[ "$PATH_ON_HOST" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+            [[ "$PATH_ON_HOST" != *..* ]]
+          [[ "$HOST_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]+$ ]]
+          grep -Eq '^-----BEGIN (OPENSSH|RSA) PRIVATE KEY-----$' \
+            <<<"$SSH_PRIVATE_KEY"
+          echo "test_vps_preflight=approved"
+
+      - name: Checkout reviewed deployment tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Buildx for immutable descriptor verification
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+
+      - name: Resolve and verify published immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/release"
+          mkdir "$release_dir"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+            >"$release_dir/release.json"
+          release_id=$(jq -r '.id' "$release_dir/release.json")
+          source_sha=$(jq -r '.target_commitish' "$release_dir/release.json")
+          version=${TAG#v}
+          jq -e --arg tag "$TAG" --arg source_sha "$source_sha" '
+            type == "object" and
+            (.id | type == "number" and floor == . and . > 0) and
+            .immutable == true and .draft == false and .prerelease == false and
+            .tag_name == $tag and
+            .target_commitish == $source_sha and
+            ($source_sha | test("^[0-9a-f]{40}$"))
+          ' "$release_dir/release.json" >/dev/null
+
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir "$release_dir" \
+            --pattern release-manifest.json \
+            --pattern image-index.json \
+            --pattern image-inspect.txt \
+            --pattern SHA256SUMS
+          scripts/verify-immutable-release-proof.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --release-id "$release_id" \
+            --source-sha "$source_sha" \
+            --assets-dir "$release_dir" \
+            >"$release_dir/immutable-proof.json"
+
+          checksum_args=()
+          if [ "$release_id" = 371012814 ]; then
+            checksum_args+=(--allow-immutable-v1.2.0-compact)
+          fi
+          scripts/verify-release-checksums.sh \
+            --release-id "$release_id" \
+            --assets-dir "$release_dir" \
+            "${checksum_args[@]}"
+
+          digest=$(jq -r '.digest' "$release_dir/release-manifest.json")
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg image "$IMAGE" \
+            --arg tag "$TAG" \
+            --arg version "$version" \
+            --arg source_sha "$source_sha" \
+            --argjson release_id "$release_id" \
+            --arg digest "$digest" '
+              .schema == "meet-backend/release-evidence/v1" and
+              .repository == $repository and .image == $image and
+              .tag == $tag and .version == $version and
+              .releaseId == $release_id and .sourceSha == $source_sha and
+              .digest == $digest and
+              ($digest | test("^sha256:[0-9a-f]{64}$")) and
+              .aliases == [$tag,$version,("sha-"+$source_sha)] and
+              .platform == "linux/amd64" and
+              .publicationPolicy == "exactly-three-aliases-publish-last" and
+              .provenance == true and .sbom == true and
+              .artifactAttestation == true and
+              .evidence == ["image-index.json","image-inspect.txt"]
+            ' "$release_dir/release-manifest.json" >/dev/null
+
+          docker buildx imagetools inspect "$IMAGE@$digest" --raw \
+            >"$release_dir/live-image-index.json"
+          cmp -s "$release_dir/image-index.json" \
+            "$release_dir/live-image-index.json"
+          grep -F "Digest: $digest" "$release_dir/image-inspect.txt" >/dev/null
+          scripts/verify-oci-evidence.sh \
+            "$IMAGE" "$digest" "$release_dir/image-index.json" >/dev/null
+          gh attestation verify "oci://$IMAGE@$digest" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null
+
+          git fetch --no-tags origin dev "$TAG"
+          test "$(git rev-list -n 1 "$TAG")" = "$source_sha"
+          test "$(git show "$source_sha:version.json" | jq -r '.version')" = "$version"
+          git merge-base --is-ancestor "$source_sha" origin/dev
+          {
+            echo "RELEASE_ID=$release_id"
+            echo "SOURCE_SHA=$source_sha"
+            echo "VERSION=$version"
+            echo "DIGEST=$digest"
+            echo "RELEASE_DIR=$release_dir"
+          } >>"$GITHUB_ENV"
+
+      - name: Pull and verify exact deployment image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE@$DIGEST" >/dev/null
+          test "$(docker image inspect "$IMAGE@$DIGEST" \
+            --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
+          test "$(docker image inspect "$IMAGE@$DIGEST" \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
+            "$SOURCE_SHA"
+          test "$(docker image inspect "$IMAGE@$DIGEST" \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = \
+            "$VERSION"
+          test "$(docker image inspect "$IMAGE@$DIGEST" \
+            --format '{{.Config.User}}')" = 10001:10001
+
+      - name: Establish strict SSH host trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/test-vps-key"
+          known_hosts="$RUNNER_TEMP/test-vps-known-hosts"
+          ssh_config="$RUNNER_TEMP/test-vps-ssh-config"
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key_file"
+          chmod 600 "$key_file"
+          ssh-keygen -y -P '' -f "$key_file" >/dev/null
+          : >"$known_hosts"
+          matched=0
+          while IFS= read -r key_line; do
+            fingerprint=$(printf '%s\n' "$key_line" |
+              ssh-keygen -lf - -E sha256 | awk '{print $2}')
+            if [ "$fingerprint" = "$HOST_FINGERPRINT" ]; then
+              printf '%s\n' "$key_line" >>"$known_hosts"
+              matched=$((matched + 1))
+            fi
+          done < <(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null)
+          [ "$matched" -eq 1 ]
+          {
+            echo 'Host test-vps'
+            echo "  HostName $HOST"
+            echo "  Port $PORT"
+            echo "  User $SSH_USER"
+            echo "  IdentityFile $key_file"
+            echo "  UserKnownHostsFile $known_hosts"
+            echo '  BatchMode yes'
+            echo '  IdentitiesOnly yes'
+            echo '  StrictHostKeyChecking yes'
+            echo '  ConnectTimeout 10'
+            echo '  ConnectionAttempts 1'
+          } >"$ssh_config"
+          chmod 600 "$ssh_config"
+          echo "SSH_CONFIG=$ssh_config" >>"$GITHUB_ENV"
+
+      - name: Stage checksum-bound deployment tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/test-vps-tooling"
+          archive="$RUNNER_TEMP/test-vps-tooling.tar"
+          remote="$PATH_ON_HOST/.test-vps-tooling-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$stage/scripts"
+          files=(
+            docker-compose.production.yml
+            scripts/production-compose.sh
+            scripts/production-config-digest.sh
+            scripts/update-production-release.sh
+            scripts/deploy-test-vps-release.sh
+          )
+          for file in "${files[@]}"; do
+            mkdir -p "$stage/$(dirname "$file")"
+            cp -- "$file" "$stage/$file"
+          done
+          chmod 755 "$stage"/scripts/*.sh
+          (
+            cd "$stage"
+            sha256sum "${files[@]}" >SHA256SUMS
+          )
+          tar -C "$stage" -cf "$archive" "${files[@]}" SHA256SUMS
+          ssh -F "$SSH_CONFIG" test-vps bash -s -- "$PATH_ON_HOST" "$remote" <<'REMOTE'
+          set -euo pipefail
+          root=$1
+          stage=$2
+          [ -d "$root" ] && [ -s "$root/.env.production" ]
+          [ ! -e "$stage" ]
+          install -d -m 700 "$stage"
+          REMOTE
+          scp -F "$SSH_CONFIG" "$archive" "test-vps:$remote/tooling.tar"
+          ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote" <<'REMOTE'
+          set -euo pipefail
+          stage=$1
+          tar -xf "$stage/tooling.tar" -C "$stage"
+          (
+            cd "$stage"
+            sha256sum -c SHA256SUMS
+          )
+          chmod 755 "$stage"/scripts/*.sh
+          REMOTE
+          echo "REMOTE_TOOLING=$remote" >>"$GITHUB_ENV"
+
+      - name: Pull and verify exact image on test VPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+            "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
+          set -euo pipefail
+          image=$1
+          revision=$2
+          version=$3
+          docker pull "$image" >/dev/null
+          test "$(docker image inspect "$image" \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
+            "$revision"
+          test "$(docker image inspect "$image" \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = \
+            "$version"
+          test "$(docker image inspect "$image" --format '{{.Config.User}}')" = \
+            10001:10001
+          docker image inspect "$image" --format '{{.Id}}'
+          REMOTE
+          )
+          [[ "$target_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "TARGET_IMAGE_ID=$target_id" >>"$GITHUB_ENV"
+
+      - name: Exercise automatic image rollback
+        if: inputs.run_rollback_drill
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
+          set -euo pipefail
+          mapfile -t containers < <(docker ps -q \
+            --filter label=com.docker.compose.project=meet-production \
+            --filter label=com.docker.compose.service=backend)
+          [ "${#containers[@]}" -eq 1 ]
+          docker inspect "${containers[0]}" --format '{{.Image}}'
+          REMOTE
+          )
+          [[ "$previous_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [ "$previous_id" != "$TARGET_IMAGE_ID" ]
+
+          set +e
+          output=$(ssh -F "$SSH_CONFIG" test-vps \
+            "$REMOTE_TOOLING/scripts/deploy-test-vps-release.sh" \
+            --root "$PATH_ON_HOST" \
+            --base-compose "$REMOTE_TOOLING/docker-compose.production.yml" \
+            --image "$IMAGE@$DIGEST" \
+            --revision "$SOURCE_SHA" \
+            --version "$VERSION" \
+            --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --mode rollback-drill 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          [ "$status" -eq 86 ]
+          grep -Fq "candidate=ready image_id=$TARGET_IMAGE_ID" <<<"$output"
+          grep -Fq 'rollback_drill=triggered' <<<"$output"
+          grep -Fq "rollback=completed previous_image_id=$previous_id" <<<"$output"
+
+          restored_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
+          set -euo pipefail
+          mapfile -t containers < <(docker ps -q \
+            --filter label=com.docker.compose.project=meet-production \
+            --filter label=com.docker.compose.service=backend)
+          [ "${#containers[@]}" -eq 1 ]
+          docker inspect "${containers[0]}" --format '{{.Image}}'
+          REMOTE
+          )
+          [ "$restored_id" = "$previous_id" ]
+          {
+            echo "ROLLBACK_PREVIOUS_IMAGE_ID=$previous_id"
+            echo "ROLLBACK_RESTORED_IMAGE_ID=$restored_id"
+          } >>"$GITHUB_ENV"
+
+      - name: Deploy selected release successfully
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -F "$SSH_CONFIG" test-vps \
+            "$REMOTE_TOOLING/scripts/deploy-test-vps-release.sh" \
+            --root "$PATH_ON_HOST" \
+            --base-compose "$REMOTE_TOOLING/docker-compose.production.yml" \
+            --image "$IMAGE@$DIGEST" \
+            --revision "$SOURCE_SHA" \
+            --version "$VERSION" \
+            --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final" \
+            --mode deploy |
+            tee "$RUNNER_TEMP/deploy-output.txt"
+          grep -Fq "deployment=completed image_id=$TARGET_IMAGE_ID" \
+            "$RUNNER_TEMP/deploy-output.txt"
+
+      - name: Capture runtime and public HTTPS evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+            "$TARGET_IMAGE_ID" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
+          set -euo pipefail
+          expected_id=$1
+          revision=$2
+          version=$3
+          mapfile -t backends < <(docker ps -q \
+            --filter label=com.docker.compose.project=meet-production \
+            --filter label=com.docker.compose.service=backend)
+          mapfile -t postgres < <(docker ps -q \
+            --filter label=com.docker.compose.project=meet-production \
+            --filter label=com.docker.compose.service=postgres)
+          [ "${#backends[@]}" -eq 1 ] && [ "${#postgres[@]}" -eq 1 ]
+          backend=${backends[0]}
+          database=${postgres[0]}
+          image_id=$(docker inspect "$backend" --format '{{.Image}}')
+          [ "$image_id" = "$expected_id" ]
+          [ "$(docker image inspect "$image_id" \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
+            "$revision" ]
+          [ "$(docker image inspect "$image_id" \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = \
+            "$version" ]
+          uid=$(docker exec "$backend" id -u)
+          gid=$(docker exec "$backend" id -g)
+          [ "$uid:$gid" = 10001:10001 ]
+          health=$(docker inspect "$backend" --format '{{.State.Health.Status}}')
+          [ "$health" = healthy ]
+          binding=$(docker inspect "$backend" --format \
+            '{{range $port, $bindings := .NetworkSettings.Ports}}{{if eq $port "8080/tcp"}}{{range $bindings}}{{.HostIp}}:{{.HostPort}}{{println}}{{end}}{{end}}{{end}}')
+          [ "$(wc -l <<<"$binding")" -eq 1 ]
+          [[ "$binding" =~ ^127\.0\.0\.1:[0-9]+$ ]]
+          [ -z "$(docker port "$database")" ]
+          upload=$(docker inspect "$backend" --format \
+            '{{range .Mounts}}{{if eq .Destination "/data/uploads"}}{{.Name}}{{end}}{{end}}')
+          [ "$upload" = meet-production_uploads_data ]
+          docker volume inspect meet-production_uploads_data >/dev/null
+          docker volume inspect meet-production_postgres_data >/dev/null
+          jq -cn \
+            --arg imageId "$image_id" \
+            --arg revision "$revision" \
+            --arg version "$version" \
+            --arg uid "$uid" --arg gid "$gid" \
+            --arg health "$health" --arg binding "$binding" \
+            --arg upload "$upload" \
+            '{
+              imageId:$imageId,revision:$revision,version:$version,
+              runtimeUser:($uid+":"+$gid),health:$health,
+              backendBinding:$binding,postgresPublished:false,
+              uploadVolume:$upload,
+              postgresVolume:"meet-production_postgres_data"
+            }'
+          REMOTE
+          )
+          jq -e \
+            --arg image_id "$TARGET_IMAGE_ID" \
+            --arg revision "$SOURCE_SHA" \
+            --arg version "$VERSION" '
+              .imageId == $image_id and .revision == $revision and
+              .version == $version and .runtimeUser == "10001:10001" and
+              .health == "healthy" and
+              (.backendBinding | test("^127\\.0\\.0\\.1:[0-9]+$")) and
+              .postgresPublished == false and
+              .uploadVolume == "meet-production_uploads_data" and
+              .postgresVolume == "meet-production_postgres_data"
+            ' <<<"$runtime" >/dev/null
+
+          meetings_status=$(curl --silent --show-error --output \
+            "$RUNNER_TEMP/meetings.json" --write-out '%{http_code}' \
+            "$PUBLIC_URL/meetings")
+          [ "$meetings_status" = 200 ]
+          jq -e 'type == "array"' "$RUNNER_TEMP/meetings.json" >/dev/null
+          actuator_status=$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' "$PUBLIC_URL/actuator")
+          [ "$actuator_status" = 404 ]
+          redirect_status=$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' \
+            "http://api.whysoezzy.online/meetings")
+          case "$redirect_status" in 301|302|307|308) ;; *) exit 1 ;; esac
+
+          {
+            echo "## Test VPS deployment evidence"
+            echo
+            echo "- Release: \`$TAG\` (ID \`$RELEASE_ID\`)"
+            echo "- Source: \`$SOURCE_SHA\`"
+            echo "- OCI digest: \`$DIGEST\`"
+            if [ "$RUN_ROLLBACK_DRILL" = true ]; then
+              echo "- Automatic rollback: restored \`$ROLLBACK_RESTORED_IMAGE_ID\`"
+            else
+              echo "- Automatic rollback drill: skipped by explicit input"
+            fi
+            echo "- Final image ID: \`$TARGET_IMAGE_ID\`"
+            echo "- Runtime: healthy, user \`10001:10001\`, backend loopback-only"
+            echo "- Volumes: PostgreSQL and uploads preserved"
+            echo "- Public probes: meetings=$meetings_status, actuator=$actuator_status, HTTP redirect=$redirect_status"
+          } >>"$GITHUB_STEP_SUMMARY"

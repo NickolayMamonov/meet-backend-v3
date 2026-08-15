@@ -259,7 +259,7 @@ expect_failure omitted-tag \
 [ ! -s "$GH_LOG" ]
 
 expect_failure wrong-explicit-tag \
-  "$VERIFY" --repository "$REPOSITORY" --tag v1.2.1 \
+  "$VERIFY" --repository "$REPOSITORY" --tag 1.2.0 \
   --release-id "$RELEASE_ID" --source-sha "$SOURCE_SHA" \
   --assets-dir "$TMP/assets"
 [ ! -s "$GH_LOG" ]

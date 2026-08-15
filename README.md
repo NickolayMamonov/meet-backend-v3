@@ -210,3 +210,6 @@ See [`docs/production-deployment.md`](docs/production-deployment.md).
 
 For the future-only immutable release controller and hosted publication proof,
 see [`docs/operations/backend-release-publishing.md`](docs/operations/backend-release-publishing.md).
+For the separate manual deployment path to the current test VPS, including
+the automatic image rollback drill, see
+[`docs/operations/test-vps-deployment.md`](docs/operations/test-vps-deployment.md).
