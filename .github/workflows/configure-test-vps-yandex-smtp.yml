@@ -199,22 +199,28 @@ jobs:
           fi
           ssh_status=$?
           set -e
+          result=deploy_failed_rollback_failed
           protocol_valid=false
-          lines=$(grep -Ec '^MEE_SMTP_RESULT=(deploy_succeeded|precheck_failed|lock_busy|deploy_failed_rollback_succeeded|deploy_failed_rollback_failed)$' "$output" || true)
-          [ "$lines" -eq 1 ] || exit 24
-          result=$(grep -E '^MEE_SMTP_RESULT=' "$output" | cut -d= -f2)
-          case "$result:$ssh_status" in
-            deploy_succeeded:0|precheck_failed:20|lock_busy:21|\
-              deploy_failed_rollback_succeeded:22|deploy_failed_rollback_failed:23)
-              ;;
-            *) exit 24 ;;
-          esac
-          protocol_valid=true
+          result_line=
+          if [ "$(grep -c '^' "$output" || true)" -eq 1 ]; then
+            result_line=$(<"$output")
+          fi
+          if [ -n "$result_line" ] &&
+            grep -Eq '^MEE_SMTP_RESULT=(deploy_succeeded|precheck_failed|lock_busy|deploy_failed_rollback_succeeded|deploy_failed_rollback_failed)$' "$output"; then
+            result=${result_line#MEE_SMTP_RESULT=}
+            case "$result:$ssh_status" in
+              deploy_succeeded:0|precheck_failed:20|lock_busy:21|\
+                deploy_failed_rollback_succeeded:22|deploy_failed_rollback_failed:23)
+                protocol_valid=true
+                ;;
+            esac
+          fi
           {
             echo "SMTP_RESULT=$result"
             echo "SMTP_SSH_STATUS=$ssh_status"
             echo "SMTP_PROTOCOL_VALID=$protocol_valid"
           } >>"$GITHUB_ENV"
+          [ "$protocol_valid" = true ]
 
       - name: Safe SMTP summary
         if: always()

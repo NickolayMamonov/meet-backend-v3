@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 tool=scripts/configure-test-vps-yandex-smtp.sh
 release=scripts/deploy-test-vps-release.sh
 retention=.github/workflows/deploy-test-vps.yml
+fake_remote=scripts/test-test-vps-yandex-smtp-fake-remote.sh
 tool_text=$(<"$tool")
 release_text=$(<"$release")
 retention_text=$(<"$retention")
@@ -30,6 +31,9 @@ for text in \
   'docker'; do
   require "$text" "$release_text" "release deploy"
 done
+
+[ -x "$fake_remote" ]
+bash "$fake_remote"
 for text in \
   'smtp_pointer="$state_root/.smtp-transaction.current"' \
   'flock -n 9' \

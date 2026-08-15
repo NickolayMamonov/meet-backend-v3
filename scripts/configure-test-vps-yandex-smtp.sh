@@ -7,11 +7,13 @@ usage() {
 }
 
 RESULT_CATEGORY=
-RESULT_STATUS=
+RESULT_EMITTED=false
 result() {
   RESULT_CATEGORY=$1
-  RESULT_STATUS=$2
-  printf 'MEE_SMTP_RESULT=%s\n' "$RESULT_CATEGORY"
+  if [ "$RESULT_EMITTED" = false ]; then
+    printf 'MEE_SMTP_RESULT=%s\n' "$RESULT_CATEGORY"
+    RESULT_EMITTED=true
+  fi
   return 0
 }
 
@@ -48,7 +50,7 @@ if [ "$mode" = apply ]; then
   [[ "$payload_file" =~ ^/[A-Za-z0-9._/-]+$ ]] || usage
 fi
 
-for command_name in awk cp curl date docker find flock grep install mktemp mv sha256sum stat sync wc; do
+for command_name in awk cat cp curl date docker find flock grep install mktemp mv rm sed sha256sum stat sync wc; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail_result precheck_failed 20
 done
@@ -80,12 +82,13 @@ pointer=$state_root/.smtp-transaction.current
 selector=$state_root/.smtp-last-good.current
 active_compose=/var/lib/meet-production/active-compose.yml
 active_runtime=/var/lib/meet-production/active-runtime.override.yml
-mkdir -p "$transactions" "$generations"
-chmod 700 "$state_root" "$transactions" "$generations"
+install -d -m 700 "$state_root"
 exec 9>"$state_root/.deploy.lock"
 if ! flock -n 9; then
   fail_result lock_busy 21
 fi
+install -d -m 700 "$transactions" "$generations"
+chmod 700 "$state_root" "$transactions" "$generations"
 
 sync_probe=$(mktemp "$state_root/.smtp-sync-probe.XXXXXX")
 chmod 600 "$sync_probe"
@@ -159,6 +162,14 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+non_email_config_digest_file() {
+  awk '
+    /^APP_EMAIL_/ { next }
+    /^SPRING_MAIL_/ { next }
+    { print }
+  ' "$1" | sha256sum | awk '{print $1}'
+}
+
 safe_selector_value() {
   [ -f "$selector" ] && [ ! -L "$selector" ] || return 1
   [ "$(wc -l <"$selector")" -eq 1 ] || return 1
@@ -174,24 +185,53 @@ validate_generation() {
   local key value
   [[ "$generation" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
   [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+  while IFS= read -r entry; do
+    case "$entry" in env|manifest) ;; *) return 1 ;; esac
+  done < <(find "$directory" -mindepth 1 -maxdepth 1 -printf '%f\n')
   [ -f "$directory/env" ] && [ ! -L "$directory/env" ] || return 1
   [ -f "$directory/manifest" ] && [ ! -L "$directory/manifest" ] || return 1
   [ "$(stat -c '%a' "$directory/env" 2>/dev/null)" = 600 ] || return 1
   [ "$(stat -c '%a' "$directory/manifest" 2>/dev/null)" = 600 ] || return 1
-  declare -A manifest=()
+  generation_manifest=()
+  local -a manifest_keys=(
+    schema generation env_sha256 non_email_config_sha256
+    non_email_runtime_fingerprint runtime_fingerprint
+    release_image release_version release_revision
+  )
   while IFS='=' read -r key value || [ -n "$key" ]; do
     [[ "$key" =~ ^[a-z_]+$ ]] || return 1
-    [ -z "${manifest[$key]+present}" ] || return 1
-    manifest[$key]=$value
+    case " ${manifest_keys[*]} " in *" $key "*) ;; *) return 1 ;; esac
+    [ -z "${generation_manifest[$key]+present}" ] || return 1
+    generation_manifest[$key]=$value
   done <"$directory/manifest"
-  [ "${manifest[schema]:-}" = 1 ] || return 1
-  [ "${manifest[generation]:-}" = "$generation" ] || return 1
-  [[ "${manifest[env_sha256]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [ "$(sha256_file "$directory/env")" = "${manifest[env_sha256]}" ]
+  for key in "${manifest_keys[@]}"; do
+    [ -n "${generation_manifest[$key]+present}" ] || return 1
+  done
+  [ "${generation_manifest[schema]:-}" = 2 ] || return 1
+  [ "${generation_manifest[generation]:-}" = "$generation" ] || return 1
+  [[ "${generation_manifest[env_sha256]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "${generation_manifest[non_email_config_sha256]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "${generation_manifest[non_email_runtime_fingerprint]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "${generation_manifest[runtime_fingerprint]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "${generation_manifest[release_image]:-}" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] ||
+    return 1
+  [[ "${generation_manifest[release_version]:-}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    return 1
+  [[ "${generation_manifest[release_revision]:-}" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [ "$(sha256_file "$directory/env")" = "${generation_manifest[env_sha256]}" ] || return 1
+  [[ "$(non_email_config_digest_file "$directory/env")" =
+    "${generation_manifest[non_email_config_sha256]}" ]] || return 1
 }
 
 declare -A journal=()
+declare -A generation_manifest=()
 journal_required=(
+  version transaction_id phase critical
+  pre_config_sha256 pre_runtime_fingerprint prior_selector
+  prior_selector_value prior_generation_sha256 candidate_generation
+  terminal_category terminal_status terminal_fingerprint
+)
+journal_allowed=(
   version transaction_id phase critical
   pre_config_sha256 pre_runtime_fingerprint prior_selector
   prior_selector_value prior_generation_sha256 candidate_generation
@@ -199,13 +239,15 @@ journal_required=(
 )
 
 load_journal() {
-  local file=$1 key value
+  local file=$1 key value line_count=0
   journal=()
   while IFS='=' read -r key value || [ -n "$key" ]; do
-    [[ "$key" =~ ^[a-z_]+$ ]] || return 1
+    line_count=$((line_count + 1))
+    case " ${journal_allowed[*]} " in *" $key "*) ;; *) return 1 ;; esac
     [ -z "${journal[$key]+present}" ] || return 1
     journal[$key]=$value
   done <"$file"
+  [ "$line_count" -eq "${#journal_allowed[@]}" ] || return 1
   for key in "${journal_required[@]}"; do
     [ -n "${journal[$key]+present}" ] || return 1
   done
@@ -216,6 +258,8 @@ load_journal() {
   [[ "${journal[critical]}" =~ ^(true|false)$ ]] || return 1
   [[ "${journal[pre_config_sha256]}" =~ ^[0-9a-f]{64}$ ]] || return 1
   [[ "${journal[pre_runtime_fingerprint]}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "${journal[candidate_generation]}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    return 1
   case "${journal[prior_selector]}" in
     absent) [ -z "${journal[prior_selector_value]}" ] &&
       [ -z "${journal[prior_generation_sha256]}" ] ;;
@@ -226,10 +270,17 @@ load_journal() {
     *) return 1 ;;
   esac
   case "${journal[phase]}" in
-    SNAPSHOTTED) [ "${journal[critical]}" = false ] ;;
+    SNAPSHOTTED)
+      [ "${journal[critical]}" = false ] &&
+        [ -z "${journal[terminal_category]}" ] &&
+        [ -z "${journal[terminal_status]}" ] &&
+        [ -z "${journal[terminal_fingerprint]}" ] ;;
     CANDIDATE_INSTALL_PENDING|CANDIDATE_INSTALLED|BACKEND_RECREATE_PENDING|\
       BACKEND_RECREATED|VERIFIED|LAST_GOOD_COMMIT_PENDING)
-      [ "${journal[critical]}" = true ] ;;
+      [ "${journal[critical]}" = true ] &&
+        [ -z "${journal[terminal_category]}" ] &&
+        [ -z "${journal[terminal_status]}" ] &&
+        [ -z "${journal[terminal_fingerprint]}" ] ;;
     COMMITTED)
       [ "${journal[critical]}" = false ] &&
         [ "${journal[terminal_category]}" = deploy_succeeded ] &&
@@ -293,14 +344,101 @@ clear_pointer_then_delete() {
   sync_directory "$transactions" transaction_directory_sync
 }
 
+delete_transaction_directory() {
+  local transaction=$1
+  [ -d "$transaction" ] && [ ! -L "$transaction" ] || return 1
+  find "$transaction" -xdev -type f -delete
+  find "$transaction" -xdev -depth -type d -empty -delete
+  sync_directory "$transactions" transaction_directory_sync
+}
+
+delete_unselected_candidate_generation() {
+  local generation=${journal[candidate_generation]}
+  local selected=
+  selected=$(safe_selector_value 2>/dev/null || true)
+  [ "$generation" != "$selected" ] || return 0
+  if [ "${journal[prior_selector]}" = present ] &&
+    [ "$generation" = "${journal[prior_selector_value]}" ]; then
+    return 0
+  fi
+  [ -e "$generations/$generation" ] || return 0
+  [ -d "$generations/$generation" ] && [ ! -L "$generations/$generation" ] ||
+    return 1
+  find "$generations/$generation" -xdev -type f -delete
+  find "$generations/$generation" -xdev -depth -type d -empty -delete
+  sync_directory "$generations" generation_delete
+}
+
+validate_transaction_material() {
+  local phase=${1:-${journal[phase]}}
+  [ -d "$transaction_dir" ] && [ ! -L "$transaction_dir" ] || return 1
+  while IFS= read -r entry; do
+    case "$entry" in
+      journal|env.before|pre-config.sha256|candidate.env|\
+        active-compose.before|active-runtime.before|\
+        had-active-compose|had-active-runtime) ;;
+      *) return 1 ;;
+    esac
+  done < <(find "$transaction_dir" -mindepth 1 -maxdepth 1 -printf '%f\n')
+  for file in journal env.before pre-config.sha256; do
+    [ -f "$transaction_dir/$file" ] && [ ! -L "$transaction_dir/$file" ] || return 1
+    [ "$(stat -c '%a' "$transaction_dir/$file" 2>/dev/null)" = 600 ] || return 1
+  done
+  [ "$(sha256_file "$transaction_dir/env.before")" = "${journal[pre_config_sha256]}" ] ||
+    return 1
+  [[ "$(tr -d '\n' <"$transaction_dir/pre-config.sha256")" =
+    "${journal[pre_config_sha256]}" ]] || return 1
+  for marker in had-active-compose had-active-runtime; do
+    if [ -e "$transaction_dir/$marker" ]; then
+      [ -f "$transaction_dir/$marker" ] && [ ! -L "$transaction_dir/$marker" ] || return 1
+      snapshot=${marker#had-}.before
+      [ -f "$transaction_dir/$snapshot" ] && [ ! -L "$transaction_dir/$snapshot" ] || return 1
+      [ "$(stat -c '%a' "$transaction_dir/$snapshot" 2>/dev/null)" = 600 ] || return 1
+    fi
+  done
+  case "$phase" in
+    SNAPSHOTTED) ;;
+    *)
+      [ -f "$transaction_dir/candidate.env" ] &&
+        [ ! -L "$transaction_dir/candidate.env" ] || return 1
+      [ "$(stat -c '%a' "$transaction_dir/candidate.env" 2>/dev/null)" = 600 ] ||
+        return 1
+      ;;
+  esac
+}
+
+verify_snapshot_state() {
+  validate_transaction_material SNAPSHOTTED || return 1
+  [ "$(sha256_file "$root/.env.production")" = "${journal[pre_config_sha256]}" ] ||
+    return 1
+  selector_matches_prior || return 1
+  [[ "$(runtime_safe_fingerprint "$root" "$compose_script")" =
+    "${journal[pre_runtime_fingerprint]}" ]]
+}
+
 selector_matches_prior() {
   case "${journal[prior_selector]}" in
     absent) [ ! -e "$selector" ] && [ ! -L "$selector" ] ;;
     present)
       [ "$(safe_selector_value)" = "${journal[prior_selector_value]}" ] || return 1
-      [ "$(sha256_file "$generations/${journal[prior_selector_value]}/manifest")" =
-        "${journal[prior_generation_sha256]}" ] ;;
+      [[ "$(sha256_file "$generations/${journal[prior_selector_value]}/manifest")" =
+        "${journal[prior_generation_sha256]}" ]] ;;
   esac
+}
+
+validate_selected_generation_identity() {
+  local generation=$1
+  validate_generation "$generation" || return 1
+  [[ "$(non_email_config_digest_file "$generations/$generation/env")" =
+    "$(runtime_non_email_config_digest "$root")" ]] || return 1
+  [[ "$(runtime_non_email_fingerprint "$root" "$compose_script")" =
+    "${generation_manifest[non_email_runtime_fingerprint]}" ]] || return 1
+  [[ "$(runtime_release_field "$root" BACKEND_IMAGE)" =
+    "${generation_manifest[release_image]}" ]] || return 1
+  [[ "$(runtime_release_field "$root" BACKEND_VERSION)" =
+    "${generation_manifest[release_version]}" ]] || return 1
+  [[ "$(runtime_release_field "$root" BACKEND_REVISION)" =
+    "${generation_manifest[release_revision]}" ]]
 }
 
 restore_selector_prior() {
@@ -363,6 +501,7 @@ finalize_terminal() {
     COMMITTED)
       [ "$(safe_selector_value)" = "${journal[candidate_generation]}" ] || return 1
       validate_generation "${journal[candidate_generation]}" || return 1
+      [ "${generation_manifest[runtime_fingerprint]}" = "$fingerprint" ] || return 1
       [ "$(runtime_safe_fingerprint "$root" "$compose_script")" = "$fingerprint" ] ||
         return 1
       ;;
@@ -373,8 +512,29 @@ finalize_terminal() {
     *) return 1 ;;
   esac
   clear_pointer_then_delete "$transaction_dir"
+  delete_unselected_candidate_generation
   result "$category" "$status"
   exit "$status"
+}
+
+finalize_orphan_terminal() {
+  case "${journal[phase]}" in
+    COMMITTED)
+      [ "$(safe_selector_value)" = "${journal[candidate_generation]}" ] || return 1
+      validate_generation "${journal[candidate_generation]}" || return 1
+      [[ "${generation_manifest[runtime_fingerprint]}" =
+        "${journal[terminal_fingerprint]}" ]] || return 1
+      [[ "$(runtime_safe_fingerprint "$root" "$compose_script")" =
+        "${journal[terminal_fingerprint]}" ]] || return 1
+      ;;
+    RECOVERED)
+      [ "${journal[terminal_fingerprint]}" = "${journal[pre_runtime_fingerprint]}" ] ||
+        return 1
+      verify_pre_state || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  delete_transaction_directory "$transaction_dir"
 }
 
 reconcile_current() {
@@ -392,13 +552,15 @@ reconcile_current() {
     fail_result deploy_failed_rollback_failed 23
   load_journal "$transaction_dir/journal" ||
     fail_result deploy_failed_rollback_failed 23
+  validate_transaction_material "${journal[phase]}" ||
+    fail_result deploy_failed_rollback_failed 23
   case "${journal[phase]}" in
     SNAPSHOTTED)
-      [ "$(sha256_file "$root/.env.production")" = "${journal[pre_config_sha256]}" ] ||
-        fail_result deploy_failed_rollback_failed 23
-      selector_matches_prior ||
+      verify_snapshot_state ||
         fail_result deploy_failed_rollback_failed 23
       clear_pointer_then_delete "$transaction_dir" ||
+        fail_result deploy_failed_rollback_failed 23
+      delete_unselected_candidate_generation ||
         fail_result deploy_failed_rollback_failed 23
       transaction_dir=
       ;;
@@ -418,7 +580,38 @@ reconcile_current() {
   esac
 }
 
+reconcile_orphans_without_pointer() {
+  local candidate
+  for candidate in "$transactions"/*; do
+    [ -e "$candidate" ] || continue
+    [ -d "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    transaction_dir=$candidate
+    load_journal "$candidate/journal" || return 1
+    validate_transaction_material "${journal[phase]}" || return 1
+    case "${journal[phase]}" in
+      SNAPSHOTTED)
+        verify_snapshot_state || return 1
+        delete_transaction_directory "$candidate" || return 1
+        delete_unselected_candidate_generation || return 1
+        ;;
+      COMMITTED)
+        finalize_orphan_terminal || return 1
+        ;;
+      RECOVERED)
+        finalize_orphan_terminal || return 1
+        ;;
+      *) return 1 ;;
+    esac
+    transaction_dir=
+  done
+  return 0
+}
+
 reconcile_current
+if ! { [ -e "$pointer" ] || [ -L "$pointer" ]; }; then
+  reconcile_orphans_without_pointer ||
+    fail_result deploy_failed_rollback_failed 23
+fi
 
 if [ "$mode" = rollback_last ] && ! { [ -e "$selector" ] || [ -L "$selector" ]; }; then
   fail_result precheck_failed 20
@@ -429,6 +622,73 @@ pre_runtime_fingerprint=$(runtime_safe_fingerprint "$root" "$compose_script") ||
   fail_result precheck_failed 20
 runtime_compose "$root" "$compose_script" config -q >/dev/null ||
   fail_result precheck_failed 20
+
+pointer_published=false
+transaction_dir=
+on_exit() {
+  local exit_status=$?
+  trap - EXIT TERM INT HUP
+  [ "$exit_status" -eq 0 ] && exit 0
+  if [ -z "${transaction_dir:-}" ]; then
+    result precheck_failed 20
+    exit 20
+  fi
+  if [ "$pointer_published" != true ] &&
+    ! { [ -e "$pointer" ] || [ -L "$pointer" ]; }; then
+    delete_transaction_directory "$transaction_dir" || {
+      result deploy_failed_rollback_failed 23
+      exit 23
+    }
+    result precheck_failed 20
+    exit 20
+  fi
+  pointer_published=true
+  [ -f "$transaction_dir/journal" ] && [ ! -L "$transaction_dir/journal" ] || {
+    result deploy_failed_rollback_failed 23
+    exit 23
+  }
+  load_journal "$transaction_dir/journal" || {
+    result deploy_failed_rollback_failed 23
+    exit 23
+  }
+  case "${journal[phase]}" in
+    SNAPSHOTTED)
+      verify_snapshot_state &&
+        clear_pointer_then_delete "$transaction_dir" &&
+        delete_unselected_candidate_generation || {
+        result deploy_failed_rollback_failed 23
+        exit 23
+      }
+      result precheck_failed 20
+      exit 20
+      ;;
+    COMMITTED|RECOVERED)
+      finalize_terminal || {
+        result deploy_failed_rollback_failed 23
+        exit 23
+      }
+      ;;
+    CANDIDATE_INSTALL_PENDING|CANDIDATE_INSTALLED|BACKEND_RECREATE_PENDING|\
+      BACKEND_RECREATED|VERIFIED|LAST_GOOD_COMMIT_PENDING)
+      if recover_transaction; then
+        write_journal RECOVERED false deploy_failed_rollback_succeeded 22 \
+          "${journal[pre_runtime_fingerprint]}"
+        finalize_terminal || {
+          result deploy_failed_rollback_failed 23
+          exit 23
+        }
+      else
+        result deploy_failed_rollback_failed 23
+        exit 23
+      fi
+      ;;
+    *) result deploy_failed_rollback_failed 23; exit 23 ;;
+  esac
+}
+trap on_exit EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
 
 prior_selector=absent
 prior_selector_value=
@@ -442,6 +702,10 @@ if [ -e "$selector" ] || [ -L "$selector" ]; then
     fail_result precheck_failed 20
   validate_generation "$prior_selector_value" ||
     fail_result precheck_failed 20
+  if [ "$mode" = rollback_last ]; then
+    validate_selected_generation_identity "$prior_selector_value" ||
+      fail_result precheck_failed 20
+  fi
   prior_generation_sha256=$(sha256_file "$generations/$prior_selector_value/manifest")
 fi
 
@@ -449,16 +713,22 @@ if [ "$mode" = rollback_last ]; then
   selected_env=$generations/$prior_selector_value/env
   [ -f "$selected_env" ] && [ ! -L "$selected_env" ] ||
     fail_result precheck_failed 20
-  transaction_id="$run_key-rollback-$(date +%s%N)"
+  transaction_id=
 else
   [ -f "$payload_file" ] && [ ! -L "$payload_file" ] ||
     fail_result precheck_failed 20
-  transaction_id="$run_key-apply-$(date +%s%N)"
+  transaction_id=
 fi
 
-transaction_dir=$transactions/$transaction_id
-[ ! -e "$transaction_dir" ] || fail_result precheck_failed 20
-install -d -m 700 "$transaction_dir"
+transaction_dir=$(mktemp -d "$transactions/${run_key}-${mode}-XXXXXX") ||
+  fail_result precheck_failed 20
+transaction_id=$(basename -- "$transaction_dir")
+if [ "$mode" = rollback_last ]; then
+  candidate_generation=$prior_selector_value
+else
+  candidate_generation=$transaction_id
+fi
+chmod 700 "$transaction_dir"
 install -m 600 "$root/.env.production" "$transaction_dir/env.before"
 printf '%s\n' "$pre_config_sha256" >"$transaction_dir/pre-config.sha256"
 chmod 600 "$transaction_dir/pre-config.sha256"
@@ -545,26 +815,6 @@ else
   candidate_env=$selected_env
 fi
 
-if [ "$mode" = rollback_last ]; then
-  candidate_generation=$prior_selector_value
-  candidate_generation_dir=$generations/$candidate_generation
-  validate_generation "$candidate_generation" ||
-    fail_result precheck_failed 20
-  atomic_copy "$candidate_generation_dir/env" "$transaction_dir/candidate.env" \
-    600 candidate_env
-else
-  candidate_generation=$transaction_id
-  candidate_generation_dir=$generations/$candidate_generation
-  install -d -m 700 "$candidate_generation_dir"
-  atomic_copy "$candidate_env" "$transaction_dir/candidate.env" 600 candidate_env
-  candidate_env_hash=$(sha256_file "$transaction_dir/candidate.env")
-  atomic_text $'schema=1\ngeneration='"$candidate_generation"$'\nenv_sha256='"$candidate_env_hash"$'\n' \
-    "$candidate_generation_dir/manifest" 600 generation_manifest
-  atomic_copy "$transaction_dir/candidate.env" "$candidate_generation_dir/env" \
-    600 generation_env
-  sync_directory "$candidate_generation_dir" generation_directory_sync
-fi
-
 journal=()
 journal[version]=1
 journal[transaction_id]=$transaction_id
@@ -581,56 +831,22 @@ journal[phase]=SNAPSHOTTED
 journal[critical]=false
 write_journal SNAPSHOTTED false '' '' ''
 publish_pointer
+pointer_published=true
 
-on_exit() {
-  local exit_status=$?
-  trap - EXIT TERM INT HUP
-  [ "$exit_status" -ne 0 ] || exit 0
-  [ -n "${transaction_dir:-}" ] &&
-    [ -f "$transaction_dir/journal" ] &&
-    load_journal "$transaction_dir/journal" || {
-    result deploy_failed_rollback_failed 23
-    exit 23
-  }
-  case "${journal[phase]}" in
-    SNAPSHOTTED)
-      clear_pointer_then_delete "$transaction_dir" || {
-        result deploy_failed_rollback_failed 23
-        exit 23
-      }
-      result precheck_failed 20
-      exit 20
-      ;;
-    COMMITTED|RECOVERED)
-      finalize_terminal || {
-        result deploy_failed_rollback_failed 23
-        exit 23
-      }
-      ;;
-    CANDIDATE_INSTALL_PENDING|CANDIDATE_INSTALLED|BACKEND_RECREATE_PENDING|\
-      BACKEND_RECREATED|VERIFIED|LAST_GOOD_COMMIT_PENDING)
-      if recover_transaction; then
-        write_journal RECOVERED false deploy_failed_rollback_succeeded 22 \
-          "${journal[pre_runtime_fingerprint]}"
-        finalize_terminal || {
-          result deploy_failed_rollback_failed 23
-          exit 23
-        }
-      else
-        result deploy_failed_rollback_failed 23
-        exit 23
-      fi
-      ;;
-    *)
-      result deploy_failed_rollback_failed 23
-      exit 23
-      ;;
-  esac
-}
-trap on_exit EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
-trap 'exit 129' HUP
+if [ "$mode" = rollback_last ]; then
+  candidate_generation=$prior_selector_value
+  candidate_generation_dir=$generations/$candidate_generation
+  validate_generation "$candidate_generation" ||
+    fail_result precheck_failed 20
+  atomic_copy "$candidate_env" "$transaction_dir/candidate.env" 600 candidate_env
+else
+  candidate_generation=$transaction_id
+  candidate_generation_dir=$generations/$candidate_generation
+  install -d -m 700 "$candidate_generation_dir"
+  atomic_copy "$candidate_env" "$transaction_dir/candidate.env" 600 candidate_env
+  atomic_copy "$candidate_env" "$candidate_generation_dir/env" 600 generation_env
+  sync_directory "$candidate_generation_dir" generation_directory_sync
+fi
 
 if [ "$mode" = rollback_last ]; then
   # The EXIT path reloads this durable record, so a signal at any publication
@@ -650,6 +866,17 @@ write_journal BACKEND_RECREATED true '' '' ''
 runtime_compose "$root" "$compose_script" ps -q backend >/dev/null
 candidate_runtime_fingerprint=$(runtime_safe_fingerprint "$root" "$compose_script")
 write_journal VERIFIED true '' '' "$candidate_runtime_fingerprint"
+if [ "$mode" = apply ]; then
+  candidate_env_hash=$(sha256_file "$candidate_generation_dir/env")
+  candidate_non_email_config=$(non_email_config_digest_file "$candidate_generation_dir/env")
+  candidate_non_email_fingerprint=$(runtime_non_email_fingerprint "$root" "$compose_script")
+  candidate_release_image=$(runtime_release_field "$root" BACKEND_IMAGE)
+  candidate_release_version=$(runtime_release_field "$root" BACKEND_VERSION)
+  candidate_release_revision=$(runtime_release_field "$root" BACKEND_REVISION)
+  atomic_text $'schema=2\ngeneration='"$candidate_generation"$'\nenv_sha256='"$candidate_env_hash"$'\nnon_email_config_sha256='"$candidate_non_email_config"$'\nnon_email_runtime_fingerprint='"$candidate_non_email_fingerprint"$'\nruntime_fingerprint='"$candidate_runtime_fingerprint"$'\nrelease_image='"$candidate_release_image"$'\nrelease_version='"$candidate_release_version"$'\nrelease_revision='"$candidate_release_revision"$'\n' \
+    "$candidate_generation_dir/manifest" 600 generation_manifest
+  sync_directory "$candidate_generation_dir" generation_directory_sync
+fi
 write_journal LAST_GOOD_COMMIT_PENDING true '' '' "$candidate_runtime_fingerprint"
 atomic_text "${candidate_generation}"$'\n' "$selector" 600 last_good_pointer
 sync_directory "$state_root" last_good_selector_root_sync

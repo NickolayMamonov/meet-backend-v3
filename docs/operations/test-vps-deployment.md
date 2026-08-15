@@ -127,7 +127,20 @@ The last-good store contains immutable mode-0600 `env` and safe manifest files
 under mode-0700 generation directories, selected by one atomic synced
 `.smtp-last-good.current` pointer. A first-generation absence is a legitimate
 state. `rollback_last` returns `precheck_failed`/20 without mutation when no
-selector exists; after a generation exists, it is idempotent.
+selector exists; after a generation exists, it is idempotent. The manifest
+binds the generation name, environment hash, non-email configuration hash,
+full and non-email runtime fingerprints, and release image/version/revision.
+The non-email fingerprint covers the backend and PostgreSQL identities,
+health/hardening, volumes, network/port topology, active Compose files, and
+release tuple, so a stale generation cannot replace a later database, release,
+HMAC/JWT, TIMEPAD, or other non-SMTP configuration. Recovery also verifies the
+full pre-state fingerprint after restoring the protected snapshots.
+
+The fake-remote interruption matrix exercises every journal and pointer
+publication boundary under `TERM`, `INT`, `HUP`, `SIGKILL`, and reboot-like
+fresh-process recovery. It accepts only complete old/new records, never
+replays a requested operation from a critical record, and preserves malformed
+or incomplete material for operator inspection.
 
 Release deployment and bounded retention acquire the same lock and reject
 every present `.smtp-transaction.current` object before creating run state,
@@ -137,13 +150,13 @@ state-root sync always precede transaction deletion.
 
 The five remote results are:
 
-| Category | Status | Meaning |
-| --- | ---: | --- |
-| `deploy_succeeded` | 0 | Verified SMTP configuration committed |
-| `precheck_failed` | 20 | No live mutation was authorized |
-| `lock_busy` | 21 | Another deployment owns the canonical lock |
-| `deploy_failed_rollback_succeeded` | 22 | Exact pre-state restored |
-| `deploy_failed_rollback_failed` | 23 | Evidence preserved; operator recovery required |
+| Category                           | Status | Meaning                                        |
+| ---------------------------------- | -----: | ---------------------------------------------- |
+| `deploy_succeeded`                 |      0 | Verified SMTP configuration committed          |
+| `precheck_failed`                  |     20 | No live mutation was authorized                |
+| `lock_busy`                        |     21 | Another deployment owns the canonical lock     |
+| `deploy_failed_rollback_succeeded` |     22 | Exact pre-state restored                       |
+| `deploy_failed_rollback_failed`    |     23 | Evidence preserved; operator recovery required |
 
 The workflow accepts exactly one result line and the matching SSH status.
 Missing, duplicate, malformed, unknown, or mismatched output fails closed and
