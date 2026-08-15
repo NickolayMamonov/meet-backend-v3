@@ -2,6 +2,7 @@ package dev.whysoezzy.meet
 
 import dev.whysoezzy.meet.config.AdminProperties
 import dev.whysoezzy.meet.config.ClientIpProperties
+import dev.whysoezzy.meet.config.DemoCatalogProperties
 import dev.whysoezzy.meet.config.EmailProperties
 import dev.whysoezzy.meet.config.GeocoderProperties
 import dev.whysoezzy.meet.config.JwtProperties
@@ -20,6 +21,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 @EnableConfigurationProperties(
     AdminProperties::class,
     ClientIpProperties::class,
+    DemoCatalogProperties::class,
     EmailProperties::class,
     GeocoderProperties::class,
     JwtProperties::class,

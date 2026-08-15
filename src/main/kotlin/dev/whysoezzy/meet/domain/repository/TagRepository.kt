@@ -6,5 +6,7 @@ import org.springframework.stereotype.Repository
 
 @Repository
 interface TagRepository : JpaRepository<Tag, Long> {
+    fun findAllByDemoCatalogKeyIn(keys: Collection<String>): List<Tag>
+
     fun findByText(text: String): Tag?
 }

@@ -1,3 +1,5 @@
+See [the demo catalog bootstrap runbook](operations/demo-catalog-bootstrap.md) for the disabled-first,
+backup-controlled operator procedure. MEE2-50 does not enable or invoke the catalog in production.
 # Production deployment
 
 ## Operator boundary and authentication configuration

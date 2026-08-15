@@ -9,6 +9,10 @@ server:
   shutdown: graceful
 
 app:
+  demo-catalog:
+    bootstrap-enabled: ${DEMO_CATALOG_BOOTSTRAP_ENABLED:false}
+    allowed-media-hosts: ${DEMO_CATALOG_ALLOWED_MEDIA_HOSTS:}
+
   geocoder:
     enabled: ${GEOCODER_ENABLED:false}
   ingestion:

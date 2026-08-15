@@ -7,6 +7,9 @@ import jakarta.persistence.*
 class Tag(
     
     @Column(nullable = false, unique = true, length = 100)
-    var text: String
+    var text: String,
+
+    @Column(name = "demo_catalog_key", length = 160, updatable = false)
+    var demoCatalogKey: String? = null
     
 ) : BaseEntity()

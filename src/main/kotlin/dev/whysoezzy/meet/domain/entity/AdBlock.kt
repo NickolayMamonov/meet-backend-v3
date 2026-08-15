@@ -6,6 +6,9 @@ import jakarta.persistence.*
 @Table(name = "ad_blocks")
 class AdBlock : BaseEntity() {
 
+    @Column(name = "demo_catalog_key", length = 160, updatable = false)
+    var demoCatalogKey: String? = null
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     var type: AdBlockType = AdBlockType.TEXT

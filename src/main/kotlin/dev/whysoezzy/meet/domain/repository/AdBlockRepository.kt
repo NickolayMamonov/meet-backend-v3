@@ -6,5 +6,7 @@ import org.springframework.stereotype.Repository
 
 @Repository
 interface AdBlockRepository : JpaRepository<AdBlock, Long> {
+    fun findAllByDemoCatalogKeyIn(keys: Collection<String>): List<AdBlock>
+
     fun findByIsActiveTrue(): List<AdBlock>
 }

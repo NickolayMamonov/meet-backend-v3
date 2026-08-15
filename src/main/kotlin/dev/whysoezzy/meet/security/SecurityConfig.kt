@@ -54,6 +54,22 @@ class SecurityConfig(
                     .requestMatchers(HttpMethod.GET, "/api/v1/tags").permitAll()
                     // AdBlocks — контроллер маппится на /api/ads (не /ad-blocks)
                     .requestMatchers(HttpMethod.GET, "/api/ads/**").permitAll()
+                    .requestMatchers(
+                        HttpMethod.GET,
+                        "/demo-assets/v1/community-moscow.png",
+                        "/demo-assets/v1/community-walks.png",
+                        "/demo-assets/v1/community-online.png",
+                        "/demo-assets/v1/meeting-moscow.png",
+                        "/demo-assets/v1/meeting-online.png",
+                        "/demo-assets/v1/avatar-01.png",
+                        "/demo-assets/v1/avatar-02.png",
+                        "/demo-assets/v1/avatar-03.png",
+                        "/demo-assets/v1/avatar-04.png",
+                        "/demo-assets/v1/avatar-05.png",
+                        "/demo-assets/v1/avatar-06.png",
+                        "/demo-events/organize-online",
+                        "/demo-events/networking-online",
+                    ).permitAll()
                     .requestMatchers("/admin/**").hasRole("ADMIN")
 
                     // Всё остальное — JWT обязателен
