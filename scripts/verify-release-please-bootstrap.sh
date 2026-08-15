@@ -7,6 +7,7 @@ fail() { echo "release-please bootstrap verification failed: $*" >&2; exit 1; }
 
 required=(
   .release-please-manifest.json version.json CHANGELOG.md
+  .github/workflows/ci.yml
   .github/workflows/release-please.yml
   docs/operations/backend-release-publishing.md
   scripts/resolve-release-descriptor.sh
@@ -25,6 +26,7 @@ required=(
   scripts/test-release-current-action-freshness.sh
   scripts/test-release-artifact-attestation-gate.sh
   scripts/test-release-controller-queue.sh
+  scripts/test-release-reader-credential-routing.sh
   scripts/test-release-post-publication-routing.sh
   scripts/test-release-protected-snapshot.sh
 )
@@ -72,6 +74,44 @@ for required_text in \
   grep -Fq -- "$required_text" <<<"$workflow" ||
     fail "workflow misses required invariant: $required_text"
 done
+controller=$(sed -n '/^  controller:/,/^  gates:/p' <<<"$workflow")
+grep -Fq '      packages: read' <<<"$controller" ||
+  fail "controller does not grant packages: read"
+step_block() {
+  local name=$1
+  awk -v marker="      - name: $name" '
+    $0 == marker { in_step=1 }
+    in_step && $0 ~ /^      - name: / && $0 != marker { exit }
+    in_step { print }
+  ' <<<"$controller"
+}
+for helper_step in \
+  'Enforce protected history before Release Please' \
+  'Classify current action before Release Please' \
+  'Enforce protected history after Release Please' \
+  'Normalize action result and current-action set difference'; do
+  helper_block=$(step_block "$helper_step")
+  [ -n "$helper_block" ] || fail "missing controller helper step: $helper_step"
+  grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$helper_block" ||
+    fail "controller helper does not use github.token: $helper_step"
+  if grep -Fq 'secrets.RELEASE_PLEASE_TOKEN' <<<"$helper_block"; then
+    fail "controller helper uses RELEASE_PLEASE_TOKEN: $helper_step"
+  fi
+done
+[ "$(grep -Fc 'GH_TOKEN: ${{ github.token }}' <<<"$controller")" -eq 4 ] ||
+  fail "controller must have exactly four github.token helper routes"
+[ "$(grep -Fc 'secrets.RELEASE_PLEASE_TOKEN' <<<"$workflow")" -eq 1 ] ||
+  fail "RELEASE_PLEASE_TOKEN must appear exactly once"
+ci_workflow=$(sed 's/\r$//' .github/workflows/ci.yml)
+if grep -Fq 'secrets.RELEASE_PLEASE_TOKEN' <<<"$ci_workflow"; then
+  fail "CI workflow must not use RELEASE_PLEASE_TOKEN"
+fi
+release_action=$(step_block 'Release Please current action')
+grep -Fq \
+  'uses: googleapis/release-please-action@c2a5a2bd6a758a0937f1ddb1e8950609867ed15c' \
+  <<<"$release_action" || fail "Release Please action is not pinned"
+grep -Fq 'token: ${{ secrets.RELEASE_PLEASE_TOKEN }}' <<<"$release_action" ||
+  fail "pinned Release Please action does not use RELEASE_PLEASE_TOKEN"
 for stale in \
   'release-recovery.yml' 'workflow_dispatch' 'route=recover' 'route=deep-recover' \
   'route=resume' 'route=resume-registry' 'mutate-release-metadata.sh canonicalize' \
