@@ -1,147 +1,98 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ASSET_INVENTORY_HELPER=$SCRIPT_DIR/release-asset-inventory.sh
-
-usage() {
-  echo "usage: $0 --repository owner/repo --release-id ID --tag vX.Y.Z --version X.Y.Z --source-sha SHA --expected-fingerprint SHA256 [--expected-route ROUTE] [--expected-admission-fingerprint SHA256] [--release-file PATH] [--repo-dir PATH] [--dev-ref REF]" >&2
-  exit 2
-}
-
-fail() {
-  echo "release mutation revalidation failed: $*" >&2
-  exit 1
-}
-
-REPOSITORY=${GITHUB_REPOSITORY:-}
-RELEASE_ID=
-TAG=
-VERSION=
-SOURCE_SHA=
-EXPECTED_FINGERPRINT=
-EXPECTED_ROUTE=
-EXPECTED_ADMISSION_FINGERPRINT=
-REPO_DIR=.
-DEV_REF=origin/dev
-RELEASE_FILE=
-
+fail() { echo "release mutation revalidation failed: $*" >&2; exit 1; }
+repository=${GITHUB_REPOSITORY:-}
+release_id=
+tag=
+version=
+source_sha=
+expected_route=materialize
+phase=complete
+release_file=
+policy_token_file=
+credential_proof=
+assets_dir=
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --repository) [ "$#" -ge 2 ] || usage; REPOSITORY=$2; shift 2 ;;
-    --release-id) [ "$#" -ge 2 ] || usage; RELEASE_ID=$2; shift 2 ;;
-    --tag) [ "$#" -ge 2 ] || usage; TAG=$2; shift 2 ;;
-    --version) [ "$#" -ge 2 ] || usage; VERSION=$2; shift 2 ;;
-    --source-sha) [ "$#" -ge 2 ] || usage; SOURCE_SHA=$2; shift 2 ;;
-    --expected-fingerprint)
-      [ "$#" -ge 2 ] || usage
-      EXPECTED_FINGERPRINT=$2
+    --repository) repository=${2:?}; shift 2 ;;
+    --release-id) release_id=${2:?}; shift 2 ;;
+    --tag) tag=${2:?}; shift 2 ;;
+    --version) version=${2:?}; shift 2 ;;
+    --source-sha) source_sha=${2:?}; shift 2 ;;
+    --expected-route) expected_route=${2:?}; shift 2 ;;
+    --phase)
+      phase=${2:?}
+      [ "$phase" = empty ] || [ "$phase" = complete ] ||
+        fail "phase must be empty or complete"
       shift 2
       ;;
-    --expected-route)
-      [ "$#" -ge 2 ] || usage
-      EXPECTED_ROUTE=$2
-      shift 2
-      ;;
-    --expected-admission-fingerprint)
-      [ "$#" -ge 2 ] || usage
-      EXPECTED_ADMISSION_FINGERPRINT=$2
-      shift 2
-      ;;
-    --repo-dir) [ "$#" -ge 2 ] || usage; REPO_DIR=$2; shift 2 ;;
-    --dev-ref) [ "$#" -ge 2 ] || usage; DEV_REF=$2; shift 2 ;;
-    --release-file) [ "$#" -ge 2 ] || usage; RELEASE_FILE=$2; shift 2 ;;
-    *) usage ;;
+    --release-file) release_file=${2:?}; shift 2 ;;
+    --policy-token-file) policy_token_file=${2:?}; shift 2 ;;
+    --credential-proof) credential_proof=${2:?}; shift 2 ;;
+    --assets-dir) assets_dir=${2:?}; shift 2 ;;
+    *) fail "unknown option: $1" ;;
   esac
 done
-
-command -v jq >/dev/null 2>&1 || fail "jq is required"
-if [ -n "$RELEASE_FILE" ]; then
-  [ -f "$RELEASE_FILE" ] || fail "release snapshot is missing"
-  jq -e 'type == "object"' "$RELEASE_FILE" >/dev/null ||
-    fail "release snapshot is not a JSON object"
+[ "$expected_route" = materialize ] || fail "only materialize is publishable"
+[[ "$release_id" =~ ^[1-9][0-9]*$ ]] || fail "release ID is invalid"
+[ "$tag" = "v$version" ] || fail "tag/version mismatch"
+[[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || fail "source SHA is invalid"
+[ -n "$policy_token_file" ] || fail "dedicated immutable-policy reader token is required"
+[ -s "$policy_token_file" ] || fail "policy reader token file is missing"
+"$(dirname "${BASH_SOURCE[0]}")/release-mutation-policy.sh" check \
+  --repository "$repository" --release-id "$release_id" --version "$version" \
+  --tag "$tag" --source-sha "$source_sha" --operation publish >/dev/null
+policy_args=(--repository "$repository" --token-file "$policy_token_file")
+[ -z "$credential_proof" ] || policy_args+=(--credential-proof "$credential_proof")
+"$(dirname "${BASH_SOURCE[0]}")/verify-immutable-release-policy.sh" \
+  "${policy_args[@]}" >/dev/null
+if [ -n "$release_file" ]; then
+  release=$(jq -c . "$release_file") || fail "release snapshot is malformed"
 else
   command -v gh >/dev/null 2>&1 || fail "gh is required"
+  release=$(gh api "repos/$repository/releases/$release_id") ||
+    fail "release read failed"
 fi
-
-[[ "$REPOSITORY" =~ ^[^/]+/[^/]+$ ]] || usage
-[[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || usage
-[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
-[ "$TAG" = "v$VERSION" ] || usage
-[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || usage
-[[ "$EXPECTED_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || usage
-
-git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
-  fail "repo-dir is not a Git work tree"
-if [ -z "$RELEASE_FILE" ]; then
-  git -C "$REPO_DIR" fetch --no-tags origin \
-    '+refs/heads/dev:refs/remotes/origin/dev' >/dev/null
+assets=(release-manifest.json image-index.json image-inspect.txt SHA256SUMS)
+if [ "$phase" = complete ] && [ -n "$assets_dir" ]; then
+  [ -d "$assets_dir" ] || fail "asset directory is missing"
+  for asset in "${assets[@]}"; do
+    [ -f "$assets_dir/$asset" ] || fail "expected asset is missing: $asset"
+  done
 fi
-
-if [ -z "$RELEASE_FILE" ]; then
-  release_file=$(mktemp)
-  trap 'rm -f "$release_file"' EXIT HUP INT TERM
-  gh api "repos/$REPOSITORY/releases/$RELEASE_ID" >"$release_file" ||
-    fail "release descriptor lookup failed"
-else
-  release_file=$RELEASE_FILE
+jq_filter='
+  .id == $id and .tag_name == $tag and .target_commitish == $source and
+  .draft == true and .prerelease == false and .published_at == null and
+  (.assets | type == "array")
+'
+if [ "$phase" = empty ]; then
+  jq_filter+=' and (.assets | length == 0)'
+elif [ "$phase" = complete ]; then
+  jq_filter+=' and (.assets | length == 4)'
 fi
-
-jq -e \
-  --argjson id "$RELEASE_ID" \
-  --arg tag "$TAG" \
-  --arg source "$SOURCE_SHA" '
-    type == "object" and
-    .id == $id and
-    .tag_name == $tag and
-    .target_commitish == $source and
-    .draft == true and
-    .published_at == null and
-    (.assets | type == "array")
-  ' "$release_file" >/dev/null ||
-  fail "release is not the expected draft descriptor"
-
-fingerprint=$(
-  "$ASSET_INVENTORY_HELPER" fingerprint --release-file "$release_file"
-) || fail "release asset inventory fingerprinting failed"
-[ "$fingerprint" = "$EXPECTED_FINGERPRINT" ] ||
-  fail "release asset metadata fingerprint changed"
-
-resolver_args=(
-  --repo-dir "$REPO_DIR"
-  --repository "$REPOSITORY"
-  --dev-ref "$DEV_REF"
-  --release-id "$RELEASE_ID"
-  --tag "$TAG"
-  --version "$VERSION"
-  --source-sha "$SOURCE_SHA"
-  --asset-inventory-fingerprint "$fingerprint"
-)
-[ -z "$EXPECTED_ROUTE" ] ||
-  resolver_args+=(--expected-route "$EXPECTED_ROUTE")
-[ -z "$EXPECTED_ADMISSION_FINGERPRINT" ] ||
-  resolver_args+=(--expected-admission-fingerprint "$EXPECTED_ADMISSION_FINGERPRINT")
-descriptor=$(
-  "$(dirname "${BASH_SOURCE[0]}")/resolve-release-descriptor.sh" verify \
-    "${resolver_args[@]}" \
-    --release-file "$release_file"
-)
-
-value() {
-  awk -F= -v key="$1" '$1 == key {
-    sub(/^[^=]*=/, "")
-    print
-  }' <<<"$descriptor"
-}
-
-test "$(value active)" = true
-test "$(value origin)" = verified
-test "$(value release_id)" = "$RELEASE_ID"
-test "$(value tag)" = "$TAG"
-test "$(value version)" = "$VERSION"
-test "$(value source_sha)" = "$SOURCE_SHA"
-test "$(value target_commitish)" = "$SOURCE_SHA"
-test "$(value draft)" = true
-test "$(value published_at)" = null
-test "$(value asset_inventory_fingerprint)" = "$fingerprint"
-printf 'mutation_admission=verified\nasset_inventory_fingerprint=%s\n' "$fingerprint"
+if [ "$phase" = complete ] && [ -n "$assets_dir" ]; then
+  expected_sha256=(
+    "$(sha256sum "$assets_dir/release-manifest.json" | awk '{print $1}')"
+    "$(sha256sum "$assets_dir/image-index.json" | awk '{print $1}')"
+    "$(sha256sum "$assets_dir/image-inspect.txt" | awk '{print $1}')"
+    "$(sha256sum "$assets_dir/SHA256SUMS" | awk '{print $1}')"
+  )
+  for index in "${!assets[@]}"; do
+    jq_filter+=" and ([.assets[] | select(.name == \"${assets[$index]}\")] |
+      length == 1 and .[0].digest == \"sha256:${expected_sha256[$index]}\")"
+  done
+  jq_filter+=' and ([.assets[].name] | sort) ==
+    ["SHA256SUMS","image-index.json","image-inspect.txt","release-manifest.json"] and
+    all(.assets[];
+      (.id | type == "number" and floor == . and . > 0) and
+      .state == "uploaded" and
+      (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+    )'
+fi
+jq -e --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" \
+  "$jq_filter" <<<"$release" >/dev/null || fail "release changed before publication"
+echo "revalidated=true"
+echo "release_id=$release_id"
+echo "route=$expected_route"
+echo "phase=$phase"

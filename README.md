@@ -207,3 +207,6 @@ requires operator-managed SMTP credentials plus an application OTP HMAC key ring
 SMS remains disabled.
 
 See [`docs/production-deployment.md`](docs/production-deployment.md).
+
+For the future-only immutable release controller and hosted publication proof,
+see [`docs/operations/backend-release-publishing.md`](docs/operations/backend-release-publishing.md).

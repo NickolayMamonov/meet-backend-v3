@@ -47,4 +47,5 @@ grep -Fx 'state=inspection-failed' "$ERROR_OUTPUT"
 
 WORKFLOW="$ROOT_DIR/.github/workflows/release-please.yml"
 grep -Fq '[ "$latest" = absent ]' "$WORKFLOW"
+grep -Fq 'release-registry-state.sh inspect "$IMAGE" "$VERSION" "$SOURCE_SHA"' "$WORKFLOW"
 echo "release registry latest preflight fixtures passed: absent, present, inspection-error"
