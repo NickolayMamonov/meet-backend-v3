@@ -303,6 +303,9 @@ jobs:
           sha256sum -c docs/evidence/MEE2-48-protected-history-v1.json.sha256
           cmp --silent docs/evidence/MEE2-48-protected-history-v1.json "$current"
 
+      - name: Set up attestation-capable Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+
       - name: Authenticate to GHCR
         env:
           GHCR_TOKEN: ${{ github.token }}

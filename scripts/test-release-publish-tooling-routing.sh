@@ -30,5 +30,15 @@ fi
 grep -Fq 'ref: ${{ needs.controller.outputs.source_sha }}' <<<"$source_checkout"
 grep -Fq 'path: source' <<<"$source_checkout"
 grep -Fq -- '--build-arg "BACKEND_REVISION=$SOURCE_SHA" source' <<<"$build"
+grep -Fq \
+  'uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435' \
+  <<<"$publish"
+buildx_line=$(grep -n 'name: Set up attestation-capable Buildx' <<<"$publish" |
+  cut -d: -f1)
+build_line=$(grep -n 'name: Build exact image' <<<"$publish" | cut -d: -f1)
+[ "$buildx_line" -lt "$build_line" ] || {
+  echo "attestation-capable Buildx must be configured before image build" >&2
+  exit 1
+}
 
 echo "release publication tooling-routing fixture passed"
