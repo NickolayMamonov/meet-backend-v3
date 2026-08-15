@@ -65,7 +65,7 @@ main() {
   local source_sha=
   local assets_dir=
   GH_COMMAND=gh
-  local release tag_release attestation statement_file
+  local release tag_release attestation statement_file bundle_statement_file
   local bundle_sha claim_sha payload asset path api_digest download_sha
   local attestation_release_id
   local -a assets=(
@@ -146,6 +146,7 @@ main() {
   tag_release=$WORK_DIR/tag-release.json
   attestation=$WORK_DIR/attestation.json
   statement_file=$WORK_DIR/statement.json
+  bundle_statement_file=$WORK_DIR/bundle-statement.json
 
   api_request GET "repos/$repository/releases/$release_id" "$release"
   api_request GET "repos/$repository/releases/tags/$tag" "$tag_release"
@@ -195,38 +196,59 @@ main() {
     type == "object" and
     (.attestation | type == "object") and
     (.attestation.bundle | type == "object") and
+    (.attestation.bundle.mediaType ==
+      "application/vnd.dev.sigstore.bundle.v0.3+json") and
     (.attestation.bundle.dsseEnvelope.payload |
       type == "string" and length > 0) and
-    (.verificationResult | type == "object" and .verified == true)
+    (.verificationResult | type == "object") and
+    (.verificationResult.mediaType ==
+      "application/vnd.dev.sigstore.verificationresult+json;version=0.1") and
+    (.verificationResult.signature.certificate |
+      type == "object" and
+      .subjectAlternativeName ==
+        "https://dotcom.releases.github.com") and
+    (.verificationResult.statement | type == "object")
   ' "$attestation" >/dev/null 2>&1 ||
-    fail "release attestation result is missing verified bundle data"
+    fail "release attestation result is missing the expected verified identity, bundle, or statement"
+
+  jq -cS '.verificationResult.statement' "$attestation" \
+    >"$statement_file" 2>/dev/null ||
+    fail "verified release attestation statement is malformed"
+  jq -e . "$statement_file" >/dev/null 2>&1 ||
+    fail "verified release attestation statement is malformed"
 
   payload=$(jq -r '.attestation.bundle.dsseEnvelope.payload' "$attestation")
-  printf '%s' "$payload" | base64 --decode >"$statement_file" 2>/dev/null ||
+  printf '%s' "$payload" | base64 --decode >"$bundle_statement_file" 2>/dev/null ||
     fail "release attestation claim is not valid base64"
-  jq -e . "$statement_file" >/dev/null 2>&1 ||
+  jq -e . "$bundle_statement_file" >/dev/null 2>&1 ||
     fail "release attestation claim is malformed"
+  cmp -s \
+    <(jq -cS . "$statement_file") \
+    <(jq -cS . "$bundle_statement_file") ||
+    fail "verified release statement does not match the attestation bundle claim"
 
-  attestation_release_id=$(jq -r '.predicate.releaseId | tostring' "$statement_file")
+  attestation_release_id=$(jq -r '.predicate.databaseId | tostring' "$statement_file")
   [ "$attestation_release_id" = "$release_id" ] ||
     fail "release attestation identifies another numeric release"
   jq -e \
     --arg repository "$repository" \
     --arg tag "$tag" \
     --arg source_sha "$source_sha" \
+    --arg purl "pkg:github/$repository@$tag" \
     --argjson release_id "$release_id" '
       type == "object" and
       .predicateType ==
-        "https://in-toto.io/attestation/release/v0.1" and
+        "https://in-toto.io/attestation/release/v0.2" and
       (.predicate | type == "object") and
       .predicate.repository == $repository and
-      (.predicate.releaseId | tostring) == ($release_id | tostring) and
+      (.predicate.databaseId | tostring) == ($release_id | tostring) and
       .predicate.tag == $tag and
+      .predicate.purl == $purl and
       (.subject | type == "array") and
       (
         [.subject[] |
           select(
-            (.uri? == ("pkg:github/" + $repository + "@" + $tag)) and
+            (.uri? == $purl) and
             (.digest.sha1? == $source_sha)
           )
         ] | length
@@ -310,7 +332,7 @@ main() {
         draft:false,
         attestation:{
           verified:true,
-          predicateType:"https://in-toto.io/attestation/release/v0.1",
+          predicateType:"https://in-toto.io/attestation/release/v0.2",
           bundleSha256:$bundle_sha,
           claimSha256:$claim_sha
         },
