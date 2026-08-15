@@ -206,6 +206,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-release-artifact-attestation-gate.sh"
           bash "$TOOLING_SCRIPTS/test-release-controller-queue.sh"
           bash "$TOOLING_SCRIPTS/test-release-reader-credential-routing.sh"
+          bash "$TOOLING_SCRIPTS/test-release-please-action-output.sh"
           bash "$TOOLING_SCRIPTS/test-release-post-publication-routing.sh"
           bash "$TOOLING_SCRIPTS/test-release-protected-snapshot.sh"
           bash "$TOOLING_SCRIPTS/test-release-mutation-revalidation.sh"
