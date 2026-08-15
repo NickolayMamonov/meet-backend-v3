@@ -30,8 +30,8 @@ jobs:
     outputs:
       route: ${{ steps.route.outputs.route }}
       release_id: ${{ steps.route.outputs.release_id }}
-      release_tag: ${{ steps.route.outputs.release_tag }}
-      release_version: ${{ steps.route.outputs.release_version }}
+      release_tag: ${{ steps.route.outputs.tag }}
+      release_version: ${{ steps.route.outputs.version }}
       source_sha: ${{ steps.route.outputs.source_sha }}
     steps:
       - name: Checkout reviewed release tooling
@@ -97,9 +97,37 @@ jobs:
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
             jq -c 'add // []' >"$releases_before"
           printf 'RELEASES_BEFORE_FILE=%s\n' "$releases_before" >>"$GITHUB_ENV"
-          descriptor=$(scripts/resolve-release-descriptor.sh pre-action \
-            --repository "$GITHUB_REPOSITORY" --dev-ref origin/dev \
-            --releases-file "$releases_before")
+          continuation_id=371012814
+          continuation_tag=v1.2.0
+          continuation_version=1.2.0
+          continuation_source=9b6d2b06c0336ab8d153564dcf6328e81c4d7b36
+          continuation_count=$(jq --argjson id "$continuation_id" '
+            [.[] | select(
+              .id == $id and .draft == true and
+              (.published_at // null) == null
+            )] | length
+          ' "$releases_before")
+          if [ "$continuation_count" -eq 1 ]; then
+            registry_state="$RUNNER_TEMP/v1.2.0-continuation-registry.txt"
+            scripts/release-registry-state.sh inspect \
+              ghcr.io/nickolaymamonov/meet-backend-v3 \
+              "$continuation_version" "$continuation_source" \
+              --quarantine-file "$RUNNER_TEMP/v1.2.0-continuation-quarantine.json" \
+              >"$registry_state"
+            descriptor=$(scripts/admit-empty-release-continuation.sh \
+              --repository "$GITHUB_REPOSITORY" --repo-dir . --dev-ref origin/dev \
+              --release-id "$continuation_id" --tag "$continuation_tag" \
+              --version "$continuation_version" --source-sha "$continuation_source" \
+              --releases-file "$releases_before" \
+              --registry-state-file "$registry_state")
+          elif [ "$continuation_count" -eq 0 ]; then
+            descriptor=$(scripts/resolve-release-descriptor.sh pre-action \
+              --repository "$GITHUB_REPOSITORY" --dev-ref origin/dev \
+              --releases-file "$releases_before")
+          else
+            echo "exact v1.2.0 continuation release is ambiguous" >&2
+            exit 1
+          fi
           printf '%s\n' "$descriptor"
           awk -F= '{print $1 "=" $2}' <<<"$descriptor" >>"$GITHUB_OUTPUT"
 
@@ -150,8 +178,8 @@ jobs:
             test "$PRE_ROUTE" = materialize || test "$PRE_ROUTE" = completed
             echo "route=$PRE_ROUTE" >>"$GITHUB_OUTPUT"
             echo "release_id=$PRE_RELEASE_ID" >>"$GITHUB_OUTPUT"
-            echo "release_tag=$PRE_TAG" >>"$GITHUB_OUTPUT"
-            echo "release_version=$PRE_VERSION" >>"$GITHUB_OUTPUT"
+            echo "tag=$PRE_TAG" >>"$GITHUB_OUTPUT"
+            echo "version=$PRE_VERSION" >>"$GITHUB_OUTPUT"
             echo "source_sha=$PRE_SOURCE_SHA" >>"$GITHUB_OUTPUT"
             exit 0
           fi
@@ -223,11 +251,18 @@ jobs:
       IMMUTABLE_POLICY_READER_APP_ID: ${{ vars.IMMUTABLE_POLICY_READER_APP_ID }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Checkout reviewed publication tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
       - name: Checkout exact publication source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ needs.controller.outputs.source_sha }}
           fetch-depth: 0
+          path: source
 
       - name: Verify reader and policy before every writer
         env:
@@ -314,7 +349,7 @@ jobs:
             --tag "$IMAGE:$TAG" --tag "$IMAGE:$VERSION" \
             --tag "$IMAGE:sha-$SOURCE_SHA" --push \
             --build-arg "BACKEND_VERSION=$VERSION" \
-            --build-arg "BACKEND_REVISION=$SOURCE_SHA" .
+            --build-arg "BACKEND_REVISION=$SOURCE_SHA" source
 
       - name: Verify exact candidate registry convergence
         run: |

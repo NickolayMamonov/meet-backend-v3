@@ -97,4 +97,20 @@ if "$RESOLVER" post-action --repo-dir "$REPO" \
   exit 1
 fi
 
+assert_output 'asset_inventory_kind=empty' verify --repo-dir "$REPO" \
+  --dev-ref HEAD --release-id 121 --tag v1.0.0 --version 1.0.0 \
+  --source-sha "$SOURCE" --phase empty --releases-file "$TMP/fresh-after.json"
+jq '.[0].assets=[{},{},{},{}]' "$TMP/fresh-after.json" >"$TMP/complete.json"
+assert_output 'asset_inventory_kind=complete' verify --repo-dir "$REPO" \
+  --dev-ref HEAD --release-id 121 --tag v1.0.0 --version 1.0.0 \
+  --source-sha "$SOURCE" --phase complete --releases-file "$TMP/complete.json"
+jq '.[0].assets=[{}]' "$TMP/fresh-after.json" >"$TMP/partial.json"
+if "$RESOLVER" verify --repo-dir "$REPO" \
+  --dev-ref HEAD --release-id 121 --tag v1.0.0 --version 1.0.0 \
+  --source-sha "$SOURCE" --phase empty --releases-file "$TMP/partial.json" \
+  >/dev/null 2>&1; then
+  echo "partial asset inventory passed empty-phase verification" >&2
+  exit 1
+fi
+
 echo "future-only pre-action routing fixtures passed"
