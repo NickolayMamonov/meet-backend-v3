@@ -418,7 +418,6 @@ class DemoCatalogBootstrapService(
             return RelationshipCounts(added = 1)
         }
         if (entityId(current) == entityId(desired)) return RelationshipCounts(unchanged = 1)
-        if (!isOwned(current)) return RelationshipCounts(unchanged = 1)
         setter(desired)
         return RelationshipCounts(added = 1, removed = 1)
     }

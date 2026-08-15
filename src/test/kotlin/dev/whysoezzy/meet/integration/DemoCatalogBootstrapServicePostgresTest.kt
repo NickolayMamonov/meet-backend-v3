@@ -4,6 +4,7 @@ import dev.whysoezzy.meet.demo.catalog.DemoCatalogBootstrapCommand
 import dev.whysoezzy.meet.demo.catalog.DemoCatalogBootstrapService
 import dev.whysoezzy.meet.demo.catalog.DemoCatalogFailureInjector
 import dev.whysoezzy.meet.demo.catalog.DemoCatalogStateRepository
+import dev.whysoezzy.meet.domain.entity.Community
 import dev.whysoezzy.meet.domain.entity.User
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -74,6 +75,63 @@ class DemoCatalogBootstrapServicePostgresTest : IntegrationTestSupport() {
         assertEquals(12, second.relationships.userInterests.unchanged)
         assertEquals(18, second.relationships.meetingParticipants.unchanged)
         assertTrue(meetings.findAll().all { ids[it.demoCatalogKey] == it.id })
+    }
+
+    @Test
+    fun `owned meeting hosts repair to frozen hosts when displaced by real rows`() {
+        service.bootstrap(command)
+        val desiredPersonHost = users.findAll().first { it.demoCatalogKey == "closed-beta-demo/user/01" }
+        val desiredCommunityHost = communities.findAll().first { it.demoCatalogKey == "closed-beta-demo/community/moscow-meets" }
+        val desiredOrganizePersonHost = users.findAll().first { it.demoCatalogKey == "closed-beta-demo/user/05" }
+        val desiredOnlineCommunityHost = communities.findAll().first { it.demoCatalogKey == "closed-beta-demo/community/online-club" }
+        val realPersonHost = users.save(User("Real", "Host", "+15550000097", email = "real-host@example.test"))
+        val realCommunityHost = communities.save(
+            Community(
+                "Real community",
+                "Real community that must remain untouched",
+                "https://example.test/real-community.png",
+            ),
+        )
+        val personDriftMeeting = meetings.findAll().first { it.demoCatalogKey == "closed-beta-demo/meeting/welcome" }
+        val communityDriftMeeting = meetings.findAll().first { it.demoCatalogKey == "closed-beta-demo/meeting/organize-online" }
+        jdbcTemplate.update(
+            "UPDATE meetings SET person_host_id = ?, community_host_id = ? WHERE id = ?",
+            realPersonHost.id,
+            desiredCommunityHost.id,
+            requireNotNull(personDriftMeeting.id),
+        )
+        jdbcTemplate.update(
+            "UPDATE meetings SET person_host_id = ?, community_host_id = ? WHERE id = ?",
+            desiredOrganizePersonHost.id,
+            realCommunityHost.id,
+            requireNotNull(communityDriftMeeting.id),
+        )
+        entityManager.clear()
+
+        val result = service.bootstrap(command)
+
+        assertEquals(1, result.relationships.meetingPersonHosts.added)
+        assertEquals(1, result.relationships.meetingPersonHosts.removed)
+        assertEquals(5, result.relationships.meetingPersonHosts.unchanged)
+        assertEquals(1, result.relationships.meetingCommunityHosts.added)
+        assertEquals(1, result.relationships.meetingCommunityHosts.removed)
+        assertEquals(5, result.relationships.meetingCommunityHosts.unchanged)
+        val repairedPersonDrift = jdbcTemplate.queryForMap(
+            "SELECT person_host_id, community_host_id FROM meetings WHERE id = ?",
+            requireNotNull(personDriftMeeting.id),
+        )
+        val repairedCommunityDrift = jdbcTemplate.queryForMap(
+            "SELECT person_host_id, community_host_id FROM meetings WHERE id = ?",
+            requireNotNull(communityDriftMeeting.id),
+        )
+        assertEquals(desiredPersonHost.id, repairedPersonDrift["person_host_id"])
+        assertEquals(desiredCommunityHost.id, repairedPersonDrift["community_host_id"])
+        assertEquals(desiredOrganizePersonHost.id, repairedCommunityDrift["person_host_id"])
+        assertEquals(desiredOnlineCommunityHost.id, repairedCommunityDrift["community_host_id"])
+        assertEquals(7, users.count())
+        assertEquals(4, communities.count())
+        assertTrue(users.findById(requireNotNull(realPersonHost.id)).isPresent)
+        assertTrue(communities.findById(requireNotNull(realCommunityHost.id)).isPresent)
     }
 
     @Test
@@ -237,6 +295,17 @@ class DemoCatalogBootstrapServicePostgresTest : IntegrationTestSupport() {
             realUserId,
             "real-member",
         )
+        jdbcTemplate.update(
+            "UPDATE users SET name = ? WHERE demo_catalog_key = ?",
+            "[ДЕМО] Drifted name",
+            "closed-beta-demo/user/01",
+        )
+        jdbcTemplate.update(
+            "UPDATE meetings SET title = ? WHERE demo_catalog_key = ?",
+            "[ДЕМО] Drifted meeting",
+            "closed-beta-demo/meeting/welcome",
+        )
+        entityManager.clear()
         val before = databaseSnapshot()
 
         doThrow(IllegalStateException("injected demo catalog failure"))
@@ -314,7 +383,9 @@ class DemoCatalogBootstrapServicePostgresTest : IntegrationTestSupport() {
             "auth_identities",
             "refresh_tokens",
             "otp_codes",
+            "otp_rate_limit_attempts",
             "user_social_media",
+            "ingestion_runs",
         )
     }
 }

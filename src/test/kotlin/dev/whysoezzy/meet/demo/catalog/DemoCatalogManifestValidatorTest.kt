@@ -33,6 +33,55 @@ class DemoCatalogManifestValidatorTest {
     }
 
     @Test
+    fun `catalog identity is frozen`() {
+        assertThrows<IllegalArgumentException> {
+            validator.validate(
+                BetaDemoCatalog.manifest.copy(catalogName = "another-catalog"),
+                setOf("api.whysoezzy.online"),
+            )
+        }
+        assertThrows<IllegalArgumentException> {
+            validator.validate(
+                BetaDemoCatalog.manifest.copy(manifestVersion = "2026-08-15.v2"),
+                setOf("api.whysoezzy.online"),
+            )
+        }
+    }
+
+    @Test
+    fun `references must target their declared entity category`() {
+        val manifest = BetaDemoCatalog.manifest
+        val wrongCategory = manifest.copy(
+            users = manifest.users.mapIndexed { index, user ->
+                if (index == 0) {
+                    user.copy(interests = setOf(manifest.communities.first().key, manifest.tags.first().key))
+                } else {
+                    user
+                }
+            },
+        )
+        assertThrows<IllegalArgumentException> {
+            validator.validate(wrongCategory, setOf("api.whysoezzy.online"))
+        }
+    }
+
+    @Test
+    fun `frozen root and relationship counts are required`() {
+        val manifest = BetaDemoCatalog.manifest
+        assertThrows<IllegalArgumentException> {
+            validator.validate(manifest.copy(meetings = manifest.meetings.dropLast(1)), setOf("api.whysoezzy.online"))
+        }
+        val missingRelationship = manifest.copy(
+            meetings = manifest.meetings.mapIndexed { index, meeting ->
+                if (index == 0) meeting.copy(participants = meeting.participants.drop(1).toSet()) else meeting
+            },
+        )
+        assertThrows<IllegalArgumentException> {
+            validator.validate(missingRelationship, setOf("api.whysoezzy.online"))
+        }
+    }
+
+    @Test
     fun `media paths must be the exact approved singleton artifact`() {
         val badMedia = BetaDemoCatalog.manifest.copy(
             communities = BetaDemoCatalog.manifest.communities.map {
