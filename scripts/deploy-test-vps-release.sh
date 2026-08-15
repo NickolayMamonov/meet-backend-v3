@@ -180,7 +180,8 @@ verify_runtime() {
 
   mapfile -t mounts < <(
     docker inspect "$backend" --format \
-      '{{range .Mounts}}{{if eq .Destination "/data/uploads"}}{{printf "%s|%s\n" .Type .Name}}{{end}}{{end}}'
+      '{{range .Mounts}}{{if eq .Destination "/data/uploads"}}{{printf "%s|%s\n" .Type .Name}}{{end}}{{end}}' |
+      sed '/^$/d'
   )
   [ "${#mounts[@]}" -eq 1 ]
   [ "${mounts[0]}" = "volume|meet-production_uploads_data" ]
@@ -188,7 +189,8 @@ verify_runtime() {
   docker volume inspect meet-production_postgres_data >/dev/null
   mapfile -t postgres_mounts < <(
     docker inspect "$postgres" --format \
-      '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{printf "%s|%s\n" .Type .Name}}{{end}}{{end}}'
+      '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{printf "%s|%s\n" .Type .Name}}{{end}}{{end}}' |
+      sed '/^$/d'
   )
   [ "${#postgres_mounts[@]}" -eq 1 ]
   [ "${postgres_mounts[0]}" = "volume|meet-production_postgres_data" ]
