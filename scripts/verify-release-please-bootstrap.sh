@@ -27,6 +27,8 @@ required=(
   scripts/test-release-artifact-attestation-gate.sh
   scripts/test-release-controller-queue.sh
   scripts/test-release-reader-credential-routing.sh
+  scripts/normalize-release-please-action-output.sh
+  scripts/test-release-please-action-output.sh
   scripts/normalize-github-attestations.sh
   scripts/resolve-ghcr-username.sh
   scripts/test-release-post-publication-routing.sh
@@ -71,6 +73,7 @@ for required_text in \
   'artifactAttestation:$artifact_attestation' \
   '--before-releases-file' '--after-releases-file' \
   '--release-created true' '--release-created false' \
+  'normalize-release-please-action-output.sh' \
   'Verify exact v1.2.0 publication tuple' \
   'release-manifest.json' 'image-index.json' 'image-inspect.txt' 'SHA256SUMS'; do
   grep -Fq -- "$required_text" <<<"$workflow" ||

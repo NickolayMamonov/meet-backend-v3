@@ -155,7 +155,14 @@ jobs:
             echo "source_sha=$PRE_SOURCE_SHA" >>"$GITHUB_OUTPUT"
             exit 0
           fi
-          case "$RELEASE_CREATED" in
+          normalized_release_created=$(
+            scripts/normalize-release-please-action-output.sh \
+              --release-created "$RELEASE_CREATED" \
+              --tag "$RELEASE_TAG" \
+              --version "$RELEASE_VERSION" \
+              --source-sha "$RELEASE_SOURCE_SHA"
+          )
+          case "$normalized_release_created" in
             true)
               releases_after="$RUNNER_TEMP/release-relevant-after.json"
               gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
@@ -179,10 +186,6 @@ jobs:
                 --before-releases-file "$RELEASES_BEFORE_FILE" \
                 --after-releases-file "$releases_after" \
                 --release-created false)
-              ;;
-            *)
-              echo "release_created must be an explicit Boolean" >&2
-              exit 1
               ;;
           esac
           printf '%s\n' "$descriptor"
