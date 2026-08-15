@@ -70,8 +70,20 @@ jq -e '
     (.registry | required_registry) and
     (.githubAttestations | type == "array" and all(.[]; (
       type == "object" and
-      (.predicateType | type == "string") and
-      (.bundleDigest | type == "string")
+      (. as $attestation |
+      ($attestation.subjectDigest | type == "string" and
+        test("^sha256:[0-9a-f]{64}$")) and
+      ($attestation.predicateType | type == "string" and length > 0) and
+      ($attestation.sourceRepository | type == "string" and
+        startswith("https://github.com/")) and
+      ($attestation.sourceDigest | type == "string" and
+        test("^[0-9a-f]{40}$")) and
+      ($attestation.workflowRef | type == "string" and startswith("refs/")) and
+      ($attestation.signerWorkflow | type == "string" and
+        startswith($attestation.sourceRepository + "/.github/workflows/") and
+        endswith("@" + $attestation.workflowRef)) and
+      ($attestation.bundleDigest | type == "string" and
+        test("^sha256:[0-9a-f]{64}$")))
     )));
   type == "object" and
   .schema == "meet-backend/protected-release-history/v1" and

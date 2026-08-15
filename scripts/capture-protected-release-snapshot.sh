@@ -246,17 +246,9 @@ attestation_state() {
     printf '[]'
     return
   fi
-  jq -cS '
-    (.attestations // []) | map({
-      subjectDigest:(.subject_digest // null),
-      predicateType:(.predicate_type // null),
-      sourceRepository:(.source_repository // null),
-      sourceDigest:(.source_digest // null),
-      workflowRef:(.workflow_ref // null),
-      signerWorkflow:(.signer_workflow // null),
-      bundleDigest:(.bundle_digest // null)
-    }) | sort_by(.predicateType,.bundleDigest)
-  ' "$file"
+  "$SCRIPT_DIR/normalize-github-attestations.sh" \
+    --input "$file" \
+    --subject-digest "$digest"
 }
 
 snapshot_object() {
@@ -268,7 +260,7 @@ snapshot_object() {
   jq -r '.body // ""' "$release_file" >"$body_file"
   body_hash=$(sha256sum "$body_file" | awk '{print $1}')
   registry=$(registry_state "$version" "$(jq -r '.target_commitish' <<<"$release")")
-  jq -cS \
+  jq -n -cS \
     --arg version "$version" --arg bodyHash "$body_hash" \
     --arg tag "$(jq -r '.tag_name' <<<"$release")" \
     --arg source "$(jq -r '.target_commitish' <<<"$release")" \
@@ -302,34 +294,53 @@ snapshot_object() {
   '
 }
 
+validate_single_object() {
+  local label=$1 file=$2 shape
+  shape=$(jq -c -s '
+    map(
+      if type == "object"
+      then {type:type,keys:(keys | sort)}
+      else {type:type}
+      end
+    )
+  ' "$file") || fail "$label snapshot output is not valid JSON"
+  [ "$shape" = '[{"type":"object","keys":["assets","gitRef","githubAttestations","identity","registry","release"]}]' ] ||
+    fail "$label snapshot output shape is $shape"
+}
+
 main() {
   local blocked_file=$work_dir/blocked.json immutable_file=$work_dir/immutable.json
   local blocked_ref=$work_dir/blocked-ref.json immutable_ref=$work_dir/immutable-ref.json
   local blocked_assets=$work_dir/blocked-assets immutable_assets=$work_dir/immutable-assets
+  local blocked_object=$work_dir/blocked-object.json
+  local immutable_object=$work_dir/immutable-object.json
   gh api "repos/$repository/releases/$blocked_id" >"$blocked_file" ||
     fail "blocked release read failed"
   gh api "repos/$repository/releases/$immutable_id" >"$immutable_file" ||
     fail "immutable predecessor read failed"
   read_ref "v$blocked_version" "$blocked_ref"
   read_ref "v$immutable_version" "$immutable_ref"
-  if ! blocked_object=$(snapshot_object "$blocked_file" "$blocked_version" \
-    "$blocked_ref" "$blocked_assets"); then
+  if ! snapshot_object "$blocked_file" "$blocked_version" \
+    "$blocked_ref" "$blocked_assets" >"$blocked_object"; then
     fail "blocked snapshot normalization failed"
   fi
-  if ! immutable_object=$(snapshot_object "$immutable_file" "$immutable_version" \
-    "$immutable_ref" "$immutable_assets"); then
+  validate_single_object blocked "$blocked_object"
+  if ! snapshot_object "$immutable_file" "$immutable_version" \
+    "$immutable_ref" "$immutable_assets" >"$immutable_object"; then
     fail "immutable snapshot normalization failed"
   fi
+  validate_single_object immutable "$immutable_object"
   jq -n -cS \
     --arg schema "meet-backend/protected-release-history/v1" \
     --arg repository "$(printf '%s' "$repository" | tr '[:upper:]' '[:lower:]')" \
     --arg image "$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')" \
-    --argjson blocked "$blocked_object" --argjson immutable "$immutable_object" '
+    --slurpfile blocked "$blocked_object" \
+    --slurpfile immutable "$immutable_object" '
     {
       schema:$schema,repository:$repository,image:$image,
-      objects:{blockedV1_1_0:$blocked,immutableV1_0_1:$immutable}
+      objects:{blockedV1_1_0:$blocked[0],immutableV1_0_1:$immutable[0]}
     }
-  ' >"$output" || fail "snapshot normalization failed"
+  ' | tr -d '\r' >"$output" || fail "snapshot normalization failed"
 }
 
 main
