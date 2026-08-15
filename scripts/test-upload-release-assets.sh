@@ -49,15 +49,38 @@ case "${1:-}" in
   *) exit 95 ;;
 esac
 EOF
+cat >"$TMP/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) output=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '{"enabled":true}\n' >"$output"
+printf '200'
+EOF
 chmod +x "$TMP/bin/gh"
+chmod +x "$TMP/bin/curl"
 export PATH="$TMP/bin:$PATH"
 export GH_FIXTURE_STATE="$TMP/release.json"
 export GH_FIXTURE_LOG="$TMP/gh.log"
+printf 'fixture-policy-reader-token\n' >"$TMP/policy-token"
+
+if "$ROOT_DIR/scripts/upload-release-assets.sh" \
+  --repository "$repository" --release-id "$release_id" \
+  --tag "$tag" --version "$version" --source-sha "$source_sha" \
+  --assets-dir "$TMP/assets" >/dev/null 2>&1; then
+  echo "asset upload without the policy reader unexpectedly passed" >&2
+  exit 1
+fi
 
 "$ROOT_DIR/scripts/upload-release-assets.sh" \
   --repository "$repository" --release-id "$release_id" \
   --tag "$tag" --version "$version" --source-sha "$source_sha" \
-  --assets-dir "$TMP/assets"
+  --assets-dir "$TMP/assets" --policy-token-file "$TMP/policy-token"
 
 [ "$(wc -l <"$TMP/gh.log" | tr -d '[:space:]')" -eq 4 ]
 grep -Fx "upload $tag $TMP/assets/release-manifest.json $repository" "$TMP/gh.log" >/dev/null

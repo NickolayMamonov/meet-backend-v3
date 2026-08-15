@@ -23,6 +23,7 @@ required=(
   scripts/test-release-evidence.sh
   scripts/test-release-mutation-policy.sh
   scripts/test-release-current-action-freshness.sh
+  scripts/test-release-artifact-attestation-gate.sh
   scripts/test-release-controller-queue.sh
   scripts/test-release-post-publication-routing.sh
   scripts/test-release-protected-snapshot.sh
@@ -60,6 +61,10 @@ for required_text in \
   'scripts/verify-immutable-policy-reader-credential.sh' \
   'scripts/verify-immutable-release-policy.sh' \
   'scripts/verify-immutable-release-proof.sh' \
+  'actions/attest-build-provenance@' \
+  'gh attestation verify "$ARTIFACT"' \
+  '--phase empty' '--policy-token-file' 'attestations: write' \
+  'artifactAttestation:$artifact_attestation' \
   '--before-releases-file' '--after-releases-file' \
   '--release-created true' '--release-created false' \
   'Verify exact v1.2.0 publication tuple' \

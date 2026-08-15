@@ -34,6 +34,8 @@ done
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || fail "source SHA is invalid"
 [ -d "$assets_dir" ] || fail "asset directory is missing"
 command -v gh >/dev/null 2>&1 || fail "gh is required"
+[ -n "$policy_token_file" ] || fail "dedicated immutable-policy reader token is required"
+[ -s "$policy_token_file" ] || fail "policy reader token file is missing"
 
 assets=(release-manifest.json image-index.json image-inspect.txt SHA256SUMS)
 for asset in "${assets[@]}"; do
@@ -44,12 +46,8 @@ expected=$(printf '%s\n' "${assets[@]}" | sort)
 actual=$(find "$assets_dir" -maxdepth 1 -type f -printf '%f\n' | sort)
 [ "$actual" = "$expected" ] || fail "asset directory contains an unexpected file"
 
-policy_args=()
-if [ -n "$policy_token_file" ]; then
-  [ -s "$policy_token_file" ] || fail "policy reader token file is missing"
-  policy_args=(--repository "$repository" --token-file "$policy_token_file")
-  [ -z "$credential_proof" ] || policy_args+=(--credential-proof "$credential_proof")
-fi
+policy_args=(--repository "$repository" --token-file "$policy_token_file")
+[ -z "$credential_proof" ] || policy_args+=(--credential-proof "$credential_proof")
 
 validate_prefix() {
   local phase=$1 release asset index expected_sha
@@ -85,10 +83,8 @@ for asset in "${assets[@]}"; do
     --repository "$repository" --release-id "$release_id" \
     --version "$version" --tag "$tag" --source-sha "$source_sha" \
     --operation upload-assets >/dev/null
-  if [ "${#policy_args[@]}" -gt 0 ]; then
-    "$script_dir/verify-immutable-release-policy.sh" \
-      "${policy_args[@]}" >/dev/null
-  fi
+  "$script_dir/verify-immutable-release-policy.sh" \
+    "${policy_args[@]}" >/dev/null
   gh release upload "$tag" "$assets_dir/$asset" --repo "$repository" ||
     fail "asset upload failed: $asset"
   phase=$((phase + 1))

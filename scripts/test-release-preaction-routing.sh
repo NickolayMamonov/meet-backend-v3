@@ -44,6 +44,19 @@ assert_output 'route=completed' post-action --repo-dir "$REPO" \
   --dev-ref HEAD --tag v1.0.0 --version 1.0.0 --source-sha "$SOURCE" \
   --allow-completed --releases-file "$TMP/published.json" --refs-file "$TMP/refs.json"
 
+OLD_SOURCE=abcdefabcdefabcdefabcdefabcdefabcdefabcd
+jq -n --arg old_source "$OLD_SOURCE" '[{
+  id:123,tag_name:"v1.0.0",target_commitish:$old_source,draft:false,prerelease:false,
+  published_at:"2026-08-14T00:00:00Z",assets:[]
+}]' >"$TMP/published-old-source.json"
+assert_output 'route=action' pre-action --repo-dir "$REPO" \
+  --dev-ref HEAD --releases-file "$TMP/published-old-source.json" \
+  --refs-file "$TMP/refs.json"
+assert_output 'route=completed' post-action --repo-dir "$REPO" \
+  --dev-ref HEAD --tag v1.0.0 --version 1.0.0 --source-sha "$SOURCE" \
+  --allow-completed --release-created false \
+  --releases-file "$TMP/published-old-source.json" --refs-file "$TMP/refs.json"
+
 jq -n --arg source "$SOURCE" '[{
   id:121,tag_name:"v1.0.0",target_commitish:$source,draft:true,prerelease:false,
   published_at:null,assets:[]

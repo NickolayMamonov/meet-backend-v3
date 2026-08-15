@@ -37,8 +37,8 @@ done
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
 [ "$tag" = "v$version" ] || usage
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || usage
-[ -z "$policy_token_file" ] || [ -s "$policy_token_file" ] ||
-  fail "policy reader token file is missing"
+[ -n "$policy_token_file" ] || fail "dedicated immutable-policy reader token is required"
+[ -s "$policy_token_file" ] || fail "policy reader token file is missing"
 
 if [ -n "$release_file" ]; then
   before=$(jq -c . "$release_file") || fail "release fixture is malformed"
@@ -50,12 +50,10 @@ fi
 "$script_dir/release-mutation-policy.sh" check \
   --repository "$repository" --release-id "$release_id" --version "$version" \
   --tag "$tag" --source-sha "$source_sha" --operation publish >/dev/null
-if [ -n "$policy_token_file" ]; then
-  policy_args=(--repository "$repository" --token-file "$policy_token_file")
-  [ -z "$credential_proof" ] || policy_args+=(--credential-proof "$credential_proof")
-  "$script_dir/verify-immutable-release-policy.sh" \
-    "${policy_args[@]}" >/dev/null
-fi
+policy_args=(--repository "$repository" --token-file "$policy_token_file")
+[ -z "$credential_proof" ] || policy_args+=(--credential-proof "$credential_proof")
+"$script_dir/verify-immutable-release-policy.sh" \
+  "${policy_args[@]}" >/dev/null
 jq -e --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" '
   type == "object" and .id == $id and .tag_name == $tag and
   .target_commitish == $source and .draft == true and .prerelease == false and
@@ -87,10 +85,8 @@ if [ -n "$release_file" ]; then
     .prerelease=false | .name=$tag
   ' <<<"$before"
 else
-  if [ -n "$policy_token_file" ]; then
-    "$script_dir/verify-immutable-release-policy.sh" \
-      "${policy_args[@]}" >/dev/null
-  fi
+  "$script_dir/verify-immutable-release-policy.sh" \
+    "${policy_args[@]}" >/dev/null
   "$script_dir/verify-release-tag-ref.sh" \
     --repository "$repository" --tag v1.1.0 \
     --source-sha 36ffd11ea4d35147f1df9c1cafa6a330300c1339 \

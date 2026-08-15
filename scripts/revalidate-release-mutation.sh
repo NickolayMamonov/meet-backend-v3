@@ -8,6 +8,7 @@ tag=
 version=
 source_sha=
 expected_route=materialize
+phase=complete
 release_file=
 policy_token_file=
 credential_proof=
@@ -20,6 +21,12 @@ while [ "$#" -gt 0 ]; do
     --version) version=${2:?}; shift 2 ;;
     --source-sha) source_sha=${2:?}; shift 2 ;;
     --expected-route) expected_route=${2:?}; shift 2 ;;
+    --phase)
+      phase=${2:?}
+      [ "$phase" = empty ] || [ "$phase" = complete ] ||
+        fail "phase must be empty or complete"
+      shift 2
+      ;;
     --release-file) release_file=${2:?}; shift 2 ;;
     --policy-token-file) policy_token_file=${2:?}; shift 2 ;;
     --credential-proof) credential_proof=${2:?}; shift 2 ;;
@@ -31,15 +38,15 @@ done
 [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || fail "release ID is invalid"
 [ "$tag" = "v$version" ] || fail "tag/version mismatch"
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || fail "source SHA is invalid"
+[ -n "$policy_token_file" ] || fail "dedicated immutable-policy reader token is required"
+[ -s "$policy_token_file" ] || fail "policy reader token file is missing"
 "$(dirname "${BASH_SOURCE[0]}")/release-mutation-policy.sh" check \
   --repository "$repository" --release-id "$release_id" --version "$version" \
   --tag "$tag" --source-sha "$source_sha" --operation publish >/dev/null
-if [ -n "$policy_token_file" ]; then
-  policy_args=(--repository "$repository" --token-file "$policy_token_file")
-  [ -z "$credential_proof" ] || policy_args+=(--credential-proof "$credential_proof")
-  "$(dirname "${BASH_SOURCE[0]}")/verify-immutable-release-policy.sh" \
-    "${policy_args[@]}" >/dev/null
-fi
+policy_args=(--repository "$repository" --token-file "$policy_token_file")
+[ -z "$credential_proof" ] || policy_args+=(--credential-proof "$credential_proof")
+"$(dirname "${BASH_SOURCE[0]}")/verify-immutable-release-policy.sh" \
+  "${policy_args[@]}" >/dev/null
 if [ -n "$release_file" ]; then
   release=$(jq -c . "$release_file") || fail "release snapshot is malformed"
 else
@@ -48,7 +55,7 @@ else
     fail "release read failed"
 fi
 assets=(release-manifest.json image-index.json image-inspect.txt SHA256SUMS)
-if [ -n "$assets_dir" ]; then
+if [ "$phase" = complete ] && [ -n "$assets_dir" ]; then
   [ -d "$assets_dir" ] || fail "asset directory is missing"
   for asset in "${assets[@]}"; do
     [ -f "$assets_dir/$asset" ] || fail "expected asset is missing: $asset"
@@ -57,9 +64,14 @@ fi
 jq_filter='
   .id == $id and .tag_name == $tag and .target_commitish == $source and
   .draft == true and .prerelease == false and .published_at == null and
-  (.assets | type == "array" and length == 4)
+  (.assets | type == "array")
 '
-if [ -n "$assets_dir" ]; then
+if [ "$phase" = empty ]; then
+  jq_filter+=' and (.assets | length == 0)'
+elif [ "$phase" = complete ]; then
+  jq_filter+=' and (.assets | length == 4)'
+fi
+if [ "$phase" = complete ] && [ -n "$assets_dir" ]; then
   expected_sha256=(
     "$(sha256sum "$assets_dir/release-manifest.json" | awk '{print $1}')"
     "$(sha256sum "$assets_dir/image-index.json" | awk '{print $1}')"
@@ -83,3 +95,4 @@ jq -e --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" \
 echo "revalidated=true"
 echo "release_id=$release_id"
 echo "route=$expected_route"
+echo "phase=$phase"

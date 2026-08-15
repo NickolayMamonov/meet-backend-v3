@@ -8,4 +8,11 @@ if "$ROOT_DIR/scripts/mutate-release-metadata.sh" canonicalize \
   echo "retired metadata operation unexpectedly accepted" >&2
   exit 1
 fi
+if "$ROOT_DIR/scripts/mutate-release-metadata.sh" publish \
+  --repository FixtureOwner/repo --release-id 120 --version 1.2.0 \
+  --tag v1.2.0 --source-sha "$SHA" --release-file /dev/null \
+  >/dev/null 2>&1; then
+  echo "publication without the policy reader unexpectedly passed" >&2
+  exit 1
+fi
 echo "publish-only metadata mutation fixtures passed"

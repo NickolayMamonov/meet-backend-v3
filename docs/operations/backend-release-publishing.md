@@ -85,16 +85,21 @@ order:
 * `image-inspect.txt`
 * `SHA256SUMS`
 
-The final release PATCH is publish-last. Immediately before it, the job
-re-fetches policy, proves `refs/tags/v1.1.0` and `refs/tags/v1.2.0` are absent,
-re-fetches the same numeric release, and applies the shared permanent deny
-policy. No shell command or writer intervenes between the final guard and
-PATCH.
+The final release PATCH is publish-last. Before release assets are uploaded,
+the workflow creates and verifies a GitHub workflow artifact attestation for
+the generated image-index evidence, and records `artifactAttestation:true` in
+the manifest only after that gate succeeds. Immediately before the first
+image push and each later writer, the job re-fetches policy and the live
+numeric release. Immediately before the final PATCH, it also proves
+`refs/tags/v1.1.0` and `refs/tags/v1.2.0` are absent and applies the shared
+permanent deny policy. No shell command or writer intervenes between the final
+guard and PATCH.
 
 After PATCH, repository-owned release/ref/package/asset/attestation writers
 are forbidden. GitHub's server-side automatic immutable-release attestation
 created as the expected consequence of PATCH is allowed and is consumed
-read-only. The workflow does not create a post-PATCH attestation.
+read-only. The workflow-created artifact attestation is strictly pre-PATCH;
+the workflow does not create a post-PATCH attestation.
 
 ## Immutable proof
 

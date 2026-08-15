@@ -186,9 +186,14 @@ validate_common() {
   [ "$target" != 36ffd11ea4d35147f1df9c1cafa6a330300c1339 ] ||
     fail "permanently denied source"
   [ "$tag" = "$authority_tag" ] || fail "release tag is not current authority"
-  [ "$target" = "$authority_source" ] || fail "release source is not current authority"
-  [ "$draft" = true ] || [ "$published" != null ] ||
-    fail "unpublished release has invalid publication state"
+  if [ "$published" = null ]; then
+    [ "$draft" = true ] || fail "unpublished release has invalid publication state"
+    [ "$target" = "$authority_source" ] ||
+      fail "unpublished release source is not current authority"
+  else
+    [[ "$target" =~ ^[0-9a-f]{40}$ ]] ||
+      fail "published release target is not a full SHA"
+  fi
   [ "$prerelease" = false ] || fail "release is a prerelease"
 }
 
