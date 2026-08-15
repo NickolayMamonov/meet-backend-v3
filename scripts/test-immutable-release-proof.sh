@@ -92,16 +92,17 @@ jq -n \
         {name:"image-inspect.txt",digest:{sha256:$inspect}},
         {name:"SHA256SUMS",digest:{sha256:$sums}}
       ],
-      predicateType:"https://in-toto.io/attestation/release/v0.1",
+      predicateType:"https://in-toto.io/attestation/release/v0.2",
       predicate:{
         repository:$repository,
-        releaseId:($release_id | tostring),
-        tag:$tag
+        databaseId:($release_id | tostring),
+        tag:$tag,
+        purl:("pkg:github/" + $repository + "@" + $tag)
       }
     }
   ' >"$TMP/statement.json"
 payload=$(base64 <"$TMP/statement.json" | tr -d '\n')
-jq -n --arg payload "$payload" '
+jq -n --arg payload "$payload" --slurpfile statement "$TMP/statement.json" '
   {
     attestation:{
       bundle:{
@@ -114,7 +115,16 @@ jq -n --arg payload "$payload" '
       },
       bundle_url:"https://api.github.test/fixture-bundle"
     },
-    verificationResult:{verified:true}
+    verificationResult:{
+      mediaType:"application/vnd.dev.sigstore.verificationresult+json;version=0.1",
+      signature:{
+        certificate:{
+          certificateIssuer:"CN=Fulcio Intermediate l1,O=GitHub\\, Inc.",
+          subjectAlternativeName:"https://dotcom.releases.github.com"
+        }
+      },
+      statement:$statement[0]
+    }
   }
 ' >"$TMP/attestation.json"
 
@@ -214,6 +224,8 @@ jq -e \
     .immutable == true and
     .draft == false and
     .attestation.verified == true and
+    .attestation.predicateType ==
+      "https://in-toto.io/attestation/release/v0.2" and
     (.attestation.bundleSha256 | test("^[0-9a-f]{64}$")) and
     (.attestation.claimSha256 | test("^[0-9a-f]{64}$")) and
     (.assets | length == 4) and
@@ -273,14 +285,17 @@ for mutation in \
   ! grep -q $'^release\tverify\t' "$GH_LOG"
 done
 
-jq '.predicate.releaseId = "121"' "$TMP/statement.json" \
-  >"$TMP/wrong-statement.json"
-wrong_payload=$(base64 <"$TMP/wrong-statement.json" | tr -d '\n')
-jq --arg payload "$wrong_payload" \
-  '.attestation.bundle.dsseEnvelope.payload = $payload' \
+jq '.verificationResult.statement.predicate.databaseId = "121"' \
   "$TMP/attestation.json" >"$TMP/wrong-attestation.json"
 ATTESTATION_RESPONSE=$TMP/wrong-attestation.json \
   expect_failure wrong-attestation-release proof_command
+! grep -q $'^release\tverify-asset\t' "$GH_LOG"
+
+jq '.verificationResult.signature.certificate.subjectAlternativeName =
+      "https://example.invalid"' \
+  "$TMP/attestation.json" >"$TMP/wrong-attestation.json"
+ATTESTATION_RESPONSE=$TMP/wrong-attestation.json \
+  expect_failure wrong-attestation-certificate proof_command
 ! grep -q $'^release\tverify-asset\t' "$GH_LOG"
 
 FAIL_ATTESTATION=true expect_failure missing-attestation proof_command
@@ -314,4 +329,4 @@ for method in PUT PATCH DELETE; do
   }
 done
 
-echo "immutable release proof fixtures passed: explicit v1.2.0, same numeric release, immutable API, attestation binding, four exact asset invocations, and read-only transport"
+echo "immutable release proof fixtures passed: explicit v1.2.0, same numeric release, immutable API, v0.2 attestation identity/binding, four exact asset invocations, and read-only transport"

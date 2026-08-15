@@ -84,6 +84,8 @@ for required_text in \
   'Checkout reviewed publication tooling' \
   'Set up attestation-capable Buildx' \
   '--build-arg "BACKEND_REVISION=$SOURCE_SHA" source' \
+  'cd "$RUNNER_TEMP/release-assets"' \
+  'sha256sum -c SHA256SUMS >/dev/null' \
   'Verify exact v1.2.0 publication tuple' \
   'release-manifest.json' 'image-index.json' 'image-inspect.txt' 'SHA256SUMS'; do
   grep -Fq -- "$required_text" <<<"$workflow" ||

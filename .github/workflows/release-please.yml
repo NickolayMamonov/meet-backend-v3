@@ -439,11 +439,12 @@ jobs:
           scripts/verify-release-consistency.sh "$VERSION" "$SOURCE_SHA" \
             --tag "$TAG" --image "$IMAGE" --image-ref "$IMAGE:$TAG" \
             --manifest "$RUNNER_TEMP/release-assets/release-manifest.json"
-          sha256sum "$RUNNER_TEMP/release-assets/release-manifest.json" \
-            "$RUNNER_TEMP/release-assets/image-index.json" \
-            "$RUNNER_TEMP/release-assets/image-inspect.txt" |
-            sed "s#  $RUNNER_TEMP/release-assets/##" \
-            >"$RUNNER_TEMP/release-assets/SHA256SUMS"
+          (
+            cd "$RUNNER_TEMP/release-assets"
+            sha256sum release-manifest.json image-index.json image-inspect.txt \
+              >SHA256SUMS
+            sha256sum -c SHA256SUMS >/dev/null
+          )
 
       - name: Upload deterministic release assets
         run: |
