@@ -116,14 +116,6 @@ release_field() {
   printf '%s' "$value"
 }
 
-compose_hash() {
-  local hash
-  hash=$(compose config --hash backend | awk '$1 == "backend" { print $2 }')
-  [[ "$hash" =~ ^[0-9a-f]{64}$ ]] ||
-    fail "backend Compose config hash is unavailable"
-  printf '%s' "$hash"
-}
-
 runtime_image_id() {
   local container
   container=$(compose ps -q backend)
@@ -152,6 +144,7 @@ verify_runtime() {
     --format '{{index .Config.Labels "com.docker.compose.service"}}')" = backend ]
   [ "$(docker inspect "$backend" \
     --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')" = "$expected_hash" ]
+  echo "runtime_check=identity image_id=$expected_id config_hash=$expected_hash"
   [ "$(docker inspect "$backend" --format '{{.HostConfig.ReadonlyRootfs}}')" = true ]
   [ "$(docker inspect "$backend" \
     --format '{{.HostConfig.RestartPolicy.Name}}')" = unless-stopped ]
@@ -166,6 +159,7 @@ verify_runtime() {
     jq -e 'index("http://127.0.0.1:8080/meetings") != null' >/dev/null
   memory=$(docker inspect "$backend" --format '{{.HostConfig.Memory}}')
   [[ "$memory" =~ ^[1-9][0-9]*$ ]]
+  echo "runtime_check=hardening image_id=$expected_id"
   [ "$(docker image inspect "$expected_id" \
     --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$expected_revision" ]
   [ "$(docker image inspect "$expected_id" \
@@ -177,6 +171,7 @@ verify_runtime() {
   [ "$(docker exec "$backend" id -u)" = 10001 ]
   [ "$(docker exec "$backend" id -g)" = 10001 ]
   docker exec "$backend" sh -ec 'test -w /data/uploads'
+  echo "runtime_check=image image_id=$expected_id runtime_user=10001:10001"
 
   mapfile -t mounts < <(
     docker inspect "$backend" --format \
@@ -194,6 +189,7 @@ verify_runtime() {
   )
   [ "${#postgres_mounts[@]}" -eq 1 ]
   [ "${postgres_mounts[0]}" = "volume|meet-production_postgres_data" ]
+  echo "runtime_check=volumes image_id=$expected_id"
 
   binding=$(docker inspect "$backend" --format \
     '{{range $port, $bindings := .NetworkSettings.Ports}}{{if eq $port "8080/tcp"}}{{range $bindings}}{{.HostIp}}:{{.HostPort}}{{println}}{{end}}{{end}}{{end}}')
@@ -206,6 +202,7 @@ verify_runtime() {
   [[ "$address" =~ ^127\.0\.0\.1:[0-9]+$ ]]
   curl --fail --silent --show-error "http://$address/meetings" |
     jq -e 'type == "array"' >/dev/null
+  echo "runtime_check=network image_id=$expected_id binding=$binding"
 }
 
 verify_environment_matches_container() {
@@ -249,7 +246,6 @@ previous_id=$(runtime_image_id)
 previous_runtime_hash=$(docker inspect "$(compose ps -q backend)" \
   --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
 [[ "$previous_runtime_hash" =~ ^[0-9a-f]{64}$ ]]
-previous_compose_hash=$(compose_hash)
 verify_runtime "$previous_id" "$previous_revision" "$previous_version" \
   "$previous_runtime_hash"
 verify_environment_matches_container
@@ -259,7 +255,6 @@ printf '%s\n' "$previous_id" >"$state/previous-image-id"
 printf '%s\n' "$previous_revision" >"$state/previous-revision"
 printf '%s\n' "$previous_version" >"$state/previous-version"
 printf '%s\n' "$previous_runtime_hash" >"$state/previous-runtime-config-hash"
-printf '%s\n' "$previous_compose_hash" >"$state/previous-compose-config-hash"
 if [ -e "$active_compose" ]; then
   [ -s "$active_compose" ] || fail "active Compose file is empty"
   install -m 600 "$active_compose" "$state/previous-active-compose.yml"
@@ -320,9 +315,12 @@ rollback() {
     >/dev/null
   compose up -d --no-deps --no-build --pull never --force-recreate \
     --wait --wait-timeout 180 backend >/dev/null
-  [ "$(compose_hash)" = "$previous_compose_hash" ]
+  restored_hash=$(docker inspect "$(compose ps -q backend)" \
+    --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
+  [ "$restored_hash" = "$previous_runtime_hash" ] ||
+    fail "rollback did not restore the exact predecessor Compose runtime"
   verify_runtime "$previous_id" "$previous_revision" "$previous_version" \
-    "$previous_compose_hash"
+    "$previous_runtime_hash"
   echo "rollback=completed previous_image_id=$previous_id"
 }
 
@@ -331,10 +329,7 @@ on_exit() {
   local status=$?
   trap - EXIT
   if [ "$status" -ne 0 ] && [ "$mutation_started" = true ]; then
-    if ! rollback; then
-      echo "rollback=failed" >&2
-      exit 90
-    fi
+    rollback
   fi
   exit "$status"
 }
@@ -348,7 +343,10 @@ PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
 
 compose up -d --no-deps --no-build --pull never --force-recreate \
   --wait --wait-timeout 180 backend >/dev/null
-target_hash=$(compose_hash)
+target_hash=$(docker inspect "$(compose ps -q backend)" \
+  --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
+[[ "$target_hash" =~ ^[0-9a-f]{64}$ ]] ||
+  fail "candidate Compose runtime hash is unavailable"
 verify_runtime "$target_id" "$revision" "$version" "$target_hash"
 echo "candidate=ready image_id=$target_id version=$version revision=$revision"
 
