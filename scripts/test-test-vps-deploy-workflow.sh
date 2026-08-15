@@ -61,6 +61,7 @@ for text in \
   'http://127.0.0.1:8080/meetings' \
   'volume|meet-production_uploads_data' \
   'docker volume inspect meet-production_postgres_data' \
+  "sed '/^$/d'" \
   '[ -z "$(docker port "$postgres")" ]' \
   '--no-deps --no-build --pull never --force-recreate' \
   'deployment=completed image_id='; do
