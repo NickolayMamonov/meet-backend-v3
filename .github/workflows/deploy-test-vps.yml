@@ -448,3 +448,59 @@ jobs:
             echo "- Volumes: PostgreSQL and uploads preserved"
             echo "- Public probes: meetings=$meetings_status, actuator=$actuator_status, HTTP redirect=$redirect_status"
           } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Apply bounded test-VPS deployment retention
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+            "$PATH_ON_HOST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'REMOTE'
+          set -euo pipefail
+          root=$1
+          run_id=$2
+          run_attempt=$3
+          tooling_prefix="$root/.test-vps-tooling-"
+          state_root=/var/lib/meet-test-vps-deploy
+          [[ "$run_id" =~ ^[0-9]+$ ]] && [[ "$run_attempt" =~ ^[0-9]+$ ]]
+          [ -d "$root" ] && [ -d "$state_root" ]
+          exec 9>"$state_root/.deploy.lock"
+          flock -n 9
+
+          delete_tree() {
+            local path=$1
+            [ -d "$path" ] && [ ! -L "$path" ]
+            find "$path" -xdev -type f -delete
+            find "$path" -xdev -type l -delete
+            find "$path" -xdev -depth -type d -empty -delete
+            [ ! -e "$path" ]
+          }
+
+          tooling_removed=0
+          for path in "$tooling_prefix"*; do
+            [ -e "$path" ] || continue
+            name=${path#"$tooling_prefix"}
+            [[ "$name" =~ ^[0-9]+-[0-9]+$ ]]
+            delete_tree "$path"
+            tooling_removed=$((tooling_removed + 1))
+          done
+
+          mapfile -t states < <(
+            find "$state_root" -mindepth 1 -maxdepth 1 -type d \
+              -printf '%T@ %p\n' |
+              sort -nr |
+              cut -d' ' -f2-
+          )
+          states_removed=0
+          for ((index=10; index<${#states[@]}; index++)); do
+            path=${states[$index]}
+            name=${path#"$state_root/"}
+            [[ "$name" =~ ^[0-9]+-[0-9]+-(rollback-drill|final-deploy)$ ]]
+            delete_tree "$path"
+            states_removed=$((states_removed + 1))
+          done
+
+          [ -s /var/lib/meet-production/active-compose.yml ]
+          [ -s /var/lib/meet-production/active-runtime.override.yml ]
+          kept=$((${#states[@]} - states_removed))
+          echo "retention=applied tooling_removed=$tooling_removed states_removed=$states_removed states_kept=$kept"
+          REMOTE

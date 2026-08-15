@@ -65,3 +65,13 @@ standard two-space separator. The bytes cannot be replaced. Deployment uses a
 strict exception limited to that numeric release ID, exactly three expected
 filenames, and matching downloaded-byte digests. Future releases must use the
 canonical `sha256sum` format and are rejected if they use the compact form.
+
+## Bounded retention
+
+After final runtime and public evidence passes, the workflow acquires the same
+remote deployment lock, removes only checksum-bound
+`.test-vps-tooling-<run>-<attempt>` directories, and retains the ten newest
+deployment-state directories under `/var/lib/meet-test-vps-deploy`. Failed
+runs remain available until the next successful deployment applies retention.
+The active Compose/runtime files under `/var/lib/meet-production` are outside
+the cleanup roots and must still exist after cleanup.

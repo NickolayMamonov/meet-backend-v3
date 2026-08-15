@@ -26,7 +26,11 @@ for text in \
   '--mode deploy' \
   'https://api.whysoezzy.online' \
   'meet-production_postgres_data' \
-  'meet-production_uploads_data'; do
+  'meet-production_uploads_data' \
+  'Apply bounded test-VPS deployment retention' \
+  'find "$path" -xdev -type f -delete' \
+  'index=10' \
+  'retention=applied'; do
   grep -Fq -- "$text" "$workflow" || {
     echo "test VPS workflow misses invariant: $text" >&2
     exit 1
@@ -78,5 +82,14 @@ if grep -Fq 'rm -rf' "$workflow" "$deploy"; then
   echo "test VPS deployment must not recursively delete host state" >&2
   exit 1
 fi
+
+cleanup_line=$(grep -n 'name: Apply bounded test-VPS deployment retention' \
+  "$workflow" | cut -d: -f1)
+evidence_line=$(grep -n 'name: Capture runtime and public HTTPS evidence' \
+  "$workflow" | cut -d: -f1)
+[ "$evidence_line" -lt "$cleanup_line" ] || {
+  echo "retention must run only after final runtime evidence" >&2
+  exit 1
+}
 
 echo "test VPS deploy workflow fixture passed"
