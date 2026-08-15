@@ -26,9 +26,13 @@ required=(
   scripts/test-release-current-action-freshness.sh
   scripts/test-release-artifact-attestation-gate.sh
   scripts/test-release-controller-queue.sh
+  scripts/test-release-controller-output-contract.sh
   scripts/test-release-reader-credential-routing.sh
   scripts/normalize-release-please-action-output.sh
   scripts/test-release-please-action-output.sh
+  scripts/admit-empty-release-continuation.sh
+  scripts/test-empty-release-continuation.sh
+  scripts/test-release-publish-tooling-routing.sh
   scripts/normalize-github-attestations.sh
   scripts/resolve-ghcr-username.sh
   scripts/test-release-post-publication-routing.sh
@@ -74,6 +78,11 @@ for required_text in \
   '--before-releases-file' '--after-releases-file' \
   '--release-created true' '--release-created false' \
   'normalize-release-please-action-output.sh' \
+  'admit-empty-release-continuation.sh' \
+  'release_tag: ${{ steps.route.outputs.tag }}' \
+  'release_version: ${{ steps.route.outputs.version }}' \
+  'Checkout reviewed publication tooling' \
+  '--build-arg "BACKEND_REVISION=$SOURCE_SHA" source' \
   'Verify exact v1.2.0 publication tuple' \
   'release-manifest.json' 'image-index.json' 'image-inspect.txt' 'SHA256SUMS'; do
   grep -Fq -- "$required_text" <<<"$workflow" ||

@@ -328,9 +328,11 @@ case "$mode" in
     candidate=$(jq -c --argjson id "$expected_id" '.[] | select(.id == $id)' <<<"$releases")
     [ -n "$candidate" ] || fail "numeric release was not found"
     validate_common "$candidate"
-    [ "$phase" = empty ] && [ "$(jq '.assets | length' <<<"$candidate")" -eq 0 ] ||
-      [ "$phase" = complete ] && [ "$(jq '.assets | length' <<<"$candidate")" -eq 4 ] ||
-      fail "asset phase does not match"
+    asset_count=$(jq '.assets | length' <<<"$candidate")
+    case "$phase" in
+      empty) [ "$asset_count" -eq 0 ] || fail "asset phase does not match" ;;
+      complete) [ "$asset_count" -eq 4 ] || fail "asset phase does not match" ;;
+    esac
     emit materialize "$candidate" verified
     ;;
 esac
