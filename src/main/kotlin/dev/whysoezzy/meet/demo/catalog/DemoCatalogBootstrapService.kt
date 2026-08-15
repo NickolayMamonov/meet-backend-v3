@@ -14,12 +14,14 @@ import dev.whysoezzy.meet.domain.repository.TagRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.api.error.BadRequestException
 import dev.whysoezzy.meet.api.error.ConflictException
+import dev.whysoezzy.meet.service.auth.identifier.EmailAddressNormalizer
 import jakarta.persistence.EntityManager
 import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import java.time.Clock
+import java.util.Locale
 
 @Service
 class DemoCatalogBootstrapService(
@@ -34,6 +36,7 @@ class DemoCatalogBootstrapService(
     private val entityManager: EntityManager,
     private val advisoryLock: DemoCatalogAdvisoryLock,
     private val validator: DemoCatalogManifestValidator,
+    private val failureInjector: DemoCatalogFailureInjector,
     private val clock: Clock,
 ) {
     private val manifest = BetaDemoCatalog.manifest
@@ -62,6 +65,7 @@ class DemoCatalogBootstrapService(
             val roots = upsertRoots(resolved, compiledMeetings)
             val relationships = reconcileRelationships(resolved)
             entityManager.flush()
+            failureInjector.afterFlushBeforeStateSave()
             stateRepository.save(
                 state?.apply {
                     manifestVersion = manifest.manifestVersion
@@ -116,19 +120,26 @@ class DemoCatalogBootstrapService(
         val existingAds = adBlockRepository.findAllByDemoCatalogKeyIn(adKeys.map(CatalogKey::value))
             .associateBy { CatalogKey(requireNotNull(it.demoCatalogKey)) }
         val desiredUsersByKey = manifest.users.associateBy { it.key.value }
+        val ownedUserKeys = userKeys.map(CatalogKey::value).toSet()
+        val desiredEmails = manifest.users
+            .map { canonicalEmail(it.email) }
+            .toSet()
 
-        val desiredEmails = manifest.users.map { it.email.lowercase() }.toSet()
         userRepository.findAll()
-            .filter { it.demoCatalogKey !in userKeys.map(CatalogKey::value).toSet() }
-            .firstOrNull { it.email?.lowercase() in desiredEmails }
+            .filter { it.demoCatalogKey !in ownedUserKeys }
+            .firstOrNull { it.email?.let(::canonicalEmail) in desiredEmails }
             ?.let { throw ConflictException("Demo catalog conflicts with existing data") }
+
+        if (hasOtpHistory("EMAIL", desiredEmails)) {
+            throw ConflictException("Demo catalog conflicts with existing data")
+        }
 
         existingUsers.values.forEach { user ->
             val desired = desiredUsersByKey[requireNotNull(user.demoCatalogKey)]
                 ?: throw ConflictException("Demo catalog conflicts with existing data")
             val emailIdentifiers = setOf(user.email, desired.email)
                 .filter { !it.isNullOrBlank() }
-                .map { it!! }
+                .map { canonicalEmail(it!!) }
                 .distinct()
             val phoneIdentifiers = setOf(user.phone)
                 .filter { !it.isNullOrBlank() }
@@ -144,16 +155,10 @@ class DemoCatalogBootstrapService(
                     count("SELECT count(*) FROM auth_identities WHERE user_id = ?", user.id) > 0 ||
                     count("SELECT count(*) FROM refresh_tokens WHERE user_id = ?", user.id) > 0 ||
                     emailIdentifiers.any {
-                        count(
-                            "SELECT count(*) FROM otp_codes WHERE channel = 'EMAIL' AND identifier = ?",
-                            it,
-                        ) > 0
+                        hasOtpHistory("EMAIL", listOf(it))
                     } ||
                     phoneIdentifiers.any {
-                        count(
-                            "SELECT count(*) FROM otp_codes WHERE channel = 'PHONE' AND identifier = ?",
-                            it,
-                        ) > 0
+                        hasOtpHistory("PHONE", listOf(it))
                     }
             if (contaminated) throw ConflictException("Demo catalog conflicts with existing data")
         }
@@ -468,6 +473,21 @@ class DemoCatalogBootstrapService(
 
     private fun count(sql: String, vararg args: Any?): Long =
         jdbcTemplate.queryForObject(sql, Long::class.java, *args) ?: 0L
+
+    private fun hasOtpHistory(channel: String, identifiers: Collection<String>): Boolean {
+        if (identifiers.isEmpty()) return false
+        val canonicalIdentifiers = identifiers.map(::canonicalEmail).distinct()
+        val placeholders = canonicalIdentifiers.joinToString(",") { "?" }
+        return count(
+            "SELECT count(*) FROM otp_codes WHERE channel = ? AND lower(btrim(identifier)) IN ($placeholders)",
+            channel,
+            *canonicalIdentifiers.toTypedArray(),
+        ) > 0
+    }
+
+    private fun canonicalEmail(value: String): String =
+        runCatching { EmailAddressNormalizer.normalize(value) }
+            .getOrElse { value.trim().lowercase(Locale.ROOT) }
 
     private class RootCounter {
         var created = 0

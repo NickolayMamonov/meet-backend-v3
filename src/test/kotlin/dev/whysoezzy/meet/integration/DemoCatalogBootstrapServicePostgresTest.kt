@@ -2,14 +2,19 @@ package dev.whysoezzy.meet.integration
 
 import dev.whysoezzy.meet.demo.catalog.DemoCatalogBootstrapCommand
 import dev.whysoezzy.meet.demo.catalog.DemoCatalogBootstrapService
+import dev.whysoezzy.meet.demo.catalog.DemoCatalogFailureInjector
 import dev.whysoezzy.meet.demo.catalog.DemoCatalogStateRepository
+import dev.whysoezzy.meet.domain.entity.User
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
+import org.mockito.Mockito.doThrow
+import org.mockito.Mockito.reset
 import dev.whysoezzy.meet.api.error.ConflictException
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.test.context.bean.override.mockito.MockitoBean
 import java.time.Instant
 import java.time.LocalDate
 import kotlin.test.assertEquals
@@ -22,6 +27,9 @@ class DemoCatalogBootstrapServicePostgresTest : IntegrationTestSupport() {
 
     @Autowired
     private lateinit var state: DemoCatalogStateRepository
+
+    @MockitoBean
+    private lateinit var failureInjector: DemoCatalogFailureInjector
 
     private val command = DemoCatalogBootstrapCommand(
         LocalDate.of(2099, 1, 1),
@@ -175,6 +183,77 @@ class DemoCatalogBootstrapServicePostgresTest : IntegrationTestSupport() {
     }
 
     @Test
+    fun `desired email OTP history conflicts on a clean database before any catalog write`() {
+        jdbcTemplate.update(
+            """
+            INSERT INTO otp_codes(identifier, channel, code_hash, hash_salt, hash_key_id, status, max_attempts, expires_at)
+            VALUES (?, 'EMAIL', ?, ?, 'test', 'PENDING', 5, CURRENT_TIMESTAMP + INTERVAL '1 hour')
+            """.trimIndent(),
+            " BETA-DEMO-PERSON-01@EXAMPLE.INVALID ",
+            ByteArray(32),
+            ByteArray(16),
+        )
+
+        assertThrows<ConflictException> { service.bootstrap(command) }
+
+        assertEquals(0, state.count())
+        assertEquals(0, users.count())
+        assertEquals(0, tags.count())
+        assertEquals(0, communities.count())
+        assertEquals(0, meetings.count())
+        assertEquals(0, adBlocks.count())
+        assertEquals(1, jdbcTemplate.queryForObject("SELECT count(*) FROM otp_codes", Long::class.java))
+    }
+
+    @Test
+    fun `injected failure rolls back roots edges state and auth storage after context clear`() {
+        service.bootstrap(command)
+        val realUser = users.save(User("Real", "Member", "+15550000098", email = "real@example.test"))
+        val realUserId = requireNotNull(realUser.id)
+        jdbcTemplate.update(
+            "INSERT INTO auth_identities(user_id, type, normalized_identifier) VALUES (?, 'EMAIL', ?)",
+            realUserId,
+            "real@example.test",
+        )
+        jdbcTemplate.update(
+            """
+            INSERT INTO refresh_tokens(user_id, token_hash, expires_at, auth_version)
+            VALUES (?, ?, CURRENT_TIMESTAMP + INTERVAL '1 day', 0)
+            """.trimIndent(),
+            realUserId,
+            "b".repeat(64),
+        )
+        jdbcTemplate.update(
+            """
+            INSERT INTO otp_codes(identifier, channel, code_hash, hash_salt, hash_key_id, status, max_attempts, expires_at)
+            VALUES (?, 'EMAIL', ?, ?, 'test', 'PENDING', 5, CURRENT_TIMESTAMP + INTERVAL '1 hour')
+            """.trimIndent(),
+            "real@example.test",
+            ByteArray(32) { 1 },
+            ByteArray(16) { 2 },
+        )
+        jdbcTemplate.update(
+            "INSERT INTO user_social_media(user_id, platform, username) VALUES (?, 'TELEGRAM', ?)",
+            realUserId,
+            "real-member",
+        )
+        val before = databaseSnapshot()
+
+        doThrow(IllegalStateException("injected demo catalog failure"))
+            .`when`(failureInjector)
+            .afterFlushBeforeStateSave()
+
+        try {
+            assertThrows<IllegalStateException> { service.bootstrap(command) }
+        } finally {
+            reset(failureInjector)
+        }
+        entityManager.clear()
+
+        assertEquals(before, databaseSnapshot())
+    }
+
+    @Test
     fun `PHONE identity with a matching email-shaped identifier is not an email collision`() {
         service.bootstrap(command)
         val real = users.save(
@@ -195,5 +274,47 @@ class DemoCatalogBootstrapServicePostgresTest : IntegrationTestSupport() {
 
         assertEquals(6, result.roots.users.unchanged)
         assertEquals(1, jdbcTemplate.queryForObject("SELECT count(*) FROM auth_identities WHERE type = 'PHONE'", Long::class.java))
+    }
+
+    @Autowired
+    private lateinit var entityManager: jakarta.persistence.EntityManager
+
+    private fun databaseSnapshot(): Map<String, List<String>> =
+        snapshotTables.associateWith { table ->
+            jdbcTemplate.queryForList("SELECT * FROM $table")
+                .map { row ->
+                    row.entries
+                        .sortedBy { it.key }
+                        .joinToString("|") { (column, value) -> "$column=${snapshotValue(value)}" }
+                }
+                .sorted()
+        }
+
+    private fun snapshotValue(value: Any?): String = when (value) {
+        null -> "<null>"
+        is ByteArray -> value.joinToString(",") { it.toUByte().toString() }
+        else -> value.toString()
+    }
+
+    private companion object {
+        val snapshotTables = listOf(
+            "tags",
+            "users",
+            "communities",
+            "meetings",
+            "ad_blocks",
+            "user_interests",
+            "community_tags",
+            "community_subscribers",
+            "meeting_tags",
+            "meeting_participants",
+            "ad_block_communities",
+            "ad_block_users",
+            "demo_catalog_state",
+            "auth_identities",
+            "refresh_tokens",
+            "otp_codes",
+            "user_social_media",
+        )
     }
 }
