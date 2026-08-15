@@ -27,6 +27,7 @@ required=(
   scripts/test-release-artifact-attestation-gate.sh
   scripts/test-release-controller-queue.sh
   scripts/test-release-reader-credential-routing.sh
+  scripts/resolve-ghcr-username.sh
   scripts/test-release-post-publication-routing.sh
   scripts/test-release-protected-snapshot.sh
 )

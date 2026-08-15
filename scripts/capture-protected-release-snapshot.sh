@@ -3,6 +3,7 @@ set -euo pipefail
 
 fail() { echo "protected snapshot capture failed: $*" >&2; exit 1; }
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repository=${GITHUB_REPOSITORY:-}
 image=
 blocked_id=368531227
@@ -131,8 +132,8 @@ registry_referrers() {
   [ -n "$digest" ] || { printf '[]'; return; }
   github_token=$(gh auth token 2>/dev/null) || fail "GHCR credential read failed"
   [ -n "$github_token" ] || fail "GHCR credential is empty"
-  username=$(gh api user --jq .login 2>/dev/null) ||
-    fail "GHCR username read failed"
+  username=$("$SCRIPT_DIR/resolve-ghcr-username.sh") ||
+    fail "GHCR username resolution failed"
   netrc=$work_dir/ghcr.netrc
   umask 077
   printf 'machine ghcr.io login %s password %s\n' "$username" "$github_token" \

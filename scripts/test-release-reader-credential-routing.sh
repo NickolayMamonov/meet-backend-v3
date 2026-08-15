@@ -4,9 +4,15 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 WORKFLOW=$ROOT_DIR/.github/workflows/release-please.yml
 CI_WORKFLOW=$ROOT_DIR/.github/workflows/ci.yml
+SNAPSHOT_CAPTURE=$ROOT_DIR/scripts/capture-protected-release-snapshot.sh
+USERNAME_RESOLVER=$ROOT_DIR/scripts/resolve-ghcr-username.sh
 fail() { echo "release reader credential-routing fixture failed: $*" >&2; exit 1; }
 workflow=$(sed 's/\r$//' "$WORKFLOW")
 ci_workflow=$(sed 's/\r$//' "$CI_WORKFLOW")
+TMP=$(mktemp -d)
+trap 'rm -r -- "$TMP"' EXIT HUP INT TERM
+[ -x "$USERNAME_RESOLVER" ] ||
+  fail "GHCR username resolver is not executable"
 
 controller=$(sed -n '/^  controller:/,/^  gates:/p' <<<"$workflow")
 grep -Fq '      packages: read' <<<"$controller" ||
@@ -49,5 +55,43 @@ grep -Fq \
   <<<"$release_action" || fail "Release Please action is not pinned"
 grep -Fq 'token: ${{ secrets.RELEASE_PLEASE_TOKEN }}' <<<"$release_action" ||
   fail "pinned Release Please action does not use RELEASE_PLEASE_TOKEN"
+
+capture=$(sed 's/\r$//' "$SNAPSHOT_CAPTURE")
+grep -Fq 'username=$("$SCRIPT_DIR/resolve-ghcr-username.sh")' <<<"$capture" ||
+  fail "protected snapshot capture bypasses the GHCR username resolver"
+if grep -Fq 'username=$(gh api user --jq .login' <<<"$capture"; then
+  fail "protected snapshot capture directly reads the unavailable /user endpoint"
+fi
+
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${FAKE_GH_MODE:-deny}:$*" in
+  fallback:"api user --jq .login") printf '%s\n' fallback-user ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "$TMP/bin/gh"
+
+resolved=$(PATH="$TMP/bin:$PATH" GHCR_USERNAME=explicit-user \
+  GITHUB_ACTOR=actor-user "$USERNAME_RESOLVER")
+[ "$resolved" = explicit-user ] ||
+  fail "explicit GHCR username did not take precedence"
+
+resolved=$(PATH="$TMP/bin:$PATH" GITHUB_ACTOR=actor-user \
+  "$USERNAME_RESOLVER")
+[ "$resolved" = actor-user ] ||
+  fail "GitHub Actions actor was not accepted as the GHCR username"
+
+resolved=$(PATH="$TMP/bin:$PATH" FAKE_GH_MODE=fallback \
+  env -u GHCR_USERNAME -u GITHUB_ACTOR "$USERNAME_RESOLVER")
+[ "$resolved" = fallback-user ] ||
+  fail "local authenticated-user fallback did not resolve"
+
+if PATH="$TMP/bin:$PATH" GHCR_USERNAME='invalid user' \
+  "$USERNAME_RESOLVER" >/dev/null 2>&1; then
+  fail "whitespace-containing GHCR username was accepted"
+fi
 
 echo "release reader credential-routing fixture passed"
