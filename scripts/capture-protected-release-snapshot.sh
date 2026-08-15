@@ -257,7 +257,7 @@ snapshot_object() {
   release=$(jq -c . "$release_file") || fail "release response is malformed"
   assets=$(asset_records "$release_file" "$asset_dir")
   body_file=$asset_dir/body.txt
-  jq -r '.body // ""' "$release_file" >"$body_file"
+  jq -rj '.body // ""' "$release_file" | tr -d '\r' >"$body_file"
   body_hash=$(sha256sum "$body_file" | awk '{print $1}')
   registry=$(registry_state "$version" "$(jq -r '.target_commitish' <<<"$release")")
   jq -n -cS \

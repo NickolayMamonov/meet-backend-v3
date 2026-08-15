@@ -10,6 +10,9 @@ capture=$(sed 's/\r$//' "$ROOT_DIR/scripts/capture-protected-release-snapshot.sh
 snapshot_object=$(sed -n '/^snapshot_object()/,/^}/p' <<<"$capture")
 grep -Fq '  jq -n -cS \' <<<"$snapshot_object" ||
   { echo "protected snapshot object construction waits for stdin" >&2; exit 1; }
+grep -Fq "jq -rj '.body // \"\"' \"\$release_file\" | tr -d '\\r'" \
+  <<<"$snapshot_object" ||
+  { echo "release body hashing is platform-dependent" >&2; exit 1; }
 grep -Fq -- '--slurpfile blocked "$blocked_object"' <<<"$capture" ||
   { echo "protected snapshot assembly does not read the blocked object from a file" >&2; exit 1; }
 grep -Fq -- '--slurpfile immutable "$immutable_object"' <<<"$capture" ||
@@ -19,6 +22,21 @@ if grep -Fq -- '--argjson blocked "$blocked_object"' <<<"$capture" ||
   echo "protected snapshot assembly passes complete JSON objects through argv" >&2
   exit 1
 fi
+
+jq -n --arg body $'line one\nline two' '{body:$body}' >"$TMP/release-body.json"
+actual_body_sha=$(
+  jq -rj '.body // ""' "$TMP/release-body.json" |
+    tr -d '\r' |
+    sha256sum |
+    awk '{print $1}'
+)
+expected_body_sha=$(
+  printf 'line one\nline two' |
+    sha256sum |
+    awk '{print $1}'
+)
+[ "$actual_body_sha" = "$expected_body_sha" ] ||
+  { echo "release body hash includes platform line endings" >&2; exit 1; }
 
 subject=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 source=0123456789abcdef0123456789abcdef01234567
