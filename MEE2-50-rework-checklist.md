@@ -5,5 +5,5 @@
 - [x] Enforce the singleton media host and exact approved media/landing URL sets.
 - [x] Add focused evidence for contamination/rollback, PHONE identity non-collision, exact paths, all thirteen resources, and exact response shape.
 - [x] Run the required focused, full, PostgreSQL, clean-build, diff, and idempotency/contamination/preservation/auth-storage checks.
-- [ ] Commit and push the rework, add the implementation-result task comment, and complete the task node.
+- [x] Commit and push the rework and add the implementation-result task comment.
 - [ ] Record the environment-gated disabled deployment/exact-host probe and MEE2-52 restore-proof status.
