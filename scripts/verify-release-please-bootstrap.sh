@@ -82,6 +82,7 @@ for required_text in \
   'release_tag: ${{ steps.route.outputs.tag }}' \
   'release_version: ${{ steps.route.outputs.version }}' \
   'Checkout reviewed publication tooling' \
+  'Set up attestation-capable Buildx' \
   '--build-arg "BACKEND_REVISION=$SOURCE_SHA" source' \
   'Verify exact v1.2.0 publication tuple' \
   'release-manifest.json' 'image-index.json' 'image-inspect.txt' 'SHA256SUMS'; do
