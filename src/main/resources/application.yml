@@ -43,6 +43,10 @@ server:
   port: ${SERVER_PORT:8080}
 
 app:
+  demo-catalog:
+    bootstrap-enabled: ${DEMO_CATALOG_BOOTSTRAP_ENABLED:false}
+    allowed-media-hosts: ${DEMO_CATALOG_ALLOWED_MEDIA_HOSTS:}
+
   geocoder:
     enabled: ${GEOCODER_ENABLED:true}
     api-key: ${LOCATIONIQ_KEY:}

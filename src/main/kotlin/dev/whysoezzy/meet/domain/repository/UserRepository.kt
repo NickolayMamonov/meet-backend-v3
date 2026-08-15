@@ -8,6 +8,8 @@ import org.springframework.stereotype.Repository
 
 @Repository
 interface UserRepository : JpaRepository<User, Long> {
+    fun findAllByDemoCatalogKeyIn(keys: Collection<String>): List<User>
+
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     fun findWithLockById(id: Long): User?
 }

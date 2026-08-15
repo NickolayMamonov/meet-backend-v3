@@ -84,6 +84,9 @@ class Meeting(
 
     @Column(name = "ends_at")
     var endsAt: Long? = null,
+
+    @Column(name = "demo_catalog_key", length = 160, updatable = false)
+    var demoCatalogKey: String? = null,
     
 ) : BaseEntity() {
     

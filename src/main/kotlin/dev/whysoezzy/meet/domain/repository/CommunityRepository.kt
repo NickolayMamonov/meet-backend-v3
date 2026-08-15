@@ -8,6 +8,8 @@ import org.springframework.stereotype.Repository
 
 @Repository
 interface CommunityRepository : JpaRepository<Community, Long> {
+    fun findAllByDemoCatalogKeyIn(keys: Collection<String>): List<Community>
+
     
     @Query("""
         SELECT c FROM Community c

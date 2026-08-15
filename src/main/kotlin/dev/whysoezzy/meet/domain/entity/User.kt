@@ -52,6 +52,9 @@ class User(
     @Column(name = "auth_version", nullable = false)
     var authVersion: Long = 0,
 
+    @Column(name = "demo_catalog_key", length = 160, updatable = false)
+    var demoCatalogKey: String? = null,
+
     @ManyToMany
     @JoinTable(
         name = "user_interests",

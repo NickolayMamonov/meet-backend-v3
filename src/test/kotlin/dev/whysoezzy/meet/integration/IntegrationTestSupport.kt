@@ -39,7 +39,7 @@ abstract class IntegrationTestSupport {
 
     protected fun resetDatabase() {
         jdbcTemplate.execute(
-            "TRUNCATE TABLE ad_block_communities, ad_block_users, meeting_participants, meeting_tags, " +
+            "TRUNCATE TABLE demo_catalog_state, ad_block_communities, ad_block_users, meeting_participants, meeting_tags, " +
                 "community_subscribers, community_tags, user_interests, user_social_media, refresh_tokens, " +
                 "otp_codes, otp_rate_limit_attempts, auth_identities, ad_blocks, meetings, communities, users, " +
                 "tags RESTART IDENTITY CASCADE",

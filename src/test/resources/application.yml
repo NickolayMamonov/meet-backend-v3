@@ -1,4 +1,8 @@
 app:
+  demo-catalog:
+    bootstrap-enabled: false
+    allowed-media-hosts: api.whysoezzy.online
+
   admin:
     api-key: test-only-admin-key
   jwt:

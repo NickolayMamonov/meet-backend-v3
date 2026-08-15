@@ -11,6 +11,7 @@ import org.springframework.stereotype.Repository
 
 @Repository
 interface MeetingRepository : JpaRepository<Meeting, Long> {
+    fun findAllByDemoCatalogKeyIn(keys: Collection<String>): List<Meeting>
 
     @Query(
         """
