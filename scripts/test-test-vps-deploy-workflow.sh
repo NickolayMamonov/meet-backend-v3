@@ -57,6 +57,9 @@ for text in \
   'trap on_exit EXIT' \
   'rollback()' \
   'rollback=completed previous_image_id=' \
+  'restored_hash' \
+  'previous_runtime_hash' \
+  'runtime_check=network' \
   'rollback drill requires a target image distinct from the predecessor' \
   'http://127.0.0.1:8080/meetings' \
   'volume|meet-production_uploads_data' \
