@@ -25,6 +25,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      packages: read
       attestations: read
     outputs:
       route: ${{ steps.route.outputs.route }}
@@ -74,7 +75,7 @@ jobs:
 
       - name: Enforce protected history before Release Please
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           current="$RUNNER_TEMP/MEE2-48-protected-history-before.json"
@@ -89,7 +90,7 @@ jobs:
       - name: Classify current action before Release Please
         id: pre_action
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           releases_before="$RUNNER_TEMP/release-relevant-before.json"
@@ -118,7 +119,7 @@ jobs:
       - name: Enforce protected history after Release Please
         if: steps.pre_action.outputs.route == 'action'
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           current="$RUNNER_TEMP/MEE2-48-protected-history-after-action.json"
@@ -142,7 +143,7 @@ jobs:
           PRE_VERSION: ${{ steps.pre_action.outputs.version }}
           PRE_SOURCE_SHA: ${{ steps.pre_action.outputs.source_sha }}
           PRE_RELEASE_ID: ${{ steps.pre_action.outputs.release_id }}
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$PRE_ROUTE" != action ]; then
