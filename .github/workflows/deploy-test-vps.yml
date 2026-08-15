@@ -222,6 +222,7 @@ jobs:
             docker-compose.production.yml
             scripts/production-compose.sh
             scripts/production-config-digest.sh
+            scripts/test-vps-runtime-invariants.sh
             scripts/update-production-release.sh
             scripts/deploy-test-vps-release.sh
           )
@@ -465,6 +466,11 @@ jobs:
           [ -d "$root" ] && [ -d "$state_root" ]
           exec 9>"$state_root/.deploy.lock"
           flock -n 9
+          smtp_pointer="$state_root/.smtp-transaction.current"
+          if [ -e "$smtp_pointer" ] || [ -L "$smtp_pointer" ]; then
+            echo "retention=skipped smtp_transaction_present"
+            exit 1
+          fi
 
           delete_tree() {
             local path=$1

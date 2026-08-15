@@ -75,3 +75,87 @@ deployment-state directories under `/var/lib/meet-test-vps-deploy`. Failed
 runs remain available until the next successful deployment applies retention.
 The active Compose/runtime files under `/var/lib/meet-production` are outside
 the cleanup roots and must still exist after cleanup.
+
+## Yandex SMTP transaction workflow
+
+The **Configure Yandex SMTP on test VPS** workflow is the only supported path
+for changing email runtime fields. It must be dispatched from `dev` and uses
+the protected `test-vps` Environment. Configure these secrets without
+disclosing them in task text, shell arguments, workflow output, summaries, or
+artifacts:
+
+- `TEST_VPS_SMTP_FROM` and `TEST_VPS_SMTP_FROM_NAME`;
+- `TEST_VPS_SMTP_USERNAME` and `TEST_VPS_SMTP_PASSWORD`;
+- `TEST_VPS_SMTP_CONNECT_TIMEOUT_MS`,
+  `TEST_VPS_SMTP_READ_TIMEOUT_MS`, and
+  `TEST_VPS_SMTP_WRITE_TIMEOUT_MS`.
+
+The workflow builds a mode-0600 NUL-delimited payload, changes only the
+SMTP/email allowlist, and uses `smtp.yandex.ru:587` with the application's
+authenticated STARTTLS and certificate-hostname checks. It never changes
+database settings, HMAC/JWT keys, volumes, image/release identity, Compose
+topology, or public releases. The remote operation holds the existing
+`/var/lib/meet-test-vps-deploy/.deploy.lock` for its complete lifetime and
+recreates only `backend`.
+
+### Durable transaction and startup rules
+
+The remote state root contains one mode-0600
+`.smtp-transaction.current` selector and a mode-0700 transaction directory.
+Journal transitions are complete mode-0600 records replaced through a sibling
+temporary file, file sync, atomic rename, and transaction-directory sync.
+`COMMITTED` is one complete `critical=false`,
+`deploy_succeeded`, status `0` record. `RECOVERED` is one complete
+`critical=false`, `deploy_failed_rollback_succeeded`, status `22` record.
+There is no durable phase-before-result state.
+
+On startup:
+
+1. No pointer permits normal preflight.
+2. A proven precritical `SNAPSHOTTED` transaction clears and syncs the pointer
+   before deleting its now-unreferenced transaction.
+3. Any critical/pre-commit phase is recovery-only. It restores and verifies
+   the exact environment, runtime fingerprint, and tagged prior selector
+   (`absent` or `present`), then records `RECOVERED`/22.
+4. A valid terminal `COMMITTED` or `RECOVERED` record is finalized only; it is
+   never replayed as a new deployment.
+5. Malformed pointers, symlinks, directories, FIFOs, missing transactions,
+   invalid phases, incomplete terminal tuples, and hash mismatches preserve
+   evidence and fail closed with `deploy_failed_rollback_failed`/23.
+
+The last-good store contains immutable mode-0600 `env` and safe manifest files
+under mode-0700 generation directories, selected by one atomic synced
+`.smtp-last-good.current` pointer. A first-generation absence is a legitimate
+state. `rollback_last` returns `precheck_failed`/20 without mutation when no
+selector exists; after a generation exists, it is idempotent.
+
+Release deployment and bounded retention acquire the same lock and reject
+every present `.smtp-transaction.current` object before creating run state,
+snapshotting, mutating Docker/Compose, enumerating retention, or deleting
+anything. Only the SMTP workflow may reconcile that pointer. Pointer clear and
+state-root sync always precede transaction deletion.
+
+The five remote results are:
+
+| Category | Status | Meaning |
+| --- | ---: | --- |
+| `deploy_succeeded` | 0 | Verified SMTP configuration committed |
+| `precheck_failed` | 20 | No live mutation was authorized |
+| `lock_busy` | 21 | Another deployment owns the canonical lock |
+| `deploy_failed_rollback_succeeded` | 22 | Exact pre-state restored |
+| `deploy_failed_rollback_failed` | 23 | Evidence preserved; operator recovery required |
+
+The workflow accepts exactly one result line and the matching SSH status.
+Missing, duplicate, malformed, unknown, or mismatched output fails closed and
+skips retention. If SSH is lost after the remote pointer was durably cleared,
+the result is **client-acknowledgment ambiguity**, not an inferred rollback.
+Do not dispatch again until an authorized operator inspects only safe evidence:
+pointer presence/absence, exact config and runtime hashes, selected generation
+integrity, image/release identity, backend health, and public edge invariants.
+Record no mailbox address, password, OTP, JWT, refresh token, provider token,
+database credential, or response body.
+
+After controlled canary approval, request delivery to the protected mailbox,
+verify the existing auth response privately, rotate refresh credentials and
+reject the old one, then logout and reject the rotated credential. Record only
+safe success booleans and status categories.

@@ -72,3 +72,9 @@ message IDs, and provider exception text are prohibited in logs and public error
 Before public traffic resumes, rollback may restore the pre-cutover database and old artifact. After post-cutover
 writes exist, use a forward-fix migration unless an authorized recovery owner accepts the selected restore point and
 its data loss. Never recreate plaintext OTP storage.
+
+For the beta test VPS SMTP cutover, use the protected
+[test VPS deployment runbook](test-vps-deployment.md#yandex-smtp-transaction-workflow).
+That workflow is scoped to the SMTP/email runtime allowlist and preserves the
+existing image, database, volumes, topology, HMAC/JWT settings, and public
+release history.
