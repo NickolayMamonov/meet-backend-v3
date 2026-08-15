@@ -8,6 +8,9 @@ import org.springframework.stereotype.Component
 class DemoCatalogManifestValidator {
     fun validate(manifest: BetaDemoCatalogManifest, allowedMediaHosts: Set<String>) {
         require(manifest.catalogName.isNotBlank() && manifest.manifestVersion.isNotBlank()) { "Invalid demo catalog manifest" }
+        require(allowedMediaHosts.map(String::lowercase).toSet() == setOf("api.whysoezzy.online")) {
+            "Invalid demo catalog manifest"
+        }
         val keys = mutableSetOf<CatalogKey>()
         fun addKey(key: CatalogKey) {
             if (!keys.add(key)) throw IllegalArgumentException("Invalid demo catalog manifest")
@@ -32,7 +35,6 @@ class DemoCatalogManifestValidator {
             validateHttps(it.imageUrl, allowedMediaHosts)
             it.externalUrl?.let { url ->
                 validateHttps(url, allowedMediaHosts)
-                require(url in manifest.publicLandingUrls)
             }
         }
         manifest.adBlocks.forEach {
@@ -41,6 +43,10 @@ class DemoCatalogManifestValidator {
             if (it.type == AdBlockType.TEXT) require(it.actionText == "Выбрать интересы" && it.actionUrl == "/profile/interests")
             else require(it.actionText == null && it.actionUrl == null)
         }
+        require(manifest.mediaUrls == approvedMediaUrls)
+        require(manifest.publicLandingUrls == approvedLandingUrls)
+        manifest.mediaUrls.forEach { require(it.startsWith(BetaDemoCatalog.MEDIA_BASE)) }
+        manifest.publicLandingUrls.forEach { require(it in approvedLandingUrls) }
         val declared = keys.toSet()
         fun references(keysToCheck: Collection<CatalogKey>) = require(keysToCheck.all { it in declared })
         manifest.users.forEach { references(it.interests) }
@@ -56,4 +62,18 @@ class DemoCatalogManifestValidator {
         require(uri.host != null && uri.host.lowercase() in allowedMediaHosts.map { it.lowercase() })
         require(uri.path.startsWith("/") && uri.path.length > 1)
     }
+
+    private val approvedMediaUrls = buildSet {
+        (1..6).forEach { add("${BetaDemoCatalog.MEDIA_BASE}avatar-%02d.png".format(it)) }
+        add("${BetaDemoCatalog.MEDIA_BASE}community-moscow.png")
+        add("${BetaDemoCatalog.MEDIA_BASE}community-walks.png")
+        add("${BetaDemoCatalog.MEDIA_BASE}community-online.png")
+        add("${BetaDemoCatalog.MEDIA_BASE}meeting-moscow.png")
+        add("${BetaDemoCatalog.MEDIA_BASE}meeting-online.png")
+    }
+
+    private val approvedLandingUrls = setOf(
+        "https://api.whysoezzy.online/demo-events/organize-online",
+        "https://api.whysoezzy.online/demo-events/networking-online",
+    )
 }

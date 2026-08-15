@@ -115,6 +115,7 @@ class DemoCatalogBootstrapService(
             .associateBy { CatalogKey(requireNotNull(it.demoCatalogKey)) }
         val existingAds = adBlockRepository.findAllByDemoCatalogKeyIn(adKeys.map(CatalogKey::value))
             .associateBy { CatalogKey(requireNotNull(it.demoCatalogKey)) }
+        val desiredUsersByKey = manifest.users.associateBy { it.key.value }
 
         val desiredEmails = manifest.users.map { it.email.lowercase() }.toSet()
         userRepository.findAll()
@@ -123,6 +124,16 @@ class DemoCatalogBootstrapService(
             ?.let { throw ConflictException("Demo catalog conflicts with existing data") }
 
         existingUsers.values.forEach { user ->
+            val desired = desiredUsersByKey[requireNotNull(user.demoCatalogKey)]
+                ?: throw ConflictException("Demo catalog conflicts with existing data")
+            val emailIdentifiers = setOf(user.email, desired.email)
+                .filter { !it.isNullOrBlank() }
+                .map { it!! }
+                .distinct()
+            val phoneIdentifiers = setOf(user.phone)
+                .filter { !it.isNullOrBlank() }
+                .map { it!! }
+                .distinct()
             val contaminated =
                 user.phone != null ||
                     user.fcmToken != null ||
@@ -132,13 +143,24 @@ class DemoCatalogBootstrapService(
                     user.socialMedia.isNotEmpty() ||
                     count("SELECT count(*) FROM auth_identities WHERE user_id = ?", user.id) > 0 ||
                     count("SELECT count(*) FROM refresh_tokens WHERE user_id = ?", user.id) > 0 ||
-                    (user.phone != null && count("SELECT count(*) FROM otp_codes WHERE identifier = ?", user.phone) > 0)
+                    emailIdentifiers.any {
+                        count(
+                            "SELECT count(*) FROM otp_codes WHERE channel = 'EMAIL' AND identifier = ?",
+                            it,
+                        ) > 0
+                    } ||
+                    phoneIdentifiers.any {
+                        count(
+                            "SELECT count(*) FROM otp_codes WHERE channel = 'PHONE' AND identifier = ?",
+                            it,
+                        ) > 0
+                    }
             if (contaminated) throw ConflictException("Demo catalog conflicts with existing data")
         }
         manifest.users.forEach {
             if (
                 count(
-                    "SELECT count(*) FROM auth_identities WHERE lower(normalized_identifier) = lower(?)",
+                    "SELECT count(*) FROM auth_identities WHERE type = 'EMAIL' AND lower(normalized_identifier) = lower(?)",
                     it.email,
                 ) > 0
             ) {
@@ -200,7 +222,7 @@ class DemoCatalogBootstrapService(
                         role = null,
                         showCommunities = true,
                         showMeetings = true,
-                        notificationsEnabled = true,
+                        notificationsEnabled = false,
                         fcmToken = null,
                         deletedAt = null,
                         authVersion = 0,
@@ -217,7 +239,7 @@ class DemoCatalogBootstrapService(
                 user.bio = desired.bio
                 user.showCommunities = true
                 user.showMeetings = true
-                user.notificationsEnabled = true
+                user.notificationsEnabled = false
                 users.updated++
             } else {
                 users.unchanged++
@@ -423,7 +445,7 @@ class DemoCatalogBootstrapService(
             user.bio != desired.bio ||
             !user.showCommunities ||
             !user.showMeetings ||
-            !user.notificationsEnabled
+            user.notificationsEnabled
 
     private fun meetingChanged(meeting: Meeting, desired: ManifestMeeting, compiled: CompiledMeeting): Boolean =
         meeting.title != desired.title ||

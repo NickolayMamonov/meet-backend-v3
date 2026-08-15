@@ -27,6 +27,37 @@ class DemoCatalogManifestValidatorTest {
         assertThrows<IllegalArgumentException> {
             validator.validate(BetaDemoCatalog.manifest, setOf("cdn.example.invalid"))
         }
+        assertThrows<IllegalArgumentException> {
+            validator.validate(BetaDemoCatalog.manifest, setOf("api.whysoezzy.online", "cdn.example.invalid"))
+        }
+    }
+
+    @Test
+    fun `media paths must be the exact approved singleton artifact`() {
+        val badMedia = BetaDemoCatalog.manifest.copy(
+            communities = BetaDemoCatalog.manifest.communities.map {
+                it.copy(imageUrl = "${BetaDemoCatalog.MEDIA_BASE}not-approved.png")
+            },
+        )
+        assertThrows<IllegalArgumentException> {
+            validator.validate(badMedia, setOf("api.whysoezzy.online"))
+        }
+    }
+
+    @Test
+    fun `landing paths must be the exact approved public pages`() {
+        val badLanding = BetaDemoCatalog.manifest.copy(
+            meetings = BetaDemoCatalog.manifest.meetings.map {
+                if (it.externalUrl != null) {
+                    it.copy(externalUrl = "https://api.whysoezzy.online/demo-events/not-approved")
+                } else {
+                    it
+                }
+            },
+        )
+        assertThrows<IllegalArgumentException> {
+            validator.validate(badLanding, setOf("api.whysoezzy.online"))
+        }
     }
 
     @Test

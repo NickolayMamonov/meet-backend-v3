@@ -5,6 +5,7 @@ import dev.whysoezzy.meet.demo.catalog.DemoCatalogBootstrapService
 import dev.whysoezzy.meet.demo.catalog.DemoCatalogStateRepository
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import dev.whysoezzy.meet.api.error.ConflictException
@@ -12,6 +13,7 @@ import org.springframework.beans.factory.annotation.Autowired
 import java.time.Instant
 import java.time.LocalDate
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class DemoCatalogBootstrapServicePostgresTest : IntegrationTestSupport() {
@@ -52,6 +54,7 @@ class DemoCatalogBootstrapServicePostgresTest : IntegrationTestSupport() {
         assertEquals(6, meetings.count())
         assertEquals(6, tags.count())
         assertEquals(3, adBlocks.count())
+        assertTrue(users.findAll().filter { it.demoCatalogKey != null }.all { !it.notificationsEnabled })
 
         val ids = meetings.findAll().associate { it.demoCatalogKey to it.id }
         val second = service.bootstrap(command)
@@ -132,5 +135,65 @@ class DemoCatalogBootstrapServicePostgresTest : IntegrationTestSupport() {
         org.junit.jupiter.api.assertThrows<ConflictException> { service.bootstrap(command) }
         assertEquals(1, state.count())
         assertEquals(6, users.count())
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["current-email", "desired-email"])
+    fun `email OTP history conflicts before writes and preserves auth state`(kind: String) {
+        service.bootstrap(command)
+        val demoUser = users.findAll().first { it.demoCatalogKey == "closed-beta-demo/user/01" }
+        val userId = requireNotNull(demoUser.id)
+        val identifier = if (kind == "current-email") {
+            "current-beta-email@example.invalid"
+        } else {
+            "beta-demo-person-01@example.invalid"
+        }
+        if (kind == "current-email") {
+            jdbcTemplate.update("UPDATE users SET email = ? WHERE id = ?", identifier, userId)
+        }
+        jdbcTemplate.update(
+            """
+            INSERT INTO otp_codes(identifier, channel, code_hash, hash_salt, hash_key_id, status, max_attempts, expires_at)
+            VALUES (?, 'EMAIL', ?, ?, 'test', 'PENDING', 5, CURRENT_TIMESTAMP + INTERVAL '1 hour')
+            """.trimIndent(),
+            identifier,
+            ByteArray(32),
+            ByteArray(16),
+        )
+
+        assertThrows<ConflictException> { service.bootstrap(command) }
+
+        val persisted = users.findById(userId).orElseThrow()
+        assertEquals(identifier, persisted.email)
+        assertFalse(persisted.notificationsEnabled)
+        assertEquals(1, state.count())
+        assertEquals(6, users.count())
+        assertEquals(1, jdbcTemplate.queryForObject("SELECT count(*) FROM otp_codes", Long::class.java))
+        assertEquals(0, jdbcTemplate.queryForObject("SELECT count(*) FROM auth_identities", Long::class.java))
+        assertEquals(0, jdbcTemplate.queryForObject("SELECT count(*) FROM refresh_tokens", Long::class.java))
+        assertEquals(0, jdbcTemplate.queryForObject("SELECT count(*) FROM user_social_media", Long::class.java))
+    }
+
+    @Test
+    fun `PHONE identity with a matching email-shaped identifier is not an email collision`() {
+        service.bootstrap(command)
+        val real = users.save(
+            dev.whysoezzy.meet.domain.entity.User(
+                "Real",
+                "Phone",
+                phone = null,
+                email = "real@example.test",
+            ),
+        )
+        jdbcTemplate.update(
+            "INSERT INTO auth_identities(user_id, type, normalized_identifier) VALUES (?, 'PHONE', ?)",
+            requireNotNull(real.id),
+            "beta-demo-person-01@example.invalid",
+        )
+
+        val result = service.bootstrap(command)
+
+        assertEquals(6, result.roots.users.unchanged)
+        assertEquals(1, jdbcTemplate.queryForObject("SELECT count(*) FROM auth_identities WHERE type = 'PHONE'", Long::class.java))
     }
 }
