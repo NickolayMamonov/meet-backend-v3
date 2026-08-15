@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT_DIR"
 publish=$(sed -n '/^  publish:/,$p' .github/workflows/release-please.yml)
 tooling=$(awk '
   /^      - name: Checkout reviewed publication tooling$/ { in_step=1 }
