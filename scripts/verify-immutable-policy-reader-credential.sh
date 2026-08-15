@@ -58,8 +58,13 @@ validate_permissions() {
 normalize() {
   local repository=$1 token=$2 permissions=$3 token_file=$4 output_file=$5
   local public proof
-  public=$(jq -cS --arg repository "$repository" \
-    '{repository:$repository,repositorySelection:"selected",permissions:.}' "$permissions")
+  public=$(jq -cS --arg repository "$repository" '
+    {
+      repository:$repository,
+      repositorySelection:"selected",
+      permissions:{administration:.administration,metadata:(.metadata // "read")}
+    }
+  ' "$permissions")
   proof=$(jq -cS --arg repository "$repository" '
     {
       schema:"meet-backend/immutable-policy-reader-credential/v1",
