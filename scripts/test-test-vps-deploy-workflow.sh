@@ -16,6 +16,7 @@ for text in \
   'scripts/verify-release-checksums.sh' \
   '--allow-immutable-v1.2.0-compact' \
   'cmp -s "$release_dir/image-index.json"' \
+  'grep -Ec "^Digest:[[:space:]]+$digest$"' \
   'gh attestation verify "oci://$IMAGE@$digest"' \
   'ssh-keyscan -T 5 -p "$PORT" "$HOST"' \
   'ssh-keygen -lf - -E sha256' \

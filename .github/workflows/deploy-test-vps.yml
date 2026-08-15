@@ -137,7 +137,8 @@ jobs:
             >"$release_dir/live-image-index.json"
           cmp -s "$release_dir/image-index.json" \
             "$release_dir/live-image-index.json"
-          grep -F "Digest: $digest" "$release_dir/image-inspect.txt" >/dev/null
+          [ "$(grep -Ec "^Digest:[[:space:]]+$digest$" \
+            "$release_dir/image-inspect.txt")" -eq 1 ]
           scripts/verify-oci-evidence.sh \
             "$IMAGE" "$digest" "$release_dir/image-index.json" >/dev/null
           gh attestation verify "oci://$IMAGE@$digest" \
