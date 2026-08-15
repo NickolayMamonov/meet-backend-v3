@@ -9,7 +9,9 @@ required=(
   .release-please-manifest.json version.json CHANGELOG.md
   .github/workflows/ci.yml
   .github/workflows/release-please.yml
+  .github/workflows/deploy-test-vps.yml
   docs/operations/backend-release-publishing.md
+  docs/operations/test-vps-deployment.md
   scripts/resolve-release-descriptor.sh
   scripts/release-mutation-policy.sh
   scripts/verify-immutable-policy-reader-credential.sh
@@ -21,6 +23,8 @@ required=(
   scripts/test-immutable-policy-reader-credential.sh
   scripts/test-immutable-release-policy.sh
   scripts/test-immutable-release-proof.sh
+  scripts/verify-release-checksums.sh
+  scripts/test-release-checksums.sh
   scripts/test-release-evidence.sh
   scripts/test-release-mutation-policy.sh
   scripts/test-release-current-action-freshness.sh
@@ -33,6 +37,8 @@ required=(
   scripts/admit-empty-release-continuation.sh
   scripts/test-empty-release-continuation.sh
   scripts/test-release-publish-tooling-routing.sh
+  scripts/deploy-test-vps-release.sh
+  scripts/test-test-vps-deploy-workflow.sh
   scripts/normalize-github-attestations.sh
   scripts/resolve-ghcr-username.sh
   scripts/test-release-post-publication-routing.sh
@@ -62,6 +68,10 @@ grep -Fq 'docs/operations/backend-release-publishing.md' README.md ||
   fail "README does not link the publication runbook"
 grep -Fq 'backend-release-publishing.md' docs/production-deployment.md ||
   fail "deployment guide does not link the publication runbook"
+grep -Fq 'test-vps-deployment.md' README.md ||
+  fail "README does not link the test VPS deployment runbook"
+grep -Fq 'test-vps-deployment.md' docs/production-deployment.md ||
+  fail "production guide does not link the test VPS deployment runbook"
 workflow=$(sed 's/\r$//' .github/workflows/release-please.yml)
 for required_text in \
   'queue: max' 'cancel-in-progress: false' \

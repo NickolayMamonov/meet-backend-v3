@@ -123,7 +123,8 @@ main() {
   command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
   command -v base64 >/dev/null 2>&1 || fail "base64 is required"
   [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || usage
-  [ "$tag" = v1.2.0 ] || usage
+  [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    usage
   [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || usage
   [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || usage
   [ -d "$assets_dir" ] || fail "assets directory is unavailable"
