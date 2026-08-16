@@ -9,6 +9,7 @@ usage() {
 RESULT_CATEGORY=
 RESULT_EMITTED=false
 TRANSACTION_TRAP_INSTALLED=false
+INTERRUPTION_EMITTED=false
 result() {
   RESULT_CATEGORY=$1
   return 0
@@ -121,7 +122,10 @@ interrupt_boundary() {
   base=${base%%:after}
   case "${MEE_SMTP_INTERRUPT_BOUNDARY:-}" in
     "$name"|"$base"|"$name:before"|"$name:after")
-      kill -s "${MEE_SMTP_INTERRUPT_SIGNAL:-TERM}" "$$"
+      if [ "$INTERRUPTION_EMITTED" = false ]; then
+        INTERRUPTION_EMITTED=true
+        kill -s "${MEE_SMTP_INTERRUPT_SIGNAL:-TERM}" "$$"
+      fi
       ;;
   esac
   [ "${MEE_SMTP_FAIL_AT:-}" != "$name" ] &&
@@ -224,7 +228,7 @@ validate_generation() {
     release_image release_version release_revision
   )
   while IFS='=' read -r key value || [ -n "$key" ]; do
-    [[ "$key" =~ ^[a-z_]+$ ]] || return 1
+    [[ "$key" =~ ^[a-z][a-z0-9_]*$ ]] || return 1
     case " ${manifest_keys[*]} " in *" $key "*) ;; *) return 1 ;; esac
     [ -z "${generation_manifest[$key]+present}" ] || return 1
     generation_manifest[$key]=$value
@@ -244,7 +248,7 @@ validate_generation() {
     return 1
   [[ "${generation_manifest[release_revision]:-}" =~ ^[0-9a-f]{40}$ ]] || return 1
   [ "$(sha256_file "$directory/env")" = "${generation_manifest[env_sha256]}" ] || return 1
-  [ "$(non_email_config_digest_file "$directory/env")" =
+  [ "$(non_email_config_digest_file "$directory/env")" = \
     "${generation_manifest[non_email_config_sha256]}" ] || return 1
 }
 
@@ -402,7 +406,10 @@ delete_transaction_directory() {
 delete_unselected_candidate_generation() {
   local generation=${journal[candidate_generation]}
   local selected=
-  selected=$(safe_selector_value 2>/dev/null || true)
+  if [ -e "$selector" ] || [ -L "$selector" ]; then
+    selected=$(safe_selector_value) || return 1
+  fi
+  [[ "$generation" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
   [ "$generation" != "$selected" ] || return 0
   if [ "${journal[prior_selector]}" = present ] &&
     [ "$generation" = "${journal[prior_selector_value]}" ]; then
@@ -412,7 +419,11 @@ delete_unselected_candidate_generation() {
   [ -d "$generations/$generation" ] && [ ! -L "$generations/$generation" ] ||
     return 1
   find "$generations/$generation" -xdev -type f -delete
-  find "$generations/$generation" -xdev -depth -type d -empty -delete
+  find "$generations/$generation" -xdev -type l -delete
+  find "$generations/$generation" -xdev -depth -mindepth 1 \
+    -type d -empty -delete
+  rmdir -- "$generations/$generation" 2>/dev/null || true
+  [ ! -e "$generations/$generation" ] || return 1
   sync_directory "$generations" generation_delete
 }
 
@@ -426,6 +437,12 @@ validate_transaction_material() {
         active-compose.before|active-runtime.before|\
         had-active-compose|no-active-compose|\
         had-active-runtime|no-active-runtime) ;;
+      journal.tmp.[A-Za-z0-9]*)
+        [ -f "$transaction_dir/$entry" ] &&
+          [ ! -L "$transaction_dir/$entry" ] || return 1
+        [ "$(stat -c '%a' "$transaction_dir/$entry" 2>/dev/null)" = 600 ] ||
+          return 1
+        ;;
       *) return 1 ;;
     esac
   done < <(find "$transaction_dir" -mindepth 1 -maxdepth 1 -printf '%f\n')
@@ -435,7 +452,7 @@ validate_transaction_material() {
   done
   [ "$(sha256_file "$transaction_dir/env.before")" = "${journal[pre_config_sha256]}" ] ||
     return 1
-  [ "$(tr -d '\n' <"$transaction_dir/pre-config.sha256")" =
+  [ "$(tr -d '\n' <"$transaction_dir/pre-config.sha256")" = \
     "${journal[pre_config_sha256]}" ] || return 1
   for name in active-compose active-runtime; do
     present_marker=$transaction_dir/had-$name
@@ -478,7 +495,7 @@ verify_snapshot_state() {
   [ "$(sha256_file "$root/.env.production")" = "${journal[pre_config_sha256]}" ] ||
     return 1
   selector_matches_prior || return 1
-  [ "$(runtime_safe_fingerprint "$root" "$compose_script")" =
+  [ "$(runtime_safe_fingerprint "$root" "$compose_script")" = \
     "${journal[pre_runtime_fingerprint]}" ]
 }
 
@@ -487,7 +504,7 @@ selector_matches_prior() {
     absent) [ ! -e "$selector" ] && [ ! -L "$selector" ] ;;
     present)
       [ "$(safe_selector_value)" = "${journal[prior_selector_value]}" ] || return 1
-      [ "$(sha256_file "$generations/${journal[prior_selector_value]}/manifest")" =
+      [ "$(sha256_file "$generations/${journal[prior_selector_value]}/manifest")" = \
         "${journal[prior_generation_sha256]}" ] ;;
   esac
 }
@@ -495,15 +512,15 @@ selector_matches_prior() {
 validate_selected_generation_identity() {
   local generation=$1
   validate_generation "$generation" || return 1
-  [ "$(non_email_config_digest_file "$generations/$generation/env")" =
+  [ "$(non_email_config_digest_file "$generations/$generation/env")" = \
     "$(runtime_non_email_config_digest "$root")" ] || return 1
-  [ "$(runtime_non_email_fingerprint "$root" "$compose_script")" =
+  [ "$(runtime_non_email_fingerprint "$root" "$compose_script")" = \
     "${generation_manifest[non_email_runtime_fingerprint]}" ] || return 1
-  [ "$(runtime_release_field "$root" BACKEND_IMAGE)" =
+  [ "$(runtime_release_field "$root" BACKEND_IMAGE)" = \
     "${generation_manifest[release_image]}" ] || return 1
-  [ "$(runtime_release_field "$root" BACKEND_VERSION)" =
+  [ "$(runtime_release_field "$root" BACKEND_VERSION)" = \
     "${generation_manifest[release_version]}" ] || return 1
-  [ "$(runtime_release_field "$root" BACKEND_REVISION)" =
+  [ "$(runtime_release_field "$root" BACKEND_REVISION)" = \
     "${generation_manifest[release_revision]}" ]
 }
 
@@ -557,8 +574,7 @@ verify_pre_state() {
   if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
     return 0
   fi
-  local image revision version config_hash container
-  image=$(runtime_release_field "$root" BACKEND_IMAGE) || return 1
+  local revision version config_hash container
   revision=$(runtime_release_field "$root" BACKEND_REVISION) || return 1
   version=$(runtime_release_field "$root" BACKEND_VERSION) || return 1
   container=$(runtime_compose "$root" "$compose_script" ps -q backend) || return 1
@@ -625,9 +641,9 @@ finalize_orphan_terminal() {
     COMMITTED)
       [ "$(safe_selector_value)" = "${journal[candidate_generation]}" ] || return 1
       validate_generation "${journal[candidate_generation]}" || return 1
-      [ "${generation_manifest[runtime_fingerprint]}" =
+      [ "${generation_manifest[runtime_fingerprint]}" = \
         "${journal[terminal_fingerprint]}" ] || return 1
-      [ "$(runtime_safe_fingerprint "$root" "$compose_script")" =
+      [ "$(runtime_safe_fingerprint "$root" "$compose_script")" = \
         "${journal[terminal_fingerprint]}" ] || return 1
       ;;
     RECOVERED)
@@ -637,6 +653,7 @@ finalize_orphan_terminal() {
       ;;
     *) return 1 ;;
   esac
+  delete_unselected_candidate_generation || return 1
   delete_transaction_directory "$transaction_dir"
 }
 

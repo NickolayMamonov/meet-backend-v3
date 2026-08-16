@@ -113,9 +113,12 @@ verify_environment_matches_container() {
 
 runtime_file_record() {
   local file=$1
+  local digest
   if [ -e "$file" ] || [ -L "$file" ]; then
     [ -f "$file" ] && [ ! -L "$file" ] || return 1
-    printf 'present:%s' "$(sha256sum "$file" | awk '{print $1}')"
+    digest=$(sha256sum "$file" | awk '{print $1}') || return 1
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf 'present:%s' "$digest"
   else
     printf 'absent'
   fi
@@ -185,30 +188,42 @@ runtime_container_material() {
 runtime_non_email_material() {
   local root=$1
   local compose_script=$2
-  local backend postgres
+  local backend postgres production_state_dir
+  local active_compose_record active_runtime_record
   backend=$(runtime_compose "$root" "$compose_script" ps -q backend)
   postgres=$(runtime_compose "$root" "$compose_script" ps -q postgres)
   [ -n "$backend" ] && [ -n "$postgres" ] || return 1
+  production_state_dir=${PRODUCTION_STATE_DIR:-/var/lib/meet-production}
+  active_compose_record=$(runtime_file_record \
+    "$production_state_dir/active-compose.yml") || return 1
+  active_runtime_record=$(runtime_file_record \
+    "$production_state_dir/active-runtime.override.yml") || return 1
   {
     printf 'non_email_config=%s\n' "$(runtime_non_email_config_digest "$root")"
     printf 'release_image=%s\n' "$(runtime_release_field "$root" BACKEND_IMAGE)"
     printf 'release_version=%s\n' "$(runtime_release_field "$root" BACKEND_VERSION)"
     printf 'release_revision=%s\n' "$(runtime_release_field "$root" BACKEND_REVISION)"
-    production_state_dir=${PRODUCTION_STATE_DIR:-/var/lib/meet-production}
-    printf 'active_compose=%s\n' \
-      "$(runtime_file_record "$production_state_dir/active-compose.yml")"
-    printf 'active_runtime=%s\n' \
-      "$(runtime_file_record "$production_state_dir/active-runtime.override.yml")"
+    printf 'active_compose=%s\n' "$active_compose_record"
+    printf 'active_runtime=%s\n' "$active_runtime_record"
     runtime_container_material "$backend" false false
     printf 'postgres:\n'
     runtime_container_material "$postgres" false false
   }
 }
 
+runtime_active_file_records() {
+  local production_state_dir=${PRODUCTION_STATE_DIR:-/var/lib/meet-production}
+  runtime_file_record "$production_state_dir/active-compose.yml" >/dev/null ||
+    return 1
+  runtime_file_record "$production_state_dir/active-runtime.override.yml" \
+    >/dev/null || return 1
+}
+
 runtime_non_email_fingerprint() {
   local root=$1
   local compose_script=$2
   if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
+    runtime_active_file_records || return 1
     printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
     return
   fi
@@ -220,6 +235,7 @@ runtime_safe_fingerprint() {
   local root=$1
   local compose_script=$2
   if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
+    runtime_active_file_records || return 1
     printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
     return
   fi
