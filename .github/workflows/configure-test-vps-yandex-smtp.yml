@@ -31,18 +31,19 @@ jobs:
       SSH_USER: ${{ vars.TEST_VPS_USER }}
       PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}
       HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
-      SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
-      SMTP_FROM: ${{ secrets.TEST_VPS_SMTP_FROM }}
-      SMTP_FROM_NAME: ${{ secrets.TEST_VPS_SMTP_FROM_NAME }}
-      SMTP_USERNAME: ${{ secrets.TEST_VPS_SMTP_USERNAME }}
-      SMTP_PASSWORD: ${{ secrets.TEST_VPS_SMTP_PASSWORD }}
-      OTP_CONNECT_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_CONNECT_TIMEOUT_MS }}
-      OTP_READ_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_READ_TIMEOUT_MS }}
-      OTP_WRITE_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_WRITE_TIMEOUT_MS }}
 
     steps:
       - name: Protected SMTP preflight
         shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+          SMTP_FROM: ${{ secrets.TEST_VPS_SMTP_FROM }}
+          SMTP_FROM_NAME: ${{ secrets.TEST_VPS_SMTP_FROM_NAME }}
+          SMTP_USERNAME: ${{ secrets.TEST_VPS_SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.TEST_VPS_SMTP_PASSWORD }}
+          OTP_CONNECT_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_CONNECT_TIMEOUT_MS }}
+          OTP_READ_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_READ_TIMEOUT_MS }}
+          OTP_WRITE_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_WRITE_TIMEOUT_MS }}
         run: |
           set -euo pipefail
           case "$MODE" in apply|rollback_last) ;; *) exit 1 ;; esac
@@ -57,9 +58,24 @@ jobs:
           if [ "$MODE" = apply ]; then
             [ -n "$SMTP_FROM" ] && [ -n "$SMTP_FROM_NAME" ]
             [ -n "$SMTP_USERNAME" ] && [ -n "$SMTP_PASSWORD" ]
+            for value in "$SMTP_FROM" "$SMTP_FROM_NAME" "$SMTP_USERNAME" "$SMTP_PASSWORD"; do
+              [[ "$value" != *[[:cntrl:]]* ]]
+              case "$value" in
+                *'#'*|*'$'*|*'`'*|*'\'*|*'"'*|*"'"*|*'='*|*';'*|*'|'*|*'&'*|\
+                  *'<'*|*'>'*|*'{'*|*'}'*|*'('*|*')'*|*'['*|*']'*)
+                  exit 1
+                  ;;
+              esac
+            done
             [[ "$OTP_CONNECT_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]]
             [[ "$OTP_READ_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]]
             [[ "$OTP_WRITE_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]]
+            [ "$OTP_CONNECT_TIMEOUT_MS" -ge 1000 ] &&
+              [ "$OTP_CONNECT_TIMEOUT_MS" -le 30000 ]
+            [ "$OTP_READ_TIMEOUT_MS" -ge 1000 ] &&
+              [ "$OTP_READ_TIMEOUT_MS" -le 30000 ]
+            [ "$OTP_WRITE_TIMEOUT_MS" -ge 1000 ] &&
+              [ "$OTP_WRITE_TIMEOUT_MS" -le 30000 ]
           fi
           echo "smtp_preflight=approved"
 
@@ -71,6 +87,8 @@ jobs:
 
       - name: Establish strict SSH host trust
         shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           key_file="$RUNNER_TEMP/test-vps-key"
@@ -150,6 +168,14 @@ jobs:
       - name: Build protected NUL-delimited SMTP payload
         if: inputs.mode == 'apply'
         shell: bash
+        env:
+          SMTP_FROM: ${{ secrets.TEST_VPS_SMTP_FROM }}
+          SMTP_FROM_NAME: ${{ secrets.TEST_VPS_SMTP_FROM_NAME }}
+          SMTP_USERNAME: ${{ secrets.TEST_VPS_SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.TEST_VPS_SMTP_PASSWORD }}
+          OTP_CONNECT_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_CONNECT_TIMEOUT_MS }}
+          OTP_READ_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_READ_TIMEOUT_MS }}
+          OTP_WRITE_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_WRITE_TIMEOUT_MS }}
         run: |
           set -euo pipefail
           payload="$RUNNER_TEMP/yandex-smtp-payload"
@@ -243,12 +269,31 @@ jobs:
             fi
           } >>"$GITHUB_STEP_SUMMARY"
 
+      - name: Secret-free public HTTPS probes
+        if: always()
+        shell: bash
+        env:
+          PUBLIC_API_URL: https://api.whysoezzy.online
+        run: |
+          set -euo pipefail
+          status=$(curl --silent --show-error --output "$RUNNER_TEMP/smtp-public-meetings.json" \
+            --write-out '%{http_code}' --connect-timeout 10 --max-time 30 \
+            "$PUBLIC_API_URL/meetings")
+          [ "$status" = 200 ]
+          jq -e 'type == "array"' "$RUNNER_TEMP/smtp-public-meetings.json" >/dev/null
+          actuator=$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' --connect-timeout 10 --max-time 30 \
+            "$PUBLIC_API_URL/actuator")
+          [ "$actuator" = 404 ]
+          echo "public_https_probe=meetings:$status actuator:$actuator" >>"$GITHUB_STEP_SUMMARY"
+
       - name: Cleanup SMTP transport
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          rm -f -- "$RUNNER_TEMP/yandex-smtp-payload" "$RUNNER_TEMP/smtp-result"
+          rm -f -- "$RUNNER_TEMP/yandex-smtp-payload" "$RUNNER_TEMP/smtp-result" \
+            "$RUNNER_TEMP/smtp-public-meetings.json"
           if [ -n "${REMOTE_TOOLING:-}" ] && [ -n "${SSH_CONFIG:-}" ]; then
             ssh -F "$SSH_CONFIG" test-vps bash -s -- "$REMOTE_TOOLING" <<'REMOTE' || true
           set -euo pipefail

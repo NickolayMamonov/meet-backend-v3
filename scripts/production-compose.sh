@@ -30,7 +30,7 @@ unset INGESTION_ENABLED INGESTION_CRON INGESTION_ZONE GEOCODER_ENABLED LOCATIONI
 unset TIMEPAD_ENABLED TIMEPAD_TOKEN TIMEPAD_CATEGORY_IDS TIMEPAD_KEYWORDS TIMEPAD_CITIES
 unset SPRINGDOC_API_DOCS_ENABLED SPRINGDOC_SWAGGER_UI_ENABLED
 
-STATE_DIR=/var/lib/meet-production
+STATE_DIR=${PRODUCTION_STATE_DIR:-/var/lib/meet-production}
 if [ "${1:-}" = --captured-runtime ]; then
   shift
   BASE_COMPOSE="$STATE_DIR/previous-compose.yml"
@@ -41,8 +41,10 @@ if [ "${1:-}" = --captured-runtime ]; then
   }
 else
   BASE_COMPOSE=${PRODUCTION_BASE_COMPOSE:-"$ROOT_DIR/docker-compose.production.yml"}
-  [ ! -s "$STATE_DIR/active-compose.yml" ] || \
-    BASE_COMPOSE="$STATE_DIR/active-compose.yml"
+  if [ "${PRODUCTION_USE_REVIEWED_COMPOSE:-false}" != true ]; then
+    [ ! -s "$STATE_DIR/active-compose.yml" ] || \
+      BASE_COMPOSE="$STATE_DIR/active-compose.yml"
+  fi
   RUNTIME_OVERRIDE="$STATE_DIR/active-runtime.override.yml"
 fi
 
