@@ -22,6 +22,10 @@ runtime_compose() {
   local compose_script=$2
   shift 2
   if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
+    if [ -n "${MEE_SMTP_FAKE_COMPOSE_LOG:-}" ]; then
+      printf '%s|%s\n' "${RUNTIME_BASE_COMPOSE:-}" "$*" \
+        >>"$MEE_SMTP_FAKE_COMPOSE_LOG"
+    fi
     case "$*" in
       "ps -q backend") printf 'backend-container\n' ;;
       "ps -q postgres") printf 'postgres-container\n' ;;
@@ -157,6 +161,10 @@ runtime_file_record() {
   local digest
   if [ -e "$file" ] || [ -L "$file" ]; then
     [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
+      printf 'present:fake'
+      return
+    fi
     digest=$(sha256sum "$file" | awk '{print $1}') || return 1
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
     printf 'present:%s' "$digest"
@@ -256,6 +264,13 @@ runtime_non_email_material() {
 
 runtime_active_file_records() {
   local production_state_dir=${PRODUCTION_STATE_DIR:-/var/lib/meet-production}
+  if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
+    [ -f "$production_state_dir/active-compose.yml" ] &&
+      [ ! -L "$production_state_dir/active-compose.yml" ] &&
+      [ -f "$production_state_dir/active-runtime.override.yml" ] &&
+      [ ! -L "$production_state_dir/active-runtime.override.yml" ]
+    return
+  fi
   runtime_file_record "$production_state_dir/active-compose.yml" >/dev/null ||
     return 1
   runtime_file_record "$production_state_dir/active-runtime.override.yml" \

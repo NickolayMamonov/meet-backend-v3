@@ -493,14 +493,18 @@ jobs:
           mapfile -t states < <(
             find "$state_root" -mindepth 1 -maxdepth 1 -type d \
               -printf '%T@ %p\n' |
+              while IFS=' ' read -r timestamp path; do
+                name=${path#"$state_root/"}
+                [[ "$name" =~ ^[0-9]+-[0-9]+-(rollback-drill|final-deploy)$ ]] ||
+                  continue
+                printf '%s %s\n' "$timestamp" "$path"
+              done |
               sort -nr |
               cut -d' ' -f2-
           )
           states_removed=0
           for ((index=10; index<${#states[@]}; index++)); do
             path=${states[$index]}
-            name=${path#"$state_root/"}
-            [[ "$name" =~ ^[0-9]+-[0-9]+-(rollback-drill|final-deploy)$ ]]
             delete_tree "$path"
             states_removed=$((states_removed + 1))
           done

@@ -132,6 +132,20 @@ jobs:
           stage="$RUNNER_TEMP/yandex-smtp-tooling"
           archive="$RUNNER_TEMP/yandex-smtp-tooling.tar"
           remote="$PATH_ON_HOST/.test-vps-smtp-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cleanup_stage_on_failure() {
+            status=$?
+            if [ "$status" -ne 0 ] && [ -n "${SSH_CONFIG:-}" ]; then
+              ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote" <<'REMOTE' || true
+          set -euo pipefail
+          stage=$1
+          [ -d "$stage" ] && [ ! -L "$stage" ] || exit 0
+          find "$stage" -xdev -type f -delete
+          find "$stage" -xdev -depth -type d -empty -delete
+          REMOTE
+            fi
+            exit "$status"
+          }
+          trap cleanup_stage_on_failure EXIT
           mkdir -p "$stage/scripts"
           files=(
             docker-compose.production.yml
@@ -164,6 +178,7 @@ jobs:
           chmod 755 "$stage"/scripts/*.sh
           REMOTE
           echo "REMOTE_TOOLING=$remote" >>"$GITHUB_ENV"
+          trap - EXIT
 
       - name: Build protected NUL-delimited SMTP payload
         if: inputs.mode == 'apply'
@@ -179,6 +194,14 @@ jobs:
         run: |
           set -euo pipefail
           payload="$RUNNER_TEMP/yandex-smtp-payload"
+          cleanup_payload_on_failure() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              rm -f -- "$payload"
+            fi
+            exit "$status"
+          }
+          trap cleanup_payload_on_failure EXIT
           umask 077
           : >"$payload"
           printf 'APP_EMAIL_PROVIDER=smtp\0' >>"$payload"
@@ -194,6 +217,7 @@ jobs:
           chmod 600 "$payload"
           scp -F "$SSH_CONFIG" "$payload" \
             "test-vps:$REMOTE_TOOLING/smtp-payload"
+          trap - EXIT
 
       - name: Run SMTP transaction
         id: transaction
@@ -294,8 +318,9 @@ jobs:
           set -euo pipefail
           rm -f -- "$RUNNER_TEMP/yandex-smtp-payload" "$RUNNER_TEMP/smtp-result" \
             "$RUNNER_TEMP/smtp-public-meetings.json"
-          if [ -n "${REMOTE_TOOLING:-}" ] && [ -n "${SSH_CONFIG:-}" ]; then
-            ssh -F "$SSH_CONFIG" test-vps bash -s -- "$REMOTE_TOOLING" <<'REMOTE' || true
+          remote="${PATH_ON_HOST}/.test-vps-smtp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [ -n "${SSH_CONFIG:-}" ]; then
+            ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote" <<'REMOTE' || true
           set -euo pipefail
           stage=$1
           [ -d "$stage" ] && [ ! -L "$stage" ] || exit 0

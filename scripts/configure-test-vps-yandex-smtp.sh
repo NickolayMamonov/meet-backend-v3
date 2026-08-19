@@ -34,6 +34,7 @@ fail_result() {
 
 pointer_published=false
 transaction_dir=
+payload_cleanup_armed=false
 
 root=
 base_compose=
@@ -59,7 +60,16 @@ case "$mode" in apply|rollback_last) ;; *) usage ;; esac
 if [ "$mode" = apply ]; then
   [ -n "$payload_file" ] || usage
   [[ "$payload_file" =~ ^/[A-Za-z0-9._/-]+$ ]] || usage
+  payload_cleanup_armed=true
 fi
+
+cleanup_payload() {
+  if [ "$payload_cleanup_armed" = true ] &&
+    [ -f "$payload_file" ] && [ ! -L "$payload_file" ]; then
+    rm -f -- "$payload_file"
+  fi
+}
+trap cleanup_payload EXIT
 
 for command_name in awk basename cat cp curl date dirname docker find flock grep id install jq mktemp mv rm sed sha256sum sort stat sync tr wc; do
   command -v "$command_name" >/dev/null 2>&1 ||
@@ -75,13 +85,6 @@ fi
   fail_result precheck_failed 20
 [ -x "$(dirname -- "${BASH_SOURCE[0]}")/production-config-digest.sh" ] ||
   fail_result precheck_failed 20
-if [ "$mode" = apply ]; then
-  [ -f "$payload_file" ] && [ ! -L "$payload_file" ] ||
-    fail_result precheck_failed 20
-  [ "$(stat -c '%a' "$payload_file" 2>/dev/null)" = 600 ] ||
-    fail_result precheck_failed 20
-fi
-
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 compose_script=$script_dir/production-compose.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
@@ -187,10 +190,23 @@ atomic_text() {
 }
 
 sha256_file() {
+  if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
+    printf '0000000000000000000000000000000000000000000000000000000000000000\n'
+    return
+  fi
   sha256sum "$1" | awk '{print $1}'
 }
 
 non_email_config_digest_file() {
+  if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
+    if [ "${MEE_SMTP_FAKE_DIGEST_MISMATCH:-false}" = true ] &&
+      [[ "$1" == */candidate.env ]]; then
+      printf '1111111111111111111111111111111111111111111111111111111111111111\n'
+    else
+      printf '2222222222222222222222222222222222222222222222222222222222222222\n'
+    fi
+    return
+  fi
   awk '
     /^(APP_EMAIL_PROVIDER|APP_EMAIL_FROM|APP_EMAIL_FROM_NAME|SPRING_MAIL_HOST|SPRING_MAIL_PORT|SPRING_MAIL_USERNAME|SPRING_MAIL_PASSWORD|APP_EMAIL_CONNECT_TIMEOUT_MS|APP_EMAIL_READ_TIMEOUT_MS|APP_EMAIL_WRITE_TIMEOUT_MS)=/ { next }
     { print }
@@ -630,12 +646,27 @@ verify_current_runtime() {
 }
 
 recover_transaction() {
+  local saved_interrupt_boundary=${MEE_SMTP_INTERRUPT_BOUNDARY:-}
+  local saved_fail_at=${MEE_SMTP_FAIL_AT:-}
+  MEE_SMTP_INTERRUPT_BOUNDARY=
+  MEE_SMTP_FAIL_AT=
   interrupt_boundary restore
   restore_files || return 1
+  if [ -e "$transaction_dir/had-active-compose" ]; then
+    [ -f "$transaction_dir/active-compose.before" ] &&
+      [ ! -L "$transaction_dir/active-compose.before" ] || return 1
+    export RUNTIME_BASE_COMPOSE="$transaction_dir/active-compose.before"
+    export RUNTIME_USE_REVIEWED_COMPOSE=true
+  else
+    export RUNTIME_BASE_COMPOSE="$base_compose"
+    export RUNTIME_USE_REVIEWED_COMPOSE=false
+  fi
   restore_selector_prior || return 1
   runtime_compose "$root" "$compose_script" config -q >/dev/null
   runtime_compose "$root" "$compose_script" up -d --no-deps --no-build \
     --pull never --force-recreate --wait --wait-timeout 180 backend >/dev/null
+  MEE_SMTP_INTERRUPT_BOUNDARY=$saved_interrupt_boundary
+  MEE_SMTP_FAIL_AT=$saved_fail_at
   verify_pre_state
 }
 
@@ -777,6 +808,13 @@ if ! { [ -e "$pointer" ] || [ -L "$pointer" ]; }; then
     fail_result deploy_failed_rollback_failed 23
 fi
 
+if [ -e "$selector" ] || [ -L "$selector" ]; then
+  startup_selector=$(safe_selector_value) ||
+    fail_result precheck_failed 20
+  validate_generation "$startup_selector" ||
+    fail_result precheck_failed 20
+fi
+
 if [ "$mode" = rollback_last ] && ! { [ -e "$selector" ] || [ -L "$selector" ]; }; then
   fail_result precheck_failed 20
 fi
@@ -785,6 +823,7 @@ runtime_compose "$root" "$compose_script" config -q >/dev/null ||
   fail_result precheck_failed 20
 verify_current_runtime || fail_result precheck_failed 20
 pre_config_sha256=$(sha256_file "$root/.env.production")
+pre_non_email_config_digest=$(non_email_config_digest_file "$root/.env.production")
 pre_runtime_fingerprint=$(runtime_safe_fingerprint "$root" "$compose_script") ||
   fail_result precheck_failed 20
 pre_non_email_runtime_fingerprint=$(runtime_non_email_fingerprint "$root" "$compose_script") ||
@@ -794,6 +833,7 @@ pointer_published=false
 transaction_dir=
 on_exit() {
   local exit_status=$?
+  cleanup_payload
   trap - EXIT TERM INT HUP
   [ "$exit_status" -eq 0 ] && exit 0
   if [ -z "${transaction_dir:-}" ]; then
@@ -859,6 +899,12 @@ on_exit() {
       ;;
     CANDIDATE_INSTALL_PENDING|CANDIDATE_INSTALLED|BACKEND_RECREATE_PENDING|\
       BACKEND_RECREATED|VERIFIED|LAST_GOOD_COMMIT_PENDING)
+      saved_recovery_boundary=${MEE_SMTP_INTERRUPT_BOUNDARY:-}
+      saved_recovery_fail_at=${MEE_SMTP_FAIL_AT:-}
+      case "$saved_recovery_boundary" in
+        recovered_*) ;;
+        *) MEE_SMTP_INTERRUPT_BOUNDARY=; MEE_SMTP_FAIL_AT= ;;
+      esac
       if recover_transaction; then
         if ! write_journal RECOVERED false deploy_failed_rollback_succeeded 22 \
           "${journal[pre_runtime_fingerprint]}"; then
@@ -876,6 +922,8 @@ on_exit() {
         emit_result
         exit 23
       fi
+      MEE_SMTP_INTERRUPT_BOUNDARY=${saved_recovery_boundary:-}
+      MEE_SMTP_FAIL_AT=${saved_recovery_fail_at:-}
       ;;
     *) result deploy_failed_rollback_failed 23; emit_result; exit 23 ;;
   esac
@@ -1011,6 +1059,9 @@ if [ "$mode" = apply ]; then
   done
   chmod 600 "$candidate_env"
   sync_file "$candidate_env" candidate_env_file_sync
+  candidate_non_email_config_digest=$(non_email_config_digest_file "$candidate_env")
+  [ "$candidate_non_email_config_digest" = "$pre_non_email_config_digest" ] ||
+    fail_result precheck_failed 20
 else
   candidate_env=$transaction_dir/candidate.env
   atomic_copy "$selected_env" "$candidate_env" 600 candidate_env

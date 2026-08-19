@@ -4,16 +4,35 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TOOL=$ROOT_DIR/scripts/configure-test-vps-yandex-smtp.sh
 TIMEOUT=$(command -v timeout)
+TIMEOUT_SECONDS=${FAKE_REMOTE_CASE_TIMEOUT_SECONDS:-180}
+WAIT_SECONDS=${FAKE_REMOTE_WAIT_SECONDS:-240}
 TMP=$(mktemp -d)
 active_pids=()
 
+descendant_pids() {
+  local parent=$1 proc pid ppid
+  for proc in /proc/[0-9]*/stat; do
+    pid=${proc#/proc/}
+    pid=${pid%/stat}
+    [ -r "$proc" ] || continue
+    read -r _ _ _ ppid _ <"$proc" || continue
+    if [ "$ppid" = "$parent" ]; then
+      descendant_pids "$pid"
+      printf '%s\n' "$pid"
+    fi
+  done
+}
+
 terminate_case_pid() {
   local pid=$1
-  if command -v taskkill.exe >/dev/null 2>&1; then
-    taskkill.exe //PID "$pid" //T //F >/dev/null 2>&1 || true
-  else
-    kill "$pid" 2>/dev/null || true
-  fi
+  local -a descendants=()
+  mapfile -t descendants < <(descendant_pids "$pid")
+  kill -TERM "$pid" "${descendants[@]}" 2>/dev/null || true
+  kill -TERM -- "-$pid" 2>/dev/null || true
+  sleep 0.1
+  mapfile -t descendants < <(descendant_pids "$pid")
+  kill -KILL "$pid" "${descendants[@]}" 2>/dev/null || true
+  kill -KILL -- "-$pid" 2>/dev/null || true
 }
 
 reap_active_cases() {
@@ -22,7 +41,7 @@ reap_active_cases() {
     terminate_case_pid "$pid"
   done
   for pid in "${active_pids[@]}"; do
-    wait "$pid" 2>/dev/null || true
+    wait_case_pid "$pid" || true
   done
   active_pids=()
 }
@@ -33,7 +52,10 @@ reap_task_processes() {
     pid=${proc#/proc/}
     pid=${pid%/cmdline}
     [ "$pid" -ne "$$" ] || continue
-    command_line=$(tr '\0' ' ' <"$proc" 2>/dev/null || true)
+    command_line=
+    if [ -r "$proc" ]; then
+      command_line=$(tr '\0' ' ' "$proc" 2>/dev/null || true)
+    fi
     case "$command_line" in *"$TMP/"*) terminate_case_pid "$pid" ;; esac
   done
 }
@@ -53,7 +75,10 @@ assert_no_task_processes() {
     pid=${proc#/proc/}
     pid=${pid%/cmdline}
     [ "$pid" -ne "$$" ] || continue
-    command_line=$(tr '\0' ' ' <"$proc" 2>/dev/null || true)
+    command_line=
+    if [ -r "$proc" ]; then
+      command_line=$(tr '\0' ' ' "$proc" 2>/dev/null || true)
+    fi
     case "$command_line" in
       *"$TMP/"*)
         echo "task-owned case process survived matrix: pid=$pid command=$command_line" >&2
@@ -61,6 +86,23 @@ assert_no_task_processes() {
         ;;
     esac
   done
+  echo "zero_survivors=0"
+}
+
+write_payload() {
+  local payload_file=$1
+  : >"$payload_file"
+  printf 'APP_EMAIL_PROVIDER=smtp\0' >>"$payload_file"
+  printf 'APP_EMAIL_FROM=canary@example.test\0' >>"$payload_file"
+  printf 'APP_EMAIL_FROM_NAME=Canary Sender\0' >>"$payload_file"
+  printf 'SPRING_MAIL_HOST=smtp.yandex.ru\0' >>"$payload_file"
+  printf 'SPRING_MAIL_PORT=587\0' >>"$payload_file"
+  printf 'SPRING_MAIL_USERNAME=canary-user\0' >>"$payload_file"
+  printf 'SPRING_MAIL_PASSWORD=canary-password\0' >>"$payload_file"
+  printf 'APP_EMAIL_CONNECT_TIMEOUT_MS=1000\0' >>"$payload_file"
+  printf 'APP_EMAIL_READ_TIMEOUT_MS=1000\0' >>"$payload_file"
+  printf 'APP_EMAIL_WRITE_TIMEOUT_MS=1000\0' >>"$payload_file"
+  chmod 600 "$payload_file"
 }
 
 make_fixture() {
@@ -98,18 +140,7 @@ make_fixture() {
     chmod 600 "$production/active-compose.yml" \
       "$production/active-runtime.override.yml"
   fi
-  : >"$case_dir/payload"
-  printf 'APP_EMAIL_PROVIDER=smtp\0' >>"$case_dir/payload"
-  printf 'APP_EMAIL_FROM=canary@example.test\0' >>"$case_dir/payload"
-  printf 'APP_EMAIL_FROM_NAME=Canary Sender\0' >>"$case_dir/payload"
-  printf 'SPRING_MAIL_HOST=smtp.yandex.ru\0' >>"$case_dir/payload"
-  printf 'SPRING_MAIL_PORT=587\0' >>"$case_dir/payload"
-  printf 'SPRING_MAIL_USERNAME=canary-user\0' >>"$case_dir/payload"
-  printf 'SPRING_MAIL_PASSWORD=canary-password\0' >>"$case_dir/payload"
-  printf 'APP_EMAIL_CONNECT_TIMEOUT_MS=1000\0' >>"$case_dir/payload"
-  printf 'APP_EMAIL_READ_TIMEOUT_MS=1000\0' >>"$case_dir/payload"
-  printf 'APP_EMAIL_WRITE_TIMEOUT_MS=1000\0' >>"$case_dir/payload"
-  chmod 600 "$case_dir/payload"
+  write_payload "$case_dir/payload"
 
   printf '%s\n' '#!/usr/bin/bash' 'exit 0' >"$bin/docker"
   chmod 755 "$bin/docker"
@@ -153,6 +184,7 @@ run_tool() {
   local boundary=${2:-}
   local signal=${3:-TERM}
   local fail_at=${4:-}
+  local mode=${5:-apply}
   local output=$case_dir/output
   local error=$case_dir/error
   local status
@@ -165,11 +197,12 @@ run_tool() {
     MEE_SMTP_INTERRUPT_BOUNDARY="$boundary" \
     MEE_SMTP_INTERRUPT_SIGNAL="$signal" \
     MEE_SMTP_FAIL_AT="$fail_at" \
-    "$TIMEOUT" "${FAKE_REMOTE_CASE_TIMEOUT_SECONDS:-180}" \
+    MEE_SMTP_FAKE_COMPOSE_LOG="$case_dir/compose.log" \
+    "$TIMEOUT" -k 1 "$TIMEOUT_SECONDS" \
     "$TOOL" --root "$case_dir/root" \
       --base-compose "$case_dir/compose.yml" \
       --run-key fake-remote \
-      --mode apply \
+      --mode "$mode" \
       --payload-file "$case_dir/payload" \
       >"$output" 2>"$error"; then
     status=0
@@ -215,9 +248,15 @@ assert_interrupted() {
       transaction_directory|journal_file_sync|journal_rename|\
       journal_directory_sync|pointer_temp_write|pointer_file_sync|pointer_rename|\
       generation_env_temp_write|generation_env_file_sync|generation_env_rename|\
-      generation_directory_sync|\
-      pointer_directory_sync)
+      generation_directory_sync)
       expected=20
+      ;;
+    pointer_directory_sync)
+      expected=23
+      ;;
+    live_config_temp_write|live_config_file_sync|live_config_rename|\
+      live_config_directory_sync|backend_recreate)
+      expected=23
       ;;
     journal_temp_write)
       expected=23
@@ -253,6 +292,7 @@ assert_interrupted() {
   if [ "$expected" -ne 23 ]; then
     [ ! -e "$case_dir/state/.smtp-transaction.current" ]
   fi
+  [ ! -e "$case_dir/payload" ]
 }
 
 pre_pointer_boundaries=(
@@ -290,7 +330,7 @@ wait_batch() {
   local batch_status=0
   local child_status
   for pid in "$@"; do
-    if wait "$pid"; then
+    if wait_case_pid "$pid"; then
       continue
     else
       child_status=$?
@@ -299,6 +339,20 @@ wait_batch() {
   done
   active_pids=()
   return "$batch_status"
+}
+
+wait_case_pid() {
+  local pid=$1
+  local deadline=$((SECONDS + WAIT_SECONDS))
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      terminate_case_pid "$pid"
+      reap_task_processes
+      break
+    fi
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null
 }
 
 run_interrupt_case() {
@@ -480,6 +534,66 @@ assert_success "$case_dir" || {
   exit 1
 }
 
+case_dir=$TMP/rollback-last
+mkdir -p "$case_dir"
+make_fixture "$case_dir"
+assert_success "$case_dir"
+selected_env="$case_dir/state/.smtp-last-good-generations/$(<"$case_dir/state/.smtp-last-good.current")/env"
+cp -- "$case_dir/root/.env.production" "$case_dir/rollback-live.env"
+sed -i 's/^APP_EMAIL_FROM=.*/APP_EMAIL_FROM=changed@example.test/' \
+  "$case_dir/root/.env.production"
+status=$(run_tool "$case_dir" '' TERM '' rollback_last)
+[ "$status" -eq 0 ] || {
+  echo "unexpected rollback_last status=$status" >&2
+  sed -n '1,80p' "$case_dir/error" >&2 || true
+  exit 1
+}
+assert_result_line "$case_dir" deploy_succeeded
+cmp --silent "$selected_env" "$case_dir/root/.env.production"
+status=$(run_tool "$case_dir" '' TERM '' rollback_last)
+[ "$status" -eq 0 ] || exit 1
+assert_result_line "$case_dir" deploy_succeeded
+cmp --silent "$selected_env" "$case_dir/root/.env.production"
+
+case_dir=$TMP/rollback-last-missing
+mkdir -p "$case_dir"
+make_fixture "$case_dir"
+status=$(run_tool "$case_dir" '' TERM '' rollback_last)
+[ "$status" -eq 20 ] || exit 1
+assert_result_line "$case_dir" precheck_failed
+[ ! -e "$case_dir/state/.smtp-transaction.current" ]
+
+case_dir=$TMP/malformed-selector
+mkdir -p "$case_dir"
+make_fixture "$case_dir"
+assert_success "$case_dir"
+printf '%s\n' 'not-a-valid-generation!' >"$case_dir/state/.smtp-last-good.current"
+chmod 600 "$case_dir/state/.smtp-last-good.current"
+status=$(run_tool "$case_dir")
+[ "$status" -eq 20 ] || exit 1
+assert_result_line "$case_dir" precheck_failed
+
+case_dir=$TMP/malformed-transaction-pointer
+mkdir -p "$case_dir"
+make_fixture "$case_dir"
+printf '%s\n' 'malformed-pointer' >"$case_dir/state/.smtp-transaction.current"
+chmod 600 "$case_dir/state/.smtp-transaction.current"
+status=$(run_tool "$case_dir")
+[ "$status" -eq 23 ] || exit 1
+assert_result_line "$case_dir" deploy_failed_rollback_failed
+
+case_dir=$TMP/active-compose-rollback
+mkdir -p "$case_dir"
+make_fixture "$case_dir"
+status=$(run_tool "$case_dir" backend_recreate TERM)
+case "$status" in 22|23) ;;
+  *) exit 1 ;;
+esac
+assert_result_line "$case_dir" deploy_failed_rollback_succeeded
+grep -Fq 'active-compose.before|config -q' "$case_dir/compose.log"
+grep -Fq 'active-compose.before|up -d --no-deps --no-build --pull never --force-recreate --wait --wait-timeout 180 backend' \
+  "$case_dir/compose.log"
+
 case_dir=$TMP/lock
 mkdir -p "$case_dir"
 make_fixture "$case_dir"
@@ -556,6 +670,7 @@ terminal_status=22
 terminal_fingerprint=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 JOURNAL
 chmod 600 "$tx/journal"
+write_payload "$case_dir/payload"
 status=$(run_tool "$case_dir")
 [ "$status" -eq 0 ] || {
   echo "unexpected orphan cleanup status=$status" >&2
