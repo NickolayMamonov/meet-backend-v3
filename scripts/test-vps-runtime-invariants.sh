@@ -88,6 +88,47 @@ runtime_normalized_mounts() {
     '
 }
 
+runtime_normalized_ports() {
+  local container=$1
+  docker inspect "$container" --format '{{json .NetworkSettings.Ports}}' |
+    jq -cS '
+      (. // {})
+      | to_entries
+      | map({
+          container_port: .key,
+          bindings: ((.value // [])
+            | map({
+                host_ip: (.HostIp // ""),
+                host_port: (.HostPort // "")
+              })
+            | sort_by([.host_ip, .host_port]))
+        })
+      | sort_by(.container_port)
+    '
+}
+
+runtime_normalized_networks() {
+  local container=$1
+  docker inspect "$container" --format '{{json .NetworkSettings.Networks}}' |
+    jq -cS '
+      (. // {})
+      | to_entries
+      | map({
+          network: .key,
+          aliases: ((.value.Aliases // []) | sort),
+          driver_opts: (.value.DriverOpts // {}),
+          ip_address: (.value.IPAddress // ""),
+          ip_prefix_len: (.value.IPPrefixLen // 0),
+          gateway: (.value.Gateway // ""),
+          global_ipv6_address: (.value.GlobalIPv6Address // ""),
+          global_ipv6_prefix_len: (.value.GlobalIPv6PrefixLen // 0),
+          ipv6_gateway: (.value.IPv6Gateway // ""),
+          links: ((.value.Links // []) | sort)
+        })
+      | sort_by(.network)
+    '
+}
+
 verify_environment_matches_container() {
   local root=$1
   local compose_script=$2
@@ -174,6 +215,8 @@ runtime_container_material() {
     printf 'memory=%s\n' "$(docker inspect "$container" \
       --format '{{.HostConfig.Memory}}')"
     printf 'mounts=%s\n' "$(runtime_normalized_mounts "$container")"
+    printf 'ports=%s\n' "$(runtime_normalized_ports "$container")"
+    printf 'networks=%s\n' "$(runtime_normalized_networks "$container")"
     printf 'healthcheck=%s\n' "$(docker inspect "$container" \
       --format '{{json .Config.Healthcheck.Test}}')"
   } | {

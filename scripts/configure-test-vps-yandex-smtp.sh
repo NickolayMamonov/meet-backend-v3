@@ -207,6 +207,20 @@ safe_selector_value() {
   printf '%s' "$value"
 }
 
+materialize_candidate_env() {
+  local candidate=$transaction_dir/candidate.env
+  if [ -f "$candidate" ] && [ ! -L "$candidate" ]; then
+    [ "$(stat -c '%a' "$candidate" 2>/dev/null)" = 600 ] || return 1
+    return 0
+  fi
+  [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || return 1
+  [[ "${journal[candidate_generation]}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    return 1
+  validate_generation "${journal[candidate_generation]}" || return 1
+  atomic_copy \
+    "$generations/${journal[candidate_generation]}/env" "$candidate" 600 candidate_env
+}
+
 validate_generation() {
   local generation=$1
   local directory=$generations/$generation
@@ -382,6 +396,7 @@ publish_pointer() {
 
 clear_pointer_then_delete() {
   local transaction=$1
+  validate_journal_temps || return 1
   [ -f "$pointer" ] && [ ! -L "$pointer" ] || return 1
   atomic_text '' "$pointer.clear" 600 pointer_clear_temp
   interrupt_boundary pointer_unlink
@@ -397,10 +412,22 @@ clear_pointer_then_delete() {
 
 delete_transaction_directory() {
   local transaction=$1
+  transaction_dir=$transaction
+  validate_journal_temps || return 1
   [ -d "$transaction" ] && [ ! -L "$transaction" ] || return 1
   find "$transaction" -xdev -type f -delete
   find "$transaction" -xdev -depth -type d -empty -delete
   sync_directory "$transactions" transaction_directory_sync
+}
+
+validate_journal_temps() {
+  local temporary
+  for temporary in "$transaction_dir"/journal.tmp.*; do
+    [ -e "$temporary" ] || continue
+    [ -f "$temporary" ] && [ ! -L "$temporary" ] || return 1
+    [ "$(stat -c '%a' "$temporary" 2>/dev/null)" = 600 ] || return 1
+    (load_journal "$temporary") || return 1
+  done
 }
 
 delete_unselected_candidate_generation() {
@@ -442,6 +469,7 @@ validate_transaction_material() {
           [ ! -L "$transaction_dir/$entry" ] || return 1
         [ "$(stat -c '%a' "$transaction_dir/$entry" 2>/dev/null)" = 600 ] ||
           return 1
+        (load_journal "$transaction_dir/$entry") || return 1
         ;;
       *) return 1 ;;
     esac
@@ -617,6 +645,7 @@ finalize_terminal() {
   local fingerprint=${journal[terminal_fingerprint]}
   case "${journal[phase]}" in
     COMMITTED)
+      verify_current_runtime || return 1
       [ "$(safe_selector_value)" = "${journal[candidate_generation]}" ] || return 1
       validate_generation "${journal[candidate_generation]}" || return 1
       [ "${generation_manifest[runtime_fingerprint]}" = "$fingerprint" ] || return 1
@@ -639,6 +668,7 @@ finalize_terminal() {
 finalize_orphan_terminal() {
   case "${journal[phase]}" in
     COMMITTED)
+      verify_current_runtime || return 1
       [ "$(safe_selector_value)" = "${journal[candidate_generation]}" ] || return 1
       validate_generation "${journal[candidate_generation]}" || return 1
       [ "${generation_manifest[runtime_fingerprint]}" = \
@@ -674,6 +704,11 @@ reconcile_current() {
     fail_result deploy_failed_rollback_failed 23
   load_journal "$transaction_dir/journal" ||
     fail_result deploy_failed_rollback_failed 23
+  case "${journal[phase]}" in
+    SNAPSHOTTED) ;;
+    *) materialize_candidate_env ||
+      fail_result deploy_failed_rollback_failed 23 ;;
+  esac
   validate_transaction_material "${journal[phase]}" ||
     fail_result deploy_failed_rollback_failed 23
   case "${journal[phase]}" in
@@ -690,7 +725,10 @@ reconcile_current() {
       BACKEND_RECREATED|VERIFIED|LAST_GOOD_COMMIT_PENDING)
       if recover_transaction; then
         fingerprint=${journal[pre_runtime_fingerprint]}
-        write_journal RECOVERED false deploy_failed_rollback_succeeded 22 "$fingerprint"
+        if ! write_journal RECOVERED false deploy_failed_rollback_succeeded 22 \
+          "$fingerprint"; then
+          fail_result deploy_failed_rollback_failed 23
+        fi
         finalize_terminal || fail_result deploy_failed_rollback_failed 23
       else
         fail_result deploy_failed_rollback_failed 23
@@ -709,6 +747,10 @@ reconcile_orphans_without_pointer() {
     [ -d "$candidate" ] && [ ! -L "$candidate" ] || return 1
     transaction_dir=$candidate
     load_journal "$candidate/journal" || return 1
+    case "${journal[phase]}" in
+      SNAPSHOTTED) ;;
+      *) materialize_candidate_env || return 1 ;;
+    esac
     validate_transaction_material "${journal[phase]}" || return 1
     case "${journal[phase]}" in
       SNAPSHOTTED)
@@ -781,6 +823,15 @@ on_exit() {
     emit_result
     exit 23
   }
+  case "${journal[phase]}" in
+    SNAPSHOTTED) ;;
+    *) materialize_candidate_env || {
+      result deploy_failed_rollback_failed 23
+      emit_result
+      exit 23
+      }
+      ;;
+  esac
   validate_transaction_material "${journal[phase]}" || {
     result deploy_failed_rollback_failed 23
     emit_result
@@ -802,14 +853,19 @@ on_exit() {
     COMMITTED|RECOVERED)
       finalize_terminal || {
         result deploy_failed_rollback_failed 23
+        emit_result
         exit 23
       }
       ;;
     CANDIDATE_INSTALL_PENDING|CANDIDATE_INSTALLED|BACKEND_RECREATE_PENDING|\
       BACKEND_RECREATED|VERIFIED|LAST_GOOD_COMMIT_PENDING)
       if recover_transaction; then
-        write_journal RECOVERED false deploy_failed_rollback_succeeded 22 \
-          "${journal[pre_runtime_fingerprint]}"
+        if ! write_journal RECOVERED false deploy_failed_rollback_succeeded 22 \
+          "${journal[pre_runtime_fingerprint]}"; then
+          result deploy_failed_rollback_failed 23
+          emit_result
+          exit 23
+        fi
         finalize_terminal || {
           result deploy_failed_rollback_failed 23
           emit_result
@@ -870,25 +926,33 @@ else
 fi
 chmod 700 "$transaction_dir"
 install -m 600 "$root/.env.production" "$transaction_dir/env.before"
+sync_file "$transaction_dir/env.before" env_before_file_sync
 printf '%s\n' "$pre_config_sha256" >"$transaction_dir/pre-config.sha256"
 chmod 600 "$transaction_dir/pre-config.sha256"
+sync_file "$transaction_dir/pre-config.sha256" pre_config_file_sync
 if [ -e "$active_compose" ]; then
   [ -s "$active_compose" ] || fail_result precheck_failed 20
   install -m 600 "$active_compose" "$transaction_dir/active-compose.before"
+  sync_file "$transaction_dir/active-compose.before" active_compose_before_file_sync
   printf 'present\n' >"$transaction_dir/had-active-compose"
   chmod 600 "$transaction_dir/had-active-compose"
+  sync_file "$transaction_dir/had-active-compose" had_active_compose_file_sync
 else
   printf 'absent\n' >"$transaction_dir/no-active-compose"
   chmod 600 "$transaction_dir/no-active-compose"
+  sync_file "$transaction_dir/no-active-compose" no_active_compose_file_sync
 fi
 if [ -e "$active_runtime" ]; then
   [ -s "$active_runtime" ] || fail_result precheck_failed 20
   install -m 600 "$active_runtime" "$transaction_dir/active-runtime.before"
+  sync_file "$transaction_dir/active-runtime.before" active_runtime_before_file_sync
   printf 'present\n' >"$transaction_dir/had-active-runtime"
   chmod 600 "$transaction_dir/had-active-runtime"
+  sync_file "$transaction_dir/had-active-runtime" had_active_runtime_file_sync
 else
   printf 'absent\n' >"$transaction_dir/no-active-runtime"
   chmod 600 "$transaction_dir/no-active-runtime"
+  sync_file "$transaction_dir/no-active-runtime" no_active_runtime_file_sync
 fi
 
 if [ "$mode" = apply ]; then
@@ -946,9 +1010,13 @@ if [ "$mode" = apply ]; then
       "$candidate_env"
   done
   chmod 600 "$candidate_env"
+  sync_file "$candidate_env" candidate_env_file_sync
 else
-  candidate_env=$selected_env
+  candidate_env=$transaction_dir/candidate.env
+  atomic_copy "$selected_env" "$candidate_env" 600 candidate_env
 fi
+sync_directory "$transaction_dir" snapshot_directory
+sync_directory "$transactions" transaction_directory
 
 journal=()
 journal[version]=1
@@ -983,8 +1051,6 @@ else
 fi
 
 if [ "$mode" = rollback_last ]; then
-  # The EXIT path reloads this durable record, so a signal at any publication
-  # boundary cannot downgrade a record whose atomic replacement is visible.
   write_journal CANDIDATE_INSTALL_PENDING true '' '' ''
   atomic_copy "$candidate_env" "$root/.env.production" 600 live_config
 else
