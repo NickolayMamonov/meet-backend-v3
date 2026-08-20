@@ -269,11 +269,16 @@ runtime_non_email_material() {
 runtime_active_file_records() {
   local production_state_dir=${PRODUCTION_STATE_DIR:-/var/lib/meet-production}
   if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
-    [ -f "$production_state_dir/active-compose.yml" ] &&
+    # Recovery runs this check in a command substitution.  Return explicitly
+    # so the preceding test-list status cannot be mistaken for a failed
+    # runtime fingerprint after the captured files are restored.
+    if [ -f "$production_state_dir/active-compose.yml" ] &&
       [ ! -L "$production_state_dir/active-compose.yml" ] &&
       [ -f "$production_state_dir/active-runtime.override.yml" ] &&
-      [ ! -L "$production_state_dir/active-runtime.override.yml" ]
-    return
+      [ ! -L "$production_state_dir/active-runtime.override.yml" ]; then
+      return 0
+    fi
+    return 1
   fi
   runtime_file_record "$production_state_dir/active-compose.yml" >/dev/null ||
     return 1

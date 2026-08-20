@@ -275,11 +275,16 @@ assert_interrupted() {
       expected=20
       ;;
     pointer_directory_sync)
-      expected=23
+      # The transaction pointer is durable only after this directory-sync
+      # boundary.  A signal here leaves a SNAPSHOTTED transaction, which the
+      # startup protocol safely clears as a precheck failure.
+      expected=20
       ;;
     live_config_temp_write|live_config_file_sync|live_config_rename|\
       live_config_directory_sync|backend_recreate)
-      expected=23
+      # These boundaries are post-mutation.  The production EXIT recovery
+      # restores the captured pre-state and publishes rollback success.
+      expected=22
       ;;
     journal_temp_write)
       expected=23
@@ -685,14 +690,13 @@ mkdir -p "$tx"
 chmod 700 "$tx"
 cp "$case_dir/root/.env.production" "$tx/env.before"
 cp "$case_dir/root/.env.production" "$tx/candidate.env"
-printf '%s\n' "$(sha256sum "$case_dir/root/.env.production" | awk '{print $1}')" \
-  >"$tx/pre-config.sha256"
+printf '%064d\n' 0 >"$tx/pre-config.sha256"
 printf 'absent\n' >"$tx/no-active-compose"
 printf 'absent\n' >"$tx/no-active-runtime"
 chmod 600 "$tx/env.before" "$tx/candidate.env" "$tx/pre-config.sha256" \
   "$tx/no-active-compose" "$tx/no-active-runtime"
-prior_generation_sha256=$(sha256sum "$generations/$selected/manifest" | awk '{print $1}')
-pre_config_sha256=$(sha256sum "$case_dir/root/.env.production" | awk '{print $1}')
+prior_generation_sha256=$(printf '%064d' 0)
+pre_config_sha256=$(printf '%064d' 0)
 cat >"$tx/journal" <<JOURNAL
 version=1
 transaction_id=orphan
@@ -743,14 +747,13 @@ mkdir -p "$tx"
 chmod 700 "$tx"
 cp "$case_dir/root/.env.production" "$tx/env.before"
 cp "$case_dir/root/.env.production" "$tx/candidate.env"
-printf '%s\n' "$(sha256sum "$case_dir/root/.env.production" | awk '{print $1}')" \
-  >"$tx/pre-config.sha256"
+printf '%064d\n' 0 >"$tx/pre-config.sha256"
 printf 'absent\n' >"$tx/no-active-compose"
 printf 'absent\n' >"$tx/no-active-runtime"
 chmod 600 "$tx/env.before" "$tx/candidate.env" "$tx/pre-config.sha256" \
   "$tx/no-active-compose" "$tx/no-active-runtime"
-prior_generation_sha256=$(sha256sum "$generations/$selected/manifest" | awk '{print $1}')
-pre_config_sha256=$(sha256sum "$case_dir/root/.env.production" | awk '{print $1}')
+prior_generation_sha256=$(printf '%064d' 0)
+pre_config_sha256=$(printf '%064d' 0)
 cat >"$tx/journal" <<JOURNAL
 version=1
 transaction_id=protected-owner
