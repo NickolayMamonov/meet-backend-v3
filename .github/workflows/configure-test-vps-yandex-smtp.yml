@@ -1,0 +1,339 @@
+name: Configure Yandex SMTP on test VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Apply protected Yandex SMTP settings or idempotently restore the selected last-good generation
+        required: true
+        default: apply
+        type: choice
+        options:
+          - apply
+          - rollback_last
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: test-vps-deploy-${{ github.repository }}
+      cancel-in-progress: false
+    environment:
+      name: test-vps
+    env:
+      MODE: ${{ inputs.mode }}
+      HOST: ${{ vars.TEST_VPS_HOST }}
+      PORT: ${{ vars.TEST_VPS_PORT }}
+      SSH_USER: ${{ vars.TEST_VPS_USER }}
+      PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}
+      HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
+
+    steps:
+      - name: Protected SMTP preflight
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+          SMTP_FROM: ${{ secrets.TEST_VPS_SMTP_FROM }}
+          SMTP_FROM_NAME: ${{ secrets.TEST_VPS_SMTP_FROM_NAME }}
+          SMTP_USERNAME: ${{ secrets.TEST_VPS_SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.TEST_VPS_SMTP_PASSWORD }}
+          OTP_CONNECT_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_CONNECT_TIMEOUT_MS }}
+          OTP_READ_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_READ_TIMEOUT_MS }}
+          OTP_WRITE_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_WRITE_TIMEOUT_MS }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in apply|rollback_last) ;; *) exit 1 ;; esac
+          [[ "$HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]
+          [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]]
+          [[ "$PATH_ON_HOST" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+            [[ "$PATH_ON_HOST" != *..* ]]
+          [[ "$HOST_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]+$ ]]
+          grep -Eq '^-----BEGIN (OPENSSH|RSA) PRIVATE KEY-----$' \
+            <<<"$SSH_PRIVATE_KEY"
+          if [ "$MODE" = apply ]; then
+            [ -n "$SMTP_FROM" ] && [ -n "$SMTP_FROM_NAME" ]
+            [ -n "$SMTP_USERNAME" ] && [ -n "$SMTP_PASSWORD" ]
+            for value in "$SMTP_FROM" "$SMTP_FROM_NAME" "$SMTP_USERNAME" "$SMTP_PASSWORD"; do
+              [[ "$value" != *[[:cntrl:]]* ]]
+              case "$value" in
+                *'#'*|*'$'*|*'`'*|*'\'*|*'"'*|*"'"*|*'='*|*';'*|*'|'*|*'&'*|\
+                  *'<'*|*'>'*|*'{'*|*'}'*|*'('*|*')'*|*'['*|*']'*)
+                  exit 1
+                  ;;
+              esac
+            done
+            [[ "$OTP_CONNECT_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]]
+            [[ "$OTP_READ_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]]
+            [[ "$OTP_WRITE_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]]
+            [ "$OTP_CONNECT_TIMEOUT_MS" -ge 1000 ] &&
+              [ "$OTP_CONNECT_TIMEOUT_MS" -le 30000 ]
+            [ "$OTP_READ_TIMEOUT_MS" -ge 1000 ] &&
+              [ "$OTP_READ_TIMEOUT_MS" -le 30000 ]
+            [ "$OTP_WRITE_TIMEOUT_MS" -ge 1000 ] &&
+              [ "$OTP_WRITE_TIMEOUT_MS" -le 30000 ]
+          fi
+          echo "smtp_preflight=approved"
+
+      - name: Checkout reviewed deployment tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Establish strict SSH host trust
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/test-vps-key"
+          known_hosts="$RUNNER_TEMP/test-vps-known-hosts"
+          ssh_config="$RUNNER_TEMP/test-vps-ssh-config"
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key_file"
+          chmod 600 "$key_file"
+          ssh-keygen -y -P '' -f "$key_file" >/dev/null
+          : >"$known_hosts"
+          matched=0
+          while IFS= read -r key_line; do
+            fingerprint=$(printf '%s\n' "$key_line" |
+              ssh-keygen -lf - -E sha256 | awk '{print $2}')
+            if [ "$fingerprint" = "$HOST_FINGERPRINT" ]; then
+              printf '%s\n' "$key_line" >>"$known_hosts"
+              matched=$((matched + 1))
+            fi
+          done < <(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null)
+          [ "$matched" -eq 1 ]
+          {
+            echo 'Host test-vps'
+            echo "  HostName $HOST"
+            echo "  Port $PORT"
+            echo "  User $SSH_USER"
+            echo "  IdentityFile $key_file"
+            echo "  UserKnownHostsFile $known_hosts"
+            echo '  BatchMode yes'
+            echo '  IdentitiesOnly yes'
+            echo '  StrictHostKeyChecking yes'
+            echo '  ConnectTimeout 10'
+            echo '  ConnectionAttempts 1'
+          } >"$ssh_config"
+          chmod 600 "$ssh_config"
+          echo "SSH_CONFIG=$ssh_config" >>"$GITHUB_ENV"
+
+      - name: Stage checksum-bound SMTP tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/yandex-smtp-tooling"
+          archive="$RUNNER_TEMP/yandex-smtp-tooling.tar"
+          remote="$PATH_ON_HOST/.test-vps-smtp-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cleanup_stage_on_failure() {
+            status=$?
+            if [ "$status" -ne 0 ] && [ -n "${SSH_CONFIG:-}" ]; then
+              ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote" <<'REMOTE' || true
+          set -euo pipefail
+          stage=$1
+          [ -d "$stage" ] && [ ! -L "$stage" ] || exit 0
+          find "$stage" -xdev -type f -delete
+          find "$stage" -xdev -depth -type d -empty -delete
+          REMOTE
+            fi
+            exit "$status"
+          }
+          trap cleanup_stage_on_failure EXIT
+          mkdir -p "$stage/scripts"
+          files=(
+            docker-compose.production.yml
+            scripts/production-compose.sh
+            scripts/production-config-digest.sh
+            scripts/test-vps-runtime-invariants.sh
+            scripts/configure-test-vps-yandex-smtp.sh
+          )
+          for file in "${files[@]}"; do
+            mkdir -p "$stage/$(dirname "$file")"
+            cp -- "$file" "$stage/$file"
+          done
+          chmod 755 "$stage"/scripts/*.sh
+          (cd "$stage" && sha256sum "${files[@]}" >SHA256SUMS)
+          tar -C "$stage" -cf "$archive" "${files[@]}" SHA256SUMS
+          ssh -F "$SSH_CONFIG" test-vps bash -s -- "$PATH_ON_HOST" "$remote" <<'REMOTE'
+          set -euo pipefail
+          root=$1
+          stage=$2
+          [ -d "$root" ] && [ -s "$root/.env.production" ]
+          [ ! -e "$stage" ]
+          install -d -m 700 "$stage"
+          REMOTE
+          scp -F "$SSH_CONFIG" "$archive" "test-vps:$remote/tooling.tar"
+          ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote" <<'REMOTE'
+          set -euo pipefail
+          stage=$1
+          tar -xf "$stage/tooling.tar" -C "$stage"
+          (cd "$stage" && sha256sum -c SHA256SUMS)
+          chmod 755 "$stage"/scripts/*.sh
+          REMOTE
+          echo "REMOTE_TOOLING=$remote" >>"$GITHUB_ENV"
+          trap - EXIT
+
+      - name: Build protected NUL-delimited SMTP payload
+        if: inputs.mode == 'apply'
+        shell: bash
+        env:
+          SMTP_FROM: ${{ secrets.TEST_VPS_SMTP_FROM }}
+          SMTP_FROM_NAME: ${{ secrets.TEST_VPS_SMTP_FROM_NAME }}
+          SMTP_USERNAME: ${{ secrets.TEST_VPS_SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.TEST_VPS_SMTP_PASSWORD }}
+          OTP_CONNECT_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_CONNECT_TIMEOUT_MS }}
+          OTP_READ_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_READ_TIMEOUT_MS }}
+          OTP_WRITE_TIMEOUT_MS: ${{ secrets.TEST_VPS_SMTP_WRITE_TIMEOUT_MS }}
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/yandex-smtp-payload"
+          cleanup_payload_on_failure() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              rm -f -- "$payload"
+            fi
+            exit "$status"
+          }
+          trap cleanup_payload_on_failure EXIT
+          umask 077
+          : >"$payload"
+          printf 'APP_EMAIL_PROVIDER=smtp\0' >>"$payload"
+          printf 'APP_EMAIL_FROM=%s\0' "$SMTP_FROM" >>"$payload"
+          printf 'APP_EMAIL_FROM_NAME=%s\0' "$SMTP_FROM_NAME" >>"$payload"
+          printf 'SPRING_MAIL_HOST=smtp.yandex.ru\0' >>"$payload"
+          printf 'SPRING_MAIL_PORT=587\0' >>"$payload"
+          printf 'SPRING_MAIL_USERNAME=%s\0' "$SMTP_USERNAME" >>"$payload"
+          printf 'SPRING_MAIL_PASSWORD=%s\0' "$SMTP_PASSWORD" >>"$payload"
+          printf 'APP_EMAIL_CONNECT_TIMEOUT_MS=%s\0' "$OTP_CONNECT_TIMEOUT_MS" >>"$payload"
+          printf 'APP_EMAIL_READ_TIMEOUT_MS=%s\0' "$OTP_READ_TIMEOUT_MS" >>"$payload"
+          printf 'APP_EMAIL_WRITE_TIMEOUT_MS=%s\0' "$OTP_WRITE_TIMEOUT_MS" >>"$payload"
+          chmod 600 "$payload"
+          scp -F "$SSH_CONFIG" "$payload" \
+            "test-vps:$REMOTE_TOOLING/smtp-payload"
+          trap - EXIT
+
+      - name: Run SMTP transaction
+        id: transaction
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/smtp-result"
+          umask 077
+          : >"$output"
+          chmod 600 "$output"
+          set +e
+          if [ "$MODE" = apply ]; then
+            ssh -F "$SSH_CONFIG" test-vps \
+              "$REMOTE_TOOLING/scripts/configure-test-vps-yandex-smtp.sh" \
+              --root "$PATH_ON_HOST" \
+              --base-compose "$REMOTE_TOOLING/docker-compose.production.yml" \
+              --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              --mode apply \
+              --payload-file "$REMOTE_TOOLING/smtp-payload" >"$output" 2>/dev/null
+          else
+            ssh -F "$SSH_CONFIG" test-vps \
+              "$REMOTE_TOOLING/scripts/configure-test-vps-yandex-smtp.sh" \
+              --root "$PATH_ON_HOST" \
+              --base-compose "$REMOTE_TOOLING/docker-compose.production.yml" \
+              --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              --mode rollback_last \
+              --payload-file "$REMOTE_TOOLING/smtp-payload" >"$output" 2>/dev/null
+          fi
+          ssh_status=$?
+          set -e
+          result=deploy_failed_rollback_failed
+          protocol_valid=false
+          result_line=
+          if [ "$(grep -c '^' "$output" || true)" -eq 1 ]; then
+            result_line=$(<"$output")
+          fi
+          if [ -n "$result_line" ] &&
+            grep -Eq '^MEE_SMTP_RESULT=(deploy_succeeded|precheck_failed|lock_busy|deploy_failed_rollback_succeeded|deploy_failed_rollback_failed)$' "$output"; then
+            result=${result_line#MEE_SMTP_RESULT=}
+            case "$result:$ssh_status" in
+              deploy_succeeded:0|precheck_failed:20|lock_busy:21|\
+                deploy_failed_rollback_succeeded:22|deploy_failed_rollback_failed:23)
+                protocol_valid=true
+                ;;
+            esac
+          fi
+          {
+            echo "SMTP_RESULT=$result"
+            echo "SMTP_SSH_STATUS=$ssh_status"
+            echo "SMTP_PROTOCOL_VALID=$protocol_valid"
+          } >>"$GITHUB_ENV"
+          [ "$protocol_valid" = true ]
+
+      - name: Safe SMTP summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          result=${SMTP_RESULT:-protocol_invalid}
+          status=${SMTP_SSH_STATUS:-unknown}
+          protocol_valid=${SMTP_PROTOCOL_VALID:-false}
+          {
+            echo "## Yandex SMTP transaction"
+            echo
+            echo "- Result category: \`$result\`"
+            echo "- SSH status: \`$status\`"
+            echo "- Protocol valid: \`$protocol_valid\`"
+            if [ "$result" = deploy_succeeded ] && [ "$status" = 0 ]; then
+              echo "- Protocol: valid terminal success"
+            else
+              echo "- Protocol: invalid; inspect the remote pointer, exact safe fingerprints, and selected generation before retrying"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Secret-free public HTTPS probes
+        if: always()
+        shell: bash
+        env:
+          PUBLIC_API_URL: https://api.whysoezzy.online
+        run: |
+          set -euo pipefail
+          status=$(curl --silent --show-error --output "$RUNNER_TEMP/smtp-public-meetings.json" \
+            --write-out '%{http_code}' --connect-timeout 10 --max-time 30 \
+            "$PUBLIC_API_URL/meetings")
+          [ "$status" = 200 ]
+          jq -e 'type == "array"' "$RUNNER_TEMP/smtp-public-meetings.json" >/dev/null
+          actuator=$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' --connect-timeout 10 --max-time 30 \
+            "$PUBLIC_API_URL/actuator")
+          [ "$actuator" = 404 ]
+          echo "public_https_probe=meetings:$status actuator:$actuator" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup SMTP transport
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/yandex-smtp-payload" "$RUNNER_TEMP/smtp-result" \
+            "$RUNNER_TEMP/smtp-public-meetings.json"
+          remote="${PATH_ON_HOST}/.test-vps-smtp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [ -n "${SSH_CONFIG:-}" ]; then
+            ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote" <<'REMOTE' || true
+          set -euo pipefail
+          stage=$1
+          [ -d "$stage" ] && [ ! -L "$stage" ] || exit 0
+          find "$stage" -xdev -type f -delete
+          find "$stage" -xdev -depth -type d -empty -delete
+          REMOTE
+          fi
+
+      - name: Enforce transaction result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${SMTP_PROTOCOL_VALID:-false}" = true ]
+          [ "${SMTP_RESULT:-}" = deploy_succeeded ]
+          [ "${SMTP_SSH_STATUS:-}" = 0 ]
