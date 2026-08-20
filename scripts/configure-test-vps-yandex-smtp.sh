@@ -454,6 +454,7 @@ delete_unselected_candidate_generation() {
   fi
   [[ "$generation" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
   [ "$generation" != "$selected" ] || return 0
+  [ "$generation" = "${journal[transaction_id]}" ] || return 1
   if [ "${journal[prior_selector]}" = present ] &&
     [ "$generation" = "${journal[prior_selector_value]}" ]; then
     return 0
@@ -461,6 +462,7 @@ delete_unselected_candidate_generation() {
   [ -e "$generations/$generation" ] || return 0
   [ -d "$generations/$generation" ] && [ ! -L "$generations/$generation" ] ||
     return 1
+  validate_generation "$generation" || return 1
   find "$generations/$generation" -xdev -type f -delete
   find "$generations/$generation" -xdev -type l -delete
   find "$generations/$generation" -xdev -depth -mindepth 1 \
@@ -468,6 +470,16 @@ delete_unselected_candidate_generation() {
   rmdir -- "$generations/$generation" 2>/dev/null || true
   [ ! -e "$generations/$generation" ] || return 1
   sync_directory "$generations" generation_delete
+}
+
+validate_pointer_sidecars() {
+  local sidecar
+  for sidecar in \
+    "$pointer.tmp" "$pointer.tmp."* \
+    "$pointer.clear" "$pointer.clear.tmp" "$pointer.clear.tmp."*; do
+    [ -e "$sidecar" ] || [ -L "$sidecar" ] || continue
+    return 1
+  done
 }
 
 validate_transaction_material() {
@@ -802,6 +814,8 @@ reconcile_orphans_without_pointer() {
   return 0
 }
 
+validate_pointer_sidecars ||
+  fail_result deploy_failed_rollback_failed 23
 reconcile_current
 if ! { [ -e "$pointer" ] || [ -L "$pointer" ]; }; then
   reconcile_orphans_without_pointer ||

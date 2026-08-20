@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TOOL=$ROOT_DIR/scripts/configure-test-vps-yandex-smtp.sh
-TIMEOUT=$(command -v timeout)
 TIMEOUT_SECONDS=${FAKE_REMOTE_CASE_TIMEOUT_SECONDS:-180}
+TIMEOUT=$(command -v timeout)
 WAIT_SECONDS=${FAKE_REMOTE_WAIT_SECONDS:-240}
 TMP=$(mktemp -d)
 active_pids=()
@@ -185,16 +185,22 @@ run_tool() {
   local signal=${3:-TERM}
   local fail_at=${4:-}
   local mode=${5:-apply}
+  local interruption_mode=${6:-signal}
+  local interrupt_boundary=$boundary
   local output=$case_dir/output
   local error=$case_dir/error
   local status
+  if [ "$interruption_mode" = failure ]; then
+    interrupt_boundary=
+    [ -n "$fail_at" ] || fail_at=$boundary
+  fi
   if env \
     PATH="$case_dir/bin:$PATH" \
     TEST_VPS_STATE_ROOT="$case_dir/state" \
     PRODUCTION_STATE_DIR="$case_dir/production" \
     MEE_SMTP_FAKE_LOCK_FILE="$case_dir/lock-busy" \
     MEE_SMTP_FAKE_REMOTE=true \
-    MEE_SMTP_INTERRUPT_BOUNDARY="$boundary" \
+    MEE_SMTP_INTERRUPT_BOUNDARY="$interrupt_boundary" \
     MEE_SMTP_INTERRUPT_SIGNAL="$signal" \
     MEE_SMTP_FAIL_AT="$fail_at" \
     MEE_SMTP_FAKE_COMPOSE_LOG="$case_dir/compose.log" \
@@ -239,7 +245,24 @@ assert_interrupted() {
   local case_dir=$1
   local boundary=$2
   local status
-  status=$(run_tool "$case_dir" "$boundary" TERM)
+  case "$boundary" in
+    env_before_file_sync|pre_config_file_sync|active_compose_before_file_sync|\
+      had_active_compose_file_sync|no_active_compose_file_sync|\
+      active_runtime_before_file_sync|had_active_runtime_file_sync|\
+      no_active_runtime_file_sync|candidate_env_file_sync|snapshot_directory|\
+      transaction_directory|journal_file_sync|journal_rename|\
+      journal_directory_sync|pointer_temp_write|pointer_file_sync|\
+      pointer_rename|generation_env_temp_write|generation_env_file_sync|\
+      generation_env_rename|generation_directory_sync)
+      # MSYS can defer a self-TERM while a file-sync helper is active.  Use
+      # the same named boundary through the deterministic failure hook; the
+      # explicit SIGKILL case below still exercises fresh-process recovery.
+      status=$(run_tool "$case_dir" "$boundary" TERM '' apply failure)
+      ;;
+    *)
+      status=$(run_tool "$case_dir" "$boundary" TERM)
+      ;;
+  esac
   case "$boundary" in
     env_before_file_sync|pre_config_file_sync|active_compose_before_file_sync|\
       had_active_compose_file_sync|no_active_compose_file_sync|\
@@ -582,6 +605,23 @@ status=$(run_tool "$case_dir")
 [ "$status" -eq 23 ] || exit 1
 assert_result_line "$case_dir" deploy_failed_rollback_failed
 
+for sidecar in \
+  .smtp-transaction.current.tmp \
+  .smtp-transaction.current.tmp.unknown \
+  .smtp-transaction.current.clear \
+  .smtp-transaction.current.clear.tmp \
+  .smtp-transaction.current.clear.tmp.unknown; do
+  case_dir=$TMP/malformed-pointer-sidecar-"${sidecar##*.smtp-transaction.current.}"
+  mkdir -p "$case_dir"
+  make_fixture "$case_dir"
+  : >"$case_dir/state/$sidecar"
+  chmod 600 "$case_dir/state/$sidecar"
+  status=$(run_tool "$case_dir")
+  [ "$status" -eq 23 ] || exit 1
+  assert_result_line "$case_dir" deploy_failed_rollback_failed
+  [ -e "$case_dir/state/$sidecar" ] || exit 1
+done
+
 case_dir=$TMP/active-compose-rollback
 mkdir -p "$case_dir"
 make_fixture "$case_dir"
@@ -633,7 +673,7 @@ make_fixture "$case_dir"
 assert_success "$case_dir"
 selected=$(<"$case_dir/state/.smtp-last-good.current")
 generations=$case_dir/state/.smtp-last-good-generations
-orphan_generation=orphan-candidate
+orphan_generation=orphan
 cp -a "$generations/$selected" "$generations/$orphan_generation"
 sed -i "s/^generation=.*/generation=$orphan_generation/" \
   "$generations/$orphan_generation/manifest"
@@ -687,6 +727,53 @@ assert_result_line "$case_dir" deploy_succeeded || {
   echo "orphan generation was not removed" >&2
   exit 1
 }
+
+case_dir=$TMP/protected-generation
+mkdir -p "$case_dir"
+make_fixture "$case_dir"
+assert_success "$case_dir"
+selected=$(<"$case_dir/state/.smtp-last-good.current")
+generations=$case_dir/state/.smtp-last-good-generations
+protected_generation=protected-evidence
+cp -a "$generations/$selected" "$generations/$protected_generation"
+printf '%s\n' 'protected evidence' >"$generations/$protected_generation/protected.txt"
+chmod 600 "$generations/$protected_generation/protected.txt"
+tx=$case_dir/state/.smtp-transactions/protected-owner
+mkdir -p "$tx"
+chmod 700 "$tx"
+cp "$case_dir/root/.env.production" "$tx/env.before"
+cp "$case_dir/root/.env.production" "$tx/candidate.env"
+printf '%s\n' "$(sha256sum "$case_dir/root/.env.production" | awk '{print $1}')" \
+  >"$tx/pre-config.sha256"
+printf 'absent\n' >"$tx/no-active-compose"
+printf 'absent\n' >"$tx/no-active-runtime"
+chmod 600 "$tx/env.before" "$tx/candidate.env" "$tx/pre-config.sha256" \
+  "$tx/no-active-compose" "$tx/no-active-runtime"
+prior_generation_sha256=$(sha256sum "$generations/$selected/manifest" | awk '{print $1}')
+pre_config_sha256=$(sha256sum "$case_dir/root/.env.production" | awk '{print $1}')
+cat >"$tx/journal" <<JOURNAL
+version=1
+transaction_id=protected-owner
+phase=RECOVERED
+critical=false
+pre_config_sha256=$pre_config_sha256
+pre_runtime_fingerprint=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+prior_selector=present
+prior_selector_value=$selected
+prior_generation_sha256=$prior_generation_sha256
+candidate_generation=$protected_generation
+candidate_runtime_fingerprint=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+terminal_category=deploy_failed_rollback_succeeded
+terminal_status=22
+terminal_fingerprint=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+JOURNAL
+chmod 600 "$tx/journal"
+write_payload "$case_dir/payload"
+status=$(run_tool "$case_dir")
+[ "$status" -eq 23 ] || exit 1
+assert_result_line "$case_dir" deploy_failed_rollback_failed
+[ -e "$generations/$protected_generation/protected.txt" ] || exit 1
+[ -d "$tx" ] || exit 1
 
 assert_no_task_processes
 echo "fake remote configure transaction matrix passed"
