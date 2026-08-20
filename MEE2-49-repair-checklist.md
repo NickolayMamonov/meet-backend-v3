@@ -9,6 +9,7 @@
 - [x] Include normalized runtime ports/networks in fingerprints and re-run terminal runtime invariants.
 - [x] Validate journal temporary records and emit protocol results for terminal recovery-publication failures.
 - [x] Expand bounded fake-remote interruption and injected-failure coverage without duplicate pre-pointer deployments; reap every parallel child and timeout/configure descendant before reporting a matrix result, assert zero survivors after each batch, and distinguish pre-rename rollback from post-rename terminal success.
-- [x] Run shell, fake-remote, deploy, Gradle/build, PostgreSQL/YAML/static checks available locally.
+- [x] Reconcile the fake-remote interruption oracle with production for journal_temp_write and live_config_temp_write pre-install failures.
+- [ ] Re-run shell, fake-remote, deploy, Gradle/build, PostgreSQL/YAML/static checks after this rework.
 - [ ] Capture hosted CI, CODEOWNER/protected-environment, live apply, mailbox canary, and rollback evidence or record blockers.
 - [ ] Commit, push, comment the implementation result, and complete MEE2-49 with exact evidence.

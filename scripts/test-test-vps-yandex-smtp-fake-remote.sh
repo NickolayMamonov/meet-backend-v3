@@ -280,14 +280,21 @@ assert_interrupted() {
       # startup protocol safely clears as a precheck failure.
       expected=20
       ;;
-    live_config_temp_write|live_config_file_sync|live_config_rename|\
+    live_config_file_sync|live_config_rename|\
       live_config_directory_sync|backend_recreate)
       # These boundaries are post-mutation.  The production EXIT recovery
       # restores the captured pre-state and publishes rollback success.
       expected=22
       ;;
     journal_temp_write)
-      expected=23
+      # A journal temporary write is before the durable transaction journal
+      # exists.  Production removes the unpublished transaction and reports
+      # this as a precheck failure.
+      expected=20
+      ;;
+    live_config_temp_write)
+      # Production reports this pre-install boundary as a precheck failure.
+      expected=20
       ;;
     committed_temp_write)
       expected=23
