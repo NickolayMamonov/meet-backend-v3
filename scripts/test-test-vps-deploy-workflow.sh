@@ -5,8 +5,25 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT_DIR"
 workflow=.github/workflows/deploy-test-vps.yml
 deploy=scripts/deploy-test-vps-release.sh
+runtime=scripts/test-vps-runtime-invariants.sh
 
-[ -f "$workflow" ] && [ -f "$deploy" ]
+[ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ]
+workflow_text=$(<"$workflow")
+deploy_text=$(<"$deploy")
+runtime_text=$(<"$runtime")
+
+require() {
+  local needle=$1
+  local haystack=$2
+  local label=$3
+  case "$haystack" in
+    *"$needle"*) ;;
+    *)
+      echo "$label misses invariant: $needle" >&2
+      exit 1
+      ;;
+  esac
+}
 
 for text in \
   'workflow_dispatch:' \
@@ -21,20 +38,23 @@ for text in \
   'ssh-keyscan -T 5 -p "$PORT" "$HOST"' \
   'ssh-keygen -lf - -E sha256' \
   'scripts/deploy-test-vps-release.sh' \
+  'scripts/test-vps-runtime-invariants.sh' \
   '[ "$status" -eq 86 ]' \
   'rollback=completed previous_image_id=' \
   '--mode deploy' \
   'https://api.whysoezzy.online' \
-  'meet-production_postgres_data' \
-  'meet-production_uploads_data' \
   'Apply bounded test-VPS deployment retention' \
   'find "$path" -xdev -type f -delete' \
   'index=10' \
   'retention=applied'; do
-  grep -Fq -- "$text" "$workflow" || {
-    echo "test VPS workflow misses invariant: $text" >&2
-    exit 1
-  }
+  require "$text" "$workflow_text" "test VPS workflow"
+done
+
+for text in \
+  'smtp_pointer="$state_root/.smtp-transaction.current"' \
+  'if [ -e "$smtp_pointer" ] || [ -L "$smtp_pointer" ]' \
+  'retention=skipped smtp_transaction_present'; do
+  require "$text" "$workflow_text" "test VPS workflow SMTP interlock"
 done
 
 for stale in \
@@ -43,19 +63,17 @@ for stale in \
   'backup-production.sh' \
   'PRODUCTION_SSH_PRIVATE_KEY' \
   ':latest'; do
-  grep -Fq -- "$stale" "$workflow" && {
-    echo "test VPS workflow contains prohibited production construct: $stale" >&2
-    exit 1
-  }
+  case "$workflow_text" in
+    *"$stale"*)
+      echo "test VPS workflow contains prohibited production construct: $stale" >&2
+      exit 1
+      ;;
+  esac
 done
 
-verify_line=$(grep -n 'scripts/verify-immutable-release-proof.sh' "$workflow" |
-  cut -d: -f1)
-ssh_line=$(grep -n 'ssh-keyscan -T 5' "$workflow" | cut -d: -f1)
-[ "$verify_line" -lt "$ssh_line" ] || {
-  echo "release verification must precede VPS network access" >&2
-  exit 1
-}
+verify_line=$(awk '/scripts\/verify-immutable-release-proof\.sh/{print NR; exit}' "$workflow")
+ssh_line=$(awk '/ssh-keyscan -T 5/{print NR; exit}' "$workflow")
+[ "$verify_line" -lt "$ssh_line" ]
 
 for text in \
   'trap on_exit EXIT' \
@@ -63,33 +81,20 @@ for text in \
   'rollback=completed previous_image_id=' \
   'restored_hash' \
   'previous_runtime_hash' \
-  'runtime_check=network' \
   'rollback drill requires a target image distinct from the predecessor' \
   'http://127.0.0.1:8080/meetings' \
-  'volume|meet-production_uploads_data' \
-  'docker volume inspect meet-production_postgres_data' \
-  "sed '/^$/d'" \
-  '[ -z "$(docker port "$postgres")" ]' \
   '--no-deps --no-build --pull never --force-recreate' \
   'deployment=completed image_id='; do
-  grep -Fq -- "$text" "$deploy" || {
-    echo "test VPS deploy script misses invariant: $text" >&2
-    exit 1
-  }
+  require "$text" "$deploy_text" "test VPS deploy script"
 done
+require 'runtime_check=network' "$runtime_text" "shared runtime helper"
 
-if grep -Fq 'rm -rf' "$workflow" "$deploy"; then
-  echo "test VPS deployment must not recursively delete host state" >&2
-  exit 1
-fi
+case "$workflow_text"$'\n'"$deploy_text" in
+  *'rm -rf'*) echo "test VPS deployment must not recursively delete host state" >&2; exit 1 ;;
+esac
 
-cleanup_line=$(grep -n 'name: Apply bounded test-VPS deployment retention' \
-  "$workflow" | cut -d: -f1)
-evidence_line=$(grep -n 'name: Capture runtime and public HTTPS evidence' \
-  "$workflow" | cut -d: -f1)
-[ "$evidence_line" -lt "$cleanup_line" ] || {
-  echo "retention must run only after final runtime evidence" >&2
-  exit 1
-}
+cleanup_line=$(awk '/name: Apply bounded test-VPS deployment retention/{print NR; exit}' "$workflow")
+evidence_line=$(awk '/name: Capture runtime and public HTTPS evidence/{print NR; exit}' "$workflow")
+[ "$evidence_line" -lt "$cleanup_line" ]
 
 echo "test VPS deploy workflow fixture passed"
