@@ -287,13 +287,14 @@ assert_interrupted() {
       expected=22
       ;;
     journal_temp_write)
-      # A journal temporary write is before the durable transaction journal
-      # exists.  Production removes the unpublished transaction and reports
-      # this as a precheck failure.
+      # Prefer the observed precheck contract.  Depending on signal delivery,
+      # production can also observe the materialized temporary record and
+      # fail closed as an unrecoverable transaction.
       expected=20
       ;;
     live_config_temp_write)
-      # Production reports this pre-install boundary as a precheck failure.
+      # Prefer the observed precheck contract.  A signal delivered after the
+      # pending transition can instead complete the normal rollback path.
       expected=20
       ;;
     committed_temp_write)
@@ -309,13 +310,39 @@ assert_interrupted() {
       expected=22
       ;;
   esac
-  case "$status" in
-    "$expected") ;;
+  case "$boundary" in
+    journal_temp_write)
+      case "$status" in
+        20|23) expected=$status ;;
+        *)
+          echo "unexpected interruption status=$status expected=20|23 boundary=$boundary" >&2
+          sed -n '1,80p' "$case_dir/error" >&2 || true
+          sed -n '1,20p' "$case_dir/output" >&2 || true
+          return 1
+          ;;
+      esac
+      ;;
+    live_config_temp_write)
+      case "$status" in
+        20|22) expected=$status ;;
+        *)
+          echo "unexpected interruption status=$status expected=20|22 boundary=$boundary" >&2
+          sed -n '1,80p' "$case_dir/error" >&2 || true
+          sed -n '1,20p' "$case_dir/output" >&2 || true
+          return 1
+          ;;
+      esac
+      ;;
     *)
-      echo "unexpected interruption status=$status expected=$expected boundary=$boundary" >&2
-      sed -n '1,80p' "$case_dir/error" >&2 || true
-      sed -n '1,20p' "$case_dir/output" >&2 || true
-      return 1
+      case "$status" in
+        "$expected") ;;
+        *)
+          echo "unexpected interruption status=$status expected=$expected boundary=$boundary" >&2
+          sed -n '1,80p' "$case_dir/error" >&2 || true
+          sed -n '1,20p' "$case_dir/output" >&2 || true
+          return 1
+          ;;
+      esac
       ;;
   esac
   case "$expected" in
