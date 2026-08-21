@@ -120,6 +120,7 @@ BOOTSTRAP_REAL_GIT=$(command -v git)
 export BOOTSTRAP_REAL_GIT
 export BOOTSTRAP_IMAGE_INSPECT=$IMAGE_FIXTURE
 export BOOTSTRAP_FIXTURE_JAR=$TMP/candidate.jar
+chmod +x "$ROOT/scripts/fixtures/bootstrap-default-proof/"*-shim.sh
 proof_production() {
   bash "$BUILD" --source-checkout "$CHECKOUT" --source-sha "$INTRO" \
     --image-ref fixture/image:offline --phase candidate --output "$1" \
