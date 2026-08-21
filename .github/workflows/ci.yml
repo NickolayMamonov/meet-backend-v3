@@ -212,6 +212,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-empty-release-continuation.sh"
           bash "$TOOLING_SCRIPTS/test-release-publish-tooling-routing.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
+          bash "$TOOLING_SCRIPTS/test-promote-dev-digest-workflow.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-workflow.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-deploy.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-fake-remote.sh"

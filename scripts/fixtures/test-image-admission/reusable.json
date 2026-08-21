@@ -1,0 +1,62 @@
+{
+  "bindings": [
+    {
+      "alias": "test-sha-0123456789abcdef0123456789abcdef01234567",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "root": {
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "labels": {
+          "org.opencontainers.image.source": "https://github.com/NickolayMamonov/meet-backend-v3",
+          "org.opencontainers.image.revision": "0123456789abcdef0123456789abcdef01234567",
+          "org.opencontainers.image.version": "1.2.3"
+        },
+        "manifests": [
+          {
+            "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "platform": {
+              "os": "linux",
+              "architecture": "amd64"
+            }
+          }
+        ]
+      },
+      "platform": {
+        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "labels": {
+          "org.opencontainers.image.source": "https://github.com/NickolayMamonov/meet-backend-v3",
+          "org.opencontainers.image.revision": "0123456789abcdef0123456789abcdef01234567",
+          "org.opencontainers.image.version": "1.2.3"
+        }
+      },
+      "referrers": [
+        {
+          "kind": "provenance",
+          "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "subject": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "artifactType": "application/vnd.in-toto+json",
+          "predicateType": "https://slsa.dev/provenance/v1"
+        },
+        {
+          "kind": "sbom",
+          "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "subject": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "artifactType": "application/spdx+json",
+          "predicateType": "https://spdx.dev/Document"
+        }
+      ],
+      "githubAttestations": [
+        {
+          "subject": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repository": "https://github.com/NickolayMamonov/meet-backend-v3",
+          "source": "0123456789abcdef0123456789abcdef01234567",
+          "revision": "0123456789abcdef0123456789abcdef01234567",
+          "version": "1.2.3",
+          "workflow": "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/build.yml@refs/heads/dev"
+        }
+      ]
+    }
+  ]
+}

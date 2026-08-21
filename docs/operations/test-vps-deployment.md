@@ -172,3 +172,32 @@ After controlled canary approval, request delivery to the protected mailbox,
 verify the existing auth response privately, rotate refresh credentials and
 reject the old one, then logout and reject the rotated credential. Record only
 safe success booleans and status categories.
+
+## Closed-beta promotion from `dev`
+
+The closed-beta promotion workflow is registered on `master` only so GitHub
+can discover it, but it must be dispatched explicitly with
+`gh workflow run promote-dev-digest-to-test-vps.yml --ref dev -f source_sha=<40-hex-dev-sha>`.
+The run proves that the event is `workflow_dispatch`, the ref is exactly
+`refs/heads/dev`, the run head SHA equals the input SHA, the detached checkout
+is clean, the current remote `origin/dev` and source tree match, and the
+master registration blob is byte-identical to the reviewed `dev` workflow.
+It also requires a successful exact-SHA CI run before any writer is reached.
+
+Only `test-sha-<source-sha>` is admissible. The read-only admission step
+requires the Linux/amd64 image identity, source/revision/version labels,
+provenance, SBOM, GitHub attestation, and complete referrer closure. Protected
+release, ref, asset, alias, digest, and subject state is captured first;
+candidate root/platform/evidence subjects are excluded from that closure
+before any copy or attestation writer is allowed to run.
+
+The remote deploy remains locked and exact-digest based. Candidate and
+predecessor bootstrap proofs are bound to the exact source tree, boot JAR
+properties, image digest, and image ID. A distinct-image rollback drill must
+return exit 86 and restore the exact predecessor before final deployment;
+same-image redeploys are explicit and cannot claim rollback proof. Closed-beta
+phase files use closed schemas, fixed paths, and mode/type/owner/size/hash
+validation. Every failed mutation or verifier selects sanitized incident
+evidence and leaves retention unauthorized. Retention is authorized only
+after final verification, required rollback policy, evidence sanitation, and
+artifact upload all succeed.

@@ -1,0 +1,14 @@
+{
+  "source": "0123456789abcdef0123456789abcdef01234567",
+  "version": "1.2.3",
+  "cases": {
+    "absent": {"expectedState": "absent", "expectedReason": "no-binding"},
+    "reusable": {"expectedState": "reusable", "expectedReason": "complete"},
+    "duplicate": {"expectedState": "rejected", "expectedReason": "duplicate-binding"},
+    "mismatch": {"expectedState": "rejected", "expectedReason": "partial-binding"},
+    "evidence-gap": {"expectedState": "rejected", "expectedReason": "referrer-closure"},
+    "partial": {"expectedState": "rejected", "expectedReason": "partial-binding"},
+    "protected-alias": {"expectedState": "rejected", "expectedReason": "protected-alias"},
+    "unknown-alias": {"expectedState": "rejected", "expectedReason": "unknown-alias"}
+  }
+}
