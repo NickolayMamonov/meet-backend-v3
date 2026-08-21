@@ -48,7 +48,7 @@ jobs:
       version: ${{ steps.authority.outputs.version }}
     steps:
       - name: Checkout exact detached dev source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
@@ -85,6 +85,16 @@ jobs:
           branches=$(gh api --paginate \
             "repos/$GITHUB_REPOSITORY/environments/closed-beta-promotion/deployment-branch-policies")
           jq -e 'any(.[]; .name == "dev" and .type == "branch")' <<<"$branches" >/dev/null
+          test_vps_environment=$(gh api "repos/$GITHUB_REPOSITORY/environments/test-vps")
+          jq -e '.name == "test-vps"' <<<"$test_vps_environment" >/dev/null
+          test_vps_policy=$(gh api \
+            "repos/$GITHUB_REPOSITORY/environments/test-vps/deployment-branch-policy")
+          jq -e '.custom_branch_policies == true and .protected_branches == false' \
+            <<<"$test_vps_policy" >/dev/null
+          test_vps_branches=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/environments/test-vps/deployment-branch-policies")
+          jq -e 'any(.[]; .name == "dev" and .type == "branch")' \
+            <<<"$test_vps_branches" >/dev/null
           [[ "$(git rev-parse refs/remotes/origin/dev)" == "$SOURCE_SHA" ]]
           [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
           ! git symbolic-ref -q HEAD
@@ -145,14 +155,12 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     outputs:
       root_digest: ${{ steps.publish.outputs.root_digest }}
       platform_digest: ${{ steps.publish.outputs.platform_digest }}
       admission_mode: ${{ steps.publish.outputs.admission_mode }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 1
@@ -236,6 +244,11 @@ jobs:
                 .digest] |
               if length == 1 then .[0] else error("OCI layout platform is not unique") end
             ' "$root_blob")
+            scripts/verify-dev-promotion-source.sh \
+              --repository "$GITHUB_WORKSPACE" \
+              --source-checkout "$GITHUB_WORKSPACE" \
+              --source-sha "$SOURCE_SHA" \
+              --output "$RUNNER_TEMP/dev-promotion-source-publish.json"
             oras cp --from-oci-layout "$layout" "$ref"
           fi
           bash scripts/admit-test-image.sh verify --source "$SOURCE_SHA" --version "$VERSION" --alias "$alias" --input-command scripts/read-test-image-state.sh
@@ -323,9 +336,11 @@ admission_mode=$mode
     outputs:
       target_image_id: ${{ steps.deploy.outputs.target_image_id }}
       previous_image_id: ${{ steps.deploy.outputs.previous_image_id }}
+      mutation_started: ${{ steps.deploy.outputs.mutation_started }}
+      rollback_attempted: ${{ steps.deploy.outputs.rollback_attempted }}
       rollback_verified: ${{ steps.deploy.outputs.rollback_verified }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 1
@@ -433,13 +448,18 @@ admission_mode=$mode
           REMOTE
           )
           echo "previous_image_id=$previous_id" >>"$GITHUB_OUTPUT"
+          mutation_started=false
+          rollback_attempted=false
           rollback_verified=false
-          echo "rollback_verified=$rollback_verified" >>"$GITHUB_OUTPUT"
+          printf 'mutation_started=false\nrollback_attempted=false\nrollback_verified=false\n' >>"$GITHUB_OUTPUT"
           if [ "$previous_id" = "$target_id" ] && [ "${{ inputs.allow_same_digest_redeploy }}" != true ]; then
             echo "same-image redeploy requires explicit allow_same_digest_redeploy=true" >&2
             exit 1
           fi
           if [ "$previous_id" != "$target_id" ]; then
+            mutation_started=true
+            rollback_attempted=true
+            printf 'mutation_started=true\nrollback_attempted=true\n' >>"$GITHUB_OUTPUT"
             set +e
             ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --mode rollback-drill --closed-beta-safety --public-url "$PUBLIC_URL" >"$RUNNER_TEMP/rollback.txt" 2>&1
             status=$?
@@ -449,6 +469,13 @@ admission_mode=$mode
             rollback_verified=true
             echo "rollback_verified=true" >>"$GITHUB_OUTPUT"
           fi
+          scripts/verify-dev-promotion-source.sh \
+            --repository "$GITHUB_WORKSPACE" \
+            --source-checkout "$GITHUB_WORKSPACE" \
+            --source-sha "$SOURCE_SHA" \
+            --output "$RUNNER_TEMP/dev-promotion-source-final-deploy.json"
+          mutation_started=true
+          echo "mutation_started=true" >>"$GITHUB_OUTPUT"
           ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final" --mode deploy --closed-beta-safety --public-url "$PUBLIC_URL"
           remote_state=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" <<'REMOTE'
@@ -497,7 +524,6 @@ admission_mode=$mode
           final_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-final.json" | awk '{print $1}')
           rollback_required=false
           [ "$previous_id" = "$target_id" ] || rollback_required=true
-          rollback_attempted=$rollback_required
           rollback_verified=${rollback_verified:-false}
           jq -n \
             --slurpfile predecessor "$RUNNER_TEMP/predecessor.json" \
@@ -555,7 +581,7 @@ admission_mode=$mode
                 probes:{
                   meetings200Json:true,actuator404:true,httpRedirectHttps:true,
                   adminMissing403:true,adminWrong403:true,
-                  adminAuthenticatedDisabled404:true,
+                  adminAuthenticatedDisabled404:$final[0].adminAuthenticatedDisabled404,
                   assets:{count:$final[0].assetsCount,verified:$final[0].assetsVerified}
                 },
                 runtime:{
@@ -608,13 +634,19 @@ admission_mode=$mode
           stage=authorization
           mutation=false
           rollback=false
+          rollback_verified=false
           if [ "${{ needs.authorize.result }}" = success ]; then stage=admission; fi
           if [ "${{ needs.admit-image.result }}" = success ]; then stage=predecessor; fi
-          if [ "${{ needs.deploy.result }}" != success ]; then mutation=true; fi
+          mutation='${{ needs.deploy.outputs.mutation_started }}'
+          rollback='${{ needs.deploy.outputs.rollback_attempted }}'
+          rollback_verified='${{ needs.deploy.outputs.rollback_verified }}'
+          [ "$mutation" = true ] || mutation=false
+          [ "$rollback" = true ] || rollback=false
+          [ "$rollback_verified" = true ] || rollback_verified=false
           scripts/build-test-promotion-evidence.sh incident \
             --stage "$stage" --failure-class internalFailure \
             --mutation-started "$mutation" \
-            --rollback-attempted "$rollback" --rollback-verified false \
+            --rollback-attempted "$rollback" --rollback-verified "$rollback_verified" \
             --output "$RUNNER_TEMP/promotion-incident.json"
       - name: Upload sanitized incident evidence
         if: always()

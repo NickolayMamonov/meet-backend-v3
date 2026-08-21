@@ -65,7 +65,7 @@ jq -cS --arg repository "$repository" '
       tag_name,
       target_commitish:(.target_commitish // ""),
       draft:(.draft // false),
-      immutable:(.immutable // true),
+      immutable:(if (.immutable | type) == "boolean" then .immutable else error("release immutable field is missing or not boolean") end),
       protected:(.protected // ((.draft // false) | not) and ((.prerelease // false) | not)),
       prerelease:(.prerelease // false),
       published_at,
