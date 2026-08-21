@@ -12,8 +12,8 @@ EOF
 }
 fail() { echo "closed-beta host-state verification failed: $*" >&2; exit 1; }
 
-phase= root= compose_script= state_dir= expected_image= expected_image_id=
-expected_revision= expected_version= expected_runtime_hash= output=
+phase='' root='' compose_script='' state_dir='' expected_image='' expected_image_id=''
+expected_revision='' expected_version='' expected_runtime_hash='' output=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --phase) [ "$#" -ge 2 ] || usage; phase=$2; shift 2 ;;

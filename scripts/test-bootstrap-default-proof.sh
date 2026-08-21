@@ -116,7 +116,8 @@ jq -cS . "$TMP/candidate.json" >"$TMP/canonical.json"
 cmp -- "$TMP/candidate.json" "$TMP/canonical.json"
 
 git -C "$CHECKOUT" checkout -q --detach "$INTRO"
-export BOOTSTRAP_REAL_GIT=$(command -v git)
+BOOTSTRAP_REAL_GIT=$(command -v git)
+export BOOTSTRAP_REAL_GIT
 export BOOTSTRAP_IMAGE_INSPECT=$IMAGE_FIXTURE
 export BOOTSTRAP_FIXTURE_JAR=$TMP/candidate.jar
 proof_production() {
