@@ -563,15 +563,11 @@ jq -e --arg root "$REAL_ROOT" --arg platform "$PLATFORM" \
     .artifactType == "application/vnd.in-toto+json"))
 ' "$TMP/read-real-shape.json" >/dev/null ||
   fail "reader did not preserve the real BuildKit layer bindings"
-set +e
-real_admission=$(
-  bash "$ADMIT" verify --source "$SOURCE" --version "$VERSION" \
-    --input "$TMP/read-real-shape.json" 2>"$TMP/read-real-admission.stderr"
-)
-real_admission_status=$?
-set -e
-[ "$real_admission_status" -eq 0 ] ||
+if ! bash "$ADMIT" verify --source "$SOURCE" --version "$VERSION" \
+  --input "$TMP/read-real-shape.json" \
+  >"$TMP/read-real-admission.json" 2>"$TMP/read-real-admission.stderr"; then
   fail "admission rejected the preserved BuildKit SBOM artifact type"
+fi
 
 run_read inspect-fail >"$TMP/read-absent.json"
 jq -e '.bindings == []' "$TMP/read-absent.json" >/dev/null ||

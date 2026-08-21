@@ -174,7 +174,7 @@ read_raw_manifest() {
 }
 
 collect_verified_attestations() {
-  local digest=$1 source_digest=$2 verified record bundle_sha
+  local digest=$1 source_digest=$2 record bundle_sha
   local verified_file="$tmp/github-${digest#sha256:}.json"
   if [ ! -f "$verified_file" ]; then
     gh attestation verify "oci://$image@$digest" \

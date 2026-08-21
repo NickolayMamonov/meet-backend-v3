@@ -122,6 +122,7 @@ root_read=$(validate_raw_manifest "$raw")
 IFS=$'\t' read -r root root_media root_size <<<"$root_read"
 [ "$root_media" = "application/vnd.oci.image.index.v1+json" ] ||
   fail "alias root is not an OCI image index"
+[ "$root_size" -gt 0 ] || fail "alias root is empty"
 jq -e '
   .schemaVersion == 2 and
   .mediaType == "application/vnd.oci.image.index.v1+json" and
