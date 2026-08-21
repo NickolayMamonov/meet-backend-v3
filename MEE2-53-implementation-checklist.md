@@ -28,4 +28,11 @@
 - [x] Keep final probes inside the remote deployment lock/rollback trap and validate fixed phase files before retrieval.
 - [x] Verify all 13 frozen demo assets and bind their evidence to the closed success schema.
 - [x] Enforce sanitized incident selection, upload-gated retention, direct privileged-job guards, and no-live-mutation policy.
+- [x] Use the shared `backend-release-${{ github.repository }}` writer lane for the complete promotion.
+- [x] Exclude protected root/platform/referrer subjects before copying a first-time OCI layout.
+- [x] Create and verify a pinned signed GitHub OCI attestation for first-time aliases.
+- [x] Require the explicit exact-SHA Backend CI job/check allowlist and upload its proof.
+- [x] Produce and reuse predecessor, rollback, candidate, and final bootstrap proofs.
+- [x] Validate remote phase files against a closed schema and expected image identity before retrieval.
+- [x] Preserve blank `ADMIN_API_KEY` disabled behavior without putting the key in process arguments.
 - [ ] Rerun exact-head hosted CI and obtain independent QA, code, and compliance PASS evidence.

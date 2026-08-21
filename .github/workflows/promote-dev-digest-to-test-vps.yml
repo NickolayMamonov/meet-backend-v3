@@ -25,7 +25,7 @@ concurrency:
   # GHCR alias publication and VPS mutation share one serialized promotion
   # lane.  A queued run must never observe or overwrite another run's
   # candidate alias or predecessor evidence.
-  group: backend-release-writer-${{ github.repository }}
+  group: backend-release-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -109,11 +109,10 @@ jobs:
           master_sha=$(git rev-parse refs/remotes/origin/master)
           dev_sha=$(git rev-parse refs/remotes/origin/dev)
           [[ "$registration_sha" =~ ^[0-9a-f]{64}$ ]]
-          ci_sha=$(gh run list --workflow ci.yml --commit "$SOURCE_SHA" --limit 20 \
-            --json headSha,status,conclusion --jq '
-              map(select(.headSha == "'"$SOURCE_SHA"'" and .status == "completed" and .conclusion == "success"))
-              | length')
-          test "$ci_sha" -ge 1
+          scripts/verify-test-promotion-required-checks.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" \
+            --output "$RUNNER_TEMP/required-checks.json"
           {
             echo "authorized=true"
             echo "source_sha=$SOURCE_SHA"
@@ -145,6 +144,7 @@ jobs:
           path: |
             ${{ runner.temp }}/promotion-authorization.json
             ${{ runner.temp }}/dev-promotion-source.json
+            ${{ runner.temp }}/required-checks.json
 
   admit-image:
     name: Admit immutable test image and protected closure
@@ -155,6 +155,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     outputs:
       root_digest: ${{ steps.publish.outputs.root_digest }}
       platform_digest: ${{ steps.publish.outputs.platform_digest }}
@@ -249,9 +251,12 @@ jobs:
               --source-checkout "$GITHUB_WORKSPACE" \
               --source-sha "$SOURCE_SHA" \
               --output "$RUNNER_TEMP/dev-promotion-source-publish.json"
+            scripts/verify-test-promotion-layout.sh \
+              --layout "$layout" \
+              --protected-state "$RUNNER_TEMP/protected-before.json" \
+              --output "$RUNNER_TEMP/layout-proof.json"
             oras cp --from-oci-layout "$layout" "$ref"
           fi
-          bash scripts/admit-test-image.sh verify --source "$SOURCE_SHA" --version "$VERSION" --alias "$alias" --input-command scripts/read-test-image-state.sh
           root_digest=$(docker buildx imagetools inspect "$ref" --format "{{.Manifest.Digest}}")
           raw="$RUNNER_TEMP/test-image-index.json"
           docker buildx imagetools inspect "$ref" --raw >"$raw"
@@ -273,11 +278,27 @@ jobs:
             --image "$IMAGE" --index-file "$raw" \
             --inventory-file "$RUNNER_TEMP/registry-inventory.json" \
             --subject-digest "$root_digest" --platform-subject "$platform_digest" >/dev/null
-          gh attestation verify "oci://$ref" --repo "$GITHUB_REPOSITORY" >/dev/null
           printf "root_digest=$root_digest
 platform_digest=$platform_digest
 admission_mode=$mode
 " >>"$GITHUB_OUTPUT"
+      - name: Create signed OCI attestation for a first-time alias
+        if: steps.publish.outputs.admission_mode == 'published'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.publish.outputs.root_digest }}
+          push-to-registry: true
+      - name: Verify signed OCI attestation identity
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          gh attestation verify \
+            "oci://${IMAGE}@${{ steps.publish.outputs.root_digest }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --source-digest "$SOURCE_SHA" >/dev/null
       - name: Read-only image admission
         shell: bash
         env:
@@ -315,9 +336,6 @@ admission_mode=$mode
     name: Locked exact-digest test VPS deployment
     needs: [authorize, admit-image]
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev' && github.sha == inputs.source_sha && needs.authorize.outputs.authorized == 'true'
-    concurrency:
-      group: test-vps-promotion-${{ github.repository }}
-      cancel-in-progress: false
     runs-on: ubuntu-24.04
     environment: test-vps
     env:
@@ -440,13 +458,21 @@ admission_mode=$mode
           )
           [[ "$target_id" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "target_image_id=$target_id" >>"$GITHUB_OUTPUT"
-          previous_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s <<"REMOTE"
+          previous_reference=$(ssh -F "$SSH_CONFIG" test-vps bash -s <<"REMOTE"
           set -euo pipefail
           mapfile -t c < <(docker ps -q --filter label=com.docker.compose.project=meet-production --filter label=com.docker.compose.service=backend)
           [ "${#c[@]}" -eq 1 ]
-          docker inspect "${c[0]}" --format "{{.Image}}"
+          docker inspect "${c[0]}" --format "{{.Config.Image}}"
           REMOTE
           )
+          [[ "$previous_reference" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]]
+          previous_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- "$previous_reference" <<'REMOTE'
+          set -euo pipefail
+          docker image inspect "$1" --format "{{.Id}}"
+          REMOTE
+          )
+          [[ "$previous_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "previous_image_reference=$previous_reference" >>"$GITHUB_OUTPUT"
           echo "previous_image_id=$previous_id" >>"$GITHUB_OUTPUT"
           mutation_started=false
           rollback_attempted=false
@@ -489,12 +515,32 @@ admission_mode=$mode
           printf '%s\n' "${states[@]}"
           REMOTE
           )
+          previous_revision=
+          previous_version=
           while IFS= read -r state_dir; do
             [ -n "$state_dir" ] || continue
+            previous_revision=$(ssh -F "$SSH_CONFIG" test-vps "cat '$state_dir/previous-revision'")
+            previous_version=$(ssh -F "$SSH_CONFIG" test-vps "cat '$state_dir/previous-version'")
             for phase in predecessor candidate rollback final; do
               remote_phase="$state_dir/$phase.json"
+              case "$phase" in
+                predecessor|rollback)
+                  expected_image="$previous_reference"
+                  expected_id="$previous_id"
+                  expected_revision="$previous_revision"
+                  expected_version="$previous_version"
+                  ;;
+                candidate|final)
+                  expected_image="$IMAGE@$IMAGE_DIGEST"
+                  expected_id="$target_id"
+                  expected_revision="$SOURCE_SHA"
+                  expected_version="$VERSION"
+                  ;;
+              esac
               if ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/validate-test-vps-phase-file.sh" \
                 --root "$PATH_ON_HOST" --state-dir "$state_dir" --phase "$phase" \
+                --expected-image "$expected_image" --expected-image-id "$expected_id" \
+                --expected-revision "$expected_revision" --expected-version "$expected_version" \
                 --output "$remote_phase"; then
                 scp -F "$SSH_CONFIG" "test-vps:$remote_phase" \
                   "$RUNNER_TEMP/$phase.json"
@@ -513,15 +559,35 @@ admission_mode=$mode
           if [ "$previous_id" != "$target_id" ]; then
             test -s "$RUNNER_TEMP/rollback.json"
           fi
+          for phase in predecessor rollback; do
+            if [ -s "$RUNNER_TEMP/$phase.json" ]; then
+              proof_sha=$(jq -r '.revision' "$RUNNER_TEMP/$phase.json")
+              proof_image=$(jq -r '.image' "$RUNNER_TEMP/$phase.json")
+              proof_checkout="$RUNNER_TEMP/bootstrap-source-$phase"
+              git fetch --no-tags origin "$proof_sha"
+              git worktree add --detach "$proof_checkout" "$proof_sha" >/dev/null
+              docker pull "$proof_image" >/dev/null
+              scripts/build-bootstrap-default-proof.sh \
+                --source-checkout "$proof_checkout" \
+                --source-sha "$proof_sha" \
+                --image-ref "$proof_image" \
+                --phase "$phase" \
+                --output "$RUNNER_TEMP/bootstrap-$phase.json"
+              git worktree remove "$proof_checkout"
+            fi
+          done
           scripts/build-bootstrap-default-proof.sh \
             --source-checkout "$GITHUB_WORKSPACE" \
             --source-sha "$SOURCE_SHA" \
             --image-ref "$IMAGE@$IMAGE_DIGEST" \
             --phase final \
             --output "$RUNNER_TEMP/bootstrap-final.json"
-          pre_proof=$(sha256sum "$RUNNER_TEMP/predecessor.json" | awk '{print $1}')
+          pre_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-predecessor.json" | awk '{print $1}')
           cand_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-candidate.json" | awk '{print $1}')
           final_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-final.json" | awk '{print $1}')
+          rollback_proof="$pre_proof"
+          [ ! -s "$RUNNER_TEMP/bootstrap-rollback.json" ] || \
+            rollback_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-rollback.json" | awk '{print $1}')
           rollback_required=false
           [ "$previous_id" = "$target_id" ] || rollback_required=true
           rollback_verified=${rollback_verified:-false}
@@ -535,7 +601,8 @@ admission_mode=$mode
             --arg admissionMode "${{ steps.publish.outputs.admission_mode }}" \
             --arg root "$IMAGE_DIGEST" --arg platform "${{ needs.admit-image.outputs.platform_digest }}" \
             --arg predecessorProof "$pre_proof" --arg candidateProof "$cand_proof" \
-            --arg finalProof "$final_proof" --arg previousId "$previous_id" \
+            --arg rollbackProof "$rollback_proof" --arg finalProof "$final_proof" \
+            --arg previousId "$previous_id" \
             --argjson rollbackRequired "$rollback_required" \
             --argjson rollbackAttempted "$rollback_attempted" \
             --argjson rollbackVerified "$rollback_verified" '
@@ -574,6 +641,7 @@ admission_mode=$mode
                 rollback:{
                   attempted:$rollbackAttempted,required:$rollbackRequired,
                   restoredImageId:(if $rollbackRequired then $previousId else null end),
+                  bootstrapProofSha256:$rollbackProof,
                   sameDigestRedeploy:(if $rollbackRequired then false else true end),
                   verified:$rollbackVerified
                 },
@@ -581,7 +649,9 @@ admission_mode=$mode
                 probes:{
                   meetings200Json:true,actuator404:true,httpRedirectHttps:true,
                   adminMissing403:true,adminWrong403:true,
+                  adminKeyConfigured:$final[0].adminKeyConfigured,
                   adminAuthenticatedDisabled404:$final[0].adminAuthenticatedDisabled404,
+                  adminBlankDisabled403:$final[0].adminBlankDisabled403,
                   assets:{count:$final[0].assetsCount,verified:$final[0].assetsVerified}
                 },
                 runtime:{
@@ -611,7 +681,10 @@ admission_mode=$mode
             ${{ runner.temp }}/rollback.json
             ${{ runner.temp }}/final.json
             ${{ runner.temp }}/bootstrap-candidate.json
+            ${{ runner.temp }}/bootstrap-predecessor.json
+            ${{ runner.temp }}/bootstrap-rollback.json
             ${{ runner.temp }}/bootstrap-final.json
+            ${{ runner.temp }}/layout-proof.json
             ${{ runner.temp }}/promotion-evidence.json
 
   incident:

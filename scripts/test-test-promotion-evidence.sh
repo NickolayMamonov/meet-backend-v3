@@ -76,6 +76,7 @@ jq -n \
         $root;$candidateId;$source;$tree;"declared-false";true;true
       ),
       rollback:{
+        bootstrapProofSha256:$proof,
         required:true,attempted:true,verified:true,sameDigestRedeploy:false,
         restoredImageId:$predecessorId
       },
@@ -93,7 +94,8 @@ jq -n \
       probes:{
         meetings200Json:true,actuator404:true,httpRedirectHttps:true,
         adminMissing403:true,adminWrong403:true,
-        adminAuthenticatedDisabled404:true,
+        adminKeyConfigured:true,adminAuthenticatedDisabled404:true,
+        adminBlankDisabled403:false,
         assets:{count:13,verified:true}
       }
     },
@@ -153,8 +155,9 @@ expect_failure unproven-rollback \
   bash "$BUILDER" success --input "$TMP/unproven-rollback.json" \
   --output "$TMP/rejected.json"
 
-jq '
+jq --arg proof "$PROOF" '
   .deployment.rollback = {
+    bootstrapProofSha256:$proof,
     required:false,attempted:false,verified:false,sameDigestRedeploy:true,
     restoredImageId:null
   } |

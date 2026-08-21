@@ -113,30 +113,51 @@ if [ "$phase" = final ] && [ -n "$public_url" ]; then
   [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ] ||
     fail "admin endpoint is not protected"
   [ "$(grep -c '^ADMIN_API_KEY=' "$root/.env.production")" -eq 1 ] ||
-    fail "configured admin key is unavailable"
+    fail "admin key setting is unavailable"
   admin_key=$(sed -n 's/^ADMIN_API_KEY=//p' "$root/.env.production")
-  [ -n "$admin_key" ] || fail "configured admin key is empty"
   case "$admin_key" in *[[:space:]]*) fail "configured admin key is malformed" ;; esac
-  authenticated_admin=$(curl --silent --show-error --output /dev/null \
-    --write-out '%{http_code}' -X POST \
-    "$public_url/admin/demo-catalog/bootstrap" \
-    -H "X-Admin-Key: $admin_key" -H 'Content-Type: application/json' --data '{}')
-  unset admin_key
-  [ "$authenticated_admin" = 404 ] ||
-    fail "authenticated disabled admin endpoint is not absent"
+  if [ -n "$admin_key" ]; then
+    admin_config=$(mktemp)
+    chmod 600 "$admin_config"
+    printf 'header = "X-Admin-Key: %s"\n' "$admin_key" >"$admin_config"
+    unset admin_key
+    authenticated_admin=$(curl --silent --show-error --output /dev/null \
+      --write-out '%{http_code}' -X POST \
+      --config "$admin_config" \
+      "$public_url/admin/demo-catalog/bootstrap" \
+      -H 'Content-Type: application/json' --data '{}')
+    rm -f -- "$admin_config"
+    [ "$authenticated_admin" = 404 ] ||
+      fail "authenticated disabled admin endpoint is not absent"
+    admin_key_configured=true
+    admin_authenticated_disabled_404=true
+    admin_blank_disabled_403=false
+  else
+    unset admin_key
+    admin_key_configured=false
+    admin_authenticated_disabled_404=false
+    admin_blank_disabled_403=true
+  fi
 fi
 
 temporary=$output.tmp.$$
 trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+admin_key_configured=${admin_key_configured:-false}
+admin_authenticated_disabled_404=${admin_authenticated_disabled_404:-false}
+admin_blank_disabled_403=${admin_blank_disabled_403:-false}
 jq -cnS --arg phase "$phase" --arg image "$expected_image" --arg imageId "$expected_image_id" \
   --arg revision "$expected_revision" --arg version "$expected_version" --arg runtimeHash "$expected_runtime_hash" \
   --argjson assetsCount "$(if [ "$phase" = final ] && [ -n "$public_url" ]; then echo 13; else echo 0; fi)" \
   --argjson assetsVerified "$(if [ "$phase" = final ] && [ -n "$public_url" ]; then echo true; else echo false; fi)" \
-  --argjson adminAuthenticatedDisabled404 "$(if [ "$phase" = final ] && [ -n "$public_url" ]; then echo true; else echo false; fi)" \
+  --argjson adminKeyConfigured "$admin_key_configured" \
+  --argjson adminAuthenticatedDisabled404 "$admin_authenticated_disabled_404" \
+  --argjson adminBlankDisabled403 "$admin_blank_disabled_403" \
   '{schema:"meet-backend/test-vps-closed-beta-state/v1",phase:$phase,image:$image,imageId:$imageId,
     revision:$revision,version:$version,runtimeConfigHash:$runtimeHash,
     containerHealthy:true,environmentMatched:true,assetsCount:$assetsCount,
-    assetsVerified:$assetsVerified,adminAuthenticatedDisabled404:$adminAuthenticatedDisabled404}' \
+    assetsVerified:$assetsVerified,adminKeyConfigured:$adminKeyConfigured,
+    adminAuthenticatedDisabled404:$adminAuthenticatedDisabled404,
+    adminBlankDisabled403:$adminBlankDisabled403}' \
   >"$temporary" || fail "evidence construction failed"
 chmod 600 "$temporary" 2>/dev/null || true
 mv -f -- "$temporary" "$output" || fail "evidence publication failed"

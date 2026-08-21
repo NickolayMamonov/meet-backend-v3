@@ -150,8 +150,10 @@ validate_success_input() {
       .final.treeId == $root.source.treeId and
       .final.version == $root.source.version and
       (.rollback | type == "object" and exact_keys([
-        "attempted","required","restoredImageId","sameDigestRedeploy","verified"
+        "attempted","bootstrapProofSha256","required","restoredImageId",
+        "sameDigestRedeploy","verified"
       ]) and
+        (.bootstrapProofSha256 | hex_digest) and
         (.required | type == "boolean") and
         (.attempted | type == "boolean") and
         (.verified | type == "boolean") and
@@ -180,12 +182,20 @@ validate_success_input() {
           "meet-production_uploads_data"
         ]) and
       (.probes | type == "object" and exact_keys([
-        "actuator404","adminAuthenticatedDisabled404","adminMissing403",
-        "adminWrong403","assets","httpRedirectHttps","meetings200Json"
+        "actuator404","adminAuthenticatedDisabled404","adminBlankDisabled403",
+        "adminKeyConfigured","adminMissing403","adminWrong403","assets",
+        "httpRedirectHttps","meetings200Json"
       ]) and
         .meetings200Json == true and .actuator404 == true and
         .httpRedirectHttps == true and .adminMissing403 == true and
-        .adminWrong403 == true and .adminAuthenticatedDisabled404 == true and
+        .adminWrong403 == true and
+        (.adminKeyConfigured | type == "boolean") and
+        (.adminAuthenticatedDisabled404 | type == "boolean") and
+        (.adminBlankDisabled403 | type == "boolean") and
+        (if .adminKeyConfigured
+         then .adminAuthenticatedDisabled404 == true and .adminBlankDisabled403 == false
+         else .adminAuthenticatedDisabled404 == false and .adminBlankDisabled403 == true
+         end) and
         (.assets | type == "object" and exact_keys(["count","verified"]) and
           .count == 13 and .verified == true))) and
     (.control | type == "object" and exact_keys([
