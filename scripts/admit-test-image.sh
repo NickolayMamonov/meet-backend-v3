@@ -198,7 +198,7 @@ fi
 
 if [ -n "$INPUT_COMMAND" ]; then
   TEMP_INPUT=$(mktemp)
-  if ! "$INPUT_COMMAND" "$IMAGE" "$ALIAS" "$SOURCE" "$VERSION" \
+  if ! bash "$INPUT_COMMAND" "$IMAGE" "$ALIAS" "$SOURCE" "$VERSION" \
       >"$TEMP_INPUT" 2>/dev/null; then
     emit rejected input-command-failed
     exit 1
