@@ -18,3 +18,14 @@
 - [x] Wire sanitized success/incident evidence, pinned artifacts, and success-only retention.
 - [x] Add exact dispatch/environment/registration proof and focused hosted CI fixtures.
 - [ ] Verify origin/master registration, provision the closed-beta Environment, and run authorized live/Yandex re-verification.
+
+## Approved P0 remediation
+
+- [x] Revalidate source authority immediately before every mutating boundary and correct `masterRegistrationSha`.
+- [x] Publish the exact admitted OCI layout once, with source-bound signed-attestation/subject validation and fail-closed remote reads.
+- [x] Capture canonical protected attestation records, OCI descriptor sizes, artifact types, predicate bindings, and post-write closure.
+- [x] Serialize GHCR and test-VPS writers; enforce same-digest opt-in and mandatory distinct-image rollback.
+- [x] Keep final probes inside the remote deployment lock/rollback trap and validate fixed phase files before retrieval.
+- [x] Verify all 13 frozen demo assets and bind their evidence to the closed success schema.
+- [x] Enforce sanitized incident selection, upload-gated retention, direct privileged-job guards, and no-live-mutation policy.
+- [ ] Rerun exact-head hosted CI and obtain independent QA, code, and compliance PASS evidence.

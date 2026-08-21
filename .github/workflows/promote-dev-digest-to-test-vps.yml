@@ -25,7 +25,7 @@ concurrency:
   # GHCR alias publication and VPS mutation share one serialized promotion
   # lane.  A queued run must never observe or overwrite another run's
   # candidate alias or predecessor evidence.
-  group: test-vps-promotion-${{ github.repository }}
+  group: backend-release-writer-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -66,6 +66,11 @@ jobs:
           [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]]
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           git fetch --no-tags origin dev master
+          scripts/verify-dev-promotion-source.sh \
+            --repository "$GITHUB_WORKSPACE" \
+            --source-checkout "$GITHUB_WORKSPACE" \
+            --source-sha "$SOURCE_SHA" \
+            --output "$RUNNER_TEMP/dev-promotion-source.json"
           dispatch=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
           jq -e --arg sha "$SOURCE_SHA" '
             .event == "workflow_dispatch" and
@@ -110,12 +115,13 @@ jobs:
           jq -cnS --arg event "$GITHUB_EVENT_NAME" --arg ref "$GITHUB_REF" \
             --arg sourceSha "$SOURCE_SHA" --arg masterSha "$master_sha" \
             --arg devSha "$dev_sha" --arg workflow "$PROMOTION_WORKFLOW" \
+            --arg masterRegistrationSha "$master_registration_sha" \
             --arg registrationSha "$registration_sha" '
             {
               schema:"meet-backend/test-promotion-authorization/v1",
               event:$event,ref:$ref,sourceSha:$sourceSha,
               masterSha:$masterSha,devSha:$devSha,workflow:$workflow,
-              masterRegistrationSha:$registrationSha,
+              masterRegistrationSha:$masterRegistrationSha,
               devRegistrationSha:$registrationSha,authorized:true
             }
           ' >"$RUNNER_TEMP/promotion-authorization.json"
@@ -126,7 +132,9 @@ jobs:
           name: test-promotion-authorization-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 14
-          path: ${{ runner.temp }}/promotion-authorization.json
+          path: |
+            ${{ runner.temp }}/promotion-authorization.json
+            ${{ runner.temp }}/dev-promotion-source.json
 
   admit-image:
     name: Admit immutable test image and protected closure
@@ -150,6 +158,13 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - name: Recheck direct writer guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/dev
+          test "$GITHUB_SHA" = "${{ inputs.source_sha }}"
       - name: Capture protected registry state before any writer
         shell: bash
         env:
@@ -199,26 +214,43 @@ jobs:
             docker buildx build --platform linux/amd64 --provenance=true --sbom=true \
               --build-arg "BACKEND_VERSION=$VERSION" --build-arg "BACKEND_REVISION=$SOURCE_SHA" \
               --tag "$ref" \
-              --output "type=oci,dest=$RUNNER_TEMP/test-image.oci.tar" \
-              --output "type=registry,name=$ref,push=true" .
+              --output "type=oci,dest=$RUNNER_TEMP/test-image.oci.tar" .
             test -s "$RUNNER_TEMP/test-image.oci.tar"
             tar -xf "$RUNNER_TEMP/test-image.oci.tar" -C "$layout"
             jq -e '.imageLayoutVersion == "1.0.0"' \
               "$layout/oci-layout" >/dev/null
-            jq -e '([.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")] | length) == 1' \
-              "$layout/index.json" >/dev/null
+            local_root_digest=$(jq -er '
+              [.manifests[] |
+                select(.mediaType == "application/vnd.oci.image.index.v1+json" and
+                  .platform == null and
+                  .annotations["vnd.docker.reference.type"] != "attestation-manifest") |
+                .digest] |
+              if length == 1 then .[0] else error("OCI layout root is not unique") end
+            ' "$layout/index.json")
+            root_blob="$layout/blobs/sha256/${local_root_digest#sha256:}"
+            [ -f "$root_blob" ] && [ ! -L "$root_blob" ]
+            local_platform_digest=$(jq -er '
+              [.manifests[] |
+                select(.mediaType == "application/vnd.oci.image.manifest.v1+json" and
+                  .platform.os == "linux" and .platform.architecture == "amd64") |
+                .digest] |
+              if length == 1 then .[0] else error("OCI layout platform is not unique") end
+            ' "$root_blob")
+            oras cp --from-oci-layout "$layout" "$ref"
           fi
           bash scripts/admit-test-image.sh verify --source "$SOURCE_SHA" --version "$VERSION" --alias "$alias" --input-command scripts/read-test-image-state.sh
           root_digest=$(docker buildx imagetools inspect "$ref" --format "{{.Manifest.Digest}}")
           raw="$RUNNER_TEMP/test-image-index.json"
           docker buildx imagetools inspect "$ref" --raw >"$raw"
           if [ "$mode" = published ]; then
-            local_root_digest=$(sha256sum "$layout/index.json" |
-              awk '{print "sha256:"$1}')
             test "$local_root_digest" = "$root_digest" ||
               { echo "published OCI subject differs from admitted OCI layout" >&2; exit 1; }
           fi
           platform_digest=$(jq -r '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest] | if length == 1 then .[0] else empty end' "$raw")
+          if [ "$mode" = published ]; then
+            test "$local_platform_digest" = "$platform_digest" ||
+              { echo "published OCI platform subject differs from admitted OCI layout" >&2; exit 1; }
+          fi
           scripts/normalize-ghcr-package-inventory.sh \
             --package-versions-file "$RUNNER_TEMP/protected-package-versions.json" \
             --digest "$root_digest" \
@@ -270,6 +302,9 @@ admission_mode=$mode
     name: Locked exact-digest test VPS deployment
     needs: [authorize, admit-image]
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev' && github.sha == inputs.source_sha && needs.authorize.outputs.authorized == 'true'
+    concurrency:
+      group: test-vps-promotion-${{ github.repository }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     environment: test-vps
     env:
@@ -306,6 +341,11 @@ admission_mode=$mode
           [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]]
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          scripts/verify-dev-promotion-source.sh \
+            --repository "$GITHUB_WORKSPACE" \
+            --source-checkout "$GITHUB_WORKSPACE" \
+            --source-sha "$SOURCE_SHA" \
+            --output "$RUNNER_TEMP/dev-promotion-source-deploy.json"
       - name: Pull exact admitted image and prove image-bound bootstrap/JAR
         shell: bash
         env:
@@ -362,7 +402,9 @@ admission_mode=$mode
           stage="$RUNNER_TEMP/test-vps-tooling"
           remote="$PATH_ON_HOST/.mee2-53-tooling-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$stage/scripts"
-          for file in docker-compose.production.yml scripts/production-compose.sh scripts/production-config-digest.sh scripts/test-vps-runtime-invariants.sh scripts/update-production-release.sh scripts/deploy-test-vps-release.sh scripts/verify-test-vps-closed-beta-state.sh; do mkdir -p "$stage/$(dirname "$file")"; cp -- "$file" "$stage/$file"; done
+          # verify-test-vps-assets.sh is invoked by the final verifier while
+          # the remote deployment lock and rollback trap are still held.
+          for file in docker-compose.production.yml scripts/production-compose.sh scripts/production-config-digest.sh scripts/test-vps-runtime-invariants.sh scripts/update-production-release.sh scripts/deploy-test-vps-release.sh scripts/verify-test-vps-closed-beta-state.sh scripts/verify-test-vps-assets.sh scripts/validate-test-vps-phase-file.sh scripts/build-bootstrap-default-proof.sh; do mkdir -p "$stage/$(dirname "$file")"; cp -- "$file" "$stage/$file"; done
           tar -C "$stage" -cf "$RUNNER_TEMP/test-vps-tooling.tar" .
           ssh -F "$SSH_CONFIG" test-vps bash -s -- "$PATH_ON_HOST" "$remote" <<"REMOTE"
           set -euo pipefail
@@ -399,7 +441,7 @@ admission_mode=$mode
           fi
           if [ "$previous_id" != "$target_id" ]; then
             set +e
-            ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --mode rollback-drill --closed-beta-safety >"$RUNNER_TEMP/rollback.txt" 2>&1
+            ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --mode rollback-drill --closed-beta-safety --public-url "$PUBLIC_URL" >"$RUNNER_TEMP/rollback.txt" 2>&1
             status=$?
             set -e
             [ "$status" -eq 86 ]
@@ -407,7 +449,7 @@ admission_mode=$mode
             rollback_verified=true
             echo "rollback_verified=true" >>"$GITHUB_OUTPUT"
           fi
-          ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final" --mode deploy --closed-beta-safety
+          ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final" --mode deploy --closed-beta-safety --public-url "$PUBLIC_URL"
           remote_state=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" <<'REMOTE'
           set -euo pipefail
@@ -424,7 +466,9 @@ admission_mode=$mode
             [ -n "$state_dir" ] || continue
             for phase in predecessor candidate rollback final; do
               remote_phase="$state_dir/$phase.json"
-              if ssh -F "$SSH_CONFIG" test-vps test -f "$remote_phase"; then
+              if ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/validate-test-vps-phase-file.sh" \
+                --root "$PATH_ON_HOST" --state-dir "$state_dir" --phase "$phase" \
+                --output "$remote_phase"; then
                 scp -F "$SSH_CONFIG" "test-vps:$remote_phase" \
                   "$RUNNER_TEMP/$phase.json"
                 jq -e --arg phase "$phase" '
@@ -442,74 +486,6 @@ admission_mode=$mode
           if [ "$previous_id" != "$target_id" ]; then
             test -s "$RUNNER_TEMP/rollback.json"
           fi
-          ssh -F "$SSH_CONFIG" test-vps bash -s -- "$target_id" "$SOURCE_SHA" "$VERSION" "$PUBLIC_URL" <<"REMOTE"
-          set -euo pipefail
-          id=$1; revision=$2; version=$3; public=$4
-          mapfile -t c < <(docker ps -q --filter label=com.docker.compose.project=meet-production --filter label=com.docker.compose.service=backend)
-          [ "${#c[@]}" -eq 1 ]; backend=${c[0]}; [ "$(docker inspect "$backend" --format "{{.Image}}")" = "$id" ]
-          [ "$(docker inspect "$backend" --format "{{.State.Health.Status}}")" = healthy ]
-          [ "$(docker inspect "$backend" --format "{{index .Config.Labels \"org.opencontainers.image.revision\"}}")" = "$revision" ]
-          [ "$(docker inspect "$backend" --format "{{index .Config.Labels \"org.opencontainers.image.version\"}}")" = "$version" ]
-          docker volume inspect meet-production_postgres_data >/dev/null; docker volume inspect meet-production_uploads_data >/dev/null
-          REMOTE
-          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
-            "$PUBLIC_URL/meetings" | jq -e 'type == "array"' >/dev/null
-          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
-            "$PUBLIC_URL/actuator" -o /dev/null -w '%{http_code}' | grep -Fx 404
-          curl --silent --show-error --proto '=http' --max-time 10 \
-            -D "$RUNNER_TEMP/http-headers" -o /dev/null \
-            "http://${PUBLIC_URL#https://}/meetings"
-          grep -Eiq '^location: https://' "$RUNNER_TEMP/http-headers"
-          missing_admin=$(curl --silent --show-error --output /dev/null --write-out "%{http_code}" -X POST "$PUBLIC_URL/admin/demo-catalog/bootstrap" -H "Content-Type: application/json" --data "{}")
-          wrong_admin=$(curl --silent --show-error --output /dev/null --write-out "%{http_code}" -X POST "$PUBLIC_URL/admin/demo-catalog/bootstrap" -H "X-Admin-Key: wrong" -H "Content-Type: application/json" --data "{}")
-          [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ]
-          for asset in networking-online organize-online; do
-            curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
-              "$PUBLIC_URL/demo-events/$asset" -o "$RUNNER_TEMP/$asset"
-          done
-          [ "$(sha256sum "$RUNNER_TEMP/networking-online" | awk "{print $1}")" = bb8fb77c0e5aa135655ecd6de1857295d3282571 ]
-          [ "$(sha256sum "$RUNNER_TEMP/organize-online" | awk "{print $1}")" = 849c92d104344d3bb6c1d096f6e866c8f24cbea6 ]
-          ssh -F "$SSH_CONFIG" test-vps bash -s -- "$PATH_ON_HOST" "$PUBLIC_URL" <<"REMOTE"
-          set -euo pipefail
-          root=$1
-          public=$2
-          grep -Eq "^DEMO_CATALOG_BOOTSTRAP_ENABLED=false$" "$root/.env.production"
-          mapfile -t backends < <(docker ps -q --filter label=com.docker.compose.project=meet-production --filter label=com.docker.compose.service=backend)
-          mapfile -t postgres_containers < <(docker ps -q --filter label=com.docker.compose.project=meet-production --filter label=com.docker.compose.service=postgres)
-          [ "${#backends[@]}" -eq 1 ] && [ "${#postgres_containers[@]}" -eq 1 ]
-          backend=${backends[0]}
-          postgres=${postgres_containers[0]}
-          admin_key=$(docker inspect "$backend" --format '{{range .Config.Env}}{{println .}}{{end}}' |
-            sed -n 's/^ADMIN_API_KEY=//p')
-          [ -n "$admin_key" ]
-          authenticated_disabled=$(curl --silent --show-error --output /dev/null \
-            --write-out "%{http_code}" -X POST \
-            "$public/admin/demo-catalog/bootstrap" \
-            -H "X-Admin-Key: $admin_key" -H "Content-Type: application/json" \
-            --data '{}')
-          [ "$authenticated_disabled" = 404 ]
-          unset admin_key
-          docker exec "$postgres" sh -ec \
-            'psql -Atqc "SELECT CASE WHEN pg_is_in_recovery() THEN 0 ELSE 1 END"' |
-            grep -Fx 1
-          for table in users communities meetings tags ad_blocks; do
-            docker exec "$postgres" sh -ec \
-              "psql -Atqc \"SELECT count(*) FROM $table WHERE demo_catalog_key IS NOT NULL\"" |
-              grep -Fx 0
-          done
-          docker exec "$postgres" sh -ec \
-            'psql -Atqc "SELECT count(*) FROM demo_catalog_state"' | grep -Fx 0
-          smtp_pointer=/var/lib/meet-test-vps-deploy/.smtp-transaction.current
-          for sample in 1 2; do
-            [ ! -e "$smtp_pointer" ] && [ ! -L "$smtp_pointer" ]
-            sleep 1
-          done
-          [ "$(docker inspect "$backend" --format '{{.Config.User}}')" = "10001:10001" ]
-          [ "$(docker inspect "$backend" --format '{{.HostConfig.ReadonlyRootfs}}')" = true ]
-          [ "$(docker inspect "$backend" --format '{{.State.Health.Status}}')" = healthy ]
-          [ "$(docker inspect "$postgres" --format '{{.State.Health.Status}}')" = healthy ]
-          REMOTE
-
           scripts/build-bootstrap-default-proof.sh \
             --source-checkout "$GITHUB_WORKSPACE" \
             --source-sha "$SOURCE_SHA" \
@@ -527,6 +503,7 @@ admission_mode=$mode
             --slurpfile predecessor "$RUNNER_TEMP/predecessor.json" \
             --slurpfile candidate "$RUNNER_TEMP/candidate.json" \
             --slurpfile final "$RUNNER_TEMP/final.json" \
+            --slurpfile authority "$RUNNER_TEMP/dev-promotion-source-deploy.json" \
             --arg source "$SOURCE_SHA" --arg tree "${{ needs.authorize.outputs.tree_id }}" \
             --arg version "$VERSION" --arg image "$IMAGE" --arg alias "test-sha-$SOURCE_SHA" \
             --arg admissionMode "${{ steps.publish.outputs.admission_mode }}" \
@@ -551,7 +528,10 @@ admission_mode=$mode
               };
             {
               schema:"meet-backend/test-promotion-evidence-input/v1",
-              source:{authoritySha:$source,sourceSha:$source,treeId:$tree,version:$version},
+              source:{
+                authoritySha:($authority[0].authoritySha),
+                sourceSha:$source,treeId:$tree,version:$version
+              },
               image:{
                 image:$image,alias:$alias,admissionMode:$admissionMode,
                 rootDigest:$root,platformDigest:$platform,platform:"linux/amd64",
@@ -575,7 +555,8 @@ admission_mode=$mode
                 probes:{
                   meetings200Json:true,actuator404:true,httpRedirectHttps:true,
                   adminMissing403:true,adminWrong403:true,
-                  adminAuthenticatedDisabled404:true,assets:{count:13,verified:true}
+                  adminAuthenticatedDisabled404:true,
+                  assets:{count:$final[0].assetsCount,verified:$final[0].assetsVerified}
                 },
                 runtime:{
                   hardeningVerified:true,nonIdleApplicationTransactions:0,
@@ -647,12 +628,12 @@ admission_mode=$mode
   retention:
     name: Success-only retention authorization
     needs: [authorize, admit-image, deploy, incident]
-    if: always() && needs.authorize.result == 'success' && needs.admit-image.result == 'success' && needs.deploy.result == 'success' && needs.incident.result == 'skipped'
+    if: always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev' && github.sha == inputs.source_sha && needs.authorize.result == 'success' && needs.admit-image.result == 'success' && needs.deploy.result == 'success' && needs.incident.result == 'skipped'
     runs-on: ubuntu-24.04
     environment: test-vps
     permissions:
       contents: read
-      packages: write
+      packages: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:

@@ -320,7 +320,8 @@ if ! jq -e \
       select(.kind == "sbom") |
       select(
         .artifactType == "application/spdx+json" or
-        .artifactType == "application/vnd.cyclonedx+json"
+        .artifactType == "application/vnd.cyclonedx+json" or
+        .artifactType == "application/vnd.in-toto+json"
       ) |
       select(.predicateType | type == "string" and
         (. == "https://spdx.dev/Document" or
