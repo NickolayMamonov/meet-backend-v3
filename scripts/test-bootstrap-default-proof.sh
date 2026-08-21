@@ -76,7 +76,7 @@ proof() {
   local phase=$1 commit=$2 jar_file=$3 output=$4
   shift 4
   git -C "$CHECKOUT" checkout -q --detach "$commit"
-  "$BUILD" --source-checkout "$CHECKOUT" --source-sha "$commit" --jar "$jar_file" \
+  bash "$BUILD" --source-checkout "$CHECKOUT" --source-sha "$commit" --jar "$jar_file" \
     --image-inspect "$IMAGE_FIXTURE" --phase "$phase" --output "$output" "$@"
 }
 
@@ -121,7 +121,7 @@ export BOOTSTRAP_REAL_GIT
 export BOOTSTRAP_IMAGE_INSPECT=$IMAGE_FIXTURE
 export BOOTSTRAP_FIXTURE_JAR=$TMP/candidate.jar
 proof_production() {
-  "$BUILD" --source-checkout "$CHECKOUT" --source-sha "$INTRO" \
+  bash "$BUILD" --source-checkout "$CHECKOUT" --source-sha "$INTRO" \
     --image-ref fixture/image:offline --phase candidate --output "$1" \
     --git-command "$ROOT/scripts/fixtures/bootstrap-default-proof/git-shim.sh" \
     --docker-command "$ROOT/scripts/fixtures/bootstrap-default-proof/docker-shim.sh" \
@@ -134,22 +134,22 @@ expect_failure production-docker-failure proof_production "$TMP/reject.json"
 unset BOOTSTRAP_DOCKER_FAIL
 
 for phase in candidate final rollback; do
-  expect_failure "legacy-$phase" "$BUILD" --source-checkout "$CHECKOUT" \
+  expect_failure "legacy-$phase" bash "$BUILD" --source-checkout "$CHECKOUT" \
     --source-sha "$PREDECESSOR" --jar "$TMP/predecessor.jar" \
     --image-inspect "$IMAGE_FIXTURE" --phase "$phase" --output "$TMP/reject.json" \
     --introduction-sha "$INTRO"
 done
-expect_failure legacy-unbound "$BUILD" --source "$REPO/src/main/resources" \
+expect_failure legacy-unbound bash "$BUILD" --source "$REPO/src/main/resources" \
   --jar "$TMP/predecessor.jar" --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/amd64 --source-sha "$PREDECESSOR" --tree-id "$TREE" --version 1.2.0 \
   --phase predecessor --output "$TMP/reject.json"
-expect_failure legacy-missing-introduction "$BUILD" --source "$REPO/src/main/resources" \
+expect_failure legacy-missing-introduction bash "$BUILD" --source "$REPO/src/main/resources" \
   --jar "$TMP/predecessor.jar" --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/amd64 --source-sha "$PREDECESSOR" --tree-id "$TREE" --version 1.2.0 \
   --phase predecessor --output "$TMP/reject.json" --strict-ancestor true
-expect_failure bad-platform "$BUILD" --source "$REPO/src/main/resources" \
+expect_failure bad-platform bash "$BUILD" --source "$REPO/src/main/resources" \
   --jar "$TMP/candidate.jar" --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/arm64 --source-sha "$INTRO" --tree-id "$TREE" --version 1.2.0 \
@@ -171,7 +171,7 @@ make_jar_dir() {
     -C "$work" BOOT-INF/classes/application-prod.yml
 }
 make_jar_dir "$MUTATION" "$TMP/true.jar"
-expect_failure true-default "$BUILD" --source "$MUTATION" --jar "$TMP/true.jar" \
+expect_failure true-default bash "$BUILD" --source "$MUTATION" --jar "$TMP/true.jar" \
   --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/amd64 --source-sha "$INTRO" --tree-id "$TREE" --version 1.2.0 \
@@ -181,7 +181,7 @@ cp -- "$REPO/src/main/resources/application.yml" "$MUTATION/application.yml"
 printf '%s\n' '  bootstrap-enabled: ${DEMO_CATALOG_BOOTSTRAP_ENABLED:false}' \
   >>"$MUTATION/application.yml"
 make_jar_dir "$MUTATION" "$TMP/duplicate.jar"
-expect_failure duplicate "$BUILD" --source "$MUTATION" --jar "$TMP/duplicate.jar" \
+expect_failure duplicate bash "$BUILD" --source "$MUTATION" --jar "$TMP/duplicate.jar" \
   --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/amd64 --source-sha "$INTRO" --tree-id "$TREE" --version 1.2.0 \
@@ -192,7 +192,7 @@ cp -- "$REPO/src/main/resources/application-prod.yml" "$MUTATION/application-pro
 sed -i 's/DEMO_CATALOG_BOOTSTRAP_ENABLED:false/DEMO_CATALOG_BOOTSTRAP_ENABLED/' \
   "$MUTATION/application.yml"
 make_jar_dir "$MUTATION" "$TMP/unbound.jar"
-expect_failure unbound "$BUILD" --source "$MUTATION" --jar "$TMP/unbound.jar" \
+expect_failure unbound bash "$BUILD" --source "$MUTATION" --jar "$TMP/unbound.jar" \
   --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/amd64 --source-sha "$INTRO" --tree-id "$TREE" --version 1.2.0 \
@@ -202,7 +202,7 @@ cp -- "$REPO/src/main/resources/application.yml" "$MUTATION/application.yml"
 cp -- "$REPO/src/main/resources/application-prod.yml" "$MUTATION/application-prod.yml"
 make_jar_dir "$MUTATION" "$TMP/mismatch.jar"
 printf '%s\n' mismatch >>"$MUTATION/application-prod.yml"
-expect_failure source-jar-mismatch "$BUILD" --source "$MUTATION" --jar "$TMP/mismatch.jar" \
+expect_failure source-jar-mismatch bash "$BUILD" --source "$MUTATION" --jar "$TMP/mismatch.jar" \
   --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/amd64 --source-sha "$INTRO" --tree-id "$TREE" --version 1.2.0 \
@@ -214,7 +214,7 @@ cp -- "$REPO/src/main/resources/application.yml" "$MIXED/application.yml"
 git -C "$REPO" show "$PREDECESSOR:src/main/resources/application-prod.yml" \
   >"$MIXED/application-prod.yml"
 make_jar_dir "$MIXED" "$TMP/mixed.jar"
-expect_failure mixed-mode "$BUILD" --source "$MIXED" --jar "$TMP/mixed.jar" \
+expect_failure mixed-mode bash "$BUILD" --source "$MIXED" --jar "$TMP/mixed.jar" \
   --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/amd64 --source-sha "$INTRO" --tree-id "$TREE" --version 1.2.0 \
@@ -227,7 +227,7 @@ sed -i 's/^[[:space:]]*bootstrap-enabled:/app.demo-catalog.bootstrap-enabled:/' 
 sed -i 's/DEMO_CATALOG_BOOTSTRAP_ENABLED:false/DEMO_CATALOG_BOOTSTRAP_ENABLED:true/' \
   "$MUTATION/application.yml"
 make_jar_dir "$MUTATION" "$TMP/dotted-true.jar"
-expect_failure dotted-true "$BUILD" --source "$MUTATION" --jar "$TMP/dotted-true.jar" \
+expect_failure dotted-true bash "$BUILD" --source "$MUTATION" --jar "$TMP/dotted-true.jar" \
   --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/amd64 --source-sha "$INTRO" --tree-id "$TREE" --version 1.2.0 \
@@ -239,7 +239,7 @@ sed -i 's/^[[:space:]]*bootstrap-enabled:/demo-catalog.bootstrap-enabled:/' \
   "$MUTATION/application.yml"
 sed -i 's/${DEMO_CATALOG_BOOTSTRAP_ENABLED:false}/false/' "$MUTATION/application.yml"
 make_jar_dir "$MUTATION" "$TMP/flat-unbound.jar"
-expect_failure flat-unbound "$BUILD" --source "$MUTATION" --jar "$TMP/flat-unbound.jar" \
+expect_failure flat-unbound bash "$BUILD" --source "$MUTATION" --jar "$TMP/flat-unbound.jar" \
   --image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --image-id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --platform linux/amd64 --source-sha "$INTRO" --tree-id "$TREE" --version 1.2.0 \

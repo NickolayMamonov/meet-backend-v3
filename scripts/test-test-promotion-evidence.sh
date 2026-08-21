@@ -101,8 +101,8 @@ jq -n \
   }
 ' >"$TMP/input.json"
 
-"$BUILDER" success --input "$TMP/input.json" --output "$TMP/evidence.json"
-"$BUILDER" success --input "$TMP/input.json" \
+bash "$BUILDER" success --input "$TMP/input.json" --output "$TMP/evidence.json"
+bash "$BUILDER" success --input "$TMP/input.json" \
   --output "$TMP/evidence-repeat.json"
 cmp "$TMP/evidence.json" "$TMP/evidence-repeat.json"
 [ "$(wc -l <"$TMP/evidence.json" | tr -d ' ')" -eq 1 ]
@@ -114,7 +114,7 @@ jq -e '
   .deployment.rollback.verified == true
 ' "$TMP/evidence.json" >/dev/null
 
-"$BUILDER" authorize-retention \
+bash "$BUILDER" authorize-retention \
   --evidence "$TMP/evidence.json" \
   --artifact-uploaded true \
   --output "$TMP/retention.json"
@@ -126,31 +126,31 @@ jq -e '
   (.evidenceSha256 | test("^[0-9a-f]{64}$"))
 ' "$TMP/retention.json" >/dev/null
 expect_failure upload-failed \
-  "$BUILDER" authorize-retention --evidence "$TMP/evidence.json" \
+  bash "$BUILDER" authorize-retention --evidence "$TMP/evidence.json" \
   --artifact-uploaded false --output "$TMP/rejected.json"
 
 jq '.unexpected = true' "$TMP/input.json" >"$TMP/unknown.json"
 expect_failure unknown-field \
-  "$BUILDER" success --input "$TMP/unknown.json" \
+  bash "$BUILDER" success --input "$TMP/unknown.json" \
   --output "$TMP/rejected.json"
 
 jq '.deployment.probes.responseBody = "safe-looking"' \
   "$TMP/input.json" >"$TMP/secret-field.json"
 expect_failure secret-field \
-  "$BUILDER" success --input "$TMP/secret-field.json" \
+  bash "$BUILDER" success --input "$TMP/secret-field.json" \
   --output "$TMP/rejected.json"
 
 jq '.image.labels.source = "Authorization: Bearer hidden-value"' \
   "$TMP/input.json" >"$TMP/secret-value.json"
 expect_failure secret-value \
-  "$BUILDER" success --input "$TMP/secret-value.json" \
+  bash "$BUILDER" success --input "$TMP/secret-value.json" \
   --output "$TMP/rejected.json"
 ! grep -Fq hidden-value "$TMP/secret-value.stderr"
 
 jq '.deployment.rollback.verified = false' \
   "$TMP/input.json" >"$TMP/unproven-rollback.json"
 expect_failure unproven-rollback \
-  "$BUILDER" success --input "$TMP/unproven-rollback.json" \
+  bash "$BUILDER" success --input "$TMP/unproven-rollback.json" \
   --output "$TMP/rejected.json"
 
 jq '
@@ -160,7 +160,7 @@ jq '
   } |
   .image.admissionMode = "reused"
 ' "$TMP/input.json" >"$TMP/same-digest.json"
-"$BUILDER" success --input "$TMP/same-digest.json" \
+bash "$BUILDER" success --input "$TMP/same-digest.json" \
   --output "$TMP/same-digest-evidence.json"
 jq -e '
   .deployment.rollback.sameDigestRedeploy == true and
@@ -168,7 +168,7 @@ jq -e '
   .deployment.rollback.verified == false
 ' "$TMP/same-digest-evidence.json" >/dev/null
 
-"$BUILDER" incident \
+bash "$BUILDER" incident \
   --stage rollback \
   --failure-class rollbackFailed \
   --mutation-started true \
@@ -190,12 +190,12 @@ jq -e '
 ' "$TMP/incident.json" >/dev/null
 
 printf 'ADMIN_KEY=must-not-be-retained\n' >"$TMP/raw.log"
-if "$BUILDER" success --input "$TMP/secret-value.json" \
+if bash "$BUILDER" success --input "$TMP/secret-value.json" \
   --output "$TMP/selected.json" >/dev/null 2>"$TMP/primary.err"; then
   echo "secret-bearing primary evidence was accepted" >&2
   exit 1
 else
-  "$BUILDER" incident \
+  bash "$BUILDER" incident \
     --stage evidence \
     --failure-class sanitizationFailed \
     --mutation-started true \
@@ -203,7 +203,7 @@ else
     --rollback-verified true \
     --output "$TMP/selected.json"
 fi
-"$BUILDER" incident \
+bash "$BUILDER" incident \
   --stage evidence \
   --failure-class sanitizationFailed \
   --mutation-started true \
@@ -213,10 +213,10 @@ fi
 cmp "$TMP/selected.json" "$TMP/selected-repeat.json"
 ! grep -Fq must-not-be-retained "$TMP/selected.json"
 expect_failure incident-retention \
-  "$BUILDER" authorize-retention --evidence "$TMP/incident.json" \
+  bash "$BUILDER" authorize-retention --evidence "$TMP/incident.json" \
   --artifact-uploaded true --output "$TMP/rejected.json"
 expect_failure impossible-rollback \
-  "$BUILDER" incident \
+  bash "$BUILDER" incident \
   --stage rollback \
   --failure-class rollbackFailed \
   --mutation-started false \

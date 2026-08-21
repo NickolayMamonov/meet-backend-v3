@@ -47,7 +47,7 @@ run_case() {
   [ "$expected_state" = rejected ] && expected_status=1
   [ "$mode" = verify ] && [ "$expected_state" = absent ] && expected_status=1
   set +e
-  actual=$("$ADMIT" "$mode" --source "$SOURCE" --version "$VERSION" \
+  actual=$(bash "$ADMIT" "$mode" --source "$SOURCE" --version "$VERSION" \
     --input "$input" 2>"$TMP/$name.$mode.stderr")
   status=$?
   set -e
@@ -72,7 +72,7 @@ run_case partial rejected partial-binding
 run_case protected-alias rejected protected-alias
 run_case unknown-alias rejected unknown-alias
 
-command_output=$("$ADMIT" verify --source "$SOURCE" --version "$VERSION" \
+command_output=$(bash "$ADMIT" verify --source "$SOURCE" --version "$VERSION" \
   --input-command "$SHIM" --output "$TMP/command-output.json")
 [ "$command_output" = "$(expected_json "$ALIAS" reusable complete)" ]
 [ "$(cat "$TMP/command-output.json")" = "$command_output" ]
@@ -80,7 +80,7 @@ command_output=$("$ADMIT" verify --source "$SOURCE" --version "$VERSION" \
 if ln -s "$TMP/secret-target" "$TMP/symlink-output" 2>/dev/null; then
   printf 'sentinel\n' >"$TMP/secret-target"
   set +e
-  "$ADMIT" inspect --source "$SOURCE" --version "$VERSION" \
+  bash "$ADMIT" inspect --source "$SOURCE" --version "$VERSION" \
     --input "$TMP/absent.json" --output "$TMP/symlink-output" \
     >"$TMP/symlink.stdout" 2>"$TMP/symlink.stderr"
   symlink_status=$?

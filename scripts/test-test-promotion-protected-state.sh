@@ -9,7 +9,7 @@ trap 'rm -r -- "$TMP"' EXIT HUP INT TERM
 
 fail() { echo "test-promotion protected-state fixture failed: $*" >&2; exit 1; }
 run_capture() {
-  "$CAPTURE" --input "$1" --output "$2" \
+  bash "$CAPTURE" --input "$1" --output "$2" \
     --candidate-alias test-sha-1111111111111111111111111111111111111111
 }
 expect_failure() {
@@ -33,7 +33,7 @@ expect_byte_change() {
   fi
 }
 
-[ -x "$CAPTURE" ] || fail "capture script is not executable"
+[ -r "$CAPTURE" ] || fail "capture script is unavailable"
 [ -f "$FIXTURE" ] || fail "fixture is missing"
 bash -n "$CAPTURE"
 command -v jq >/dev/null 2>&1 || fail "jq is required"

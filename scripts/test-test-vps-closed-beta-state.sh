@@ -53,13 +53,13 @@ unset -f docker 2>/dev/null || true
 export PATH="$TMP/bin:$PATH" ROOT="$TMP/root" COMPOSE="$TMP/tooling/production-compose.sh"
 hash -r
 export IMAGE IMAGE_ID REVISION VERSION RUNTIME_HASH
-"$VERIFY" --phase predecessor --root "$TMP/root" --compose-script "$TMP/tooling/production-compose.sh" \
+bash "$VERIFY" --phase predecessor --root "$TMP/root" --compose-script "$TMP/tooling/production-compose.sh" \
   --state-dir "$TMP/state" --expected-image "$IMAGE" --expected-image-id "$IMAGE_ID" \
   --expected-revision "$REVISION" --expected-version "$VERSION" --expected-runtime-hash "$RUNTIME_HASH" \
   --output "$TMP/predecessor.json"
 jq -e '.schema == "meet-backend/test-vps-closed-beta-state/v1" and .phase == "predecessor" and .containerHealthy' \
   "$TMP/predecessor.json" >/dev/null
-if "$VERIFY" --phase nope --root "$TMP/root" --compose-script "$TMP/tooling/production-compose.sh" \
+if bash "$VERIFY" --phase nope --root "$TMP/root" --compose-script "$TMP/tooling/production-compose.sh" \
   --state-dir "$TMP/state" --expected-image "$IMAGE" --expected-image-id "$IMAGE_ID" \
   --expected-revision "$REVISION" --expected-version "$VERSION" --expected-runtime-hash "$RUNTIME_HASH" \
   --output "$TMP/bad.json" >"$TMP/bad.stdout" 2>"$TMP/bad.stderr"; then
