@@ -46,3 +46,11 @@
 - [x] Retrieve only fixed remote phase paths and compare downloaded SHA-256 before local evidence validation.
 - [x] Add legacy-not-applicable, declared-false, proof-mismatch, and rollback-reuse fixtures.
 - [ ] Run exact-head hosted Backend CI and repeat independent QA/compliance review.
+
+## Approved runtime truthfulness remediation
+
+- [x] Add a secret-free aggregate zero-state probe bound to exact image/runtime identity and run it from every locked deployment safety phase.
+- [x] Derive closed phase and success evidence from observed probe output; remove workflow hard-coded runtime/probe assertions.
+- [x] Add populated and unknown zero-state evidence regression fixtures.
+- [x] Rerun focused shell/fixture checks and Gradle clean build for the runtime truthfulness remediation.
+- [ ] Rerun exact-head hosted CI, independent QA/code/compliance review, and the required read-only/live gate evidence.

@@ -68,7 +68,8 @@ jq -e --arg phase "$phase" \
   (keys | sort) == [
     "adminAuthenticatedDisabled404","adminBlankDisabled403","adminKeyConfigured",
     "assetsCount","assetsVerified","containerHealthy","environmentMatched",
-    "image","imageId","phase","revision","runtimeConfigHash","schema","version"
+    "image","imageId","phase","revision","runtimeConfigHash","schema",
+    "version","zeroStateProbe"
   ] and
   .schema == "meet-backend/test-vps-closed-beta-state/v1" and
   .phase == $phase and
@@ -83,6 +84,22 @@ jq -e --arg phase "$phase" \
   (.runtimeConfigHash | type == "string" and test("^[0-9a-f]{64}$")) and
   .containerHealthy == true and
   .environmentMatched == true and
+  (.zeroStateProbe | type == "object" and
+    .schema == "meet-backend/test-vps-zero-state-probe/v1" and
+    .phase == $phase and .image == $expected_image and
+    .imageId == $expected_image_id and .sourceSha == $expected_revision and
+    .version == $expected_version and .zeroStateObserved == true and
+    .zeroState == "closed" and
+    .runtime.containerHealthy == true and
+    .runtime.topologyVerified == true and
+    .runtime.hardeningVerified == true and
+    .runtime.volumesVerified == true and
+    .runtime.postgresWritablePrimary == true and
+    .runtime.nonIdleApplicationTransactions == 0 and
+    .runtime.smtpIdleSamples == [0,0] and
+    .database.totalRows == 0 and
+    .http.meetingsStatus == 200 and .http.meetingsJson == true and
+    .http.meetingsCount == 0) and
   (.assetsCount | type == "number" and floor == . and . >= 0) and
   (.assetsVerified | type == "boolean") and
   (.adminKeyConfigured | type == "boolean") and

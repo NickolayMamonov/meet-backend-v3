@@ -440,7 +440,7 @@ jobs:
           mkdir -p "$stage/scripts"
           # verify-test-vps-assets.sh is invoked by the final verifier while
           # the remote deployment lock and rollback trap are still held.
-          for file in docker-compose.production.yml scripts/production-compose.sh scripts/production-config-digest.sh scripts/test-vps-runtime-invariants.sh scripts/update-production-release.sh scripts/deploy-test-vps-release.sh scripts/verify-test-vps-closed-beta-state.sh scripts/verify-test-vps-assets.sh scripts/validate-test-vps-phase-file.sh scripts/build-bootstrap-default-proof.sh; do mkdir -p "$stage/$(dirname "$file")"; cp -- "$file" "$stage/$file"; done
+          for file in docker-compose.production.yml scripts/production-compose.sh scripts/production-config-digest.sh scripts/test-vps-runtime-invariants.sh scripts/update-production-release.sh scripts/deploy-test-vps-release.sh scripts/verify-test-vps-closed-beta-state.sh scripts/probe-test-vps-zero-state.sh scripts/verify-test-vps-assets.sh scripts/validate-test-vps-phase-file.sh scripts/build-bootstrap-default-proof.sh; do mkdir -p "$stage/$(dirname "$file")"; cp -- "$file" "$stage/$file"; done
           tar -C "$stage" -cf "$RUNNER_TEMP/test-vps-tooling.tar" .
           ssh -F "$SSH_CONFIG" test-vps bash -s -- "$PATH_ON_HOST" "$remote" <<"REMOTE"
           set -euo pipefail
@@ -568,7 +568,20 @@ jobs:
               .schema == "meet-backend/test-vps-closed-beta-state/v1" and
               .phase == $phase and .image == $image and .imageId == $imageId and
               .revision == $revision and .version == $version and
-              .containerHealthy == true and .environmentMatched == true
+              .containerHealthy == true and .environmentMatched == true and
+              (.zeroStateProbe | type == "object" and
+                .schema == "meet-backend/test-vps-zero-state-probe/v1" and
+                .zeroStateObserved == true and .zeroState == "closed" and
+                .runtime.containerHealthy == true and
+                .runtime.topologyVerified == true and
+                .runtime.hardeningVerified == true and
+                .runtime.volumesVerified == true and
+                .runtime.postgresWritablePrimary == true and
+                .runtime.nonIdleApplicationTransactions == 0 and
+                .runtime.smtpIdleSamples == [0,0] and
+                .database.totalRows == 0 and
+                .http.meetingsStatus == 200 and
+                .http.meetingsJson == true and .http.meetingsCount == 0)
             ' "$local_file" >/dev/null
           }
           download_phase "$final_state_dir" predecessor "$previous_reference" \
@@ -677,7 +690,7 @@ jobs:
                   bootstrapMode:$bootstrap.bootstrapMode,
                   bootstrapControlPresent:$bootstrap.bootstrapControlPresent,
                   bootstrapDisabled:(if $bootstrap.bootstrapControlPresent then true else null end),
-                  healthy:$x.containerHealthy, demoZero:true
+                  zeroStateProbe:$x.zeroStateProbe
                 }
               end;
             {
@@ -706,21 +719,7 @@ jobs:
                   sameDigestRedeploy:(if $rollbackRequired then false else true end),
                   verified:$rollbackVerified
                 },
-                final:phase($final;$finalBootstrap;$finalProof),
-                probes:{
-                  meetings200Json:true,actuator404:true,httpRedirectHttps:true,
-                  adminMissing403:true,adminWrong403:true,
-                  adminKeyConfigured:$final[0].adminKeyConfigured,
-                  adminAuthenticatedDisabled404:$final[0].adminAuthenticatedDisabled404,
-                  adminBlankDisabled403:$final[0].adminBlankDisabled403,
-                  assets:{count:$final[0].assetsCount,verified:$final[0].assetsVerified}
-                },
-                runtime:{
-                  hardeningVerified:true,nonIdleApplicationTransactions:0,
-                  postgresWritablePrimary:true,smtpIdleSamples:[0,0],
-                  topologyVerified:true,volumesVerified:true,
-                  volumes:["meet-production_postgres_data","meet-production_uploads_data"]
-                }
+                final:phase($final;$finalBootstrap;$finalProof)
               },
               control:{finalVerified:true,rollbackPolicySatisfied:true}
             }

@@ -44,6 +44,8 @@ elif [ "$1" = inspect ]; then
     '{{.Image}}') printf '%s\n' "$IMAGE_ID";;
     *Config.Image*) printf '%s\n' "$IMAGE";;
     *com.docker.compose.config-hash*) printf '%s\n' "$RUNTIME_HASH";;
+    '{{.State.Running}}') printf 'true\n';;
+    '{{.State.Health.Status}}') printf 'healthy\n';;
     *) exit 1;;
   esac
 else exit 1; fi

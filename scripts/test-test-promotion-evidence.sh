@@ -41,13 +41,46 @@ jq -n \
   --arg proof "$PROOF" \
   --arg config "$CONFIG" \
   --arg runtime "$RUNTIME" '
+  def probe($digest;$id;$sourceSha;$phase;$runtimeHash):
+    {
+      schema:"meet-backend/test-vps-zero-state-probe/v1",
+      phase:$phase,image:$digest,imageId:$id,sourceSha:$sourceSha,
+      version:"1.2.0",runtimeConfigHash:$runtimeHash,
+      runtime:{
+        containerHealthy:true,hardeningVerified:true,topologyVerified:true,
+        volumesVerified:true,postgresWritablePrimary:true,
+        nonIdleApplicationTransactions:0,smtpIdleSamples:[0,0],
+        volumes:[{type:"volume",source:"meet-production_uploads_data",
+          destination:"/data/uploads",read_only:false,propagation:""}],
+        postgresVolumes:[{type:"volume",source:"meet-production_postgres_data",
+          destination:"/var/lib/postgresql/data",read_only:false,propagation:""}],
+        ports:[],networks:[]
+      },
+      database:{
+        tables:{
+          ad_block_communities:0,ad_block_users:0,ad_blocks:0,
+          communities:0,community_subscribers:0,community_tags:0,
+          demo_catalog_state:0,meeting_participants:0,meeting_tags:0,
+          meetings:0,tags:0,user_interests:0,user_social_media:0,users:0
+        },totalRows:0
+      },
+      http:{
+        actuatorStatus:404,adminAuthenticatedDisabled404:true,
+        adminBlankDisabled403:false,adminKeyConfigured:true,
+        adminMissingStatus:403,adminWrongStatus:403,assetsCount:13,
+        assetsVerified:true,httpRedirectHttps:true,meetingsCount:0,
+        meetingsJson:true,meetingsStatus:200
+      },
+      zeroStateObserved:true,zeroState:"closed"
+    };
   def phase($digest;$id;$sourceSha;$treeId;$mode;$present;$disabled):
     {
       imageDigest:$digest,imageId:$id,sourceSha:$sourceSha,treeId:$treeId,
       version:"1.2.0",bootstrapProofSha256:$proof,
       configDigest:$config,runtimeDigest:$runtime,bootstrapMode:$mode,
       bootstrapControlPresent:$present,bootstrapDisabled:$disabled,
-      healthy:true,demoZero:true
+      zeroStateProbe:probe($digest;$id;$sourceSha;
+        (if $sourceSha == $source then "candidate" else "predecessor" end);$runtime)
     };
   {
     schema:"meet-backend/test-promotion-evidence-input/v1",
@@ -82,22 +115,7 @@ jq -n \
       },
       final:phase(
         $root;$candidateId;$source;$tree;"declared-false";true;true
-      ),
-      runtime:{
-        topologyVerified:true,hardeningVerified:true,volumesVerified:true,
-        volumes:[
-          "meet-production_postgres_data","meet-production_uploads_data"
-        ],
-        postgresWritablePrimary:true,nonIdleApplicationTransactions:0,
-        smtpIdleSamples:[0,0]
-      },
-      probes:{
-        meetings200Json:true,actuator404:true,httpRedirectHttps:true,
-        adminMissing403:true,adminWrong403:true,
-        adminKeyConfigured:true,adminAuthenticatedDisabled404:true,
-        adminBlankDisabled403:false,
-        assets:{count:13,verified:true}
-      }
+      )
     },
     control:{finalVerified:true,rollbackPolicySatisfied:true}
   }
@@ -134,6 +152,23 @@ expect_failure upload-failed \
 jq '.unexpected = true' "$TMP/input.json" >"$TMP/unknown.json"
 expect_failure unknown-field \
   bash "$BUILDER" success --input "$TMP/unknown.json" \
+  --output "$TMP/rejected.json"
+
+jq '
+  .deployment.final.zeroStateProbe.database.tables.meetings = 1 |
+  .deployment.final.zeroStateProbe.database.totalRows = 1 |
+  .deployment.final.zeroStateProbe.zeroState = "populated"
+' "$TMP/input.json" >"$TMP/non-empty-state.json"
+expect_failure non-empty-state \
+  bash "$BUILDER" success --input "$TMP/non-empty-state.json" \
+  --output "$TMP/rejected.json"
+
+jq '
+  .deployment.final.zeroStateProbe.zeroState = "unknown" |
+  .deployment.final.zeroStateProbe.zeroStateObserved = false
+' "$TMP/input.json" >"$TMP/unknown-state.json"
+expect_failure unknown-state \
+  bash "$BUILDER" success --input "$TMP/unknown-state.json" \
   --output "$TMP/rejected.json"
 
 jq '.deployment.probes.responseBody = "safe-looking"' \
