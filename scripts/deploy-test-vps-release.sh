@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --root PATH --base-compose PATH --image IMAGE@sha256:DIGEST --revision SHA --version VERSION --run-key KEY --mode deploy|rollback-drill" >&2
+  echo "usage: $0 --root PATH --base-compose PATH --image IMAGE@sha256:DIGEST --revision SHA --version VERSION --run-key KEY --mode deploy|rollback-drill [--closed-beta-safety] [--public-url https://HOST]" >&2
   exit 2
 }
 
@@ -18,6 +18,8 @@ revision=
 version=
 run_key=
 mode=
+closed_beta_safety=false
+public_url=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --root) [ "$#" -ge 2 ] && [ -z "$root" ] || usage; root=$2; shift 2 ;;
@@ -27,6 +29,16 @@ while [ "$#" -gt 0 ]; do
     --version) [ "$#" -ge 2 ] && [ -z "$version" ] || usage; version=$2; shift 2 ;;
     --run-key) [ "$#" -ge 2 ] && [ -z "$run_key" ] || usage; run_key=$2; shift 2 ;;
     --mode) [ "$#" -ge 2 ] && [ -z "$mode" ] || usage; mode=$2; shift 2 ;;
+    --closed-beta-safety)
+      [ "$closed_beta_safety" = false ] || usage
+      closed_beta_safety=true
+      shift
+      ;;
+    --public-url)
+      [ "$#" -ge 2 ] && [ -z "$public_url" ] || usage
+      public_url=$2
+      shift 2
+      ;;
     *) usage ;;
   esac
 done
@@ -41,6 +53,9 @@ done
   usage
 [[ "$run_key" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || usage
 case "$mode" in deploy|rollback-drill) ;; *) usage ;; esac
+if [ -n "$public_url" ]; then
+  [[ "$public_url" =~ ^https://[^/]+$ ]] || usage
+fi
 
 for command_name in docker curl jq flock; do
   command -v "$command_name" >/dev/null 2>&1 ||
@@ -57,6 +72,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 compose_script=$script_dir/production-compose.sh
 update_script=$script_dir/update-production-release.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
+safety_hook=$script_dir/verify-test-vps-closed-beta-state.sh
 [ -x "$compose_script" ] || fail "reviewed Compose wrapper is unavailable"
 [ -x "$update_script" ] || fail "reviewed release updater is unavailable"
 [ -r "$runtime_helper" ] || fail "runtime invariant helper is unavailable"
@@ -71,6 +87,10 @@ state=$state_root/$run_key-$mode
 install -d -m 700 "$state_root"
 exec 9>"$state_root/.deploy.lock"
 flock -n 9 || fail "another test VPS deployment is active"
+if [ "$closed_beta_safety" = true ]; then
+  [ -f "$safety_hook" ] && [ ! -L "$safety_hook" ] && [ -x "$safety_hook" ] ||
+    fail "closed-beta safety hook is unavailable"
+fi
 
 # This is intentionally an existence/type-only interlock.  SMTP tooling owns
 # parsing, recovery, terminal publication, and cleanup of every object class.
@@ -118,6 +138,65 @@ if [ -e "$active_runtime" ]; then
   : >"$state/had-active-runtime"
 fi
 
+run_safety_hook() {
+  local phase=$1
+  local expected_image=$2
+  local expected_id=$3
+  local expected_revision=$4
+  local expected_version=$5
+  local expected_runtime_hash=$6
+  local output=$state/$phase.json
+  [ "$closed_beta_safety" = true ] || return 0
+  [ ! -e "$output" ] && [ ! -L "$output" ] ||
+    fail "closed-beta $phase evidence already exists"
+  safety_args=(
+    --phase "$phase"
+    --root "$root"
+    --compose-script "$compose_script"
+    --state-dir "$state"
+    --expected-image "$expected_image"
+    --expected-image-id "$expected_id"
+    --expected-revision "$expected_revision"
+    --expected-version "$expected_version"
+    --expected-runtime-hash "$expected_runtime_hash"
+  )
+  if [ -n "$public_url" ]; then
+    safety_args+=(--public-url "$public_url")
+  fi
+  "$safety_hook" "${safety_args[@]}" \
+    --output "$output" >/dev/null
+  [ -f "$output" ] && [ ! -L "$output" ] && [ -s "$output" ] ||
+    fail "closed-beta $phase evidence is unavailable"
+  chmod 600 "$output"
+  if [ "$phase" = final ] && [ -n "$public_url" ]; then
+    "$script_dir/verify-test-vps-assets.sh" \
+      --public-url "$public_url" \
+      --output "$state/frozen-assets.json" >/dev/null
+    curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+      "$public_url/meetings" | jq -e 'type == "array"' >/dev/null
+    [ "$(curl --silent --show-error --proto '=https' --tlsv1.2 \
+      -o /dev/null -w '%{http_code}' "$public_url/actuator")" = 404 ] ||
+      fail "Actuator is not private"
+    headers=$(mktemp)
+    trap 'rm -f -- "$headers"' RETURN
+    curl --silent --show-error --proto '=http' --max-time 10 \
+      -D "$headers" -o /dev/null "${public_url/https:\/\//http://}/meetings"
+    grep -Eiq '^location: https://' "$headers" ||
+      fail "HTTP does not redirect to HTTPS"
+    rm -f -- "$headers"
+    missing_admin=$(curl --silent --show-error --output /dev/null \
+      --write-out '%{http_code}' -X POST \
+      "$public_url/admin/demo-catalog/bootstrap" \
+      -H 'Content-Type: application/json' --data '{}')
+    wrong_admin=$(curl --silent --show-error --output /dev/null \
+      --write-out '%{http_code}' -X POST \
+      "$public_url/admin/demo-catalog/bootstrap" \
+      -H 'X-Admin-Key: wrong' -H 'Content-Type: application/json' --data '{}')
+    [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ] ||
+      fail "admin guard did not reject unauthenticated requests"
+  fi
+}
+
 target_id=$(docker image inspect "$image" --format '{{.Id}}')
 [ "$(docker image inspect "$image" \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision" ]
@@ -130,6 +209,8 @@ target_id=$(docker image inspect "$image" --format '{{.Id}}')
 if [ "$mode" = rollback-drill ] && [ "$target_id" = "$previous_id" ]; then
   fail "rollback drill requires a target image distinct from the predecessor"
 fi
+run_safety_hook predecessor "$previous_image" "$previous_id" \
+  "$previous_revision" "$previous_version" "$previous_runtime_hash"
 
 cat >"$state/target-runtime.override.yml" <<'YAML'
 services:
@@ -173,6 +254,8 @@ rollback() {
     fail "rollback did not restore the exact predecessor Compose runtime"
   verify_runtime_invariants "$root" "$compose_script" "$previous_id" \
     "$previous_revision" "$previous_version" "$previous_runtime_hash"
+  run_safety_hook rollback "$previous_image" "$previous_id" \
+    "$previous_revision" "$previous_version" "$previous_runtime_hash"
   echo "rollback=completed previous_image_id=$previous_id"
 }
 
@@ -199,6 +282,8 @@ target_hash=$(docker inspect "$(compose ps -q backend)" \
 [[ "$target_hash" =~ ^[0-9a-f]{64}$ ]] || fail "candidate runtime hash unavailable"
 verify_runtime_invariants "$root" "$compose_script" "$target_id" \
   "$revision" "$version" "$target_hash"
+run_safety_hook candidate "$image" "$target_id" \
+  "$revision" "$version" "$target_hash"
 echo "candidate=ready image_id=$target_id version=$version revision=$revision"
 
 if [ "$mode" = rollback-drill ]; then
@@ -206,5 +291,7 @@ if [ "$mode" = rollback-drill ]; then
   exit 86
 fi
 
+run_safety_hook final "$image" "$target_id" \
+  "$revision" "$version" "$target_hash"
 mutation_started=false
 echo "deployment=completed image_id=$target_id version=$version revision=$revision"

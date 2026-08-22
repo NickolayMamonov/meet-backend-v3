@@ -1,0 +1,92 @@
+{
+  "schema": "meet-backend/test-promotion-protected-state-input/v1",
+  "repository": "nickolaymamonov/meet-backend-v3",
+  "image": "ghcr.io/nickolaymamonov/meet-backend-v3",
+  "releases": [
+    {
+      "id": 367640510,
+      "tag_name": "v1.0.1",
+      "target_commitish": "2222222222222222222222222222222222222222",
+      "draft": false,
+      "immutable": true,
+      "protected": true,
+      "prerelease": false,
+      "published_at": "2026-08-10T23:02:54Z",
+      "assets": [
+        {"id": 1001, "name": "release-manifest.json", "size": 661, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"id": 1002, "name": "SHA256SUMS", "size": 255, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+      ]
+    },
+    {
+      "id": 371012814,
+      "tag_name": "v1.2.0",
+      "target_commitish": "1111111111111111111111111111111111111111",
+      "draft": false,
+      "immutable": true,
+      "protected": false,
+      "prerelease": false,
+      "published_at": "2026-08-12T01:00:00Z",
+      "assets": [
+        {"id": 1201, "name": "release-manifest.json", "size": 661, "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+        {"id": 1202, "name": "SHA256SUMS", "size": 255, "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}
+      ]
+    },
+    {
+      "id": 400000001,
+      "tag_name": "v9.9.9",
+      "target_commitish": "3333333333333333333333333333333333333333",
+      "draft": true,
+      "immutable": false,
+      "protected": false,
+      "prerelease": false,
+      "published_at": null,
+      "assets": [
+        {"id": 1301, "name": "candidate.json", "size": 7, "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
+      ]
+    }
+  ],
+  "tagRefs": [
+    {"tag": "v1.0.1", "state": "present", "objectType": "commit", "objectSha": "2222222222222222222222222222222222222222", "peeledCommitSha": "2222222222222222222222222222222222222222"},
+    {"tag": "v1.2.0", "state": "present", "objectType": "commit", "objectSha": "1111111111111111111111111111111111111111", "peeledCommitSha": "1111111111111111111111111111111111111111"},
+    {"tag": "v9.9.9", "state": "absent", "objectType": null, "objectSha": null, "peeledCommitSha": null}
+  ],
+  "registry": {
+    "versions": [
+      {"id": 2001, "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tags": ["1.2.0", "sha-1111111111111111111111111111111111111111", "test-sha-1111111111111111111111111111111111111111", "v1.2.0"]},
+      {"id": 2002, "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "tags": []},
+      {"id": 2003, "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "tags": ["1.0.1", "sha-2222222222222222222222222222222222222222", "v1.0.1"]},
+      {"id": 2004, "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "tags": []},
+      {"id": 2005, "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "tags": ["test-sha-3333333333333333333333333333333333333333"]},
+      {"id": 2006, "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "tags": []},
+      {"id": 2007, "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777", "tags": []},
+      {"id": 2008, "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999", "tags": ["v1.2.0"]}
+    ],
+    "subjects": [
+      {"digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "kind": "root", "releaseId": 371012814, "rootDigest": null, "platformDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aliases": ["1.2.0", "sha-1111111111111111111111111111111111111111", "test-sha-1111111111111111111111111111111111111111", "v1.2.0"]},
+      {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "kind": "platform", "releaseId": 371012814, "rootDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "platformDigest": null, "aliases": []},
+      {"digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "kind": "root", "releaseId": 367640510, "rootDigest": null, "platformDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "aliases": ["1.0.1", "sha-2222222222222222222222222222222222222222", "v1.0.1"]},
+      {"digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "kind": "platform", "releaseId": 367640510, "rootDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "platformDigest": null, "aliases": []},
+      {"digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "kind": "root", "releaseId": 400000001, "rootDigest": null, "platformDigest": null, "aliases": ["test-sha-3333333333333333333333333333333333333333"]}
+    ],
+    "manifests": [
+      {"digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "mediaType": "application/vnd.oci.image.index.v1+json", "size": 100, "subjectDigest": null, "artifactType": null, "predicateTypes": [], "children": ["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"]},
+      {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 200, "subjectDigest": null, "artifactType": null, "predicateTypes": [], "children": []},
+      {"digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "mediaType": "application/vnd.oci.image.index.v1+json", "size": 101, "subjectDigest": null, "artifactType": null, "predicateTypes": [], "children": ["sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "sha256:7777777777777777777777777777777777777777777777777777777777777777"]},
+      {"digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 201, "subjectDigest": null, "artifactType": null, "predicateTypes": [], "children": []},
+      {"digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 300, "subjectDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "artifactType": "application/vnd.in-toto+json", "predicateTypes": ["https://slsa.dev/provenance/v1"], "children": ["sha256:7777777777777777777777777777777777777777777777777777777777777777"]},
+      {"digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777", "mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 301, "subjectDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "artifactType": "application/vnd.spdx+json", "predicateTypes": ["https://spdx.dev/Document"], "children": []},
+      {"digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999", "mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 402, "subjectDigest": null, "artifactType": null, "predicateTypes": [], "children": []},
+      {"digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "mediaType": "application/vnd.oci.image.index.v1+json", "size": 403, "subjectDigest": null, "artifactType": null, "predicateTypes": [], "children": []}
+    ],
+    "attestations": [
+      {"subjectDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "predicateType": "https://slsa.dev/provenance/v1", "sourceRepository": "https://github.com/NickolayMamonov/meet-backend-v3", "sourceDigest": "1111111111111111111111111111111111111111", "workflowRef": "refs/heads/dev", "signerWorkflow": "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev", "bundleDigest": "sha256:1212121212121212121212121212121212121212121212121212121212121212"},
+      {"subjectDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "predicateType": "https://slsa.dev/provenance/v1", "sourceRepository": "https://github.com/NickolayMamonov/meet-backend-v3", "sourceDigest": "2222222222222222222222222222222222222222", "workflowRef": "refs/heads/dev", "signerWorkflow": "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev", "bundleDigest": "sha256:3434343434343434343434343434343434343434343434343434343434343434"},
+      {"subjectDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "predicateType": "https://slsa.dev/provenance/v1", "sourceRepository": "https://github.com/NickolayMamonov/meet-backend-v3", "sourceDigest": "3333333333333333333333333333333333333333", "workflowRef": "refs/heads/dev", "signerWorkflow": "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev", "bundleDigest": "sha256:5656565656565656565656565656565656565656565656565656565656565656"}
+    ]
+  },
+  "proof": {
+    "path": "docs/evidence/MEE2-48-protected-history-v1.json",
+    "sha256": "db5659e40c0b882e17d5e4f8e0218232e500134a86ecf49e6de714808de5c529",
+    "checksum": "db5659e40c0b882e17d5e4f8e0218232e500134a86ecf49e6de714808de5c529 *docs/evidence/MEE2-48-protected-history-v1.json"
+  }
+}
