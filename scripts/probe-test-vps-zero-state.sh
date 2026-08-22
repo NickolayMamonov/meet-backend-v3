@@ -147,8 +147,8 @@ fi
 hardening_verified=false
 memory=$(docker inspect "$backend" --format '{{.HostConfig.Memory}}')
 if [ "$(docker inspect "$backend" --format '{{.HostConfig.ReadonlyRootfs}}')" = true ] &&
-  [ "$(docker inspect "$backend" --format '{{.HostConfig.RestartPolicy.Name}}')" = unless-stopped &&
-  [ "$(docker inspect "$backend" --format '{{.HostConfig.LogConfig.Type}}')" = local &&
+  [ "$(docker inspect "$backend" --format '{{.HostConfig.RestartPolicy.Name}}')" = unless-stopped ] &&
+  [ "$(docker inspect "$backend" --format '{{.HostConfig.LogConfig.Type}}')" = local ] &&
   docker inspect "$backend" --format '{{json .HostConfig.CapDrop}}' |
     jq -e 'index("ALL") != null' >/dev/null &&
   docker inspect "$backend" --format '{{json .HostConfig.SecurityOpt}}' |
