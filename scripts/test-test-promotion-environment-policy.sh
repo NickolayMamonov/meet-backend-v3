@@ -21,13 +21,14 @@ done
 "$VERIFY" --input "$FIXTURES/valid-live-shape.json" | grep -Fxq 'deployment_branch=dev' ||
   fail "valid live policy shape was rejected"
 
+tmp=$(mktemp -d)
+trap 'rm -r -- "$tmp"' EXIT HUP INT TERM
 for fixture in malformed array multiple wrong-branch wrong-type; do
-  if "$VERIFY" --input "$FIXTURES/$fixture.json" >"$FIXTURES/$fixture.stdout" 2>"$FIXTURES/$fixture.stderr"; then
+  if "$VERIFY" --input "$FIXTURES/$fixture.json" >"$tmp/$fixture.stdout" 2>"$tmp/$fixture.stderr"; then
     fail "$fixture policy shape was accepted"
   fi
-  [ ! -s "$FIXTURES/$fixture.stdout" ] || fail "$fixture emitted success output"
-  [ -s "$FIXTURES/$fixture.stderr" ] || fail "$fixture did not report a validation error"
-  rm -f -- "$FIXTURES/$fixture.stdout" "$FIXTURES/$fixture.stderr"
+  [ ! -s "$tmp/$fixture.stdout" ] || fail "$fixture emitted success output"
+  [ -s "$tmp/$fixture.stderr" ] || fail "$fixture did not report a validation error"
 done
 
 grep -Fq 'verify-test-promotion-environment-policy.sh' "$WORKFLOW" ||
