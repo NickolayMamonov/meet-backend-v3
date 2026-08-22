@@ -54,3 +54,10 @@
 - [x] Add populated and unknown zero-state evidence regression fixtures.
 - [x] Rerun focused shell/fixture checks and Gradle clean build for the runtime truthfulness remediation.
 - [ ] Rerun exact-head hosted CI, independent QA/code/compliance review, and the required read-only/live gate evidence.
+
+## Approved executable-contract remediation
+
+- [x] Restore reviewed 100755 mode for every tracked shell script used by workflows, callbacks, fixtures, or staged remote tooling.
+- [x] Add a deterministic audit for workflow-direct scripts, input-command callbacks, staged remote executables, and incident upload wiring.
+- [x] Add an authorization-failure fixture proving no mutation and successful sanitized incident generation/upload selection.
+- [ ] Rerun exact-head hosted CI and obtain independent QA/code/compliance PASS evidence.

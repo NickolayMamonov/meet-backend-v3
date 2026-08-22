@@ -1,0 +1,12 @@
+{
+  "schema": "meet-backend/test-promotion-authorization-failure/v1",
+  "authorizationJob": "failed",
+  "mutationStarted": false,
+  "incidentStage": "authorization",
+  "incidentFailureClass": "internalFailure",
+  "incidentUpload": {
+    "condition": "always",
+    "ifNoFilesFound": "error",
+    "artifact": "promotion-incident.json"
+  }
+}
