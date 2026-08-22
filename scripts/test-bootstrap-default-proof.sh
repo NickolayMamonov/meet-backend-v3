@@ -83,6 +83,7 @@ proof() {
 proof candidate "$INTRO" "$TMP/candidate.jar" "$TMP/candidate.json"
 proof final "$INTRO" "$TMP/candidate.jar" "$TMP/final.json"
 proof rollback "$INTRO" "$TMP/candidate.jar" "$TMP/rollback.json"
+proof predecessor "$INTRO" "$TMP/candidate.jar" "$TMP/declared-predecessor.json"
 proof predecessor "$PREDECESSOR" "$TMP/predecessor.jar" "$TMP/predecessor.json" \
   --introduction-sha "$INTRO"
 
@@ -106,6 +107,9 @@ jq -e --arg source "$INTRO" --arg tree "$TREE" '
 ' "$TMP/candidate.json" >/dev/null
 jq -e '.bootstrapMode == "declared-false" and .phase == "final"' "$TMP/final.json" >/dev/null
 jq -e '.bootstrapMode == "declared-false" and .phase == "rollback"' "$TMP/rollback.json" >/dev/null
+jq -e '.bootstrapMode == "declared-false" and .phase == "predecessor" and
+  .bootstrapControlPresent == true and .strictAncestor == false' \
+  "$TMP/declared-predecessor.json" >/dev/null
 jq -e '.bootstrapMode == "legacy-not-applicable" and .phase == "predecessor" and
   .bootstrapControlPresent == false and .introductionSha == $intro and
   .strictAncestor == true' --arg intro "$INTRO" "$TMP/predecessor.json" >/dev/null

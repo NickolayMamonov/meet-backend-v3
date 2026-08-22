@@ -31,6 +31,10 @@ concurrency:
 env:
   IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
   PROMOTION_WORKFLOW: .github/workflows/promote-dev-digest-to-test-vps.yml
+  # Public v1.2.0 predates the bootstrap control.  This is the immutable
+  # commit that first declares it; the deploy job verifies the predecessor
+  # ancestry before producing the legacy proof.
+  PUBLIC_V1_2_0_BOOTSTRAP_INTRODUCTION_SHA: a8aa869dafc7b23178c6c505ef07faa720a8b923
 
 jobs:
   authorize:
@@ -503,79 +507,105 @@ admission_mode=$mode
           mutation_started=true
           echo "mutation_started=true" >>"$GITHUB_OUTPUT"
           ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final" --mode deploy --closed-beta-safety --public-url "$PUBLIC_URL"
-          remote_state=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
-            "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" <<'REMOTE'
+          state_root=/var/lib/meet-test-vps-deploy
+          rollback_state_dir="$state_root/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-rollback-drill"
+          final_state_dir="$state_root/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final-deploy"
+          ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+            "$rollback_state_dir" "$final_state_dir" <<'REMOTE'
           set -euo pipefail
-          prefix=$1
-          mapfile -t states < <(
-            find /var/lib/meet-test-vps-deploy -mindepth 1 -maxdepth 1 -type d \
-              -name "$prefix*" -print | sort
-          )
-          [ "${#states[@]}" -ge 1 ] && [ "${#states[@]}" -le 2 ]
-          printf '%s\n' "${states[@]}"
+          [ -d "$1" ] && [ ! -L "$1" ]
+          [ -d "$2" ] && [ ! -L "$2" ]
+          REMOTE
+          previous_revision=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+            "$final_state_dir/previous-revision" <<'REMOTE'
+          set -euo pipefail
+          [ -f "$1" ] && [ ! -L "$1" ]
+          cat "$1"
           REMOTE
           )
-          previous_revision=
-          previous_version=
-          while IFS= read -r state_dir; do
-            [ -n "$state_dir" ] || continue
-            previous_revision=$(ssh -F "$SSH_CONFIG" test-vps "cat '$state_dir/previous-revision'")
-            previous_version=$(ssh -F "$SSH_CONFIG" test-vps "cat '$state_dir/previous-version'")
-            for phase in predecessor candidate rollback final; do
-              remote_phase="$state_dir/$phase.json"
-              case "$phase" in
-                predecessor|rollback)
-                  expected_image="$previous_reference"
-                  expected_id="$previous_id"
-                  expected_revision="$previous_revision"
-                  expected_version="$previous_version"
-                  ;;
-                candidate|final)
-                  expected_image="$IMAGE@$IMAGE_DIGEST"
-                  expected_id="$target_id"
-                  expected_revision="$SOURCE_SHA"
-                  expected_version="$VERSION"
-                  ;;
-              esac
-              if ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/validate-test-vps-phase-file.sh" \
-                --root "$PATH_ON_HOST" --state-dir "$state_dir" --phase "$phase" \
-                --expected-image "$expected_image" --expected-image-id "$expected_id" \
-                --expected-revision "$expected_revision" --expected-version "$expected_version" \
-                --output "$remote_phase"; then
-                scp -F "$SSH_CONFIG" "test-vps:$remote_phase" \
-                  "$RUNNER_TEMP/$phase.json"
-                jq -e --arg phase "$phase" '
-                  type == "object" and
-                  .schema == "meet-backend/test-vps-closed-beta-state/v1" and
-                  .phase == $phase and .containerHealthy == true and
-                  .environmentMatched == true
-                ' "$RUNNER_TEMP/$phase.json" >/dev/null
-              fi
-            done
-          done <<<"$remote_state"
+          previous_version=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+            "$final_state_dir/previous-version" <<'REMOTE'
+          set -euo pipefail
+          [ -f "$1" ] && [ ! -L "$1" ]
+          cat "$1"
+          REMOTE
+          )
+          [[ "$previous_revision" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$previous_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          git fetch --no-tags origin "$previous_revision" \
+            "$PUBLIC_V1_2_0_BOOTSTRAP_INTRODUCTION_SHA"
+          if [ "$previous_version" = 1.2.0 ]; then
+            git merge-base --is-ancestor "$previous_revision" \
+              "$PUBLIC_V1_2_0_BOOTSTRAP_INTRODUCTION_SHA"
+            ! git merge-base --is-ancestor \
+              "$PUBLIC_V1_2_0_BOOTSTRAP_INTRODUCTION_SHA" "$previous_revision"
+          fi
+          predecessor_introduction_args=(
+            --introduction-sha "$PUBLIC_V1_2_0_BOOTSTRAP_INTRODUCTION_SHA"
+          )
+          download_phase() {
+            local state_dir=$1 phase=$2 expected_image=$3 expected_id=$4
+            local expected_revision=$5 expected_version=$6 local_file remote_file
+            remote_file="$state_dir/$phase.json"
+            local_file="$RUNNER_TEMP/$phase.json"
+            ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/validate-test-vps-phase-file.sh" \
+              --root "$PATH_ON_HOST" --state-dir "$state_dir" --phase "$phase" \
+              --expected-image "$expected_image" --expected-image-id "$expected_id" \
+              --expected-revision "$expected_revision" --expected-version "$expected_version" \
+              --output "$remote_file"
+            remote_sha=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote_file" <<'REMOTE'
+          set -euo pipefail
+          sha256sum -- "$1" | awk '{print $1}'
+          REMOTE
+            )
+            [[ "$remote_sha" =~ ^[0-9a-f]{64}$ ]]
+            scp -F "$SSH_CONFIG" "test-vps:$remote_file" "$local_file"
+            local_sha=$(sha256sum "$local_file" | awk '{print $1}')
+            [ "$local_sha" = "$remote_sha" ]
+            jq -e --arg phase "$phase" --arg image "$expected_image" \
+              --arg imageId "$expected_id" --arg revision "$expected_revision" \
+              --arg version "$expected_version" '
+              type == "object" and
+              .schema == "meet-backend/test-vps-closed-beta-state/v1" and
+              .phase == $phase and .image == $image and .imageId == $imageId and
+              .revision == $revision and .version == $version and
+              .containerHealthy == true and .environmentMatched == true
+            ' "$local_file" >/dev/null
+          }
+          download_phase "$final_state_dir" predecessor "$previous_reference" \
+            "$previous_id" "$previous_revision" "$previous_version"
+          download_phase "$final_state_dir" candidate "$IMAGE@$IMAGE_DIGEST" \
+            "$target_id" "$SOURCE_SHA" "$VERSION"
+          if [ "$previous_id" != "$target_id" ]; then
+            download_phase "$rollback_state_dir" rollback "$previous_reference" \
+              "$previous_id" "$previous_revision" "$previous_version"
+          fi
+          download_phase "$final_state_dir" final "$IMAGE@$IMAGE_DIGEST" \
+            "$target_id" "$SOURCE_SHA" "$VERSION"
           for phase in predecessor candidate final; do
             test -s "$RUNNER_TEMP/$phase.json"
           done
           if [ "$previous_id" != "$target_id" ]; then
             test -s "$RUNNER_TEMP/rollback.json"
           fi
-          for phase in predecessor rollback; do
-            if [ -s "$RUNNER_TEMP/$phase.json" ]; then
-              proof_sha=$(jq -r '.revision' "$RUNNER_TEMP/$phase.json")
-              proof_image=$(jq -r '.image' "$RUNNER_TEMP/$phase.json")
-              proof_checkout="$RUNNER_TEMP/bootstrap-source-$phase"
-              git fetch --no-tags origin "$proof_sha"
-              git worktree add --detach "$proof_checkout" "$proof_sha" >/dev/null
-              docker pull "$proof_image" >/dev/null
-              scripts/build-bootstrap-default-proof.sh \
-                --source-checkout "$proof_checkout" \
-                --source-sha "$proof_sha" \
-                --image-ref "$proof_image" \
-                --phase "$phase" \
-                --output "$RUNNER_TEMP/bootstrap-$phase.json"
-              git worktree remove "$proof_checkout"
-            fi
-          done
+          proof_sha=$(jq -r '.revision' "$RUNNER_TEMP/predecessor.json")
+          proof_image=$(jq -r '.image' "$RUNNER_TEMP/predecessor.json")
+          proof_checkout="$RUNNER_TEMP/bootstrap-source-predecessor"
+          git fetch --no-tags origin "$proof_sha"
+          git worktree add --detach "$proof_checkout" "$proof_sha" >/dev/null
+          docker pull "$proof_image" >/dev/null
+          scripts/build-bootstrap-default-proof.sh \
+            --source-checkout "$proof_checkout" \
+            --source-sha "$proof_sha" \
+            --image-ref "$proof_image" \
+            --phase predecessor \
+            --output "$RUNNER_TEMP/bootstrap-predecessor.json" \
+            "${predecessor_introduction_args[@]}"
+          git worktree remove "$proof_checkout"
+          cp -- "$RUNNER_TEMP/bootstrap-predecessor.json" \
+            "$RUNNER_TEMP/bootstrap-rollback.json"
+          cmp -- "$RUNNER_TEMP/bootstrap-predecessor.json" \
+            "$RUNNER_TEMP/bootstrap-rollback.json"
           scripts/build-bootstrap-default-proof.sh \
             --source-checkout "$GITHUB_WORKSPACE" \
             --source-sha "$SOURCE_SHA" \
@@ -586,8 +616,6 @@ admission_mode=$mode
           cand_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-candidate.json" | awk '{print $1}')
           final_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-final.json" | awk '{print $1}')
           rollback_proof="$pre_proof"
-          [ ! -s "$RUNNER_TEMP/bootstrap-rollback.json" ] || \
-            rollback_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-rollback.json" | awk '{print $1}')
           rollback_required=false
           [ "$previous_id" = "$target_id" ] || rollback_required=true
           rollback_verified=${rollback_verified:-false}
@@ -595,6 +623,9 @@ admission_mode=$mode
             --slurpfile predecessor "$RUNNER_TEMP/predecessor.json" \
             --slurpfile candidate "$RUNNER_TEMP/candidate.json" \
             --slurpfile final "$RUNNER_TEMP/final.json" \
+            --slurpfile predecessorBootstrap "$RUNNER_TEMP/bootstrap-predecessor.json" \
+            --slurpfile candidateBootstrap "$RUNNER_TEMP/bootstrap-candidate.json" \
+            --slurpfile finalBootstrap "$RUNNER_TEMP/bootstrap-final.json" \
             --slurpfile authority "$RUNNER_TEMP/dev-promotion-source-deploy.json" \
             --arg source "$SOURCE_SHA" --arg tree "${{ needs.authorize.outputs.tree_id }}" \
             --arg version "$VERSION" --arg image "$IMAGE" --arg alias "test-sha-$SOURCE_SHA" \
@@ -606,19 +637,50 @@ admission_mode=$mode
             --argjson rollbackRequired "$rollback_required" \
             --argjson rollbackAttempted "$rollback_attempted" \
             --argjson rollbackVerified "$rollback_verified" '
-            def phase($p;$proof;$candidate):
-              ($p[0]) as $x |
-              {
-                imageDigest:($x.image | split("@")[1]), imageId:$x.imageId,
-                sourceSha:(if $candidate then $source else $x.revision end),
-                treeId:$tree, version:$x.version,
-                bootstrapProofSha256:$proof, configDigest:$x.runtimeConfigHash,
-                runtimeDigest:$x.runtimeConfigHash,
-                bootstrapMode:(if $candidate then "declared-false" else "legacy-not-applicable" end),
-                bootstrapControlPresent:$candidate,
-                bootstrapDisabled:(if $candidate then true else null end),
-                healthy:$x.containerHealthy, demoZero:true
-              };
+            def exact_keys($keys): (keys | sort) == ($keys | sort);
+            def proof($doc):
+              ($doc[0]) as $proof |
+              if ($proof | type == "object" and exact_keys([
+                    "bootstrapControlPresent","bootstrapMode","effectiveDefault",
+                    "imageDigest","imageId","introductionSha",
+                    "jarProductionSha256","jarPropertiesSha256","phase",
+                    "platform","schema","sourceProductionSha256",
+                    "sourcePropertiesSha256","sourceSha","strictAncestor",
+                    "treeId","version"
+                  ]) and
+                  .schema == "meet-backend/test-promotion-bootstrap-proof/v1" and
+                  (.imageDigest | test("^sha256:[0-9a-f]{64}$")) and
+                  (.imageId | test("^sha256:[0-9a-f]{64}$")) and
+                  (.sourceSha | test("^[0-9a-f]{40}$")) and
+                  (.treeId | test("^[0-9a-f]{40}$")) and
+                  (.version | test("^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$")) and
+                  (.bootstrapMode == "declared-false" or
+                   .bootstrapMode == "legacy-not-applicable") and
+                  (.bootstrapControlPresent | type == "boolean") and
+                  (.effectiveDefault == false) and
+                  (.strictAncestor | type == "boolean"))
+              then $proof else error("bootstrap proof is invalid") end;
+            def phase($p;$b;$proofSha):
+              ($p[0]) as $x | proof($b) as $bootstrap |
+              if (($x.image | split("@")[1]) != $bootstrap.imageDigest or
+                  $x.imageId != $bootstrap.imageId or
+                  $x.revision != $bootstrap.sourceSha or
+                  $x.version != $bootstrap.version)
+              then error("phase is not bound to its bootstrap proof")
+              else
+                {
+                  imageDigest:($x.image | split("@")[1]), imageId:$x.imageId,
+                  sourceSha:$bootstrap.sourceSha, treeId:$bootstrap.treeId,
+                  version:$bootstrap.version,
+                  bootstrapProofSha256:$proofSha,
+                  configDigest:$x.runtimeConfigHash,
+                  runtimeDigest:$x.runtimeConfigHash,
+                  bootstrapMode:$bootstrap.bootstrapMode,
+                  bootstrapControlPresent:$bootstrap.bootstrapControlPresent,
+                  bootstrapDisabled:(if $bootstrap.bootstrapControlPresent then true else null end),
+                  healthy:$x.containerHealthy, demoZero:true
+                }
+              end;
             {
               schema:"meet-backend/test-promotion-evidence-input/v1",
               source:{
@@ -636,8 +698,8 @@ admission_mode=$mode
                 referrerClosure:true,protectedStateEqual:true
               },
               deployment:{
-                predecessor:phase($predecessor;$predecessorProof;false),
-                candidate:phase($candidate;$candidateProof;true),
+                predecessor:phase($predecessor;$predecessorBootstrap;$predecessorProof),
+                candidate:phase($candidate;$candidateBootstrap;$candidateProof),
                 rollback:{
                   attempted:$rollbackAttempted,required:$rollbackRequired,
                   restoredImageId:(if $rollbackRequired then $previousId else null end),
@@ -645,7 +707,7 @@ admission_mode=$mode
                   sameDigestRedeploy:(if $rollbackRequired then false else true end),
                   verified:$rollbackVerified
                 },
-                final:phase($final;$finalProof;true),
+                final:phase($final;$finalBootstrap;$finalProof),
                 probes:{
                   meetings200Json:true,actuator404:true,httpRedirectHttps:true,
                   adminMissing403:true,adminWrong403:true,

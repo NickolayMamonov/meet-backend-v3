@@ -159,6 +159,7 @@ validate_success_input() {
         (.verified | type == "boolean") and
         (.sameDigestRedeploy | type == "boolean") and
         (.restoredImageId == null or (.restoredImageId | digest)) and
+        (.bootstrapProofSha256 == $root.deployment.predecessor.bootstrapProofSha256) and
         (
           if .required
           then .attempted and .verified and

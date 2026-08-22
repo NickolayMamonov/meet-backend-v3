@@ -247,7 +247,8 @@ fi
 for name in application.yml application-prod.yml; do
   entry=BOOT-INF/classes/$name
   entries=$(zipinfo -1 "$JAR" 2>/dev/null) || fail "application JAR is malformed"
-  [ "$(printf '%s\n' "$entries" | awk -v e="$entry" '$0==e {n++} END {print n+0}')" -eq 1 ] ||
+  entry_count=$(printf '%s\n' "$entries" | grep -Fxc "$entry" || true)
+  [ "${entry_count:-0}" -eq 1 ] ||
     fail "application JAR entry is missing or duplicated"
   unzip -p "$JAR" "$entry" >"$TMP/jar-$name" 2>/dev/null ||
     fail "application JAR entry extraction failed"
@@ -283,6 +284,15 @@ case "$FIRST" in
     sha "$INTRO" || fail "legacy introduction SHA is unavailable"
     [ "$INTRO" != "$SOURCE_SHA" ] || fail "legacy source is not a strict ancestor"
     [ "$ANCESTOR" = true ] || fail "legacy source is not a strict ancestor"
+    if [ -n "$CHECKOUT" ]; then
+      for name in application.yml application-prod.yml; do
+        "$GIT" -C "$CHECKOUT" show "$INTRO:src/main/resources/$name" \
+          >"$(src_file "introduction-$name")" 2>/dev/null ||
+          fail "introduction source bootstrap file is unavailable"
+        [ "$(classify "$(src_file "introduction-$name")")" = declared ] ||
+          fail "introduction SHA does not declare bootstrap control"
+      done
+    fi
     MODE=legacy-not-applicable
     ;;
   *) fail "bootstrap mode is unavailable" ;;

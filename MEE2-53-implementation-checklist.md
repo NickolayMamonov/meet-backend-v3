@@ -36,3 +36,12 @@
 - [x] Validate remote phase files against a closed schema and expected image identity before retrieval.
 - [x] Preserve blank `ADMIN_API_KEY` disabled behavior without putting the key in process arguments.
 - [ ] Rerun exact-head hosted CI and obtain independent QA, code, and compliance PASS evidence.
+
+## Final approved defect remediation
+
+- [x] Verify the real public v1.2.0 bootstrap-control introduction SHA and strict legacy predecessor ancestry.
+- [x] Bind predecessor/candidate/final evidence identity and bootstrap mode to canonical bootstrap proofs.
+- [x] Reuse the canonical predecessor proof for rollback without rebuilding or substituting it.
+- [x] Retrieve only fixed remote phase paths and compare downloaded SHA-256 before local evidence validation.
+- [x] Add legacy-not-applicable, declared-false, proof-mismatch, and rollback-reuse fixtures.
+- [ ] Run exact-head hosted Backend CI and repeat independent QA/compliance review.

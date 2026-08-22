@@ -155,6 +155,24 @@ expect_failure unproven-rollback \
   bash "$BUILDER" success --input "$TMP/unproven-rollback.json" \
   --output "$TMP/rejected.json"
 
+jq '.deployment.rollback.bootstrapProofSha256 =
+  "0000000000000000000000000000000000000000000000000000000000000000"' \
+  "$TMP/input.json" >"$TMP/rollback-proof-mismatch.json"
+expect_failure rollback-proof-mismatch \
+  bash "$BUILDER" success --input "$TMP/rollback-proof-mismatch.json" \
+  --output "$TMP/rejected.json"
+
+jq '
+  .deployment.predecessor.bootstrapMode = "declared-false" |
+  .deployment.predecessor.bootstrapControlPresent = true |
+  .deployment.predecessor.bootstrapDisabled = true |
+  .deployment.predecessor.bootstrapProofSha256 =
+    "0000000000000000000000000000000000000000000000000000000000000000"
+' "$TMP/input.json" >"$TMP/declared-false-predecessor-mismatch.json"
+expect_failure declared-false-predecessor-mismatch \
+  bash "$BUILDER" success --input "$TMP/declared-false-predecessor-mismatch.json" \
+  --output "$TMP/rejected.json"
+
 jq --arg proof "$PROOF" '
   .deployment.rollback = {
     bootstrapProofSha256:$proof,
