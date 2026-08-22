@@ -130,11 +130,13 @@ validate_success_input() {
          then .adminAuthenticatedDisabled404 == true and .adminBlankDisabled403 == false
          else .adminAuthenticatedDisabled404 == false and .adminBlankDisabled403 == true
          end) and .assetsCount == 13 and .assetsVerified == true);
-    def phase:
+    def phase($expectedPhase):
+      . as $phaseDoc |
       type == "object" and exact_keys([
         "bootstrapControlPresent","bootstrapDisabled","bootstrapMode",
-        "bootstrapProofSha256","configDigest","imageDigest","imageId",
-        "runtimeDigest","sourceSha","treeId","version","zeroStateProbe"
+        "bootstrapProofSha256","configDigest","demoZero","healthy",
+        "imageDigest","imageId","runtimeDigest","sourceSha","treeId",
+        "version","zeroStateProbe"
       ]) and
       (.imageDigest | digest) and (.imageId | digest) and
       (.sourceSha | sha) and (.treeId | sha) and (.version | semver) and
@@ -144,17 +146,26 @@ validate_success_input() {
        .bootstrapMode == "legacy-not-applicable") and
       (.bootstrapControlPresent | type == "boolean") and
       (.bootstrapDisabled == null or (.bootstrapDisabled | type == "boolean")) and
-      (.zeroStateProbe | probe) and
-      .zeroStateProbe.image == .imageDigest and
-      .zeroStateProbe.imageId == .imageId and
-      .zeroStateProbe.sourceSha == .sourceSha and
-      .zeroStateProbe.version == .version and
-      .zeroStateProbe.runtimeConfigHash == .runtimeDigest and
+      (.healthy | type == "boolean") and (.demoZero | type == "boolean") and
+      ($phaseDoc.zeroStateProbe | probe) and
+      $phaseDoc.zeroStateProbe.phase == $expectedPhase and
+      $phaseDoc.zeroStateProbe.image == $phaseDoc.imageDigest and
+      $phaseDoc.zeroStateProbe.imageId == $phaseDoc.imageId and
+      $phaseDoc.zeroStateProbe.sourceSha == $phaseDoc.sourceSha and
+      $phaseDoc.zeroStateProbe.version == $phaseDoc.version and
+      $phaseDoc.zeroStateProbe.runtimeConfigHash == $phaseDoc.runtimeDigest and
+      $phaseDoc.healthy == $phaseDoc.zeroStateProbe.runtime.containerHealthy and
+      $phaseDoc.demoZero == ($phaseDoc.zeroStateProbe.zeroState == "closed") and
       (if .bootstrapMode == "declared-false"
        then .bootstrapControlPresent == true and .bootstrapDisabled == true
        else .bootstrapControlPresent == false and .bootstrapDisabled == null
        end);
     . as $root |
+    ($root.deployment.final.zeroStateProbe) as $finalProbe |
+    ($root.deployment) as $deployment |
+    ($deployment.runtime) as $runtime |
+    ($deployment.probes) as $probes |
+    ($deployment.rollback) as $rollback |
     type == "object" and (keys | length) == 5 and exact_keys([
       "control","deployment","image","schema","source"
     ]) and
@@ -181,42 +192,84 @@ validate_success_input() {
       .provenance == true and .sbom == true and
       .githubAttestation == true and .referrerClosure == true and
       .protectedStateEqual == true) and
-    (.deployment | type == "object" and exact_keys([
-      "candidate","final","predecessor","rollback"
-    ]) and
-      (.predecessor | phase) and (.candidate | phase) and (.final | phase) and
-      .candidate.bootstrapMode == "declared-false" and
-      .candidate.bootstrapControlPresent == true and
-      .candidate.bootstrapDisabled == true and
-      .candidate.zeroStateProbe.zeroState == "closed" and
-      .candidate.imageDigest == $root.image.rootDigest and
-      .candidate.sourceSha == $root.source.sourceSha and
-      .candidate.treeId == $root.source.treeId and
-      .candidate.version == $root.source.version and
-      .final.bootstrapMode == "declared-false" and
-      .final.bootstrapControlPresent == true and
-      .final.bootstrapDisabled == true and
-      .final.zeroStateProbe.zeroState == "closed" and
-      .final.imageDigest == $root.image.rootDigest and
-      .final.sourceSha == $root.source.sourceSha and
-      .final.treeId == $root.source.treeId and
-      .final.version == $root.source.version and
-      (.rollback | type == "object" and exact_keys([
-        "attempted","bootstrapProofSha256","required","restoredImageId",
-        "sameDigestRedeploy","verified"
-      ]) and
-        (.bootstrapProofSha256 | hex_digest) and
-        (.required | type == "boolean") and (.attempted | type == "boolean") and
-        (.verified | type == "boolean") and (.sameDigestRedeploy | type == "boolean") and
-        (.restoredImageId == null or (.restoredImageId | digest)) and
-        (.bootstrapProofSha256 == $root.deployment.predecessor.bootstrapProofSha256) and
-        (if .required
-         then .attempted and .verified and (.sameDigestRedeploy | not) and
-           .restoredImageId == $root.deployment.predecessor.imageId
-         else (.attempted | not) and (.verified | not) and
-           .sameDigestRedeploy and .restoredImageId == null
-         end))
-    ) and
+    ($deployment | type == "object") and
+    (($deployment | keys | sort) == ([
+      "candidate","final","predecessor","probes","rollback","runtime"
+    ] | sort)) and
+    ($deployment.predecessor | phase("predecessor")) and
+    ($deployment.candidate | phase("candidate")) and
+    ($deployment.final | phase("final")) and
+    $deployment.candidate.bootstrapMode == "declared-false" and
+    $deployment.candidate.bootstrapControlPresent == true and
+    $deployment.candidate.bootstrapDisabled == true and
+    $deployment.candidate.zeroStateProbe.zeroState == "closed" and
+    $deployment.candidate.imageDigest == $root.image.rootDigest and
+    $deployment.candidate.sourceSha == $root.source.sourceSha and
+    $deployment.candidate.treeId == $root.source.treeId and
+    $deployment.candidate.version == $root.source.version and
+    $deployment.final.bootstrapMode == "declared-false" and
+    $deployment.final.bootstrapControlPresent == true and
+    $deployment.final.bootstrapDisabled == true and
+    $deployment.final.zeroStateProbe.zeroState == "closed" and
+    $deployment.final.imageDigest == $root.image.rootDigest and
+    $deployment.final.sourceSha == $root.source.sourceSha and
+    $deployment.final.treeId == $root.source.treeId and
+    $deployment.final.version == $root.source.version and
+    ($runtime | type == "object") and
+    (($runtime | keys | sort) == ([
+      "hardeningVerified","nonIdleApplicationTransactions",
+      "postgresWritablePrimary","smtpIdleSamples","topologyVerified",
+      "volumes","volumesVerified"
+    ] | sort)) and
+    $runtime.topologyVerified == $finalProbe.runtime.topologyVerified and
+    $runtime.hardeningVerified == $finalProbe.runtime.hardeningVerified and
+    $runtime.volumesVerified == $finalProbe.runtime.volumesVerified and
+    $runtime.postgresWritablePrimary == $finalProbe.runtime.postgresWritablePrimary and
+    $runtime.nonIdleApplicationTransactions ==
+      $finalProbe.runtime.nonIdleApplicationTransactions and
+    $runtime.smtpIdleSamples == $finalProbe.runtime.smtpIdleSamples and
+    $runtime.volumes == (($finalProbe.runtime.volumes +
+      $finalProbe.runtime.postgresVolumes) | map(.source) | sort) and
+    ($probes | type == "object") and
+    (($probes | keys | sort) == ([
+      "actuator404","adminAuthenticatedDisabled404","adminBlankDisabled403",
+      "adminKeyConfigured","adminMissing403","adminWrong403","assets",
+      "httpRedirectHttps","meetings200Json"
+    ] | sort)) and
+    $probes.actuator404 == ($finalProbe.http.actuatorStatus == 404) and
+    $probes.adminAuthenticatedDisabled404 ==
+      $finalProbe.http.adminAuthenticatedDisabled404 and
+    $probes.adminBlankDisabled403 == $finalProbe.http.adminBlankDisabled403 and
+    $probes.adminKeyConfigured == $finalProbe.http.adminKeyConfigured and
+    $probes.adminMissing403 == ($finalProbe.http.adminMissingStatus == 403) and
+    $probes.adminWrong403 == ($finalProbe.http.adminWrongStatus == 403) and
+    $probes.httpRedirectHttps == $finalProbe.http.httpRedirectHttps and
+    $probes.meetings200Json == ($finalProbe.http.meetingsStatus == 200 and
+      $finalProbe.http.meetingsJson == true and
+      $finalProbe.http.meetingsCount == 0) and
+    ($probes.assets == {
+      count:$finalProbe.http.assetsCount,
+      verified:$finalProbe.http.assetsVerified
+    }) and
+    ($rollback | type == "object") and
+    (($rollback | keys | sort) == ([
+      "attempted","bootstrapProofSha256","required","restoredImageId",
+      "sameDigestRedeploy","verified"
+    ] | sort)) and
+    ($rollback.bootstrapProofSha256 | hex_digest) and
+    ($rollback.required | type == "boolean") and
+    ($rollback.attempted | type == "boolean") and
+    ($rollback.verified | type == "boolean") and
+    ($rollback.sameDigestRedeploy | type == "boolean") and
+    ($rollback.restoredImageId == null or ($rollback.restoredImageId | digest)) and
+    ($rollback.bootstrapProofSha256 == $deployment.predecessor.bootstrapProofSha256) and
+    (if $rollback.required
+     then $rollback.attempted and $rollback.verified and
+       ($rollback.sameDigestRedeploy | not) and
+       $rollback.restoredImageId == $deployment.predecessor.imageId
+     else ($rollback.attempted | not) and ($rollback.verified | not) and
+       $rollback.sameDigestRedeploy and $rollback.restoredImageId == null
+     end) and
     (.control | type == "object" and exact_keys([
       "finalVerified","rollbackPolicySatisfied"
     ]) and .finalVerified == true and .rollbackPolicySatisfied == true)
@@ -247,9 +300,11 @@ validate_success_evidence() {
       schema:"meet-backend/test-promotion-evidence-input/v1",
       source:.source,image:.image,
       deployment:{
-        predecessor:(.deployment.predecessor | del(.healthy,.demoZero)),
-        candidate:(.deployment.candidate | del(.healthy,.demoZero)),
-        final:(.deployment.final | del(.healthy,.demoZero)),
+        predecessor:.deployment.predecessor,
+        candidate:.deployment.candidate,
+        final:.deployment.final,
+        runtime:.deployment.runtime,
+        probes:.deployment.probes,
         rollback:.deployment.rollback
       },
       control:.control

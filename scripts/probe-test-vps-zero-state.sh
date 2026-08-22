@@ -29,6 +29,10 @@ expected_version=
 expected_runtime_hash=
 public_url=
 output=
+meetings_body=
+headers=
+admin_config=
+temporary=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --phase) [ "$#" -ge 2 ] || usage; phase=$2; shift 2 ;;
@@ -210,9 +214,19 @@ postgres_writable_primary=$(query_metric \
 [ "$postgres_writable_primary" = 1 ] ||
   fail "PostgreSQL is not a writable primary"
 
+cleanup() {
+  local path
+  for path in "$temporary" "$meetings_body" "$headers" "$admin_config"; do
+    if [ -n "$path" ]; then
+      rm -f -- "$path"
+    fi
+  done
+}
+
 meetings_body=$(mktemp)
-trap 'rm -f -- "$meetings_body" "$headers"' EXIT HUP INT TERM
-meetings_status=$(curl --silent --show-error --output "$meetings_body" \
+trap cleanup EXIT HUP INT TERM
+meetings_status=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+  --output "$meetings_body" \
   --write-out '%{http_code}' --proto '=https' --tlsv1.2 "$public_url/meetings") ||
   fail "meetings HTTP probe failed"
 [ "$meetings_status" = 200 ] || fail "meetings HTTP status was not 200"
@@ -220,18 +234,21 @@ meetings_json=$(jq -c 'if type == "array" then . else error("not an array") end'
   "$meetings_body") || fail "meetings response was not a JSON array"
 meetings_json_valid=true
 meetings_count=$(jq 'length' <<<"$meetings_json")
-actuator_status=$(curl --silent --show-error --output /dev/null \
+actuator_status=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+  --output /dev/null \
   --write-out '%{http_code}' --proto '=https' --tlsv1.2 "$public_url/actuator")
 headers=$(mktemp)
-curl --silent --show-error --proto '=http' --max-time 10 \
+curl --silent --show-error --connect-timeout 10 --proto '=http' --max-time 10 \
   -D "$headers" -o /dev/null "${public_url/https:\/\//http://}/meetings" ||
   fail "HTTP redirect probe failed"
 http_redirect_https=false
 grep -Eiq '^location: https://' "$headers" && http_redirect_https=true
-missing_admin=$(curl --silent --show-error --output /dev/null \
+missing_admin=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+  --output /dev/null \
   --write-out '%{http_code}' -X POST "$public_url/admin/demo-catalog/bootstrap" \
   -H 'Content-Type: application/json' --data '{}')
-wrong_admin=$(curl --silent --show-error --output /dev/null \
+wrong_admin=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+  --output /dev/null \
   --write-out '%{http_code}' -X POST "$public_url/admin/demo-catalog/bootstrap" \
   -H 'X-Admin-Key: wrong' -H 'Content-Type: application/json' --data '{}')
 admin_key_configured=false
@@ -246,11 +263,13 @@ if [ -n "$admin_key" ]; then
   chmod 600 "$admin_config"
   printf 'header = "X-Admin-Key: %s"\n' "$admin_key" >"$admin_config"
   unset admin_key
-  authenticated_admin=$(curl --silent --show-error --output /dev/null \
+  authenticated_admin=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+    --output /dev/null \
     --write-out '%{http_code}' -X POST --config "$admin_config" \
     "$public_url/admin/demo-catalog/bootstrap" \
     -H 'Content-Type: application/json' --data '{}')
   rm -f -- "$admin_config"
+  admin_config=
   [ "$authenticated_admin" = 404 ] ||
     fail "authenticated disabled admin endpoint is not absent"
   admin_key_configured=true
@@ -285,10 +304,10 @@ elif [ "$container_healthy" = true ] &&
 fi
 
 temporary="$output.tmp.$$"
-trap 'rm -f -- "$temporary" "$meetings_body" "$headers"' EXIT HUP INT TERM
+trap cleanup EXIT HUP INT TERM
 jq -cnS \
   --arg schema "meet-backend/test-vps-zero-state-probe/v1" \
-  --arg phase "$phase" --arg image "$expected_image" --arg imageId "$expected_image_id" \
+  --arg phase "$phase" --arg image "${expected_image##*@}" --arg imageId "$expected_image_id" \
   --arg sourceSha "$expected_revision" --arg version "$expected_version" \
   --arg runtimeHash "$expected_runtime_hash" --arg zeroState "$zero_state" \
   --argjson containerHealthy "$container_healthy" \

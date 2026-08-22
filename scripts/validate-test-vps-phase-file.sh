@@ -86,7 +86,9 @@ jq -e --arg phase "$phase" \
   .environmentMatched == true and
   (.zeroStateProbe | type == "object" and
     .schema == "meet-backend/test-vps-zero-state-probe/v1" and
-    .phase == $phase and .image == $expected_image and
+    .phase == $phase and
+    (if $expected_image == "" then true
+     else .image == ($expected_image | split("@")[1]) end) and
     .imageId == $expected_image_id and .sourceSha == $expected_revision and
     .version == $expected_version and .zeroStateObserved == true and
     .zeroState == "closed" and

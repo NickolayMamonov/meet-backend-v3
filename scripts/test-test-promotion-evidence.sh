@@ -73,14 +73,16 @@ jq -n \
       },
       zeroStateObserved:true,zeroState:"closed"
     };
-  def phase($digest;$id;$sourceSha;$treeId;$mode;$present;$disabled):
+  def phase($digest;$id;$sourceSha;$treeId;$mode;$present;$disabled;$probePhase):
+    probe($digest;$id;$sourceSha;$probePhase;$runtime) as $observed |
     {
       imageDigest:$digest,imageId:$id,sourceSha:$sourceSha,treeId:$treeId,
       version:"1.2.0",bootstrapProofSha256:$proof,
       configDigest:$config,runtimeDigest:$runtime,bootstrapMode:$mode,
       bootstrapControlPresent:$present,bootstrapDisabled:$disabled,
-      zeroStateProbe:probe($digest;$id;$sourceSha;
-        (if $sourceSha == $source then "candidate" else "predecessor" end);$runtime)
+      healthy:$observed.runtime.containerHealthy,
+      demoZero:($observed.zeroState == "closed"),
+      zeroStateProbe:$observed
     };
   {
     schema:"meet-backend/test-promotion-evidence-input/v1",
@@ -103,10 +105,10 @@ jq -n \
         $predecessor;$predecessorId;
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        "legacy-not-applicable";false;null
+        "legacy-not-applicable";false;null;"predecessor"
       ),
       candidate:phase(
-        $root;$candidateId;$source;$tree;"declared-false";true;true
+        $root;$candidateId;$source;$tree;"declared-false";true;true;"candidate"
       ),
       rollback:{
         bootstrapProofSha256:$proof,
@@ -114,8 +116,21 @@ jq -n \
         restoredImageId:$predecessorId
       },
       final:phase(
-        $root;$candidateId;$source;$tree;"declared-false";true;true
-      )
+        $root;$candidateId;$source;$tree;"declared-false";true;true;"final"
+      ),
+      runtime:{
+        topologyVerified:true,hardeningVerified:true,volumesVerified:true,
+        volumes:["meet-production_postgres_data","meet-production_uploads_data"],
+        postgresWritablePrimary:true,nonIdleApplicationTransactions:0,
+        smtpIdleSamples:[0,0]
+      },
+      probes:{
+        meetings200Json:true,actuator404:true,httpRedirectHttps:true,
+        adminMissing403:true,adminWrong403:true,
+        adminKeyConfigured:true,adminAuthenticatedDisabled404:true,
+        adminBlankDisabled403:false,
+        assets:{count:13,verified:true}
+      }
     },
     control:{finalVerified:true,rollbackPolicySatisfied:true}
   }
