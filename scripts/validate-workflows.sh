@@ -23,4 +23,8 @@ command -v "$ACTIONLINT" >/dev/null 2>&1 || {
   exit 1
 }
 
-"$ACTIONLINT" "$WORKFLOW"
+# Keep the workflow parser, expression, and schema checks mandatory. The
+# repository's existing ShellCheck gate owns checked-in shell scripts; disabling
+# actionlint's embedded-shell integration avoids duplicate diagnostics for
+# heredocs and GitHub expression text inside run blocks.
+"$ACTIONLINT" -shellcheck "" "$WORKFLOW"
