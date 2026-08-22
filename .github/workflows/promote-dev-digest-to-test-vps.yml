@@ -81,20 +81,20 @@ jobs:
             .head_branch == "dev" and .head_sha == $sha
           ' <<<"$dispatch" >/dev/null
           environment=$(gh api "repos/$GITHUB_REPOSITORY/environments/closed-beta-promotion")
-          jq -e '.name == "closed-beta-promotion"' <<<"$environment" >/dev/null
-          policy=$(gh api \
-            "repos/$GITHUB_REPOSITORY/environments/closed-beta-promotion/deployment-branch-policy")
-          jq -e '.custom_branch_policies == true and .protected_branches == false' \
-            <<<"$policy" >/dev/null
+          jq -e '
+            .name == "closed-beta-promotion" and
+            .deployment_branch_policy.custom_branch_policies == true and
+            .deployment_branch_policy.protected_branches == false
+          ' <<<"$environment" >/dev/null
           branches=$(gh api --paginate \
             "repos/$GITHUB_REPOSITORY/environments/closed-beta-promotion/deployment-branch-policies")
           jq -e 'any(.[]; .name == "dev" and .type == "branch")' <<<"$branches" >/dev/null
           test_vps_environment=$(gh api "repos/$GITHUB_REPOSITORY/environments/test-vps")
-          jq -e '.name == "test-vps"' <<<"$test_vps_environment" >/dev/null
-          test_vps_policy=$(gh api \
-            "repos/$GITHUB_REPOSITORY/environments/test-vps/deployment-branch-policy")
-          jq -e '.custom_branch_policies == true and .protected_branches == false' \
-            <<<"$test_vps_policy" >/dev/null
+          jq -e '
+            .name == "test-vps" and
+            .deployment_branch_policy.custom_branch_policies == true and
+            .deployment_branch_policy.protected_branches == false
+          ' <<<"$test_vps_environment" >/dev/null
           test_vps_branches=$(gh api --paginate \
             "repos/$GITHUB_REPOSITORY/environments/test-vps/deployment-branch-policies")
           jq -e 'any(.[]; .name == "dev" and .type == "branch")' \

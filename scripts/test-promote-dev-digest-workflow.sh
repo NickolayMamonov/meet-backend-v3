@@ -42,6 +42,9 @@ grep -Fq 'local_sha=$(sha256sum "$local_file"' "$WORKFLOW"
 grep -Fq 'cmp -- "$RUNNER_TEMP/bootstrap-predecessor.json"' "$WORKFLOW"
 ! grep -Fq 'find /var/lib/meet-test-vps-deploy' "$WORKFLOW"
 grep -Fq 'test-vps/deployment-branch-policies' "$WORKFLOW"
+! grep -Fq '/deployment-branch-policy"' "$WORKFLOW"
+[ "$(grep -Fc '.deployment_branch_policy.custom_branch_policies == true' "$WORKFLOW")" -eq 2 ]
+[ "$(grep -Fc '.deployment_branch_policy.protected_branches == false' "$WORKFLOW")" -eq 2 ]
 grep -Fq 'dev-promotion-source-final-deploy.json' "$WORKFLOW"
 grep -Fq 'mutation_started' "$WORKFLOW"
 ! grep -Eiq 'gh[[:space:]]+release|docker[[:space:]]+push|git[[:space:]]+push|refs/tags|--method[[:space:]]+DELETE' "$WORKFLOW"

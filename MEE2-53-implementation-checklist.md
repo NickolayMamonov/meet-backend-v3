@@ -39,6 +39,7 @@
 
 ## Final approved defect remediation
 
+- [x] Validate environment deployment policies from the fetched JSON and retain plural branch membership checks.
 - [x] Verify the real public v1.2.0 bootstrap-control introduction SHA and strict legacy predecessor ancestry.
 - [x] Bind predecessor/candidate/final evidence identity and bootstrap mode to canonical bootstrap proofs.
 - [x] Reuse the canonical predecessor proof for rollback without rebuilding or substituting it.
