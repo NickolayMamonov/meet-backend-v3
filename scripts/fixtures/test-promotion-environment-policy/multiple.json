@@ -1,0 +1,15 @@
+{
+  "total_count": 2,
+  "branch_policies": [
+    {
+      "id": 123456,
+      "name": "dev",
+      "type": "branch"
+    },
+    {
+      "id": 123457,
+      "name": "dev",
+      "type": "branch"
+    }
+  ]
+}

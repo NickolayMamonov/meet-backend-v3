@@ -86,19 +86,22 @@ jobs:
             .deployment_branch_policy.custom_branch_policies == true and
             .deployment_branch_policy.protected_branches == false
           ' <<<"$environment" >/dev/null
-          branches=$(gh api --paginate \
-            "repos/$GITHUB_REPOSITORY/environments/closed-beta-promotion/deployment-branch-policies")
-          jq -e 'any(.[]; .name == "dev" and .type == "branch")' <<<"$branches" >/dev/null
+          branches=$(gh api \
+            "repos/$GITHUB_REPOSITORY/environments/closed-beta-promotion/deployment-branch-policies?per_page=100")
+          printf '%s\n' "$branches" >"$RUNNER_TEMP/closed-beta-promotion-branch-policy.json"
+          scripts/verify-test-promotion-environment-policy.sh --input \
+            "$RUNNER_TEMP/closed-beta-promotion-branch-policy.json"
           test_vps_environment=$(gh api "repos/$GITHUB_REPOSITORY/environments/test-vps")
           jq -e '
             .name == "test-vps" and
             .deployment_branch_policy.custom_branch_policies == true and
             .deployment_branch_policy.protected_branches == false
           ' <<<"$test_vps_environment" >/dev/null
-          test_vps_branches=$(gh api --paginate \
-            "repos/$GITHUB_REPOSITORY/environments/test-vps/deployment-branch-policies")
-          jq -e 'any(.[]; .name == "dev" and .type == "branch")' \
-            <<<"$test_vps_branches" >/dev/null
+          test_vps_branches=$(gh api \
+            "repos/$GITHUB_REPOSITORY/environments/test-vps/deployment-branch-policies?per_page=100")
+          printf '%s\n' "$test_vps_branches" >"$RUNNER_TEMP/test-vps-branch-policy.json"
+          scripts/verify-test-promotion-environment-policy.sh --input \
+            "$RUNNER_TEMP/test-vps-branch-policy.json"
           [[ "$(git rev-parse refs/remotes/origin/dev)" == "$SOURCE_SHA" ]]
           [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
           ! git symbolic-ref -q HEAD
