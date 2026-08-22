@@ -47,6 +47,9 @@ grep -Fq 'test-vps/deployment-branch-policies' "$WORKFLOW"
 [ "$(grep -Fc '.deployment_branch_policy.protected_branches == false' "$WORKFLOW")" -eq 2 ]
 grep -Fq 'dev-promotion-source-final-deploy.json' "$WORKFLOW"
 grep -Fq 'mutation_started' "$WORKFLOW"
+grep -Fq 'printf '\''root_digest=%s\n'\'' "$root_digest" >> "$GITHUB_OUTPUT"' "$WORKFLOW"
+grep -Fq 'printf '\''platform_digest=%s\n'\'' "$platform_digest" >> "$GITHUB_OUTPUT"' "$WORKFLOW"
+grep -Fq 'printf '\''admission_mode=%s\n'\'' "$mode" >> "$GITHUB_OUTPUT"' "$WORKFLOW"
 ! grep -Eiq 'gh[[:space:]]+release|docker[[:space:]]+push|git[[:space:]]+push|refs/tags|--method[[:space:]]+DELETE' "$WORKFLOW"
 command -v jq >/dev/null
 jq -e '(.event_name == "workflow_dispatch") and (.ref == "refs/heads/dev") and (.head_sha | test("^[0-9a-f]{40}$")) and (.authorized == true)' \
