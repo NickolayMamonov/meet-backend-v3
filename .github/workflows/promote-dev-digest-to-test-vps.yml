@@ -282,10 +282,9 @@ jobs:
             --image "$IMAGE" --index-file "$raw" \
             --inventory-file "$RUNNER_TEMP/registry-inventory.json" \
             --subject-digest "$root_digest" --platform-subject "$platform_digest" >/dev/null
-          printf "root_digest=$root_digest
-platform_digest=$platform_digest
-admission_mode=$mode
-" >>"$GITHUB_OUTPUT"
+          printf 'root_digest=%s\n' "$root_digest" >> "$GITHUB_OUTPUT"
+          printf 'platform_digest=%s\n' "$platform_digest" >> "$GITHUB_OUTPUT"
+          printf 'admission_mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
       - name: Create signed OCI attestation for a first-time alias
         if: steps.publish.outputs.admission_mode == 'published'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -629,7 +628,7 @@ admission_mode=$mode
             --slurpfile authority "$RUNNER_TEMP/dev-promotion-source-deploy.json" \
             --arg source "$SOURCE_SHA" --arg tree "${{ needs.authorize.outputs.tree_id }}" \
             --arg version "$VERSION" --arg image "$IMAGE" --arg alias "test-sha-$SOURCE_SHA" \
-            --arg admissionMode "${{ steps.publish.outputs.admission_mode }}" \
+            --arg admissionMode "${{ needs.admit-image.outputs.admission_mode }}" \
             --arg root "$IMAGE_DIGEST" --arg platform "${{ needs.admit-image.outputs.platform_digest }}" \
             --arg predecessorProof "$pre_proof" --arg candidateProof "$cand_proof" \
             --arg rollbackProof "$rollback_proof" --arg finalProof "$final_proof" \
