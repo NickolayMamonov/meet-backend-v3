@@ -109,25 +109,32 @@ REAL_GIT=$(command -v git) \
   source_command "$advanced_sha" "$TMP/rejected.json" \
     --git-command "$TMP/git-race"
 
-printf '{\n  "version": "01.2.0"\n}\n' >"$TMP/seed/version.json"
-git -C "$TMP/seed" add version.json
-git -C "$TMP/seed" commit -qm invalid-version
-invalid_sha=$(git -C "$TMP/seed" rev-parse HEAD)
-git -C "$TMP/seed" push -q origin HEAD:dev
-git -C "$TMP/source" fetch -q origin dev
-git -C "$TMP/source" checkout -q --detach "$invalid_sha"
-expect_failure invalid-version \
-  source_command "$invalid_sha" "$TMP/rejected.json"
-
-printf '{\n  "version": "1.2.1",\n  "extra": true\n}\n' \
-  >"$TMP/seed/version.json"
-git -C "$TMP/seed" add version.json
-git -C "$TMP/seed" commit -qm ambiguous-version
-ambiguous_sha=$(git -C "$TMP/seed" rev-parse HEAD)
-git -C "$TMP/seed" push -q origin HEAD:dev
-git -C "$TMP/source" fetch -q origin dev
-git -C "$TMP/source" checkout -q --detach "$ambiguous_sha"
-expect_failure ambiguous-version \
-  source_command "$ambiguous_sha" "$TMP/rejected.json"
+for case_name in malformed extra missing non-string noncanonical; do
+  case "$case_name" in
+    malformed)
+      printf '{"version":\n' >"$TMP/seed/version.json"
+      ;;
+    extra)
+      printf '{\n  "version": "1.2.1",\n  "extra": true\n}\n' >"$TMP/seed/version.json"
+      ;;
+    missing)
+      printf '{\n  "other": "1.2.1"\n}\n' >"$TMP/seed/version.json"
+      ;;
+    non-string)
+      printf '{\n  "version": 120\n}\n' >"$TMP/seed/version.json"
+      ;;
+    noncanonical)
+      printf '{\n  "version": "01.2.0"\n}\n' >"$TMP/seed/version.json"
+      ;;
+  esac
+  git -C "$TMP/seed" add version.json
+  git -C "$TMP/seed" commit -qm "invalid version $case_name"
+  invalid_sha=$(git -C "$TMP/seed" rev-parse HEAD)
+  git -C "$TMP/seed" push -q origin HEAD:dev
+  git -C "$TMP/source" fetch -q origin dev
+  git -C "$TMP/source" checkout -q --detach "$invalid_sha"
+  expect_failure "$case_name" \
+    source_command "$invalid_sha" "$TMP/rejected.json"
+done
 
 echo "dev promotion source fixtures passed"

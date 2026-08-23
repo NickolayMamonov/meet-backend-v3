@@ -45,32 +45,74 @@ trap 'rm -r -- "$tmp"' EXIT HUP INT TERM
 gh api --paginate --slurp \
   "repos/$repository/actions/workflows/ci.yml/runs?head_sha=$source_sha&per_page=100" \
   >"$tmp/runs.json" || fail "CI run lookup failed"
-jq -e 'type == "array" and all(.[]; type == "array")' "$tmp/runs.json" >/dev/null ||
+jq -e '
+  (type == "array") and
+  (length > 0) and
+  (all(.[];
+    (type == "object") and
+    ((keys | sort) == ["total_count","workflow_runs"]) and
+    ((.total_count | type) == "number") and
+    (.total_count >= 0) and
+    ((.workflow_runs | type) == "array")
+  ))
+' "$tmp/runs.json" >/dev/null ||
   fail "CI run response is malformed"
+jq -e '
+  [.[] | .workflow_runs[]] as $runs |
+  all($runs[];
+    (type == "object") and
+    ((.id | type) == "number") and
+    ((.head_sha | type) == "string") and
+    ((.status | type) == "string") and
+    ((.conclusion | type) == "string")
+  )
+' "$tmp/runs.json" >/dev/null ||
+  fail "CI run object is malformed"
 
 selected=
 while IFS= read -r run_id; do
+  run_id=${run_id//$'\r'/}
   jobs="$tmp/jobs-$run_id.json"
   gh api --paginate --slurp "repos/$repository/actions/runs/$run_id/jobs?per_page=100" \
     >"$jobs" || fail "CI job lookup failed for run $run_id"
   if jq -e --argjson required "$required_jobs_json" '
-    [add // [] | .[]] as $jobs |
+    (type == "array") and
+    (length > 0) and
+    (all(.[];
+      (type == "object") and
+      ((keys | sort) == ["jobs","total_count"]) and
+      ((.total_count | type) == "number") and
+      (.total_count >= 0) and
+      ((.jobs | type) == "array")
+    )) and
+    ([.[] | .jobs[]] as $jobs |
     ($jobs | length > 0) and
-    (all($jobs[]; .conclusion == "success")) and
-    (all($required[] as $requiredJob;
-      any($jobs[]; .name == $requiredJob and .conclusion == "success")))
+    (all($jobs[];
+      (type == "object") and
+      ((.name | type) == "string") and
+      ((.conclusion | type) == "string") and
+      (.conclusion == "success")
+    )) and
+    (all($required[];
+      . as $requiredJob |
+      any($jobs[];
+        ((.name == $requiredJob) and (.conclusion == "success")))
+    ))
+    )
   ' "$jobs" >/dev/null 2>&1; then
     selected=$run_id
     break
   fi
 done < <(
-  jq -r '[add // [] | .[] |
-    select(.head_sha == "'"$source_sha"'" and .status == "completed" and .conclusion == "success") |
+  jq -r --arg sourceSha "$source_sha" '[.[] | .workflow_runs[] |
+    select((.head_sha == $sourceSha) and (.status == "completed") and
+      (.conclusion == "success")) |
     .id] | unique[]' "$tmp/runs.json"
 )
 
 [ -n "$selected" ] || fail "no exact-SHA CI run satisfies the required-job allowlist"
 jobs_file="$tmp/jobs-$selected.json"
+tmp_output="$output.tmp.$$"
 jq -cnS --arg sourceSha "$source_sha" --arg runId "$selected" \
   --argjson required "$required_jobs_json" \
   --slurpfile jobs "$jobs_file" '
@@ -80,9 +122,10 @@ jq -cnS --arg sourceSha "$source_sha" --arg runId "$selected" \
     sourceSha:$sourceSha,
     runId:($runId | tonumber),
     requiredJobs:$required,
-    verifiedJobs:($jobs[0] | add // [] | map(.name) | unique | sort),
+    verifiedJobs:($jobs[0] | map(.jobs[]) | map(.name) | unique | sort),
     exactSha:true,
     allRequiredChecksSuccessful:true
   }
-' >"$output" || fail "required-check proof construction failed"
-chmod 600 "$output" 2>/dev/null || true
+' >"$tmp_output" || fail "required-check proof construction failed"
+chmod 600 "$tmp_output" 2>/dev/null || true
+mv -f -- "$tmp_output" "$output" || fail "required-check proof publication failed"

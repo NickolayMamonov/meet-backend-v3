@@ -1,0 +1,7 @@
+{
+  "name": "closed-beta-promotion",
+  "deployment_branch_policy": {
+    "custom_branch_policies": true,
+    "protected_branches": false
+  }
+}

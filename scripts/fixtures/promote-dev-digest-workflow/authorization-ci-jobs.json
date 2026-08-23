@@ -1,0 +1,42 @@
+[
+  {
+    "total_count": 5,
+    "jobs": [
+      {
+        "id": 1,
+        "name": "Validate reusable call",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 2,
+        "name": "Gradle tests and build",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 3,
+        "name": "PostgreSQL tests",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ]
+  },
+  {
+    "total_count": 5,
+    "jobs": [
+      {
+        "id": 4,
+        "name": "Compose, Bash, and ShellCheck",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 5,
+        "name": "Docker image verification",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ]
+  }
+]

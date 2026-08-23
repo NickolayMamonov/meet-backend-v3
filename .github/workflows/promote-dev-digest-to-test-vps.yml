@@ -64,83 +64,13 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
-          [[ "$GITHUB_REF" == refs/heads/dev ]]
-          [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]]
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --no-tags origin dev master
-          scripts/verify-dev-promotion-source.sh \
-            --repository "$GITHUB_WORKSPACE" \
+          scripts/authorize-dev-promotion.sh \
+            --repository "$GITHUB_REPOSITORY" \
             --source-checkout "$GITHUB_WORKSPACE" \
             --source-sha "$SOURCE_SHA" \
-            --output "$RUNNER_TEMP/dev-promotion-source.json"
-          dispatch=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
-          jq -e --arg sha "$SOURCE_SHA" '
-            .event == "workflow_dispatch" and
-            .head_branch == "dev" and .head_sha == $sha
-          ' <<<"$dispatch" >/dev/null
-          environment=$(gh api "repos/$GITHUB_REPOSITORY/environments/closed-beta-promotion")
-          jq -e '
-            .name == "closed-beta-promotion" and
-            .deployment_branch_policy.custom_branch_policies == true and
-            .deployment_branch_policy.protected_branches == false
-          ' <<<"$environment" >/dev/null
-          branches=$(gh api \
-            "repos/$GITHUB_REPOSITORY/environments/closed-beta-promotion/deployment-branch-policies?per_page=100")
-          printf '%s\n' "$branches" >"$RUNNER_TEMP/closed-beta-promotion-branch-policy.json"
-          scripts/verify-test-promotion-environment-policy.sh --input \
-            "$RUNNER_TEMP/closed-beta-promotion-branch-policy.json"
-          test_vps_environment=$(gh api "repos/$GITHUB_REPOSITORY/environments/test-vps")
-          jq -e '
-            .name == "test-vps" and
-            .deployment_branch_policy.custom_branch_policies == true and
-            .deployment_branch_policy.protected_branches == false
-          ' <<<"$test_vps_environment" >/dev/null
-          test_vps_branches=$(gh api \
-            "repos/$GITHUB_REPOSITORY/environments/test-vps/deployment-branch-policies?per_page=100")
-          printf '%s\n' "$test_vps_branches" >"$RUNNER_TEMP/test-vps-branch-policy.json"
-          scripts/verify-test-promotion-environment-policy.sh --input \
-            "$RUNNER_TEMP/test-vps-branch-policy.json"
-          [[ "$(git rev-parse refs/remotes/origin/dev)" == "$SOURCE_SHA" ]]
-          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
-          ! git symbolic-ref -q HEAD
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
-          tree_id=$(git rev-parse HEAD^{tree})
-          version=$(jq -er 'keys == ["version"] and (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) | .version' version.json)
-          master_registration_sha=$(git show "refs/remotes/origin/master:$PROMOTION_WORKFLOW" |
-            sha256sum | awk '{print $1}')
-          registration_sha=$(git show "refs/remotes/origin/dev:$PROMOTION_WORKFLOW" |
-            sha256sum | awk '{print $1}')
-          test "$master_registration_sha" = "$registration_sha"
-          master_sha=$(git rev-parse refs/remotes/origin/master)
-          dev_sha=$(git rev-parse refs/remotes/origin/dev)
-          [[ "$registration_sha" =~ ^[0-9a-f]{64}$ ]]
-          scripts/verify-test-promotion-required-checks.sh \
-            --repository "$GITHUB_REPOSITORY" \
-            --source-sha "$SOURCE_SHA" \
-            --output "$RUNNER_TEMP/required-checks.json"
-          {
-            echo "authorized=true"
-            echo "source_sha=$SOURCE_SHA"
-            echo "tree_id=$tree_id"
-            echo "version=$version"
-            echo "master_registration_sha=$master_registration_sha"
-            echo "registration_sha=$registration_sha"
-          } >>"$GITHUB_OUTPUT"
-          jq -cnS --arg event "$GITHUB_EVENT_NAME" --arg ref "$GITHUB_REF" \
-            --arg sourceSha "$SOURCE_SHA" --arg masterSha "$master_sha" \
-            --arg devSha "$dev_sha" --arg workflow "$PROMOTION_WORKFLOW" \
-            --arg masterRegistrationSha "$master_registration_sha" \
-            --arg registrationSha "$registration_sha" '
-            {
-              schema:"meet-backend/test-promotion-authorization/v1",
-              event:$event,ref:$ref,sourceSha:$sourceSha,
-              masterSha:$masterSha,devSha:$devSha,workflow:$workflow,
-              masterRegistrationSha:$masterRegistrationSha,
-              devRegistrationSha:$registrationSha,authorized:true
-            }
-          ' >"$RUNNER_TEMP/promotion-authorization.json"
+            --workflow "$PROMOTION_WORKFLOW" \
+            --output-dir "$RUNNER_TEMP" \
+            --github-output "$GITHUB_OUTPUT"
       - name: Upload registration and dispatch proof
         if: always() && steps.authority.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

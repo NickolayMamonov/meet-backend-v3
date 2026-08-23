@@ -212,6 +212,8 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-empty-release-continuation.sh"
           bash "$TOOLING_SCRIPTS/test-release-publish-tooling-routing.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
+          bash "$TOOLING_SCRIPTS/test-dev-promotion-source.sh"
+          bash "$TOOLING_SCRIPTS/test-dev-promotion-authorization.sh"
           bash "$TOOLING_SCRIPTS/test-promote-dev-digest-workflow.sh"
           bash "$TOOLING_SCRIPTS/test-test-promotion-environment-policy.sh"
           bash "$TOOLING_SCRIPTS/test-script-execution-contract.sh"

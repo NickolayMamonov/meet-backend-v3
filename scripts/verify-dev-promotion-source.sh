@@ -121,9 +121,9 @@ source_tree=$(source_git rev-parse --verify 'HEAD^{tree}' 2>/dev/null) ||
 version_json=$(repo_git show "$source_sha:version.json" 2>/dev/null) ||
   fail "authority version manifest is unavailable"
 version=$(jq -er '
-  if type == "object" and (keys == ["version"]) and
-     (.version | type == "string" and
-       test("^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$"))
+  if (type == "object") and ((keys | sort) == ["version"]) and
+     ((.version | type) == "string") and
+     ((.version | test("^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$")))
   then .version
   else error("invalid version manifest")
   end

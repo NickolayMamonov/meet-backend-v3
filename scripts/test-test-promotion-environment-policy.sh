@@ -5,6 +5,7 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 VERIFY=$ROOT_DIR/scripts/verify-test-promotion-environment-policy.sh
 FIXTURES=$ROOT_DIR/scripts/fixtures/test-promotion-environment-policy
 WORKFLOW=$ROOT_DIR/.github/workflows/promote-dev-digest-to-test-vps.yml
+AUTHORIZER=$ROOT_DIR/scripts/authorize-dev-promotion.sh
 
 fail() {
   echo "test promotion environment policy fixture failed: $*" >&2
@@ -31,10 +32,10 @@ for fixture in malformed array multiple wrong-branch wrong-type; do
   [ -s "$tmp/$fixture.stderr" ] || fail "$fixture did not report a validation error"
 done
 
-grep -Fq 'verify-test-promotion-environment-policy.sh' "$WORKFLOW" ||
-  fail "workflow does not call the reusable policy validator"
-[ "$(grep -Fc 'verify-test-promotion-environment-policy.sh --input' "$WORKFLOW")" -eq 2 ] ||
-  fail "workflow must validate both live environment policy objects"
+grep -Fq 'verify-test-promotion-environment-policy.sh' "$AUTHORIZER" ||
+  fail "authorization helper does not call the reusable policy validator"
+[ "$(grep -Fc 'verify-test-promotion-environment-policy.sh --input' "$AUTHORIZER")" -eq 2 ] ||
+  fail "authorization helper must validate both live environment policy objects"
 ! grep -Fq "jq -e 'any(.[]; .name == \"dev\" and .type == \"branch\")'" "$WORKFLOW" ||
   fail "workflow still iterates the deployment-policy response as an array"
 ! grep -Fq "jq -e 'any(.[]; .name == \"dev\" and .type == \"branch\")' \\" "$WORKFLOW" ||
