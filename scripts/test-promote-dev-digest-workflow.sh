@@ -3,8 +3,11 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 WORKFLOW=$ROOT_DIR/.github/workflows/promote-dev-digest-to-test-vps.yml
 FIXTURES=$ROOT_DIR/scripts/fixtures/promote-dev-digest-workflow
+AUTHORIZER=$ROOT_DIR/scripts/authorize-dev-promotion.sh
 [ -f "$WORKFLOW" ] && [ -f "$FIXTURES/authorized-run.json" ] || exit 1
 grep -Fq "workflow_dispatch:" "$WORKFLOW"
+grep -Fq 'scripts/authorize-dev-promotion.sh' "$WORKFLOW"
+! grep -Fq 'version.json' "$WORKFLOW"
 ! grep -Eq '^[[:space:]]+(push|pull_request|schedule):' "$WORKFLOW"
 for guard in "github.event_name == 'workflow_dispatch'" "github.ref == 'refs/heads/dev'" "github.sha == inputs.source_sha"; do
   [ "$(grep -Fc "$guard" "$WORKFLOW")" -ge 4 ] || { echo "missing direct guard: $guard" >&2; exit 1; }
@@ -29,7 +32,7 @@ grep -Fq 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' "$WO
 grep -Fq 'verify-test-vps-assets.sh' "$WORKFLOW"
 grep -Fq 'validate-test-vps-phase-file.sh' "$WORKFLOW"
 grep -Fq 'verify-test-promotion-layout.sh' "$WORKFLOW"
-grep -Fq 'verify-test-promotion-required-checks.sh' "$WORKFLOW"
+grep -Fq 'verify-test-promotion-required-checks.sh' "$AUTHORIZER"
 grep -Fq 'actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373' "$WORKFLOW"
 grep -Fq 'id-token: write' "$WORKFLOW"
 grep -Fq 'push-to-registry: true' "$WORKFLOW"
@@ -41,12 +44,12 @@ grep -Fq 'sha256sum -- "$1"' "$WORKFLOW"
 grep -Fq 'local_sha=$(sha256sum "$local_file"' "$WORKFLOW"
 grep -Fq 'cmp -- "$RUNNER_TEMP/bootstrap-predecessor.json"' "$WORKFLOW"
 ! grep -Fq 'find /var/lib/meet-test-vps-deploy' "$WORKFLOW"
-grep -Fq 'test-vps/deployment-branch-policies?per_page=100' "$WORKFLOW"
+grep -Fq 'deployment-branch-policies?per_page=100' "$AUTHORIZER"
 ! grep -Fq '/deployment-branch-policy"' "$WORKFLOW"
-[ "$(grep -Fc 'verify-test-promotion-environment-policy.sh --input' "$WORKFLOW")" -eq 2 ]
-[ "$(grep -Fc 'deployment-branch-policies?per_page=100' "$WORKFLOW")" -eq 2 ]
-[ "$(grep -Fc '.deployment_branch_policy.custom_branch_policies == true' "$WORKFLOW")" -eq 2 ]
-[ "$(grep -Fc '.deployment_branch_policy.protected_branches == false' "$WORKFLOW")" -eq 2 ]
+[ "$(grep -Fc 'verify-test-promotion-environment-policy.sh --input' "$AUTHORIZER")" -eq 2 ]
+[ "$(grep -Fc 'deployment-branch-policies?per_page=100' "$AUTHORIZER")" -eq 2 ]
+[ "$(grep -Fc 'check_environment closed-beta-promotion' "$AUTHORIZER")" -eq 1 ]
+[ "$(grep -Fc 'check_environment test-vps' "$AUTHORIZER")" -eq 1 ]
 grep -Fq 'dev-promotion-source-final-deploy.json' "$WORKFLOW"
 grep -Fq 'mutation_started' "$WORKFLOW"
 grep -Fq 'printf '\''root_digest=%s\n'\'' "$root_digest" >> "$GITHUB_OUTPUT"' "$WORKFLOW"

@@ -47,18 +47,38 @@ gh api --paginate --slurp \
   >"$tmp/runs.json" || fail "CI run lookup failed"
 jq -e 'type == "array" and all(.[]; type == "array")' "$tmp/runs.json" >/dev/null ||
   fail "CI run response is malformed"
+jq -e '
+  [add // [] | .[]] as $runs |
+  all($runs[];
+    (type == "object") and
+    ((.id | type) == "number") and
+    ((.head_sha | type) == "string") and
+    ((.status | type) == "string") and
+    ((.conclusion | type) == "string")
+  )
+' "$tmp/runs.json" >/dev/null ||
+  fail "CI run object is malformed"
 
 selected=
 while IFS= read -r run_id; do
+  run_id=${run_id//$'\r'/}
   jobs="$tmp/jobs-$run_id.json"
   gh api --paginate --slurp "repos/$repository/actions/runs/$run_id/jobs?per_page=100" \
     >"$jobs" || fail "CI job lookup failed for run $run_id"
   if jq -e --argjson required "$required_jobs_json" '
     [add // [] | .[]] as $jobs |
     ($jobs | length > 0) and
-    (all($jobs[]; .conclusion == "success")) and
-    (all($required[] as $requiredJob;
-      any($jobs[]; .name == $requiredJob and .conclusion == "success")))
+    (all($jobs[];
+      (type == "object") and
+      ((.name | type) == "string") and
+      ((.conclusion | type) == "string") and
+      (.conclusion == "success")
+    )) and
+    (all($required[];
+      . as $requiredJob |
+      any($jobs[];
+        ((.name == $requiredJob) and (.conclusion == "success")))
+    ))
   ' "$jobs" >/dev/null 2>&1; then
     selected=$run_id
     break
@@ -71,6 +91,7 @@ done < <(
 
 [ -n "$selected" ] || fail "no exact-SHA CI run satisfies the required-job allowlist"
 jobs_file="$tmp/jobs-$selected.json"
+tmp_output="$output.tmp.$$"
 jq -cnS --arg sourceSha "$source_sha" --arg runId "$selected" \
   --argjson required "$required_jobs_json" \
   --slurpfile jobs "$jobs_file" '
@@ -84,5 +105,6 @@ jq -cnS --arg sourceSha "$source_sha" --arg runId "$selected" \
     exactSha:true,
     allRequiredChecksSuccessful:true
   }
-' >"$output" || fail "required-check proof construction failed"
-chmod 600 "$output" 2>/dev/null || true
+' >"$tmp_output" || fail "required-check proof construction failed"
+chmod 600 "$tmp_output" 2>/dev/null || true
+mv -f -- "$tmp_output" "$output" || fail "required-check proof publication failed"

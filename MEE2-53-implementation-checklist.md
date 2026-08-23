@@ -61,3 +61,8 @@
 - [x] Add a deterministic audit for workflow-direct scripts, input-command callbacks, staged remote executables, and incident upload wiring.
 - [x] Add an authorization-failure fixture proving no mutation and successful sanitized incident generation/upload selection.
 - [ ] Rerun exact-head hosted CI and obtain independent QA/code/compliance PASS evidence.
+
+## MEE2-60 promotion version-gate remediation
+
+- [x] Record Actions run `32650054492` as permanently **no-touch/no-rerun**; authorization failed before writers and its sanitized incident path succeeded.
+- [ ] Do not rerun, dispatch, publish, deploy, bootstrap, release, or mutate any historical state while this remediation is reviewed.
