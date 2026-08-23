@@ -165,11 +165,11 @@ gh api \
   >"$test_vps_branches" || fail "test-vps branch policy lookup failed"
 scripts/verify-test-promotion-environment-policy.sh --input "$test_vps_branches" >/dev/null
 
-authority_sha=$(git -C "$source_checkout" rev-parse --verify refs/remotes/origin/dev^{commit}) ||
+authority_sha=$(git -C "$source_checkout" rev-parse --verify 'refs/remotes/origin/dev^{commit}') ||
   fail "fetched dev authority is unavailable"
 [ "$authority_sha" = "$source_sha" ] ||
   fail "selected source is not the fetched current dev authority"
-head_sha=$(git -C "$source_checkout" rev-parse --verify HEAD^{commit}) ||
+head_sha=$(git -C "$source_checkout" rev-parse --verify 'HEAD^{commit}') ||
   fail "source checkout HEAD is unavailable"
 [ "$head_sha" = "$source_sha" ] ||
   fail "source checkout is at another commit"
@@ -177,7 +177,7 @@ git -C "$source_checkout" symbolic-ref -q HEAD >/dev/null 2>&1 &&
   fail "source checkout is not detached"
 [ -z "$(git -C "$source_checkout" status --porcelain=v1 --untracked-files=all)" ] ||
   fail "source checkout is not clean"
-tree_id=$(git -C "$source_checkout" rev-parse --verify HEAD^{tree}) ||
+tree_id=$(git -C "$source_checkout" rev-parse --verify 'HEAD^{tree}') ||
   fail "source checkout tree is unavailable"
 jq -e --arg tree "$tree_id" '.treeId == $tree' "$source_proof" >/dev/null ||
   fail "source authority tree proof does not match checkout"
@@ -194,9 +194,9 @@ registration_sha=$(cd "$source_checkout" &&
   fail "dev registration digest is malformed"
 [ "$master_registration_sha" = "$registration_sha" ] ||
   fail "dev and master workflow registrations differ"
-master_sha=$(git -C "$source_checkout" rev-parse --verify refs/remotes/origin/master^{commit}) ||
+master_sha=$(git -C "$source_checkout" rev-parse --verify 'refs/remotes/origin/master^{commit}') ||
   fail "master authority is unavailable"
-dev_sha=$(git -C "$source_checkout" rev-parse --verify refs/remotes/origin/dev^{commit}) ||
+dev_sha=$(git -C "$source_checkout" rev-parse --verify 'refs/remotes/origin/dev^{commit}') ||
   fail "dev authority is unavailable"
 [[ "$master_sha" =~ ^[0-9a-f]{40}$ ]] || fail "master authority is malformed"
 [[ "$dev_sha" =~ ^[0-9a-f]{40}$ ]] || fail "dev authority is malformed"

@@ -28,7 +28,7 @@ printf 'authorization fixture\n' >"$TMP/seed/tracked.txt"
 git -C "$TMP/seed" add .
 git -C "$TMP/seed" commit -qm fixture
 source_sha=$(git -C "$TMP/seed" rev-parse HEAD)
-tree_id=$(git -C "$TMP/seed" rev-parse HEAD^{tree})
+tree_id=$(git -C "$TMP/seed" rev-parse 'HEAD^{tree}')
 
 git init -q --bare "$TMP/remote.git"
 git -C "$TMP/remote.git" symbolic-ref HEAD refs/heads/dev
