@@ -70,14 +70,14 @@ printf '%s\n' "$endpoint" >>"$GH_CALL_LOG"
 case "$endpoint" in
   repos/*/actions/runs/*/jobs\?per_page=100)
     if [ "${AUTH_FIXTURE_CASE:-valid}" = ci-jobs-wrong-type ]; then
-      printf '[["wrong job shape"]]\n'
+      printf '[{"total_count":1,"jobs":[{"name":false,"conclusion":"success"}]}]\n'
     else
       cat "$AUTH_FIXTURE_ROOT/authorization-ci-jobs.json"
     fi
     ;;
   repos/*/actions/workflows/ci.yml/runs\?head_sha=*)
     if [ "${AUTH_FIXTURE_CASE:-valid}" = ci-runs-wrong-type ]; then
-      printf '{"workflow_runs":[]}\n'
+      printf '[{"total_count":"wrong","workflow_runs":[]}]\n'
     else
       sed "s/0000000000000000000000000000000000000000/$SOURCE_SHA/g" \
         "$AUTH_FIXTURE_ROOT/authorization-ci-runs.json"
