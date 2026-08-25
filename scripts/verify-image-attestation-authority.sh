@@ -271,7 +271,6 @@ expected_bundle_digest=$(jq -r '.evidenceStorage.bundleDigest // empty' "$author
 [ -z "$expected_bundle_digest" ] || [ "$expected_bundle_digest" = "$bundle_digest" ] ||
   fail "canonical evidence bundle digest does not match authority"
 
-asset_name=$(jq -r '.evidenceStorage.asset.name // .subject.name' "$authority")
 asset_id=$(jq -r '.evidenceStorage.asset.id // 0' "$authority")
 asset_size=$(jq -r '.evidenceStorage.asset.size // 0' "$authority")
 asset_api_digest=$(jq -r '.evidenceStorage.asset.apiDigest // empty' "$authority")

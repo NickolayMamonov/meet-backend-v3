@@ -206,10 +206,10 @@ jq -cS -n \
     }
   }]
 ' >"$DATA/collect-verified.json"
-jq -cS -n --arg source "$COLLECT_SOURCE" '
+jq -cS -n --arg source "$COLLECT_SOURCE" --arg tag "$COLLECT_TAG" --arg version "$COLLECT_VERSION" --argjson releaseId "$COLLECT_RELEASE_ID" '
   [[{
-    id:367640510,
-    tag_name:"v1.0.1",
+    id:$releaseId,
+    tag_name:$tag,
     target_commitish:$source,
     draft:false,immutable:true,protected:true,prerelease:false,
     published_at:"2026-08-12T01:00:00Z",
@@ -222,10 +222,11 @@ jq -cS -n --arg source "$COLLECT_SOURCE" '
 jq -cS -n \
   --arg root "$COLLECT_ROOT" --arg platform "$PLATFORM" \
   --arg provenance "$PROVENANCE" --arg sbom "$SBOM" \
-  --arg signature "$SIGNATURE" --arg source "$COLLECT_SOURCE" '
+  --arg signature "$SIGNATURE" --arg source "$COLLECT_SOURCE" \
+  --arg tag "$COLLECT_TAG" --arg version "$COLLECT_VERSION" '
   [[
     {id:2001,name:$root,metadata:{container:{tags:[
-      "v1.0.1","1.0.1",("sha-"+$source)
+      $tag,$version,("sha-"+$source)
     ]}}},
     {id:2002,name:$platform,metadata:{container:{tags:[]}}},
     {id:2003,name:$provenance,metadata:{container:{tags:[]}}},

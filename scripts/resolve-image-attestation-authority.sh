@@ -182,7 +182,7 @@ if [ "$mode" = protected-release ]; then
     certificate_source=$v120_signer
     signer=$v120_signer
     storage_kind=github-api-workflow-artifact
-    subject_name=image-index.json
+    subject_name="image-index.json"
     bundle_digest=sha256:cf1f5d905c0bb97ca2013b3dd8aa415fb331a63dfec860e0382e5690339e5958
     asset_json=$(
       jq -cnS \
@@ -208,7 +208,7 @@ else
 fi
 
 if [ "$storage_kind" = github-api-workflow-artifact ]; then
-  subject_name=image-index.json
+  subject_name="image-index.json"
 fi
 certificate_identity=$source_repository/$workflow@$source_ref
 

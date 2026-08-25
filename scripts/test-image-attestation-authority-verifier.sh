@@ -49,7 +49,6 @@ EOF
 chmod +x "$FAKE_BIN/gh" "$FAKE_BIN/sha256sum"
 export REAL_SHA256SUM
 
-REPO=https://github.com/NickolayMamonov/meet-backend-v3
 REPO_SLUG=NickolayMamonov/meet-backend-v3
 REF=refs/heads/dev
 ISSUER=https://token.actions.githubusercontent.com
@@ -61,7 +60,6 @@ V101_SIGNER=4bff2902511e8e739d7604bf120b121429e60aeb
 V120_SOURCE=9b6d2b06c0336ab8d153564dcf6328e81c4d7b36
 V120_ROOT=sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda
 V120_SIGNER=9af0723444f918594101999a4338b418607cbd01
-V120_BUNDLE=sha256:cf1f5d905c0bb97ca2013b3dd8aa415fb331a63dfec860e0382e5690339e5958
 CANDIDATE_SOURCE=fedcba9876543210fedcba9876543210fedcba98
 PLATFORM=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 CANDIDATE_ROOT=sha256:5555555555555555555555555555555555555555555555555555555555555555
@@ -94,7 +92,7 @@ assets_json() {
 }
 make_authority() {
   local scope=$1 release_id=$2 tag=$3 version=$4 release_source=$5
-  local certificate_source=$6 signer=$7 workflow=$8 root=$9 authority=${12}
+  local root=$9 authority=${12}
   local -a args=("$RESOLVE" "$scope")
   if [ "$scope" = protected-release ]; then
     args+=(--release-id "$release_id" --tag "$tag" --version "$version")

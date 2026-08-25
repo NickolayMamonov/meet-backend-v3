@@ -67,6 +67,11 @@ BUNDLE_MANIFEST=
 BUNDLE_LAYER=
 BUNDLE_LAYER_MEDIA=
 BUNDLE_LAYER_SIZE=
+actual_media=
+referrer_descriptor=
+current_referrer_descriptor=
+node_media=
+bundle_layer_fields=
 
 validate_digest() {
   [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]] ||
@@ -102,40 +107,41 @@ read_descriptor() {
   IFS=$'\034' read -r DESCRIPTOR_DIGEST DESCRIPTOR_MEDIA DESCRIPTOR_SIZE \
     DESCRIPTOR_PREDICATE DESCRIPTOR_REFERENCE_TYPE DESCRIPTOR_REFERENCE_DIGEST \
     DESCRIPTOR_OS DESCRIPTOR_ARCH <"$output" || fail "OCI descriptor is malformed"
+  : "$DESCRIPTOR_REFERENCE_TYPE" "$DESCRIPTOR_REFERENCE_DIGEST" \
+    "$DESCRIPTOR_OS" "$DESCRIPTOR_ARCH"
   rm -f -- "$input" "$output"
 }
 
 jq_read() {
   local variable=$1
   shift
-  local output
+  local output value
   output=$(mktemp "$WORK_DIR/jq-value.XXXXXX")
   jq "$@" >"$output" || fail "JSON value could not be read"
-  if ! IFS= read -r "$variable" <"$output"; then
-    printf -v "$variable" '%s' ""
+  if IFS= read -r value <"$output"; then
+    value=${value%$'\r'}
   else
-    local value=${!variable%$'\r'}
-    printf -v "$variable" '%s' "$value"
+    value=
   fi
+  printf -v "$variable" '%s' "$value"
   rm -f -- "$output"
 }
 
 jq_read_text() {
   local variable=$1 text=$2
   shift 2
-  local input output
+  local input output value
   input=$(mktemp "$WORK_DIR/jq-input.XXXXXX")
   output=$(mktemp "$WORK_DIR/jq-value.XXXXXX")
   printf '%s\n' "$text" >"$input"
   jq "$@" "$input" >"$output" || fail "JSON value could not be read"
-  if ! IFS= read -r "$variable" <"$output"; then
-    printf -v "$variable" '%s' ""
+  if IFS= read -r value <"$output"; then
+    value=${value%$'\r'}
   else
-    local value=${!variable%$'\r'}
-    printf -v "$variable" '%s' "$value"
+    value=
   fi
-  rm -f -- "$input"
-  rm -f -- "$output"
+  printf -v "$variable" '%s' "$value"
+  rm -f -- "$input" "$output"
 }
 
 jq -e \

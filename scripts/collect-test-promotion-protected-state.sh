@@ -186,6 +186,7 @@ collect_verified_attestations() {
   local raw="$tmp/raw-${digest#sha256:}.json"
   local inventory="$tmp/inventory-${digest#sha256:}.json"
   local -a closure_args=()
+  local image_index_hash
 
   release_tag=$(jq -r --argjson id "$release_id" \
     '.[] | select(.id == $id) | .tag_name' "$tmp/releases-normalized.json")
@@ -261,8 +262,8 @@ collect_verified_attestations() {
         .evidenceStorage.assets[] |
         [.id,.name,.size,.apiDigest,.downloadSha256] | @tsv
       ' "$authority")
-      [ "$(sha256sum "$assets_dir/image-index.json" | awk '{print $1}')" =
-        "${digest#sha256:}" ] ||
+      image_index_hash=$(sha256sum "$assets_dir/image-index.json" | awk '{print $1}')
+      [ "$image_index_hash" = "${digest#sha256:}" ] ||
         fail "immutable release index bytes do not match the registry root"
       [ "$(wc -c <"$assets_dir/image-index.json" | tr -d ' ')" -eq 857 ] ||
         fail "immutable release index size is not pinned"

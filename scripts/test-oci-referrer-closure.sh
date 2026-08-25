@@ -366,7 +366,6 @@ jq -n --arg platform "$BUNDLE_PLATFORM" --argjson platformSize "$BUNDLE_PLATFORM
    ]}
 ' >"$BUNDLE_ROOT_RAW"
 BUNDLE_ROOT=$(digest_of "$BUNDLE_ROOT_RAW")
-BUNDLE_ROOT_SIZE=$(size_of "$BUNDLE_ROOT_RAW")
 cp "$BUNDLE_ROOT_RAW" "$BUNDLE_FIXTURE/${BUNDLE_ROOT#sha256:}.json"
 BUNDLE_INVENTORY=$TMP/bundle-inventory.json
 jq -n --arg root "$BUNDLE_ROOT" --arg platform "$BUNDLE_PLATFORM" \
