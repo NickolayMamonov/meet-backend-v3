@@ -141,8 +141,52 @@ jobs:
             "$release_dir/image-inspect.txt")" -eq 1 ]
           scripts/verify-oci-evidence.sh \
             "$IMAGE" "$digest" "$release_dir/image-index.json" >/dev/null
-          gh attestation verify "oci://$IMAGE@$digest" \
-            --repo "$GITHUB_REPOSITORY" >/dev/null
+          platform_digest=$(jq -er '
+            [.manifests[] |
+              select(.mediaType == "application/vnd.oci.image.manifest.v1+json" and
+                .platform.os == "linux" and .platform.architecture == "amd64") |
+              .digest] |
+            if length == 1 then .[0] else error("release platform is not unique") end
+          ' "$release_dir/image-index.json")
+          scripts/resolve-image-attestation-authority.sh protected-release \
+            --release-id "$release_id" --tag "$TAG" --version "$version" \
+            --source "$source_sha" --root "$digest" --platform "$platform_digest" \
+            >"$release_dir/attestation-authority.json"
+          storage_kind=$(jq -r '.evidenceStorage.kind' \
+            "$release_dir/attestation-authority.json")
+          if [ "$storage_kind" = github-api-workflow-artifact ]; then
+            jq -e --slurpfile proof "$release_dir/immutable-proof.json" \
+              --slurpfile authority "$release_dir/attestation-authority.json" '
+              ($proof[0].assets |
+                map({id,name,size,apiDigest,downloadSha256}) | sort_by(.id)) ==
+              ($authority[0].evidenceStorage.assets | sort_by(.id))
+            ' >/dev/null ||
+              { echo "immutable release asset tuple disagrees with authority" >&2; exit 1; }
+            scripts/verify-image-attestation-authority.sh \
+              --authority "$release_dir/attestation-authority.json" \
+              --subject-file "$release_dir/image-index.json" \
+              --immutable-proof "$release_dir/immutable-proof.json" \
+              --output "$release_dir/attestation-evidence.json"
+          else
+            gh api --paginate --slurp \
+              "users/${GITHUB_REPOSITORY%%/*}/packages/container/${GITHUB_REPOSITORY##*/}/versions?per_page=100" \
+              >"$release_dir/package-versions.json"
+            scripts/normalize-ghcr-package-inventory.sh \
+              --package-versions-file "$release_dir/package-versions.json" \
+              --digest "$digest" --output "$release_dir/package-inventory.json"
+            scripts/verify-oci-referrer-closure.sh \
+              --image "$IMAGE" --index-file "$release_dir/image-index.json" \
+              --inventory-file "$release_dir/package-inventory.json" \
+              --subject-digest "$digest" --platform-subject "$platform_digest" \
+              --require-bundle --bundle-output "$release_dir/attestation-bundle.json" \
+              --output "$release_dir/closure.json" >/dev/null
+            scripts/verify-image-attestation-authority.sh \
+              --authority "$release_dir/attestation-authority.json" \
+              --subject-file "$release_dir/image-index.json" \
+              --bundle "$release_dir/attestation-bundle.json" \
+              --closure "$release_dir/closure.json" \
+              --output "$release_dir/attestation-evidence.json"
+          fi
 
           git fetch --no-tags origin dev "$TAG"
           test "$(git rev-list -n 1 "$TAG")" = "$source_sha"

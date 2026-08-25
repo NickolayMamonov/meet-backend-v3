@@ -11,6 +11,7 @@ default_branch=$(api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
 required_paths=(
   .github/workflows/release-please.yml
   .github/workflows/deploy-production.yml
+  .github/workflows/promote-dev-digest-to-test-vps.yml
   scripts/resolve-release-descriptor.sh
   scripts/release-mutation-policy.sh
   scripts/verify-immutable-policy-reader-credential.sh

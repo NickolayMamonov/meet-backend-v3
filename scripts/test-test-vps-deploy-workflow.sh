@@ -34,7 +34,11 @@ for text in \
   '--allow-immutable-v1.2.0-compact' \
   'cmp -s "$release_dir/image-index.json"' \
   'grep -Ec "^Digest:[[:space:]]+$digest$"' \
-  'gh attestation verify "oci://$IMAGE@$digest"' \
+  'scripts/resolve-image-attestation-authority.sh' \
+  'scripts/verify-image-attestation-authority.sh' \
+  '--immutable-proof "$release_dir/immutable-proof.json"' \
+  'scripts/verify-oci-referrer-closure.sh' \
+  '--require-bundle' \
   'ssh-keyscan -T 5 -p "$PORT" "$HOST"' \
   'ssh-keygen -lf - -E sha256' \
   'scripts/deploy-test-vps-release.sh' \
@@ -58,6 +62,7 @@ for text in \
 done
 
 for stale in \
+  '--verified-json' \
   "refs/heads/master" \
   '      name: production' \
   'backup-production.sh' \

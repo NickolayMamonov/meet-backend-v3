@@ -219,6 +219,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-script-execution-contract.sh"
           bash "$TOOLING_SCRIPTS/test-test-promotion-layout.sh"
           bash "$TOOLING_SCRIPTS/test-test-image-admission.sh"
+          bash "$TOOLING_SCRIPTS/test-test-image-state-readers.sh"
           bash "$TOOLING_SCRIPTS/test-test-promotion-protected-state.sh"
           bash "$TOOLING_SCRIPTS/test-test-promotion-evidence.sh"
           bash "$TOOLING_SCRIPTS/test-bootstrap-default-proof.sh"
@@ -237,6 +238,8 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-ghcr-package-inventory.sh"
           bash "$TOOLING_SCRIPTS/test-ghcr-package-normalization.sh"
           bash "$TOOLING_SCRIPTS/test-oci-referrer-closure.sh"
+          bash "$TOOLING_SCRIPTS/test-image-attestation-authority.sh"
+          bash "$TOOLING_SCRIPTS/test-image-attestation-authority-verifier.sh"
           bash "$TOOLING_SCRIPTS/test-release-pr-fingerprint.sh"
           bash "$TOOLING_SCRIPTS/test-release-tag-ref.sh"
       - name: Validate workflow YAML with actionlint

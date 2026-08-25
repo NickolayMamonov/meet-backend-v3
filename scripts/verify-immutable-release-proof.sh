@@ -66,7 +66,7 @@ main() {
   local assets_dir=
   GH_COMMAND=gh
   local release tag_release attestation statement_file bundle_statement_file
-  local bundle_sha claim_sha payload asset path api_digest download_sha
+  local bundle_sha claim_sha payload asset path api_digest download_sha asset_id asset_size
   local attestation_release_id
   local -a assets=(
     release-manifest.json
@@ -294,6 +294,14 @@ main() {
       jq -r --arg asset "$asset" \
         '.assets[] | select(.name == $asset) | .digest' "$release"
     )
+    asset_id=$(
+      jq -r --arg asset "$asset" \
+        '.assets[] | select(.name == $asset) | .id' "$release"
+    )
+    asset_size=$(
+      jq -r --arg asset "$asset" \
+        '.assets[] | select(.name == $asset) | .size' "$release"
+    )
     download_sha=$(sha256_file "$path")
     jq -cn \
       --arg repository "$repository" \
@@ -302,13 +310,17 @@ main() {
       --arg bundle_sha "$bundle_sha" \
       --arg asset "$asset" \
       --arg api_digest "$api_digest" \
-      --arg download_sha "$download_sha" '
+      --arg download_sha "$download_sha" \
+      --argjson asset_id "$asset_id" \
+      --argjson asset_size "$asset_size" '
         {
           repository:$repository,
           tag:$tag,
           releaseId:$release_id,
           attestationBundleSha256:$bundle_sha,
           name:$asset,
+          id:$asset_id,
+          size:$asset_size,
           apiDigest:$api_digest,
           downloadSha256:$download_sha,
           verified:true

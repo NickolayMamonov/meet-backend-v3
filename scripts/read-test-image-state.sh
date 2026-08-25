@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 usage() { echo "usage: $0 IMAGE ALIAS SOURCE VERSION" >&2; exit 2; }
 fail() { echo "test image registry read failed: $*" >&2; exit 1; }
 
@@ -151,6 +152,26 @@ platform_size=$(jq -r '.size' <<<"$platform_descriptor")
 validate_digest "$root"
 validate_digest "$platform"
 [ "$root" != "$platform" ] || fail "root and platform digests are identical"
+
+read_package_inventory >/dev/null
+"$SCRIPT_DIR/normalize-ghcr-package-inventory.sh" \
+  --package-versions-file "$tmp/packages.json" \
+  --digest "$root" --output "$tmp/inventory.json" ||
+  fail "package inventory normalization failed"
+closure_args=()
+[ -z "${IMAGE_ATTESTATION_FIXTURE_DIR:-}" ] ||
+  closure_args=(--fixture-dir "$IMAGE_ATTESTATION_FIXTURE_DIR")
+"$SCRIPT_DIR/verify-oci-referrer-closure.sh" \
+  --image "$image" --index-file "$raw" --inventory-file "$tmp/inventory.json" \
+  --subject-digest "$root" --platform-subject "$platform" \
+  "${closure_args[@]}" \
+  --require-bundle --bundle-output "$tmp/registry-bundle.json" \
+  --output "$tmp/closure.json" >/dev/null ||
+  fail "closure-derived registry bundle verification failed"
+"$SCRIPT_DIR/resolve-image-attestation-authority.sh" test-candidate \
+  --source "$source" --root "$root" --platform "$platform" \
+  >"$tmp/authority.json" ||
+  fail "candidate authority resolution failed"
 jq -e --arg root "$root" --arg platform "$platform" '
   all(.manifests[];
     (
@@ -229,14 +250,20 @@ while IFS= read -r descriptor; do
         test("^sha256:[0-9a-f]{64}$")) and
       (.mediaType | type == "string" and length > 0) and
       (.size | type == "number" and floor == . and . > 0) and
-      (.annotations["in-toto.io/predicate-type"] |
-        type == "string" and length > 0))
+      (
+        .mediaType == "application/vnd.dev.sigstore.bundle.v0.3+json" or
+        (.annotations["in-toto.io/predicate-type"] |
+          type == "string" and length > 0)
+      ))
   ' "$referrer_raw" >/dev/null ||
     fail "attestation predicate binding is missing"
   while IFS= read -r layer; do
     layer=${layer%$'\r'}
     layer_digest=$(jq -r '.digest' <<<"$layer")
     layer_artifact_type=$(jq -r '.mediaType' <<<"$layer")
+    if [ "$layer_artifact_type" = "application/vnd.dev.sigstore.bundle.v0.3+json" ]; then
+      continue
+    fi
     predicate=$(jq -r '.annotations["in-toto.io/predicate-type"]' <<<"$layer")
     case "$predicate" in
       https://slsa.dev/provenance/*)
@@ -276,57 +303,26 @@ referrers=$(jq -c . "$tmp/referrers.json")
 [ "$(jq '[.[] | select(.kind == "sbom")] | length' <<<"$referrers")" -eq 1 ] ||
   fail "SBOM descriptor binding is not unique"
 
-verified=$tmp/verified-attestations.json
-gh attestation verify "oci://$image@$root" \
-  --repo "$GITHUB_REPOSITORY" --source-digest "$source" --format json \
-  >"$verified" 2>/dev/null ||
-  fail "GitHub OCI attestation verification failed"
-jq -e --arg root "${root#sha256:}" --arg platform "${platform#sha256:}" \
-  --arg repository "https://github.com/$GITHUB_REPOSITORY" \
-  --arg source "$source" '
-  (type == "array" and length == 1) and
-  (.[0] as $verified |
-    ($verified.verificationResult.statement as $statement |
-      ($statement.predicateType |
-        type == "string" and length > 0) and
-      ([$statement.subject[]? |
-        select(.digest.sha256? == $root or .digest.sha256? == $platform)] |
-        length) == 1) and
-    ($verified.verificationResult.signature.certificate as $certificate |
-      $certificate.sourceRepositoryURI == $repository and
-      $certificate.sourceRepositoryDigest == $source and
-      ($certificate.sourceRepositoryRef |
-        type == "string" and startswith("refs/")) and
-      ($certificate.buildSignerURI |
-        type == "string" and
-        startswith($repository + "/.github/workflows/") and
-        endswith("@" + $certificate.sourceRepositoryRef)) and
-      $certificate.subjectAlternativeName == $certificate.buildSignerURI))
-' "$verified" >/dev/null ||
-  fail "verified GitHub attestation identity or subject is malformed"
-github_attestations=$(jq -cS --arg root "$root" --arg platform "$platform" \
-  --arg version "$actual_version" '
-  [
-    .[] |
-    .verificationResult as $result |
-    $result.signature.certificate as $certificate |
-    ([ $result.statement.subject[] |
-      select(
-        .digest.sha256? == ($root | sub("^sha256:";"")) or
-        .digest.sha256? == ($platform | sub("^sha256:";""))
-      ) |
-      "sha256:" + .digest.sha256 ][0]) as $subject |
-    {
-      subject:$subject,
-      repository:$certificate.sourceRepositoryURI,
-      source:$certificate.sourceRepositoryDigest,
-      revision:$certificate.sourceRepositoryDigest,
-      version:$version,
-      workflow:$certificate.buildSignerURI
-    }
-  ]
-' "$verified") || fail "verified GitHub attestation normalization failed"
-
+evidence=$tmp/attestation-evidence.json
+subject_file=$raw
+authority_for_verification=$tmp/authority-for-verification.json
+if [ -n "${IMAGE_ATTESTATION_FIXTURE_DIR:-}" ]; then
+  subject_file=$tmp/image-index.json
+  cp -- "$raw" "$subject_file" ||
+    fail "offline subject staging failed"
+  cp -- "$tmp/authority.json" "$authority_for_verification" ||
+    fail "offline authority staging failed"
+else
+  cp -- "$tmp/authority.json" "$authority_for_verification" ||
+    fail "authority staging failed"
+fi
+"$SCRIPT_DIR/verify-image-attestation-authority.sh" \
+  --authority "$authority_for_verification" \
+  --subject-file "$subject_file" \
+  --bundle "$tmp/registry-bundle.json" \
+  --closure "$tmp/closure.json" \
+  --output "$evidence" ||
+  fail "shared image attestation verification failed"
 root_manifest=$(jq -c '
   [.manifests[] |
     select(
@@ -336,12 +332,14 @@ root_manifest=$(jq -c '
       ((.platform.variant? // "") == ""
     ))] | .[0]
 ' "$raw") || fail "linux/amd64 descriptor normalization failed"
-jq -cnS --arg alias "$alias" --arg root "$root" \
+jq -cnS --arg schema "meet-backend/test-image-state/v2" \
+  --arg alias "$alias" --arg root "$root" \
   --arg rootMedia "$root_media" --arg platform "$platform" \
   --arg platformMedia "$platform_media" --argjson labels "$labels" \
   --argjson rootManifest "$root_manifest" --argjson referrers "$referrers" \
-  --argjson githubAttestations "$github_attestations" '
+  --slurpfile attestationEvidence "$evidence" '
   {
+    schema:$schema,
     bindings:[{
       alias:$alias,
       digest:$root,
@@ -357,7 +355,7 @@ jq -cnS --arg alias "$alias" --arg root "$root" \
         labels:$labels
       },
       referrers:$referrers,
-      githubAttestations:$githubAttestations
+      attestationEvidence:$attestationEvidence
     }]
   }
 '
