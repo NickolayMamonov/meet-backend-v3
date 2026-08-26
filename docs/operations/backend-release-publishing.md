@@ -24,13 +24,30 @@ cover that tuple and immutable predecessor release ID `367640510`, version
 `1.0.1`. Compare canonical bytes before and after every hosted checkpoint.
 Any mismatch is a hard stop.
 
-The one-time continuation authority is release ID `377201468`, tag `v1.3.0`, version `1.3.0`, and source `a7abfe04f6852f479291a4710ebdee23e9ae8a34`. Its exact pending draft is the only continuation admitted for materialization: `draft:true`, `immutable:false`, `prerelease:false`, `published_at:null`, zero assets, an absent tag ref, and exactly empty `$TAG`, `$VERSION`, `sha-$SOURCE_SHA`, and `latest` registry state. An exact immutable published object is treated as completed and sent to the normal resolver; absence is also normal resolution, while every other object or state for this ID fails closed. It is never deleted, recreated, retagged, or adopted through a different tuple.
+The one-time continuation authority is release ID `377201468`, tag `v1.3.0`,
+version `1.3.0`, and source
+`a7abfe04f6852f479291a4710ebdee23e9ae8a34`. Its exact pending draft is the
+only continuation admitted for materialization: `draft:true`,
+`immutable:false`, `prerelease:false`, `published_at:null`, zero assets,
+an absent tag ref, and exactly empty `$TAG`, `$VERSION`,
+`sha-$SOURCE_SHA`, and `latest` registry state. An exact immutable published
+object is treated as completed and sent to the normal resolver; absence is
+also normal resolution, while every other object or state for this ID fails
+closed. It is never deleted, recreated, retagged, or adopted through a
+different tuple.
 
 ## Historical recovery records
 
-Release ID `371012814` was the prior quarantined `v1.2.0` continuation, with source `9b6d2b06c0336ab8d153564dcf6328e81c4d7b36`. That tuple is historical evidence only; it is not an authorization for the current `v1.3.0` continuation.
+Release ID `371012814` was the prior quarantined `v1.2.0` continuation,
+with source `9b6d2b06c0336ab8d153564dcf6328e81c4d7b36`. That tuple is
+historical evidence only; it is not an authorization for the current
+`v1.3.0` continuation.
 
-Release ID `368531227`, tag `v1.1.0`, version `1.1.0`, and source `36ffd11ea4d35147f1df9c1cafa6a330300c1339` remain permanently no-touch. Their four assets, absent ref, package aliases, draft state, and attestation state are protected by the canonical snapshot and must remain byte-for-byte unchanged.
+Release ID `368531227`, tag `v1.1.0`, version `1.1.0`, and source
+`36ffd11ea4d35147f1df9c1cafa6a330300c1339` remain permanently no-touch.
+Their four assets, absent ref, package aliases, draft state, and attestation
+state are protected by the canonical snapshot and must remain byte-for-byte
+unchanged.
 
 ## Normal controller routes
 
@@ -122,17 +139,18 @@ gh release verify-asset <tag> <asset-path> --repo nickolaymamonov/meet-backend-v
 ```
 
 An omitted or wrong tag, or a latest release that resolves to an unrelated
-release, cannot pass. The normalized proof binds repository, tag, release ID, source,
-attestation/bundle identity where exposed, each asset name, API digest, and
-downloaded SHA-256. It contains no raw API response or secret. Uploading the
-checksummed `MEE2-48-<tag>-immutability-proof` artifact is the only
+release, cannot pass. The normalized proof binds repository, tag, release ID,
+source, attestation/bundle identity where exposed, each asset name, API digest,
+and downloaded SHA-256. It contains no raw API response or secret. Uploading
+the checksummed `MEE2-48-<tag>-immutability-proof` artifact is the only
 repository-owned control-plane write after PATCH.
 
 ## Terminal partial and rollback
 
-If any external object for the current tuple exists and the run stops, do not rerun it. Leave
-the draft and all external objects unchanged. Collect only allowlisted
-read-only release/ref/package/attestation evidence and the Actions run URL,
+If any external object for the current tuple exists and the run stops, do not
+rerun it. Leave the draft and all external objects unchanged. Collect only
+allowlisted read-only release/ref/package/attestation evidence and the Actions
+run URL,
 then open separately authorized incident work. Before any current-tuple external
 write, the infrastructure PR may be reverted normally after protected-history
 equality is proven. After PATCH, no release rollback or compensating mutation

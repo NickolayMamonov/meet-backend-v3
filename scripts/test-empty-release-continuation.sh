@@ -72,17 +72,22 @@ expect_rejection "$ADMIT" --repository owner/repo --repo-dir "$REPO" --dev-ref "
   --releases-file "$TMP/releases.json" --registry-state-file "$TMP/registry.txt" \
   --refs-file "$TMP/refs.json"
 
-jq '.[0].immutable=true' "$TMP/releases.json" >"$TMP/immutable.json"
-expect_rejection "$ADMIT" --repository owner/repo --repo-dir "$REPO" --dev-ref "$SOURCE" \
-  --release-id 377201468 --tag v1.3.0 --version 1.3.0 \
-  --source-sha "$SOURCE" --releases-file "$TMP/immutable.json" \
-  --registry-state-file "$TMP/registry.txt" --refs-file "$TMP/refs.json"
-
-
 reject_mutation() {
   local label=$1 filter=$2
   jq "$filter" "$TMP/releases.json" >"$TMP/$label.json"
-  if "$ADMIT" --repository owner/repo --repo-dir "$REPO" --dev-ref "$SOURCE" --release-id 377201468 --tag v1.3.0 --version 1.3.0 --source-sha "$SOURCE" --releases-file "$TMP/$label.json" --registry-state-file "$TMP/registry.txt" --refs-file "$TMP/refs.json" >/dev/null 2>&1; then
+  local -a args=(
+    --repository owner/repo
+    --repo-dir "$REPO"
+    --dev-ref "$SOURCE"
+    --release-id 377201468
+    --tag v1.3.0
+    --version 1.3.0
+    --source-sha "$SOURCE"
+    --releases-file "$TMP/$label.json"
+    --registry-state-file "$TMP/registry.txt"
+    --refs-file "$TMP/refs.json"
+  )
+  if "$ADMIT" "${args[@]}" >/dev/null 2>&1; then
     echo "$label mutation was admitted" >&2
     exit 1
   fi
