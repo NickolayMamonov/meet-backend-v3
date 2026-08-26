@@ -113,7 +113,7 @@ if ! docker buildx imagetools inspect --raw "$ref" >"$raw" 2>/dev/null; then
       .name] | unique
   ' <<<"$inventory") || fail "package inventory lookup failed"
   case "$(jq length <<<"$alias_digests")" in
-    0) jq -cn '{bindings:[]}'; exit 0 ;;
+    0) jq -cn '{schema:"meet-backend/test-image-state/v2",bindings:[]}'; exit 0 ;;
     1) fail "registry manifest inspection failed for an existing alias" ;;
     *) fail "package inventory binds the alias to multiple digests" ;;
   esac

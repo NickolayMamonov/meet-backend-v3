@@ -59,6 +59,17 @@ command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
   fail "closure output directory is unavailable"
 
 WORK_DIR=$(mktemp -d)
+temporary_bundle=
+temporary_output=
+cleanup_workspace() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  [ -z "$temporary_bundle" ] || rm -f -- "$temporary_bundle"
+  [ -z "$temporary_output" ] || rm -f -- "$temporary_output"
+  rm -r -- "$WORK_DIR"
+  exit "$status"
+}
+trap cleanup_workspace EXIT HUP INT TERM
 REFERRERS=$WORK_DIR/referrers
 INVENTORY_DIGESTS=$WORK_DIR/inventory-digests
 ATTRIBUTIONS=$WORK_DIR/attributions.jsonl
@@ -599,13 +610,14 @@ if [ "$REQUIRE_BUNDLE" -eq 1 ]; then
       "application/vnd.dev.sigstore.bundle.v0.3+json"
   ' "$bundle_file" >/dev/null ||
     fail "Sigstore bundle JSON is malformed"
-  temporary_bundle=$BUNDLE_OUTPUT.tmp.$$
-  [ ! -e "$temporary_bundle" ] && [ ! -L "$temporary_bundle" ] ||
+  [ ! -e "$BUNDLE_OUTPUT.tmp.$$" ] && [ ! -L "$BUNDLE_OUTPUT.tmp.$$" ] ||
     fail "bundle output staging path is unsafe"
+  temporary_bundle=$BUNDLE_OUTPUT.tmp.$$
   cp -- "$bundle_file" "$temporary_bundle" || fail "bundle output staging failed"
   chmod 600 "$temporary_bundle" 2>/dev/null || true
   mv -f -- "$temporary_bundle" "$BUNDLE_OUTPUT" ||
     fail "bundle output publication failed"
+  temporary_bundle=
 fi
 
 jq \
@@ -627,9 +639,9 @@ jq \
 if [ -n "$OUTPUT" ]; then
   [ ! -e "$OUTPUT" ] || [ -f "$OUTPUT" ] ||
     fail "closure output is unsafe"
-  temporary_output=$OUTPUT.tmp.$$
-  [ ! -e "$temporary_output" ] && [ ! -L "$temporary_output" ] ||
+  [ ! -e "$OUTPUT.tmp.$$" ] && [ ! -L "$OUTPUT.tmp.$$" ] ||
     fail "closure output staging path is unsafe"
+  temporary_output=$OUTPUT.tmp.$$
   if [ "$REQUIRE_BUNDLE" -eq 1 ]; then
     jq -cS \
       --arg signatureManifestDigest "$BUNDLE_MANIFEST" \
@@ -646,8 +658,10 @@ if [ -n "$OUTPUT" ]; then
       }}' "$WORK_DIR/inventory-attributed.json" >"$temporary_output" ||
       fail "closure evidence could not be emitted"
     mv -f -- "$temporary_output" "$OUTPUT"
+    temporary_output=
   else
     mv "$WORK_DIR/inventory-attributed.json" "$OUTPUT"
+    temporary_output=
   fi
 else
   if [ "$REQUIRE_BUNDLE" -eq 1 ]; then
@@ -668,5 +682,3 @@ else
     cat "$WORK_DIR/inventory-attributed.json"
   fi
 fi
-
-rm -r -- "$WORK_DIR"

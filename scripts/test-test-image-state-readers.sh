@@ -625,8 +625,27 @@ if ! bash "$ADMIT" verify --source "$SOURCE" --version "$VERSION" \
 fi
 
 run_read inspect-fail >"$TMP/read-absent.json"
-jq -e '.bindings == []' "$TMP/read-absent.json" >/dev/null ||
-  fail "independently confirmed absence was not emitted"
+jq -e '.schema == "meet-backend/test-image-state/v2" and .bindings == []' "$TMP/read-absent.json" >/dev/null ||
+  fail "independently confirmed absence was not emitted as canonical v2 state"
+bash "$ADMIT" inspect --source "$SOURCE" --version "$VERSION" \
+  --input "$TMP/read-absent.json" >"$TMP/read-absent-admission.json" ||
+  fail "canonical absent reader output was rejected by image admission"
+jq -e '.state == "absent" and .reason == "no-binding"' "$TMP/read-absent-admission.json" >/dev/null ||
+  fail "image admission did not preserve absent state"
+printf '%s\n' '{"schema":"meet-backend/test-image-state/v1","bindings":[]}' >"$TMP/read-absent-v1.json"
+if bash "$ADMIT" inspect --source "$SOURCE" --version "$VERSION" \
+    --input "$TMP/read-absent-v1.json" >"$TMP/read-absent-v1-admission.json" 2>"$TMP/read-absent-v1.stderr"; then
+  fail "v1 absent reader output was accepted"
+fi
+jq -e '.state == "rejected" and .reason == "malformed-input"' "$TMP/read-absent-v1-admission.json" >/dev/null ||
+  fail "v1 absent reader output was not rejected as malformed"
+printf '{\n' >"$TMP/read-absent-malformed.json"
+if bash "$ADMIT" inspect --source "$SOURCE" --version "$VERSION" \
+    --input "$TMP/read-absent-malformed.json" >"$TMP/read-absent-malformed-admission.json" 2>"$TMP/read-absent-malformed.stderr"; then
+  fail "malformed absent reader output was accepted"
+fi
+jq -e '.state == "rejected" and .reason == "malformed-input"' "$TMP/read-absent-malformed-admission.json" >/dev/null ||
+  fail "malformed absent reader output was not rejected"
 expect_failure inspect-existing run_read inspect-existing
 expect_failure inventory-error run_read inventory-error
 expect_failure malformed-root run_read malformed-root

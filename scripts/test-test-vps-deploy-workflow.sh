@@ -6,6 +6,8 @@ cd "$ROOT_DIR"
 workflow=.github/workflows/deploy-test-vps.yml
 deploy=scripts/deploy-test-vps-release.sh
 runtime=scripts/test-vps-runtime-invariants.sh
+TMP=$(mktemp -d)
+trap 'rm -r -- "$TMP"' EXIT HUP INT TERM
 
 [ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ]
 workflow_text=$(<"$workflow")
@@ -35,6 +37,7 @@ for text in \
   'cmp -s "$release_dir/image-index.json"' \
   'grep -Ec "^Digest:[[:space:]]+$digest$"' \
   'scripts/resolve-image-attestation-authority.sh' \
+  'jq -en --slurpfile proof "$release_dir/immutable-proof.json"' \
   'scripts/verify-image-attestation-authority.sh' \
   '--immutable-proof "$release_dir/immutable-proof.json"' \
   'scripts/verify-oci-referrer-closure.sh' \
@@ -76,6 +79,27 @@ for stale in \
   esac
 done
 
+guard_probe="$TMP/asset-guard.json"
+jq -cn '{assets:[{id:1,name:"image-index.json",size:1,apiDigest:"sha256:1",downloadSha256:"1"}],evidenceStorage:{assets:[{id:1,name:"image-index.json",size:1,apiDigest:"sha256:1",downloadSha256:"1"}]}}' >"$guard_probe"
+jq -en --slurpfile proof "$guard_probe" --slurpfile authority "$guard_probe" '
+  ($proof[0].assets |
+    map({id,name,size,apiDigest,downloadSha256}) | sort_by(.id)) ==
+  ($authority[0].evidenceStorage.assets | sort_by(.id))
+' >/dev/null
+guard_mismatch="$TMP/asset-guard-mismatch.json"
+jq -cn '{assets:[{id:1,name:"image-index.json",size:1,apiDigest:"sha256:1",downloadSha256:"1"}],evidenceStorage:{assets:[{id:2,name:"image-index.json",size:1,apiDigest:"sha256:2",downloadSha256:"2"}]}}' >"$guard_mismatch"
+if jq -en --slurpfile proof "$guard_mismatch" --slurpfile authority "$guard_mismatch" '
+  ($proof[0].assets |
+    map({id,name,size,apiDigest,downloadSha256}) | sort_by(.id)) ==
+  ($authority[0].evidenceStorage.assets | sort_by(.id))
+' >/dev/null; then
+  echo "asset tuple guard accepted mismatched authority assets" >&2
+  exit 1
+fi
+asset_guard_line=$(awk '/jq -en --slurpfile proof/{print NR; exit}' "$workflow")
+attestation_verifier_line=$(awk '/scripts\/verify-image-attestation-authority\.sh/{print NR; exit}' "$workflow")
+[ -n "$asset_guard_line" ] && [ -n "$attestation_verifier_line" ]
+[ "$asset_guard_line" -lt "$attestation_verifier_line" ]
 verify_line=$(awk '/scripts\/verify-immutable-release-proof\.sh/{print NR; exit}' "$workflow")
 ssh_line=$(awk '/ssh-keyscan -T 5/{print NR; exit}' "$workflow")
 [ "$verify_line" -lt "$ssh_line" ]

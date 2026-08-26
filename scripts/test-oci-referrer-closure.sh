@@ -404,11 +404,14 @@ jq -e --arg root "$BUNDLE_ROOT" --arg platform "$BUNDLE_PLATFORM" \
 
 expect_bundle_failure() {
   local name=$1 index_file=$2 inventory_file=$3 fixture_dir=$4
-  local sentinel_bundle=$TMP/$name.bundle.sentinel
-  local sentinel_closure=$TMP/$name.closure.sentinel
+  local sentinel_bundle=$TMP/$name.bundle.sentinel expected_bundle=$TMP/$name.bundle.expected
+  local sentinel_closure=$TMP/$name.closure.sentinel expected_closure=$TMP/$name.closure.expected case_tmp=$TMP/$name-tmpdir
   printf 'bundle sentinel\n' >"$sentinel_bundle"
   printf 'closure sentinel\n' >"$sentinel_closure"
-  if "$VERIFY" --image "$IMAGE" --index-file "$index_file" \
+  cp -- "$sentinel_bundle" "$expected_bundle"
+  cp -- "$sentinel_closure" "$expected_closure"
+  mkdir "$case_tmp"
+  if TMPDIR="$case_tmp" "$VERIFY" --image "$IMAGE" --index-file "$index_file" \
       --inventory-file "$inventory_file" --subject-digest "$BUNDLE_ROOT" \
       --platform-subject "$BUNDLE_PLATFORM" --fixture-dir "$fixture_dir" \
       --require-bundle --bundle-output "$sentinel_bundle" \
@@ -416,10 +419,17 @@ expect_bundle_failure() {
     echo "expected bundle rejection: $name" >&2
     exit 1
   fi
-  cmp --silent "$sentinel_bundle" "$TMP/$name.bundle.sentinel" ||
+  cmp --silent "$sentinel_bundle" "$expected_bundle" ||
     { echo "bundle sentinel changed: $name" >&2; exit 1; }
-  cmp --silent "$sentinel_closure" "$TMP/$name.closure.sentinel" ||
+  cmp --silent "$sentinel_closure" "$expected_closure" ||
     { echo "closure sentinel changed: $name" >&2; exit 1; }
+  [ -z "$(find "$case_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
+    { echo "temporary work directory was not cleaned: $name" >&2; exit 1; }
+  [ -z "$(find "$TMP" -maxdepth 1 -name "$name.bundle.sentinel.tmp.*" -print -quit)" ] ||
+    { echo "bundle staging file was not cleaned: $name" >&2; exit 1; }
+  [ -z "$(find "$TMP" -maxdepth 1 -name "$name.closure.sentinel.tmp.*" -print -quit)" ] ||
+    { echo "closure staging file was not cleaned: $name" >&2; exit 1; }
+  rmdir "$case_tmp"
 }
 
 make_bundle_variant() {

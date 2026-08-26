@@ -155,7 +155,7 @@ jobs:
           storage_kind=$(jq -r '.evidenceStorage.kind' \
             "$release_dir/attestation-authority.json")
           if [ "$storage_kind" = github-api-workflow-artifact ]; then
-            jq -e --slurpfile proof "$release_dir/immutable-proof.json" \
+            jq -en --slurpfile proof "$release_dir/immutable-proof.json" \
               --slurpfile authority "$release_dir/attestation-authority.json" '
               ($proof[0].assets |
                 map({id,name,size,apiDigest,downloadSha256}) | sort_by(.id)) ==
