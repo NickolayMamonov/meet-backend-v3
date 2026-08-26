@@ -1,5 +1,63 @@
 # Changelog
 
+## [1.3.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.2.0...v1.3.0) (2026-08-23)
+
+
+### Features
+
+* add exact dev test VPS promotion path ([cc4d840](https://github.com/NickolayMamonov/meet-backend-v3/commit/cc4d840cb0248e66666f98674ce035b66de04d3d))
+* **deploy:** add durable Yandex SMTP rollout ([4680658](https://github.com/NickolayMamonov/meet-backend-v3/commit/46806584aceb86423b044463b1a096af9d9ddd93))
+* **deploy:** add guarded test VPS promotion ([c8fc32b](https://github.com/NickolayMamonov/meet-backend-v3/commit/c8fc32bf627857123c34c5c198983078bfea344c))
+* **deploy:** add guarded test VPS promotion ([9a89692](https://github.com/NickolayMamonov/meet-backend-v3/commit/9a89692bf12099734f2106ca6b4402e400f6bb9a))
+
+
+### Fixes
+
+* bind promotion evidence to predecessor proofs ([e30fe72](https://github.com/NickolayMamonov/meet-backend-v3/commit/e30fe72fbab3582d8d6f167fa2b9e74f6b8b8bf2))
+* centralize dev promotion authorization ([adbae1f](https://github.com/NickolayMamonov/meet-backend-v3/commit/adbae1f36207317c21ca35ca1f8ed57fdabaed31))
+* **ci:** enforce promotion script execution contract ([f27299a](https://github.com/NickolayMamonov/meet-backend-v3/commit/f27299a6a7230be9adaeefe02ca36dddcf90be1e))
+* **ci:** keep workflow validation parser-focused ([62d72f4](https://github.com/NickolayMamonov/meet-backend-v3/commit/62d72f4856af4bb5018c6ef999dbe69dd3159018))
+* **ci:** mark workflow validator executable ([4bedd7e](https://github.com/NickolayMamonov/meet-backend-v3/commit/4bedd7e510116c93cd59338d6c8b8760c6c1e981))
+* **ci:** validate promotion environment policy shape ([172459d](https://github.com/NickolayMamonov/meet-backend-v3/commit/172459d02c30a1b0c483722ace2ff0e31c6e791a))
+* **ci:** validate promotion environment policy shape ([da400c9](https://github.com/NickolayMamonov/meet-backend-v3/commit/da400c9837c84af128eeee12ac2977b7a963b567))
+* **ci:** validate promotion workflow syntax ([46f47df](https://github.com/NickolayMamonov/meet-backend-v3/commit/46f47df88c328a12d312245e07bf705ae4f38cd9))
+* close dev promotion admission and evidence gates ([fa7f147](https://github.com/NickolayMamonov/meet-backend-v3/commit/fa7f1472056fff26b4bdbde13fbca4e4dbba94c3))
+* close dev promotion rework gates ([13ee040](https://github.com/NickolayMamonov/meet-backend-v3/commit/13ee04040c55c66cf9a5b7d53cf89caa6c6d6232))
+* close promotion QA gates ([5617591](https://github.com/NickolayMamonov/meet-backend-v3/commit/56175912be93522e3164257a9c20ab4d22907610))
+* close remaining promotion review gates ([55b933d](https://github.com/NickolayMamonov/meet-backend-v3/commit/55b933d830f7d5917a6d54c65995ba9ed5e54615))
+* **deploy:** accept aligned image digest evidence ([ae83bf1](https://github.com/NickolayMamonov/meet-backend-v3/commit/ae83bf160902338657b7164fe1b1e8d18c9a5122))
+* **deploy:** accept aligned image digest evidence ([10ca6b2](https://github.com/NickolayMamonov/meet-backend-v3/commit/10ca6b27f5299e403390609158a83f9821609107))
+* **deploy:** bind promotion evidence to runtime probes ([a1b81d0](https://github.com/NickolayMamonov/meet-backend-v3/commit/a1b81d0a59f32daaa548f5d94d6ca23dde0e9b54))
+* **deploy:** bound test VPS retention ([2739920](https://github.com/NickolayMamonov/meet-backend-v3/commit/27399202b2a9e92d2816749e12965a9f5368b5b3))
+* **deploy:** bound test VPS retention ([2cfd63c](https://github.com/NickolayMamonov/meet-backend-v3/commit/2cfd63c5e8bf7dace7a3f4a3ffb952811743164d))
+* **deploy:** close SMTP rollback findings ([31167dd](https://github.com/NickolayMamonov/meet-backend-v3/commit/31167ddf3664b3497d3b3a8bf77746c7290de514))
+* **deploy:** close SMTP startup evidence gaps ([8d7194c](https://github.com/NickolayMamonov/meet-backend-v3/commit/8d7194c492b7fd8d99dd2c792415f543f8867940))
+* **deploy:** close SMTP transaction findings ([b43fb54](https://github.com/NickolayMamonov/meet-backend-v3/commit/b43fb54ca39819d0154fc6999fe2820df72a2259))
+* **deploy:** harden SMTP recovery state ([7d1898f](https://github.com/NickolayMamonov/meet-backend-v3/commit/7d1898fdfb37a9a1c81a90c608eb20cca87acc1a))
+* **deploy:** harden SMTP transaction recovery ([cf3fdd0](https://github.com/NickolayMamonov/meet-backend-v3/commit/cf3fdd0b6a0cb7ec63cde0431c5f108893727159))
+* **deploy:** mark SMTP tooling executable ([f74ec26](https://github.com/NickolayMamonov/meet-backend-v3/commit/f74ec26aa0a22b956e4adc78a0a5ed2a25bfdfdb))
+* **deploy:** normalize Docker mount records ([fc1a00b](https://github.com/NickolayMamonov/meet-backend-v3/commit/fc1a00b07c338d821733b02112e30f350e6d063b))
+* **deploy:** normalize Docker mount records ([47f5ac9](https://github.com/NickolayMamonov/meet-backend-v3/commit/47f5ac98a6ecbf26dfa8873faf25b75a0d7ea446))
+* **deploy:** preserve observed promotion evidence ([b28f107](https://github.com/NickolayMamonov/meet-backend-v3/commit/b28f107b82120553ee180cfae9766c093f469ef6))
+* **deploy:** reconcile SMTP transaction findings ([1f119f5](https://github.com/NickolayMamonov/meet-backend-v3/commit/1f119f5d90a44f86bd166c451e528b0ea5d5fc4f))
+* **deploy:** restore SMTP rollback verification ([662f03e](https://github.com/NickolayMamonov/meet-backend-v3/commit/662f03e431128d3778e58b677ac229896413d494))
+* **deploy:** satisfy probe shell validation ([06ec1e7](https://github.com/NickolayMamonov/meet-backend-v3/commit/06ec1e702f5c261d7fb7502de49b7094feb6f8f8))
+* **deploy:** verify runtime Compose labels ([14dd6b8](https://github.com/NickolayMamonov/meet-backend-v3/commit/14dd6b85f8fba49752dc2bd58523c1a6ba38c0d1))
+* **deploy:** verify runtime Compose labels ([4d4cf51](https://github.com/NickolayMamonov/meet-backend-v3/commit/4d4cf51593cebf1f4253449d1afab52cdf437e85))
+* model paginated GitHub check responses ([7f42a2c](https://github.com/NickolayMamonov/meet-backend-v3/commit/7f42a2ce87d8b6fa21dbe27fa1ef3b277e6809c9))
+* quote promotion refspecs for shellcheck ([113a6cb](https://github.com/NickolayMamonov/meet-backend-v3/commit/113a6cbecc15369b198b9d44cfb13a5c4adffcbd))
+* **release:** anchor tooling fixtures ([5f59a61](https://github.com/NickolayMamonov/meet-backend-v3/commit/5f59a6162e6f8045aacd61d168c904b4af9273e6))
+* **release:** anchor tooling fixtures ([328405f](https://github.com/NickolayMamonov/meet-backend-v3/commit/328405f4ffaa762ce8ea11dcb01fa2537f630ab1))
+* **release:** continue exact empty v1.2.0 draft ([eadad24](https://github.com/NickolayMamonov/meet-backend-v3/commit/eadad246a0c394bf99b6616683577ec05987049c))
+* **release:** continue exact empty v1.2.0 draft ([d152c3b](https://github.com/NickolayMamonov/meet-backend-v3/commit/d152c3ba1fe2685b57f6e232a1acbb46baa7e637))
+* **release:** provision attestation buildx ([9af0723](https://github.com/NickolayMamonov/meet-backend-v3/commit/9af0723444f918594101999a4338b418607cbd01))
+* **release:** provision attestation buildx ([4c69fb0](https://github.com/NickolayMamonov/meet-backend-v3/commit/4c69fb044b89d1304fdb1c77eab9a966959a4599))
+* **release:** verify immutable attestations v0.2 ([a437707](https://github.com/NickolayMamonov/meet-backend-v3/commit/a437707f6b9491edb93cef5b41bc225fc0224f16))
+* **release:** verify immutable attestations v0.2 ([0d60805](https://github.com/NickolayMamonov/meet-backend-v3/commit/0d60805acf4ce76d349b26ed728e937db3754411))
+* run promotion shims through bash ([7dd4150](https://github.com/NickolayMamonov/meet-backend-v3/commit/7dd415052f198fff6350c12ff4bca767a6d02ea4))
+* satisfy promotion shell lint ([7e51ebf](https://github.com/NickolayMamonov/meet-backend-v3/commit/7e51ebfad71b767338c4bd79fdab44ed20ac2824))
+* validate promotion environment policies ([ec92451](https://github.com/NickolayMamonov/meet-backend-v3/commit/ec92451bb7901982c8cc253313d974b62ab5c3b6))
+
 ## [1.2.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.1.0...v1.2.0) (2026-08-15)
 
 
