@@ -65,14 +65,27 @@ done
 [ "$tag" != v1.1.0 ] || fail "permanently denied tag"
 [ "$source_sha" != 36ffd11ea4d35147f1df9c1cafa6a330300c1339 ] ||
   fail "permanently denied source"
-if [ -z "$refs_file" ]; then
-  if [ "$release_id" != 371012814 ] ||
-     [ "$tag" != v1.2.0 ] ||
-     [ "$version" != 1.2.0 ] ||
-     [ "$source_sha" != 9b6d2b06c0336ab8d153564dcf6328e81c4d7b36 ]; then
-    fail "only the exact quarantined v1.2.0 draft may continue"
-  fi
+if [ "$release_id" != 377201468 ] ||
+   [ "$tag" != v1.3.0 ] ||
+   [ "$version" != 1.3.0 ] ||
+   [ "$source_sha" != a7abfe04f6852f479291a4710ebdee23e9ae8a34 ]; then
+  fail "only the exact quarantined v1.3.0 draft may continue"
 fi
+
+jq -e 'type == "array" and all(.[]; type == "object")' "$releases_file" >/dev/null ||
+  fail "release snapshot is malformed"
+continuation_release=$(jq -c --argjson id 377201468 '
+  [ .[] | select(.id == $id) ] | if length == 1 then .[0] else empty end
+' "$releases_file")
+[ -n "$continuation_release" ] || fail "exact continuation release is missing or ambiguous"
+jq -e --argjson id 377201468 '
+  .id == $id and .name == "v1.3.0" and .tag_name == "v1.3.0" and
+  .target_commitish == "a7abfe04f6852f479291a4710ebdee23e9ae8a34" and
+  .draft == true and .immutable == false and .prerelease == false and
+  (.published_at // null) == null and
+  (.assets | type == "array" and length == 0)
+' <<<"$continuation_release" >/dev/null ||
+  fail "continuation release is not the exact empty v1.3.0 draft"
 
 source_commit=$(git -C "$repo_dir" rev-parse --verify "${source_sha}^{commit}" 2>/dev/null) ||
   fail "release source commit is unavailable"
