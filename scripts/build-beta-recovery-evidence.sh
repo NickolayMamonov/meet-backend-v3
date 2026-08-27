@@ -149,9 +149,8 @@ validate_manifest_shape() {
       (.artifactName == ("beta-recovery-" + $id + "-" + ($run|tostring))) and
       (.contracts | (keys | sort) == ["database","media","tooling","workflow"]) and
       (all(.contracts[]; type == "string" and test("^[0-9a-f]{64}$"))) and
-      (.artifactFiles | type == "array" and length == 5 and
-        map(.path) == [
-          "capture-runtime.json","database-proof.json","media-proof.json",
+      (.artifactFiles | type == "array" and length == 2 and
+        (map(.path) | sort) == [
           "postgres.dump.age","uploads.tar.gz.age"
         ] and
         all(.[]; (keys | sort) == ["path","sha256","size"] and
@@ -165,8 +164,7 @@ validate_manifest_shape() {
 artifact_files_json() {
   local artifact_dir=$1
   local path size digest
-  for path in capture-runtime.json database-proof.json media-proof.json \
-    postgres.dump.age uploads.tar.gz.age; do
+  for path in postgres.dump.age uploads.tar.gz.age; do
     regular "$artifact_dir/$path" || fail "artifact file missing: $path"
     size=$(wc -c <"$artifact_dir/$path" | tr -d '[:space:]')
     digest=$(sha256sum -- "$artifact_dir/$path" | awk '{print $1}')
@@ -205,21 +203,10 @@ case "$kind" in
     db_cipher_sha=$(sha256sum -- "$database_ciphertext" | awk '{print $1}')
     uploads_cipher_size=$(wc -c <"$uploads_ciphertext" | tr -d '[:space:]')
     uploads_cipher_sha=$(sha256sum -- "$uploads_ciphertext" | awk '{print $1}')
-    runtime_size=$(wc -c <"$runtime" | tr -d '[:space:]')
-    runtime_sha=$(sha256sum -- "$runtime" | awk '{print $1}')
-    dbp_size=$(wc -c <"$dbp" | tr -d '[:space:]')
-    dbp_sha=$(sha256sum -- "$dbp" | awk '{print $1}')
-    mp_size=$(wc -c <"$mp" | tr -d '[:space:]')
-    mp_sha=$(sha256sum -- "$mp" | awk '{print $1}')
     artifact_files=$(jq -cnS \
-      --arg rsha "$runtime_sha" --arg dsha "$dbp_sha" --arg msha "$mp_sha" \
       --arg csha "$db_cipher_sha" --arg usha "$uploads_cipher_sha" \
-      --argjson rsize "$runtime_size" --argjson dsize "$dbp_size" --argjson msize "$mp_size" \
       --argjson csize "$db_cipher_size" --argjson usize "$uploads_cipher_size" '
       [
-        {path:"capture-runtime.json",size:$rsize,sha256:$rsha},
-        {path:"database-proof.json",size:$dsize,sha256:$dsha},
-        {path:"media-proof.json",size:$msize,sha256:$msha},
         {path:"postgres.dump.age",size:$csize,sha256:$csha},
         {path:"uploads.tar.gz.age",size:$usize,sha256:$usha}
       ]')
@@ -253,15 +240,12 @@ case "$kind" in
     regular "$artifact_dir/recovery-point.json" || fail "manifest missing"
     [ "$(find "$artifact_dir" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" = '' ] ||
       fail "artifact contains a non-file entry"
-    [ "$(find "$artifact_dir" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" = 6 ] ||
+    [ "$(find "$artifact_dir" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" = 3 ] ||
       fail "artifact shape is not exact"
     validate_manifest_shape "$artifact_dir/recovery-point.json" "$id" "$sha" "$repo" "$run"
     expected=$(jq -cS '.artifactFiles' "$artifact_dir/recovery-point.json")
     actual=$(artifact_files_json "$artifact_dir" | jq -cS .)
     [ "$expected" = "$actual" ] || fail "artifact exact-byte contract mismatch"
-    validate_database_proof "$artifact_dir/database-proof.json"
-    validate_media_proof "$artifact_dir/media-proof.json"
-    validate_runtime_proof "$artifact_dir/capture-runtime.json"
     ;;
   final)
     safe_path "$output" || usage
@@ -279,11 +263,10 @@ case "$kind" in
     validate_runtime_proof "$pre"; validate_runtime_proof "$post"
     safe_json "$mount"
     jq -e '
-      (keys | sort) == ["anonymous","destination","readWrite","schema","type","volumeName"] and
+      (keys | sort) == ["anonymous","destination","readWrite","schema","type"] and
       .schema == "meet-backend/beta-recovery-mount/v1" and .type == "volume" and
       .destination == "/var/lib/postgresql/data" and .readWrite == true and
-      .anonymous == true and (.volumeName | type == "string" and length > 0) and
-      .volumeName != "meet-production_postgres_data"
+      .anonymous == true
     ' "$mount" >/dev/null || fail "mount contract is invalid"
     cmp -- "$pre" "$post" || fail "restore probes are not exactly equal"
     for b in "$healthy" "$equal" "$verified" "$cleanup" "$absent"; do bool "$b" || fail "boolean malformed"; done

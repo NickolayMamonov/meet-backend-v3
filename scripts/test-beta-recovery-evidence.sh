@@ -35,19 +35,19 @@ bash "$builder" manifest \
   --database-ciphertext "$tmp/postgres.dump.age" --uploads-ciphertext "$tmp/uploads.tar.gz.age" \
   --output "$tmp/recovery-point.json"
 mkdir "$tmp/artifact"
-cp -- "$db_proof" "$media_proof" "$runtime" "$tmp/postgres.dump.age" "$tmp/uploads.tar.gz.age" \
+cp -- "$tmp/postgres.dump.age" "$tmp/uploads.tar.gz.age" \
   "$tmp/recovery-point.json" "$tmp/artifact/"
 bash "$builder" validate-artifact --artifact-dir "$tmp/artifact" \
   --recovery-id recovery-0001 --source-sha 0123456789abcdef0123456789abcdef01234567 \
   --repository NickolayMamonov/meet-backend-v3 --run-id 1
 jq -e '.schema == "meet-backend/beta-recovery-manifest/v1" and
-  .retentionDays == 30 and (.artifactFiles | length == 5)' \
+  .retentionDays == 30 and (.artifactFiles | length == 2)' \
   "$tmp/recovery-point.json" >/dev/null
 
 cp -- "$runtime" "$tmp/pre.json"
 cp -- "$runtime" "$tmp/post.json"
 jq -cn '{schema:"meet-backend/beta-recovery-mount/v1",type:"volume",
-  destination:"/var/lib/postgresql/data",readWrite:true,anonymous:true,volumeName:"anonymous-test"}' \
+  destination:"/var/lib/postgresql/data",readWrite:true,anonymous:true}' \
   >"$tmp/mount.json"
 bash "$builder" final \
   --recovery-id recovery-0001 --source-sha 0123456789abcdef0123456789abcdef01234567 \
@@ -61,6 +61,7 @@ bash "$builder" final \
   --anonymous-volume-absent true --status success --output "$tmp/drill.json"
 jq -e '.schema == "meet-backend/beta-recovery-drill/v1" and
   .artifact.id == 7 and .restore.mountContract.anonymous == true and
+  (.restore.mountContract | has("volumeName") | not) and
   .timing.dispatchToPostProbeSeconds == 600' "$tmp/drill.json" >/dev/null
 
 bash "$builder" incident --recovery-id recovery-0001 \

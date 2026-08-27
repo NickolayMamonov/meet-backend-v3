@@ -4,6 +4,9 @@ This manually dispatched, one-shot drill captures one quiesced PostgreSQL
 custom dump and uploads tree, encrypts both streams directly with age before
 transfer, publishes one unique GitHub Actions artifact with exactly 30 days of
 retention, and restores only on a reviewer-approved ephemeral Ubuntu runner.
+The capture artifact contains exactly `postgres.dump.age`,
+`uploads.tar.gz.age`, and `recovery-point.json`; the aggregate proofs and
+runtime fingerprint are embedded only in that manifest.
 
 The capture job has `test-vps` SSH and only the public age recipient. The
 protected `closed-beta-restore` job has only the private age identity and no
@@ -42,7 +45,7 @@ volume at that destination. Bind, named, production, duplicate, missing, or
 unexpected mounts fail before start.
 
 Dump listing, restore, the read-only V1-V9 database proof, uploads aggregate,
-and managed media references must match. Always-run cleanup removes the
+and every managed media reference must match. Always-run cleanup removes the
 identity, decrypted data, references, container with `--volumes`, captured
 anonymous volume, and internal network. Docker proves all three are absent
 before `cleanup_complete`; failure blocks success and retains only minimum

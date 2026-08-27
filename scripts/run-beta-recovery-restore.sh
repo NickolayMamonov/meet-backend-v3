@@ -2,7 +2,7 @@
 set -euo pipefail
 export LC_ALL=C
 
-usage(){ echo "usage: $0 --artifact-dir PATH --recovery-id ID --output-dir PATH --identity PATH --sql-proof PATH --media-script PATH --database-proof PATH --media-proof PATH --source-sha SHA --repository OWNER/REPO --tooling-digest SHA --workflow-digest SHA --database-digest SHA --media-digest SHA [--image IMAGE]" >&2; exit 2; }
+usage(){ echo "usage: $0 --artifact-dir PATH --recovery-id ID --output-dir PATH [--identity PATH] --sql-proof PATH --media-script PATH [--database-proof PATH --media-proof PATH] --source-sha SHA --repository OWNER/REPO --tooling-digest SHA --workflow-digest SHA --database-digest SHA --media-digest SHA [--image IMAGE]" >&2; exit 2; }
 fail(){ echo "beta recovery restore failed: $*" >&2; exit 1; }
 regular(){ [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ]; }
 identity=''
@@ -15,7 +15,12 @@ preflight_cleanup(){
 trap preflight_cleanup EXIT HUP INT TERM
 decimal(){ [[ "$1" =~ ^[0-9]+$ ]]; }
 normalize(){ local v=$1; v=$(printf '%s\n' "$v" | sed 's/^0*//'); printf '%s\n' "${v:-0}"; }
-decimal_ge(){ local a b; a=$(normalize "$1"); b=$(normalize "$2"); [ "${#a}" -gt "${#b}" ] || { [ "${#a}" -eq "${#b}" ] && [[ "$a" > "$b" || "$a" = "$b" ]]; }; }
+decimal_ge(){
+  local a b
+  decimal "$1" && decimal "$2" || return 1
+  a=$(normalize "$1"); b=$(normalize "$2")
+  [ "${#a}" -gt "${#b}" ] || { [ "${#a}" -eq "${#b}" ] && [[ "$a" > "$b" || "$a" = "$b" ]]; }
+}
 add(){
   local a b c=0 r='' x y d; decimal "$1" && decimal "$2" || return 1
   a=$(normalize "$1"); b=$(normalize "$2")
@@ -106,28 +111,47 @@ if [ "${1:-}" = --cleanup-survivors ]; then
   esac; done
   [[ "$rid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] && [ "$c" = "beta-recovery-postgres-$rid" ] &&
     [ "$n" = "beta-recovery-$rid" ] && [ -n "$root" ] || fail "cleanup ownership names are invalid"
-  [ -z "$v" ] || { [[ "$v" =~ ^[0-9a-f]{64}$ ]] && regular "$marker" && [ "$(<"$marker")" = "$v" ] || fail "cleanup volume identity is invalid"; }
+  volumes=()
+  if [ -n "$v" ]; then
+    [[ "$v" =~ ^[0-9a-f]{64}$ ]] || fail "cleanup volume identity is invalid"
+    regular "$marker" || fail "cleanup volume marker is unavailable"
+  fi
+  if regular "$marker"; then
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      [[ "$candidate" =~ ^[0-9a-f]{64}$ ]] || fail "cleanup volume marker is invalid"
+      volumes+=("$candidate")
+    done <"$marker"
+  fi
+  [ "${#volumes[@]}" -gt 0 ] || [ -z "$v" ] || fail "cleanup volume identity is missing"
+  if [ -n "$v" ]; then
+    printf '%s\n' "${volumes[@]}" | grep -Fxq "$v" || fail "cleanup volume identity differs"
+  fi
   docker info >/dev/null 2>&1 || fail "cleanup cannot contact Docker"
   for attempt in 1 2 3; do
     if inspect_resource container "$c"; then
       jq -e --arg id "$rid" '.[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null || fail "unowned container survivor"
-      [ -n "$v" ] || fail "container survivor volume identity is missing"
-      container_mount_provenance "$INSPECT_JSON" "$v" "$root" || fail "volume/container association is invalid"
-      docker container rm --force --volumes "$c" ||
-        fail "cleanup could not remove container $c"
+      if [ -n "$v" ]; then
+        container_mount_provenance "$INSPECT_JSON" "$v" "$root" || fail "volume/container association is invalid"
+        docker container rm --force --volumes "$c" ||
+          fail "cleanup could not remove container $c"
+      else
+        docker container rm --force "$c" ||
+          fail "cleanup could not remove container $c"
+      fi
     else
       container_status=$?
       [ "$container_status" -eq 2 ] && fail "container inspection failed"
     fi
-    if [ -n "$v" ]; then
-      if inspect_resource volume "$v"; then
-        volume_provenance "$INSPECT_JSON" "$v" "$root" || fail "invalid volume survivor provenance"
-        docker volume rm "$v" || fail "cleanup could not remove volume $v"
+    for volume in "${volumes[@]}"; do
+      if inspect_resource volume "$volume"; then
+        volume_provenance "$INSPECT_JSON" "$volume" "$root" || fail "invalid volume survivor provenance"
+        docker volume rm "$volume" || fail "cleanup could not remove volume $volume"
       else
         volume_status=$?
         [ "$volume_status" -eq 2 ] && fail "volume inspection failed"
       fi
-    fi
+    done
     if inspect_resource network "$n"; then
       jq -e --arg id "$rid" '.[0].Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null || fail "unowned network survivor"
       docker network rm "$n" || fail "cleanup could not remove network $n"
@@ -137,7 +161,10 @@ if [ "${1:-}" = --cleanup-survivors ]; then
     fi
     if inspect_resource container "$c"; then cs=0; else cs=$?; fi
     if inspect_resource network "$n"; then ns=0; else ns=$?; fi
-    vs=1; [ -z "$v" ] || { if inspect_resource volume "$v"; then vs=0; else vs=$?; fi; }
+    vs=1
+    for volume in "${volumes[@]}"; do
+      if inspect_resource volume "$volume"; then vs=0; else volume_status=$?; [ "$volume_status" -eq 2 ] && vs=2; fi
+    done
     [ "$cs" -eq 2 ] || [ "$ns" -eq 2 ] || [ "$vs" -eq 2 ] && fail "cleanup inspection failed"
     if [ "$cs" -eq 1 ] && [ "$ns" -eq 1 ] && [ "$vs" -eq 1 ]; then
       exit 0
@@ -148,7 +175,7 @@ if [ "${1:-}" = --cleanup-survivors ]; then
 fi
 
 image=${POSTGRES_IMAGE:-postgres:16-alpine@sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2}
-artifact='' id='' output='' identity='' temp=${RUNNER_TEMP:-/tmp}/beta-recovery docker_root=/var/lib/docker
+artifact='' id='' output='' identity='' temp=${RUNNER_TEMP:-/tmp}/beta-recovery docker_root=''
 sql='' media='' expected_db='' expected_media='' source_sha='' repository='' tooling='' workflow='' database_digest='' media_digest='' capacity_only=false
 while [ "$#" -gt 0 ]; do case "$1" in
   --artifact-dir) artifact=$2; shift 2;; --recovery-id) id=$2; shift 2;; --output-dir) output=$2; shift 2;;
@@ -183,33 +210,39 @@ actual_tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta
   sha256sum "$file"
 done | sort | sha256sum | awk '{print $1}')
 [ "$actual_tooling" = "$tooling" ] || fail "tooling contract digest differs"
-for file in capture-runtime.json database-proof.json media-proof.json postgres.dump.age uploads.tar.gz.age recovery-point.json; do regular "$artifact/$file" || fail "artifact file missing: $file"; done
+regular "$artifact/recovery-point.json" || fail "artifact file missing: recovery-point.json"
+for file in postgres.dump.age uploads.tar.gz.age; do regular "$artifact/$file" || fail "artifact file missing: $file"; done
 [ "$(find "$artifact" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" = '' ] || fail "artifact contains a non-file entry"
-[ "$(find "$artifact" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" = 6 ] || fail "artifact shape is not exact"
+[ "$(find "$artifact" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" = 3 ] || fail "artifact shape is not exact"
 manifest=$artifact/recovery-point.json
 jq -e --arg id "$id" --arg sha "$source_sha" --arg repo "$repository" --arg tooling "$tooling" --arg workflow "$workflow" --arg dbcontract "$database_digest" --arg mediacontract "$media_digest" '
-  type=="object" and (keys|sort)==["artifactFiles","artifactId","artifactName","capturedAt","captureRuntime","contracts","databaseProof","mediaProof","recoveryId","recoveryPointTime","repository","retentionDays","runId","schema","source","sourceSha"] and
+  type=="object" and (keys|sort)==["artifactFiles","artifactId","artifactName","captureRuntime","capturedAt","contracts","databaseProof","mediaProof","recoveryId","recoveryPointTime","repository","retentionDays","runId","schema","source","sourceSha"] and
   .schema=="meet-backend/beta-recovery-manifest/v1" and .recoveryId==$id and .sourceSha==$sha and .repository==$repo and .retentionDays==30 and .artifactId==null and
   (.runId|type=="number" and floor==. and .>0) and
   .artifactName==("beta-recovery-"+$id+"-"+(.runId|tostring)) and
   (.contracts|type=="object" and (keys|sort)==["database","media","tooling","workflow"] and .tooling==$tooling and .workflow==$workflow and .database==$dbcontract and .media==$mediacontract) and
-  (.artifactFiles|type=="array" and length==5 and (map(.path)|sort)==["capture-runtime.json","database-proof.json","media-proof.json","postgres.dump.age","uploads.tar.gz.age"] and all(.[]; (keys|sort)==["path","sha256","size"] and (.size|type=="number" and floor==. and .>0) and (.sha256|test("^[0-9a-f]{64}$")))) and
+  (.artifactFiles|type=="array" and length==2 and (map(.path)|sort)==["postgres.dump.age","uploads.tar.gz.age"] and all(.[]; (keys|sort)==["path","sha256","size"] and (.size|type=="number" and floor==. and .>0) and (.sha256|test("^[0-9a-f]{64}$")))) and
   (.source|type=="object" and (keys|sort)==["ciphertexts","postgresDatabaseBytes","uploads"] and (.postgresDatabaseBytes|type=="number" and floor==. and .>=0) and (.uploads|type=="object" and (keys|sort)==["bytes","digest","files"] and (.files|type=="number" and floor==. and .>=0) and (.bytes|type=="number" and floor==. and .>=0) and (.digest|test("^[0-9a-f]{64}$")))) and
   (.source.ciphertexts|type=="object" and (keys|sort)==["database","uploads"] and .database.name=="postgres.dump.age" and .uploads.name=="uploads.tar.gz.age" and all(.[]; (keys|sort)==["name","sha256","size"] and (.size|type=="number" and floor==. and .>0) and (.sha256|test("^[0-9a-f]{64}$")))) and
   (.databaseProof|type=="object") and (.mediaProof|type=="object") and .mediaProof.files==.source.uploads.files and .mediaProof.bytes==.source.uploads.bytes and .mediaProof.canonicalDigest==.source.uploads.digest and (.captureRuntime|type=="object")
 ' "$manifest" >/dev/null || fail "artifact source or contract differs from authorized checkout"
-for file in capture-runtime.json database-proof.json media-proof.json postgres.dump.age uploads.tar.gz.age; do
+for file in postgres.dump.age uploads.tar.gz.age; do
   size=$(wc -c <"$artifact/$file" | tr -d '[:space:]'); sha=$(sha256sum -- "$artifact/$file" | awk '{print $1}')
   esize=$(jq -er --arg p "$file" '.artifactFiles[]|select(.path==$p)|.size' "$manifest"); esha=$(jq -er --arg p "$file" '.artifactFiles[]|select(.path==$p)|.sha256' "$manifest")
   [ "$size" = "$esize" ] && [ "$sha" = "$esha" ] || fail "artifact file hash or size differs from manifest: $file"
 done
-jq -e --slurpfile r "$artifact/capture-runtime.json" --slurpfile d "$artifact/database-proof.json" --slurpfile m "$artifact/media-proof.json" '.captureRuntime==$r[0] and .databaseProof==$d[0] and .mediaProof==$m[0]' "$manifest" >/dev/null || fail "artifact proof binding differs"
-if [ -z "$expected_db" ] || ! regular "$expected_db"; then
-  fail "expected database proof is required"
+if [ -e "$temp" ]; then
+  [ -d "$temp" ] && [ ! -L "$temp" ] || fail "temporary restore root is unsafe"
+else
+  mkdir -p -- "$temp"
 fi
-if [ -z "$expected_media" ] || ! regular "$expected_media"; then
-  fail "expected media proof is required"
-fi
+db_expected=$temp/expected-database-proof.json
+media_expected=$temp/expected-media-proof.json
+jq -cS '.databaseProof' "$manifest" >"$db_expected"
+jq -cS '.mediaProof' "$manifest" >"$media_expected"
+regular "$db_expected" && regular "$media_expected" || fail "manifest proof extraction failed"
+[ -n "$expected_db" ] && regular "$expected_db" || expected_db=$db_expected
+[ -n "$expected_media" ] && regular "$expected_media" || expected_media=$media_expected
 jq -e '.schema=="meet-backend/closed-beta-database-proof/v1"' "$expected_db" >/dev/null || fail "expected database proof contract is invalid"
 jq -e '.schema=="meet-backend/beta-recovery-media-proof/v1" and .referencesResolved==true' "$expected_media" >/dev/null || fail "expected media proof contract is invalid"
 jq -e --slurpfile d "$expected_db" --slurpfile m "$expected_media" '.databaseProof==$d[0] and .mediaProof==$m[0]' "$manifest" >/dev/null || fail "expected proofs are not bound by artifact manifest"
@@ -218,11 +251,10 @@ dbsha=$(sha256sum -- "$artifact/postgres.dump.age" | awk '{print $1}'); usha=$(s
 [ "$dbsize" = "$(jq -er '.source.ciphertexts.database.size' "$manifest")" ] && [ "$dbsha" = "$(jq -er '.source.ciphertexts.database.sha256' "$manifest")" ] && [ "$usize" = "$(jq -er '.source.ciphertexts.uploads.size' "$manifest")" ] && [ "$usha" = "$(jq -er '.source.ciphertexts.uploads.sha256' "$manifest")" ] || fail "ciphertext hash or size differs from artifact manifest"
 db=$(jq -er '.source.postgresDatabaseBytes' "$manifest"); uploads=$(jq -er '.source.uploads.bytes' "$manifest")
 pair=$(add "$dbsize" "$usize"); temp_required=$(add "$(add "$(mul_small "$pair" 2)" "$db")" "$(add "$uploads" 2147483648)"); docker_required=$(add "$(mul_small "$db" 4)" 5368709120)
-if [ -e "$temp" ]; then
-  [ -d "$temp" ] && [ ! -L "$temp" ] || fail "temporary restore root is unsafe"
-else
-  mkdir -p -- "$temp"
+if [ -z "$docker_root" ]; then
+  docker_root=$(docker info --format '{{.DockerRootDir}}') || fail "Docker root is unknown"
 fi
+[ -n "$docker_root" ] && [ -d "$docker_root" ] && [ ! -L "$docker_root" ] || fail "Docker root is unsafe"
 tempdf=$(df -Pk -- "$temp" | awk 'NR==2{print $1 "\t" $4}')
 docker_capacity=$(df -Pk -- "$docker_root" | awk 'NR==2{print $1 "\t" $4}') || fail "Docker capacity is unknown"
 td=${tempdf%%$'\t'*}; tf=$(mul_small "${tempdf#*$'\t'}" 1024); dd=${docker_capacity%%$'\t'*}; dfree=$(mul_small "${docker_capacity#*$'\t'}" 1024)
@@ -233,31 +265,35 @@ fi
 regular "$identity" || fail "age identity unavailable"
 private=$temp/private-$id; [ ! -e "$private" ] || fail "private restore directory already exists"; mkdir -- "$private"; chmod 700 "$private"
 db_dump=$private/postgres.dump; uploads_archive=$private/uploads.tar.gz; marker=$temp/volume.identity; [ ! -e "$marker" ] || fail "volume identity path is already in use"
-network=beta-recovery-$id; container=beta-recovery-postgres-$id; volume=''; volume_owned=0; marker_owned=0
+network=beta-recovery-$id; container=beta-recovery-postgres-$id; volume=''; marker_owned=0
 cleanup(){
-  local status=$? c v n cleanup_confirmed=0; trap - EXIT HUP INT TERM
+  local status=$? c v n cleanup_confirmed=0 candidate; trap - EXIT HUP INT TERM
   rm -f -- "$identity" "$db_dump" "$uploads_archive" "$private/reference-list" || status=1
   if inspect_resource container "$container"; then c=0; else c=$?; fi
   if [ "$c" -eq 0 ]; then
-    if [ "$volume_owned" -eq 1 ] &&
-      jq -e --arg id "$id" '.[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null &&
-      container_mount_provenance "$INSPECT_JSON" "$volume" "$docker_root" &&
-      docker container rm --force --volumes "$container"; then :; else status=1; fi
-  elif [ "$c" -eq 2 ]; then status=1; fi
-  if [ "$volume_owned" -eq 1 ]; then
-    if inspect_resource volume "$volume"; then
-      v=0
-      if volume_provenance "$INSPECT_JSON" "$volume" "$docker_root"; then
-        docker volume rm "$volume" || status=1
+    jq -e --arg id "$id" '.[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null ||
+      status=1
+    if [ "$status" -eq 0 ]; then
+      if [ "$marker_owned" -eq 1 ]; then
+        docker container rm --force --volumes "$container" || status=1
       else
-        status=1
+        docker container rm --force "$container" || status=1
       fi
-    else
-      v=$?
-      [ "$v" -eq 2 ] && status=1
     fi
-  else
-    v=1
+  elif [ "$c" -eq 2 ]; then status=1; fi
+  v=1
+  if [ "$marker_owned" -eq 1 ]; then
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      if inspect_resource volume "$candidate"; then
+        v=0
+        volume_provenance "$INSPECT_JSON" "$candidate" "$docker_root" || status=1
+        [ "$status" -ne 0 ] || docker volume rm "$candidate" || status=1
+      else
+        volume_status=$?
+        [ "$volume_status" -eq 2 ] && status=1
+      fi
+    done <"$marker"
   fi
   if inspect_resource network "$network"; then n=0; else n=$?; fi
   if [ "$n" -eq 0 ]; then
@@ -266,7 +302,13 @@ cleanup(){
   elif [ "$n" -eq 2 ]; then status=1; fi
   if inspect_resource container "$container"; then c=0; else c=$?; fi
   if inspect_resource network "$network"; then n=0; else n=$?; fi
-  if [ "$volume_owned" -eq 1 ]; then if inspect_resource volume "$volume"; then v=0; else v=$?; fi; else v=1; fi
+  v=1
+  if [ "$marker_owned" -eq 1 ]; then
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      if inspect_resource volume "$candidate"; then v=0; else volume_status=$?; [ "$volume_status" -eq 2 ] && v=2; fi
+    done <"$marker"
+  fi
   if [ "$c" -eq 2 ] || [ "$n" -eq 2 ] || [ "$v" -eq 2 ] || [ "$c" -eq 0 ] || [ "$n" -eq 0 ] || [ "$v" -eq 0 ]; then
     echo "cleanup survivors or inspection failure detected; starting a fresh-process retry" >&2
     if "$0" --cleanup-survivors --container "$container" --network "$network" --volume "${volume:-}" --volume-identity "$marker" --recovery-id "$id" --docker-root "$docker_root"; then
@@ -283,6 +325,11 @@ cleanup(){
   elif [ "$marker_owned" -eq 1 ]; then
     chmod 600 "$marker" || status=1
   fi
+  if [ "$status" -eq 0 ] && [ "$cleanup_confirmed" -eq 1 ]; then
+    printf 'cleanup_complete=true\n' >"$output/restore-summary" || status=1
+  else
+    rm -f -- "$output/restore-summary" || status=1
+  fi
   [ ! -e "$private" ] || rm -r -- "$private" || status=1
   [ "$status" -eq 0 ] || exit "$status"; exit "$status"
 }
@@ -296,16 +343,31 @@ docker image inspect "$image" --format '{{json .Config.Volumes}}' | jq -e 'type=
 docker network create --internal --label com.meet-backend.beta-recovery/owner=restore --label com.meet-backend.beta-recovery/recovery-id="$id" "$network" >/dev/null
 docker create --name "$container" --network "$network" --label com.meet-backend.beta-recovery/owner=restore --label com.meet-backend.beta-recovery/recovery-id="$id" -e POSTGRES_DB=restore_db -e POSTGRES_USER=restore_user -e POSTGRES_PASSWORD="$(od -An -N24 -tx1 /dev/urandom|tr -d '[:space:]')" "$image" >/dev/null
 container_json=$(docker container inspect "$container")
+volume_names=$(jq -r '.[0].Mounts[]? | select(.Type=="volume") | .Name' <<<"$container_json")
+if [ -n "$volume_names" ]; then
+  printf '%s\n' "$volume_names" >"$marker"
+  chmod 600 "$marker"
+  marker_owned=1
+  while IFS= read -r candidate; do
+    [[ "$candidate" =~ ^[0-9a-f]{64}$ ]] || fail "anonymous volume identity is invalid"
+  done <<<"$volume_names"
+  volume=$(printf '%s\n' "$volume_names" | head -n 1)
+else
+  fail "anonymous volume identity is missing"
+fi
 jq -e '(
   ((.[0].HostConfig.Binds == null) or (.[0].HostConfig.Binds | type == "array" and length == 0)) and
   ((.[0].HostConfig.Mounts == null) or (.[0].HostConfig.Mounts | type == "array" and length == 0)) and
   (.[0].Mounts | type == "array" and length == 1 and .[0].Type == "volume" and
     .[0].Destination == "/var/lib/postgresql/data" and .[0].RW == true and
-    (.[0].Name | test("^[0-9a-f]{64}$")) and (.[0].Source | type == "string" and startswith("/")))
+    (.[0].Name | test("^[0-9a-f]{64}$")) and (.[0].Source | type == "string" and length > 0))
 )' <<<"$container_json" >/dev/null || fail "anonymous mount provenance is not exact"
-volume=$(jq -er '.[0].Mounts[0].Name' <<<"$container_json"); volume_json=$(docker volume inspect "$volume"); volume_provenance "$volume_json" "$volume" "$docker_root" || fail "volume is not anonymous local provenance"; volume_owned=1
+volume_json=$(docker volume inspect "$volume"); volume_provenance "$volume_json" "$volume" "$docker_root" || fail "volume is not anonymous local provenance"
 container_mount_provenance "$container_json" "$volume" "$docker_root" || fail "anonymous mount provenance is not exact"
-printf '%s\n' "$volume" >"$marker"; chmod 600 "$marker"; marker_owned=1
+jq -cnS '{schema:"meet-backend/beta-recovery-mount/v1",type:"volume",
+  destination:"/var/lib/postgresql/data",readWrite:true,anonymous:true}' \
+  >"$output/mount-contract.json"
+chmod 600 "$output/mount-contract.json"
 docker start "$container" >/dev/null
 for _ in $(seq 1 60); do docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&1 && break; sleep 1; done
 docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&1 || fail "postgres did not become ready"
@@ -316,7 +378,15 @@ docker exec "$container" pg_restore --no-owner --no-privileges --exit-on-error -
 docker cp "$sql" "$container:/tmp/proof.sql"
 docker exec "$container" psql -X -qAt -U restore_user -d restore_db -f /tmp/proof.sql >"$output/restored-database-proof.json"
 cmp -- "$expected_db" "$output/restored-database-proof.json" || fail "database proof differs byte-for-byte"
+docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -c \
+  "SELECT regexp_replace(image_url, '^https://api[.]whysoezzy[.]online/demo-assets/v1/', '')
+     FROM (
+       SELECT avatar_url AS image_url FROM users WHERE avatar_url LIKE 'https://api.whysoezzy.online/demo-assets/v1/%'
+       UNION ALL SELECT image_url FROM communities WHERE image_url LIKE 'https://api.whysoezzy.online/demo-assets/v1/%'
+       UNION ALL SELECT image_url FROM meetings WHERE image_url LIKE 'https://api.whysoezzy.online/demo-assets/v1/%'
+     ) media_refs
+     ORDER BY 1" >"$private/reference-list"
 mkdir -- "$private/uploads"; validate_upload_archive "$uploads_archive" "$private"; tar --extract --gzip --file "$uploads_archive" --directory "$private/uploads" --no-same-owner --no-same-permissions --no-overwrite-dir
-"$media" --root "$private/uploads" --output "$output/restored-media-proof.json"
+"$media" --root "$private/uploads" --reference-list "$private/reference-list" --output "$output/restored-media-proof.json"
 cmp -- "$expected_media" "$output/restored-media-proof.json" || fail "media proof differs byte-for-byte"
-chmod 600 "$output/restored-database-proof.json" "$output/restored-media-proof.json"; printf 'cleanup_complete=true\n' >"$output/restore-summary"
+chmod 600 "$output/restored-database-proof.json" "$output/restored-media-proof.json"

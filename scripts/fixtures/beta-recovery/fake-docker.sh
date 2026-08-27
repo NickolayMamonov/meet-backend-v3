@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state=${FAKE_DOCKER_STATE:?}
+root=${FAKE_DOCKER_ROOT:?}
+mkdir -p "$state" "$root/volumes"
+volume=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+volume_root="$root/volumes/$volume/_data"
+
+json_container() {
+  local mounts=${FAKE_DOCKER_MOUNT_MODE:-valid}
+  case "$mounts" in
+    valid)
+      jq -cn --arg volume "$volume" --arg source "$volume_root" '
+        [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+          HostConfig:{Binds:[],Mounts:[]},
+          Mounts:[{Type:"volume",Name:$volume,Destination:"/var/lib/postgresql/data",RW:true,Source:$source}]}]'
+      ;;
+    bind)
+      jq -cn --arg source "$state/bind" '
+        [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+          HostConfig:{Binds:[$source],Mounts:[]},
+          Mounts:[{Type:"bind",Source:$source,Destination:"/var/lib/postgresql/data",RW:true}]}]'
+      ;;
+    named)
+      jq -cn --arg source "$root/volumes/meet-production_postgres_data/_data" '
+        [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+          HostConfig:{Binds:[],Mounts:[]},
+          Mounts:[{Type:"volume",Name:"meet-production_postgres_data",
+            Destination:"/var/lib/postgresql/data",RW:true,Source:$source}]}]'
+      ;;
+    duplicate)
+      jq -cn --arg volume "$volume" --arg source "$volume_root" '
+        [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+          HostConfig:{Binds:[],Mounts:[]},
+          Mounts:[
+            {Type:"volume",Name:$volume,Destination:"/var/lib/postgresql/data",RW:true,Source:$source},
+            {Type:"volume",Name:$volume,Destination:"/other",RW:true,Source:$source}]}]'
+      ;;
+    missing)
+      jq -cn '
+        [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+          HostConfig:{Binds:[],Mounts:[]},Mounts:[]}]'
+      ;;
+    *) exit 2 ;;
+  esac
+}
+
+case "${1:-}" in
+  info)
+    if [ "${2:-}" = --format ]; then printf '%s\n' "$root"; else printf 'fixture\n'; fi
+    ;;
+  pull) ;;
+  image)
+    [ "${2:-}" = inspect ] || exit 2
+    case "${!#}" in
+      *RepoDigests*) printf '%s\n' '["repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]' ;;
+      *Config.Volumes*) printf '%s\n' '{"\/var\/lib\/postgresql\/data":{}}' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  network)
+    case "${2:-}" in
+      create) touch "$state/network" ;;
+      inspect)
+        [ -e "$state/network" ] || { echo 'No such network' >&2; exit 1; }
+        jq -cn --arg id "$FAKE_RECOVERY_ID" \
+          '[{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
+            "com.meet-backend.beta-recovery/recovery-id":$id}}]' ;;
+      rm) rm -f "$state/network" ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  container)
+    case "${2:-}" in
+      inspect)
+        [ -e "$state/container" ] || { echo 'No such container' >&2; exit 1; }
+        json_container ;;
+      rm)
+        if [ "${FAKE_DOCKER_FAIL_CONTAINER_RM_ONCE:-0}" = 1 ] &&
+          [ ! -e "$state/container-rm-failed" ]; then
+          touch "$state/container-rm-failed"
+          exit 1
+        fi
+        rm -f "$state/container"
+        if [ "${3:-}" = --force ] && [ "${4:-}" = --volumes ] &&
+          [ "${FAKE_DOCKER_PRESERVE_VOLUME:-0}" != 1 ]; then
+          rm -f "$state/volume"
+          [ ! -e "$volume_root" ] || rm -r -- "$volume_root"
+        fi
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  create)
+    touch "$state/container"
+    if [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = valid ] ||
+      [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = duplicate ]; then
+      mkdir -p "$volume_root"
+      touch "$state/volume"
+    fi
+    ;;
+  start) ;;
+  exec)
+    if printf '%s\n' "$*" | grep -Fq pg_isready; then exit 0; fi
+    if printf '%s\n' "$*" | grep -Fq 'pg_restore --list'; then printf 'fixture archive list\n'; exit 0; fi
+    if [ "${FAKE_DOCKER_FAIL_RESTORE:-0}" = 1 ] &&
+      printf '%s\n' "$*" | grep -Fq 'pg_restore --no-owner'; then exit 1; fi
+    if printf '%s\n' "$*" | grep -Fq 'psql'; then
+      if printf '%s\n' "$*" | grep -Fq -- '-f /tmp/proof.sql'; then
+        cat "$FAKE_DATABASE_PROOF"
+      fi
+      exit 0
+    fi
+    exit 0
+    ;;
+  cp) ;;
+  volume)
+    case "${2:-}" in
+      inspect)
+        [ "${3:-}" = "$volume" ] && [ -e "$state/volume" ] || { echo 'No such volume' >&2; exit 1; }
+        jq -cn --arg volume "$volume" --arg source "$volume_root" \
+          '[{Name:$volume,Driver:"local",Mountpoint:$source,Labels:{},Options:{}}]' ;;
+      rm)
+        [ "${FAKE_DOCKER_FAIL_VOLUME_RM:-0}" = 1 ] && exit 1
+        [ ! -e "$volume_root" ] || rm -r -- "$volume_root"
+        rm -f "$state/volume" ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) echo "unsupported fake docker operation: $*" >&2; exit 2 ;;
+esac

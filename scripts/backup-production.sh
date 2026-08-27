@@ -13,7 +13,9 @@ restart_current() {
     local health
     health=$(docker inspect "$container" --format \
       '{{if .State.Health}}{{.State.Health.Status}}{{else}}unknown{{end}}')
-    [ "$health" = healthy ] || [ "$health" = running ] && return 0
+    if [ "$health" = healthy ] || [ "$health" = running ]; then
+      return 0
+    fi
     sleep 2
   done
   return 1
@@ -40,6 +42,55 @@ validate_upload_archive() {
   while IFS= read -r entry; do
     case "${entry:0:1}" in d|-) ;; *) echo "unsafe uploads archive type" >&2; return 1 ;; esac
   done <"$types"
+}
+
+decimal() { [[ "$1" =~ ^[0-9]+$ ]]; }
+normalize_decimal() { local value=${1#0*}; printf '%s\n' "${value:-0}"; }
+decimal_ge() {
+  local left right
+  decimal "$1" && decimal "$2" || return 1
+  left=$(normalize_decimal "$1")
+  right=$(normalize_decimal "$2")
+  [ "${#left}" -gt "${#right}" ] ||
+    { [ "${#left}" -eq "${#right}" ] && [[ "$left" > "$right" || "$left" = "$right" ]]; }
+}
+decimal_add() {
+  local left=$1 right=$2 carry=0 result='' ld rd digit
+  decimal "$left" && decimal "$right" || return 1
+  while [ -n "$left" ] || [ -n "$right" ] || [ "$carry" -gt 0 ]; do
+    ld=0; rd=0; [ -z "$left" ] || ld=${left: -1}; [ -z "$right" ] || rd=${right: -1}
+    digit=$((10#$ld + 10#$rd + carry)); result=$((digit % 10))$result; carry=$((digit / 10))
+    [ -z "$left" ] || left=${left:0:${#left}-1}; [ -z "$right" ] || right=${right:0:${#right}-1}
+  done
+  normalize_decimal "$result"
+}
+decimal_mul_small() {
+  local value=$1 multiplier=$2 carry=0 result='' digit last
+  decimal "$value" && [[ "$multiplier" =~ ^[0-9]+$ ]] || return 1
+  value=$(normalize_decimal "$value")
+  while [ -n "$value" ] || [ "$carry" -gt 0 ]; do
+    last=0; [ -z "$value" ] || last=${value: -1}
+    digit=$((10#$last * 10#$multiplier + carry))
+    result=$((digit % 10))$result; carry=$((digit / 10))
+    [ -z "$value" ] || value=${value:0:${#value}-1}
+  done
+  normalize_decimal "$result"
+}
+capacity_ok() {
+  decimal_ge "$1" "$2" &&
+    decimal_ge "$(decimal_mul_small "$1" 4)" "$(decimal_mul_small "$2" 5)"
+}
+
+write_media_reference_list() {
+  local output=$1
+  "${COMPOSE[@]}" exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -c \
+    "SELECT regexp_replace(image_url, '^https://api[.]whysoezzy[.]online/demo-assets/v1/', '')
+       FROM (
+         SELECT avatar_url AS image_url FROM users WHERE avatar_url LIKE 'https://api.whysoezzy.online/demo-assets/v1/%'
+         UNION ALL SELECT image_url FROM communities WHERE image_url LIKE 'https://api.whysoezzy.online/demo-assets/v1/%'
+         UNION ALL SELECT image_url FROM meetings WHERE image_url LIKE 'https://api.whysoezzy.online/demo-assets/v1/%'
+       ) media_refs
+       ORDER BY 1" >"$output"
 }
 
 if [ "${1:-}" = "--beta" ]; then
@@ -87,9 +138,31 @@ if [ "${1:-}" = "--beta" ]; then
   }
   trap cleanup EXIT HUP INT TERM
   docker stop --time 30 "$backend" >/dev/null
+  trap 'cleanup' EXIT HUP INT TERM
   db_bytes=$("${COMPOSE[@]}" exec -T postgres sh -c \
     'psql -X -Atqc "SELECT pg_database_size(current_database())"' | tr -d '[:space:]')
   [[ "$db_bytes" =~ ^[1-9][0-9]*$ ]] || exit 1
+  write_media_reference_list "$temp/reference-list"
+  "$media_script" --root "$upload_root" --reference-list "$temp/reference-list" \
+    --output "$temp/media-proof.json"
+  jq -e '.schema=="meet-backend/beta-recovery-media-proof/v1" and
+    .referencesResolved==true' "$temp/media-proof.json" >/dev/null
+  postgres_root=$(docker volume inspect --format '{{.Mountpoint}}' meet-production_postgres_data)
+  docker_root=$(docker info --format '{{.DockerRootDir}}')
+  [ -d "$postgres_root" ] && [ -d "$docker_root" ] || exit 1
+  db_capacity=$(df -Pk -- "$postgres_root" | awk 'NR==2{print $1 "\t" $4}')
+  upload_capacity=$(df -Pk -- "$upload_root" | awk 'NR==2{print $1 "\t" $4}')
+  [ -n "$db_capacity" ] && [ -n "$upload_capacity" ] || exit 1
+  db_device=${db_capacity%%$'\t'*}; db_free=$(decimal_mul_small "${db_capacity#*$'\t'}" 1024)
+  upload_device=${upload_capacity%%$'\t'*}; upload_free=$(decimal_mul_small "${upload_capacity#*$'\t'}" 1024)
+  projected=$(decimal_add "$db_bytes" "$(jq -er '.bytes' "$temp/media-proof.json")")
+  required=$(decimal_add "$(decimal_mul_small "$projected" 2)" 2147483648)
+  if [ "$db_device" = "$upload_device" ]; then
+    capacity_ok "$db_free" "$required" || exit 1
+  else
+    capacity_ok "$db_free" "$required" || exit 1
+    capacity_ok "$upload_free" "$required" || exit 1
+  fi
   "${COMPOSE[@]}" exec -T postgres sh -c \
     'pg_dump --format=custom -U "$POSTGRES_USER" -d "$POSTGRES_DB"' |
     age -r "$AGE_RECIPIENT" -o "$db_file"
@@ -99,12 +172,8 @@ if [ "${1:-}" = "--beta" ]; then
     "$image" -C /source -czf - . | age -r "$AGE_RECIPIENT" -o "$media_file"
   [ -s "$db_file" ] && [ -s "$media_file" ] || exit 1
   cat "$database_sql" | "${COMPOSE[@]}" exec -T postgres sh -c 'psql -X -qAt -f -' |
-    jq -e 'type=="object" and .schema=="meet-backend/closed-beta-database-proof/v1"' \
+    jq -cS 'if type=="object" and .schema=="meet-backend/closed-beta-database-proof/v1" then . else error("database proof schema") end' \
       >"$temp/database-proof.json"
-  "$media_script" --root "$upload_root" --output "$temp/media-proof.json"
-  jq -e '.schema=="meet-backend/beta-recovery-media-proof/v1" and
-    (.canonicalDigest|test("^[0-9a-f]{64}$")) and .referencesResolved==true' \
-    "$temp/media-proof.json" >/dev/null
   cp -- "$temp/database-proof.json" "$beta_dir/capture-database-proof.json"
   cp -- "$temp/media-proof.json" "$beta_dir/capture-media-proof.json"
   db_sha=$(sha256sum "$db_file" | awk '{print $1}')

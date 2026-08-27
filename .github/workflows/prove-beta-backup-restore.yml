@@ -78,6 +78,17 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 1
           persist-credentials: false
+      - name: Revalidate source immediately before VPS access
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin dev master
+          scripts/authorize-beta-recovery.sh revalidate \
+            --repository "$GITHUB_REPOSITORY" --source-checkout "$GITHUB_WORKSPACE" \
+            --source-sha "${{ inputs.source_sha }}" --workflow "$RECOVERY_WORKFLOW" \
+            --output-dir "$RUNNER_TEMP"
       - name: Stage and run the locked VPS capture
         shell: bash
         run: |
@@ -90,66 +101,45 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
           known="$RUNNER_TEMP/known-hosts"
           printf '%s\n' "$HOST_FINGERPRINT" >"$known"
-          opts=(-i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known")
+          ssh_opts=(-i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known")
+          scp_opts=(-i "$key" -P "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known")
           remote="/tmp/beta-recovery-$RECOVERY_ID"
           cleanup_remote() {
             local status=$?
             trap - EXIT
-            if ! ssh "${opts[@]}" "$SSH_USER@$HOST" \
+            if ! ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" \
               "sudo test ! -e '$remote' || sudo rm -r -- '$remote'"; then
               status=1
             fi
             exit "$status"
           }
           trap cleanup_remote EXIT
-          ssh "${opts[@]}" "$SSH_USER@$HOST" "mkdir -p '$remote'"
-          scp "${opts[@]}" scripts/run-beta-recovery-capture.sh scripts/backup-production.sh \
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "mkdir -p '$remote'"
+          scp "${scp_opts[@]}" scripts/run-beta-recovery-capture.sh scripts/backup-production.sh \
             scripts/probe-test-vps-recovery-runtime.sh scripts/production-compose.sh \
             scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
             "$SSH_USER@$HOST:$remote/"
-          ssh "${opts[@]}" "$SSH_USER@$HOST" \
-            "sudo bash -s -- '$remote'" <<'REMOTE'
-          set -euo pipefail
-          remote=$1
-          compose="$remote/production-compose.sh"
-          postgres=$("$compose" ps -q postgres)
-          backend=$("$compose" ps -q backend)
-          [ -n "$postgres" ] && [ -n "$backend" ]
-          docker cp "$remote/beta-recovery-database-proof.sql" "$postgres:/tmp/beta-recovery-database-proof.sql"
-          "$compose" exec -T postgres psql -X -qAt -f /tmp/beta-recovery-database-proof.sql \
-            >"$remote/database-proof.json"
-          db_bytes=$("$compose" exec -T postgres psql -X -qAt \
-            -c 'SELECT pg_database_size(current_database())' | tr -d '[:space:]')
-          [[ "$db_bytes" =~ ^[1-9][0-9]*$ ]]
-          upload_root=$(docker volume inspect --format '{{.Mountpoint}}' meet-production_uploads_data)
-          [ -d "$upload_root" ] && [ ! -L "$upload_root" ]
-          bash "$remote/beta-recovery-media-proof.sh" \
-            --root "$upload_root" --output "$remote/media-proof.json"
-          jq -e '.schema == "meet-backend/closed-beta-database-proof/v1"' \
-            "$remote/database-proof.json" >/dev/null
-          jq -e '.schema == "meet-backend/beta-recovery-media-proof/v1" and
-            .referencesResolved == true' "$remote/media-proof.json" >/dev/null
-          printf '%s\n' "$db_bytes" >"$remote/database-bytes"
-          chmod 644 "$remote/database-proof.json" "$remote/media-proof.json" "$remote/database-bytes"
-          REMOTE
-          ssh "${opts[@]}" "$SSH_USER@$HOST" \
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" \
             "sudo env AGE_RECIPIENT='$AGE_RECIPIENT' PRODUCTION_COMPOSE_SCRIPT='$remote/production-compose.sh' \
               BETA_BACKUP_SCRIPT='$remote/backup-production.sh' RECOVERY_PROBE_SCRIPT='$remote/probe-test-vps-recovery-runtime.sh' \
               TEST_VPS_STATE_ROOT=/var/lib/meet-test-vps-deploy PRODUCTION_ROOT=/var/lib/meet-production \
               bash '$remote/run-beta-recovery-capture.sh' --recovery-id '$RECOVERY_ID' \
               --root /var/lib/meet-production --output-dir '$remote' --recipient '$AGE_RECIPIENT' \
               --public-url '$PUBLIC_URL'"
-          ssh "${opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/postgres.dump.age'" \
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/postgres.dump.age'" \
             >"$RUNNER_TEMP/postgres.dump.age"
-          ssh "${opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/uploads.tar.gz.age'" \
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/uploads.tar.gz.age'" \
             >"$RUNNER_TEMP/uploads.tar.gz.age"
-          ssh "${opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-runtime.json'" \
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-runtime.json'" \
             >"$RUNNER_TEMP/capture-runtime.json"
-          ssh "${opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/database-proof.json'" \
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-database-proof.json'" \
             >"$RUNNER_TEMP/database-proof.json"
-          ssh "${opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/media-proof.json'" \
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-media-proof.json'" \
             >"$RUNNER_TEMP/media-proof.json"
-          db_bytes=$(ssh "${opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/database-bytes'")
+          capture_result="$RUNNER_TEMP/capture-result.json"
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-result.json'" \
+            >"$capture_result"
+          db_bytes=$(jq -er '.databaseBytes' "$capture_result")
           [[ "$db_bytes" =~ ^[1-9][0-9]*$ ]]
           uploads_files=$(jq -er '.files' "$RUNNER_TEMP/media-proof.json")
           uploads_bytes=$(jq -er '.bytes' "$RUNNER_TEMP/media-proof.json")
@@ -181,7 +171,7 @@ jobs:
             --database-ciphertext "$RUNNER_TEMP/postgres.dump.age" \
             --uploads-ciphertext "$RUNNER_TEMP/uploads.tar.gz.age" \
             --output "$RUNNER_TEMP/recovery-point.json"
-          cp -- "$RUNNER_TEMP/"{postgres.dump.age,uploads.tar.gz.age,capture-runtime.json,database-proof.json,media-proof.json,recovery-point.json} \
+          cp -- "$RUNNER_TEMP/"{postgres.dump.age,uploads.tar.gz.age,recovery-point.json} \
             "$RUNNER_TEMP/artifact/"
           scripts/build-beta-recovery-evidence.sh validate-artifact \
             --artifact-dir "$RUNNER_TEMP/artifact" --recovery-id "$RECOVERY_ID" \
@@ -197,9 +187,6 @@ jobs:
           path: |
             ${{ runner.temp }}/postgres.dump.age
             ${{ runner.temp }}/uploads.tar.gz.age
-            ${{ runner.temp }}/capture-runtime.json
-            ${{ runner.temp }}/database-proof.json
-            ${{ runner.temp }}/media-proof.json
             ${{ runner.temp }}/recovery-point.json
       - name: Verify artifact publication commit marker
         shell: bash
@@ -239,11 +226,22 @@ jobs:
           set -euo pipefail
           [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
           artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID")
+          workflow_run_id=$(jq -er '.workflow_run.id' <<<"$artifact_json")
+          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
           jq -e --arg prefix "beta-recovery-${{ inputs.recovery_id }}-" '
             .id == ($id|tonumber) and .expired == false and .size_in_bytes > 0 and
-            (.name | startswith($prefix)) and .workflow_run.head_sha == $sha
+            (.name | startswith($prefix)) and .workflow_run.head_sha == $sha and
+            .workflow_run.event == "workflow_dispatch" and
+            .workflow_run.head_branch == "dev"
           ' --arg id "$ARTIFACT_ID" \
             --arg sha "${{ inputs.source_sha }}" <<<"$artifact_json"
+          jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
+            .status == "completed" and .conclusion == "success" and
+            .event == "workflow_dispatch" and .head_branch == "dev" and
+            .head_sha == $sha and
+            ((.path // .workflow_path // "") == $workflow) and
+            ((.display_title // "") | startswith("Beta recovery capture "))
+          ' <<<"$run_json"
           directory="$RUNNER_TEMP/artifact"
           mkdir "$directory"
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" >"$RUNNER_TEMP/artifact.zip"
@@ -294,14 +292,19 @@ jobs:
           printf '%s\n' "$HOST_FINGERPRINT" >"$known"
           ssh -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$known" "$SSH_USER@$HOST" \
-            "sudo bash -c 'exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock; flock -n 9 || exit 1; \
-             bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
-             --root /var/lib/meet-production --compose-script \
-             /var/lib/meet-test-vps-deploy/scripts/production-compose.sh --output /tmp/pre-probe.json \
-             --public-url \"$PUBLIC_URL\"'"
-          ssh -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$known" "$SSH_USER@$HOST" \
-            "sudo cat /tmp/pre-probe.json" >"$RUNNER_TEMP/pre-probe.json"
+            "sudo bash -s -- '$PUBLIC_URL'" >"$RUNNER_TEMP/pre-probe.json" <<'REMOTE'
+          set -euo pipefail
+          url=$1
+          exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
+          flock -n 9
+          tmp=$(mktemp /tmp/beta-recovery-pre-probe.XXXXXX)
+          trap 'rm -f -- "$tmp"' EXIT
+          bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
+            --root /var/lib/meet-production \
+            --compose-script /var/lib/meet-test-vps-deploy/scripts/production-compose.sh \
+            --output "$tmp" --public-url "$url"
+          cat "$tmp"
+          REMOTE
           scripts/build-beta-recovery-evidence.sh validate-runtime \
             --runtime-proof "$RUNNER_TEMP/pre-probe.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -347,6 +350,14 @@ jobs:
           [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
           mkdir "$RUNNER_TEMP/artifact"
           artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID")
+          workflow_run_id=$(jq -er '.workflow_run.id' <<<"$artifact_json")
+          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
+          jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
+            .status == "completed" and .conclusion == "success" and
+            .event == "workflow_dispatch" and .head_branch == "dev" and .head_sha == $sha and
+            ((.path // .workflow_path // "") == $workflow) and
+            ((.display_title // "") | startswith("Beta recovery capture "))
+          ' <<<"$run_json"
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
             >"$RUNNER_TEMP/artifact.zip"
           unzip -q "$RUNNER_TEMP/artifact.zip" -d "$RUNNER_TEMP/artifact"
@@ -357,7 +368,8 @@ jobs:
           jq -e --arg name "$(jq -r '.artifactName' "$RUNNER_TEMP/artifact/recovery-point.json")" \
             --argjson run "$(jq -r '.runId' "$RUNNER_TEMP/artifact/recovery-point.json")" \
             --arg sha "${{ inputs.source_sha }}" \
-            '.name == $name and .workflow_run.id == $run and .workflow_run.head_sha == $sha' \
+            '.name == $name and .workflow_run.id == $run and .workflow_run.head_sha == $sha and
+             .workflow_run.event == "workflow_dispatch" and .workflow_run.head_branch == "dev"' \
             <<<"$artifact_json"
       - name: Validate runner capacity
         shell: bash
@@ -368,11 +380,13 @@ jobs:
             --recovery-id "${{ inputs.recovery_id }}" --output-dir "$RUNNER_TEMP/restore-output" \
             --sql-proof scripts/beta-recovery-database-proof.sql \
             --media-script scripts/beta-recovery-media-proof.sh \
-            --database-proof "$RUNNER_TEMP/artifact/database-proof.json" \
-            --media-proof "$RUNNER_TEMP/artifact/media-proof.json" \
             --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
-            --tooling-digest "$(jq -er '.toolingDigest' "$RUNNER_TEMP/beta-recovery-authorization.json")" \
-            --workflow-digest "$(jq -er '.workflowDigest' "$RUNNER_TEMP/beta-recovery-authorization.json")" \
+            --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+              scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
+              scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
+              scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh; do sha256sum "$file"; done |
+              sort | sha256sum | awk '{print $1}')" \
+            --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
             --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')"
       - name: Revalidate source immediately before identity access
@@ -396,73 +410,43 @@ jobs:
           identity="$RUNNER_TEMP/age-identity"
           install -m 600 /dev/null "$identity"
           printf '%s\n' "$AGE_IDENTITY" >"$identity"
+          unset AGE_IDENTITY
           mkdir -p "$RUNNER_TEMP/restore-output"
           restore_artifact="$RUNNER_TEMP/restore-artifact"
-          expected_proofs="$RUNNER_TEMP/expected-proofs"
-          mkdir "$restore_artifact" "$expected_proofs"
+          mkdir "$restore_artifact"
           cp -- "$RUNNER_TEMP/artifact/postgres.dump.age" \
             "$RUNNER_TEMP/artifact/uploads.tar.gz.age" \
             "$RUNNER_TEMP/artifact/recovery-point.json" "$restore_artifact/"
-          cp -- "$RUNNER_TEMP/artifact/database-proof.json" \
-            "$RUNNER_TEMP/artifact/media-proof.json" "$expected_proofs/"
           restore_temp="$RUNNER_TEMP/restore-temp"
-          mount_identity="$RUNNER_TEMP/mount.identity"
-          rm -f -- "$mount_identity"
           mkdir -p "$restore_temp"
-          (
-            for _ in $(seq 1 600); do
-              if [ -s "$restore_temp/volume.identity" ]; then
-                cp -- "$restore_temp/volume.identity" "$mount_identity"
-                chmod 600 "$mount_identity"
-                exit 0
-              fi
-              sleep 1
-            done
-            exit 1
-          ) &
-          watcher=$!
           set +e
           scripts/run-beta-recovery-restore.sh \
             --artifact-dir "$restore_artifact" --recovery-id "${{ inputs.recovery_id }}" \
             --output-dir "$RUNNER_TEMP/restore-output" --identity "$identity" --image "$POSTGRES_IMAGE" \
             --sql-proof scripts/beta-recovery-database-proof.sql \
             --media-script scripts/beta-recovery-media-proof.sh \
-            --database-proof "$expected_proofs/database-proof.json" \
-            --media-proof "$expected_proofs/media-proof.json" \
             --temp-root "$restore_temp" \
             --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
-            --tooling-digest "$(jq -er '.toolingDigest' "$RUNNER_TEMP/beta-recovery-authorization.json")" \
-            --workflow-digest "$(jq -er '.workflowDigest' "$RUNNER_TEMP/beta-recovery-authorization.json")" \
+            --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+              scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
+              scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
+              scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh; do sha256sum "$file"; done |
+              sort | sha256sum | awk '{print $1}')" \
+            --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
             --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')"
           restore_status=$?
           set -e
-          kill "$watcher" 2>/dev/null || true
-          wait "$watcher" 2>/dev/null || true
           [ "$restore_status" -eq 0 ]
           [ -s "$RUNNER_TEMP/restore-output/restored-database-proof.json" ]
           [ -s "$RUNNER_TEMP/restore-output/restored-media-proof.json" ]
-          [ -s "$mount_identity" ]
-          volume=$(tr -d '[:space:]' <"$mount_identity")
-          [[ "$volume" =~ ^[0-9a-f]{64}$ ]]
-          container_absent=true
-          network_absent=true
-          volume_absent=true
-          docker container inspect "beta-recovery-postgres-${{ inputs.recovery_id }}" >/dev/null 2>&1 && container_absent=false || true
-          docker network inspect "beta-recovery-${{ inputs.recovery_id }}" >/dev/null 2>&1 && network_absent=false || true
-          docker volume inspect "$volume" >/dev/null 2>&1 && volume_absent=false || true
-          [ "$container_absent" = true ] && [ "$network_absent" = true ] && [ "$volume_absent" = true ]
-          jq -cnS --arg volume "$volume" \
-            '{schema:"meet-backend/beta-recovery-mount/v1",type:"volume",
-              destination:"/var/lib/postgresql/data",readWrite:true,anonymous:true,
-              volumeName:$volume}' >"$RUNNER_TEMP/mount-contract.json"
-          cleanup_complete=false
-          if [ -s "$RUNNER_TEMP/restore-output/restore-summary" ] &&
-            grep -Fxq cleanup_complete=true "$RUNNER_TEMP/restore-output/restore-summary"; then
-            cleanup_complete=true
-          fi
+          [ -s "$RUNNER_TEMP/restore-output/mount-contract.json" ]
+          cp -- "$RUNNER_TEMP/restore-output/mount-contract.json" "$RUNNER_TEMP/mount-contract.json"
+          grep -Fxq cleanup_complete=true "$RUNNER_TEMP/restore-output/restore-summary"
+          cleanup_complete=true
+          anonymous_volume_absent=true
           echo "cleanup_complete=$cleanup_complete" >>"$GITHUB_OUTPUT"
-          echo "anonymous_volume_absent=$volume_absent" >>"$GITHUB_OUTPUT"
+          echo "anonymous_volume_absent=$anonymous_volume_absent" >>"$GITHUB_OUTPUT"
       - name: Transfer restore proofs and cleanup contract
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -470,12 +454,10 @@ jobs:
           retention-days: 30
           if-no-files-found: error
           path: |
-            ${{ runner.temp }}/artifact/database-proof.json
-            ${{ runner.temp }}/artifact/media-proof.json
             ${{ runner.temp }}/restore-output/restored-database-proof.json
             ${{ runner.temp }}/restore-output/restored-media-proof.json
             ${{ runner.temp }}/restore-output/restore-summary
-            ${{ runner.temp }}/mount-contract.json
+            ${{ runner.temp }}/restore-output/mount-contract.json
 
   restore-post-probe:
     name: Probe test VPS after cleanup
@@ -513,14 +495,19 @@ jobs:
           printf '%s\n' "$HOST_FINGERPRINT" >"$known"
           ssh -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$known" "$SSH_USER@$HOST" \
-            "sudo bash -c 'exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock; flock -n 9 || exit 1; \
-             bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
-             --root /var/lib/meet-production --compose-script \
-             /var/lib/meet-test-vps-deploy/scripts/production-compose.sh --output /tmp/post-probe.json \
-             --public-url \"$PUBLIC_URL\"'"
-          ssh -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$known" "$SSH_USER@$HOST" \
-            "sudo cat /tmp/post-probe.json" >"$RUNNER_TEMP/post-probe.json"
+            "sudo bash -s -- '$PUBLIC_URL'" >"$RUNNER_TEMP/post-probe.json" <<'REMOTE'
+          set -euo pipefail
+          url=$1
+          exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
+          flock -n 9
+          tmp=$(mktemp /tmp/beta-recovery-post-probe.XXXXXX)
+          trap 'rm -f -- "$tmp"' EXIT
+          bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
+            --root /var/lib/meet-production \
+            --compose-script /var/lib/meet-test-vps-deploy/scripts/production-compose.sh \
+            --output "$tmp" --public-url "$url"
+          cat "$tmp"
+          REMOTE
           scripts/build-beta-recovery-evidence.sh validate-runtime \
             --runtime-proof "$RUNNER_TEMP/post-probe.json"
           gh run download "$GITHUB_RUN_ID" --name "beta-recovery-pre-probe-$GITHUB_RUN_ID" \
@@ -593,9 +580,19 @@ jobs:
         run: |
           set -euo pipefail
           manifest="$RUNNER_TEMP/selected/recovery-point.json"
+          jq -cS '.databaseProof' "$manifest" >"$RUNNER_TEMP/selected-database-proof.json"
+          jq -cS '.mediaProof' "$manifest" >"$RUNNER_TEMP/selected-media-proof.json"
           artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/${{ inputs.artifact_id }}")
           artifact_name=$(jq -r '.artifactName' "$manifest")
           artifact_run=$(jq -r '.runId' "$manifest")
+          artifact_workflow_run=$(jq -er '.workflow_run.id' <<<"$artifact_json")
+          artifact_run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_workflow_run")
+          jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
+            .status == "completed" and .conclusion == "success" and
+            .event == "workflow_dispatch" and .head_branch == "dev" and .head_sha == $sha and
+            ((.path // .workflow_path // "") == $workflow) and
+            ((.display_title // "") | startswith("Beta recovery capture "))
+          ' <<<"$artifact_run_json"
           jq -e --arg name "$artifact_name" --argjson run "$artifact_run" \
             --arg sha "${{ inputs.source_sha }}" \
             '.id == ($id|tonumber) and .name == $name and .expired == false and
@@ -610,8 +607,8 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
             --artifact-id "${{ inputs.artifact_id }}" --artifact-name "$artifact_name" \
             --manifest "$manifest" \
-            --database-proof "$RUNNER_TEMP/selected/database-proof.json" \
-            --media-proof "$RUNNER_TEMP/selected/media-proof.json" \
+            --database-proof "$RUNNER_TEMP/selected-database-proof.json" \
+            --media-proof "$RUNNER_TEMP/selected-media-proof.json" \
             --restored-database-proof "$RUNNER_TEMP/restore-evidence/restored-database-proof.json" \
             --restored-media-proof "$RUNNER_TEMP/restore-evidence/restored-media-proof.json" \
             --pre-probe "$RUNNER_TEMP/pre/pre-probe.json" \
