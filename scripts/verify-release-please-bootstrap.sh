@@ -32,8 +32,12 @@ required=(
   scripts/test-release-controller-queue.sh
   scripts/test-release-controller-output-contract.sh
   scripts/test-release-reader-credential-routing.sh
+  scripts/classify-release-continuation.sh
+  scripts/test-classify-release-continuation.sh
   scripts/normalize-release-please-action-output.sh
   scripts/test-release-please-action-output.sh
+  scripts/normalize-release-pages.sh
+  scripts/test-release-page-normalization.sh
   scripts/admit-empty-release-continuation.sh
   scripts/test-empty-release-continuation.sh
   scripts/test-release-publish-tooling-routing.sh
@@ -88,19 +92,24 @@ for required_text in \
   '--before-releases-file' '--after-releases-file' \
   '--release-created true' '--release-created false' \
   'normalize-release-please-action-output.sh' \
+  'scripts/classify-release-continuation.sh' \
   'admit-empty-release-continuation.sh' \
   'release_tag: ${{ steps.route.outputs.tag }}' \
   'release_version: ${{ steps.route.outputs.version }}' \
   'Checkout reviewed publication tooling' \
   'Set up attestation-capable Buildx' \
+  'scripts/normalize-release-pages.sh' \
   '--build-arg "BACKEND_REVISION=$SOURCE_SHA" source' \
   'cd "$RUNNER_TEMP/release-assets"' \
   'sha256sum -c SHA256SUMS >/dev/null' \
-  'Verify exact v1.2.0 publication tuple' \
+  'Verify canonical publication tuple' \
   'release-manifest.json' 'image-index.json' 'image-inspect.txt' 'SHA256SUMS'; do
   grep -Fq -- "$required_text" <<<"$workflow" ||
     fail "workflow misses required invariant: $required_text"
 done
+if grep -Fq "jq -c 'add // []'" <<<"$workflow"; then
+  fail "workflow release-list paths bypass normalize-release-pages.sh"
+fi
 controller=$(sed -n '/^  controller:/,/^  gates:/p' <<<"$workflow")
 grep -Fq '      packages: read' <<<"$controller" ||
   fail "controller does not grant packages: read"
@@ -153,6 +162,39 @@ for stale in \
   grep -Fq -- "$stale" <<<"$runbook" &&
     fail "stale runbook construct remains: $stale" || true
 done
-grep -Fq 'gh release verify-asset v1.2.0' <<<"$runbook" ||
-  fail "runbook does not pin explicit v1.2.0 asset verification"
+grep -Fq 'gh release verify-asset <tag>' <<<"$runbook" ||
+  fail "runbook does not use parameterized asset verification"
+grep -Fq 'continuation_id=377201468' <<<"$controller" || fail "continuation ID is not exact"
+grep -Fq 'continuation_tag=v1.3.0' <<<"$controller" || fail "continuation tag is not exact"
+grep -Fq 'continuation_version=1.3.0' <<<"$controller" || fail "continuation version is not exact"
+grep -Fq 'continuation_source=a7abfe04f6852f479291a4710ebdee23e9ae8a34' <<<"$controller" || fail "continuation source is not exact"
+for required_text in \
+  'continuation_state=$(scripts/classify-release-continuation.sh \' \
+  'case "$continuation_state" in' \
+  'pending)' \
+  'published|absent)' \
+  '*)' \
+  'continuation classifier returned an invalid state'; do
+  grep -Fq -- "$required_text" <<<"$controller" ||
+    fail "continuation classifier routing misses required invariant: $required_text"
+done
+for inline_predicate in \
+  'then "pending"' 'then "published"' \
+  '.draft == true' '.draft == false' \
+  '.immutable == false' '.immutable == true' \
+  '.published_at' '[.assets[].name]'; do
+  if grep -Fq -- "$inline_predicate" <<<"$controller"; then
+    fail "controller duplicates continuation classifier predicate: $inline_predicate"
+  fi
+done
+wildcard_route=$(sed -n '/^            \*)/,/^          esac/p' <<<"$controller")
+grep -Fq 'continuation classifier returned an invalid state' <<<"$wildcard_route" ||
+  fail "continuation classifier wildcard does not report an invalid state"
+grep -Fq 'exit 1' <<<"$wildcard_route" ||
+  fail "continuation classifier wildcard does not fail closed"
+grep -Fq 'Verify canonical publication tuple' <<<"$workflow" || fail "publication tuple is not generic"
+if grep -Fq 'Verify exact v1.2.0 publication tuple' <<<"$workflow"; then fail "v1.2.0-only publication assertion remains"; fi
+grep -Fq 'gh release verify-asset <tag> <asset-path>' <<<"$runbook" || fail "runbook does not use a parameterized asset tag"
+grep -Fq 'Release ID `371012814`' <<<"$runbook" || fail "historical v1.2.0 recovery facts are missing"
+grep -Fq 'permanently no-touch' <<<"$runbook" || fail "v1.1.0 no-touch policy is missing"
 echo "release-please bootstrap=verified"

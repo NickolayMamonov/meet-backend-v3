@@ -51,28 +51,35 @@ while [ "$#" -gt 0 ]; do
 done
 
 [[ "$repository" =~ ^[^/]+/[^/]+$ ]] || usage
-[ -d "$repo_dir" ] || usage
 [ -n "$dev_ref" ] || usage
 [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || usage
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
 [ "$tag" = "v$version" ] || usage
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || usage
-[ -f "$releases_file" ] || usage
-[ -f "$registry_state_file" ] || usage
-[ -z "$refs_file" ] || [ -f "$refs_file" ] || usage
 
 [ "$release_id" != 368531227 ] || fail "permanently denied release ID"
 [ "$tag" != v1.1.0 ] || fail "permanently denied tag"
 [ "$source_sha" != 36ffd11ea4d35147f1df9c1cafa6a330300c1339 ] ||
   fail "permanently denied source"
-if [ -z "$refs_file" ]; then
-  if [ "$release_id" != 371012814 ] ||
-     [ "$tag" != v1.2.0 ] ||
-     [ "$version" != 1.2.0 ] ||
-     [ "$source_sha" != 9b6d2b06c0336ab8d153564dcf6328e81c4d7b36 ]; then
-    fail "only the exact quarantined v1.2.0 draft may continue"
-  fi
+if [ "$release_id" != 377201468 ] ||
+   [ "$tag" != v1.3.0 ] ||
+   [ "$version" != 1.3.0 ] ||
+   [ "$source_sha" != a7abfe04f6852f479291a4710ebdee23e9ae8a34 ]; then
+  fail "only the exact quarantined v1.3.0 draft may continue"
 fi
+
+[ -f "$releases_file" ] || usage
+continuation_state=$("$ROOT_DIR/scripts/classify-release-continuation.sh" \
+  --release-id 377201468 --tag v1.3.0 \
+  --source-sha a7abfe04f6852f479291a4710ebdee23e9ae8a34 \
+  --releases-file "$releases_file") ||
+  fail "continuation release classification failed"
+[ "$continuation_state" = pending ] ||
+  fail "continuation release is not pending"
+
+[ -d "$repo_dir" ] || usage
+[ -f "$registry_state_file" ] || usage
+[ -z "$refs_file" ] || [ -f "$refs_file" ] || usage
 
 source_commit=$(git -C "$repo_dir" rev-parse --verify "${source_sha}^{commit}" 2>/dev/null) ||
   fail "release source commit is unavailable"
