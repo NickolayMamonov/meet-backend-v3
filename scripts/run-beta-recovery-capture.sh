@@ -1,109 +1,161 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-if [ "${1:-}" = reconcile ]; then
-  shift
-  state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
-  current='' output=''
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --state-root) state_root=$2; shift 2 ;;
-      --current-runtime) current=$2; shift 2 ;;
-      --output) output=$2; shift 2 ;;
-      *) exit 2 ;;
-    esac
-  done
-  [ -d "$state_root" ] && [ -f "$current" ] && [ -n "$output" ] || exit 2
-  command -v jq >/dev/null 2>&1 || exit 1
-  current_hash=$(jq -er '.runtime.configHash' "$current") || exit 1
-  reconciled=0
-  for state in "$state_root"/beta-recovery-*; do
-    [ -d "$state" ] && [ ! -L "$state" ] || continue
-    journal=$state/journal.json
-    [ -f "$journal" ] && [ ! -L "$journal" ] || continue
-    jq -e '
-      (keys|sort)==["capturedContainerSafe","capturedRuntimeDigest","currentRuntimeHealthy",
-      "ownedPaths","phase","recoveryId","schema","state"] and
-      .schema=="meet-backend/beta-recovery-journal/v1" and .state=="nonterminal" and
-      (.capturedRuntimeDigest|test("^[0-9a-f]{64}$")) and
-      (.ownedPaths|type=="array" and all(.[]; startswith("private/") and (contains("..")|not)))
-    ' "$journal" >/dev/null || { echo "malformed capture journal" >&2; exit 1; }
-    hash=$(jq -r '.capturedRuntimeDigest' "$journal")
-    if [ "$hash" = "$current_hash" ]; then status=incident_resolved
-    else
-      jq -e '.currentRuntimeHealthy == true and .capturedContainerSafe == true' "$journal" >/dev/null ||
-        { echo "replacement is not independently proven" >&2; exit 1; }
-      status=superseded
-    fi
-    while IFS= read -r owned; do [ -n "$owned" ] && rm -f -- "$state/$owned"; done \
-      < <(jq -r '.ownedPaths[]' "$journal")
-    rm -rf -- "$state/staging"
-    jq -cnS --arg id "$(jq -r '.recoveryId' "$journal")" --arg status "$status" \
-      '{schema:"meet-backend/beta-recovery-incident/v1",recoveryId:$id,status:$status,sanitized:true}' \
-      >"$state/incident.json"
-    jq --arg phase "$status" '.state="terminal" | .phase=$phase' "$journal" >"$journal.tmp.$$"
-    chmod 600 "$journal.tmp.$$"; mv -f -- "$journal.tmp.$$" "$journal"
-    reconciled=$((reconciled + 1))
-  done
-  jq -cnS --argjson count "$reconciled" \
-    '{schema:"meet-backend/beta-recovery-reconcile/v1",reconciled:$count}' >"$output"
-  chmod 600 "$output"
-  exit 0
-fi
-usage(){ echo "usage: $0 --recovery-id ID --root PATH --output-dir PATH --recipient AGE-RECIPIENT [--public-url URL]" >&2; exit 2; }
+usage(){ echo "usage: $0 --recovery-id ID --root PATH --output-dir PATH --recipient AGE-RECIPIENT --public-url https://HOST" >&2; exit 2; }
 fail(){ echo "beta recovery capture failed: $*" >&2; exit 1; }
-recovery_id='' root='' output='' recipient='' public_url=''
+mode=capture; recovery_id='' root='' output='' recipient='' public_url=''
+state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}; compose=''; backup=''; probe=''; current_runtime=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    reconcile) mode=reconcile; shift;;
     --recovery-id) recovery_id=$2; shift 2;; --root) root=$2; shift 2;;
-    --output-dir) output=$2; shift 2;; --recipient) recipient=$2; shift 2;;
-    --public-url) public_url=$2; shift 2;; *) usage;;
+    --output-dir|--output) output=$2; shift 2;; --recipient) recipient=$2; shift 2;;
+    --public-url) public_url=$2; shift 2;; --state-root) state_root=$2; shift 2;;
+    --compose-script) compose=$2; shift 2;; --backup-script) backup=$2; shift 2;;
+    --probe-script) probe=$2; shift 2;; --current-runtime) current_runtime=$2; shift 2;;
+    *) usage;;
   esac
 done
-[[ "$recovery_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || usage
-[ -d "$root" ] && [ -d "$output" ] && [ ! -L "$output" ] || usage
-[[ "$recipient" =~ ^age1[0-9a-z]+$ ]] || fail "recipient malformed"
-for tool in docker flock jq; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
+if [ "$mode" = capture ]; then
+  [[ "$recovery_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || usage
+  [[ "$recipient" =~ ^age1[0-9a-z]+$ ]] || fail "recipient malformed"
+  [ -n "$output" ] && [ -d "$output" ] && [ ! -L "$output" ] || usage
+fi
+[ -d "$root" ] && [ ! -L "$root" ] || usage
+[[ "$public_url" =~ ^https://[^/]+$ ]] || fail "public HTTPS URL is required"
+for tool in docker flock jq stat find mktemp; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-compose=${PRODUCTION_COMPOSE_SCRIPT:-"$root/scripts/production-compose.sh"}
-backup=${BETA_BACKUP_SCRIPT:-"$script_dir/backup-production.sh"}
-probe=${RECOVERY_PROBE_SCRIPT:-"$script_dir/probe-test-vps-recovery-runtime.sh"}
+compose=${compose:-${PRODUCTION_COMPOSE_SCRIPT:-"$script_dir/production-compose.sh"}}
+backup=${backup:-${BETA_BACKUP_SCRIPT:-"$script_dir/backup-production.sh"}}
+probe=${probe:-${RECOVERY_PROBE_SCRIPT:-"$script_dir/probe-test-vps-recovery-runtime.sh"}}
 [ -x "$compose" ] && [ -x "$backup" ] && [ -x "$probe" ] || fail "reviewed tooling unavailable"
-state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
-install -d -m 700 "$state_root"
+database_proof=${BETA_DATABASE_PROOF_SCRIPT:-"$script_dir/beta-recovery-database-proof.sql"}
+media_proof=${BETA_MEDIA_PROOF_SCRIPT:-"$script_dir/beta-recovery-media-proof.sh"}
+[ -f "$database_proof" ] && [ -x "$media_proof" ] || fail "capture proof tooling is unavailable"
+[ -z "$current_runtime" ] || { [ -f "$current_runtime" ] && [ ! -L "$current_runtime" ]; } || fail "current runtime proof is unsafe"
+reconcile_output=''; [ "$mode" = reconcile ] && { [ -n "$output" ] && [ ! -e "$output" ] && [ -d "$(dirname "$output")" ] || usage; reconcile_output=$output; }
+install -d -m 700 "$state_root"; [ ! -L "$state_root" ] || fail "state root is unsafe"
 exec 9>"$state_root/.deploy.lock"; flock -n 9 || fail "deploy lock is busy"
-[ ! -e "$state_root/.smtp-transaction.current" ] || fail "SMTP transaction is active"
-state=$state_root/beta-recovery-$recovery_id
-[ ! -e "$state" ] || fail "recovery ID already exists"
-install -d -m 700 "$state" "$state/private" "$state/staging"
-journal=$state/journal.json
-write_journal(){
-  local phase=$1; local hash=$2; local healthy=$3; local safe=$4; local tmp=$journal.tmp.$$
-  jq -cnS --arg id "$recovery_id" --arg phase "$phase" --arg hash "$hash" \
-    --argjson healthy "$healthy" --argjson safe "$safe" \
-    '{schema:"meet-backend/beta-recovery-journal/v1",recoveryId:$id,state:"nonterminal",
-      phase:$phase,capturedRuntimeDigest:$hash,currentRuntimeHealthy:$healthy,
-      capturedContainerSafe:$safe,ownedPaths:["private/postgres.dump.age",
-      "private/uploads.tar.gz.age","private/capture-runtime.json","staging"]}' >"$tmp"
-  chmod 600 "$tmp"; mv -f -- "$tmp" "$journal"
+probe_runtime(){
+  local destination=$1 backend mount
+  "$probe" --root "$root" --compose-script "$compose" --output "$destination" --public-url "$public_url" || fail "runtime probe failed"
+  jq -e '.schema=="meet-backend/test-vps-recovery-runtime/v1" and .healthy==true and .runtime.health=="healthy" and
+    (.runtime.imageId|test("^sha256:[0-9a-f]{64}$")) and (.runtime.configHash|test("^[0-9a-f]{64}$")) and
+    .runtime.uploadsMount=="volume" and .https.meetingsStatus=="200" and .https.meetingsJson==true and
+    .https.actuatorStatus=="404" and .https.httpRedirectHttps==true' "$destination" >/dev/null ||
+    fail "runtime or HTTPS safety proof is incomplete"
+  backend=$("$compose" ps -q backend); [ -n "$backend" ] || fail "backend unavailable during runtime proof"
+  mount=$(docker inspect "$backend" --format '{{range .Mounts}}{{if eq .Destination "/data/uploads"}}{{printf "%s|%s" .Type .Name}}{{end}}{{end}}')
+  [ "$mount" = "volume|meet-production_uploads_data" ] || fail "active uploads volume differs"
 }
-pre=$state/capture-runtime.json
-"$probe" --root "$root" --compose-script "$compose" --output "$pre" \
-  ${public_url:+--public-url "$public_url"} || fail "pre-capture probe failed"
-runtime_hash=$(jq -er '.runtime.configHash' "$pre") || fail "runtime hash unavailable"
-write_journal pre_stop "$runtime_hash" true true
+owned='["private/capture-runtime.json","private/post-capture.json","private/capture-result.json","private/capture-database-proof.json","private/capture-media-proof.json","private/postgres.dump.age","private/uploads.tar.gz.age","staging"]'
+validate_journal(){
+  jq -e --argjson owned "$owned" 'type=="object" and
+    (keys|sort)==["capturedContainerId","capturedContainerSafe","capturedImageId","capturedRuntimeDigest","currentRuntimeHealthy","ownedPaths","phase","recoveryId","schema","state"] and
+    .schema=="meet-backend/beta-recovery-journal/v1" and (.recoveryId|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")) and
+    (.phase|type=="string" and length>0) and (.state=="nonterminal" or .state=="terminal") and
+    (.capturedContainerId|test("^[0-9a-f]{12,64}$")) and (.capturedImageId|test("^sha256:[0-9a-f]{64}$")) and
+    (.capturedRuntimeDigest|test("^[0-9a-f]{64}$")) and (.currentRuntimeHealthy|type=="boolean") and
+    (.capturedContainerSafe|type=="boolean") and .ownedPaths==$owned' "$1" >/dev/null
+}
+clean_owned(){
+  local state=$1 path
+  while IFS= read -r path; do case "$path" in private/*) rm -f -- "$state/$path";; staging) [ ! -e "$state/staging" ] || { [ ! -L "$state/staging" ] && rm -r -- "$state/staging"; };; *) return 1;; esac; done < <(jq -r '.ownedPaths[]' "$state/journal.json")
+  [ ! -e "$state/private" ] || [ -z "$(find "$state/private" -mindepth 1 -print -quit)" ] || return 1
+  [ ! -e "$state/staging" ] || return 1
+}
+terminalize(){
+  local state=$1 status=$2 journal incident tmp
+  journal=$state/journal.json; incident=$state/incident.json; tmp=$incident.tmp.$$
+  jq -cnS --arg id "$(jq -er .recoveryId "$journal")" --arg status "$status" '{schema:"meet-backend/beta-recovery-incident/v1",recoveryId:$id,status:$status,sanitized:true}' >"$tmp"
+  chmod 600 "$tmp"
+  if [ -e "$incident" ]; then cmp -- "$tmp" "$incident" >/dev/null || { rm -f "$tmp"; return 1; }; rm -f "$tmp"; else mv -- "$tmp" "$incident"; fi
+  tmp=$journal.tmp.$$
+  jq --arg phase "$status" '.state="terminal"|.phase=$phase|.currentRuntimeHealthy=true|.capturedContainerSafe=true' "$journal" >"$tmp"
+  chmod 600 "$tmp"; mv -- "$tmp" "$journal"
+}
+reconcile_states(){
+  local state state_id journal current expected image running mount fresh hash count=0 summary
+  summary=$(mktemp "$state_root/.reconcile.XXXXXX")
+  trap 'rm -f -- "${summary:-}"' RETURN
+  for state in "$state_root"/beta-recovery-*; do
+    [ -d "$state" ] && [ ! -L "$state" ] || continue
+    state_id=${state##*/beta-recovery-}; journal=$state/journal.json
+    [ -f "$journal" ] && [ ! -L "$journal" ] || fail "malformed recovery state"
+    find "$state" -type l -print -quit | grep -q . && fail "recovery state contains a symlink" || true
+    validate_journal "$journal" || fail "malformed capture journal"
+    [ "$(jq -er .recoveryId "$journal")" = "$state_id" ] || fail "recovery state identity differs"
+    if [ "$(jq -er .state "$journal")" = terminal ]; then
+      [ -f "$state/incident.json" ] && [ ! -L "$state/incident.json" ] || fail "terminal incident missing"
+      clean_owned "$state" || fail "terminal capture state is not clean"; continue
+    fi
+    expected=$(jq -er .capturedContainerId "$journal"); image=$(jq -er .capturedImageId "$journal")
+    current=$("$compose" ps -q backend) || fail "backend lookup failed"; [ -n "$current" ] || fail "current backend unavailable"
+    if [ "$current" = "$expected" ]; then
+      [ "$(docker inspect "$expected" --format '{{.Image}}')" = "$image" ] || fail "captured image differs"
+      mount=$(docker inspect "$expected" --format '{{range .Mounts}}{{if eq .Destination "/data/uploads"}}{{printf "%s|%s" .Type .Name}}{{end}}{{end}}')
+      [ "$mount" = "volume|meet-production_uploads_data" ] || fail "captured uploads mount differs"
+      running=$(docker inspect "$expected" --format '{{.State.Running}}')
+      [ "$running" = true ] || docker start "$expected" >/dev/null || fail "captured backend restart failed"
+      fresh=$(mktemp "$state_root/.runtime.XXXXXX"); probe_runtime "$fresh"; hash=$(jq -er .runtime.configHash "$fresh")
+      [ "$hash" = "$(jq -er .capturedRuntimeDigest "$journal")" ] || fail "captured runtime differs"; rm -f -- "$fresh"; status=incident_resolved
+    else
+      docker info >/dev/null 2>&1 || fail "Docker state unavailable"
+      if docker inspect "$expected" >/dev/null 2>&1; then
+        [ "$(docker inspect "$expected" --format '{{.State.Running}}')" = false ] || fail "superseded container is running"
+        [ "$(docker inspect "$expected" --format '{{.Image}}')" = "$image" ] || fail "superseded image differs"
+      fi
+      fresh=$(mktemp "$state_root/.runtime.XXXXXX"); probe_runtime "$fresh"
+      [ -z "$current_runtime" ] || cmp -- "$current_runtime" "$fresh" || fail "current runtime differs"
+      rm -f -- "$fresh"; status=superseded
+    fi
+    terminalize "$state" "$status" || fail "terminal state publication failed"; clean_owned "$state" || fail "capture-owned state cleanup failed"; count=$((count+1))
+  done
+  jq -cnS --argjson count "$count" '{schema:"meet-backend/beta-recovery-reconcile/v1",reconciled:$count}' >"$summary"
+  if [ -n "$reconcile_output" ]; then mv -- "$summary" "$reconcile_output"; chmod 600 "$reconcile_output"; else rm -f -- "$summary"; fi
+  trap - RETURN
+}
+reconcile_states
+[ "$mode" = reconcile ] && exit 0
+[ ! -e "$state_root/.smtp-transaction.current" ] || fail "SMTP transaction is active"
+[ ! -e "$state_root/beta-recovery-$recovery_id" ] || fail "recovery ID already exists"
+published=(); pre_tmp=''
+cleanup_staged(){
+  local file status=0
+  case "$script_dir" in /tmp/beta-recovery-*|/var/tmp/beta-recovery-*)
+    for file in run-beta-recovery-capture.sh backup-production.sh probe-test-vps-recovery-runtime.sh production-compose.sh beta-recovery-database-proof.sql beta-recovery-media-proof.sh; do
+      [ ! -e "$script_dir/$file" ] || rm -f -- "$script_dir/$file" || status=1
+      [ ! -e "$script_dir/$file" ] || status=1
+    done;; esac
+  return "$status"
+}
+cleanup(){
+  local status=$? file; trap - EXIT HUP INT TERM
+  [ -z "$pre_tmp" ] || rm -f -- "$pre_tmp" || status=1
+  if [ "$status" -ne 0 ]; then for file in "${published[@]}"; do rm -f -- "$output/$file" || status=1; done; cleanup_staged || status=1; fi
+  exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+output_uid=$(stat -c '%u' "$output"); output_gid=$(stat -c '%g' "$output")
+expected_uid=${SUDO_UID:-$(id -u)}; expected_gid=${SUDO_GID:-$(id -g)}
+[ "$output_uid" = "$expected_uid" ] && [ "$output_gid" = "$expected_gid" ] || fail "output owner differs"
+chmod 700 "$output"; pre_tmp=$(mktemp "$state_root/.pre-capture.XXXXXX"); probe_runtime "$pre_tmp"
+backend=$("$compose" ps -q backend); [ -n "$backend" ] || fail "backend unavailable"
+container_id=$(docker inspect "$backend" --format '{{.Id}}'); image_id=$(docker inspect "$backend" --format '{{.Image}}'); runtime_hash=$(jq -er .runtime.configHash "$pre_tmp")
+state=$state_root/beta-recovery-$recovery_id; install -d -m 700 "$state" "$state/private" "$state/staging"; mv -- "$pre_tmp" "$state/private/capture-runtime.json"; pre_tmp=''; journal=$state/journal.json
+write_journal(){ local phase=$1 tmp=$journal.tmp.$$; jq -cnS --arg id "$recovery_id" --arg phase "$phase" --arg c "$container_id" --arg i "$image_id" --arg h "$runtime_hash" --argjson owned "$owned" '{schema:"meet-backend/beta-recovery-journal/v1",recoveryId:$id,state:"nonterminal",phase:$phase,capturedContainerId:$c,capturedImageId:$i,capturedRuntimeDigest:$h,currentRuntimeHealthy:true,capturedContainerSafe:true,ownedPaths:$owned}' >"$tmp"; chmod 600 "$tmp"; mv -f -- "$tmp" "$journal"; }
+write_journal pre_stop
 export AGE_RECIPIENT="$recipient" BACKUP_DIR="$state/private" PRODUCTION_ROOT="$root"
-"$backup" --beta --recovery-id "$recovery_id" --output-dir "$state/private" ||
-  fail "beta backup failed"
-write_journal snapshot_complete "$runtime_hash" true true
-post=$state/post-capture.json
-"$probe" --root "$root" --compose-script "$compose" --output "$post" \
-  ${public_url:+--public-url "$public_url"} || fail "post-capture probe failed"
-cmp -- "$pre" "$post" || fail "active runtime changed during capture"
-write_journal runtime_verified "$runtime_hash" true true
-for file in postgres.dump.age uploads.tar.gz.age; do
-  [ -s "$state/private/$file" ] || fail "encrypted pair is incomplete"
-  mv -- "$state/private/$file" "$output/$file"
-done
-cp -- "$pre" "$output/capture-runtime.json"
-rm -r -- "$state"
+production_scripts_dir=$(dirname -- "$compose"); export PRODUCTION_SCRIPTS_DIR="$production_scripts_dir"
+export BETA_DATABASE_PROOF_SCRIPT="$database_proof" BETA_MEDIA_PROOF_SCRIPT="$media_proof"
+"$backup" --beta --recovery-id "$recovery_id" --output-dir "$state/private" || fail "beta backup failed"
+write_journal snapshot_complete
+post=$state/private/post-capture.json; probe_runtime "$post"; cmp -- "$state/private/capture-runtime.json" "$post" || fail "runtime or HTTPS changed during capture"; write_journal runtime_verified
+for file in postgres.dump.age uploads.tar.gz.age capture-database-proof.json capture-media-proof.json capture-result.json capture-runtime.json post-capture.json; do [ -f "$state/private/$file" ] && [ ! -L "$state/private/$file" ] || fail "capture output incomplete"; done
+jq -e --arg id "$recovery_id" '.schema=="meet-backend/beta-recovery-capture/v1" and .recoveryId==$id and (.databaseBytes|type=="number" and floor==. and .>=0) and (.uploads.bytes|type=="number" and floor==. and .>=0) and (.uploads.digest|test("^[0-9a-f]{64}$")) and .ciphertexts.database.name=="postgres.dump.age" and .ciphertexts.uploads.name=="uploads.tar.gz.age" and .proofs.database.name=="capture-database-proof.json" and .proofs.media.name=="capture-media-proof.json"' "$state/private/capture-result.json" >/dev/null || fail "capture result malformed"
+for proof in capture-database-proof.json capture-media-proof.json; do [ "$(wc -l <"$state/private/$proof" | tr -d '[:space:]')" = 1 ] || fail "capture proof is not compact"; done
+jq -e '.schema=="meet-backend/closed-beta-database-proof/v1"' "$state/private/capture-database-proof.json" >/dev/null || fail "database proof malformed"
+jq -e '.schema=="meet-backend/beta-recovery-media-proof/v1" and .referencesResolved==true' "$state/private/capture-media-proof.json" >/dev/null || fail "media proof malformed"
+publish_file(){ local name=$1 source=$2 tmp; [ ! -e "$output/$name" ] || fail "capture output exists"; tmp=$(mktemp "$output/.capture-output.XXXXXX"); cp -- "$source" "$tmp"; chmod 600 "$tmp"; chown "$expected_uid:$expected_gid" "$tmp"; mv -n -- "$tmp" "$output/$name"; [ ! -e "$tmp" ] || fail "capture output publication raced"; published+=("$name"); }
+for file in postgres.dump.age uploads.tar.gz.age capture-database-proof.json capture-media-proof.json capture-result.json capture-runtime.json post-capture.json; do publish_file "$file" "$state/private/$file"; done
+rm -r -- "$state" || fail "capture state cleanup failed"; trap - EXIT HUP INT TERM; cleanup_staged || fail "remote staging cleanup failed"
+printf 'database=%s\nuploads=%s\n' "$output/postgres.dump.age" "$output/uploads.tar.gz.age"

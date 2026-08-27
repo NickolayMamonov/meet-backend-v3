@@ -15,6 +15,22 @@ grep -Fq 'restore-pre-probe' "$workflow"
 grep -Fq 'restore-post-probe' "$workflow"
 grep -Fq 'run-beta-recovery-restore.sh' "$workflow"
 grep -Fq 'BETA_RECOVERY_AGE_IDENTITY' "$workflow"
+grep -Fq 'PUBLIC_URL: https://api.whysoezzy.online' "$workflow"
+grep -Fq -- '--public-url' "$workflow"
+grep -Fq 'scripts/build-beta-recovery-evidence.sh validate-artifact' "$workflow"
+grep -Fq 'scripts/build-beta-recovery-evidence.sh validate-runtime' "$workflow"
+grep -Fq -- '--database-proof "$expected_proofs/database-proof.json"' "$workflow"
+grep -Fq -- '--media-proof "$expected_proofs/media-proof.json"' "$workflow"
+grep -Fq -- '--temp-root "$restore_temp"' "$workflow"
+grep -Fq 'docker volume inspect "$volume"' "$workflow"
+grep -Fq 'anonymous_volume_absent' "$workflow"
+grep -Fq 'beta-recovery-restore-evidence-' "$workflow"
+grep -Fq 'beta-recovery-drill-' "$workflow"
+grep -Fq 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' "$workflow"
+if grep -Fq 'successful:true' "$workflow" || grep -Fq 'canonicalDigest:"0000000000000000000000000000000000000000000000000000000000000000' "$workflow"; then
+  echo "capture workflow contains synthetic proofs" >&2
+  exit 1
+fi
 if awk '/restore-isolated:/{flag=1} /restore-post-probe:/{flag=0} flag' "$workflow" |
   grep -Eq 'TEST_VPS|SSH_PRIVATE_KEY|TEST_VPS_HOST'; then
   echo "isolated restore job has VPS custody" >&2
