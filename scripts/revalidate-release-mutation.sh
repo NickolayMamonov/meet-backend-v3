@@ -58,18 +58,39 @@ assets=(release-manifest.json image-index.json image-inspect.txt SHA256SUMS)
 if [ "$phase" = complete ] && [ -n "$assets_dir" ]; then
   [ -d "$assets_dir" ] || fail "asset directory is missing"
   for asset in "${assets[@]}"; do
-    [ -f "$assets_dir/$asset" ] || fail "expected asset is missing: $asset"
+    [ -f "$assets_dir/$asset" ] && [ ! -L "$assets_dir/$asset" ] ||
+      fail "expected asset is missing or unsafe: $asset"
+    [ -s "$assets_dir/$asset" ] || fail "expected asset is empty: $asset"
   done
+  expected=$(printf '%s\n' "${assets[@]}" | sort)
+  actual=$(find "$assets_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+  [ "$actual" = "$expected" ] || fail "asset directory inventory is not exact"
 fi
 jq_filter='
-  .id == $id and .tag_name == $tag and .target_commitish == $source and
-  .draft == true and .prerelease == false and .published_at == null and
+  type == "object" and
+  .id == $id and .name == $tag and .tag_name == $tag and
+  .target_commitish == $source and
+  .draft == true and .prerelease == false and
+  has("immutable") and .immutable == false and
+  has("published_at") and .published_at == null and
   (.assets | type == "array")
 '
 if [ "$phase" = empty ]; then
   jq_filter+=' and (.assets | length == 0)'
 elif [ "$phase" = complete ]; then
-  jq_filter+=' and (.assets | length == 4)'
+  jq_filter+=' and
+    (.assets | length == 4) and
+    ([.assets[].name] | sort) ==
+      ["SHA256SUMS","image-index.json","image-inspect.txt","release-manifest.json"] and
+    ([.assets[].id] | unique | length == 4) and
+    all(.assets[];
+      type == "object" and
+      (.id | type == "number" and floor == . and . > 0) and
+      (.name | type == "string") and
+      .state == "uploaded" and
+      (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.size | type == "number" and floor == . and . > 0)
+    )'
 fi
 if [ "$phase" = complete ] && [ -n "$assets_dir" ]; then
   expected_sha256=(
@@ -78,17 +99,18 @@ if [ "$phase" = complete ] && [ -n "$assets_dir" ]; then
     "$(sha256sum "$assets_dir/image-inspect.txt" | awk '{print $1}')"
     "$(sha256sum "$assets_dir/SHA256SUMS" | awk '{print $1}')"
   )
+  expected_size=(
+    "$(wc -c <"$assets_dir/release-manifest.json" | tr -d '[:space:]')"
+    "$(wc -c <"$assets_dir/image-index.json" | tr -d '[:space:]')"
+    "$(wc -c <"$assets_dir/image-inspect.txt" | tr -d '[:space:]')"
+    "$(wc -c <"$assets_dir/SHA256SUMS" | tr -d '[:space:]')"
+  )
   for index in "${!assets[@]}"; do
     jq_filter+=" and ([.assets[] | select(.name == \"${assets[$index]}\")] |
-      length == 1 and .[0].digest == \"sha256:${expected_sha256[$index]}\")"
+      length == 1 and
+      .[0].digest == \"sha256:${expected_sha256[$index]}\" and
+      .[0].size == ${expected_size[$index]})"
   done
-  jq_filter+=' and ([.assets[].name] | sort) ==
-    ["SHA256SUMS","image-index.json","image-inspect.txt","release-manifest.json"] and
-    all(.assets[];
-      (.id | type == "number" and floor == . and . > 0) and
-      .state == "uploaded" and
-      (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
-    )'
 fi
 jq -e --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" \
   "$jq_filter" <<<"$release" >/dev/null || fail "release changed before publication"

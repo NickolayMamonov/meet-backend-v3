@@ -103,4 +103,63 @@ reject_mutation published ".[0].published_at |= tostring"
 reject_mutation partial-assets ".[0].assets = .[0].assets + [{}]"
 reject_mutation duplicate-release ". + [.[0]]"
 reject_mutation missing-release ". = []"
+
+printf '%s\n' '{not-json' >"$TMP/malformed.json"
+expect_rejection "$ADMIT" --repository owner/repo --repo-dir "$REPO" \
+  --dev-ref "$SOURCE" --release-id 377201468 --tag v1.3.0 \
+  --version 1.3.0 --source-sha "$SOURCE" \
+  --releases-file "$TMP/malformed.json" \
+  --registry-state-file "$TMP/registry.txt" --refs-file "$TMP/refs.json"
+
+jq '. + [{
+  id:377201469,
+  name:"other",
+  tag_name:"v1.3.0",
+  target_commitish:"0123456789abcdef0123456789abcdef01234567",
+  immutable:false,
+  draft:true,
+  prerelease:false,
+  published_at:null,
+  assets:[]
+}]' "$TMP/releases.json" >"$TMP/ambiguous-tag.json"
+expect_rejection "$ADMIT" --repository owner/repo --repo-dir "$REPO" \
+  --dev-ref "$SOURCE" --release-id 377201468 --tag v1.3.0 \
+  --version 1.3.0 --source-sha "$SOURCE" \
+  --releases-file "$TMP/ambiguous-tag.json" \
+  --registry-state-file "$TMP/registry.txt" --refs-file "$TMP/refs.json"
+
+jq '. + [{
+  id:377201469,
+  name:"other",
+  tag_name:"v9.9.9",
+  target_commitish:"'"$SOURCE"'",
+  immutable:false,
+  draft:true,
+  prerelease:false,
+  published_at:null,
+  assets:[]
+}]' "$TMP/releases.json" >"$TMP/ambiguous-source.json"
+expect_rejection "$ADMIT" --repository owner/repo --repo-dir "$REPO" \
+  --dev-ref "$SOURCE" --release-id 377201468 --tag v1.3.0 \
+  --version 1.3.0 --source-sha "$SOURCE" \
+  --releases-file "$TMP/ambiguous-source.json" \
+  --registry-state-file "$TMP/registry.txt" --refs-file "$TMP/refs.json"
+admission_source=$(sed -n '1,$p' "$ADMIT")
+line_of() {
+  local pattern=$1
+  grep -n -m1 -F -- "$pattern" <<<"$admission_source" | cut -d: -f1
+}
+classifier_line=$(line_of 'classify-release-continuation.sh')
+for later_check in \
+  'git -C "$repo_dir" rev-parse' \
+  'verify-release-tag-ref.sh' \
+  'cmp --silent "$expected_registry"'; do
+  later_line=$(line_of "$later_check")
+  [ -n "$classifier_line" ] && [ -n "$later_line" ] &&
+    [ "$classifier_line" -lt "$later_line" ] || {
+      echo "continuation classifier does not precede $later_check" >&2
+      exit 1
+    }
+done
+
 echo "empty release continuation fixtures passed"

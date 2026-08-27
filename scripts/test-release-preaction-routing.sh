@@ -27,7 +27,7 @@ assert_output() {
 assert_output 'route=action' pre-action --repo-dir "$REPO" \
   --dev-ref HEAD --releases-file "$TMP/empty.json" --refs-file "$TMP/refs.json"
 jq -n --arg source "$SOURCE" '[{
-  id:120,tag_name:"v1.0.0",target_commitish:$source,draft:true,prerelease:false,
+  id:120,name:"v1.0.0",tag_name:"v1.0.0",target_commitish:$source,draft:true,immutable:false,prerelease:false,
   published_at:null,assets:[]
 }]' >"$TMP/draft.json"
 if "$RESOLVER" pre-action --repo-dir "$REPO" \
@@ -37,7 +37,7 @@ if "$RESOLVER" pre-action --repo-dir "$REPO" \
   exit 1
 fi
 jq -n --arg source "$SOURCE" '[{
-  id:120,tag_name:"v1.0.0",target_commitish:$source,draft:false,prerelease:false,
+  id:120,name:"v1.0.0",tag_name:"v1.0.0",target_commitish:$source,draft:false,immutable:true,prerelease:false,
   published_at:"2026-08-14T00:00:00Z",assets:[]
 }]' >"$TMP/published.json"
 assert_output 'route=completed' post-action --repo-dir "$REPO" \
@@ -46,7 +46,7 @@ assert_output 'route=completed' post-action --repo-dir "$REPO" \
 
 OLD_SOURCE=abcdefabcdefabcdefabcdefabcdefabcdefabcd
 jq -n --arg old_source "$OLD_SOURCE" '[{
-  id:123,tag_name:"v1.0.0",target_commitish:$old_source,draft:false,prerelease:false,
+  id:123,name:"v1.0.0",tag_name:"v1.0.0",target_commitish:$old_source,draft:false,immutable:true,prerelease:false,
   published_at:"2026-08-14T00:00:00Z",assets:[]
 }]' >"$TMP/published-old-source.json"
 assert_output 'route=action' pre-action --repo-dir "$REPO" \
@@ -58,7 +58,7 @@ assert_output 'route=completed' post-action --repo-dir "$REPO" \
   --releases-file "$TMP/published-old-source.json" --refs-file "$TMP/refs.json"
 
 jq -n --arg source "$SOURCE" '[{
-  id:121,tag_name:"v1.0.0",target_commitish:$source,draft:true,prerelease:false,
+  id:121,name:"v1.0.0",tag_name:"v1.0.0",target_commitish:$source,draft:true,immutable:false,prerelease:false,
   published_at:null,assets:[]
 }]' >"$TMP/fresh-after.json"
 jq -n '[]' >"$TMP/fresh-before.json"
@@ -72,7 +72,7 @@ assert_output 'release_id=121' post-action --repo-dir "$REPO" \
   --after-releases-file "$TMP/fresh-after.json" --release-created true
 
 jq -n --arg source "$SOURCE" '[{
-  id:122,tag_name:"v1.0.0",target_commitish:$source,draft:false,prerelease:false,
+  id:122,name:"v1.0.0",tag_name:"v1.0.0",target_commitish:$source,draft:false,immutable:true,prerelease:false,
   published_at:"2026-08-14T00:00:00Z",assets:[]
 }]' >"$TMP/published-before.json"
 cp "$TMP/published-before.json" "$TMP/published-after.json"
@@ -100,6 +100,13 @@ fi
 assert_output 'asset_inventory_kind=empty' verify --repo-dir "$REPO" \
   --dev-ref HEAD --release-id 121 --tag v1.0.0 --version 1.0.0 \
   --source-sha "$SOURCE" --phase empty --releases-file "$TMP/fresh-after.json"
+if "$RESOLVER" verify --repo-dir "$REPO" \
+  --dev-ref HEAD --release-id 120 --tag v1.0.0 --version 1.0.0 \
+  --source-sha "$SOURCE" --phase empty --releases-file "$TMP/published.json" \
+  >/dev/null 2>&1; then
+  echo "valid published release passed verification" >&2
+  exit 1
+fi
 jq '.[0].assets=[{},{},{},{}]' "$TMP/fresh-after.json" >"$TMP/complete.json"
 assert_output 'asset_inventory_kind=complete' verify --repo-dir "$REPO" \
   --dev-ref HEAD --release-id 121 --tag v1.0.0 --version 1.0.0 \
@@ -110,6 +117,48 @@ if "$RESOLVER" verify --repo-dir "$REPO" \
   --source-sha "$SOURCE" --phase empty --releases-file "$TMP/partial.json" \
   >/dev/null 2>&1; then
   echo "partial asset inventory passed empty-phase verification" >&2
+  exit 1
+fi
+
+for publication_mutation in \
+  '.[0].published_at=false' \
+  'del(.[0].published_at)' \
+  '.[0].draft=false' \
+  '.[0].immutable=true' \
+  '.[0].published_at=""' \
+  '.[0].published_at="2026-08-14T00:00:00Z"' \
+  '.[0].published_at="2026-08-14T00:00:00Z" | .[0].draft=false | .[0].immutable=true | .[0].target_commitish="main"' \
+  '.[0].target_commitish="abcdefabcdefabcdefabcdefabcdefabcdefabcd"'; do
+  jq "$publication_mutation" "$TMP/fresh-after.json" >"$TMP/invalid-publication.json"
+  if "$RESOLVER" verify --repo-dir "$REPO" \
+    --dev-ref HEAD --release-id 121 --tag v1.0.0 --version 1.0.0 \
+    --source-sha "$SOURCE" --phase empty \
+    --releases-file "$TMP/invalid-publication.json" >/dev/null 2>&1; then
+    echo "invalid published_at state passed verification: $publication_mutation" >&2
+    exit 1
+  fi
+done
+
+for publication_mutation in \
+  '.[0].draft=true' \
+  '.[0].immutable=false' \
+  '.[0].published_at=null'; do
+  jq "$publication_mutation" "$TMP/published.json" >"$TMP/invalid-publication.json"
+  if "$RESOLVER" verify --repo-dir "$REPO" \
+    --dev-ref HEAD --release-id 120 --tag v1.0.0 --version 1.0.0 \
+    --source-sha "$SOURCE" --phase empty \
+    --releases-file "$TMP/invalid-publication.json" >/dev/null 2>&1; then
+    echo "invalid published release state passed verification: $publication_mutation" >&2
+    exit 1
+  fi
+done
+
+jq '.[1] = (.[0] | .id = 124)' "$TMP/fresh-after.json" >"$TMP/ambiguous.json"
+if "$RESOLVER" verify --repo-dir "$REPO" \
+  --dev-ref HEAD --release-id 121 --tag v1.0.0 --version 1.0.0 \
+  --source-sha "$SOURCE" --phase empty --releases-file "$TMP/ambiguous.json" \
+  >/dev/null 2>&1; then
+  echo "second current release with a different ID passed verification" >&2
   exit 1
 fi
 

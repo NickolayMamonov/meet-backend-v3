@@ -32,6 +32,8 @@ required=(
   scripts/test-release-controller-queue.sh
   scripts/test-release-controller-output-contract.sh
   scripts/test-release-reader-credential-routing.sh
+  scripts/classify-release-continuation.sh
+  scripts/test-classify-release-continuation.sh
   scripts/normalize-release-please-action-output.sh
   scripts/test-release-please-action-output.sh
   scripts/admit-empty-release-continuation.sh
@@ -88,6 +90,7 @@ for required_text in \
   '--before-releases-file' '--after-releases-file' \
   '--release-created true' '--release-created false' \
   'normalize-release-please-action-output.sh' \
+  'scripts/classify-release-continuation.sh' \
   'admit-empty-release-continuation.sh' \
   'release_tag: ${{ steps.route.outputs.tag }}' \
   'release_version: ${{ steps.route.outputs.version }}' \
@@ -159,8 +162,30 @@ grep -Fq 'continuation_id=377201468' <<<"$controller" || fail "continuation ID i
 grep -Fq 'continuation_tag=v1.3.0' <<<"$controller" || fail "continuation tag is not exact"
 grep -Fq 'continuation_version=1.3.0' <<<"$controller" || fail "continuation version is not exact"
 grep -Fq 'continuation_source=a7abfe04f6852f479291a4710ebdee23e9ae8a34' <<<"$controller" || fail "continuation source is not exact"
-grep -Fq '.immutable == false' <<<"$controller" || fail "pending continuation state is not exact"
-grep -Fq '.immutable == true' <<<"$controller" || fail "published continuation state is not exact"
+for required_text in \
+  'continuation_state=$(scripts/classify-release-continuation.sh \' \
+  'case "$continuation_state" in' \
+  'pending)' \
+  'published|absent)' \
+  '*)' \
+  'continuation classifier returned an invalid state'; do
+  grep -Fq -- "$required_text" <<<"$controller" ||
+    fail "continuation classifier routing misses required invariant: $required_text"
+done
+for inline_predicate in \
+  'then "pending"' 'then "published"' \
+  '.draft == true' '.draft == false' \
+  '.immutable == false' '.immutable == true' \
+  '.published_at' '[.assets[].name]'; do
+  if grep -Fq -- "$inline_predicate" <<<"$controller"; then
+    fail "controller duplicates continuation classifier predicate: $inline_predicate"
+  fi
+done
+wildcard_route=$(sed -n '/^            \*)/,/^          esac/p' <<<"$controller")
+grep -Fq 'continuation classifier returned an invalid state' <<<"$wildcard_route" ||
+  fail "continuation classifier wildcard does not report an invalid state"
+grep -Fq 'exit 1' <<<"$wildcard_route" ||
+  fail "continuation classifier wildcard does not fail closed"
 grep -Fq 'Verify canonical publication tuple' <<<"$workflow" || fail "publication tuple is not generic"
 if grep -Fq 'Verify exact v1.2.0 publication tuple' <<<"$workflow"; then fail "v1.2.0-only publication assertion remains"; fi
 grep -Fq 'gh release verify-asset <tag> <asset-path>' <<<"$runbook" || fail "runbook does not use a parameterized asset tag"

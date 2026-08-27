@@ -14,8 +14,8 @@ git -C "$REPO" add .
 git -C "$REPO" commit -qm bootstrap
 source_sha=$(git -C "$REPO" rev-parse HEAD)
 jq -n --arg source "$source_sha" '[{
-  id:120,tag_name:"v1.0.0",target_commitish:$source,draft:true,prerelease:false,
-  published_at:null,assets:[]
+  id:120,tag_name:"v1.0.0",name:"v1.0.0",target_commitish:$source,draft:true,prerelease:false,
+  immutable:false,published_at:null,assets:[]
 }]' >"$TMP/releases.json"
 jq -n '{refs:{},tags:{}}' >"$TMP/refs.json"
 if scripts/resolve-release-descriptor.sh pre-action --repo-dir "$REPO" \
@@ -25,8 +25,8 @@ if scripts/resolve-release-descriptor.sh pre-action --repo-dir "$REPO" \
   exit 1
 fi
 jq -n --arg source "$source_sha" '[{
-  id:121,tag_name:"v1.0.0",target_commitish:$source,draft:true,prerelease:false,
-  published_at:null,assets:[]
+  id:121,tag_name:"v1.0.0",name:"v1.0.0",target_commitish:$source,draft:true,prerelease:false,
+  immutable:false,published_at:null,assets:[]
 }]' >"$TMP/fresh-after.json"
 jq -n '[]' >"$TMP/fresh-before.json"
 descriptor=$(scripts/resolve-release-descriptor.sh post-action --repo-dir "$REPO" \

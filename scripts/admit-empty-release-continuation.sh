@@ -51,15 +51,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 [[ "$repository" =~ ^[^/]+/[^/]+$ ]] || usage
-[ -d "$repo_dir" ] || usage
 [ -n "$dev_ref" ] || usage
 [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || usage
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
 [ "$tag" = "v$version" ] || usage
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || usage
-[ -f "$releases_file" ] || usage
-[ -f "$registry_state_file" ] || usage
-[ -z "$refs_file" ] || [ -f "$refs_file" ] || usage
 
 [ "$release_id" != 368531227 ] || fail "permanently denied release ID"
 [ "$tag" != v1.1.0 ] || fail "permanently denied tag"
@@ -72,20 +68,18 @@ if [ "$release_id" != 377201468 ] ||
   fail "only the exact quarantined v1.3.0 draft may continue"
 fi
 
-jq -e 'type == "array" and all(.[]; type == "object")' "$releases_file" >/dev/null ||
-  fail "release snapshot is malformed"
-continuation_release=$(jq -c --argjson id 377201468 '
-  [ .[] | select(.id == $id) ] | if length == 1 then .[0] else empty end
-' "$releases_file")
-[ -n "$continuation_release" ] || fail "exact continuation release is missing or ambiguous"
-jq -e --argjson id 377201468 '
-  .id == $id and .name == "v1.3.0" and .tag_name == "v1.3.0" and
-  .target_commitish == "a7abfe04f6852f479291a4710ebdee23e9ae8a34" and
-  .draft == true and .immutable == false and .prerelease == false and
-  (.published_at // null) == null and
-  (.assets | type == "array" and length == 0)
-' <<<"$continuation_release" >/dev/null ||
-  fail "continuation release is not the exact empty v1.3.0 draft"
+[ -f "$releases_file" ] || usage
+continuation_state=$("$ROOT_DIR/scripts/classify-release-continuation.sh" \
+  --release-id 377201468 --tag v1.3.0 \
+  --source-sha a7abfe04f6852f479291a4710ebdee23e9ae8a34 \
+  --releases-file "$releases_file") ||
+  fail "continuation release classification failed"
+[ "$continuation_state" = pending ] ||
+  fail "continuation release is not pending"
+
+[ -d "$repo_dir" ] || usage
+[ -f "$registry_state_file" ] || usage
+[ -z "$refs_file" ] || [ -f "$refs_file" ] || usage
 
 source_commit=$(git -C "$repo_dir" rev-parse --verify "${source_sha}^{commit}" 2>/dev/null) ||
   fail "release source commit is unavailable"

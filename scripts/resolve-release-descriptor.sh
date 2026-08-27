@@ -167,12 +167,16 @@ resolve_ref() {
 }
 
 validate_common() {
-  local release=$1 id tag target draft prerelease published
+  local release=$1 id tag target draft immutable prerelease
   jq -e '
     type == "object" and
     (.id | type == "number" and floor == . and . > 0) and
     (.tag_name | type == "string") and (.target_commitish | type == "string") and
-    (.draft | type == "boolean") and (.prerelease | type == "boolean") and
+    (.draft | type == "boolean") and (.immutable | type == "boolean") and
+    (.prerelease | type == "boolean") and
+    has("published_at") and
+    (.published_at == null or
+      (.published_at | type == "string" and length > 0)) and
     (.assets | type == "array")
   ' <<<"$release" >/dev/null || fail "release object is malformed"
   id=$(jq -r '.id' <<<"$release")
@@ -180,17 +184,20 @@ validate_common() {
   target=$(jq -r '.target_commitish' <<<"$release")
   draft=$(jq -r '.draft' <<<"$release")
   prerelease=$(jq -r '.prerelease' <<<"$release")
-  published=$(jq -r '.published_at // "null"' <<<"$release")
+  immutable=$(jq -r '.immutable' <<<"$release")
   [ "$id" != 368531227 ] || fail "permanently denied release ID"
   [ "$tag" != v1.1.0 ] || fail "permanently denied tag"
   [ "$target" != 36ffd11ea4d35147f1df9c1cafa6a330300c1339 ] ||
     fail "permanently denied source"
   [ "$tag" = "$authority_tag" ] || fail "release tag is not current authority"
-  if [ "$published" = null ]; then
+  if jq -e '.published_at == null' <<<"$release" >/dev/null; then
     [ "$draft" = true ] || fail "unpublished release has invalid publication state"
+    [ "$immutable" = false ] || fail "unpublished release has invalid publication state"
     [ "$target" = "$authority_source" ] ||
       fail "unpublished release source is not current authority"
   else
+    [ "$draft" = false ] || fail "published release has invalid publication state"
+    [ "$immutable" = true ] || fail "published release has invalid publication state"
     [[ "$target" =~ ^[0-9a-f]{40}$ ]] ||
       fail "published release target is not a full SHA"
   fi
@@ -207,7 +214,7 @@ emit() {
     "$route" "$([ "$route" = completed ] && echo false || echo true)" "$origin" \
     "$id" "$tag" "$authority_version" "$authority_source" "$target" \
     "$(jq -r '.draft' <<<"$release")" "$(jq -r '.prerelease' <<<"$release")" \
-    "$(jq -c '.published_at // null' <<<"$release")" "$kind"
+    "$(jq -c '.published_at' <<<"$release")" "$kind"
 }
 
 releases=$(load_releases)
@@ -252,7 +259,7 @@ if [ -n "$before_file" ]; then
   ' "$before_file")
   for candidate in "${before_candidates[@]}"; do
     validate_common "$candidate"
-    if [ "$(jq -r '.published_at // "null"' <<<"$candidate")" != null ]; then
+    if [ "$(jq -r '.published_at' <<<"$candidate")" != null ]; then
       before_has_published=true
     fi
   done
@@ -272,7 +279,7 @@ case "$mode" in
         fail "post-action release is not the one new current-action release ID"
     fi
     if [ "$(jq -r '.draft' <<<"$candidate")" = true ] &&
-       [ "$(jq -r '.published_at // "null"' <<<"$candidate")" = null ]; then
+       [ "$(jq -r '.published_at' <<<"$candidate")" = null ]; then
       fail "pre-existing current draft is stale; only a current-action fresh draft may materialize"
     else
       printf 'route=action\nactive=false\norigin=pre_action_published\nrelease_id=\ntag=%s\nversion=%s\nsource_sha=%s\n' \
@@ -287,7 +294,7 @@ case "$mode" in
       [ "${#candidates[@]}" -eq 0 ] || [ "${#candidates[@]}" -eq 1 ] ||
         fail "release_created=false produced ambiguous current release set"
       if [ "${#candidates[@]}" -eq 1 ] &&
-         [ "$(jq -r '.published_at // "null"' <<<"${candidates[0]}")" = null ]; then
+         [ "$(jq -r '.published_at' <<<"${candidates[0]}")" = null ]; then
         fail "release_created=false cannot adopt an unpublished current draft"
       fi
     fi
@@ -308,11 +315,11 @@ case "$mode" in
     }
     candidate=${candidates[0]}
     if [ "$release_created" = false ]; then
-      [ "$(jq -r '.published_at // "null"' <<<"$candidate")" != null ] ||
+      [ "$(jq -r '.published_at' <<<"$candidate")" != null ] ||
         fail "release_created=false left an unpublished current release"
       [ "$allow_completed" = true ] || fail "published result requires completed admission"
       emit completed "$candidate" post_action
-    elif [ "$(jq -r '.published_at // "null"' <<<"$candidate")" != null ]; then
+    elif [ "$(jq -r '.published_at' <<<"$candidate")" != null ]; then
       [ "$allow_completed" = true ] || fail "published result requires completed admission"
       emit completed "$candidate" post_action
     else
@@ -325,9 +332,18 @@ case "$mode" in
     [ "$expected_tag" = "$authority_tag" ] || fail "wrong explicit tag"
     [ "$expected_version" = "$authority_version" ] || fail "wrong version"
     [ "$expected_source" = "$authority_source" ] || fail "wrong source"
-    candidate=$(jq -c --argjson id "$expected_id" '.[] | select(.id == $id)' <<<"$releases")
-    [ -n "$candidate" ] || fail "numeric release was not found"
-    validate_common "$candidate"
+    [ "${#candidates[@]}" -eq 1 ] ||
+      fail "verification requires exactly one current release"
+    candidate=${candidates[0]}
+    [ "$(jq -r '.id' <<<"$candidate")" = "$expected_id" ] ||
+      fail "current release ID does not match expected release ID"
+    jq -e '
+      .draft == true and
+      .immutable == false and
+      has("published_at") and
+      .published_at == null
+    ' <<<"$candidate" >/dev/null ||
+      fail "verification requires a mutable unpublished draft"
     asset_count=$(jq '.assets | length' <<<"$candidate")
     case "$phase" in
       empty) [ "$asset_count" -eq 0 ] || fail "asset phase does not match" ;;
