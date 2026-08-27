@@ -76,6 +76,12 @@ for path in "${remote_executables[@]}"; do
   require_workflow_reference "$path"
 done
 
+for path in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+  scripts/run-beta-recovery-restore.sh scripts/probe-test-vps-recovery-runtime.sh \
+  scripts/build-beta-recovery-evidence.sh scripts/beta-recovery-media-proof.sh; do
+  require_workflow_reference "$path"
+done
+
 # The always-run incident path is an authorization-failure fixture: it must
 # produce a closed-schema, sanitized artifact before upload selection, while
 # proving that no writer marker was created.

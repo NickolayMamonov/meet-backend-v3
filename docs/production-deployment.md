@@ -262,7 +262,9 @@ scripts/production-compose.sh exec postgres sh -c \
 ```
 
 Set `DB_PASSWORD` to that same value in `.env.production` without changing its
-mode or any release field. The wrapper clears every exported `DB_*` and
+mode or any release field. The one-shot closed-beta backup/restore proof is
+documented in `docs/operations/closed-beta-backup-restore.md`; it is not
+recurring backup automation or an ongoing RPO guarantee. The wrapper clears every exported `DB_*` and
 `COMPOSE_*` shell override, then recreates only the backend from the single
 production env source:
 

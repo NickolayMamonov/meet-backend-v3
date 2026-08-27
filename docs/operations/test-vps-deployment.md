@@ -175,6 +175,11 @@ safe success booleans and status categories.
 
 ## Closed-beta promotion from `dev`
 
+The recovery drill may use the existing `.deploy.lock` only during its bounded
+snapshot and runtime-recovery section. It does not change this deployment
+mutator; see `closed-beta-backup-restore.md` for capture-local interruption
+reconciliation and superseded-runtime handling.
+
 The closed-beta promotion workflow is registered on `master` only so GitHub
 can discover it, but it must be dispatched explicitly with
 `gh workflow run promote-dev-digest-to-test-vps.yml --ref dev -f source_sha=<40-hex-dev-sha>`.
