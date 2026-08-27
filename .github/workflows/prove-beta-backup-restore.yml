@@ -363,8 +363,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          df -Pk "$RUNNER_TEMP"
-          docker info --format '{{.DockerRootDir}}'
+          scripts/run-beta-recovery-restore.sh \
+            --capacity-only --artifact-dir "$RUNNER_TEMP/artifact" \
+            --recovery-id "${{ inputs.recovery_id }}" --output-dir "$RUNNER_TEMP/restore-output" \
+            --sql-proof scripts/beta-recovery-database-proof.sql \
+            --media-script scripts/beta-recovery-media-proof.sh \
+            --database-proof "$RUNNER_TEMP/artifact/database-proof.json" \
+            --media-proof "$RUNNER_TEMP/artifact/media-proof.json" \
+            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
+            --tooling-digest "$(jq -er '.toolingDigest' "$RUNNER_TEMP/beta-recovery-authorization.json")" \
+            --workflow-digest "$(jq -er '.workflowDigest' "$RUNNER_TEMP/beta-recovery-authorization.json")" \
+            --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
+            --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')"
       - name: Revalidate source immediately before identity access
         shell: bash
         env:
@@ -419,7 +429,12 @@ jobs:
             --media-script scripts/beta-recovery-media-proof.sh \
             --database-proof "$expected_proofs/database-proof.json" \
             --media-proof "$expected_proofs/media-proof.json" \
-            --temp-root "$restore_temp"
+            --temp-root "$restore_temp" \
+            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
+            --tooling-digest "$(jq -er '.toolingDigest' "$RUNNER_TEMP/beta-recovery-authorization.json")" \
+            --workflow-digest "$(jq -er '.workflowDigest' "$RUNNER_TEMP/beta-recovery-authorization.json")" \
+            --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
+            --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')"
           restore_status=$?
           set -e
           kill "$watcher" 2>/dev/null || true

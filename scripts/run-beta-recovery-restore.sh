@@ -149,7 +149,7 @@ fi
 
 image=${POSTGRES_IMAGE:-postgres:16-alpine@sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2}
 artifact='' id='' output='' identity='' temp=${RUNNER_TEMP:-/tmp}/beta-recovery docker_root=/var/lib/docker
-sql='' media='' expected_db='' expected_media='' source_sha='' repository='' tooling='' workflow='' database_digest='' media_digest=''
+sql='' media='' expected_db='' expected_media='' source_sha='' repository='' tooling='' workflow='' database_digest='' media_digest='' capacity_only=false
 while [ "$#" -gt 0 ]; do case "$1" in
   --artifact-dir) artifact=$2; shift 2;; --recovery-id) id=$2; shift 2;; --output-dir) output=$2; shift 2;;
   --identity) identity=$2; shift 2;; --image) image=$2; shift 2;; --temp-root) temp=$2; shift 2;;
@@ -157,6 +157,7 @@ while [ "$#" -gt 0 ]; do case "$1" in
   --database-proof) expected_db=$2; shift 2;; --media-proof) expected_media=$2; shift 2;;
   --source-sha) source_sha=$2; shift 2;; --repository) repository=$2; shift 2;; --tooling-digest) tooling=$2; shift 2;;
   --workflow-digest) workflow=$2; shift 2;; --database-digest) database_digest=$2; shift 2;; --media-digest) media_digest=$2; shift 2;;
+  --capacity-only) capacity_only=true; shift ;;
   *) usage;;
 esac; done
 [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || usage
@@ -167,6 +168,21 @@ for value in "$tooling" "$workflow" "$database_digest" "$media_digest"; do [[ "$
 regular "$sql" || fail "database proof SQL unavailable"; regular "$media" || fail "media proof script unavailable"; [ -x "$media" ] || fail "media proof script is not executable"
 [[ "$image" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || fail "PostgreSQL image must be pinned by digest"
 for tool in age docker df find jq sha256sum tar; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
+actual_database_digest=$(sha256sum "$sql" | awk '{print $1}')
+actual_media_digest=$(sha256sum "$media" | awk '{print $1}')
+[ "$actual_database_digest" = "$database_digest" ] || fail "database proof contract digest differs"
+[ "$actual_media_digest" = "$media_digest" ] || fail "media proof contract digest differs"
+workflow_file=.github/workflows/prove-beta-backup-restore.yml
+[ -f "$workflow_file" ] || fail "workflow contract file is unavailable"
+[ "$(sha256sum "$workflow_file" | awk '{print $1}')" = "$workflow" ] ||
+  fail "workflow contract digest differs"
+actual_tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+  scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
+  scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
+  scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh; do
+  sha256sum "$file"
+done | sort | sha256sum | awk '{print $1}')
+[ "$actual_tooling" = "$tooling" ] || fail "tooling contract digest differs"
 for file in capture-runtime.json database-proof.json media-proof.json postgres.dump.age uploads.tar.gz.age recovery-point.json; do regular "$artifact/$file" || fail "artifact file missing: $file"; done
 [ "$(find "$artifact" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" = '' ] || fail "artifact contains a non-file entry"
 [ "$(find "$artifact" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" = 6 ] || fail "artifact shape is not exact"
@@ -211,6 +227,9 @@ tempdf=$(df -Pk -- "$temp" | awk 'NR==2{print $1 "\t" $4}')
 docker_capacity=$(df -Pk -- "$docker_root" | awk 'NR==2{print $1 "\t" $4}') || fail "Docker capacity is unknown"
 td=${tempdf%%$'\t'*}; tf=$(mul_small "${tempdf#*$'\t'}" 1024); dd=${docker_capacity%%$'\t'*}; dfree=$(mul_small "${docker_capacity#*$'\t'}" 1024)
 if [ "$td" = "$dd" ]; then shared=$(add "$temp_required" "$docker_required"); capacity_ok "$tf" "$shared" || fail "shared-device capacity gate failed (20 percent margin included)"; else capacity_ok "$tf" "$temp_required" || fail "temporary capacity gate failed (20 percent margin included)"; capacity_ok "$dfree" "$docker_required" || fail "Docker capacity gate failed (20 percent margin included)"; fi
+if [ "$capacity_only" = true ]; then
+  exit 0
+fi
 regular "$identity" || fail "age identity unavailable"
 private=$temp/private-$id; [ ! -e "$private" ] || fail "private restore directory already exists"; mkdir -- "$private"; chmod 700 "$private"
 db_dump=$private/postgres.dump; uploads_archive=$private/uploads.tar.gz; marker=$temp/volume.identity; [ ! -e "$marker" ] || fail "volume identity path is already in use"

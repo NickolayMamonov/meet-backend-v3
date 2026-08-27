@@ -13,7 +13,7 @@ restart_current() {
     local health
     health=$(docker inspect "$container" --format \
       '{{if .State.Health}}{{.State.Health.Status}}{{else}}unknown{{end}}')
-    [ "$health" = healthy ] && return 0
+    [ "$health" = healthy ] || [ "$health" = running ] && return 0
     sleep 2
   done
   return 1
@@ -143,6 +143,9 @@ upload_mount=$(docker inspect "$backend" --format \
 [ "$upload_mount" = "volume|meet-production_uploads_data" ] || exit 1
 docker stop --time 30 "$backend" >/dev/null
 trap 'restart_current "$backend"' EXIT
+validate_upload_archive meet-production_uploads_data \
+  "$(docker inspect "$backend" --format '{{.Image}}')" \
+  "$BACKUP_DIR/.archive.list" "$BACKUP_DIR/.archive.types"
 "${COMPOSE[@]}" exec -T postgres sh -c \
   'pg_dump --format=custom -U "$POSTGRES_USER" -d "$POSTGRES_DB"' |
   age -r "$AGE_RECIPIENT" -o "$db_backup"
