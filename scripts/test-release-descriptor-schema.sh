@@ -31,6 +31,7 @@ jq -n --arg source "$source_sha" '[{
 jq -n '[]' >"$TMP/fresh-before.json"
 descriptor=$(scripts/resolve-release-descriptor.sh post-action --repo-dir "$REPO" \
   --dev-ref HEAD --tag v1.0.0 --version 1.0.0 --source-sha "$source_sha" \
+  --refs-file "$TMP/refs.json" \
   --before-releases-file "$TMP/fresh-before.json" \
   --after-releases-file "$TMP/fresh-after.json" --release-created true)
 grep -Fx 'route=materialize' <<<"$descriptor"
