@@ -16,6 +16,11 @@ with the repository release concurrency group, `queue: max`, and
 release-ID set before and after Release Please. Only one positive numeric ID
 newly admitted by that invocation can be materialized.
 
+Each before/after release inventory is fetched across all API pages, normalized
+from the paginated response into one release list, and schema-validated before
+routing or set comparison. An empty inventory normalizes to `[]`; malformed
+page or release shapes fail closed.
+
 The permanent no-touch tuple is release ID `368531227`, version `1.1.0`,
 tag `v1.1.0`, its four assets, absent ref, package aliases, and attestation
 state. The durable
@@ -113,9 +118,10 @@ order:
 The final release PATCH is publish-last. Before release assets are uploaded,
 the workflow creates and verifies a GitHub workflow artifact attestation for
 the generated image-index evidence, and records `artifactAttestation:true` in
-the manifest only after that gate succeeds. Immediately before the first
-image push and each later writer, the job re-fetches policy and the live
-numeric release. Immediately before the final PATCH, it also proves
+the manifest only after that gate succeeds. The current tag ref must be absent
+before the first writer is admitted. Immediately before the first image push
+and each later writer, the job re-fetches policy and the live numeric release.
+Immediately before the final PATCH, it again proves
 `refs/tags/v1.1.0` and `refs/tags/$TAG` are absent and applies the shared
 permanent deny policy. No shell command or writer intervenes between the final
 guard and PATCH.
@@ -124,7 +130,10 @@ After PATCH, repository-owned release/ref/package/asset/attestation writers
 are forbidden. GitHub's server-side automatic immutable-release attestation
 created as the expected consequence of PATCH is allowed and is consumed
 read-only. The workflow-created artifact attestation is strictly pre-PATCH;
-the workflow does not create a post-PATCH attestation.
+the workflow does not create a post-PATCH attestation. After the single final
+PATCH, only bounded read-only observation may wait for `immutable=true` and
+the automatic attestation to become visible. Exhausting that bound fails the
+run without retrying PATCH or invoking another writer.
 
 ## Immutable proof
 

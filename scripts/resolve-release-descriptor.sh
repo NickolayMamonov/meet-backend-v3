@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 fail() { echo "release descriptor resolution failed: $*" >&2; exit 1; }
 usage() {
   cat >&2 <<'EOF'
@@ -105,7 +106,7 @@ load_releases() {
   [ -n "$repository" ] || fail "repository is required for live reads"
   command -v gh >/dev/null 2>&1 || fail "gh is required for live reads"
   gh api --paginate --slurp "repos/$repository/releases?per_page=100" |
-    jq -c 'add // []'
+    "$ROOT_DIR/scripts/normalize-release-pages.sh"
 }
 
 relevant_ids() {
@@ -323,6 +324,8 @@ case "$mode" in
       [ "$allow_completed" = true ] || fail "published result requires completed admission"
       emit completed "$candidate" post_action
     else
+      [ "$(resolve_ref "$authority_tag")" = absent ] ||
+        fail "fresh unpublished release already has an authority tag ref"
       emit materialize "$candidate" post_action
     fi
     ;;

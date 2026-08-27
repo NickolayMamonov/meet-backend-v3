@@ -65,11 +65,30 @@ jq -n '[]' >"$TMP/fresh-before.json"
 assert_output 'route=materialize' post-action --repo-dir "$REPO" \
   --dev-ref HEAD --tag v1.0.0 --version 1.0.0 --source-sha "$SOURCE" \
   --before-releases-file "$TMP/fresh-before.json" \
-  --after-releases-file "$TMP/fresh-after.json" --release-created true
+  --after-releases-file "$TMP/fresh-after.json" --release-created true \
+  --refs-file "$TMP/refs.json"
 assert_output 'release_id=121' post-action --repo-dir "$REPO" \
   --dev-ref HEAD --tag v1.0.0 --version 1.0.0 --source-sha "$SOURCE" \
   --before-releases-file "$TMP/fresh-before.json" \
-  --after-releases-file "$TMP/fresh-after.json" --release-created true
+  --after-releases-file "$TMP/fresh-after.json" --release-created true \
+  --refs-file "$TMP/refs.json"
+
+jq -n --arg source "$SOURCE" '{
+  refs:{"v1.0.0":{type:"commit",sha:$source}},
+  tags:{}
+}' >"$TMP/refs-present.json"
+if "$RESOLVER" post-action --repo-dir "$REPO" \
+  --dev-ref HEAD --tag v1.0.0 --version 1.0.0 --source-sha "$SOURCE" \
+  --before-releases-file "$TMP/fresh-before.json" \
+  --after-releases-file "$TMP/fresh-after.json" --release-created true \
+  --refs-file "$TMP/refs-present.json" \
+  >"$TMP/ref-present.out" 2>"$TMP/ref-present.err"; then
+  echo "fresh unpublished release with an existing authority tag ref was incorrectly materialized" >&2
+  exit 1
+fi
+grep -Fx \
+  'release descriptor resolution failed: fresh unpublished release already has an authority tag ref' \
+  "$TMP/ref-present.err"
 
 jq -n --arg source "$SOURCE" '[{
   id:122,name:"v1.0.0",tag_name:"v1.0.0",target_commitish:$source,draft:false,immutable:true,prerelease:false,

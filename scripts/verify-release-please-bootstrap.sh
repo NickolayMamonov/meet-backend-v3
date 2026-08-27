@@ -36,6 +36,8 @@ required=(
   scripts/test-classify-release-continuation.sh
   scripts/normalize-release-please-action-output.sh
   scripts/test-release-please-action-output.sh
+  scripts/normalize-release-pages.sh
+  scripts/test-release-page-normalization.sh
   scripts/admit-empty-release-continuation.sh
   scripts/test-empty-release-continuation.sh
   scripts/test-release-publish-tooling-routing.sh
@@ -96,6 +98,7 @@ for required_text in \
   'release_version: ${{ steps.route.outputs.version }}' \
   'Checkout reviewed publication tooling' \
   'Set up attestation-capable Buildx' \
+  'scripts/normalize-release-pages.sh' \
   '--build-arg "BACKEND_REVISION=$SOURCE_SHA" source' \
   'cd "$RUNNER_TEMP/release-assets"' \
   'sha256sum -c SHA256SUMS >/dev/null' \
@@ -104,6 +107,9 @@ for required_text in \
   grep -Fq -- "$required_text" <<<"$workflow" ||
     fail "workflow misses required invariant: $required_text"
 done
+if grep -Fq "jq -c 'add // []'" <<<"$workflow"; then
+  fail "workflow release-list paths bypass normalize-release-pages.sh"
+fi
 controller=$(sed -n '/^  controller:/,/^  gates:/p' <<<"$workflow")
 grep -Fq '      packages: read' <<<"$controller" ||
   fail "controller does not grant packages: read"

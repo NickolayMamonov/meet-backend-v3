@@ -74,10 +74,11 @@ if grep -Eq '^[[:space:]]+(if|elif|while|until)[[:space:]]' \
   echo "continuation classifier call must be unconditional" >&2
   exit 1
 fi
-if [ "$(grep -Fc 'jq ' <<<"$pre_action_step")" -ne 1 ] ||
+if grep -Fq 'jq ' <<<"$pre_action_step" ||
    grep -Fq 'continuation_count' <<<"$pre_action_step" ||
-   grep -Fq -- '--argjson id' <<<"$pre_action_step"; then
-  echo "controller contains manual continuation jq/count state logic" >&2
+   grep -Fq -- '--argjson id' <<<"$pre_action_step" ||
+   [ "$(grep -Fc 'scripts/normalize-release-pages.sh' <<<"$pre_action_step")" -ne 1 ]; then
+  echo "controller must normalize release pages exactly once without manual continuation jq/count state logic" >&2
   exit 1
 fi
 grep -Fq 'continuation classifier returned an invalid state' <<<"$pre_action_step"

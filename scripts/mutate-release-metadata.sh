@@ -95,6 +95,44 @@ validate_release() {
   done
 }
 
+validate_published_release() {
+  local release=$1 asset expected_sha expected_size
+  jq -e --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" '
+    type == "object" and
+    .id == $id and .name == $tag and .tag_name == $tag and
+    .target_commitish == $source and
+    .draft == false and .prerelease == false and
+    has("published_at") and
+    (.published_at | type == "string" and length > 0) and
+    has("immutable") and (.immutable | type == "boolean") and
+    (.assets | type == "array" and length == 4) and
+    ([.assets[].name] | sort) ==
+      ["SHA256SUMS","image-index.json","image-inspect.txt","release-manifest.json"] and
+    ([.assets[].id] | unique | length == 4) and
+    all(.assets[];
+      type == "object" and
+      (.id | type == "number" and floor == . and . > 0) and
+      (.name | type == "string") and
+      .state == "uploaded" and
+      (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.size | type == "number" and floor == . and . > 0)
+    )
+  ' <<<"$release" >/dev/null ||
+    fail "published release observation failed its postcondition"
+  for asset in "${assets[@]}"; do
+    expected_sha=$(sha256sum "$assets_dir/$asset" | awk '{print $1}')
+    expected_size=$(wc -c <"$assets_dir/$asset" | tr -d '[:space:]')
+    jq -e --arg name "$asset" --arg digest "sha256:$expected_sha" \
+      --argjson size "$expected_size" '
+      [.assets[] | select(.name == $name)] | length == 1 and
+      .[0].digest == $digest and .[0].state == "uploaded" and
+      .[0].size == $size
+    ' <<<"$release" >/dev/null ||
+      fail "published release observation does not match local bytes: $asset"
+  done
+  observed_immutable=$(jq -r '.immutable' <<<"$release")
+}
+
 if [ -n "$release_file" ]; then
   before=$(jq -c . "$release_file") || fail "release fixture is malformed"
 else
@@ -148,38 +186,23 @@ else
   validate_release "$before"
   after=$(gh api --method PATCH "repos/$repository/releases/$release_id" --input "$payload") ||
     fail "release publication PATCH failed"
-  jq -e --argjson id "$release_id" --arg tag "$tag" --arg source "$source_sha" '
-    type == "object" and
-    .id == $id and .name == $tag and .tag_name == $tag and
-    .target_commitish == $source and
-    .draft == false and .prerelease == false and
-    has("published_at") and
-    (.published_at | type == "string" and length > 0) and
-    (.assets | type == "array" and length == 4) and
-    ([.assets[].name] | sort) ==
-      ["SHA256SUMS","image-index.json","image-inspect.txt","release-manifest.json"] and
-    ([.assets[].id] | unique | length == 4) and
-    all(.assets[];
-      type == "object" and
-      (.id | type == "number" and floor == . and . > 0) and
-      (.name | type == "string") and
-      .state == "uploaded" and
-      (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
-      (.size | type == "number" and floor == . and . > 0)
-    )
-  ' <<<"$after" >/dev/null ||
-    fail "release publication response failed its postcondition"
-  for asset in "${assets[@]}"; do
-    expected_sha=$(sha256sum "$assets_dir/$asset" | awk '{print $1}')
-    expected_size=$(wc -c <"$assets_dir/$asset" | tr -d '[:space:]')
-    jq -e --arg name "$asset" --arg digest "sha256:$expected_sha" \
-      --argjson size "$expected_size" '
-      [.assets[] | select(.name == $name)] | length == 1 and
-      .[0].digest == $digest and .[0].state == "uploaded" and
-      .[0].size == $size
-    ' <<<"$after" >/dev/null ||
-      fail "release publication response does not match local bytes: $asset"
-  done
+  validate_published_release "$after"
+  immutable_poll_attempts=5
+  immutable_poll_delay_seconds=2
+  if [ "$observed_immutable" = false ]; then
+    for ((attempt = 1; attempt <= immutable_poll_attempts; attempt++)); do
+      observation=$(gh api --method GET \
+        "repos/$repository/releases/$release_id") ||
+        fail "immutable release observation failed"
+      validate_published_release "$observation"
+      [ "$observed_immutable" = true ] && break
+      if [ "$attempt" -lt "$immutable_poll_attempts" ]; then
+        sleep "$immutable_poll_delay_seconds"
+      fi
+    done
+  fi
+  [ "$observed_immutable" = true ] ||
+    fail "release did not become immutable within the observation bound"
 fi
 echo "mutation=verified"
 echo "operation=publish"

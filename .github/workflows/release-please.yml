@@ -95,7 +95,7 @@ jobs:
           set -euo pipefail
           releases_before="$RUNNER_TEMP/release-relevant-before.json"
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
-            jq -c 'add // []' >"$releases_before"
+            scripts/normalize-release-pages.sh >"$releases_before"
           printf 'RELEASES_BEFORE_FILE=%s\n' "$releases_before" >>"$GITHUB_ENV"
           continuation_id=377201468
           continuation_tag=v1.3.0
@@ -196,7 +196,7 @@ jobs:
             true)
               releases_after="$RUNNER_TEMP/release-relevant-after.json"
               gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
-                jq -c 'add // []' >"$releases_after"
+                scripts/normalize-release-pages.sh >"$releases_after"
               descriptor=$(scripts/resolve-release-descriptor.sh post-action \
                 --repository "$GITHUB_REPOSITORY" --dev-ref origin/dev \
                 --tag "$RELEASE_TAG" --version "$RELEASE_VERSION" \
@@ -208,7 +208,7 @@ jobs:
             false)
               releases_after="$RUNNER_TEMP/release-relevant-after.json"
               gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
-                jq -c 'add // []' >"$releases_after"
+                scripts/normalize-release-pages.sh >"$releases_after"
               descriptor=$(scripts/resolve-release-descriptor.sh post-action \
                 --repository "$GITHUB_REPOSITORY" --dev-ref origin/dev \
                 --tag "$PRE_TAG" --version "$PRE_VERSION" \
@@ -345,6 +345,9 @@ jobs:
             --expected-route materialize --phase empty \
             --policy-token-file "$RUNNER_TEMP/reader-token" \
             --credential-proof "$RUNNER_TEMP/reader-proof.json"
+          scripts/verify-release-tag-ref.sh \
+            --repository "$GITHUB_REPOSITORY" --tag "$TAG" \
+            --source-sha "$SOURCE_SHA" --expect-absent
 
       - name: Build exact image
         run: |

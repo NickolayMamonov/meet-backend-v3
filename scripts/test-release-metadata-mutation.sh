@@ -54,14 +54,27 @@ assets_dir=${GH_FIXTURE_ASSETS:?}
 [ "${1:-}" = api ] || exit 90
 shift
 if [ "${1:-}" = --method ]; then
-  [ "${2:-}" = PATCH ] || exit 91
-  [ "${3:-}" = "repos/FixtureOwner/repo/releases/120" ] || exit 92
-  [ "${4:-}" = --input ] || exit 93
-  [ -s "${5:-}" ] || exit 94
-  printf 'patch\n' >>"$log"
-  jq '.draft = false | .immutable = false |
-      .published_at = "2026-08-26T12:00:00Z"' "$state"
-  exit 0
+  method=${2:-}
+  shift 2
+  if [ "$method" = PATCH ]; then
+    [ "${1:-}" = "repos/FixtureOwner/repo/releases/120" ] || exit 92
+    [ "${2:-}" = --input ] || exit 93
+    [ -s "${3:-}" ] || exit 94
+    printf 'patch\n' >>"$log"
+    case "${GH_FIXTURE_POST_PATCH:-success}" in
+      patch-malformed) printf '{\n' ;;
+      patch-missing) jq '.draft = false | del(.immutable) |
+          .published_at = "2026-08-26T12:00:00Z"' "$state" ;;
+      patch-string) jq '.draft = false | .immutable = "false" |
+          .published_at = "2026-08-26T12:00:00Z"' "$state" ;;
+      patch-divergent) jq '.draft = false | .immutable = false | .name = "renamed" |
+          .published_at = "2026-08-26T12:00:00Z"' "$state" ;;
+      *) jq '.draft = false | .immutable = false |
+          .published_at = "2026-08-26T12:00:00Z"' "$state" ;;
+    esac
+    exit 0
+  fi
+  [ "$method" = GET ] || exit 91
 fi
 endpoint=${1:-}
 case "$endpoint" in
@@ -70,7 +83,23 @@ case "$endpoint" in
     count=$((count + 1))
     printf '%s\n' "$count" >"$count_file"
     printf 'get-release %s\n' "$count" >>"$log"
-    if [ "$count" -eq 2 ] && [ -n "${GH_FIXTURE_RACE:-}" ]; then
+    if [ "$count" -ge 3 ]; then
+      case "${GH_FIXTURE_POST_PATCH:-success}" in
+        get-malformed) printf '{\n' ;;
+        success) jq '.draft = false | .immutable = true |
+            .published_at = "2026-08-26T12:00:00Z"' "$state" ;;
+        get-missing) jq '.draft = false | del(.immutable) |
+            .published_at = "2026-08-26T12:00:00Z"' "$state" ;;
+        get-string) jq '.draft = false | .immutable = "true" |
+            .published_at = "2026-08-26T12:00:00Z"' "$state" ;;
+        get-divergent) jq '.draft = false | .immutable = false | .tag_name = "v9.9.9" |
+            .published_at = "2026-08-26T12:00:00Z"' "$state" ;;
+        exhaustion) jq '.draft = false | .immutable = false |
+            .published_at = "2026-08-26T12:00:00Z"' "$state" ;;
+        patch-*) exit 97 ;;
+        *) exit 95 ;;
+      esac
+    elif [ "$count" -eq 2 ] && [ -n "${GH_FIXTURE_RACE:-}" ]; then
       case "$GH_FIXTURE_RACE" in
         renamed) jq '.name = "renamed"' "$state" ;;
         immutable) jq '.immutable = true' "$state" ;;
@@ -107,6 +136,12 @@ case "$endpoint" in
   *) exit 96 ;;
 esac
 EOF
+cat >"$TMP/bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$#" -eq 1 ] && [ "$1" = 2 ] || exit 98
+printf 'sleep %s\n' "$1" >>"${GH_FIXTURE_LOG:?}"
+EOF
 cat >"$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -120,7 +155,7 @@ done
 printf '{"enabled":true}\n' >"$output"
 printf '200'
 EOF
-chmod +x "$TMP/bin/gh" "$TMP/bin/curl"
+chmod +x "$TMP/bin/gh" "$TMP/bin/sleep" "$TMP/bin/curl"
 export PATH="$TMP/bin:$PATH"
 export GH_FIXTURE_STATE="$TMP/release.json"
 export GH_FIXTURE_LOG="$TMP/gh.log"
@@ -148,6 +183,30 @@ reject_race() {
   fi
 }
 
+assert_single_patch() {
+  local case_name=$1
+  [ "$(grep -c '^patch$' "$TMP/gh.log")" -eq 1 ] || {
+    echo "$case_name did not perform exactly one PATCH" >&2
+    exit 1
+  }
+}
+reject_post_patch() {
+  local fixture=$1 expected_gets=$2 expected_sleeps=$3
+  reset_release
+  if GH_FIXTURE_POST_PATCH="$fixture" publish >/dev/null 2>&1; then
+    echo "metadata mutation accepted the $fixture post-PATCH observation" >&2
+    exit 1
+  fi
+  assert_single_patch "$fixture"
+  [ "$(grep -c '^get-release ' "$TMP/gh.log")" -eq "$expected_gets" ] || {
+    echo "$fixture did not fail at the expected observation" >&2
+    exit 1
+  }
+  [ "$(grep -c '^sleep 2$' "$TMP/gh.log" || true)" -eq "$expected_sleeps" ] || {
+    echo "$fixture did not stop polling immediately" >&2
+    exit 1
+  }
+}
 if "$ROOT_DIR/scripts/mutate-release-metadata.sh" canonicalize \
   --repository "$repository" --release-id "$release_id" --version "$version" \
   --tag "$tag" --source-sha "$source_sha" >/dev/null 2>&1; then
@@ -176,12 +235,23 @@ reset_release
 publication=$(publish)
 grep -Fx 'mutation=verified' <<<"$publication" >/dev/null
 grep -Fx 'operation=publish' <<<"$publication" >/dev/null
-[ "$(grep -c '^get-release ' "$TMP/gh.log")" -eq 2 ]
-[ "$(grep -c '^patch$' "$TMP/gh.log")" -eq 1 ]
-[ "$(tail -n 2 "$TMP/gh.log")" = $'get-release 2\npatch' ] || {
-  echo "final release binding was not immediately before PATCH" >&2
+[ "$(grep -c '^get-release ' "$TMP/gh.log")" -eq 3 ]
+assert_single_patch success
+[ "$(grep -c '^sleep ' "$TMP/gh.log" || true)" -eq 0 ]
+[ "$(tail -n 3 "$TMP/gh.log")" = $'get-release 2\npatch\nget-release 3' ] || {
+  echo "false PATCH response was not followed by one read-only GET observation" >&2
   exit 1
 }
+
+reject_post_patch patch-malformed 2 0
+reject_post_patch patch-missing 2 0
+reject_post_patch patch-string 2 0
+reject_post_patch patch-divergent 2 0
+reject_post_patch get-malformed 3 0
+reject_post_patch get-missing 3 0
+reject_post_patch get-string 3 0
+reject_post_patch get-divergent 3 0
+reject_post_patch exhaustion 7 4
 
 reject_race renamed
 reject_race immutable
@@ -216,4 +286,4 @@ if publish >/dev/null 2>&1; then
 fi
 [ ! -s "$TMP/gh.log" ]
 
-echo "publish-only metadata mutation fixtures passed: final asset binding and race rejection"
+echo "publish-only metadata mutation fixtures passed: bounded immutable observation, final asset binding, and race rejection"
