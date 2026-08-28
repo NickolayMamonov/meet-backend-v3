@@ -38,7 +38,7 @@ bech32_feed(){
   done
 }
 validate_age_recipient(){
-  local recipient=${1:-} char i
+  local recipient=${1:-} i
   [[ "$recipient" =~ ^age1[0-9a-z]{58}$ ]] || fail "age recipient malformed"
   bech32_checksum=1
   bech32_generator=(0x3b6a57b2 0x26508e6d 0x1ea119fa 0x3d4233dd 0x2a1462b3)
