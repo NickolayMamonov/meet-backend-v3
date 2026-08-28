@@ -94,10 +94,18 @@ fi
 
 run_restore_fixture() {
   local name=$1 expected_status=$2 mount_mode=${3:-valid} behavior=${4:-normal}
+  local identity_kind=${5:-valid} identity_mode=${6:-600}
   local case_dir=$fixture/$name
   local hash tooling workflow_digest database_digest media_digest
   mkdir -p "$case_dir/artifact" "$case_dir/output" "$case_dir/docker-root" "$case_dir/docker-state" "$case_dir/temp"
-  printf identity >"$case_dir/identity"
+  case "$identity_kind" in
+    missing) ;;
+    empty) : >"$case_dir/identity" ;;
+    newline-empty) printf '\n\n' >"$case_dir/identity" ;;
+    malformed) printf malformed >"$case_dir/identity" ;;
+    wrong) printf wrong-identity >"$case_dir/identity" ;;
+    *) printf identity >"$case_dir/identity" ;;
+  esac
   printf 'database\n' >"$case_dir/database.dump"
   tar --create --gzip --file "$case_dir/uploads.tar.gz" --directory "$fixture/valid" .
   printf encrypted >"$case_dir/artifact/postgres.dump.age"
@@ -116,7 +124,8 @@ run_restore_fixture() {
   tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
     scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
     scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
-    scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh; do
+    scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
+    scripts/install-beta-recovery-age.sh; do
     sha256sum "$file"
   done | sort | sha256sum | awk '{print $1}')
   workflow_digest=$(sha256sum .github/workflows/prove-beta-backup-restore.yml | awk '{print $1}')
@@ -145,15 +154,21 @@ run_restore_fixture() {
   mkdir -p "$case_dir/bin"
   ln -- "$root/scripts/fixtures/beta-recovery/fake-docker.sh" "$case_dir/bin/docker"
   ln -- "$root/scripts/fixtures/beta-recovery/fake-age.sh" "$case_dir/bin/age"
-  chmod 700 "$case_dir/bin/docker" "$case_dir/bin/age"
+  ln -- "$root/scripts/fixtures/beta-recovery/fake-age.sh" "$case_dir/bin/age-keygen"
+  ln -- "$root/scripts/fixtures/beta-recovery/fake-stat.sh" "$case_dir/bin/stat"
+  chmod 700 "$case_dir/bin/docker" "$case_dir/bin/age" "$case_dir/bin/age-keygen" "$case_dir/bin/stat"
   export FAKE_DOCKER_STATE="$case_dir/docker-state"
   export FAKE_DOCKER_ROOT="$case_dir/docker-root"
   export FAKE_RECOVERY_ID=recovery-fixture
   export FAKE_DOCKER_MOUNT_MODE="$mount_mode"
+  export FAKE_RECOVERY_EVENT_LOG="$case_dir/events.log"
+  export FAKE_IDENTITY_MODE="$identity_mode"
   export FAKE_MEDIA_REFERENCE=avatars/file
   unset FAKE_DOCKER_FAIL_RESTORE FAKE_DOCKER_FAIL_CONTAINER_RM_ONCE
   unset FAKE_DOCKER_FAIL_VOLUME_RM_ONCE FAKE_DOCKER_FAIL_VOLUME_RM
   unset FAKE_DOCKER_PRESERVE_VOLUME FAKE_DOCKER_INTERRUPT_AFTER_CREATE
+  unset FAKE_AGE_FAIL_UPLOADS AGE_IDENTITY
+  if [ "$identity_kind" = environment ]; then export AGE_IDENTITY=unexpected; fi
   if [ "$behavior" = restore-failure ]; then export FAKE_DOCKER_FAIL_RESTORE=1; fi
   if [ "$behavior" = zero-reference ]; then export FAKE_MEDIA_REFERENCE=meetings/unreferenced-zero; fi
   if [ "$behavior" = retry ]; then
@@ -169,6 +184,7 @@ run_restore_fixture() {
     export FAKE_DOCKER_PRESERVE_VOLUME=1
   fi
   if [ "$behavior" = interrupt ]; then export FAKE_DOCKER_INTERRUPT_AFTER_CREATE=1; fi
+  if [ "$behavior" = second-decrypt-failure ]; then export FAKE_AGE_FAIL_UPLOADS=1; fi
   export FAKE_DATABASE_PROOF="$case_dir/database-proof.json"
   export FAKE_DATABASE_DUMP="$case_dir/database.dump"
   export FAKE_UPLOADS_ARCHIVE="$case_dir/uploads.tar.gz"
@@ -187,6 +203,7 @@ run_restore_fixture() {
       --label com.meet-backend.beta-recovery/owner-token="$collision_token" \
       "$POSTGRES_IMAGE"
     printf 'pre-existing\n' >"$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/_data/sentinel"
+    : >"$case_dir/events.log"
     if PATH="$case_dir/bin:$PATH" bash "$script" \
       --artifact-dir "$case_dir/artifact" --recovery-id recovery-fixture \
       --output-dir "$case_dir/output" --identity "$case_dir/identity" \
@@ -252,6 +269,7 @@ run_restore_fixture() {
     [ ! -e "$case_dir/capacity-temp" ] && [ ! -L "$case_dir/capacity-temp" ] ||
       { echo "capacity-only restore left temporary residue" >&2; exit 1; }
   fi
+  : >"$case_dir/events.log"
   if PATH="$case_dir/bin:$PATH" bash "$script" \
     --artifact-dir "$case_dir/artifact" --recovery-id recovery-fixture \
     --output-dir "$case_dir/output" --identity "$case_dir/identity" \
@@ -269,6 +287,29 @@ run_restore_fixture() {
     echo "restore fixture $name returned $actual_status, expected $expected_status" >&2
     exit 1
   }
+  if [ "$identity_kind" != valid ] || [ "$behavior" = second-decrypt-failure ]; then
+    ! grep -q '^docker-' "$case_dir/events.log" || {
+      echo "identity/decrypt failure reached Docker: $name" >&2
+      exit 1
+    }
+    [ ! -e "$case_dir/identity" ] &&
+      [ ! -e "$case_dir/temp" ] &&
+      [ ! -e "$case_dir/output/restore-summary" ] &&
+      [ ! -e "$case_dir/output/restored-database-proof.json" ] &&
+      [ ! -e "$case_dir/output/restored-media-proof.json" ] ||
+      { echo "identity/decrypt failure left private residue: $name" >&2; exit 1; }
+    if [ "$identity_kind" = wrong ]; then
+      [ "$(cat "$case_dir/events.log")" = $'identity-parse\ndatabase-decrypt' ] ||
+        { echo "wrong identity event order differs" >&2; exit 1; }
+    elif [ "$behavior" = second-decrypt-failure ]; then
+      [ "$(cat "$case_dir/events.log")" = $'identity-parse\ndatabase-decrypt\nuploads-decrypt' ] ||
+        { echo "second decrypt event order differs" >&2; exit 1; }
+    else
+      [ ! -s "$case_dir/events.log" ] ||
+        { echo "invalid identity unexpectedly reached age" >&2; exit 1; }
+    fi
+    return
+  fi
   if [ "$behavior" = interrupt ]; then
     [ ! -e "$case_dir/temp/volume.identity" ] &&
       [ ! -e "$case_dir/docker-state/container" ] && [ ! -e "$case_dir/docker-state/network" ] &&
@@ -323,5 +364,13 @@ run_restore_fixture restore-collision 1 valid collision
 run_restore_fixture restore-zero-reference 1 valid zero-reference
 run_restore_fixture restore-interruption 137 valid interrupt
 run_restore_fixture restore-interruption-retry 0 valid survivor
+run_restore_fixture restore-missing-identity 1 valid normal missing
+run_restore_fixture restore-empty-identity 1 valid normal empty
+run_restore_fixture restore-newline-empty-identity 1 valid normal newline-empty
+run_restore_fixture restore-malformed-identity 1 valid normal malformed
+run_restore_fixture restore-wrong-mode-identity 1 valid normal valid 644
+run_restore_fixture restore-wrong-identity 1 valid normal wrong
+run_restore_fixture restore-environment-identity 1 valid normal environment
+run_restore_fixture restore-second-decrypt-failure 1 valid second-decrypt-failure
 
 echo "beta recovery restore contract and archive fixtures passed"

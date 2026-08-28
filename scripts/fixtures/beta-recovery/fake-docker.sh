@@ -3,6 +3,11 @@ set -euo pipefail
 
 state=${FAKE_DOCKER_STATE:?}
 root=${FAKE_DOCKER_ROOT:?}
+event_log=${FAKE_RECOVERY_EVENT_LOG:-}
+log_event() {
+  [ -n "$event_log" ] || return 0
+  printf 'docker-%s\n' "$1" >>"$event_log"
+}
 mkdir -p "$state" "$root/volumes"
 volume=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 volume_root="$root/volumes/$volume/_data"
@@ -90,10 +95,12 @@ json_container() {
 
 case "${1:-}" in
   info)
+    log_event info
     if [ "${2:-}" = --format ]; then printf '%s\n' "$root"; else printf 'fixture\n'; fi
     ;;
-  pull) ;;
+  pull) log_event pull ;;
   image)
+    log_event image-"${2:-}"
     [ "${2:-}" = inspect ] || exit 2
     case "${!#}" in
       *RepoDigests*) printf '%s\n' '["repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]' ;;
@@ -102,6 +109,7 @@ case "${1:-}" in
     esac
     ;;
   network)
+    log_event network-"${2:-}"
     case "${2:-}" in
       create)
         touch "$state/network"
@@ -118,6 +126,7 @@ case "${1:-}" in
     esac
     ;;
   container)
+    log_event container-"${2:-}"
     case "${2:-}" in
       inspect)
         [ -e "$state/container" ] || { echo 'No such container' >&2; exit 1; }
@@ -139,6 +148,7 @@ case "${1:-}" in
     esac
     ;;
   create)
+    log_event create
     touch "$state/container"
     label_value com.meet-backend.beta-recovery/owner-token "$@" >"$state/container-owner-token" || :
     if [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = valid ] ||
@@ -151,8 +161,9 @@ case "${1:-}" in
       exit 137
     fi
     ;;
-  start) ;;
+  start) log_event start ;;
   exec)
+    log_event exec
     if printf '%s\n' "$*" | grep -Fq pg_isready; then exit 0; fi
     if printf '%s\n' "$*" | grep -Fq 'pg_restore --list'; then printf 'fixture archive list\n'; exit 0; fi
     if [ "${FAKE_DOCKER_FAIL_RESTORE:-0}" = 1 ] &&
@@ -167,8 +178,9 @@ case "${1:-}" in
     fi
     exit 0
     ;;
-  cp) ;;
+  cp) log_event cp ;;
   volume)
+    log_event volume-"${2:-}"
     case "${2:-}" in
       inspect)
         [ "${3:-}" = "$volume" ] && [ -e "$state/volume" ] || { echo 'No such volume' >&2; exit 1; }

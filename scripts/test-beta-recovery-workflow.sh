@@ -28,6 +28,21 @@ grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
 grep -Fq 'Revalidate source immediately before identity access' "$workflow"
 grep -Fq 'scp_opts=(-i "$key" -P "$PORT"' "$workflow"
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
+grep -Fq 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow"
+grep -Fq 'archive_size=10263766' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq 'archive_sha256=bdc69c09cbdd6cf8b1f333d372a1f58247b3a33146406333e30c0f26e8f51377' \
+  "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq 'age-v1.3.1-linux-amd64.tar.gz' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq '[ "$(uname -s)" = Linux ]' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq '[ "$(uname -m)" = x86_64 ]' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq 'tar -tzf "$archive"' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq 'age/age-plugin-batchpass' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq 'install -m 0755' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq 'stat -c' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq '"$age_keygen" -y' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq 'cmp -- "$plaintext" "$decrypted"' "$root/scripts/install-beta-recovery-age.sh"
+grep -Fq 'printf '\''%s\n'\'' "$age_bin" >>"$GITHUB_PATH"' "$workflow"
+grep -Fq 'Provision and canary pinned age toolchain' "$root/.github/workflows/ci.yml"
 grep -Fq 'RECOVERY_ID: ${{ inputs.recovery_id }}' "$workflow"
 grep -Fq 'scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"' "$workflow"
 grep -Fq 'scripts/authorize-beta-recovery.sh validate-age-recipient "$AGE_RECIPIENT"' "$workflow"
@@ -35,8 +50,18 @@ grep -Fq 'closed-beta-restore environment protection policy is malformed or mism
   "$root/scripts/authorize-beta-recovery.sh"
 grep -Fq 'closed-beta-restore/deployment-branch-policies?per_page=100' \
   "$root/scripts/authorize-beta-recovery.sh"
-grep -Fq 'closed-beta-restore/secrets?per_page=100' \
-  "$root/scripts/authorize-beta-recovery.sh"
+if grep -Fq 'closed-beta-restore/secrets?per_page=100' \
+  "$root/scripts/authorize-beta-recovery.sh"; then
+  echo "authorization still uses unsupported Environment secret inventory" >&2
+  exit 1
+fi
+unsupported_claim=identitySecretProvisio
+unsupported_claim+=ned
+if grep -Fq "$unsupported_claim" "$root/scripts/authorize-beta-recovery.sh" ||
+  grep -Fq "$unsupported_claim" "$workflow"; then
+  echo "authorization still emits unsupported identity proof" >&2
+  exit 1
+fi
 grep -Fq 'recipient_file="$RUNNER_TEMP/age-recipient"' "$workflow"
 grep -Fq 'recipient=$(<"$remote/age-recipient")' "$workflow"
 grep -Fq 'Remove selected artifact temporary files' "$workflow"
@@ -76,6 +101,12 @@ if grep -Fq '${{ inputs.recovery_id }}' <<<"$run_block"; then
 fi
 validation_count=$(grep -Fc 'scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"' "$workflow")
 [ "$validation_count" -eq 7 ]
+secret_expression_count=$(grep -Fc '${{ secrets.BETA_RECOVERY_AGE_IDENTITY }}' "$workflow")
+[ "$secret_expression_count" -eq 1 ]
+setup_line=$(grep -n 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow" | cut -d: -f1)
+revalidate_line=$(grep -n 'Revalidate source immediately before identity access' "$workflow" | cut -d: -f1)
+restore_line=$(grep -n 'id: restore' "$workflow" | cut -d: -f1)
+[ "$setup_line" -lt "$revalidate_line" ] && [ "$revalidate_line" -lt "$restore_line" ]
 auth="$root/scripts/authorize-beta-recovery.sh"
 fixture_dir=$(mktemp -d)
 trap 'rm -r -- "$fixture_dir"' EXIT HUP INT TERM

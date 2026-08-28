@@ -169,19 +169,12 @@ jq -e '
   (.branch_policies[0].type // "branch") == "branch"
 ' <<<"$restore_branches" >/dev/null ||
   fail "closed-beta-restore must allow exactly the dev branch"
-restore_secrets=$(gh api \
-  "repos/$repository/environments/closed-beta-restore/secrets?per_page=100") ||
-  fail "closed-beta-restore secret inventory lookup failed"
-jq -e '
-  type == "object" and
-  ([.secrets[]? | select(.name == "BETA_RECOVERY_AGE_IDENTITY")] | length == 1)
-' <<<"$restore_secrets" >/dev/null ||
-  fail "closed-beta-restore private identity secret is not provisioned"
 files=(
   scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh
   scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh
   scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh
+  scripts/install-beta-recovery-age.sh
 )
 tooling_digest=$(for file in "${files[@]}"; do [ -f "$checkout/$file" ] || fail "missing tooling: $file"; (cd "$checkout" && sha256sum -- "$file"); done | sort | sha256sum | awk '{print $1}')
 workflow_digest=$(git -C "$checkout" show "HEAD:$workflow" | sha256sum | awk '{print $1}')
@@ -195,7 +188,7 @@ jq -cnS --arg mode "$mode" --arg sha "$source_sha" --arg master "$master_sha" \
     registration:{dev:$dev,master:$masterReg,masterWorkflowPresent:true,equal:true},
     restoreEnvironment:{name:"closed-beta-restore",protected:true,
       requiredReviewers:true,preventSelfReview:true,administratorBypass:false,
-      deploymentBranch:"dev",identitySecretProvisioned:true},
+      deploymentBranch:"dev"},
     toolingDigest:$tools}' >"$tmp"
 chmod 600 "$tmp"; mv -f -- "$tmp" "$proof"; trap - EXIT HUP INT TERM
 if [ -n "$github_output" ]; then

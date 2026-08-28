@@ -13,6 +13,12 @@ protected `closed-beta-restore` job has only the private age identity and no
 test-VPS variables, route, active-volume name, or host path. The pre- and
 post-restore probes have SSH only. Dispatch requires a new recovery ID and the
 exact current `dev` SHA; restore additionally requires the numeric artifact ID.
+Authorization proves only the source, CI, workflow registration, dispatch, and
+protected Environment policy through supported read-only GitHub APIs. It does
+not enumerate Environment secrets or claim that the private identity exists.
+After reviewer approval, the restore runner provisions and canaries its pinned
+age toolchain, then revalidates the source before the one step that materializes
+the private identity.
 
 Capture holds `/var/lib/meet-test-vps-deploy/.deploy.lock` only for the bounded
 snapshot and runtime recovery section. It rejects an active SMTP transaction,
@@ -43,6 +49,11 @@ pinned PostgreSQL 16 image must declare exactly
 operator-supplied mount and accepts only one inspected read-write anonymous
 volume at that destination. Bind, named, production, duplicate, missing, or
 unexpected mounts fail before start.
+
+The identity is parsed and both ciphertexts are decrypted into a private
+mode-0700 directory before any Docker command. Missing, empty, malformed,
+wrong-mode, wrong-key, or failed-second-decrypt inputs remove the identity and
+private plaintext without Docker activity or successful restore evidence.
 
 Dump listing, restore, the read-only V1-V9 database proof, uploads aggregate,
 and every managed media reference must match. Always-run cleanup removes the

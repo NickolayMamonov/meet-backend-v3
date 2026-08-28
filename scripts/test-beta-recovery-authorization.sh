@@ -57,11 +57,8 @@ case "$endpoint" in
     fi
     ;;
   repos/*/environments/closed-beta-restore/secrets*)
-    if [ "${AUTH_FIXTURE_CASE:-valid}" = missing-identity ]; then
-      printf '%s\n' '{"total_count":0,"secrets":[]}'
-    else
-      cat "$FIXTURE_ROOT/closed-beta-restore-secrets.json"
-    fi
+    echo 'Forbidden' >&2
+    exit 22
     ;;
   repos/*/environments/closed-beta-restore)
     case "${AUTH_FIXTURE_CASE:-valid}" in
@@ -116,8 +113,7 @@ jq -e '
   .authorized == true and
   .restoreEnvironment == {
     name:"closed-beta-restore",protected:true,requiredReviewers:true,
-    preventSelfReview:true,administratorBypass:false,deploymentBranch:"dev",
-    identitySecretProvisioned:true
+    preventSelfReview:true,administratorBypass:false,deploymentBranch:"dev"
   }
 ' "$tmp/valid/beta-recovery-authorization.json" >/dev/null
 
@@ -135,7 +131,7 @@ expect_failure() {
   [ -s "$output_dir/stderr" ]
 }
 
-for case_name in missing-environment wrong-reviewer admin-bypass wrong-branch missing-identity; do
+for case_name in missing-environment wrong-reviewer admin-bypass wrong-branch; do
   expect_failure "$case_name"
 done
 
@@ -143,7 +139,10 @@ grep -Fxq 'repos/fixture/meet-backend/environments/closed-beta-restore' "$tmp/gh
 grep -Fxq \
   'repos/fixture/meet-backend/environments/closed-beta-restore/deployment-branch-policies?per_page=100' \
   "$tmp/gh.log"
-grep -Fxq \
+if grep -Fq \
   'repos/fixture/meet-backend/environments/closed-beta-restore/secrets?per_page=100' \
-  "$tmp/gh.log"
+  "$tmp/gh.log"; then
+  echo "unsupported Environment secret inventory endpoint was called" >&2
+  exit 1
+fi
 echo "beta recovery authorization environment fixtures passed"
