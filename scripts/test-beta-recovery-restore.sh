@@ -152,7 +152,8 @@ run_restore_fixture() {
   export FAKE_DOCKER_MOUNT_MODE="$mount_mode"
   export FAKE_MEDIA_REFERENCE=avatars/file
   unset FAKE_DOCKER_FAIL_RESTORE FAKE_DOCKER_FAIL_CONTAINER_RM_ONCE
-  unset FAKE_DOCKER_FAIL_VOLUME_RM_ONCE FAKE_DOCKER_PRESERVE_VOLUME FAKE_DOCKER_INTERRUPT_AFTER_CREATE
+  unset FAKE_DOCKER_FAIL_VOLUME_RM_ONCE FAKE_DOCKER_FAIL_VOLUME_RM
+  unset FAKE_DOCKER_PRESERVE_VOLUME FAKE_DOCKER_INTERRUPT_AFTER_CREATE
   if [ "$behavior" = restore-failure ]; then export FAKE_DOCKER_FAIL_RESTORE=1; fi
   if [ "$behavior" = zero-reference ]; then export FAKE_MEDIA_REFERENCE=meetings/unreferenced-zero; fi
   if [ "$behavior" = retry ]; then
@@ -161,6 +162,10 @@ run_restore_fixture() {
   fi
   if [ "$behavior" = volume-retry ]; then
     export FAKE_DOCKER_FAIL_VOLUME_RM_ONCE=1
+    export FAKE_DOCKER_PRESERVE_VOLUME=1
+  fi
+  if [ "$behavior" = persistent-cleanup-failure ]; then
+    export FAKE_DOCKER_FAIL_VOLUME_RM=1
     export FAKE_DOCKER_PRESERVE_VOLUME=1
   fi
   if [ "$behavior" = interrupt ]; then export FAKE_DOCKER_INTERRUPT_AFTER_CREATE=1; fi
@@ -272,6 +277,18 @@ run_restore_fixture() {
       { echo "interruption cleanup left an owned survivor" >&2; exit 1; }
     return
   fi
+  if [ "$behavior" = persistent-cleanup-failure ]; then
+    [ ! -e "$case_dir/identity" ] &&
+      [ ! -e "$case_dir/temp/private-recovery-fixture" ] &&
+      [ -f "$case_dir/temp/volume.identity" ] &&
+      [ -f "$case_dir/temp/restore-ownership.json" ] &&
+      [ ! -e "$case_dir/output/restore-summary" ] &&
+      [ ! -e "$case_dir/docker-state/container" ] &&
+      [ ! -e "$case_dir/docker-state/network" ] &&
+      [ -e "$case_dir/docker-state/volume" ] ||
+      { echo "persistent cleanup failure did not retain retry markers safely" >&2; exit 1; }
+    return
+  fi
   [ ! -e "$case_dir/docker-state/container" ] && [ ! -e "$case_dir/docker-state/network" ] ||
     { echo "restore fixture $name left Docker resources" >&2; exit 1; }
   [ ! -e "$case_dir/docker-state/volume" ] ||
@@ -296,6 +313,7 @@ run_restore_fixture success 0 valid capacity
 run_restore_fixture restore-failure 1 valid restore-failure
 run_restore_fixture restore-retry 0 valid retry
 run_restore_fixture restore-volume-retry 0 valid volume-retry
+run_restore_fixture restore-persistent-cleanup-failure 1 valid persistent-cleanup-failure
 run_restore_fixture restore-bind 1 bind
 run_restore_fixture restore-named 1 named
 run_restore_fixture restore-duplicate 1 duplicate

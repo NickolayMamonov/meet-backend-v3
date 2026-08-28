@@ -97,12 +97,30 @@ git -C "$checkout" fetch --no-tags origin \
 [ "$(git -C "$checkout" rev-parse refs/remotes/origin/dev)" = "$source_sha" ] || fail "source is not current dev"
 master_sha=$(git -C "$checkout" rev-parse refs/remotes/origin/master) ||
   fail "master authority is unavailable"
-dev_registration=$(git -C "$checkout" show "refs/remotes/origin/dev:$workflow" |
+git_show_registration() {
+  local ref=$1 git_dir=$checkout
+  if command -v cygpath >/dev/null 2>&1; then
+    git_dir=$(cygpath -w "$checkout")
+    MSYS_NO_PATHCONV=1 git -C "$git_dir" show "$ref:$workflow"
+  else
+    git -C "$git_dir" show "$ref:$workflow"
+  fi
+}
+git_has_registration() {
+  local ref=$1 git_dir=$checkout
+  if command -v cygpath >/dev/null 2>&1; then
+    git_dir=$(cygpath -w "$checkout")
+    MSYS_NO_PATHCONV=1 git -C "$git_dir" cat-file -e "$ref:$workflow"
+  else
+    git -C "$git_dir" cat-file -e "$ref:$workflow"
+  fi
+}
+dev_registration=$(git_show_registration refs/remotes/origin/dev |
   sha256sum | awk '{print $1}') || fail "dev registration missing"
 master_registration=''
-git -C "$checkout" cat-file -e "refs/remotes/origin/master:$workflow" ||
+git_has_registration refs/remotes/origin/master ||
   fail "master registration missing"
-master_registration=$(git -C "$checkout" show "refs/remotes/origin/master:$workflow" |
+master_registration=$(git_show_registration refs/remotes/origin/master |
   sha256sum | awk '{print $1}') || fail "master registration unreadable"
 [[ "$dev_registration" =~ ^[0-9a-f]{64}$ ]] || fail "dev registration malformed"
 [[ "$master_registration" =~ ^[0-9a-f]{64}$ ]] || fail "master registration malformed"
@@ -123,6 +141,42 @@ jq -e --arg sha "$source_sha" '
       .head_sha == $sha and .status == "completed" and .conclusion == "success") ] |
   length > 0
 ' <<<"$ci" >/dev/null || fail "exact CI is not successful"
+restore_environment=$(gh api "repos/$repository/environments/closed-beta-restore") ||
+  fail "closed-beta-restore environment lookup failed"
+jq -e '
+  type == "object" and
+  .name == "closed-beta-restore" and
+  .can_admins_bypass == false and
+  (.deployment_branch_policy | type == "object" and
+    .custom_branch_policies == true and .protected_branches == false) and
+  ([.protection_rules[]? |
+    select(.type == "required_reviewers") |
+    select(.prevent_self_review == true and
+      (.reviewers | type == "array" and length >= 1) and
+      all(.reviewers[];
+        ((.type == "User" or .type == "Team") and
+          ((.reviewer.id // .id) | type == "number" and floor == . and . > 0))))] |
+    length == 1)
+' <<<"$restore_environment" >/dev/null ||
+  fail "closed-beta-restore environment protection policy is malformed or mismatched"
+restore_branches=$(gh api \
+  "repos/$repository/environments/closed-beta-restore/deployment-branch-policies?per_page=100") ||
+  fail "closed-beta-restore deployment policy lookup failed"
+jq -e '
+  type == "object" and .total_count == 1 and
+  (.branch_policies | type == "array" and length == 1) and
+  .branch_policies[0].name == "dev" and
+  (.branch_policies[0].type // "branch") == "branch"
+' <<<"$restore_branches" >/dev/null ||
+  fail "closed-beta-restore must allow exactly the dev branch"
+restore_secrets=$(gh api \
+  "repos/$repository/environments/closed-beta-restore/secrets?per_page=100") ||
+  fail "closed-beta-restore secret inventory lookup failed"
+jq -e '
+  type == "object" and
+  ([.secrets[]? | select(.name == "BETA_RECOVERY_AGE_IDENTITY")] | length == 1)
+' <<<"$restore_secrets" >/dev/null ||
+  fail "closed-beta-restore private identity secret is not provisioned"
 files=(
   scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh
@@ -139,6 +193,9 @@ jq -cnS --arg mode "$mode" --arg sha "$source_sha" --arg master "$master_sha" \
   '{schema:"meet-backend/beta-recovery-authorization/v1",mode:$mode,authorized:true,
     sourceSha:$sha,masterSha:$master,workflowDigest:$wf,
     registration:{dev:$dev,master:$masterReg,masterWorkflowPresent:true,equal:true},
+    restoreEnvironment:{name:"closed-beta-restore",protected:true,
+      requiredReviewers:true,preventSelfReview:true,administratorBypass:false,
+      deploymentBranch:"dev",identitySecretProvisioned:true},
     toolingDigest:$tools}' >"$tmp"
 chmod 600 "$tmp"; mv -f -- "$tmp" "$proof"; trap - EXIT HUP INT TERM
 if [ -n "$github_output" ]; then

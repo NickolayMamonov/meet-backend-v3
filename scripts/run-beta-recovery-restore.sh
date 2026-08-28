@@ -7,6 +7,7 @@ fail(){ echo "beta recovery restore failed: $*" >&2; exit 1; }
 regular(){ [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ]; }
 identity=''
 temp_owned=0
+cleanup_survivor_mode=0
 remove_path(){
   local path=$1
   if [ -L "$path" ]; then
@@ -22,7 +23,9 @@ preflight_cleanup(){
   local status=$?
   trap - EXIT HUP INT TERM
   [ -z "$identity" ] || rm -f -- "$identity" || status=1
-  [ -z "${ownership_marker:-}" ] || rm -f -- "$ownership_marker" || status=1
+  if [ "$cleanup_survivor_mode" -eq 0 ]; then
+    [ -z "${ownership_marker:-}" ] || rm -f -- "$ownership_marker" || status=1
+  fi
   if [ "${temp_owned:-0}" -eq 1 ]; then
     remove_path "${db_expected:-}" || status=1
     remove_path "${media_expected:-}" || status=1
@@ -190,6 +193,7 @@ if [ "${1:-}" = --validate-uploads-archive ]; then
   command -v tar >/dev/null 2>&1 || fail "tar is required"; validate_upload_archive "$archive" "$work"; exit 0
 fi
 if [ "${1:-}" = --cleanup-survivors ]; then
+  cleanup_survivor_mode=1
   shift; c=''; n=''; v=''; marker=''; ownership_marker=''; owner_token=''; rid=''; root=''
   while [ "$#" -gt 0 ]; do case "$1" in
     --container) c=$2; shift 2;; --network) n=$2; shift 2;; --volume) v=$2; shift 2;;

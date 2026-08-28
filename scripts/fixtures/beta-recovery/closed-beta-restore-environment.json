@@ -1,0 +1,22 @@
+{
+  "name": "closed-beta-restore",
+  "can_admins_bypass": false,
+  "deployment_branch_policy": {
+    "custom_branch_policies": true,
+    "protected_branches": false
+  },
+  "protection_rules": [
+    {
+      "type": "required_reviewers",
+      "prevent_self_review": true,
+      "reviewers": [
+        {
+          "type": "User",
+          "reviewer": {
+            "id": 123
+          }
+        }
+      ]
+    }
+  ]
+}

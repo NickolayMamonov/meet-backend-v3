@@ -31,6 +31,12 @@ grep -Fq 'unset AGE_IDENTITY' "$workflow"
 grep -Fq 'RECOVERY_ID: ${{ inputs.recovery_id }}' "$workflow"
 grep -Fq 'scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"' "$workflow"
 grep -Fq 'scripts/authorize-beta-recovery.sh validate-age-recipient "$AGE_RECIPIENT"' "$workflow"
+grep -Fq 'closed-beta-restore environment protection policy is malformed or mismatched' \
+  "$root/scripts/authorize-beta-recovery.sh"
+grep -Fq 'closed-beta-restore/deployment-branch-policies?per_page=100' \
+  "$root/scripts/authorize-beta-recovery.sh"
+grep -Fq 'closed-beta-restore/secrets?per_page=100' \
+  "$root/scripts/authorize-beta-recovery.sh"
 grep -Fq 'recipient_file="$RUNNER_TEMP/age-recipient"' "$workflow"
 grep -Fq 'recipient=$(<"$remote/age-recipient")' "$workflow"
 grep -Fq 'Remove selected artifact temporary files' "$workflow"
@@ -40,8 +46,12 @@ grep -Fq 'cleanup_complete: ${{ steps.final_cleanup.outputs.cleanup_complete }}'
 grep -Fq 'anonymous_volume_absent: ${{ steps.final_cleanup.outputs.anonymous_volume_absent }}' "$workflow"
 post_probe_job=$(awk '/restore-post-probe:/{flag=1} /evidence:/{flag=0} flag' "$workflow")
 evidence_job=$(awk '/evidence:/{flag=1} flag' "$workflow")
-grep -Fq "needs.restore-isolated.result == 'success'" <<<"$post_probe_job"
 grep -Fq "needs.restore-isolated.result == 'success'" <<<"$evidence_job"
+grep -Fq "needs.restore-isolated.result != 'skipped'" <<<"$post_probe_job"
+if grep -Fq "needs.restore-isolated.result == 'success'" <<<"$post_probe_job"; then
+  echo "post-probe is incorrectly success-gated" >&2
+  exit 1
+fi
 isolated_result=failure
 final_cleanup_complete=true
 anonymous_volume_absent=true
@@ -139,6 +149,32 @@ grep -Fq 'observed_age=$((observed_epoch - point_epoch))' "$workflow"
 grep -Fq '.created_at | (type=="string"' "$workflow"
 grep -Fq '.expires_at | (type=="string"' "$workflow"
 grep -Fq '30 * 24 * 60 * 60' "$workflow"
+grep -Fq 'select(.event == "workflow_dispatch" and .head_branch == "dev"' "$workflow"
+valid_dispatch=$(jq -cn --arg sha "$valid_recovery_id" \
+  '{event:"workflow_dispatch",head_branch:"dev",head_sha:$sha,created_at:"2026-08-28T12:00:00Z"}')
+dispatch_at=$(jq -er --arg sha "$valid_recovery_id" \
+  'select(.event == "workflow_dispatch" and .head_branch == "dev" and .head_sha == $sha) |
+   .created_at | select(type == "string" and length > 0)' \
+  <<<"$valid_dispatch")
+[ "$dispatch_at" = 2026-08-28T12:00:00Z ]
+for mismatched_dispatch in \
+  "$(jq -cn --arg sha "$valid_recovery_id" \
+    '{event:"push",head_branch:"dev",head_sha:$sha,created_at:"2026-08-28T12:00:00Z"}')" \
+  "$(jq -cn --arg sha "$valid_recovery_id" \
+    '{event:"workflow_dispatch",head_branch:"main",head_sha:$sha,created_at:"2026-08-28T12:00:00Z"}')" \
+  "$(jq -cn --arg sha "$valid_recovery_id" \
+    '{event:"workflow_dispatch",head_branch:"dev",head_sha:"wrong",created_at:"2026-08-28T12:00:00Z"}')" \
+  '{"event":"workflow_dispatch","head_branch":"dev","head_sha":"recovery-fixture"}' \
+  '{"event":"workflow_dispatch","head_branch":"dev","head_sha":"recovery-fixture","created_at":null}' \
+  '{"event":"workflow_dispatch","head_branch":"dev","head_sha":"recovery-fixture","created_at":123}'; do
+  if jq -er --arg sha "$valid_recovery_id" \
+    'select(.event == "workflow_dispatch" and .head_branch == "dev" and .head_sha == $sha) |
+     .created_at | select(type == "string" and length > 0)' \
+    <<<"$mismatched_dispatch" >/dev/null; then
+    echo "malformed dispatch fixture unexpectedly produced created_at" >&2
+    exit 1
+  fi
+done
 if grep -Eq '\.workflow_run\.(event|head_branch|head_sha)' "$workflow"; then
   echo "artifact validation depends on unavailable nested workflow-run fields" >&2
   exit 1
