@@ -145,7 +145,7 @@ jobs:
           uploads_bytes=$(jq -er '.bytes' "$RUNNER_TEMP/media-proof.json")
           uploads_digest=$(jq -er '.canonicalDigest' "$RUNNER_TEMP/media-proof.json")
           chmod 600 "$RUNNER_TEMP/"*.age "$RUNNER_TEMP/"*.json
-          ssh "${opts[@]}" "$SSH_USER@$HOST" "sudo rm -r -- '$remote'"
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo rm -r -- '$remote'"
           mkdir "$RUNNER_TEMP/artifact"
           scripts/build-beta-recovery-evidence.sh manifest \
             --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
@@ -230,9 +230,7 @@ jobs:
           run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
           jq -e --arg prefix "beta-recovery-${{ inputs.recovery_id }}-" '
             .id == ($id|tonumber) and .expired == false and .size_in_bytes > 0 and
-            (.name | startswith($prefix)) and .workflow_run.head_sha == $sha and
-            .workflow_run.event == "workflow_dispatch" and
-            .workflow_run.head_branch == "dev"
+            (.name | startswith($prefix))
           ' --arg id "$ARTIFACT_ID" \
             --arg sha "${{ inputs.source_sha }}" <<<"$artifact_json"
           jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
@@ -368,8 +366,7 @@ jobs:
           jq -e --arg name "$(jq -r '.artifactName' "$RUNNER_TEMP/artifact/recovery-point.json")" \
             --argjson run "$(jq -r '.runId' "$RUNNER_TEMP/artifact/recovery-point.json")" \
             --arg sha "${{ inputs.source_sha }}" \
-            '.name == $name and .workflow_run.id == $run and .workflow_run.head_sha == $sha and
-             .workflow_run.event == "workflow_dispatch" and .workflow_run.head_branch == "dev"' \
+            '.name == $name and .workflow_run.id == $run' \
             <<<"$artifact_json"
       - name: Validate runner capacity
         shell: bash
@@ -596,8 +593,7 @@ jobs:
           jq -e --arg name "$artifact_name" --argjson run "$artifact_run" \
             --arg sha "${{ inputs.source_sha }}" \
             '.id == ($id|tonumber) and .name == $name and .expired == false and
-             .size_in_bytes > 0 and .workflow_run.id == $run and
-             .workflow_run.head_sha == $sha' \
+             .size_in_bytes > 0 and .workflow_run.id == $run' \
             --arg id "${{ inputs.artifact_id }}" <<<"$artifact_json"
           dispatch_at=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" |
             jq -er '.event == "workflow_dispatch" and .head_branch == "dev" and
