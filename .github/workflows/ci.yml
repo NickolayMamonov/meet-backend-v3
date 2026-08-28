@@ -188,6 +188,12 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           path: source
+      - name: Provision and canary pinned age toolchain
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
+        run: |
+          set -euo pipefail
+          age_bin="$RUNNER_TEMP/beta-recovery-age-v1.3.1/bin"
+          "$TOOLING_SCRIPTS/install-beta-recovery-age.sh" "$age_bin"
       - name: Validate shell scripts
         working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |

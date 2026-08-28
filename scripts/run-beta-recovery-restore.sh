@@ -10,6 +10,7 @@ temp_owned=0
 cleanup_survivor_mode=0
 remove_path(){
   local path=$1
+  [ -n "$path" ] || return 0
   if [ -L "$path" ]; then
     rm -f -- "$path"
   elif [ -d "$path" ]; then
@@ -19,16 +20,39 @@ remove_path(){
   fi
   [ ! -e "$path" ] && [ ! -L "$path" ]
 }
+floor_sub(){
+  local a b
+  decimal "$1" && decimal "$2" || return 1
+  if decimal_ge "$2" "$1"; then
+    printf '0\n'
+    return
+  fi
+  a=$(normalize "$1"); b=$(normalize "$2")
+  while [ "${#b}" -lt "${#a}" ]; do b=0$b; done
+  local i borrow=0 result='' digit_a digit_b digit
+  for ((i=${#a}-1; i>=0; i--)); do
+    digit_a=${a:i:1}; digit_b=${b:i:1}
+    digit=$((10#$digit_a - 10#$digit_b - borrow))
+    if [ "$digit" -lt 0 ]; then digit=$((digit + 10)); borrow=1; else borrow=0; fi
+    result=$digit$result
+  done
+  normalize "$result"
+}
+identity=''
+private=''
+db_dump=''
+uploads_archive=''
 preflight_cleanup(){
   local status=$?
   trap - EXIT HUP INT TERM
-  [ -z "$identity" ] || rm -f -- "$identity" || status=1
+  remove_path "$identity" || status=1
+  remove_path "$private" || status=1
   if [ "$cleanup_survivor_mode" -eq 0 ]; then
     [ -z "${ownership_marker:-}" ] || rm -f -- "$ownership_marker" || status=1
   fi
   if [ "${temp_owned:-0}" -eq 1 ]; then
-    remove_path "${db_expected:-}" || status=1
-    remove_path "${media_expected:-}" || status=1
+    remove_path "$db_expected" || status=1
+    remove_path "$media_expected" || status=1
     if [ -d "$temp" ] && [ ! -L "$temp" ] &&
       [ -z "$(find "$temp" -mindepth 1 -print -quit)" ]; then
       rmdir -- "$temp" || status=1
@@ -326,7 +350,10 @@ fi
 for value in "$tooling" "$workflow" "$database_digest" "$media_digest"; do [[ "$value" =~ ^[0-9a-f]{64}$ ]] || fail "contract digest is required"; done
 regular "$sql" || fail "database proof SQL unavailable"; regular "$media" || fail "media proof script unavailable"; [ -x "$media" ] || fail "media proof script is not executable"
 [[ "$image" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || fail "PostgreSQL image must be pinned by digest"
-for tool in age docker df find jq sha256sum tar; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
+for tool in docker df find jq sha256sum tar; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
+if [ "$capacity_only" = false ]; then
+  for tool in age age-keygen stat; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
+fi
 actual_database_digest=$(sha256sum "$sql" | awk '{print $1}')
 actual_media_digest=$(sha256sum "$media" | awk '{print $1}')
 [ "$actual_database_digest" = "$database_digest" ] || fail "database proof contract digest differs"
@@ -338,7 +365,8 @@ workflow_file=.github/workflows/prove-beta-backup-restore.yml
 actual_tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
   scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
-  scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh; do
+  scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
+  scripts/install-beta-recovery-age.sh; do
   sha256sum "$file"
 done | sort | sha256sum | awk '{print $1}')
 [ "$actual_tooling" = "$tooling" ] || fail "tooling contract digest differs"
@@ -387,19 +415,61 @@ dbsha=$(sha256sum -- "$artifact/postgres.dump.age" | awk '{print $1}'); usha=$(s
 [ "$dbsize" = "$(jq -er '.source.ciphertexts.database.size' "$manifest")" ] && [ "$dbsha" = "$(jq -er '.source.ciphertexts.database.sha256' "$manifest")" ] && [ "$usize" = "$(jq -er '.source.ciphertexts.uploads.size' "$manifest")" ] && [ "$usha" = "$(jq -er '.source.ciphertexts.uploads.sha256' "$manifest")" ] || fail "ciphertext hash or size differs from artifact manifest"
 db=$(jq -er '.source.postgresDatabaseBytes' "$manifest"); uploads=$(jq -er '.source.uploads.bytes' "$manifest")
 pair=$(add "$dbsize" "$usize"); temp_required=$(add "$(add "$(mul_small "$pair" 2)" "$db")" "$(add "$uploads" 2147483648)"); docker_required=$(add "$(mul_small "$db" 4)" 5368709120)
+if [ "$capacity_only" = true ]; then
+  if [ -z "$docker_root" ]; then
+    docker_root=$(docker info --format '{{.DockerRootDir}}') || fail "Docker root is unknown"
+  fi
+  [ -n "$docker_root" ] && [ -d "$docker_root" ] && [ ! -L "$docker_root" ] || fail "Docker root is unsafe"
+  tempdf=$(df -Pk -- "$temp" | awk 'NR==2{print $1 "\t" $4}')
+  docker_capacity=$(df -Pk -- "$docker_root" | awk 'NR==2{print $1 "\t" $4}') || fail "Docker capacity is unknown"
+  td=${tempdf%%$'\t'*}; tf=$(mul_small "${tempdf#*$'\t'}" 1024); dd=${docker_capacity%%$'\t'*}; dfree=$(mul_small "${docker_capacity#*$'\t'}" 1024)
+  if [ "$td" = "$dd" ]; then
+    shared=$(add "$temp_required" "$docker_required")
+    capacity_ok "$tf" "$shared" || fail "shared-device capacity gate failed (20 percent margin included)"
+  else
+    capacity_ok "$tf" "$temp_required" || fail "temporary capacity gate failed (20 percent margin included)"
+    capacity_ok "$dfree" "$docker_required" || fail "Docker capacity gate failed (20 percent margin included)"
+  fi
+  exit 0
+fi
+
+tempdf=$(df -Pk -- "$temp" | awk 'NR==2{print $1 "\t" $4}')
+td=${tempdf%%$'\t'*}; tf=$(mul_small "${tempdf#*$'\t'}" 1024)
+capacity_ok "$tf" "$temp_required" || fail "temporary capacity gate failed (20 percent margin included)"
+if [ "${AGE_IDENTITY+x}" = x ]; then
+  fail "age identity environment must be unset"
+fi
+regular "$identity" || fail "age identity unavailable"
+identity_mode=$(stat -c '%a' "$identity" 2>/dev/null) || fail "age identity mode is unavailable"
+[ "$identity_mode" = 600 ] || fail "age identity mode differs"
+age-keygen -y "$identity" >/dev/null 2>&1 || fail "age identity is malformed"
+private=$temp/private-$id
+[ ! -e "$private" ] || fail "private restore directory already exists"
+mkdir -- "$private"; chmod 700 "$private"
+db_dump=$private/postgres.dump
+uploads_archive=$private/uploads.tar.gz
+age -d -i "$identity" -o "$db_dump" "$artifact/postgres.dump.age" ||
+  fail "database ciphertext decryption failed"
+age -d -i "$identity" -o "$uploads_archive" "$artifact/uploads.tar.gz.age" ||
+  fail "uploads ciphertext decryption failed"
+decrypted_bytes=$(add "$(wc -c <"$db_dump" | tr -d '[:space:]')" \
+  "$(wc -c <"$uploads_archive" | tr -d '[:space:]')")
+remaining_temp_required=$(floor_sub "$temp_required" "$decrypted_bytes")
 if [ -z "$docker_root" ]; then
   docker_root=$(docker info --format '{{.DockerRootDir}}') || fail "Docker root is unknown"
 fi
 [ -n "$docker_root" ] && [ -d "$docker_root" ] && [ ! -L "$docker_root" ] || fail "Docker root is unsafe"
 tempdf=$(df -Pk -- "$temp" | awk 'NR==2{print $1 "\t" $4}')
 docker_capacity=$(df -Pk -- "$docker_root" | awk 'NR==2{print $1 "\t" $4}') || fail "Docker capacity is unknown"
-td=${tempdf%%$'\t'*}; tf=$(mul_small "${tempdf#*$'\t'}" 1024); dd=${docker_capacity%%$'\t'*}; dfree=$(mul_small "${docker_capacity#*$'\t'}" 1024)
-if [ "$td" = "$dd" ]; then shared=$(add "$temp_required" "$docker_required"); capacity_ok "$tf" "$shared" || fail "shared-device capacity gate failed (20 percent margin included)"; else capacity_ok "$tf" "$temp_required" || fail "temporary capacity gate failed (20 percent margin included)"; capacity_ok "$dfree" "$docker_required" || fail "Docker capacity gate failed (20 percent margin included)"; fi
-if [ "$capacity_only" = true ]; then
-  exit 0
+td=${tempdf%%$'\t'*}; tf=$(mul_small "${tempdf#*$'\t'}" 1024)
+dd=${docker_capacity%%$'\t'*}; dfree=$(mul_small "${docker_capacity#*$'\t'}" 1024)
+if [ "$td" = "$dd" ]; then
+  shared=$(add "$remaining_temp_required" "$docker_required")
+  capacity_ok "$tf" "$shared" || fail "shared-device capacity gate failed (20 percent margin included)"
+else
+  capacity_ok "$tf" "$remaining_temp_required" || fail "temporary capacity gate failed (20 percent margin included)"
+  capacity_ok "$dfree" "$docker_required" || fail "Docker capacity gate failed (20 percent margin included)"
 fi
-regular "$identity" || fail "age identity unavailable"
-db_dump=''; uploads_archive=''; private=''
 marker=$temp/volume.identity; ownership_marker=$temp/restore-ownership.json
 network=beta-recovery-$id; container=beta-recovery-postgres-$id; volume=''; volume_identities=(); marker_owned=0
 owner_token=$(printf '%s:%s:%s:%s\n' "$id" "$$" "$RANDOM" "$(date +%s%N)" |
@@ -415,10 +485,6 @@ if inspect_resource network "$network"; then
 else
   [ "$?" -eq 1 ] || fail "cannot inspect restore network"
 fi
-private=$temp/private-$id
-[ ! -e "$private" ] || fail "private restore directory already exists"
-mkdir -- "$private"; chmod 700 "$private"
-db_dump=$private/postgres.dump; uploads_archive=$private/uploads.tar.gz
 [ ! -e "$marker" ] || fail "volume identity path is already in use"
 cleanup(){
   local status=$? local_cleanup_status=0 resource_cleanup_status=0 c v n cleanup_confirmed=0 candidate
@@ -529,7 +595,7 @@ cleanup(){
     [ -z "$(find "$temp" -mindepth 1 -print -quit)" ] &&
       rmdir -- "$temp" && [ ! -e "$temp" ] || local_cleanup_status=1
   fi
-  if [ "$local_cleanup_status" -eq 0 ] && [ "$resource_cleanup_status" -eq 0 ] &&
+  if [ "$status" -eq 0 ] && [ "$local_cleanup_status" -eq 0 ] && [ "$resource_cleanup_status" -eq 0 ] &&
     [ "$cleanup_confirmed" -eq 1 ] && [ ! -e "$temp" ] && [ ! -L "$temp" ]; then
     printf 'cleanup_complete=true\n' >"$output/restore-summary" || local_cleanup_status=1
   else
@@ -539,7 +605,6 @@ cleanup(){
   [ "$status" -eq 0 ] || exit "$status"; exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
-age -d -i "$identity" -o "$db_dump" "$artifact/postgres.dump.age"; age -d -i "$identity" -o "$uploads_archive" "$artifact/uploads.tar.gz.age"
 docker pull --quiet "$image" >/dev/null || fail "pinned image pull failed"
 docker image inspect "$image" --format '{{json .RepoDigests}}' | jq -e --arg d "${image##*@}" 'any(.[];endswith($d))' >/dev/null || fail "pinned image provenance differs"
 docker image inspect "$image" --format '{{json .Config.Volumes}}' | jq -e 'type=="object" and (keys|sort)==["/var/lib/postgresql/data"]' >/dev/null || fail "image volume declaration differs"

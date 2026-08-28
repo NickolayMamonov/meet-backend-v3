@@ -78,7 +78,8 @@ done
 
 for path in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
   scripts/run-beta-recovery-restore.sh scripts/probe-test-vps-recovery-runtime.sh \
-  scripts/build-beta-recovery-evidence.sh scripts/beta-recovery-media-proof.sh; do
+  scripts/build-beta-recovery-evidence.sh scripts/beta-recovery-media-proof.sh \
+  scripts/install-beta-recovery-age.sh; do
   require_workflow_reference "$path"
 done
 
