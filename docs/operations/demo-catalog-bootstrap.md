@@ -12,7 +12,8 @@ schema change is additive migration V9. The endpoint is available only when
    after V8 and that production Flyway still uses only `classpath:db/migration`.
 2. Inspect table sizes before applying V9. The five partial unique indexes can
    briefly lock writes; schedule a maintenance window when required.
-3. Take a verified backup. MEE2-52 owns proof that the backup can be restored.
+3. Take a verified backup. The one-shot closed-beta restore proof is documented
+   in `closed-beta-backup-restore.md`; recurring automation remains MEE2-63.
 4. Deploy with `DEMO_CATALOG_BOOTSTRAP_ENABLED=false`. Verify readiness, missing
    or wrong `X-Admin-Key` returns 403, and an authenticated admin receives the
    existing 404 envelope for `/admin/demo-catalog/bootstrap`.

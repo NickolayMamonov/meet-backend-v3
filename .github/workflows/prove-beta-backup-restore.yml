@@ -1,0 +1,837 @@
+name: Prove beta backup restore
+
+run-name: Beta recovery ${{ inputs.operation }} ${{ inputs.recovery_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Capture or restore
+        required: true
+        type: choice
+        options: [capture, restore]
+      source_sha:
+        description: Exact lowercase 40-hex current dev commit
+        required: true
+        type: string
+      artifact_id:
+        description: Numeric capture artifact ID for restore
+        required: false
+        type: string
+      recovery_id:
+        description: Unique recovery identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: beta-recovery-${{ github.repository }}-${{ inputs.recovery_id }}
+  cancel-in-progress: false
+
+env:
+  RECOVERY_WORKFLOW: .github/workflows/prove-beta-backup-restore.yml
+  POSTGRES_IMAGE: postgres:16-alpine@sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2
+  RECOVERY_ID: ${{ inputs.recovery_id }}
+
+jobs:
+  authorize:
+    name: Authorize exact current dev
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev' && github.sha == inputs.source_sha
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate recovery ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"
+      - name: Prove source, CI, and master registration
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/authorize-beta-recovery.sh authorize \
+            --repository "$GITHUB_REPOSITORY" --source-checkout "$GITHUB_WORKSPACE" \
+            --source-sha "${{ inputs.source_sha }}" --workflow "$RECOVERY_WORKFLOW" \
+            --output-dir "$RUNNER_TEMP" --github-output "$GITHUB_OUTPUT"
+
+  capture:
+    name: Capture one encrypted recovery point
+    needs: authorize
+    if: inputs.operation == 'capture' && needs.authorize.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: test-vps
+    env:
+      HOST: ${{ vars.TEST_VPS_HOST }}
+      PORT: ${{ vars.TEST_VPS_PORT }}
+      SSH_USER: ${{ vars.TEST_VPS_USER }}
+      HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
+      SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+      PUBLIC_URL: https://api.whysoezzy.online
+      AGE_RECIPIENT: ${{ vars.BETA_RECOVERY_AGE_RECIPIENT }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate recovery ID and age recipient
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"
+          scripts/authorize-beta-recovery.sh validate-age-recipient "$AGE_RECIPIENT"
+      - name: Revalidate source immediately before VPS access
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin dev master
+          scripts/authorize-beta-recovery.sh revalidate \
+            --repository "$GITHUB_REPOSITORY" --source-checkout "$GITHUB_WORKSPACE" \
+            --source-sha "${{ inputs.source_sha }}" --workflow "$RECOVERY_WORKFLOW" \
+            --output-dir "$RUNNER_TEMP"
+      - name: Stage and run the locked VPS capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
+          key="$RUNNER_TEMP/ssh-key"
+          install -m 600 /dev/null "$key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
+          known="$RUNNER_TEMP/known-hosts"
+          printf '%s\n' "$HOST_FINGERPRINT" >"$known"
+          ssh_opts=(-i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known")
+          scp_opts=(-i "$key" -P "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known")
+          remote="/tmp/beta-recovery-$RECOVERY_ID"
+          recipient_file="$RUNNER_TEMP/age-recipient"
+          install -m 600 /dev/null "$recipient_file"
+          printf '%s\n' "$AGE_RECIPIENT" >"$recipient_file"
+          cleanup_remote() {
+            local status=$?
+            trap - EXIT
+            if ! ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" \
+              "sudo test ! -e '$remote' || sudo rm -r -- '$remote'"; then
+              status=1
+            fi
+            exit "$status"
+          }
+          trap cleanup_remote EXIT
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "mkdir -p '$remote'"
+          scp "${scp_opts[@]}" scripts/run-beta-recovery-capture.sh scripts/backup-production.sh \
+            scripts/probe-test-vps-recovery-runtime.sh scripts/production-compose.sh \
+            scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
+            "$recipient_file" \
+            "$SSH_USER@$HOST:$remote/"
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo bash -s -- '$remote' '$RECOVERY_ID' '$PUBLIC_URL'" <<'REMOTE'
+          set -euo pipefail
+          remote=$1
+          recovery_id=$2
+          public_url=$3
+          recipient=$(<"$remote/age-recipient")
+          export AGE_RECIPIENT="$recipient"
+          export PRODUCTION_COMPOSE_SCRIPT="$remote/production-compose.sh"
+          export BETA_BACKUP_SCRIPT="$remote/backup-production.sh"
+          export RECOVERY_PROBE_SCRIPT="$remote/probe-test-vps-recovery-runtime.sh"
+          export TEST_VPS_STATE_ROOT=/var/lib/meet-test-vps-deploy
+          export PRODUCTION_ROOT=/var/lib/meet-production
+          bash "$remote/run-beta-recovery-capture.sh" --recovery-id "$recovery_id" \
+            --root /var/lib/meet-production --output-dir "$remote" --recipient "$recipient" \
+            --public-url "$public_url"
+          REMOTE
+          rm -f -- "$recipient_file"
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/postgres.dump.age'" \
+            >"$RUNNER_TEMP/postgres.dump.age"
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/uploads.tar.gz.age'" \
+            >"$RUNNER_TEMP/uploads.tar.gz.age"
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-runtime.json'" \
+            >"$RUNNER_TEMP/capture-runtime.json"
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-database-proof.json'" \
+            >"$RUNNER_TEMP/database-proof.json"
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-media-proof.json'" \
+            >"$RUNNER_TEMP/media-proof.json"
+          capture_result="$RUNNER_TEMP/capture-result.json"
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-result.json'" \
+            >"$capture_result"
+          jq -e '
+            type=="object" and
+            (keys|sort)==["capturedAt","ciphertexts","databaseBytes","proofs","recoveryId","recoveryPointTime","schema","uploads"] and
+            .schema=="meet-backend/beta-recovery-capture/v1" and
+            (.databaseBytes|type=="number" and floor==. and .>0) and
+            (.uploads|type=="object" and (keys|sort)==["bytes","digest","files"]) and
+            (.uploads.files|type=="number" and floor==. and .>=0) and
+            (.uploads.bytes|type=="number" and floor==. and .>=0) and
+            (.uploads.digest|test("^[0-9a-f]{64}$")) and
+            (.ciphertexts|type=="object" and (keys|sort)==["database","uploads"]) and
+            all(.ciphertexts[]; (keys|sort)==["name","sha256","size"] and
+              (.size|type=="number" and floor==. and .>0) and
+              (.sha256|type=="string" and test("^[0-9a-f]{64}$"))) and
+            (.proofs|type=="object" and (keys|sort)==["database","media"]) and
+            all(.proofs[]; (keys|sort)==["name","sha256"] and
+              (.sha256|type=="string" and test("^[0-9a-f]{64}$"))) and
+            (.recoveryId==$id) and (.capturedAt==.recoveryPointTime)
+          ' --arg id "$RECOVERY_ID" "$capture_result" >/dev/null
+          db_bytes=$(jq -er '.databaseBytes' "$capture_result")
+          uploads_files=$(jq -er '.uploads.files' "$capture_result")
+          uploads_bytes=$(jq -er '.uploads.bytes' "$capture_result")
+          uploads_digest=$(jq -er '.uploads.digest' "$capture_result")
+          db_cipher_size=$(wc -c <"$RUNNER_TEMP/postgres.dump.age" | tr -d '[:space:]')
+          db_cipher_sha=$(sha256sum "$RUNNER_TEMP/postgres.dump.age" | awk '{print $1}')
+          uploads_cipher_size=$(wc -c <"$RUNNER_TEMP/uploads.tar.gz.age" | tr -d '[:space:]')
+          uploads_cipher_sha=$(sha256sum "$RUNNER_TEMP/uploads.tar.gz.age" | awk '{print $1}')
+          [ "$db_cipher_size" = "$(jq -er '.ciphertexts.database.size' "$capture_result")" ] &&
+            [ "$db_cipher_sha" = "$(jq -er '.ciphertexts.database.sha256' "$capture_result")" ] &&
+            [ "$uploads_cipher_size" = "$(jq -er '.ciphertexts.uploads.size' "$capture_result")" ] &&
+            [ "$uploads_cipher_sha" = "$(jq -er '.ciphertexts.uploads.sha256' "$capture_result")" ] ||
+            { echo "transferred ciphertext differs from quiesced capture result" >&2; exit 1; }
+          [ "$(sha256sum "$RUNNER_TEMP/database-proof.json" | awk '{print $1}')" =
+            "$(jq -er '.proofs.database.sha256' "$capture_result")" ] &&
+            [ "$(sha256sum "$RUNNER_TEMP/media-proof.json" | awk '{print $1}')" =
+            "$(jq -er '.proofs.media.sha256' "$capture_result")" ] ||
+            { echo "transferred proof differs from quiesced capture result" >&2; exit 1; }
+          [ "$uploads_files" = "$(jq -er '.files' "$RUNNER_TEMP/media-proof.json")" ] &&
+            [ "$uploads_bytes" = "$(jq -er '.bytes' "$RUNNER_TEMP/media-proof.json")" ] &&
+            [ "$uploads_digest" = "$(jq -er '.canonicalDigest' "$RUNNER_TEMP/media-proof.json")" ] ||
+            { echo "transferred media proof differs from quiesced capture result" >&2; exit 1; }
+          point_time=$(jq -er '.recoveryPointTime' "$capture_result")
+          captured_at=$(jq -er '.capturedAt' "$capture_result")
+          point_epoch=$(date -u -d "$point_time" +%s)
+          observed_epoch=$(date -u +%s)
+          [ "$observed_epoch" -ge "$point_epoch" ] || { echo "recovery point is in the future" >&2; exit 1; }
+          observed_age=$((observed_epoch - point_epoch))
+          chmod 600 "$RUNNER_TEMP/"*.age "$RUNNER_TEMP/"*.json
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo rm -r -- '$remote'"
+          mkdir "$RUNNER_TEMP/artifact"
+          scripts/build-beta-recovery-evidence.sh manifest \
+            --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --artifact-name "beta-recovery-$RECOVERY_ID-$GITHUB_RUN_ID" \
+            --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh \
+              scripts/run-beta-recovery-capture.sh scripts/run-beta-recovery-restore.sh \
+              scripts/build-beta-recovery-evidence.sh scripts/probe-test-vps-recovery-runtime.sh \
+              scripts/backup-production.sh scripts/beta-recovery-database-proof.sql \
+              scripts/beta-recovery-media-proof.sh; do sha256sum "$file"; done |
+              sort | sha256sum | awk '{print $1}')" \
+            --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
+            --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
+            --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')" \
+            --captured-at "$captured_at" \
+            --point-time "$point_time" --observed-age-seconds "$observed_age" \
+            --database-bytes "$db_bytes" \
+            --uploads-files "$(jq -r '.files' "$RUNNER_TEMP/media-proof.json')" \
+            --uploads-bytes "$(jq -r '.bytes' "$RUNNER_TEMP/media-proof.json")" \
+            --uploads-digest "$(jq -r '.canonicalDigest' "$RUNNER_TEMP/media-proof.json")" \
+            --database-proof "$RUNNER_TEMP/database-proof.json" --media-proof "$RUNNER_TEMP/media-proof.json" \
+            --runtime-proof "$RUNNER_TEMP/capture-runtime.json" \
+            --database-ciphertext "$RUNNER_TEMP/postgres.dump.age" \
+            --uploads-ciphertext "$RUNNER_TEMP/uploads.tar.gz.age" \
+            --output "$RUNNER_TEMP/recovery-point.json"
+          cp -- "$RUNNER_TEMP/"{postgres.dump.age,uploads.tar.gz.age,recovery-point.json} \
+            "$RUNNER_TEMP/artifact/"
+          scripts/build-beta-recovery-evidence.sh validate-artifact \
+            --artifact-dir "$RUNNER_TEMP/artifact" --recovery-id "$RECOVERY_ID" \
+            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID"
+      - id: publish
+        name: Publish exactly one unique 30-day artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: beta-recovery-${{ env.RECOVERY_ID }}-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/postgres.dump.age
+            ${{ runner.temp }}/uploads.tar.gz.age
+            ${{ runner.temp }}/recovery-point.json
+      - name: Verify artifact publication commit marker
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifact_id="${{ steps.publish.outputs.artifact-id }}"
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+          artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id")
+          jq -e --arg name "beta-recovery-$RECOVERY_ID-$GITHUB_RUN_ID" \
+            '.id == ($artifact_id|tonumber) and .name == $name and .expired == false and
+             .size_in_bytes > 0 and .workflow_run.id == ($run_id|tonumber) and
+             (.created_at | (type=="string" and length > 0)) and
+             (.expires_at | (type=="string" and length > 0))' \
+            --arg run_id "$GITHUB_RUN_ID" --arg artifact_id "$artifact_id" \
+            <<<"$artifact_json"
+          created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$artifact_json")" +%s)
+          expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$artifact_json")" +%s)
+          [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
+            { echo "published artifact expiry is not exactly 30 days" >&2; exit 1; }
+
+  restore-select:
+    name: Validate numeric artifact
+    needs: authorize
+    if: inputs.operation == 'restore' && needs.authorize.result == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_dir: ${{ steps.download.outputs.artifact_dir }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate recovery ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"
+      - id: download
+        name: Download exact artifact without identity access
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID")
+          workflow_run_id=$(jq -er '.workflow_run.id' <<<"$artifact_json")
+          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
+          jq -e --arg prefix "beta-recovery-$RECOVERY_ID-" '
+            .id == ($id|tonumber) and .expired == false and .size_in_bytes > 0 and
+            (.name | startswith($prefix)) and
+            (.created_at | (type=="string" and length > 0)) and
+            (.expires_at | (type=="string" and length > 0))
+          ' --arg id "$ARTIFACT_ID" \
+            --arg sha "${{ inputs.source_sha }}" <<<"$artifact_json"
+          created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$artifact_json")" +%s)
+          expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$artifact_json")" +%s)
+          [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
+            { echo "selected artifact expiry is not exactly 30 days" >&2; exit 1; }
+          jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
+            .status == "completed" and .conclusion == "success" and
+            .event == "workflow_dispatch" and .head_branch == "dev" and
+            .head_sha == $sha and
+            ((.path // .workflow_path // "") == $workflow) and
+            ((.display_title // "") | startswith("Beta recovery capture "))
+          ' <<<"$run_json"
+          directory="$RUNNER_TEMP/artifact"
+          mkdir "$directory"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" >"$RUNNER_TEMP/artifact.zip"
+          unzip -q "$RUNNER_TEMP/artifact.zip" -d "$directory"
+          scripts/build-beta-recovery-evidence.sh validate-artifact \
+            --artifact-dir "$directory" --recovery-id "$RECOVERY_ID" \
+            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
+            --run-id "$(jq -r '.runId' "$directory/recovery-point.json")"
+          jq -e --argjson run "$(jq -r '.runId' "$directory/recovery-point.json")" \
+            --arg name "$(jq -r '.artifactName' "$directory/recovery-point.json")" \
+            '.workflow_run.id == $run and .name == $name' <<<"$artifact_json"
+          echo "artifact_dir=$directory" >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: beta-recovery-selected-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/artifact
+      - name: Remove selected artifact temporary files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup_path() {
+            local path=$1
+            if [ -L "$path" ]; then
+              rm -f -- "$path"
+            elif [ -d "$path" ]; then
+              rm -r -- "$path"
+            elif [ -e "$path" ]; then
+              rm -f -- "$path"
+            fi
+            [ ! -e "$path" ] && [ ! -L "$path" ]
+          }
+          cleanup_path "$RUNNER_TEMP/artifact.zip"
+          cleanup_path "$RUNNER_TEMP/artifact"
+
+  restore-pre-probe:
+    name: Probe test VPS before approval
+    needs: restore-select
+    if: inputs.operation == 'restore' && needs.restore-select.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: test-vps
+    env:
+      HOST: ${{ vars.TEST_VPS_HOST }}
+      PORT: ${{ vars.TEST_VPS_PORT }}
+      SSH_USER: ${{ vars.TEST_VPS_USER }}
+      HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
+      SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+      PUBLIC_URL: https://api.whysoezzy.online
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate recovery ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"
+      - name: SSH-only pre-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
+          key="$RUNNER_TEMP/ssh-key"
+          install -m 600 /dev/null "$key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
+          known="$RUNNER_TEMP/known-hosts"
+          printf '%s\n' "$HOST_FINGERPRINT" >"$known"
+          ssh -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known" "$SSH_USER@$HOST" \
+            "sudo bash -s -- '$PUBLIC_URL'" >"$RUNNER_TEMP/pre-probe.json" <<'REMOTE'
+          set -euo pipefail
+          url=$1
+          exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
+          flock -n 9
+          tmp=$(mktemp /tmp/beta-recovery-pre-probe.XXXXXX)
+          trap 'rm -f -- "$tmp"' EXIT
+          bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
+            --root /var/lib/meet-production \
+            --compose-script /var/lib/meet-test-vps-deploy/scripts/production-compose.sh \
+            --output "$tmp" --public-url "$url"
+          cat "$tmp"
+          REMOTE
+          scripts/build-beta-recovery-evidence.sh validate-runtime \
+            --runtime-proof "$RUNNER_TEMP/pre-probe.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: beta-recovery-pre-probe-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/pre-probe.json
+
+  restore-isolated:
+    name: Reviewer-approved PostgreSQL 16 restore
+    needs: [restore-select, restore-pre-probe]
+    if: inputs.operation == 'restore' && needs.restore-pre-probe.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: closed-beta-restore
+    outputs:
+      cleanup_complete: ${{ steps.final_cleanup.outputs.cleanup_complete }}
+      anonymous_volume_absent: ${{ steps.final_cleanup.outputs.anonymous_volume_absent }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate recovery ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"
+      - name: Revalidate source before identity or Docker
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin dev master
+          scripts/authorize-beta-recovery.sh revalidate \
+            --repository "$GITHUB_REPOSITORY" --source-checkout "$GITHUB_WORKSPACE" \
+            --source-sha "${{ inputs.source_sha }}" --workflow "$RECOVERY_WORKFLOW" \
+            --output-dir "$RUNNER_TEMP"
+      - name: Download exact artifact after source revalidation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          mkdir "$RUNNER_TEMP/artifact"
+          artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID")
+          workflow_run_id=$(jq -er '.workflow_run.id' <<<"$artifact_json")
+          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
+          jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
+            .status == "completed" and .conclusion == "success" and
+            .event == "workflow_dispatch" and .head_branch == "dev" and .head_sha == $sha and
+            ((.path // .workflow_path // "") == $workflow) and
+            ((.display_title // "") | startswith("Beta recovery capture "))
+          ' <<<"$run_json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
+            >"$RUNNER_TEMP/artifact.zip"
+          unzip -q "$RUNNER_TEMP/artifact.zip" -d "$RUNNER_TEMP/artifact"
+          scripts/build-beta-recovery-evidence.sh validate-artifact \
+            --artifact-dir "$RUNNER_TEMP/artifact" --recovery-id "$RECOVERY_ID" \
+            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
+            --run-id "$(jq -r '.runId' "$RUNNER_TEMP/artifact/recovery-point.json")"
+          jq -e --arg name "$(jq -r '.artifactName' "$RUNNER_TEMP/artifact/recovery-point.json")" \
+            --argjson run "$(jq -r '.runId' "$RUNNER_TEMP/artifact/recovery-point.json")" \
+            --arg sha "${{ inputs.source_sha }}" \
+            '.name == $name and .workflow_run.id == $run' \
+            <<<"$artifact_json"
+      - name: Validate runner capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/run-beta-recovery-restore.sh \
+            --capacity-only --artifact-dir "$RUNNER_TEMP/artifact" \
+            --recovery-id "$RECOVERY_ID" --output-dir "$RUNNER_TEMP/restore-output" \
+            --sql-proof scripts/beta-recovery-database-proof.sql \
+            --media-script scripts/beta-recovery-media-proof.sh \
+            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
+            --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+              scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
+              scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
+              scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh; do sha256sum "$file"; done |
+              sort | sha256sum | awk '{print $1}')" \
+            --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
+            --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
+            --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')"
+      - name: Revalidate source immediately before identity access
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin dev master
+          scripts/authorize-beta-recovery.sh revalidate \
+            --repository "$GITHUB_REPOSITORY" --source-checkout "$GITHUB_WORKSPACE" \
+            --source-sha "${{ inputs.source_sha }}" --workflow "$RECOVERY_WORKFLOW" \
+            --output-dir "$RUNNER_TEMP"
+      - id: restore
+        name: Restore and prove owned cleanup
+        shell: bash
+        env:
+          AGE_IDENTITY: ${{ secrets.BETA_RECOVERY_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          identity="$RUNNER_TEMP/age-identity"
+          install -m 600 /dev/null "$identity"
+          printf '%s\n' "$AGE_IDENTITY" >"$identity"
+          unset AGE_IDENTITY
+          mkdir -p "$RUNNER_TEMP/restore-output"
+          restore_artifact="$RUNNER_TEMP/restore-artifact"
+          mkdir "$restore_artifact"
+          cp -- "$RUNNER_TEMP/artifact/postgres.dump.age" \
+            "$RUNNER_TEMP/artifact/uploads.tar.gz.age" \
+            "$RUNNER_TEMP/artifact/recovery-point.json" "$restore_artifact/"
+          restore_temp="$RUNNER_TEMP/restore-temp"
+          mkdir -p "$restore_temp"
+          set +e
+          scripts/run-beta-recovery-restore.sh \
+            --artifact-dir "$restore_artifact" --recovery-id "$RECOVERY_ID" \
+            --output-dir "$RUNNER_TEMP/restore-output" --identity "$identity" --image "$POSTGRES_IMAGE" \
+            --sql-proof scripts/beta-recovery-database-proof.sql \
+            --media-script scripts/beta-recovery-media-proof.sh \
+            --temp-root "$restore_temp" \
+            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
+            --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+              scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
+              scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
+              scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh; do sha256sum "$file"; done |
+              sort | sha256sum | awk '{print $1}')" \
+            --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
+            --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
+            --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')"
+          restore_status=$?
+          set -e
+          [ "$restore_status" -eq 0 ]
+          [ -s "$RUNNER_TEMP/restore-output/restored-database-proof.json" ]
+          [ -s "$RUNNER_TEMP/restore-output/restored-media-proof.json" ]
+          [ -s "$RUNNER_TEMP/restore-output/mount-contract.json" ]
+          cp -- "$RUNNER_TEMP/restore-output/mount-contract.json" "$RUNNER_TEMP/mount-contract.json"
+          grep -Fxq cleanup_complete=true "$RUNNER_TEMP/restore-output/restore-summary"
+      - id: cleanup
+        name: Remove downloaded ciphertext and temporary restore state
+        if: always()
+        shell: bash
+        env:
+          RESTORE_OUTCOME: ${{ steps.restore.outcome }}
+        run: |
+          set -euo pipefail
+          cleanup_path() {
+            local path=$1
+            if [ -L "$path" ]; then
+              rm -f -- "$path"
+            elif [ -d "$path" ]; then
+              rm -r -- "$path"
+            elif [ -e "$path" ]; then
+              rm -f -- "$path"
+            fi
+            [ ! -e "$path" ] && [ ! -L "$path" ]
+          }
+          cleanup_status=0
+          for path in "$RUNNER_TEMP/age-identity" "$RUNNER_TEMP/artifact.zip" \
+            "$RUNNER_TEMP/artifact" "$RUNNER_TEMP/restore-artifact" \
+            "$RUNNER_TEMP/restore-temp"; do
+            cleanup_path "$path" || cleanup_status=1
+          done
+          if [ "$RESTORE_OUTCOME" = success ] && [ "$cleanup_status" -eq 0 ]; then
+            echo "cleanup_complete=true" >>"$GITHUB_OUTPUT"
+            echo "anonymous_volume_absent=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "cleanup_complete=false" >>"$GITHUB_OUTPUT"
+            echo "anonymous_volume_absent=false" >>"$GITHUB_OUTPUT"
+            exit 1
+          fi
+      - name: Transfer restore proofs and cleanup contract
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: beta-recovery-restore-evidence-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/restore-output/restored-database-proof.json
+            ${{ runner.temp }}/restore-output/restored-media-proof.json
+            ${{ runner.temp }}/restore-output/restore-summary
+            ${{ runner.temp }}/restore-output/mount-contract.json
+      - id: final_cleanup
+        name: Verify no isolated restore runner residue
+        if: always()
+        shell: bash
+        env:
+          RESTORE_CLEANUP_COMPLETE: ${{ steps.cleanup.outputs.cleanup_complete }}
+          ANONYMOUS_VOLUME_ABSENT: ${{ steps.cleanup.outputs.anonymous_volume_absent }}
+        run: |
+          set -euo pipefail
+          cleanup_path() {
+            local path=$1
+            if [ -L "$path" ]; then
+              rm -f -- "$path"
+            elif [ -d "$path" ]; then
+              rm -r -- "$path"
+            elif [ -e "$path" ]; then
+              rm -f -- "$path"
+            fi
+            [ ! -e "$path" ] && [ ! -L "$path" ]
+          }
+          cleanup_status=0
+          for path in "$RUNNER_TEMP/age-identity" "$RUNNER_TEMP/artifact.zip" \
+            "$RUNNER_TEMP/artifact" "$RUNNER_TEMP/restore-artifact" \
+            "$RUNNER_TEMP/restore-temp" "$RUNNER_TEMP/restore-output" \
+            "$RUNNER_TEMP/mount-contract"; do
+            cleanup_path "$path" || cleanup_status=1
+          done
+          if [ "$RESTORE_CLEANUP_COMPLETE" = true ] &&
+            [ "$ANONYMOUS_VOLUME_ABSENT" = true ] && [ "$cleanup_status" -eq 0 ]; then
+            echo "cleanup_complete=true" >>"$GITHUB_OUTPUT"
+            echo "anonymous_volume_absent=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "cleanup_complete=false" >>"$GITHUB_OUTPUT"
+            echo "anonymous_volume_absent=false" >>"$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+  restore-post-probe:
+    name: Probe test VPS after cleanup
+    needs: [restore-pre-probe, restore-isolated]
+    if: always() && inputs.operation == 'restore' && needs.restore-pre-probe.result == 'success' &&
+      needs.restore-isolated.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: test-vps
+    outputs:
+      post_probe_at: ${{ steps.post_probe.outputs.post_probe_at }}
+    env:
+      HOST: ${{ vars.TEST_VPS_HOST }}
+      PORT: ${{ vars.TEST_VPS_PORT }}
+      SSH_USER: ${{ vars.TEST_VPS_USER }}
+      HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
+      SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+      PUBLIC_URL: https://api.whysoezzy.online
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate recovery ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"
+      - id: post_probe
+        name: SSH-only post-probe
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
+          key="$RUNNER_TEMP/ssh-key"
+          install -m 600 /dev/null "$key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
+          known="$RUNNER_TEMP/known-hosts"
+          printf '%s\n' "$HOST_FINGERPRINT" >"$known"
+          ssh -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known" "$SSH_USER@$HOST" \
+            "sudo bash -s -- '$PUBLIC_URL'" >"$RUNNER_TEMP/post-probe.json" <<'REMOTE'
+          set -euo pipefail
+          url=$1
+          exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
+          flock -n 9
+          tmp=$(mktemp /tmp/beta-recovery-post-probe.XXXXXX)
+          trap 'rm -f -- "$tmp"' EXIT
+          bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
+            --root /var/lib/meet-production \
+            --compose-script /var/lib/meet-test-vps-deploy/scripts/production-compose.sh \
+            --output "$tmp" --public-url "$url"
+          cat "$tmp"
+          REMOTE
+          scripts/build-beta-recovery-evidence.sh validate-runtime \
+            --runtime-proof "$RUNNER_TEMP/post-probe.json"
+          gh run download "$GITHUB_RUN_ID" --name "beta-recovery-pre-probe-$GITHUB_RUN_ID" \
+            --dir "$RUNNER_TEMP/pre"
+          cmp -- "$RUNNER_TEMP/pre/pre-probe.json" "$RUNNER_TEMP/post-probe.json"
+          echo "equal=true" >>"$GITHUB_OUTPUT"
+          echo "post_probe_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: beta-recovery-post-probe-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/post-probe.json
+
+  evidence:
+    name: Require complete secret-free evidence
+    needs: [restore-select, restore-isolated, restore-post-probe]
+    if: always() && inputs.operation == 'restore' && needs.restore-select.result == 'success' &&
+      needs.restore-isolated.result == 'success'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate recovery ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recovery-selected-${{ github.run_id }}
+          path: ${{ runner.temp }}/selected
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recovery-restore-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/restore-evidence
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recovery-pre-probe-${{ github.run_id }}
+          path: ${{ runner.temp }}/pre
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recovery-post-probe-${{ github.run_id }}
+          path: ${{ runner.temp }}/post
+      - name: Validate exact transferred artifact and secret-safe probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/build-beta-recovery-evidence.sh validate-artifact \
+            --artifact-dir "$RUNNER_TEMP/selected" --recovery-id "$RECOVERY_ID" \
+            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
+            --run-id "$(jq -r '.runId' "$RUNNER_TEMP/selected/recovery-point.json")"
+          scripts/build-beta-recovery-evidence.sh validate-runtime \
+            --runtime-proof "$RUNNER_TEMP/pre/pre-probe.json"
+          scripts/build-beta-recovery-evidence.sh validate-runtime \
+            --runtime-proof "$RUNNER_TEMP/post/post-probe.json"
+          cmp -- "$RUNNER_TEMP/pre/pre-probe.json" "$RUNNER_TEMP/post/post-probe.json"
+          test "${{ needs.restore-isolated.outputs.cleanup_complete }}" = true
+          test "${{ needs.restore-isolated.outputs.anonymous_volume_absent }}" = true
+          test "${{ needs.restore-post-probe.result }}" = success
+          test -s "$RUNNER_TEMP/restore-evidence/restore-summary"
+          grep -Fxq cleanup_complete=true "$RUNNER_TEMP/restore-evidence/restore-summary"
+          if grep -Eiq -- '-----BEGIN .*PRIVATE KEY-----|postgres(ql)?://|password[=:]|secret[=:]|token[=:]' \
+            "$RUNNER_TEMP"/selected/*.json "$RUNNER_TEMP"/pre/*.json "$RUNNER_TEMP"/post/*.json \
+            "$RUNNER_TEMP"/restore-evidence/*.json; then
+            echo "secret-like material appeared in recovery evidence" >&2
+            exit 1
+          fi
+      - name: Construct canonical recovery drill evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/selected/recovery-point.json"
+          jq -cS '.databaseProof' "$manifest" >"$RUNNER_TEMP/selected-database-proof.json"
+          jq -cS '.mediaProof' "$manifest" >"$RUNNER_TEMP/selected-media-proof.json"
+          artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/${{ inputs.artifact_id }}")
+          artifact_name=$(jq -r '.artifactName' "$manifest")
+          artifact_run=$(jq -r '.runId' "$manifest")
+          artifact_workflow_run=$(jq -er '.workflow_run.id' <<<"$artifact_json")
+          artifact_run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_workflow_run")
+          jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
+            .status == "completed" and .conclusion == "success" and
+            .event == "workflow_dispatch" and .head_branch == "dev" and .head_sha == $sha and
+            ((.path // .workflow_path // "") == $workflow) and
+            ((.display_title // "") | startswith("Beta recovery capture "))
+          ' <<<"$artifact_run_json"
+          jq -e --arg name "$artifact_name" --argjson run "$artifact_run" \
+            --arg sha "${{ inputs.source_sha }}" \
+            '.id == ($id|tonumber) and .name == $name and .expired == false and
+             .size_in_bytes > 0 and .workflow_run.id == $run and
+             (.created_at | (type=="string" and length > 0)) and
+             (.expires_at | (type=="string" and length > 0))' \
+            --arg id "${{ inputs.artifact_id }}" <<<"$artifact_json"
+          created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$artifact_json")" +%s)
+          expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$artifact_json")" +%s)
+          [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
+            { echo "final artifact expiry is not exactly 30 days" >&2; exit 1; }
+          dispatch_at=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" |
+            jq -er '.event == "workflow_dispatch" and .head_branch == "dev" and
+              .head_sha == $sha | .created_at' --arg sha "${{ inputs.source_sha }}")
+          scripts/build-beta-recovery-evidence.sh final \
+            --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --artifact-id "${{ inputs.artifact_id }}" --artifact-name "$artifact_name" \
+            --manifest "$manifest" \
+            --database-proof "$RUNNER_TEMP/selected-database-proof.json" \
+            --media-proof "$RUNNER_TEMP/selected-media-proof.json" \
+            --restored-database-proof "$RUNNER_TEMP/restore-evidence/restored-database-proof.json" \
+            --restored-media-proof "$RUNNER_TEMP/restore-evidence/restored-media-proof.json" \
+            --pre-probe "$RUNNER_TEMP/pre/pre-probe.json" \
+            --post-probe "$RUNNER_TEMP/post/post-probe.json" \
+            --mount-contract "$RUNNER_TEMP/restore-evidence/mount-contract.json" \
+            --dispatch-at "$dispatch_at" \
+            --post-probe-at "${{ needs.restore-post-probe.outputs.post_probe_at }}" \
+            --healthy true --equal true --artifact-verified true \
+            --cleanup-complete "${{ needs.restore-isolated.outputs.cleanup_complete }}" \
+            --anonymous-volume-absent "${{ needs.restore-isolated.outputs.anonymous_volume_absent }}" \
+            --status success --output "$RUNNER_TEMP/beta-recovery-drill.json"
+          jq -e '
+            .schema == "meet-backend/beta-recovery-drill/v1" and
+            .artifact.id == ($id|tonumber) and .artifact.name == $name and
+            .restore.healthy == true and .restore.equal == true and
+            .restore.mountContract.schema == "meet-backend/beta-recovery-mount/v1" and
+            .timing.dispatchToPostProbeSeconds <= 7200 and
+            .preProbe == .postProbe
+          ' --arg id "${{ inputs.artifact_id }}" --arg name "$artifact_name" \
+            "$RUNNER_TEMP/beta-recovery-drill.json"
+      - name: Hash canonical secret-free evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum "$RUNNER_TEMP/beta-recovery-drill.json" |
+            awk '{print $1}' >"$RUNNER_TEMP/beta-recovery-drill.json.sha256"
+          test "$(wc -c <"$RUNNER_TEMP/beta-recovery-drill.json.sha256" |
+            tr -d '[:space:]')" -eq 65
+      - name: Publish canonical secret-free evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: beta-recovery-drill-${{ env.RECOVERY_ID }}-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/beta-recovery-drill.json
+            ${{ runner.temp }}/beta-recovery-drill.json.sha256
