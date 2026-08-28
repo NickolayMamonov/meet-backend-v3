@@ -26,7 +26,34 @@ grep -Fq 'beta-recovery-drill-' "$workflow"
 grep -Fq 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' "$workflow"
 grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
 grep -Fq 'Revalidate source immediately before identity access' "$workflow"
-grep -Fq 'scp_opts=(-i "$key" -P "$PORT"' "$workflow"
+grep -Fq 'scp_opts=(-F "$config" -i "$key" -P "$PORT"' "$workflow"
+grep -Fq 'scripts/materialize-beta-recovery-known-hosts.sh' "$workflow"
+helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
+[ "$helper_count" -eq 3 ]
+for required in \
+  'ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")' \
+  'install -m 600 /dev/null "$config"' \
+  '-F "$config"' \
+  '-o StrictHostKeyChecking=yes' \
+  '-o UserKnownHostsFile="$known"' \
+  '-o GlobalKnownHostsFile=/dev/null' \
+  '-o KnownHostsCommand=none' \
+  'trap cleanup_probe EXIT HUP INT TERM' \
+  'trap cleanup_capture EXIT HUP INT TERM'; do
+  grep -Fq -- "$required" "$workflow"
+done
+if grep -Fq 'printf '\''%s\n'\'' "$HOST_FINGERPRINT"' "$workflow"; then
+  echo "workflow directly writes the configured fingerprint" >&2
+  exit 1
+fi
+capture_block=$(awk '/Stage and run the locked VPS capture/{flag=1} /restore-select:/{flag=0} flag' "$workflow")
+pre_probe_block=$(awk '/restore-pre-probe:/{flag=1} /restore-isolated:/{flag=0} flag' "$workflow")
+post_probe_block=$(awk '/restore-post-probe:/{flag=1} /evidence:/{flag=0} flag' "$workflow")
+for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
+  helper_line=$(grep -n 'scripts/materialize-beta-recovery-known-hosts.sh' <<<"$block" | head -1 | cut -d: -f1)
+  key_line=$(grep -n 'install -m 600 /dev/null "$key"' <<<"$block" | head -1 | cut -d: -f1)
+  [ "$helper_line" -lt "$key_line" ]
+done
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
 grep -Fq 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow"
 grep -Fq 'archive_size=10263766' "$root/scripts/install-beta-recovery-age.sh"

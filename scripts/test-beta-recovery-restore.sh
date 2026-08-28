@@ -125,7 +125,7 @@ run_restore_fixture() {
     scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
     scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
     scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
-    scripts/install-beta-recovery-age.sh; do
+    scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh; do
     sha256sum "$file"
   done | sort | sha256sum | awk '{print $1}')
   workflow_digest=$(sha256sum .github/workflows/prove-beta-backup-restore.yml | awk '{print $1}')
