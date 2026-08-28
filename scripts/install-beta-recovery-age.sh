@@ -96,8 +96,8 @@ done
 
 age=$install_dir/age
 age_keygen=$install_dir/age-keygen
-[ "$("$age" --version)" = 1.3.1 ] || fail "age version differs"
-[ "$("$age_keygen" --version)" = 1.3.1 ] || fail "age-keygen version differs"
+[ "$("$age" --version)" = v1.3.1 ] || fail "age version differs"
+[ "$("$age_keygen" --version)" = v1.3.1 ] || fail "age-keygen version differs"
 identity=$staging/canary-identity
 plaintext=$staging/canary-plaintext
 ciphertext=$staging/canary.age

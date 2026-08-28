@@ -16,7 +16,7 @@ program=$(basename -- "$0")
 if [ "$program" = age-keygen ]; then
   case "${1:-}" in
     --version)
-      printf '1.3.1\n'
+      printf 'v1.3.1\n'
       exit 0
       ;;
     -y)
@@ -52,7 +52,7 @@ identity=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --version)
-      printf '1.3.1\n'
+      printf 'v1.3.1\n'
       exit 0
       ;;
     -o)
