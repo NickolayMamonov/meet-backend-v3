@@ -219,7 +219,7 @@ jobs:
               scripts/run-beta-recovery-capture.sh scripts/run-beta-recovery-restore.sh \
               scripts/build-beta-recovery-evidence.sh scripts/probe-test-vps-recovery-runtime.sh \
               scripts/backup-production.sh scripts/beta-recovery-database-proof.sql \
-              scripts/beta-recovery-media-proof.sh; do sha256sum "$file"; done |
+              scripts/beta-recovery-media-proof.sh scripts/install-beta-recovery-age.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
@@ -490,11 +490,19 @@ jobs:
             --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
               scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
-              scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh; do sha256sum "$file"; done |
+              scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
+              scripts/install-beta-recovery-age.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
             --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')"
+      - name: Provision and canary pinned age toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          age_bin="$RUNNER_TEMP/beta-recovery-age-v1.3.1/bin"
+          scripts/install-beta-recovery-age.sh "$age_bin"
+          printf '%s\n' "$age_bin" >>"$GITHUB_PATH"
       - name: Revalidate source immediately before identity access
         shell: bash
         env:
@@ -514,6 +522,13 @@ jobs:
         run: |
           set -euo pipefail
           identity="$RUNNER_TEMP/age-identity"
+          cleanup_identity() {
+            local status=$?
+            trap - EXIT HUP INT TERM
+            rm -f -- "$identity" || status=1
+            exit "$status"
+          }
+          trap cleanup_identity EXIT HUP INT TERM
           install -m 600 /dev/null "$identity"
           printf '%s\n' "$AGE_IDENTITY" >"$identity"
           unset AGE_IDENTITY
@@ -536,7 +551,8 @@ jobs:
             --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
               scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
-              scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh; do sha256sum "$file"; done |
+              scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
+              scripts/install-beta-recovery-age.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
