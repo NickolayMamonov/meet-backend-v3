@@ -114,9 +114,13 @@ reconcile_states(){
   if [ -n "$reconcile_output" ]; then mv -- "$summary" "$reconcile_output"; chmod 600 "$reconcile_output"; else rm -f -- "$summary"; fi
   trap - RETURN
 }
+smtp_pointer="$state_root/.smtp-transaction.current"
+[ ! -e "$smtp_pointer" ] && [ ! -L "$smtp_pointer" ] ||
+  fail "SMTP transaction pointer is present"
 reconcile_states
 [ "$mode" = reconcile ] && exit 0
-[ ! -e "$state_root/.smtp-transaction.current" ] || fail "SMTP transaction is active"
+[ ! -e "$smtp_pointer" ] && [ ! -L "$smtp_pointer" ] ||
+  fail "SMTP transaction pointer appeared during reconciliation"
 [ ! -e "$state_root/beta-recovery-$recovery_id" ] || fail "recovery ID already exists"
 published=(); pre_tmp=''
 cleanup_staged(){
@@ -151,7 +155,18 @@ export BETA_DATABASE_PROOF_SCRIPT="$database_proof" BETA_MEDIA_PROOF_SCRIPT="$me
 write_journal snapshot_complete
 post=$state/private/post-capture.json; probe_runtime "$post"; cmp -- "$state/private/capture-runtime.json" "$post" || fail "runtime or HTTPS changed during capture"; write_journal runtime_verified
 for file in postgres.dump.age uploads.tar.gz.age capture-database-proof.json capture-media-proof.json capture-result.json capture-runtime.json post-capture.json; do [ -f "$state/private/$file" ] && [ ! -L "$state/private/$file" ] || fail "capture output incomplete"; done
-jq -e --arg id "$recovery_id" '.schema=="meet-backend/beta-recovery-capture/v1" and .recoveryId==$id and (.databaseBytes|type=="number" and floor==. and .>=0) and (.uploads.bytes|type=="number" and floor==. and .>=0) and (.uploads.digest|test("^[0-9a-f]{64}$")) and .ciphertexts.database.name=="postgres.dump.age" and .ciphertexts.uploads.name=="uploads.tar.gz.age" and .proofs.database.name=="capture-database-proof.json" and .proofs.media.name=="capture-media-proof.json"' "$state/private/capture-result.json" >/dev/null || fail "capture result malformed"
+jq -e --arg id "$recovery_id" '.schema=="meet-backend/beta-recovery-capture/v1" and .recoveryId==$id and
+  (.capturedAt|type=="string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^[:space:]]+Z$")) and
+  (.recoveryPointTime|type=="string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^[:space:]]+Z$")) and
+  (.databaseBytes|type=="number" and floor==. and .>=0) and
+  (.uploads.files|type=="number" and floor==. and .>=0) and
+  (.uploads.bytes|type=="number" and floor==. and .>=0) and
+  (.uploads.digest|type=="string" and test("^[0-9a-f]{64}$")) and
+  .ciphertexts.database.name=="postgres.dump.age" and .ciphertexts.uploads.name=="uploads.tar.gz.age" and
+  (.ciphertexts[] | (.size|type=="number" and floor==. and .>0)) and
+  (.ciphertexts[] | (.sha256|type=="string" and test("^[0-9a-f]{64}$"))) and
+  .proofs.database.name=="capture-database-proof.json" and .proofs.media.name=="capture-media-proof.json" and
+  (.proofs[] | (.sha256|type=="string" and test("^[0-9a-f]{64}$")))' "$state/private/capture-result.json" >/dev/null || fail "capture result malformed"
 for proof in capture-database-proof.json capture-media-proof.json; do [ "$(wc -l <"$state/private/$proof" | tr -d '[:space:]')" = 1 ] || fail "capture proof is not compact"; done
 jq -e '.schema=="meet-backend/closed-beta-database-proof/v1"' "$state/private/capture-database-proof.json" >/dev/null || fail "database proof malformed"
 jq -e '.schema=="meet-backend/beta-recovery-media-proof/v1" and .referencesResolved==true' "$state/private/capture-media-proof.json" >/dev/null || fail "media proof malformed"

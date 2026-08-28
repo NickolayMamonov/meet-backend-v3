@@ -139,6 +139,7 @@ if [ "${1:-}" = "--beta" ]; then
   trap cleanup EXIT HUP INT TERM
   docker stop --time 30 "$backend" >/dev/null
   trap 'cleanup' EXIT HUP INT TERM
+  point_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   db_bytes=$("${COMPOSE[@]}" exec -T postgres sh -c \
     'psql -X -Atqc "SELECT pg_database_size(current_database())"' | tr -d '[:space:]')
   [[ "$db_bytes" =~ ^[1-9][0-9]*$ ]] || exit 1
@@ -187,7 +188,9 @@ if [ "${1:-}" = "--beta" ]; then
     --argjson files "$(jq -er '.files' "$beta_dir/capture-media-proof.json")" \
     --argjson bytes "$(jq -er '.bytes' "$beta_dir/capture-media-proof.json")" \
     --arg digest "$(jq -er '.canonicalDigest' "$beta_dir/capture-media-proof.json")" \
-    '{schema:"meet-backend/beta-recovery-capture/v1",recoveryId:$id,databaseBytes:$db,
+    --arg point "$point_time" \
+    '{schema:"meet-backend/beta-recovery-capture/v1",recoveryId:$id,
+      capturedAt:$point,recoveryPointTime:$point,databaseBytes:$db,
       uploads:{files:$files,bytes:$bytes,digest:$digest},
       ciphertexts:{database:{name:"postgres.dump.age",size:$dbsize,sha256:$dbsha},
         uploads:{name:"uploads.tar.gz.age",size:$mediasize,sha256:$mediasha}},

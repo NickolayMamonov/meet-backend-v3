@@ -126,6 +126,7 @@ run_restore_fixture() {
     --tooling-digest "$tooling" --workflow-digest "$workflow_digest" \
     --database-digest "$database_digest" --media-digest "$media_digest" \
     --captured-at 2026-08-27T19:00:00Z --point-time 2026-08-27T19:00:00Z \
+    --observed-age-seconds 120 \
     --database-bytes 1 --uploads-files "$(jq -er '.files' "$case_dir/media-proof.json")" \
     --uploads-bytes "$(jq -er '.bytes' "$case_dir/media-proof.json")" --uploads-digest "$hash" \
     --database-proof "$case_dir/database-proof.json" --media-proof "$case_dir/media-proof.json" \
@@ -162,21 +163,64 @@ run_restore_fixture() {
   export FAKE_DATABASE_DUMP="$case_dir/database.dump"
   export FAKE_UPLOADS_ARCHIVE="$case_dir/uploads.tar.gz"
   export POSTGRES_IMAGE=repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  if [ "$behavior" = survivor ]; then
+  if [ "$behavior" = collision ]; then
+    collision_token=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
     PATH="$case_dir/bin:$PATH" docker network create \
       --label com.meet-backend.beta-recovery/owner=restore \
       --label com.meet-backend.beta-recovery/recovery-id=recovery-fixture \
+      --label com.meet-backend.beta-recovery/owner-token="$collision_token" \
       beta-recovery-recovery-fixture
     PATH="$case_dir/bin:$PATH" docker create \
       --name beta-recovery-postgres-recovery-fixture \
       --label com.meet-backend.beta-recovery/owner=restore \
       --label com.meet-backend.beta-recovery/recovery-id=recovery-fixture \
+      --label com.meet-backend.beta-recovery/owner-token="$collision_token" \
+      "$POSTGRES_IMAGE"
+    printf 'pre-existing\n' >"$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/_data/sentinel"
+    if PATH="$case_dir/bin:$PATH" bash "$script" \
+      --artifact-dir "$case_dir/artifact" --recovery-id recovery-fixture \
+      --output-dir "$case_dir/output" --identity "$case_dir/identity" \
+      --sql-proof "$root/scripts/beta-recovery-database-proof.sql" \
+      --media-script "$root/scripts/beta-recovery-media-proof.sh" \
+      --temp-root "$case_dir/temp" --source-sha 0123456789abcdef0123456789abcdef01234567 \
+      --repository NickolayMamonov/meet-backend-v3 --tooling-digest "$tooling" \
+      --workflow-digest "$workflow_digest" --database-digest "$database_digest" \
+      --media-digest "$media_digest"; then
+      echo "same-name collision unexpectedly succeeded" >&2
+      exit 1
+    fi
+    [ -e "$case_dir/docker-state/container" ] && [ -e "$case_dir/docker-state/network" ] &&
+      [ -e "$case_dir/docker-state/volume" ] &&
+      [ "$(cat "$case_dir/docker-state/container-owner-token")" = "$collision_token" ] &&
+      [ "$(cat "$case_dir/docker-state/network-owner-token")" = "$collision_token" ] &&
+      [ "$(cat "$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/_data/sentinel")" = pre-existing ] ||
+      { echo "same-name collision resource was modified" >&2; exit 1; }
+    return
+  fi
+  if [ "$behavior" = survivor ]; then
+    survivor_token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    jq -cn --arg id recovery-fixture --arg token "$survivor_token" \
+      '{schema:"meet-backend/beta-recovery-ownership/v1",recoveryId:$id,ownerToken:$token,
+        containerName:"beta-recovery-postgres-recovery-fixture",networkName:"beta-recovery-recovery-fixture",
+        containerAttempted:true,containerCreated:true,networkAttempted:true,networkCreated:true}' \
+      >"$case_dir/temp/ownership.json"
+    PATH="$case_dir/bin:$PATH" docker network create \
+      --label com.meet-backend.beta-recovery/owner=restore \
+      --label com.meet-backend.beta-recovery/recovery-id=recovery-fixture \
+      --label com.meet-backend.beta-recovery/owner-token="$survivor_token" \
+      beta-recovery-recovery-fixture
+    PATH="$case_dir/bin:$PATH" docker create \
+      --name beta-recovery-postgres-recovery-fixture \
+      --label com.meet-backend.beta-recovery/owner=restore \
+      --label com.meet-backend.beta-recovery/recovery-id=recovery-fixture \
+      --label com.meet-backend.beta-recovery/owner-token="$survivor_token" \
       "$POSTGRES_IMAGE"
     [ ! -e "$case_dir/temp/volume.identity" ]
     PATH="$case_dir/bin:$PATH" bash "$script" --cleanup-survivors \
       --container beta-recovery-postgres-recovery-fixture \
       --network beta-recovery-recovery-fixture \
       --volume-identity "$case_dir/temp/volume.identity" \
+      --ownership-marker "$case_dir/temp/ownership.json" --owner-token "$survivor_token" \
       --recovery-id recovery-fixture --docker-root "$case_dir/docker-root"
     [ ! -e "$case_dir/docker-state/container" ] && [ ! -e "$case_dir/docker-state/network" ] &&
       [ ! -e "$case_dir/docker-state/volume" ] &&
@@ -245,6 +289,7 @@ run_restore_fixture restore-named 1 named
 run_restore_fixture restore-duplicate 1 duplicate
 run_restore_fixture restore-missing 1 missing
 run_restore_fixture restore-unexpected 1 unexpected
+run_restore_fixture restore-collision 1 valid collision
 run_restore_fixture restore-interruption 137 valid interrupt
 run_restore_fixture restore-interruption-retry 0 valid survivor
 

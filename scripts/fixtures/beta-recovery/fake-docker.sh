@@ -6,58 +6,82 @@ root=${FAKE_DOCKER_ROOT:?}
 mkdir -p "$state" "$root/volumes"
 volume=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 volume_root="$root/volumes/$volume/_data"
+label_value() {
+  local key=$1 arg
+  shift
+  for arg in "$@"; do
+    case "$arg" in "$key="*) printf '%s\n' "${arg#*=}"; return 0;; esac
+  done
+  return 1
+}
+container_owner_token() {
+  [ -f "$state/container-owner-token" ] && cat "$state/container-owner-token" ||
+    printf '%s' "${FAKE_DOCKER_OWNER_TOKEN:-}"
+}
+network_owner_token() {
+  [ -f "$state/network-owner-token" ] && cat "$state/network-owner-token" ||
+    printf '%s' "${FAKE_DOCKER_OWNER_TOKEN:-}"
+}
 
 json_container() {
   local mounts=${FAKE_DOCKER_MOUNT_MODE:-valid}
+  local token
+  token=$(container_owner_token)
   case "$mounts" in
     valid)
-      jq -cn --arg volume "$volume" --arg source "$volume_root" '
+      jq -cn --arg volume "$volume" --arg source "$volume_root" --arg token "$token" '
         [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
-            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID,
+            "com.meet-backend.beta-recovery/owner-token":$token}},
           HostConfig:{Binds:[],Mounts:[]},
           Mounts:[{Type:"volume",Name:$volume,Destination:"/var/lib/postgresql/data",RW:true,Source:$source}]}]'
       ;;
     bind)
-      jq -cn --arg source "$state/bind" '
+      jq -cn --arg source "$state/bind" --arg token "$token" '
         [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
-            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID,
+            "com.meet-backend.beta-recovery/owner-token":$token}},
           HostConfig:{Binds:[$source],Mounts:[]},
           Mounts:[{Type:"bind",Source:$source,Destination:"/var/lib/postgresql/data",RW:true}]}]'
       ;;
     named)
-      jq -cn --arg source "$root/volumes/meet-production_postgres_data/_data" '
+      jq -cn --arg source "$root/volumes/meet-production_postgres_data/_data" --arg token "$token" '
         [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
-            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID,
+            "com.meet-backend.beta-recovery/owner-token":$token}},
           HostConfig:{Binds:[],Mounts:[]},
           Mounts:[{Type:"volume",Name:"meet-production_postgres_data",
             Destination:"/var/lib/postgresql/data",RW:true,Source:$source}]}]'
       ;;
     duplicate)
-      jq -cn --arg volume "$volume" --arg source "$volume_root" '
+      jq -cn --arg volume "$volume" --arg source "$volume_root" --arg token "$token" '
         [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
-            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID,
+            "com.meet-backend.beta-recovery/owner-token":$token}},
           HostConfig:{Binds:[],Mounts:[]},
           Mounts:[
             {Type:"volume",Name:$volume,Destination:"/var/lib/postgresql/data",RW:true,Source:$source},
             {Type:"volume",Name:$volume,Destination:"/other",RW:true,Source:$source}]}]'
       ;;
     unexpected)
-      jq -cn --arg volume "$volume" --arg source "$volume_root" '
+      jq -cn --arg volume "$volume" --arg source "$volume_root" --arg token "$token" '
         [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
-            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID,
+            "com.meet-backend.beta-recovery/owner-token":$token}},
           HostConfig:{Binds:[],Mounts:[]},
           Mounts:[{Type:"volume",Name:$volume,Destination:"/unexpected",RW:true,Source:$source}]}]'
       ;;
     missing)
-      jq -cn '
+      jq -cn --arg token "$token" '
         [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
-            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID,
+            "com.meet-backend.beta-recovery/owner-token":$token}},
           HostConfig:{Binds:[],Mounts:[]},Mounts:[]}]'
       ;;
     *) exit 2 ;;
@@ -79,13 +103,17 @@ case "${1:-}" in
     ;;
   network)
     case "${2:-}" in
-      create) touch "$state/network" ;;
+      create)
+        touch "$state/network"
+        label_value com.meet-backend.beta-recovery/owner-token "$@" >"$state/network-owner-token" || :
+        ;;
       inspect)
         [ -e "$state/network" ] || { echo 'No such network' >&2; exit 1; }
-        jq -cn --arg id "$FAKE_RECOVERY_ID" \
+        jq -cn --arg id "$FAKE_RECOVERY_ID" --arg token "$(network_owner_token)" \
           '[{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
-            "com.meet-backend.beta-recovery/recovery-id":$id}}]' ;;
-      rm) rm -f "$state/network" ;;
+            "com.meet-backend.beta-recovery/recovery-id":$id,
+            "com.meet-backend.beta-recovery/owner-token":$token}}]' ;;
+      rm) rm -f "$state/network" "$state/network-owner-token" ;;
       *) exit 2 ;;
     esac
     ;;
@@ -100,7 +128,7 @@ case "${1:-}" in
           touch "$state/container-rm-failed"
           exit 1
         fi
-        rm -f "$state/container"
+        rm -f "$state/container" "$state/container-owner-token"
         if [ "${3:-}" = --force ] && [ "${4:-}" = --volumes ] &&
           [ "${FAKE_DOCKER_PRESERVE_VOLUME:-0}" != 1 ]; then
           rm -f "$state/volume"
@@ -112,6 +140,7 @@ case "${1:-}" in
     ;;
   create)
     touch "$state/container"
+    label_value com.meet-backend.beta-recovery/owner-token "$@" >"$state/container-owner-token" || :
     if [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = valid ] ||
       [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = duplicate ] ||
       [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = unexpected ]; then

@@ -28,6 +28,13 @@ grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
 grep -Fq 'Revalidate source immediately before identity access' "$workflow"
 grep -Fq 'scp_opts=(-i "$key" -P "$PORT"' "$workflow"
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
+grep -Fq 'transferred ciphertext differs from quiesced capture result' "$workflow"
+grep -Fq 'transferred proof differs from quiesced capture result' "$workflow"
+grep -Fq '.capturedAt==.recoveryPointTime' "$workflow"
+grep -Fq 'observed_age=$((observed_epoch - point_epoch))' "$workflow"
+grep -Fq '.created_at | (type=="string"' "$workflow"
+grep -Fq '.expires_at | (type=="string"' "$workflow"
+grep -Fq '30 * 24 * 60 * 60' "$workflow"
 if grep -Eq '\.workflow_run\.(event|head_branch|head_sha)' "$workflow"; then
   echo "artifact validation depends on unavailable nested workflow-run fields" >&2
   exit 1
@@ -38,6 +45,38 @@ jq -e '.workflow_run.id == 123 and (.workflow_run.event // null) == null and
   <<<"$artifact_fixture" >/dev/null
 if jq -e '.event == "workflow_dispatch" or .head_branch == "dev"' <<<"$artifact_fixture" >/dev/null; then
   echo "artifact fixture unexpectedly exposed top-level run fields" >&2
+  exit 1
+fi
+capture_db_sha=$(printf '%s\n' database-proof | sha256sum | awk '{print $1}')
+capture_media_sha=$(printf '%s\n' media-proof | sha256sum | awk '{print $1}')
+capture_fixture=$(jq -cn --arg db "$capture_db_sha" --arg media "$capture_media_sha" '
+  {capturedAt:"2026-08-27T19:00:00Z",recoveryPointTime:"2026-08-27T19:00:00Z",
+   ciphertexts:{database:{size:10,sha256:$db},uploads:{size:11,sha256:$media}},
+   proofs:{database:{name:"database-proof.json",sha256:$db},
+           media:{name:"media-proof.json",sha256:$media}}}')
+jq -e '
+  .capturedAt == .recoveryPointTime and
+  all(.ciphertexts[]; (.size|type=="number") and (.sha256|test("^[0-9a-f]{64}$"))) and
+  all(.proofs[]; (.sha256|test("^[0-9a-f]{64}$")))
+' <<<"$capture_fixture" >/dev/null
+jq -e --arg db "$capture_db_sha" --arg media "$capture_media_sha" '
+  .ciphertexts.database.sha256 == $db and
+  .ciphertexts.uploads.sha256 == $media and
+  .proofs.database.sha256 == $db and
+  .proofs.media.sha256 == $media
+' <<<"$capture_fixture" >/dev/null
+point_epoch=$(date -u -d 2026-08-27T19:00:00Z +%s)
+observed_epoch=$((point_epoch + 120))
+[ "$((observed_epoch - point_epoch))" -eq 120 ]
+expiry_fixture='{"created_at":"2026-08-01T00:00:00Z","expires_at":"2026-08-31T00:00:00Z"}'
+jq -e '(.created_at|type=="string") and (.expires_at|type=="string")' \
+  <<<"$expiry_fixture" >/dev/null
+created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$expiry_fixture")" +%s)
+expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$expiry_fixture")" +%s)
+[ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ]
+short_expires_epoch=$(date -u -d 2026-08-30T00:00:00Z +%s)
+if [ "$short_expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ]; then
+  echo "short artifact expiry fixture was accepted" >&2
   exit 1
 fi
 grep -Fq 'capture-database-proof.json' "$workflow"

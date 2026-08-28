@@ -10,6 +10,7 @@ preflight_cleanup(){
   local status=$?
   trap - EXIT HUP INT TERM
   [ -z "$identity" ] || rm -f -- "$identity" || status=1
+  [ -z "${ownership_marker:-}" ] || rm -f -- "$ownership_marker" || status=1
   exit "$status"
 }
 trap preflight_cleanup EXIT HUP INT TERM
@@ -109,6 +110,31 @@ load_container_volume_identities(){
   volume=${volume_identities[0]}
   marker_owned=1
 }
+write_ownership(){
+  local container_attempted=$1 container_created=$2 network_attempted=$3 network_created=$4 tmp
+  tmp=$ownership_marker.tmp.$$
+  jq -cnS --arg id "$id" --arg token "$owner_token" --arg container "$container" --arg network "$network" \
+    --argjson container_attempted "$container_attempted" --argjson container_created "$container_created" \
+    --argjson network_attempted "$network_attempted" --argjson network_created "$network_created" \
+    '{schema:"meet-backend/beta-recovery-ownership/v1",recoveryId:$id,ownerToken:$token,
+      containerName:$container,networkName:$network,containerAttempted:$container_attempted,
+      containerCreated:$container_created,networkAttempted:$network_attempted,networkCreated:$network_created}' \
+    >"$tmp"
+  chmod 600 "$tmp" && mv -f -- "$tmp" "$ownership_marker" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+}
+load_ownership(){
+  local marker_json=$1
+  jq -e --arg id "$id" --arg token "$owner_token" --arg container "$container" --arg network "$network" '
+    (keys|sort)==["containerAttempted","containerCreated","containerName","networkAttempted","networkCreated","networkName","ownerToken","recoveryId","schema"] and
+    .schema=="meet-backend/beta-recovery-ownership/v1" and .recoveryId==$id and .ownerToken==$token and
+    .containerName==$container and .networkName==$network and
+    (.containerAttempted|type=="boolean") and (.containerCreated|type=="boolean") and
+    (.networkAttempted|type=="boolean") and (.networkCreated|type=="boolean")
+  ' "$marker_json" >/dev/null
+}
 validate_upload_archive(){
   local archive=$1 work=$2 names="$2/names" details="$2/details" entry detail expected index
   tar --list --gzip --quoting-style=escape --file "$archive" >"$names" || fail "uploads archive listing failed"
@@ -143,14 +169,26 @@ if [ "${1:-}" = --validate-uploads-archive ]; then
   command -v tar >/dev/null 2>&1 || fail "tar is required"; validate_upload_archive "$archive" "$work"; exit 0
 fi
 if [ "${1:-}" = --cleanup-survivors ]; then
-  shift; c=''; n=''; v=''; marker=''; rid=''; root=''
+  shift; c=''; n=''; v=''; marker=''; ownership_marker=''; owner_token=''; rid=''; root=''
   while [ "$#" -gt 0 ]; do case "$1" in
     --container) c=$2; shift 2;; --network) n=$2; shift 2;; --volume) v=$2; shift 2;;
     --volume-identity) marker=$2; shift 2;; --recovery-id) rid=$2; shift 2;;
+    --ownership-marker) ownership_marker=$2; shift 2;; --owner-token) owner_token=$2; shift 2;;
     --docker-root) root=$2; shift 2;; *) usage;;
   esac; done
   [[ "$rid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] && [ "$c" = "beta-recovery-postgres-$rid" ] &&
-    [ "$n" = "beta-recovery-$rid" ] && [ -n "$root" ] || fail "cleanup ownership names are invalid"
+    [ "$n" = "beta-recovery-$rid" ] && [ -n "$root" ] &&
+    [ -n "$owner_token" ] && [[ "$owner_token" =~ ^[0-9a-f]{64}$ ]] &&
+    regular "$ownership_marker" || fail "cleanup ownership names are invalid"
+  jq -e --arg id "$rid" --arg token "$owner_token" --arg container "$c" --arg network "$n" '
+    (keys|sort)==["containerAttempted","containerCreated","containerName","networkAttempted","networkCreated","networkName","ownerToken","recoveryId","schema"] and
+    .schema=="meet-backend/beta-recovery-ownership/v1" and .recoveryId==$id and
+    .ownerToken==$token and .containerName==$container and .networkName==$network and
+    (.containerAttempted|type=="boolean") and (.containerCreated|type=="boolean") and
+    (.networkAttempted|type=="boolean") and (.networkCreated|type=="boolean")
+  ' "$ownership_marker" >/dev/null || fail "cleanup ownership marker is invalid"
+  container_attempted=$(jq -er '.containerAttempted' "$ownership_marker")
+  network_attempted=$(jq -er '.networkAttempted' "$ownership_marker")
   volumes=()
   if [ -n "$v" ]; then
     [[ "$v" =~ ^[0-9a-f]{64}$ ]] || fail "cleanup volume identity is invalid"
@@ -171,7 +209,12 @@ if [ "${1:-}" = --cleanup-survivors ]; then
   docker info >/dev/null 2>&1 || fail "cleanup cannot contact Docker"
   for attempt in 1 2 3; do
     if inspect_resource container "$c"; then
-      jq -e --arg id "$rid" '.[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null || fail "unowned container survivor"
+      [ "$container_attempted" = true ] || fail "container ownership was not durably claimed"
+      jq -e --arg id "$rid" --arg token "$owner_token" '
+        .[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and
+        .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id and
+        .[0].Config.Labels["com.meet-backend.beta-recovery/owner-token"]==$token
+      ' <<<"$INSPECT_JSON" >/dev/null || fail "unowned container survivor"
       if [ -z "$v" ] && [ "${#volumes[@]}" -eq 0 ]; then
         persist_container_volume_identities "$INSPECT_JSON" || fail "surviving volume identity is invalid"
         if regular "$marker"; then
@@ -205,7 +248,12 @@ if [ "${1:-}" = --cleanup-survivors ]; then
       fi
     done
     if inspect_resource network "$n"; then
-      jq -e --arg id "$rid" '.[0].Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null || fail "unowned network survivor"
+      [ "$network_attempted" = true ] || fail "network ownership was not durably claimed"
+      jq -e --arg id "$rid" --arg token "$owner_token" '
+        .[0].Labels["com.meet-backend.beta-recovery/owner"]=="restore" and
+        .[0].Labels["com.meet-backend.beta-recovery/recovery-id"]==$id and
+        .[0].Labels["com.meet-backend.beta-recovery/owner-token"]==$token
+      ' <<<"$INSPECT_JSON" >/dev/null || fail "unowned network survivor"
       docker network rm "$n" || fail "cleanup could not remove network $n"
     else
       network_status=$?
@@ -220,6 +268,7 @@ if [ "${1:-}" = --cleanup-survivors ]; then
     [ "$cs" -eq 2 ] || [ "$ns" -eq 2 ] || [ "$vs" -eq 2 ] && fail "cleanup inspection failed"
     if [ "$cs" -eq 1 ] && [ "$ns" -eq 1 ] && [ "$vs" -eq 1 ]; then
       [ -z "$marker" ] || rm -f -- "$marker" || fail "cleanup marker removal failed"
+      rm -f -- "$ownership_marker" || fail "cleanup ownership marker removal failed"
       exit 0
     fi
     [ "$attempt" -lt 3 ] && sleep 1
@@ -274,7 +323,7 @@ for file in postgres.dump.age uploads.tar.gz.age; do regular "$artifact/$file" |
 [ "$(find "$artifact" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" = 3 ] || fail "artifact shape is not exact"
 manifest=$artifact/recovery-point.json
 jq -e --arg id "$id" --arg sha "$source_sha" --arg repo "$repository" --arg tooling "$tooling" --arg workflow "$workflow" --arg dbcontract "$database_digest" --arg mediacontract "$media_digest" '
-  type=="object" and (keys|sort)==["artifactFiles","artifactId","artifactName","captureRuntime","capturedAt","contracts","databaseProof","mediaProof","recoveryId","recoveryPointTime","repository","retentionDays","runId","schema","source","sourceSha"] and
+  type=="object" and (keys|sort)==["artifactFiles","artifactId","artifactName","captureRuntime","capturedAt","contracts","databaseProof","mediaProof","observedAgeSeconds","recoveryId","recoveryPointTime","repository","retentionDays","runId","schema","source","sourceSha"] and
   .schema=="meet-backend/beta-recovery-manifest/v1" and .recoveryId==$id and .sourceSha==$sha and .repository==$repo and .retentionDays==30 and .artifactId==null and
   (.runId|type=="number" and floor==. and .>0) and
   .artifactName==("beta-recovery-"+$id+"-"+(.runId|tostring)) and
@@ -282,6 +331,7 @@ jq -e --arg id "$id" --arg sha "$source_sha" --arg repo "$repository" --arg tool
   (.artifactFiles|type=="array" and length==2 and (map(.path)|sort)==["postgres.dump.age","uploads.tar.gz.age"] and all(.[]; (keys|sort)==["path","sha256","size"] and (.size|type=="number" and floor==. and .>0) and (.sha256|test("^[0-9a-f]{64}$")))) and
   (.source|type=="object" and (keys|sort)==["ciphertexts","postgresDatabaseBytes","uploads"] and (.postgresDatabaseBytes|type=="number" and floor==. and .>=0) and (.uploads|type=="object" and (keys|sort)==["bytes","digest","files"] and (.files|type=="number" and floor==. and .>=0) and (.bytes|type=="number" and floor==. and .>=0) and (.digest|test("^[0-9a-f]{64}$")))) and
   (.source.ciphertexts|type=="object" and (keys|sort)==["database","uploads"] and .database.name=="postgres.dump.age" and .uploads.name=="uploads.tar.gz.age" and all(.[]; (keys|sort)==["name","sha256","size"] and (.size|type=="number" and floor==. and .>0) and (.sha256|test("^[0-9a-f]{64}$")))) and
+  (.observedAgeSeconds|type=="number" and floor==. and .>=0) and
   (.databaseProof|type=="object") and (.mediaProof|type=="object") and .mediaProof.files==.source.uploads.files and .mediaProof.bytes==.source.uploads.bytes and .mediaProof.canonicalDigest==.source.uploads.digest and (.captureRuntime|type=="object")
 ' "$manifest" >/dev/null || fail "artifact source or contract differs from authorized checkout"
 for file in postgres.dump.age uploads.tar.gz.age; do
@@ -321,15 +371,47 @@ if [ "$capacity_only" = true ]; then
   exit 0
 fi
 regular "$identity" || fail "age identity unavailable"
-private=$temp/private-$id; [ ! -e "$private" ] || fail "private restore directory already exists"; mkdir -- "$private"; chmod 700 "$private"
-db_dump=$private/postgres.dump; uploads_archive=$private/uploads.tar.gz; marker=$temp/volume.identity; [ ! -e "$marker" ] || fail "volume identity path is already in use"
+db_dump=''; uploads_archive=''; private=''
+marker=$temp/volume.identity; ownership_marker=$temp/restore-ownership.json
 network=beta-recovery-$id; container=beta-recovery-postgres-$id; volume=''; volume_identities=(); marker_owned=0
+owner_token=$(printf '%s:%s:%s:%s\n' "$id" "$$" "$RANDOM" "$(date +%s%N)" |
+  sha256sum | awk '{print $1}')
+write_ownership false false false false || fail "restore ownership state could not be persisted"
+if inspect_resource container "$container"; then
+  fail "restore container already exists"
+else
+  [ "$?" -eq 1 ] || fail "cannot inspect restore container"
+fi
+if inspect_resource network "$network"; then
+  fail "restore network already exists"
+else
+  [ "$?" -eq 1 ] || fail "cannot inspect restore network"
+fi
+private=$temp/private-$id
+[ ! -e "$private" ] || fail "private restore directory already exists"
+mkdir -- "$private"; chmod 700 "$private"
+db_dump=$private/postgres.dump; uploads_archive=$private/uploads.tar.gz
+[ ! -e "$marker" ] || fail "volume identity path is already in use"
 cleanup(){
-  local status=$? local_cleanup_status=0 resource_cleanup_status=0 c v n cleanup_confirmed=0 candidate container_owned=0; trap - EXIT HUP INT TERM
+  local status=$? local_cleanup_status=0 resource_cleanup_status=0 c v n cleanup_confirmed=0 candidate
+  local container_owned=0 ownership_valid=0 container_attempted=false network_attempted=false
+  trap - EXIT HUP INT TERM
+  if load_ownership "$ownership_marker"; then
+    ownership_valid=1
+    container_attempted=$(jq -er '.containerAttempted' "$ownership_marker")
+    network_attempted=$(jq -er '.networkAttempted' "$ownership_marker")
+  else
+    resource_cleanup_status=1
+  fi
   rm -f -- "$identity" "$db_dump" "$uploads_archive" "$private/reference-list" || local_cleanup_status=1
   if inspect_resource container "$container"; then c=0; else c=$?; fi
   if [ "$c" -eq 0 ]; then
-    if jq -e --arg id "$id" '.[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null; then
+    if [ "$ownership_valid" -eq 1 ] && [ "$container_attempted" = true ] &&
+      jq -e --arg id "$id" --arg token "$owner_token" '
+        .[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and
+        .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id and
+        .[0].Config.Labels["com.meet-backend.beta-recovery/owner-token"]==$token
+      ' <<<"$INSPECT_JSON" >/dev/null; then
       container_owned=1
     else
       resource_cleanup_status=1
@@ -367,8 +449,16 @@ cleanup(){
   fi
   if inspect_resource network "$network"; then n=0; else n=$?; fi
   if [ "$n" -eq 0 ]; then
-    if jq -e --arg id "$id" '.[0].Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null &&
-      docker network rm "$network"; then :; else resource_cleanup_status=1; fi
+    if [ "$ownership_valid" -eq 1 ] && [ "$network_attempted" = true ] &&
+      jq -e --arg id "$id" --arg token "$owner_token" '
+        .[0].Labels["com.meet-backend.beta-recovery/owner"]=="restore" and
+        .[0].Labels["com.meet-backend.beta-recovery/recovery-id"]==$id and
+        .[0].Labels["com.meet-backend.beta-recovery/owner-token"]==$token
+      ' <<<"$INSPECT_JSON" >/dev/null; then
+      docker network rm "$network" || resource_cleanup_status=1
+    else
+      resource_cleanup_status=1
+    fi
   elif [ "$n" -eq 2 ]; then resource_cleanup_status=1; fi
   if inspect_resource container "$container"; then c=0; else c=$?; fi
   if inspect_resource network "$network"; then n=0; else n=$?; fi
@@ -381,7 +471,10 @@ cleanup(){
   fi
   if [ "$c" -eq 2 ] || [ "$n" -eq 2 ] || [ "$v" -eq 2 ] || [ "$c" -eq 0 ] || [ "$n" -eq 0 ] || [ "$v" -eq 0 ]; then
     echo "cleanup survivors or inspection failure detected; starting a fresh-process retry" >&2
-    if "$0" --cleanup-survivors --container "$container" --network "$network" --volume "${volume:-}" --volume-identity "$marker" --recovery-id "$id" --docker-root "$docker_root"; then
+    if [ "$ownership_valid" -eq 1 ] && "$0" --cleanup-survivors \
+      --container "$container" --network "$network" --volume "${volume:-}" \
+      --volume-identity "$marker" --ownership-marker "$ownership_marker" \
+      --owner-token "$owner_token" --recovery-id "$id" --docker-root "$docker_root"; then
       cleanup_confirmed=1
       resource_cleanup_status=0
     else
@@ -392,8 +485,10 @@ cleanup(){
   fi
   if [ "$cleanup_confirmed" -eq 1 ]; then
     [ ! -e "$marker" ] || rm -f -- "$marker" || local_cleanup_status=1
+    [ ! -e "$ownership_marker" ] || rm -f -- "$ownership_marker" || local_cleanup_status=1
   elif [ "$marker_owned" -eq 1 ]; then
     chmod 600 "$marker" || local_cleanup_status=1
+    chmod 600 "$ownership_marker" || local_cleanup_status=1
   fi
   if [ "$local_cleanup_status" -eq 0 ] && [ "$resource_cleanup_status" -eq 0 ] &&
     [ "$cleanup_confirmed" -eq 1 ]; then
@@ -406,14 +501,23 @@ cleanup(){
   [ "$status" -eq 0 ] || exit "$status"; exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
-if inspect_resource container "$container"; then fail "restore container already exists"; else [ "$?" -eq 1 ] || fail "cannot inspect restore container"; fi
-if inspect_resource network "$network"; then fail "restore network already exists"; else [ "$?" -eq 1 ] || fail "cannot inspect restore network"; fi
 age -d -i "$identity" -o "$db_dump" "$artifact/postgres.dump.age"; age -d -i "$identity" -o "$uploads_archive" "$artifact/uploads.tar.gz.age"
 docker pull --quiet "$image" >/dev/null || fail "pinned image pull failed"
 docker image inspect "$image" --format '{{json .RepoDigests}}' | jq -e --arg d "${image##*@}" 'any(.[];endswith($d))' >/dev/null || fail "pinned image provenance differs"
 docker image inspect "$image" --format '{{json .Config.Volumes}}' | jq -e 'type=="object" and (keys|sort)==["/var/lib/postgresql/data"]' >/dev/null || fail "image volume declaration differs"
-docker network create --internal --label com.meet-backend.beta-recovery/owner=restore --label com.meet-backend.beta-recovery/recovery-id="$id" "$network" >/dev/null
-docker create --name "$container" --network "$network" --label com.meet-backend.beta-recovery/owner=restore --label com.meet-backend.beta-recovery/recovery-id="$id" -e POSTGRES_DB=restore_db -e POSTGRES_USER=restore_user -e POSTGRES_PASSWORD="$(od -An -N24 -tx1 /dev/urandom|tr -d '[:space:]')" "$image" >/dev/null
+write_ownership false false true false || fail "restore network ownership state could not be persisted"
+docker network create --internal --label com.meet-backend.beta-recovery/owner=restore \
+  --label com.meet-backend.beta-recovery/recovery-id="$id" \
+  --label com.meet-backend.beta-recovery/owner-token="$owner_token" "$network" >/dev/null
+write_ownership false false true true || fail "restore network ownership state could not be persisted"
+write_ownership true false true true || fail "restore container ownership state could not be persisted"
+docker create --name "$container" --network "$network" \
+  --label com.meet-backend.beta-recovery/owner=restore \
+  --label com.meet-backend.beta-recovery/recovery-id="$id" \
+  --label com.meet-backend.beta-recovery/owner-token="$owner_token" \
+  -e POSTGRES_DB=restore_db -e POSTGRES_USER=restore_user \
+  -e POSTGRES_PASSWORD="$(od -An -N24 -tx1 /dev/urandom|tr -d '[:space:]')" "$image" >/dev/null
+write_ownership true true true true || fail "restore container ownership state could not be persisted"
 container_json=$(docker container inspect "$container")
 persist_container_volume_identities "$container_json" || fail "anonymous volume identity is invalid"
 jq -e '(

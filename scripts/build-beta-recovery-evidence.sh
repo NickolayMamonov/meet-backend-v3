@@ -32,7 +32,7 @@ case "$kind" in
 esac
 
 id='' sha='' repo='' run='' artifact='' name='' td='' wd='' dd='' md=''
-captured='' point='' db='' files='' bytes='' ud='' dbp='' mp='' runtime=''
+captured='' point='' observed_age='' db='' files='' bytes='' ud='' dbp='' mp='' runtime=''
 database_ciphertext='' uploads_ciphertext=''
 pre='' post='' mount='' dispatch='' completed='' status='' failure=''
 output='' artifact_dir='' manifest='' restored_db='' restored_media=''
@@ -52,6 +52,7 @@ while [ "$#" -gt 0 ]; do
     --media-digest) [ "$#" -ge 2 ] || usage; md=$2; shift 2 ;;
     --captured-at) [ "$#" -ge 2 ] || usage; captured=$2; shift 2 ;;
     --point-time) [ "$#" -ge 2 ] || usage; point=$2; shift 2 ;;
+    --observed-age-seconds) [ "$#" -ge 2 ] || usage; observed_age=$2; shift 2 ;;
     --database-bytes) [ "$#" -ge 2 ] || usage; db=$2; shift 2 ;;
     --uploads-files) [ "$#" -ge 2 ] || usage; files=$2; shift 2 ;;
     --uploads-bytes) [ "$#" -ge 2 ] || usage; bytes=$2; shift 2 ;;
@@ -139,7 +140,7 @@ validate_manifest_shape() {
     --arg id "$expected_id" --arg sha "$expected_sha" --arg repo "$expected_repo" --argjson run "$expected_run" '
       (keys | sort) == [
         "artifactFiles","artifactId","artifactName","captureRuntime","capturedAt",
-        "contracts","databaseProof","mediaProof","recoveryId","recoveryPointTime",
+        "contracts","databaseProof","mediaProof","observedAgeSeconds","recoveryId","recoveryPointTime",
         "repository","retentionDays","runId","schema","source","sourceSha"
       ] and
       .schema == "meet-backend/beta-recovery-manifest/v1" and
@@ -155,7 +156,8 @@ validate_manifest_shape() {
         ] and
         all(.[]; (keys | sort) == ["path","sha256","size"] and
           (.size | type == "number" and floor == . and . > 0) and
-          (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))))
+          (.sha256 | type == "string" and test("^[0-9a-f]{64}$")))) and
+      (.observedAgeSeconds | type == "number" and floor == . and . >= 0)
     ' "$file" >/dev/null || fail "manifest contract is invalid or unbound"
   timestamp "$(jq -er .capturedAt "$file")" || fail "manifest capture time is invalid"
   timestamp "$(jq -er .recoveryPointTime "$file")" || fail "manifest point time is invalid"
@@ -190,6 +192,7 @@ case "$kind" in
     for d in "$td" "$wd" "$dd" "$md"; do sha64 "$d" || fail "contract digest malformed"; done
     timestamp "$captured" || fail "capture time is malformed"
     timestamp "$point" || fail "point time is malformed"
+    [[ "$observed_age" =~ ^[0-9]+$ ]] || fail "observed point age is malformed"
     [[ "$db" =~ ^[0-9]+$ && "$files" =~ ^[0-9]+$ && "$bytes" =~ ^[0-9]+$ ]] ||
       fail "aggregate malformed"
     sha64 "$ud" || fail "uploads digest malformed"
@@ -215,13 +218,15 @@ case "$kind" in
     jq -cnS --arg id "$id" --arg sha "$sha" --arg repo "$repo" --arg run "$run" \
       --arg name "$name" --arg captured "$captured" --arg point "$point" \
       --arg td "$td" --arg wd "$wd" --arg dd "$dd" --arg md "$md" \
+      --argjson observed_age "$observed_age" \
       --argjson artifact "${artifact:-null}" --arg artifact_files "$artifact_files" \
       --arg dbp "$(jq -cS . "$dbp")" \
       --arg mp "$(jq -cS . "$mp")" --arg runtime "$(jq -cS . "$runtime")" \
       '{schema:"meet-backend/beta-recovery-manifest/v1",recoveryId:$id,
         repository:$repo,sourceSha:$sha,runId:($run|tonumber),artifactId:$artifact,
         artifactName:$name,retentionDays:30,capturedAt:$captured,
-        recoveryPointTime:$point,contracts:{tooling:$td,workflow:$wd,database:$dd,media:$md},
+        recoveryPointTime:$point,observedAgeSeconds:$observed_age,
+        contracts:{tooling:$td,workflow:$wd,database:$dd,media:$md},
         artifactFiles:($artifact_files|fromjson),databaseProof:($dbp|fromjson),mediaProof:($mp|fromjson),
         captureRuntime:($runtime|fromjson)}' >"$tmp"
     jq --argjson db "$db" --argjson files "$files" --argjson bytes "$bytes" --arg ud "$ud" \
@@ -278,6 +283,7 @@ case "$kind" in
       '($b|fromdateiso8601)-($a|fromdateiso8601)') || fail "RTO is not parseable"
     [[ "$rto" =~ ^[0-9]+$ ]] && [ "$rto" -ge 0 ] && [ "$rto" -le 7200 ] ||
       fail "RTO exceeds two hours"
+    observed_age=$(jq -er '.observedAgeSeconds' "$manifest")
     manifest_artifact=$(jq -r '.artifactName' "$manifest")
     [ "$name" = "$manifest_artifact" ] || fail "artifact name is not manifest-bound"
     [[ "$artifact" =~ ^[1-9][0-9]*$ ]] || fail "artifact ID is required"
@@ -286,6 +292,7 @@ case "$kind" in
     jq -cnS --arg id "$id" --arg sha "$sha" --arg repo "$repo" --arg run "$run" \
       --arg name "$name" --arg captured "$(jq -r .capturedAt "$manifest")" \
       --arg point "$(jq -r .recoveryPointTime "$manifest")" --arg dispatch "$dispatch" \
+      --argjson observed_age "$observed_age" \
       --arg completed "$completed" --arg status "$status" --arg failure "$failure" \
       --arg td "$(jq -r .contracts.tooling "$manifest")" --arg wd "$(jq -r .contracts.workflow "$manifest")" \
       --arg dd "$(jq -r .contracts.database "$manifest")" --arg md "$(jq -r .contracts.media "$manifest")" \
@@ -300,7 +307,8 @@ case "$kind" in
       '{schema:"meet-backend/beta-recovery-drill/v1",recoveryId:$id,repository:$repo,
         sourceSha:$sha,runId:($run|tonumber),
         artifact:{id:$artifact,name:$name,retentionDays:30,files:$contract},
-        capturedAt:$captured,recoveryPointTime:$point,contracts:{tooling:$td,workflow:$wd,database:$dd,media:$md},
+        capturedAt:$captured,recoveryPointTime:$point,observedAgeSeconds:$observed_age,
+        contracts:{tooling:$td,workflow:$wd,database:$dd,media:$md},
         source:$source,databaseProof:($dbp|fromjson),mediaProof:($mp|fromjson),
         restore:{healthy:$healthy,equal:$equal,cleanupComplete:$cleanup,
           anonymousVolumeAbsent:$absent,mountContract:($mount|fromjson),

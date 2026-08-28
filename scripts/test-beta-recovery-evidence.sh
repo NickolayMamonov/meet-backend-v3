@@ -30,6 +30,7 @@ bash "$builder" manifest \
   --artifact-name beta-recovery-recovery-0001-1 \
   --tooling-digest "$hash" --workflow-digest "$hash" --database-digest "$hash" --media-digest "$hash" \
   --captured-at 2026-08-27T19:00:00Z --point-time 2026-08-27T19:00:00Z \
+  --observed-age-seconds 120 \
   --database-bytes 1 --uploads-files 1 --uploads-bytes 1 --uploads-digest "$hash" \
   --database-proof "$db_proof" --media-proof "$media_proof" --runtime-proof "$runtime" \
   --database-ciphertext "$tmp/postgres.dump.age" --uploads-ciphertext "$tmp/uploads.tar.gz.age" \
@@ -41,7 +42,7 @@ bash "$builder" validate-artifact --artifact-dir "$tmp/artifact" \
   --recovery-id recovery-0001 --source-sha 0123456789abcdef0123456789abcdef01234567 \
   --repository NickolayMamonov/meet-backend-v3 --run-id 1
 jq -e '.schema == "meet-backend/beta-recovery-manifest/v1" and
-  .retentionDays == 30 and (.artifactFiles | length == 2)' \
+  .retentionDays == 30 and .observedAgeSeconds == 120 and (.artifactFiles | length == 2)' \
   "$tmp/recovery-point.json" >/dev/null
 
 cp -- "$runtime" "$tmp/pre.json"
@@ -60,7 +61,7 @@ bash "$builder" final \
   --healthy true --equal true --artifact-verified true --cleanup-complete true \
   --anonymous-volume-absent true --status success --output "$tmp/drill.json"
 jq -e '.schema == "meet-backend/beta-recovery-drill/v1" and
-  .artifact.id == 7 and .restore.mountContract.anonymous == true and
+  .artifact.id == 7 and .observedAgeSeconds == 120 and .restore.mountContract.anonymous == true and
   (.restore.mountContract | has("volumeName") | not) and
   .timing.dispatchToPostProbeSeconds == 600' "$tmp/drill.json" >/dev/null
 

@@ -139,11 +139,52 @@ jobs:
           capture_result="$RUNNER_TEMP/capture-result.json"
           ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/capture-result.json'" \
             >"$capture_result"
+          jq -e '
+            type=="object" and
+            (keys|sort)==["capturedAt","ciphertexts","databaseBytes","proofs","recoveryId","recoveryPointTime","schema","uploads"] and
+            .schema=="meet-backend/beta-recovery-capture/v1" and
+            (.databaseBytes|type=="number" and floor==. and .>0) and
+            (.uploads|type=="object" and (keys|sort)==["bytes","digest","files"]) and
+            (.uploads.files|type=="number" and floor==. and .>=0) and
+            (.uploads.bytes|type=="number" and floor==. and .>=0) and
+            (.uploads.digest|test("^[0-9a-f]{64}$")) and
+            (.ciphertexts|type=="object" and (keys|sort)==["database","uploads"]) and
+            all(.ciphertexts[]; (keys|sort)==["name","sha256","size"] and
+              (.size|type=="number" and floor==. and .>0) and
+              (.sha256|type=="string" and test("^[0-9a-f]{64}$"))) and
+            (.proofs|type=="object" and (keys|sort)==["database","media"]) and
+            all(.proofs[]; (keys|sort)==["name","sha256"] and
+              (.sha256|type=="string" and test("^[0-9a-f]{64}$"))) and
+            (.recoveryId==$id) and (.capturedAt==.recoveryPointTime)
+          ' --arg id "$RECOVERY_ID" "$capture_result" >/dev/null
           db_bytes=$(jq -er '.databaseBytes' "$capture_result")
-          [[ "$db_bytes" =~ ^[1-9][0-9]*$ ]]
-          uploads_files=$(jq -er '.files' "$RUNNER_TEMP/media-proof.json")
-          uploads_bytes=$(jq -er '.bytes' "$RUNNER_TEMP/media-proof.json")
-          uploads_digest=$(jq -er '.canonicalDigest' "$RUNNER_TEMP/media-proof.json")
+          uploads_files=$(jq -er '.uploads.files' "$capture_result")
+          uploads_bytes=$(jq -er '.uploads.bytes' "$capture_result")
+          uploads_digest=$(jq -er '.uploads.digest' "$capture_result")
+          db_cipher_size=$(wc -c <"$RUNNER_TEMP/postgres.dump.age" | tr -d '[:space:]')
+          db_cipher_sha=$(sha256sum "$RUNNER_TEMP/postgres.dump.age" | awk '{print $1}')
+          uploads_cipher_size=$(wc -c <"$RUNNER_TEMP/uploads.tar.gz.age" | tr -d '[:space:]')
+          uploads_cipher_sha=$(sha256sum "$RUNNER_TEMP/uploads.tar.gz.age" | awk '{print $1}')
+          [ "$db_cipher_size" = "$(jq -er '.ciphertexts.database.size' "$capture_result")" ] &&
+            [ "$db_cipher_sha" = "$(jq -er '.ciphertexts.database.sha256' "$capture_result")" ] &&
+            [ "$uploads_cipher_size" = "$(jq -er '.ciphertexts.uploads.size' "$capture_result")" ] &&
+            [ "$uploads_cipher_sha" = "$(jq -er '.ciphertexts.uploads.sha256' "$capture_result")" ] ||
+            { echo "transferred ciphertext differs from quiesced capture result" >&2; exit 1; }
+          [ "$(sha256sum "$RUNNER_TEMP/database-proof.json" | awk '{print $1}')" =
+            "$(jq -er '.proofs.database.sha256' "$capture_result")" ] &&
+            [ "$(sha256sum "$RUNNER_TEMP/media-proof.json" | awk '{print $1}')" =
+            "$(jq -er '.proofs.media.sha256' "$capture_result")" ] ||
+            { echo "transferred proof differs from quiesced capture result" >&2; exit 1; }
+          [ "$uploads_files" = "$(jq -er '.files' "$RUNNER_TEMP/media-proof.json")" ] &&
+            [ "$uploads_bytes" = "$(jq -er '.bytes' "$RUNNER_TEMP/media-proof.json")" ] &&
+            [ "$uploads_digest" = "$(jq -er '.canonicalDigest' "$RUNNER_TEMP/media-proof.json")" ] ||
+            { echo "transferred media proof differs from quiesced capture result" >&2; exit 1; }
+          point_time=$(jq -er '.recoveryPointTime' "$capture_result")
+          captured_at=$(jq -er '.capturedAt' "$capture_result")
+          point_epoch=$(date -u -d "$point_time" +%s)
+          observed_epoch=$(date -u +%s)
+          [ "$observed_epoch" -ge "$point_epoch" ] || { echo "recovery point is in the future" >&2; exit 1; }
+          observed_age=$((observed_epoch - point_epoch))
           chmod 600 "$RUNNER_TEMP/"*.age "$RUNNER_TEMP/"*.json
           ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo rm -r -- '$remote'"
           mkdir "$RUNNER_TEMP/artifact"
@@ -160,8 +201,8 @@ jobs:
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
             --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')" \
-            --captured-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --point-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --captured-at "$captured_at" \
+            --point-time "$point_time" --observed-age-seconds "$observed_age" \
             --database-bytes "$db_bytes" \
             --uploads-files "$(jq -r '.files' "$RUNNER_TEMP/media-proof.json')" \
             --uploads-bytes "$(jq -r '.bytes' "$RUNNER_TEMP/media-proof.json")" \
@@ -196,12 +237,18 @@ jobs:
           set -euo pipefail
           artifact_id="${{ steps.publish.outputs.artifact-id }}"
           [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" |
-            jq -e --arg name "beta-recovery-${{ inputs.recovery_id }}-${{ github.run_id }}" \
-              '.id == ($artifact_id|tonumber) and .name == $name and .expired == false and
-               .size_in_bytes > 0 and .workflow_run.id == ($run_id|tonumber)' \
-              --arg run_id "$GITHUB_RUN_ID" \
-              --arg artifact_id "$artifact_id"
+          artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id")
+          jq -e --arg name "beta-recovery-${{ inputs.recovery_id }}-${{ github.run_id }}" \
+            '.id == ($artifact_id|tonumber) and .name == $name and .expired == false and
+             .size_in_bytes > 0 and .workflow_run.id == ($run_id|tonumber) and
+             (.created_at | (type=="string" and length > 0)) and
+             (.expires_at | (type=="string" and length > 0))' \
+            --arg run_id "$GITHUB_RUN_ID" --arg artifact_id "$artifact_id" \
+            <<<"$artifact_json"
+          created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$artifact_json")" +%s)
+          expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$artifact_json")" +%s)
+          [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
+            { echo "published artifact expiry is not exactly 30 days" >&2; exit 1; }
 
   restore-select:
     name: Validate numeric artifact
@@ -230,9 +277,15 @@ jobs:
           run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
           jq -e --arg prefix "beta-recovery-${{ inputs.recovery_id }}-" '
             .id == ($id|tonumber) and .expired == false and .size_in_bytes > 0 and
-            (.name | startswith($prefix))
+            (.name | startswith($prefix)) and
+            (.created_at | (type=="string" and length > 0)) and
+            (.expires_at | (type=="string" and length > 0))
           ' --arg id "$ARTIFACT_ID" \
             --arg sha "${{ inputs.source_sha }}" <<<"$artifact_json"
+          created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$artifact_json")" +%s)
+          expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$artifact_json")" +%s)
+          [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
+            { echo "selected artifact expiry is not exactly 30 days" >&2; exit 1; }
           jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
             .status == "completed" and .conclusion == "success" and
             .event == "workflow_dispatch" and .head_branch == "dev" and
@@ -593,8 +646,14 @@ jobs:
           jq -e --arg name "$artifact_name" --argjson run "$artifact_run" \
             --arg sha "${{ inputs.source_sha }}" \
             '.id == ($id|tonumber) and .name == $name and .expired == false and
-             .size_in_bytes > 0 and .workflow_run.id == $run' \
+             .size_in_bytes > 0 and .workflow_run.id == $run and
+             (.created_at | (type=="string" and length > 0)) and
+             (.expires_at | (type=="string" and length > 0))' \
             --arg id "${{ inputs.artifact_id }}" <<<"$artifact_json"
+          created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$artifact_json")" +%s)
+          expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$artifact_json")" +%s)
+          [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
+            { echo "final artifact expiry is not exactly 30 days" >&2; exit 1; }
           dispatch_at=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" |
             jq -er '.event == "workflow_dispatch" and .head_branch == "dev" and
               .head_sha == $sha | .created_at' --arg sha "${{ inputs.source_sha }}")
