@@ -45,6 +45,14 @@ json_container() {
             {Type:"volume",Name:$volume,Destination:"/var/lib/postgresql/data",RW:true,Source:$source},
             {Type:"volume",Name:$volume,Destination:"/other",RW:true,Source:$source}]}]'
       ;;
+    unexpected)
+      jq -cn --arg volume "$volume" --arg source "$volume_root" '
+        [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
+            "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID}},
+          HostConfig:{Binds:[],Mounts:[]},
+          Mounts:[{Type:"volume",Name:$volume,Destination:"/unexpected",RW:true,Source:$source}]}]'
+      ;;
     missing)
       jq -cn '
         [{Id:"fixture-container",Image:"repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -96,7 +104,7 @@ case "${1:-}" in
         if [ "${3:-}" = --force ] && [ "${4:-}" = --volumes ] &&
           [ "${FAKE_DOCKER_PRESERVE_VOLUME:-0}" != 1 ]; then
           rm -f "$state/volume"
-          [ ! -e "$volume_root" ] || rm -r -- "$volume_root"
+          [ ! -e "$root/volumes/$volume" ] || rm -r -- "$root/volumes/$volume"
         fi
         ;;
       *) exit 2 ;;
@@ -105,9 +113,13 @@ case "${1:-}" in
   create)
     touch "$state/container"
     if [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = valid ] ||
-      [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = duplicate ]; then
+      [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = duplicate ] ||
+      [ "${FAKE_DOCKER_MOUNT_MODE:-valid}" = unexpected ]; then
       mkdir -p "$volume_root"
       touch "$state/volume"
+    fi
+    if [ "${FAKE_DOCKER_INTERRUPT_AFTER_CREATE:-0}" = 1 ]; then
+      exit 137
     fi
     ;;
   start) ;;
@@ -132,8 +144,13 @@ case "${1:-}" in
         jq -cn --arg volume "$volume" --arg source "$volume_root" \
           '[{Name:$volume,Driver:"local",Mountpoint:$source,Labels:{},Options:{}}]' ;;
       rm)
+        if [ "${FAKE_DOCKER_FAIL_VOLUME_RM_ONCE:-0}" = 1 ] &&
+          [ ! -e "$state/volume-rm-failed" ]; then
+          touch "$state/volume-rm-failed"
+          exit 1
+        fi
         [ "${FAKE_DOCKER_FAIL_VOLUME_RM:-0}" = 1 ] && exit 1
-        [ ! -e "$volume_root" ] || rm -r -- "$volume_root"
+        [ ! -e "$root/volumes/$volume" ] || rm -r -- "$root/volumes/$volume"
         rm -f "$state/volume" ;;
       *) exit 2 ;;
     esac

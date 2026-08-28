@@ -28,6 +28,18 @@ grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
 grep -Fq 'Revalidate source immediately before identity access' "$workflow"
 grep -Fq 'scp_opts=(-i "$key" -P "$PORT"' "$workflow"
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
+if grep -Eq '\.workflow_run\.(event|head_branch|head_sha)' "$workflow"; then
+  echo "artifact validation depends on unavailable nested workflow-run fields" >&2
+  exit 1
+fi
+artifact_fixture='{"id":7,"name":"beta-recovery-recovery-fixture-1","expired":false,"size_in_bytes":1,"workflow_run":{"id":123}}'
+jq -e '.workflow_run.id == 123 and (.workflow_run.event // null) == null and
+  (.workflow_run.head_branch // null) == null and (.workflow_run.head_sha // null) == null' \
+  <<<"$artifact_fixture" >/dev/null
+if jq -e '.event == "workflow_dispatch" or .head_branch == "dev"' <<<"$artifact_fixture" >/dev/null; then
+  echo "artifact fixture unexpectedly exposed top-level run fields" >&2
+  exit 1
+fi
 grep -Fq 'capture-database-proof.json' "$workflow"
 if grep -Fq '${{ runner.temp }}/database-proof.json' "$workflow" ||
   grep -Fq '${{ runner.temp }}/media-proof.json' "$workflow"; then

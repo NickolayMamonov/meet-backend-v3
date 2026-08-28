@@ -92,10 +92,10 @@ if "$script" --validate-uploads-archive --archive "$fixture/fifo.tar.gz" \
 fi
 
 run_restore_fixture() {
-  local name=$1 expected_status=$2
+  local name=$1 expected_status=$2 mount_mode=${3:-valid} behavior=${4:-normal}
   local case_dir=$fixture/$name
   local hash tooling workflow_digest database_digest media_digest
-  mkdir -p "$case_dir/artifact" "$case_dir/output" "$case_dir/docker-root" "$case_dir/docker-state"
+  mkdir -p "$case_dir/artifact" "$case_dir/output" "$case_dir/docker-root" "$case_dir/docker-state" "$case_dir/temp"
   printf identity >"$case_dir/identity"
   printf 'database\n' >"$case_dir/database.dump"
   tar --create --gzip --file "$case_dir/uploads.tar.gz" --directory "$fixture/valid" .
@@ -143,12 +143,59 @@ run_restore_fixture() {
   ln -- "$root/scripts/fixtures/beta-recovery/fake-age.sh" "$case_dir/bin/age"
   chmod 700 "$case_dir/bin/docker" "$case_dir/bin/age"
   export FAKE_DOCKER_STATE="$case_dir/docker-state"
-  export FAKE_DOCKER_ROOT="/tmp/beta-recovery-$name-docker-root"
+  export FAKE_DOCKER_ROOT="$case_dir/docker-root"
   export FAKE_RECOVERY_ID=recovery-fixture
+  export FAKE_DOCKER_MOUNT_MODE="$mount_mode"
+  unset FAKE_DOCKER_FAIL_RESTORE FAKE_DOCKER_FAIL_CONTAINER_RM_ONCE
+  unset FAKE_DOCKER_FAIL_VOLUME_RM_ONCE FAKE_DOCKER_PRESERVE_VOLUME FAKE_DOCKER_INTERRUPT_AFTER_CREATE
+  if [ "$behavior" = restore-failure ]; then export FAKE_DOCKER_FAIL_RESTORE=1; fi
+  if [ "$behavior" = retry ]; then
+    export FAKE_DOCKER_FAIL_CONTAINER_RM_ONCE=1
+    export FAKE_DOCKER_PRESERVE_VOLUME=1
+  fi
+  if [ "$behavior" = volume-retry ]; then
+    export FAKE_DOCKER_FAIL_VOLUME_RM_ONCE=1
+    export FAKE_DOCKER_PRESERVE_VOLUME=1
+  fi
+  if [ "$behavior" = interrupt ]; then export FAKE_DOCKER_INTERRUPT_AFTER_CREATE=1; fi
   export FAKE_DATABASE_PROOF="$case_dir/database-proof.json"
   export FAKE_DATABASE_DUMP="$case_dir/database.dump"
   export FAKE_UPLOADS_ARCHIVE="$case_dir/uploads.tar.gz"
   export POSTGRES_IMAGE=repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  if [ "$behavior" = survivor ]; then
+    PATH="$case_dir/bin:$PATH" docker network create \
+      --label com.meet-backend.beta-recovery/owner=restore \
+      --label com.meet-backend.beta-recovery/recovery-id=recovery-fixture \
+      beta-recovery-recovery-fixture
+    PATH="$case_dir/bin:$PATH" docker create \
+      --name beta-recovery-postgres-recovery-fixture \
+      --label com.meet-backend.beta-recovery/owner=restore \
+      --label com.meet-backend.beta-recovery/recovery-id=recovery-fixture \
+      "$POSTGRES_IMAGE"
+    [ ! -e "$case_dir/temp/volume.identity" ]
+    PATH="$case_dir/bin:$PATH" bash "$script" --cleanup-survivors \
+      --container beta-recovery-postgres-recovery-fixture \
+      --network beta-recovery-recovery-fixture \
+      --volume-identity "$case_dir/temp/volume.identity" \
+      --recovery-id recovery-fixture --docker-root "$case_dir/docker-root"
+    [ ! -e "$case_dir/docker-state/container" ] && [ ! -e "$case_dir/docker-state/network" ] &&
+      [ ! -e "$case_dir/docker-state/volume" ] &&
+      [ ! -e "$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] ||
+      { echo "fresh-process cleanup left an owned survivor" >&2; exit 1; }
+    return
+  fi
+  if [ "$behavior" = capacity ]; then
+    PATH="$case_dir/bin:$PATH" bash "$script" \
+      --capacity-only --artifact-dir "$case_dir/artifact" --recovery-id recovery-fixture \
+      --output-dir "$case_dir/capacity-output" --temp-root "$case_dir/capacity-temp" \
+      --docker-root "$case_dir/docker-root" --sql-proof "$root/scripts/beta-recovery-database-proof.sql" \
+      --media-script "$root/scripts/beta-recovery-media-proof.sh" \
+      --source-sha 0123456789abcdef0123456789abcdef01234567 \
+      --repository NickolayMamonov/meet-backend-v3 --tooling-digest "$tooling" \
+      --workflow-digest "$workflow_digest" --database-digest "$database_digest" \
+      --media-digest "$media_digest"
+    [ -d "$case_dir/capacity-output" ]
+  fi
   if PATH="$case_dir/bin:$PATH" bash "$script" \
     --artifact-dir "$case_dir/artifact" --recovery-id recovery-fixture \
     --output-dir "$case_dir/output" --identity "$case_dir/identity" \
@@ -166,8 +213,20 @@ run_restore_fixture() {
     echo "restore fixture $name returned $actual_status, expected $expected_status" >&2
     exit 1
   }
+  if [ "$behavior" = interrupt ]; then
+    [ ! -e "$case_dir/temp/volume.identity" ] &&
+      [ ! -e "$case_dir/docker-state/container" ] && [ ! -e "$case_dir/docker-state/network" ] &&
+      [ ! -e "$case_dir/docker-state/volume" ] &&
+      [ ! -e "$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] ||
+      { echo "interruption cleanup left an owned survivor" >&2; exit 1; }
+    return
+  fi
   [ ! -e "$case_dir/docker-state/container" ] && [ ! -e "$case_dir/docker-state/network" ] ||
     { echo "restore fixture $name left Docker resources" >&2; exit 1; }
+  [ ! -e "$case_dir/docker-state/volume" ] ||
+    { echo "restore fixture $name left anonymous volume state" >&2; exit 1; }
+  [ ! -e "$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] ||
+    { echo "restore fixture $name left anonymous volume data" >&2; exit 1; }
   if [ "$expected_status" -eq 0 ]; then
     [ -s "$case_dir/output/restored-database-proof.json" ] &&
       [ -s "$case_dir/output/restored-media-proof.json" ] &&
@@ -177,7 +236,16 @@ run_restore_fixture() {
   fi
 }
 
-run_restore_fixture success 0
-FAKE_DOCKER_FAIL_RESTORE=1 run_restore_fixture restore-failure 1
+run_restore_fixture success 0 valid capacity
+run_restore_fixture restore-failure 1 valid restore-failure
+run_restore_fixture restore-retry 0 valid retry
+run_restore_fixture restore-volume-retry 0 valid volume-retry
+run_restore_fixture restore-bind 1 bind
+run_restore_fixture restore-named 1 named
+run_restore_fixture restore-duplicate 1 duplicate
+run_restore_fixture restore-missing 1 missing
+run_restore_fixture restore-unexpected 1 unexpected
+run_restore_fixture restore-interruption 137 valid interrupt
+run_restore_fixture restore-interruption-retry 0 valid survivor
 
 echo "beta recovery restore contract and archive fixtures passed"

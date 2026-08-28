@@ -43,14 +43,16 @@ decimal_add(){
     digit=$((10#$ld + 10#$rd + carry)); result=$((digit % 10))${result:-}; carry=$((digit / 10))
     [ -z "$left" ] || left=${left:0:${#left}-1}; [ -z "$right" ] || right=${right:0:${#right}-1}
   done
-  result=$(printf '%s\n' "$result" | sed 's/^0*//'); printf '%s\n' "${result:-0}"
+  while [ "${result#0}" != "$result" ]; do result=${result#0}; done
+  printf '%s\n' "${result:-0}"
 }
 count=$(wc -l <"$records" | tr -d '[:space:]'); bytes=0
 while IFS=$'\t' read -r _ size _; do bytes=$(decimal_add "$bytes" "$size") || fail "file-size overflow"; done <"$records"
 aggregate=$(sha256sum -- "$records" | awk '{print $1}'); reference_count=0; references_resolved=true
 if [ -n "$references" ]; then
   while IFS= read -r reference; do
-    [ -n "$reference" ] || continue; reference_count=$((reference_count + 1))
+    reference_count=$((reference_count + 1))
+    [ -n "$reference" ] || { references_resolved=false; continue; }
     case "$reference" in avatars/*|meetings/*|communities/*);; /*|../*|*/../*|*'/..'|*\\*) references_resolved=false; continue;; *) references_resolved=false; continue;; esac
     [ -f "$root/$reference" ] && [ ! -L "$root/$reference" ] || references_resolved=false
   done <"$references"

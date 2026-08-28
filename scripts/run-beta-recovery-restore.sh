@@ -14,7 +14,11 @@ preflight_cleanup(){
 }
 trap preflight_cleanup EXIT HUP INT TERM
 decimal(){ [[ "$1" =~ ^[0-9]+$ ]]; }
-normalize(){ local v=$1; v=$(printf '%s\n' "$v" | sed 's/^0*//'); printf '%s\n' "${v:-0}"; }
+normalize(){
+  local v=$1
+  while [ "${v#0}" != "$v" ]; do v=${v#0}; done
+  printf '%s\n' "${v:-0}"
+}
 decimal_ge(){
   local a b
   decimal "$1" && decimal "$2" || return 1
@@ -69,6 +73,42 @@ container_mount_provenance(){
       .[0].RW==true and .[0].Source==$expected)
   ' <<<"$json" >/dev/null
 }
+persist_container_volume_identities(){
+  local json=$1 names candidate tmp count=0
+  volume_identities=()
+  names=$(jq -r '.[0].Mounts[]? | select(.Type=="volume") | .Name' <<<"$json") || return 1
+  while IFS= read -r candidate; do
+    candidate=${candidate%$'\r'}
+    [ -n "$candidate" ] || continue
+    [[ "$candidate" =~ ^[0-9a-f]{64}$ ]] || return 1
+    volume_identities+=("$candidate")
+    count=$((count + 1))
+  done <<<"$names"
+  [ "$count" -gt 0 ] || return 0
+  tmp=$marker.tmp.$$
+  printf '%s\n' "${volume_identities[@]}" >"$tmp" || return 1
+  chmod 600 "$tmp" && mv -f -- "$tmp" "$marker" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  volume=${volume_identities[0]}
+  marker_owned=1
+}
+load_container_volume_identities(){
+  local candidate count=0
+  volume_identities=()
+  regular "$marker" || return 1
+  while IFS= read -r candidate; do
+    candidate=${candidate%$'\r'}
+    [ -n "$candidate" ] || continue
+    [[ "$candidate" =~ ^[0-9a-f]{64}$ ]] || return 1
+    volume_identities+=("$candidate")
+    count=$((count + 1))
+  done <"$marker"
+  [ "$count" -gt 0 ] || return 1
+  volume=${volume_identities[0]}
+  marker_owned=1
+}
 validate_upload_archive(){
   local archive=$1 work=$2 names="$2/names" details="$2/details" entry detail expected index
   tar --list --gzip --quoting-style=escape --file "$archive" >"$names" || fail "uploads archive listing failed"
@@ -118,6 +158,7 @@ if [ "${1:-}" = --cleanup-survivors ]; then
   fi
   if regular "$marker"; then
     while IFS= read -r candidate; do
+      candidate=${candidate%$'\r'}
       [ -n "$candidate" ] || continue
       [[ "$candidate" =~ ^[0-9a-f]{64}$ ]] || fail "cleanup volume marker is invalid"
       volumes+=("$candidate")
@@ -131,6 +172,17 @@ if [ "${1:-}" = --cleanup-survivors ]; then
   for attempt in 1 2 3; do
     if inspect_resource container "$c"; then
       jq -e --arg id "$rid" '.[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null || fail "unowned container survivor"
+      if [ -z "$v" ] && [ "${#volumes[@]}" -eq 0 ]; then
+        persist_container_volume_identities "$INSPECT_JSON" || fail "surviving volume identity is invalid"
+        if regular "$marker"; then
+          while IFS= read -r candidate; do
+            candidate=${candidate%$'\r'}
+            [ -n "$candidate" ] || continue
+            volumes+=("$candidate")
+          done <"$marker"
+          [ "${#volumes[@]}" -gt 0 ] && v=${volumes[0]}
+        fi
+      fi
       if [ -n "$v" ]; then
         container_mount_provenance "$INSPECT_JSON" "$v" "$root" || fail "volume/container association is invalid"
         docker container rm --force --volumes "$c" ||
@@ -167,6 +219,7 @@ if [ "${1:-}" = --cleanup-survivors ]; then
     done
     [ "$cs" -eq 2 ] || [ "$ns" -eq 2 ] || [ "$vs" -eq 2 ] && fail "cleanup inspection failed"
     if [ "$cs" -eq 1 ] && [ "$ns" -eq 1 ] && [ "$vs" -eq 1 ]; then
+      [ -z "$marker" ] || rm -f -- "$marker" || fail "cleanup marker removal failed"
       exit 0
     fi
     [ "$attempt" -lt 3 ] && sleep 1
@@ -188,7 +241,12 @@ while [ "$#" -gt 0 ]; do case "$1" in
   *) usage;;
 esac; done
 [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || usage
-[ -d "$artifact" ] && [ ! -L "$artifact" ] && [ -d "$output" ] && [ ! -L "$output" ] || usage
+[ -d "$artifact" ] && [ ! -L "$artifact" ] && [ -n "$output" ] || usage
+if [ -e "$output" ]; then
+  [ -d "$output" ] && [ ! -L "$output" ] || usage
+else
+  mkdir -p -- "$output"
+fi
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || fail "source SHA is required"
 [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "repository is required"
 for value in "$tooling" "$workflow" "$database_digest" "$media_digest"; do [[ "$value" =~ ^[0-9a-f]{64}$ ]] || fail "contract digest is required"; done
@@ -265,41 +323,53 @@ fi
 regular "$identity" || fail "age identity unavailable"
 private=$temp/private-$id; [ ! -e "$private" ] || fail "private restore directory already exists"; mkdir -- "$private"; chmod 700 "$private"
 db_dump=$private/postgres.dump; uploads_archive=$private/uploads.tar.gz; marker=$temp/volume.identity; [ ! -e "$marker" ] || fail "volume identity path is already in use"
-network=beta-recovery-$id; container=beta-recovery-postgres-$id; volume=''; marker_owned=0
+network=beta-recovery-$id; container=beta-recovery-postgres-$id; volume=''; volume_identities=(); marker_owned=0
 cleanup(){
-  local status=$? c v n cleanup_confirmed=0 candidate; trap - EXIT HUP INT TERM
-  rm -f -- "$identity" "$db_dump" "$uploads_archive" "$private/reference-list" || status=1
+  local status=$? local_cleanup_status=0 resource_cleanup_status=0 c v n cleanup_confirmed=0 candidate container_owned=0; trap - EXIT HUP INT TERM
+  rm -f -- "$identity" "$db_dump" "$uploads_archive" "$private/reference-list" || local_cleanup_status=1
   if inspect_resource container "$container"; then c=0; else c=$?; fi
   if [ "$c" -eq 0 ]; then
-    jq -e --arg id "$id" '.[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null ||
-      status=1
-    if [ "$status" -eq 0 ]; then
-      if [ "$marker_owned" -eq 1 ]; then
-        docker container rm --force --volumes "$container" || status=1
+    if jq -e --arg id "$id" '.[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null; then
+      container_owned=1
+    else
+      resource_cleanup_status=1
+    fi
+    if [ "$container_owned" -eq 1 ] && [ "$marker_owned" -eq 0 ]; then
+      if [ -e "$marker" ]; then
+        load_container_volume_identities || resource_cleanup_status=1
       else
-        docker container rm --force "$container" || status=1
+        persist_container_volume_identities "$INSPECT_JSON" || resource_cleanup_status=1
       fi
     fi
-  elif [ "$c" -eq 2 ]; then status=1; fi
+    if [ "$container_owned" -eq 1 ]; then
+      if [ "$marker_owned" -eq 1 ] || [ "${#volume_identities[@]}" -gt 0 ]; then
+        docker container rm --force --volumes "$container" || resource_cleanup_status=1
+      else
+        docker container rm --force "$container" || resource_cleanup_status=1
+      fi
+    fi
+  elif [ "$c" -eq 2 ]; then resource_cleanup_status=1; fi
   v=1
-  if [ "$marker_owned" -eq 1 ]; then
-    while IFS= read -r candidate; do
-      [ -n "$candidate" ] || continue
+  if [ "${#volume_identities[@]}" -gt 0 ]; then
+    for candidate in "${volume_identities[@]}"; do
       if inspect_resource volume "$candidate"; then
         v=0
-        volume_provenance "$INSPECT_JSON" "$candidate" "$docker_root" || status=1
-        [ "$status" -ne 0 ] || docker volume rm "$candidate" || status=1
+        if volume_provenance "$INSPECT_JSON" "$candidate" "$docker_root"; then
+          docker volume rm "$candidate" || resource_cleanup_status=1
+        else
+          resource_cleanup_status=1
+        fi
       else
         volume_status=$?
-        [ "$volume_status" -eq 2 ] && status=1
+        [ "$volume_status" -eq 2 ] && resource_cleanup_status=1
       fi
-    done <"$marker"
+    done
   fi
   if inspect_resource network "$network"; then n=0; else n=$?; fi
   if [ "$n" -eq 0 ]; then
     if jq -e --arg id "$id" '.[0].Labels["com.meet-backend.beta-recovery/owner"]=="restore" and .[0].Labels["com.meet-backend.beta-recovery/recovery-id"]==$id' <<<"$INSPECT_JSON" >/dev/null &&
-      docker network rm "$network"; then :; else status=1; fi
-  elif [ "$n" -eq 2 ]; then status=1; fi
+      docker network rm "$network"; then :; else resource_cleanup_status=1; fi
+  elif [ "$n" -eq 2 ]; then resource_cleanup_status=1; fi
   if inspect_resource container "$container"; then c=0; else c=$?; fi
   if inspect_resource network "$network"; then n=0; else n=$?; fi
   v=1
@@ -313,24 +383,26 @@ cleanup(){
     echo "cleanup survivors or inspection failure detected; starting a fresh-process retry" >&2
     if "$0" --cleanup-survivors --container "$container" --network "$network" --volume "${volume:-}" --volume-identity "$marker" --recovery-id "$id" --docker-root "$docker_root"; then
       cleanup_confirmed=1
+      resource_cleanup_status=0
     else
-      status=1
+      resource_cleanup_status=1
     fi
   else
     cleanup_confirmed=1
   fi
   if [ "$cleanup_confirmed" -eq 1 ]; then
-    [ -e "$marker" ] || [ "$marker_owned" -eq 0 ] || status=1
-    [ ! -e "$marker" ] || rm -f -- "$marker" || status=1
+    [ ! -e "$marker" ] || rm -f -- "$marker" || local_cleanup_status=1
   elif [ "$marker_owned" -eq 1 ]; then
-    chmod 600 "$marker" || status=1
+    chmod 600 "$marker" || local_cleanup_status=1
   fi
-  if [ "$status" -eq 0 ] && [ "$cleanup_confirmed" -eq 1 ]; then
-    printf 'cleanup_complete=true\n' >"$output/restore-summary" || status=1
+  if [ "$local_cleanup_status" -eq 0 ] && [ "$resource_cleanup_status" -eq 0 ] &&
+    [ "$cleanup_confirmed" -eq 1 ]; then
+    printf 'cleanup_complete=true\n' >"$output/restore-summary" || local_cleanup_status=1
   else
-    rm -f -- "$output/restore-summary" || status=1
+    rm -f -- "$output/restore-summary" || local_cleanup_status=1
   fi
-  [ ! -e "$private" ] || rm -r -- "$private" || status=1
+  [ ! -e "$private" ] || rm -r -- "$private" || local_cleanup_status=1
+  [ "$local_cleanup_status" -eq 0 ] && [ "$resource_cleanup_status" -eq 0 ] || status=1
   [ "$status" -eq 0 ] || exit "$status"; exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
@@ -343,18 +415,7 @@ docker image inspect "$image" --format '{{json .Config.Volumes}}' | jq -e 'type=
 docker network create --internal --label com.meet-backend.beta-recovery/owner=restore --label com.meet-backend.beta-recovery/recovery-id="$id" "$network" >/dev/null
 docker create --name "$container" --network "$network" --label com.meet-backend.beta-recovery/owner=restore --label com.meet-backend.beta-recovery/recovery-id="$id" -e POSTGRES_DB=restore_db -e POSTGRES_USER=restore_user -e POSTGRES_PASSWORD="$(od -An -N24 -tx1 /dev/urandom|tr -d '[:space:]')" "$image" >/dev/null
 container_json=$(docker container inspect "$container")
-volume_names=$(jq -r '.[0].Mounts[]? | select(.Type=="volume") | .Name' <<<"$container_json")
-if [ -n "$volume_names" ]; then
-  printf '%s\n' "$volume_names" >"$marker"
-  chmod 600 "$marker"
-  marker_owned=1
-  while IFS= read -r candidate; do
-    [[ "$candidate" =~ ^[0-9a-f]{64}$ ]] || fail "anonymous volume identity is invalid"
-  done <<<"$volume_names"
-  volume=$(printf '%s\n' "$volume_names" | head -n 1)
-else
-  fail "anonymous volume identity is missing"
-fi
+persist_container_volume_identities "$container_json" || fail "anonymous volume identity is invalid"
 jq -e '(
   ((.[0].HostConfig.Binds == null) or (.[0].HostConfig.Binds | type == "array" and length == 0)) and
   ((.[0].HostConfig.Mounts == null) or (.[0].HostConfig.Mounts | type == "array" and length == 0)) and
