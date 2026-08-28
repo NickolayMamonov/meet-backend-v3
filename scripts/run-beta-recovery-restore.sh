@@ -6,11 +6,32 @@ usage(){ echo "usage: $0 --artifact-dir PATH --recovery-id ID --output-dir PATH 
 fail(){ echo "beta recovery restore failed: $*" >&2; exit 1; }
 regular(){ [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ]; }
 identity=''
+temp_owned=0
+remove_path(){
+  local path=$1
+  if [ -L "$path" ]; then
+    rm -f -- "$path"
+  elif [ -d "$path" ]; then
+    rm -r -- "$path"
+  elif [ -e "$path" ]; then
+    rm -f -- "$path"
+  fi
+  [ ! -e "$path" ] && [ ! -L "$path" ]
+}
 preflight_cleanup(){
   local status=$?
   trap - EXIT HUP INT TERM
   [ -z "$identity" ] || rm -f -- "$identity" || status=1
   [ -z "${ownership_marker:-}" ] || rm -f -- "$ownership_marker" || status=1
+  if [ "${temp_owned:-0}" -eq 1 ]; then
+    remove_path "${db_expected:-}" || status=1
+    remove_path "${media_expected:-}" || status=1
+    if [ -d "$temp" ] && [ ! -L "$temp" ] &&
+      [ -z "$(find "$temp" -mindepth 1 -print -quit)" ]; then
+      rmdir -- "$temp" || status=1
+    fi
+    [ ! -e "$temp" ] && [ ! -L "$temp" ] || status=1
+  fi
   exit "$status"
 }
 trap preflight_cleanup EXIT HUP INT TERM
@@ -344,6 +365,9 @@ if [ -e "$temp" ]; then
 else
   mkdir -p -- "$temp"
 fi
+[ -z "$(find "$temp" -mindepth 1 -print -quit)" ] || fail "temporary restore root is not empty"
+chmod 700 "$temp"
+temp_owned=1
 db_expected=$temp/expected-database-proof.json
 media_expected=$temp/expected-media-proof.json
 jq -cS '.databaseProof' "$manifest" >"$db_expected"
@@ -403,7 +427,12 @@ cleanup(){
   else
     resource_cleanup_status=1
   fi
-  rm -f -- "$identity" "$db_dump" "$uploads_archive" "$private/reference-list" || local_cleanup_status=1
+  remove_path "$identity" || local_cleanup_status=1
+  remove_path "$db_dump" || local_cleanup_status=1
+  remove_path "$uploads_archive" || local_cleanup_status=1
+  remove_path "$private/reference-list" || local_cleanup_status=1
+  remove_path "$db_expected" || local_cleanup_status=1
+  remove_path "$media_expected" || local_cleanup_status=1
   if inspect_resource container "$container"; then c=0; else c=$?; fi
   if [ "$c" -eq 0 ]; then
     if [ "$ownership_valid" -eq 1 ] && [ "$container_attempted" = true ] &&
@@ -490,13 +519,18 @@ cleanup(){
     chmod 600 "$marker" || local_cleanup_status=1
     chmod 600 "$ownership_marker" || local_cleanup_status=1
   fi
+  remove_path "$private" || local_cleanup_status=1
+  if [ "$cleanup_confirmed" -eq 1 ] && [ "$local_cleanup_status" -eq 0 ] &&
+    [ "$resource_cleanup_status" -eq 0 ] && [ "$temp_owned" -eq 1 ]; then
+    [ -z "$(find "$temp" -mindepth 1 -print -quit)" ] &&
+      rmdir -- "$temp" && [ ! -e "$temp" ] || local_cleanup_status=1
+  fi
   if [ "$local_cleanup_status" -eq 0 ] && [ "$resource_cleanup_status" -eq 0 ] &&
-    [ "$cleanup_confirmed" -eq 1 ]; then
+    [ "$cleanup_confirmed" -eq 1 ] && [ ! -e "$temp" ] && [ ! -L "$temp" ]; then
     printf 'cleanup_complete=true\n' >"$output/restore-summary" || local_cleanup_status=1
   else
     rm -f -- "$output/restore-summary" || local_cleanup_status=1
   fi
-  [ ! -e "$private" ] || rm -r -- "$private" || local_cleanup_status=1
   [ "$local_cleanup_status" -eq 0 ] && [ "$resource_cleanup_status" -eq 0 ] || status=1
   [ "$status" -eq 0 ] || exit "$status"; exit "$status"
 }

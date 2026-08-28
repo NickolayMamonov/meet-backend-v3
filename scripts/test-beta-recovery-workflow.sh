@@ -28,6 +28,93 @@ grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
 grep -Fq 'Revalidate source immediately before identity access' "$workflow"
 grep -Fq 'scp_opts=(-i "$key" -P "$PORT"' "$workflow"
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
+grep -Fq 'RECOVERY_ID: ${{ inputs.recovery_id }}' "$workflow"
+grep -Fq 'scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"' "$workflow"
+grep -Fq 'scripts/authorize-beta-recovery.sh validate-age-recipient "$AGE_RECIPIENT"' "$workflow"
+grep -Fq 'recipient_file="$RUNNER_TEMP/age-recipient"' "$workflow"
+grep -Fq 'recipient=$(<"$remote/age-recipient")' "$workflow"
+if grep -Fq "AGE_RECIPIENT='" "$workflow" ||
+  grep -Fq -- "--recipient '" "$workflow"; then
+  echo "age recipient is interpolated into remote shell source" >&2
+  exit 1
+fi
+run_block=$(awk '
+  /^        run: \|$/ { in_run=1; next }
+  in_run && /^      [^ ]/ { in_run=0 }
+  in_run { print }
+' "$workflow")
+if grep -Fq '${{ inputs.recovery_id }}' <<<"$run_block"; then
+  echo "recovery ID is interpolated directly into a run block" >&2
+  exit 1
+fi
+validation_count=$(grep -Fc 'scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"' "$workflow")
+[ "$validation_count" -eq 7 ]
+auth="$root/scripts/authorize-beta-recovery.sh"
+fixture_dir=$(mktemp -d)
+trap 'rm -r -- "$fixture_dir"' EXIT HUP INT TERM
+valid_recovery_id=recovery-fixture
+valid_recipient=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m
+invalid_short_recipient=age1x
+invalid_checksum_recipient=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh76
+remote_dir="$fixture_dir/remote"
+remote_marker="$fixture_dir/remote-marker"
+received_recipient="$fixture_dir/received-recipient"
+remote_log="$fixture_dir/remote.log"
+malicious_recovery_id="recovery-fixture'; touch $remote_marker; #"
+malicious_recipient="age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m'; touch $remote_marker; #"
+bash "$auth" validate-recovery-id "$valid_recovery_id"
+bash "$auth" validate-age-recipient "$valid_recipient"
+if bash "$auth" validate-age-recipient "$invalid_short_recipient" >/dev/null 2>&1 ||
+  bash "$auth" validate-age-recipient "$invalid_checksum_recipient" >/dev/null 2>&1 ||
+  bash "$auth" validate-recovery-id "$malicious_recovery_id" >/dev/null 2>&1 ||
+  bash "$auth" validate-age-recipient "$malicious_recipient" >/dev/null 2>&1; then
+  echo "shell metacharacter fixture was accepted" >&2
+  exit 1
+fi
+[ ! -e "$remote_marker" ]
+mkdir "$remote_dir"
+scp_calls=0
+ssh_calls=0
+scp(){
+  scp_calls=$((scp_calls + 1))
+  printf 'scp %s\n' "$*" >>"$remote_log"
+  cp -- "$1" "$remote_dir/age-recipient"
+}
+ssh(){
+  ssh_calls=$((ssh_calls + 1))
+  printf 'ssh %s\n' "$*" >>"$remote_log"
+  bash -s -- "$remote_dir" "$valid_recovery_id" \
+    https://api.whysoezzy.online "$received_recipient" "$valid_recipient" "$remote_marker"
+}
+run_safe_capture_preflight(){
+  local recipient=$1 recipient_file="$fixture_dir/age-recipient-input"
+  scripts/authorize-beta-recovery.sh validate-age-recipient "$recipient" || return
+  printf '%s\n' "$recipient" >"$recipient_file"
+  scp "$recipient_file" "fake-host:$remote_dir/"
+  ssh fake-host "sudo bash -s -- '$remote_dir' '$valid_recovery_id' 'https://api.whysoezzy.online'" <<'REMOTE'
+set -euo pipefail
+remote=$1
+recovery_id=$2
+public_url=$3
+received=$4
+expected=$5
+marker=$6
+recipient=$(<"$remote/age-recipient")
+if [ "$recipient" != "$expected" ]; then
+  touch "$marker"
+fi
+printf '%s\n' "$recipient" >"$received"
+REMOTE
+}
+if run_safe_capture_preflight "$malicious_recipient"; then
+  echo "malicious recipient crossed the remote boundary" >&2
+  exit 1
+fi
+[ "$scp_calls" -eq 0 ] && [ "$ssh_calls" -eq 0 ] && [ ! -e "$remote_marker" ]
+run_safe_capture_preflight "$valid_recipient"
+[ "$scp_calls" -eq 1 ] && [ "$ssh_calls" -eq 1 ]
+[ "$(wc -l <"$received_recipient" | tr -d '[:space:]')" -eq 1 ]
+[ "$(<"$received_recipient")" = "$valid_recipient" ]
 grep -Fq 'transferred ciphertext differs from quiesced capture result' "$workflow"
 grep -Fq 'transferred proof differs from quiesced capture result' "$workflow"
 grep -Fq '.capturedAt==.recoveryPointTime' "$workflow"

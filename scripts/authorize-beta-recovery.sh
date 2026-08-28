@@ -1,8 +1,71 @@
 #!/usr/bin/env bash
 set -euo pipefail
-usage(){ echo "usage: $0 authorize|revalidate --repository OWNER/REPO --source-checkout PATH --source-sha SHA --workflow PATH --output-dir PATH" >&2; exit 2; }
+usage(){
+  echo "usage: $0 validate-recovery-id ID | validate-age-recipient RECIPIENT | authorize|revalidate --repository OWNER/REPO --source-checkout PATH --source-sha SHA --workflow PATH --output-dir PATH" >&2
+  exit 2
+}
 fail(){ echo "beta recovery authorization failed: $*" >&2; exit 1; }
-mode=${1:-}; case "$mode" in authorize|revalidate) shift;; *) usage;; esac
+validate_recovery_id(){ [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || fail "recovery ID malformed"; }
+bech32_char_value(){
+  case "$1" in
+    q) bech32_value_result=0;; p) bech32_value_result=1;;
+    z) bech32_value_result=2;; r) bech32_value_result=3;;
+    y) bech32_value_result=4;; 9) bech32_value_result=5;;
+    x) bech32_value_result=6;; 8) bech32_value_result=7;;
+    g) bech32_value_result=8;; f) bech32_value_result=9;;
+    2) bech32_value_result=10;; t) bech32_value_result=11;;
+    v) bech32_value_result=12;; d) bech32_value_result=13;;
+    w) bech32_value_result=14;; 0) bech32_value_result=15;;
+    s) bech32_value_result=16;; 3) bech32_value_result=17;;
+    j) bech32_value_result=18;; n) bech32_value_result=19;;
+    5) bech32_value_result=20;; 4) bech32_value_result=21;;
+    k) bech32_value_result=22;; h) bech32_value_result=23;;
+    c) bech32_value_result=24;; e) bech32_value_result=25;;
+    6) bech32_value_result=26;; m) bech32_value_result=27;;
+    u) bech32_value_result=28;; a) bech32_value_result=29;;
+    7) bech32_value_result=30;; l) bech32_value_result=31;;
+    *) return 1;;
+  esac
+}
+bech32_feed(){
+  local top=$((bech32_checksum >> 25))
+  bech32_checksum=$(((bech32_checksum & 0x1ffffff) << 5 | $1))
+  local i
+  for i in 0 1 2 3 4; do
+    if (( (top >> i) & 1 )); then
+      bech32_checksum=$((bech32_checksum ^ bech32_generator[i]))
+    fi
+  done
+}
+validate_age_recipient(){
+  local recipient=${1:-} char i
+  [[ "$recipient" =~ ^age1[0-9a-z]{58}$ ]] || fail "age recipient malformed"
+  bech32_checksum=1
+  bech32_generator=(0x3b6a57b2 0x26508e6d 0x1ea119fa 0x3d4233dd 0x2a1462b3)
+  for i in 3 3 3 0 1 7 5; do bech32_feed "$i"; done
+  for ((i=4; i<${#recipient}; i++)); do
+    bech32_char_value "${recipient:i:1}" || fail "age recipient malformed"
+    bech32_feed "$bech32_value_result"
+  done
+  (( bech32_checksum == 1 )) || fail "age recipient malformed"
+  bech32_char_value "${recipient:55:1}" || fail "age recipient malformed"
+  (( (bech32_value_result & 15) == 0 )) || fail "age recipient malformed"
+}
+mode=${1:-}
+case "$mode" in
+  validate-recovery-id)
+    [ "$#" -eq 2 ] || usage
+    validate_recovery_id "$2"
+    exit 0
+    ;;
+  validate-age-recipient)
+    [ "$#" -eq 2 ] || usage
+    validate_age_recipient "$2"
+    exit 0
+    ;;
+  authorize|revalidate) shift;;
+  *) usage;;
+esac
 repository='' checkout='' source_sha='' workflow='' output_dir='' github_output=''
 while [ "$#" -gt 0 ]; do
   case "$1" in

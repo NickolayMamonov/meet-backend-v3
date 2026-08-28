@@ -39,8 +39,8 @@ grep -Fq -- '--validate-uploads-archive' "$script"
 grep -Fq 'tar --extract --gzip' "$script"
 grep -Fq 'cleanup-survivors' "$script"
 grep -Fq -- '"$0" --cleanup-survivors' "$script"
-grep -Fq 'rm -f -- "$identity"' "$script"
-grep -Fq 'rm -r -- "$private"' "$script"
+grep -Fq 'remove_path "$identity"' "$script"
+grep -Fq 'remove_path "$private"' "$script"
 grep -Fq 'docker container rm --force --volumes' "$script"
 grep -Fq 'docker volume rm' "$script"
 grep -Fq 'docker network rm' "$script"
@@ -68,6 +68,7 @@ printf 'avatar\n' >"$fixture/valid/avatars/file"
 printf 'nested avatar\n' >"$fixture/valid/avatars/nested/file"
 printf 'meeting\n' >"$fixture/valid/meetings/file"
 printf 'community\n' >"$fixture/valid/communities/file"
+: >"$fixture/valid/meetings/unreferenced-zero"
 tar --create --gzip --file "$fixture/valid.tar.gz" --directory "$fixture/valid" .
 "$script" --validate-uploads-archive --archive "$fixture/valid.tar.gz" --work-dir "$fixture/work"
 
@@ -103,7 +104,9 @@ run_restore_fixture() {
   printf encrypted >"$case_dir/artifact/uploads.tar.gz.age"
   jq -cnS '{schema:"meet-backend/closed-beta-database-proof/v1",rows:{users:1}}' \
     >"$case_dir/database-proof.json"
+  printf 'avatars/file\n' >"$case_dir/reference-list"
   "$root/scripts/beta-recovery-media-proof.sh" --root "$fixture/valid" \
+    --reference-list "$case_dir/reference-list" \
     --output "$case_dir/media-proof.json"
   hash=$(jq -er '.canonicalDigest' "$case_dir/media-proof.json")
   jq -cnS --arg hash "$hash" '{schema:"meet-backend/test-vps-recovery-runtime/v1",healthy:true,
@@ -147,9 +150,11 @@ run_restore_fixture() {
   export FAKE_DOCKER_ROOT="$case_dir/docker-root"
   export FAKE_RECOVERY_ID=recovery-fixture
   export FAKE_DOCKER_MOUNT_MODE="$mount_mode"
+  export FAKE_MEDIA_REFERENCE=avatars/file
   unset FAKE_DOCKER_FAIL_RESTORE FAKE_DOCKER_FAIL_CONTAINER_RM_ONCE
   unset FAKE_DOCKER_FAIL_VOLUME_RM_ONCE FAKE_DOCKER_PRESERVE_VOLUME FAKE_DOCKER_INTERRUPT_AFTER_CREATE
   if [ "$behavior" = restore-failure ]; then export FAKE_DOCKER_FAIL_RESTORE=1; fi
+  if [ "$behavior" = zero-reference ]; then export FAKE_MEDIA_REFERENCE=meetings/unreferenced-zero; fi
   if [ "$behavior" = retry ]; then
     export FAKE_DOCKER_FAIL_CONTAINER_RM_ONCE=1
     export FAKE_DOCKER_PRESERVE_VOLUME=1
@@ -239,6 +244,8 @@ run_restore_fixture() {
       --workflow-digest "$workflow_digest" --database-digest "$database_digest" \
       --media-digest "$media_digest"
     [ -d "$case_dir/capacity-output" ]
+    [ ! -e "$case_dir/capacity-temp" ] && [ ! -L "$case_dir/capacity-temp" ] ||
+      { echo "capacity-only restore left temporary residue" >&2; exit 1; }
   fi
   if PATH="$case_dir/bin:$PATH" bash "$script" \
     --artifact-dir "$case_dir/artifact" --recovery-id recovery-fixture \
@@ -271,6 +278,11 @@ run_restore_fixture() {
     { echo "restore fixture $name left anonymous volume state" >&2; exit 1; }
   [ ! -e "$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] ||
     { echo "restore fixture $name left anonymous volume data" >&2; exit 1; }
+  if [ "$behavior" = zero-reference ]; then
+    jq -e '.referencesTotal==1 and .referencesResolved==false' \
+      "$case_dir/output/restored-media-proof.json" >/dev/null ||
+      { echo "zero-byte reference did not produce an unresolved media proof" >&2; exit 1; }
+  fi
   if [ "$expected_status" -eq 0 ]; then
     [ -s "$case_dir/output/restored-database-proof.json" ] &&
       [ -s "$case_dir/output/restored-media-proof.json" ] &&
@@ -290,6 +302,7 @@ run_restore_fixture restore-duplicate 1 duplicate
 run_restore_fixture restore-missing 1 missing
 run_restore_fixture restore-unexpected 1 unexpected
 run_restore_fixture restore-collision 1 valid collision
+run_restore_fixture restore-zero-reference 1 valid zero-reference
 run_restore_fixture restore-interruption 137 valid interrupt
 run_restore_fixture restore-interruption-retry 0 valid survivor
 

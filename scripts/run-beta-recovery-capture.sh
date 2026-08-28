@@ -54,14 +54,39 @@ validate_journal(){
     .schema=="meet-backend/beta-recovery-journal/v1" and (.recoveryId|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")) and
     (.phase|type=="string" and length>0) and (.state=="nonterminal" or .state=="terminal") and
     (.capturedContainerId|test("^[0-9a-f]{12,64}$")) and (.capturedImageId|test("^sha256:[0-9a-f]{64}$")) and
-    (.capturedRuntimeDigest|test("^[0-9a-f]{64}$")) and (.currentRuntimeHealthy|type=="boolean") and
-    (.capturedContainerSafe|type=="boolean") and .ownedPaths==$owned' "$1" >/dev/null
+    (.capturedRuntimeDigest|test("^[0-9a-f]{64}$")) and (.currentRuntimeHealthy==true) and
+    (.capturedContainerSafe==true) and .ownedPaths==$owned' "$1" >/dev/null
 }
 clean_owned(){
   local state=$1 path
-  while IFS= read -r path; do case "$path" in private/*) rm -f -- "$state/$path";; staging) [ ! -e "$state/staging" ] || { [ ! -L "$state/staging" ] && rm -r -- "$state/staging"; };; *) return 1;; esac; done < <(jq -r '.ownedPaths[]' "$state/journal.json")
+  while IFS= read -r path; do
+    path=${path%$'\r'}
+    case "$path" in
+      private/*) rm -f -- "$state/$path";;
+      staging) [ ! -e "$state/staging" ] || { [ ! -L "$state/staging" ] && rm -r -- "$state/staging"; };;
+      *) return 1;;
+    esac
+  done < <(jq -r '.ownedPaths[]' "$state/journal.json")
   [ ! -e "$state/private" ] || [ -z "$(find "$state/private" -mindepth 1 -print -quit)" ] || return 1
   [ ! -e "$state/staging" ] || return 1
+}
+inspect_captured_container(){
+  local container=$1 response=$2 errors
+  errors=$(mktemp "$state_root/.inspect-error.XXXXXX")
+  if docker inspect "$container" >"$response" 2>"$errors"; then
+    if jq -e 'type=="array" and length==1 and (.[0]|type=="object")' "$response" >/dev/null; then
+      rm -f -- "$errors"
+      return 0
+    fi
+    rm -f -- "$errors" "$response"
+    return 2
+  fi
+  if grep -Eq '^(Error: |Error response from daemon: )No such (container|object): [^[:space:]]' "$errors"; then
+    rm -f -- "$errors" "$response"
+    return 1
+  fi
+  rm -f -- "$errors" "$response"
+  return 2
 }
 terminalize(){
   local state=$1 status=$2 journal incident tmp
@@ -100,9 +125,17 @@ reconcile_states(){
       [ "$hash" = "$(jq -er .capturedRuntimeDigest "$journal")" ] || fail "captured runtime differs"; rm -f -- "$fresh"; status=incident_resolved
     else
       docker info >/dev/null 2>&1 || fail "Docker state unavailable"
-      if docker inspect "$expected" >/dev/null 2>&1; then
-        [ "$(docker inspect "$expected" --format '{{.State.Running}}')" = false ] || fail "superseded container is running"
-        [ "$(docker inspect "$expected" --format '{{.Image}}')" = "$image" ] || fail "superseded image differs"
+      inspected=$(mktemp "$state_root/.inspect.XXXXXX")
+      if inspect_captured_container "$expected" "$inspected"; then
+        [ "$(jq -er '.[0].State.Running' "$inspected")" = false ] ||
+          { rm -f -- "$inspected"; fail "superseded container is running"; }
+        [ "$(jq -er '.[0].Image' "$inspected")" = "$image" ] ||
+          { rm -f -- "$inspected"; fail "superseded image differs"; }
+        rm -f -- "$inspected"
+      else
+        inspect_status=$?
+        rm -f -- "$inspected"
+        [ "$inspect_status" = 1 ] || fail "captured container inspection is ambiguous"
       fi
       fresh=$(mktemp "$state_root/.runtime.XXXXXX"); probe_runtime "$fresh"
       [ -z "$current_runtime" ] || cmp -- "$current_runtime" "$fresh" || fail "current runtime differs"

@@ -160,6 +160,8 @@ case "${1:-}" in
     if printf '%s\n' "$*" | grep -Fq 'psql'; then
       if printf '%s\n' "$*" | grep -Fq -- '-f /tmp/proof.sql'; then
         cat "$FAKE_DATABASE_PROOF"
+      elif printf '%s\n' "$*" | grep -Fq 'regexp_replace(image_url'; then
+        [ -z "${FAKE_MEDIA_REFERENCE:-}" ] || printf '%s\n' "$FAKE_MEDIA_REFERENCE"
       fi
       exit 0
     fi

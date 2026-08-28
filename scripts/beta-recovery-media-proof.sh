@@ -54,7 +54,8 @@ if [ -n "$references" ]; then
     reference_count=$((reference_count + 1))
     [ -n "$reference" ] || { references_resolved=false; continue; }
     case "$reference" in avatars/*|meetings/*|communities/*);; /*|../*|*/../*|*'/..'|*\\*) references_resolved=false; continue;; *) references_resolved=false; continue;; esac
-    [ -f "$root/$reference" ] && [ ! -L "$root/$reference" ] || references_resolved=false
+    [ -f "$root/$reference" ] && [ ! -L "$root/$reference" ] && [ -s "$root/$reference" ] ||
+      references_resolved=false
   done <"$references"
 fi
 candidate=$(mktemp "$output.tmp.XXXXXX")
