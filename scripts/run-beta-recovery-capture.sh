@@ -52,7 +52,8 @@ validate_journal(){
   jq -e --argjson owned "$owned" 'type=="object" and
     (keys|sort)==["capturedContainerId","capturedContainerSafe","capturedImageId","capturedRuntimeDigest","currentRuntimeHealthy","ownedPaths","phase","recoveryId","schema","state"] and
     .schema=="meet-backend/beta-recovery-journal/v1" and (.recoveryId|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")) and
-    (.phase|type=="string" and length>0) and (.state=="nonterminal" or .state=="terminal") and
+    (((.state=="nonterminal") and (.phase=="pre_stop" or .phase=="snapshot_complete" or .phase=="runtime_verified")) or
+     ((.state=="terminal") and (.phase=="incident_resolved" or .phase=="superseded"))) and
     (.capturedContainerId|test("^[0-9a-f]{12,64}$")) and (.capturedImageId|test("^sha256:[0-9a-f]{64}$")) and
     (.capturedRuntimeDigest|test("^[0-9a-f]{64}$")) and (.currentRuntimeHealthy==true) and
     (.capturedContainerSafe==true) and .ownedPaths==$owned' "$1" >/dev/null
@@ -98,8 +99,17 @@ terminalize(){
   jq --arg phase "$status" '.state="terminal"|.phase=$phase|.currentRuntimeHealthy=true|.capturedContainerSafe=true' "$journal" >"$tmp"
   chmod 600 "$tmp"; mv -- "$tmp" "$journal"
 }
+validate_incident(){
+  local incident=$1 expected_id=$2 expected_status=$3
+  jq -e --arg id "$expected_id" --arg status "$expected_status" '
+    type=="object" and (keys|sort)==["recoveryId","sanitized","schema","status"] and
+    .schema=="meet-backend/beta-recovery-incident/v1" and .recoveryId==$id and
+    .status==$status and ($status=="incident_resolved" or $status=="superseded") and
+    .sanitized==true
+  ' "$incident" >/dev/null
+}
 reconcile_states(){
-  local state state_id journal current expected image running mount fresh hash count=0 summary
+  local state state_id journal current expected image running mount fresh hash count=0 summary terminal_phase
   summary=$(mktemp "$state_root/.reconcile.XXXXXX")
   trap 'rm -f -- "${summary:-}"' RETURN
   for state in "$state_root"/beta-recovery-*; do
@@ -111,6 +121,9 @@ reconcile_states(){
     [ "$(jq -er .recoveryId "$journal")" = "$state_id" ] || fail "recovery state identity differs"
     if [ "$(jq -er .state "$journal")" = terminal ]; then
       [ -f "$state/incident.json" ] && [ ! -L "$state/incident.json" ] || fail "terminal incident missing"
+      terminal_phase=$(jq -er .phase "$journal")
+      validate_incident "$state/incident.json" "$state_id" "$terminal_phase" ||
+        fail "terminal incident is malformed"
       clean_owned "$state" || fail "terminal capture state is not clean"; continue
     fi
     expected=$(jq -er .capturedContainerId "$journal"); image=$(jq -er .capturedImageId "$journal")

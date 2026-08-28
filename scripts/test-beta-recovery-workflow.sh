@@ -33,6 +33,9 @@ grep -Fq 'scripts/authorize-beta-recovery.sh validate-recovery-id "$RECOVERY_ID"
 grep -Fq 'scripts/authorize-beta-recovery.sh validate-age-recipient "$AGE_RECIPIENT"' "$workflow"
 grep -Fq 'recipient_file="$RUNNER_TEMP/age-recipient"' "$workflow"
 grep -Fq 'recipient=$(<"$remote/age-recipient")' "$workflow"
+grep -Fq 'Remove selected artifact temporary files' "$workflow"
+grep -Fq 'RUNNER_TEMP/age-identity' "$workflow"
+grep -Fq 'Verify no isolated restore runner residue' "$workflow"
 if grep -Fq "AGE_RECIPIENT='" "$workflow" ||
   grep -Fq -- "--recipient '" "$workflow"; then
   echo "age recipient is interpolated into remote shell source" >&2

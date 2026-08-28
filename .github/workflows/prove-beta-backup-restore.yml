@@ -339,6 +339,24 @@ jobs:
           retention-days: 30
           if-no-files-found: error
           path: ${{ runner.temp }}/artifact
+      - name: Remove selected artifact temporary files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup_path() {
+            local path=$1
+            if [ -L "$path" ]; then
+              rm -f -- "$path"
+            elif [ -d "$path" ]; then
+              rm -r -- "$path"
+            elif [ -e "$path" ]; then
+              rm -f -- "$path"
+            fi
+            [ ! -e "$path" ] && [ ! -L "$path" ]
+          }
+          cleanup_path "$RUNNER_TEMP/artifact.zip"
+          cleanup_path "$RUNNER_TEMP/artifact"
 
   restore-pre-probe:
     name: Probe test VPS before approval
@@ -551,8 +569,9 @@ jobs:
             [ ! -e "$path" ] && [ ! -L "$path" ]
           }
           cleanup_status=0
-          for path in "$RUNNER_TEMP/artifact.zip" "$RUNNER_TEMP/artifact" \
-            "$RUNNER_TEMP/restore-artifact" "$RUNNER_TEMP/restore-temp"; do
+          for path in "$RUNNER_TEMP/age-identity" "$RUNNER_TEMP/artifact.zip" \
+            "$RUNNER_TEMP/artifact" "$RUNNER_TEMP/restore-artifact" \
+            "$RUNNER_TEMP/restore-temp"; do
             cleanup_path "$path" || cleanup_status=1
           done
           if [ "$RESTORE_OUTCOME" = success ] && [ "$cleanup_status" -eq 0 ]; then
@@ -575,6 +594,42 @@ jobs:
             ${{ runner.temp }}/restore-output/restored-media-proof.json
             ${{ runner.temp }}/restore-output/restore-summary
             ${{ runner.temp }}/restore-output/mount-contract.json
+      - id: final_cleanup
+        name: Verify no isolated restore runner residue
+        if: always()
+        shell: bash
+        env:
+          RESTORE_CLEANUP_COMPLETE: ${{ steps.cleanup.outputs.cleanup_complete }}
+          ANONYMOUS_VOLUME_ABSENT: ${{ steps.cleanup.outputs.anonymous_volume_absent }}
+        run: |
+          set -euo pipefail
+          cleanup_path() {
+            local path=$1
+            if [ -L "$path" ]; then
+              rm -f -- "$path"
+            elif [ -d "$path" ]; then
+              rm -r -- "$path"
+            elif [ -e "$path" ]; then
+              rm -f -- "$path"
+            fi
+            [ ! -e "$path" ] && [ ! -L "$path" ]
+          }
+          cleanup_status=0
+          for path in "$RUNNER_TEMP/age-identity" "$RUNNER_TEMP/artifact.zip" \
+            "$RUNNER_TEMP/artifact" "$RUNNER_TEMP/restore-artifact" \
+            "$RUNNER_TEMP/restore-temp" "$RUNNER_TEMP/restore-output" \
+            "$RUNNER_TEMP/mount-contract"; do
+            cleanup_path "$path" || cleanup_status=1
+          done
+          if [ "$RESTORE_CLEANUP_COMPLETE" = true ] &&
+            [ "$ANONYMOUS_VOLUME_ABSENT" = true ] && [ "$cleanup_status" -eq 0 ]; then
+            echo "cleanup_complete=true" >>"$GITHUB_OUTPUT"
+            echo "anonymous_volume_absent=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "cleanup_complete=false" >>"$GITHUB_OUTPUT"
+            echo "anonymous_volume_absent=false" >>"$GITHUB_OUTPUT"
+            exit 1
+          fi
 
   restore-post-probe:
     name: Probe test VPS after cleanup

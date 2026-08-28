@@ -190,4 +190,34 @@ for unsafe_flags in healthy safe; do
     [ -f "$unsafe_state/private/capture-runtime.json" ] && [ -f "$unsafe_state/staging/owned" ] ||
     fail "false $unsafe_flags journal lost owned state"
 done
+invalid_phase_root="$capture_fixture/state-invalid-phase"
+write_capture_journal "$invalid_phase_root" true true
+invalid_phase_state="$invalid_phase_root/beta-recovery-recovery-fixture"
+jq '.phase="invalid_phase"' "$invalid_phase_state/journal.json" >"$invalid_phase_state/journal.tmp"
+mv -- "$invalid_phase_state/journal.tmp" "$invalid_phase_state/journal.json"
+printf '{}' >"$invalid_phase_state/incident.json"
+invalid_phase_journal_before=$(sha256sum "$invalid_phase_state/journal.json")
+invalid_phase_owned_before=$(find "$invalid_phase_state/private" "$invalid_phase_state/staging" -type f -exec sha256sum {} \; | sort | sha256sum)
+if run_capture_reconcile not-found "$invalid_phase_root"; then
+  fail "invalid journal phase was reconciled"
+fi
+[ "$invalid_phase_journal_before" = "$(sha256sum "$invalid_phase_state/journal.json")" ] &&
+  [ "$invalid_phase_owned_before" = "$(find "$invalid_phase_state/private" "$invalid_phase_state/staging" -type f -exec sha256sum {} \; | sort | sha256sum)" ] &&
+  [ "$(jq -er .state "$invalid_phase_state/journal.json")" = nonterminal ] ||
+  fail "invalid journal phase changed capture state"
+terminal_incident_root="$capture_fixture/state-invalid-incident"
+write_capture_journal "$terminal_incident_root" true true
+terminal_incident_state="$terminal_incident_root/beta-recovery-recovery-fixture"
+jq '.state="terminal"|.phase="superseded"' "$terminal_incident_state/journal.json" >"$terminal_incident_state/journal.tmp"
+mv -- "$terminal_incident_state/journal.tmp" "$terminal_incident_state/journal.json"
+printf '{}' >"$terminal_incident_state/incident.json"
+terminal_incident_journal_before=$(sha256sum "$terminal_incident_state/journal.json")
+terminal_incident_owned_before=$(find "$terminal_incident_state/private" "$terminal_incident_state/staging" -type f -exec sha256sum {} \; | sort | sha256sum)
+if run_capture_reconcile not-found "$terminal_incident_root"; then
+  fail "malformed terminal incident was reconciled"
+fi
+[ "$terminal_incident_journal_before" = "$(sha256sum "$terminal_incident_state/journal.json")" ] &&
+  [ "$terminal_incident_owned_before" = "$(find "$terminal_incident_state/private" "$terminal_incident_state/staging" -type f -exec sha256sum {} \; | sort | sha256sum)" ] &&
+  [ "$(jq -er .state "$terminal_incident_state/journal.json")" = terminal ] ||
+  fail "malformed terminal incident changed capture state"
 echo "beta recovery capture contract passed"
