@@ -230,6 +230,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-deploy.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-fake-remote.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-workflow.sh"
+          bash "$TOOLING_SCRIPTS/test-beta-recovery-authorization.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-evidence.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-capture.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-restore.sh"
