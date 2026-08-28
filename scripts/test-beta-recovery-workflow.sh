@@ -36,6 +36,20 @@ grep -Fq 'recipient=$(<"$remote/age-recipient")' "$workflow"
 grep -Fq 'Remove selected artifact temporary files' "$workflow"
 grep -Fq 'RUNNER_TEMP/age-identity' "$workflow"
 grep -Fq 'Verify no isolated restore runner residue' "$workflow"
+grep -Fq 'cleanup_complete: ${{ steps.final_cleanup.outputs.cleanup_complete }}' "$workflow"
+grep -Fq 'anonymous_volume_absent: ${{ steps.final_cleanup.outputs.anonymous_volume_absent }}' "$workflow"
+post_probe_job=$(awk '/restore-post-probe:/{flag=1} /evidence:/{flag=0} flag' "$workflow")
+evidence_job=$(awk '/evidence:/{flag=1} flag' "$workflow")
+grep -Fq "needs.restore-isolated.result == 'success'" <<<"$post_probe_job"
+grep -Fq "needs.restore-isolated.result == 'success'" <<<"$evidence_job"
+isolated_result=failure
+final_cleanup_complete=true
+anonymous_volume_absent=true
+if [ "$isolated_result" = success ] &&
+  [ "$final_cleanup_complete" = true ] && [ "$anonymous_volume_absent" = true ]; then
+  echo "failed isolated cleanup could reach success" >&2
+  exit 1
+fi
 if grep -Fq "AGE_RECIPIENT='" "$workflow" ||
   grep -Fq -- "--recipient '" "$workflow"; then
   echo "age recipient is interpolated into remote shell source" >&2

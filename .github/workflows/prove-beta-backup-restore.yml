@@ -423,8 +423,8 @@ jobs:
     runs-on: ubuntu-24.04
     environment: closed-beta-restore
     outputs:
-      cleanup_complete: ${{ steps.cleanup.outputs.cleanup_complete }}
-      anonymous_volume_absent: ${{ steps.cleanup.outputs.anonymous_volume_absent }}
+      cleanup_complete: ${{ steps.final_cleanup.outputs.cleanup_complete }}
+      anonymous_volume_absent: ${{ steps.final_cleanup.outputs.anonymous_volume_absent }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -634,7 +634,8 @@ jobs:
   restore-post-probe:
     name: Probe test VPS after cleanup
     needs: [restore-pre-probe, restore-isolated]
-    if: always() && inputs.operation == 'restore' && needs.restore-pre-probe.result == 'success'
+    if: always() && inputs.operation == 'restore' && needs.restore-pre-probe.result == 'success' &&
+      needs.restore-isolated.result == 'success'
     runs-on: ubuntu-24.04
     environment: test-vps
     outputs:
@@ -702,7 +703,8 @@ jobs:
   evidence:
     name: Require complete secret-free evidence
     needs: [restore-select, restore-isolated, restore-post-probe]
-    if: always() && inputs.operation == 'restore' && needs.restore-select.result == 'success'
+    if: always() && inputs.operation == 'restore' && needs.restore-select.result == 'success' &&
+      needs.restore-isolated.result == 'success'
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
