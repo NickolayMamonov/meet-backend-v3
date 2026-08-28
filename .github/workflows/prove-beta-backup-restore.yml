@@ -570,10 +570,12 @@ jobs:
           }
           cleanup_status=0
           for path in "$RUNNER_TEMP/age-identity" "$RUNNER_TEMP/artifact.zip" \
-            "$RUNNER_TEMP/artifact" "$RUNNER_TEMP/restore-artifact" \
-            "$RUNNER_TEMP/restore-temp"; do
+            "$RUNNER_TEMP/artifact" "$RUNNER_TEMP/restore-artifact"; do
             cleanup_path "$path" || cleanup_status=1
           done
+          if [ "$RESTORE_OUTCOME" = success ] && [ "$cleanup_status" -eq 0 ]; then
+            cleanup_path "$RUNNER_TEMP/restore-temp" || cleanup_status=1
+          fi
           if [ "$RESTORE_OUTCOME" = success ] && [ "$cleanup_status" -eq 0 ]; then
             echo "cleanup_complete=true" >>"$GITHUB_OUTPUT"
             echo "anonymous_volume_absent=true" >>"$GITHUB_OUTPUT"
@@ -601,6 +603,7 @@ jobs:
         env:
           RESTORE_CLEANUP_COMPLETE: ${{ steps.cleanup.outputs.cleanup_complete }}
           ANONYMOUS_VOLUME_ABSENT: ${{ steps.cleanup.outputs.anonymous_volume_absent }}
+          RESTORE_OUTCOME: ${{ steps.restore.outcome }}
         run: |
           set -euo pipefail
           cleanup_path() {
@@ -617,11 +620,17 @@ jobs:
           cleanup_status=0
           for path in "$RUNNER_TEMP/age-identity" "$RUNNER_TEMP/artifact.zip" \
             "$RUNNER_TEMP/artifact" "$RUNNER_TEMP/restore-artifact" \
-            "$RUNNER_TEMP/restore-temp" "$RUNNER_TEMP/restore-output" \
+            "$RUNNER_TEMP/restore-output" \
             "$RUNNER_TEMP/mount-contract"; do
             cleanup_path "$path" || cleanup_status=1
           done
-          if [ "$RESTORE_CLEANUP_COMPLETE" = true ] &&
+          if [ "$RESTORE_OUTCOME" = success ] &&
+            [ "$RESTORE_CLEANUP_COMPLETE" = true ] &&
+            [ "$ANONYMOUS_VOLUME_ABSENT" = true ] && [ "$cleanup_status" -eq 0 ]; then
+            cleanup_path "$RUNNER_TEMP/restore-temp" || cleanup_status=1
+          fi
+          if [ "$RESTORE_OUTCOME" = success ] &&
+            [ "$RESTORE_CLEANUP_COMPLETE" = true ] &&
             [ "$ANONYMOUS_VOLUME_ABSENT" = true ] && [ "$cleanup_status" -eq 0 ]; then
             echo "cleanup_complete=true" >>"$GITHUB_OUTPUT"
             echo "anonymous_volume_absent=true" >>"$GITHUB_OUTPUT"
@@ -635,7 +644,7 @@ jobs:
     name: Probe test VPS after cleanup
     needs: [restore-pre-probe, restore-isolated]
     if: always() && inputs.operation == 'restore' && needs.restore-pre-probe.result == 'success' &&
-      needs.restore-isolated.result == 'success'
+      needs.restore-isolated.result != 'skipped'
     runs-on: ubuntu-24.04
     environment: test-vps
     outputs:
@@ -789,8 +798,9 @@ jobs:
           [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
             { echo "final artifact expiry is not exactly 30 days" >&2; exit 1; }
           dispatch_at=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" |
-            jq -er '.event == "workflow_dispatch" and .head_branch == "dev" and
-              .head_sha == $sha | .created_at' --arg sha "${{ inputs.source_sha }}")
+            jq -er 'select(.event == "workflow_dispatch" and .head_branch == "dev" and
+              .head_sha == $sha) | .created_at |
+              select(type == "string" and length > 0)' --arg sha "${{ inputs.source_sha }}")
           scripts/build-beta-recovery-evidence.sh final \
             --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
             --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
