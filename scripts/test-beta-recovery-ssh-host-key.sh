@@ -170,12 +170,14 @@ make_case() {
 run_materializer() {
   local case_dir=$1 host=$2 port=$3 expected=$4 mode=$5 keygen_mode=${6:-delegate}
   local output_override=${7:-} ln_barrier=${8:-}
+  local path_prefix=${9:-$fixture_bin}
+  local rm_marker=${10:-}
   local output=$case_dir/runner/output/known_hosts scan_line_for_case=$scan_line
   [ "$port" = 22 ] || scan_line_for_case="[$host]:$port $key_type $key_data"
   [ -n "$output_override" ] && output=$output_override
   local scan_endpoint_for_case=${scan_line_for_case%% *}
   env \
-    PATH="$fixture_bin:$original_path" \
+    PATH="$path_prefix:$original_path" \
     HOME="$case_dir/home" \
     RUNNER_TEMP="$case_dir/runner" \
     BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
@@ -183,6 +185,9 @@ run_materializer() {
     BETA_RECOVERY_REAL_LN="$(command -v ln)" \
     BETA_RECOVERY_REAL_STAT="$(command -v stat)" \
     BETA_RECOVERY_REAL_RM="$real_rm" \
+    BETA_RECOVERY_REAL_MKTEMP="$(command -v mktemp)" \
+    BETA_RECOVERY_REAL_CHMOD="$(command -v chmod)" \
+    BETA_RECOVERY_RM_MARKER="$rm_marker" \
     BETA_RECOVERY_SCAN_MODE="$mode" \
     BETA_RECOVERY_SCAN_LINE="$scan_line_for_case" \
     BETA_RECOVERY_SCAN_ALT_LINE="$scan_line_for_case" \
@@ -482,6 +487,74 @@ write_wrapper "$signal_failure_bin/rm" \
   '  exit 62' \
   'fi' \
   'exec "${BETA_RECOVERY_REAL_RM:?}" "$@"'
+
+diagnostic_failure_bin=$temporary_root/diagnostic-failure-bin
+mkdir -p "$diagnostic_failure_bin"
+chmod 700 "$diagnostic_failure_bin"
+for utility in realpath stat mktemp chmod; do
+  write_wrapper "$diagnostic_failure_bin/$utility" \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'echo "injected utility failure $0 $*" >&2' \
+    'exit 71'
+done
+
+diagnostic_cleanup_bin=$temporary_root/diagnostic-cleanup-bin
+mkdir -p "$diagnostic_cleanup_bin"
+chmod 700 "$diagnostic_cleanup_bin"
+write_wrapper "$diagnostic_cleanup_bin/rm" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [[ "$*" == *".beta-recovery-keyscan."* ]] &&' \
+  '  [ ! -e "${BETA_RECOVERY_RM_MARKER:?}" ]; then' \
+  '  : >"$BETA_RECOVERY_RM_MARKER"' \
+  '  "${BETA_RECOVERY_REAL_RM:?}" "$@"' \
+  '  echo "injected cleanup failure $*" >&2' \
+  '  exit 72' \
+  'fi' \
+  'exec "${BETA_RECOVERY_REAL_RM:?}" "$@"'
+
+diagnostic_write_bin=$temporary_root/diagnostic-write-bin
+mkdir -p "$diagnostic_write_bin"
+chmod 700 "$diagnostic_write_bin"
+write_wrapper "$diagnostic_write_bin/mktemp" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'path=$("${BETA_RECOVERY_REAL_MKTEMP:?}" "$@")' \
+  'case "${1:-}" in' \
+  '  *".beta-recovery-known-hosts.XXXXXX")' \
+  '    "${BETA_RECOVERY_REAL_CHMOD:?}" 000 "$path" ;;' \
+  'esac' \
+  'printf "%s\n" "$path"'
+
+run_utility_failure_case() {
+  local name=$1 path_prefix=$2
+  local case_dir
+  case_dir=$(make_case "$name")
+  if run_materializer "$case_dir" "$scan_host" 22 "$expected_fingerprint" valid \
+    delegate '' '' "$path_prefix:$fixture_bin"; then
+    fail "utility failure unexpectedly succeeded: $name"
+  fi
+  assert_failure_case "$case_dir"
+  assert_sanitized_failure "$case_dir" "$scan_host" "$expected_fingerprint" \
+    "$key_data" "$case_dir/runner/output/known_hosts"
+}
+
+for utility in realpath stat mktemp chmod; do
+  run_utility_failure_case "diagnostic-$utility-failure" "$diagnostic_failure_bin"
+done
+cleanup_failure_case=$(make_case diagnostic-cleanup-failure)
+if run_materializer "$cleanup_failure_case" "$scan_host" 22 "$expected_fingerprint" valid \
+  delegate '' '' "$diagnostic_cleanup_bin:$fixture_bin" \
+  "$cleanup_failure_case/rm.marker"; then
+  fail "diagnostic cleanup failure unexpectedly succeeded"
+fi
+assert_failure_case "$cleanup_failure_case"
+assert_sanitized_failure "$cleanup_failure_case" "$scan_host" \
+  "$expected_fingerprint" "$key_data" "$cleanup_failure_case/runner/output/known_hosts"
+
+run_utility_failure_case diagnostic-write-failure "$diagnostic_write_bin"
+
 failure_case=$(make_case cleanup-failure-after-publication)
 failure_output=$failure_case/runner/output/known_hosts
 set +e
