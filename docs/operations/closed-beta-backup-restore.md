@@ -20,6 +20,20 @@ After reviewer approval, the restore runner provisions and canaries its pinned
 age toolchain, then revalidates the source before the one step that materializes
 the private identity.
 
+At each SSH boundary, the runner performs one bounded RSA key scan for the
+configured host and port, verifies that key against the configured SHA-256
+fingerprint, and uses the resulting temporary known-hosts record with strict
+checking. The private key, empty SSH configuration, generated known-hosts file,
+and staging directory are removed on every exit path. Malformed configuration,
+scan or parser failure, ambiguous or unexpected key output, fingerprint
+mismatch, unsafe path, timeout, and publication collision fail closed before
+SSH/SCP or downstream recovery work.
+
+A mismatch or host-key rotation requires out-of-band review, an approved
+fingerprint update, and a new authorized run. Do not trust a scanned key,
+enable TOFU or `accept-new`, retry or rotate automatically, or resume the
+failed August 28, 2026 capture.
+
 Capture holds `/var/lib/meet-test-vps-deploy/.deploy.lock` only for the bounded
 snapshot and runtime recovery section. It rejects an active SMTP transaction,
 proves a healthy populated runtime and HTTPS edge, and uses fixed

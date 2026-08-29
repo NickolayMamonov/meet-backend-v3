@@ -26,7 +26,66 @@ grep -Fq 'beta-recovery-drill-' "$workflow"
 grep -Fq 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' "$workflow"
 grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
 grep -Fq 'Revalidate source immediately before identity access' "$workflow"
-grep -Fq 'scp_opts=(-i "$key" -P "$PORT"' "$workflow"
+grep -Fq 'scp_opts=(-F "$config" -i "$key" -P "$PORT"' "$workflow"
+grep -Fq 'scripts/materialize-beta-recovery-known-hosts.sh' "$workflow"
+grep -Fq 'published_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+grep -Fq 'remove_published_output' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+grep -Fq 'ln -T --' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+grep -Fq 'published_output_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+grep -Fq '[ "$published_output_identity" = "$candidate_identity" ]' \
+  "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
+[ "$helper_count" -eq 3 ]
+for required in \
+  'ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")' \
+  'install -m 600 /dev/null "$config"' \
+  '-F "$config"' \
+  '-o StrictHostKeyChecking=yes' \
+  '-o UserKnownHostsFile="$known"' \
+  '-o GlobalKnownHostsFile=/dev/null' \
+  '-o KnownHostsCommand=none'; do
+  grep -Fq -- "$required" "$workflow"
+done
+for required in \
+  "trap 'cleanup_capture 129' HUP" \
+  "trap 'cleanup_capture 130' INT" \
+  "trap 'cleanup_capture 143' TERM" \
+  "trap 'cleanup_probe 129' HUP" \
+  "trap 'cleanup_probe 130' INT" \
+  "trap 'cleanup_probe 143' TERM"; do
+  grep -Fq -- "$required" "$workflow"
+done
+grep -Fq "trap 'cleanup_capture \"\$?\"' EXIT" "$workflow"
+grep -Fq "trap 'cleanup_probe \"\$?\"' EXIT" "$workflow"
+if grep -Fq 'trap cleanup_capture EXIT HUP INT TERM' "$workflow" ||
+  grep -Fq 'trap cleanup_probe EXIT HUP INT TERM' "$workflow"; then
+  echo "workflow uses signal-ambiguous cleanup traps" >&2
+  exit 1
+fi
+if grep -Fq 'printf '\''%s\n'\'' "$HOST_FINGERPRINT"' "$workflow"; then
+  echo "workflow directly writes the configured fingerprint" >&2
+  exit 1
+fi
+capture_block=$(awk '/Stage and run the locked VPS capture/{flag=1} /restore-select:/{flag=0} flag' "$workflow")
+pre_probe_block=$(awk '/restore-pre-probe:/{flag=1} /restore-isolated:/{flag=0} flag' "$workflow")
+post_probe_block=$(awk '/restore-post-probe:/{flag=1} /evidence:/{flag=0} flag' "$workflow")
+for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
+  helper_line=$(grep -n 'scripts/materialize-beta-recovery-known-hosts.sh' <<<"$block" | head -1 | cut -d: -f1)
+  key_line=$(grep -n 'install -m 600 /dev/null "$key"' <<<"$block" | head -1 | cut -d: -f1)
+  [ "$helper_line" -lt "$key_line" ]
+  mktemp_line=$(grep -n 'ssh_dir=$(mktemp -d' <<<"$block" | head -1 | cut -d: -f1)
+  trap_line=$(grep -n "trap 'cleanup_" <<<"$block" | head -1 | cut -d: -f1)
+  chmod_line=$(grep -n 'chmod 700 "$ssh_dir"' <<<"$block" | head -1 | cut -d: -f1)
+  [ "$mktemp_line" -lt "$trap_line" ] && [ "$trap_line" -lt "$chmod_line" ]
+done
+grep -Fq 'for signal in HUP INT TERM' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'capture-pre-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'effective-config-failed' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'argv-rejected' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'BETA_RECOVERY_REMOTE_CLEANUP_FAIL' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'publication-race' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'cleanup-failure-after-publication' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'post-publication-signal-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
 grep -Fq 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow"
 grep -Fq 'archive_size=10263766' "$root/scripts/install-beta-recovery-age.sh"
