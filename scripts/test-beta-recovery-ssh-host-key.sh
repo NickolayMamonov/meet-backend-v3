@@ -74,7 +74,15 @@ write_wrapper "$fixture_bin/ssh-keyscan" \
   'printf "\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'case "${BETA_RECOVERY_SCAN_MODE:-valid}" in' \
   '  valid|mismatch) printf "%s\n" "${BETA_RECOVERY_SCAN_LINE:?}" ;;' \
-  '  ambiguous) printf "%s\n%s\n" "${BETA_RECOVERY_SCAN_LINE:?}" "${BETA_RECOVERY_SCAN_ALT_LINE:?}" ;;' \
+  '  timeout) exit 124 ;;' \
+  '  empty) : ;;' \
+  '  comment) printf "# hostile comment\n" ;;' \
+  '  extra-field) printf "%s extra\n" "${BETA_RECOVERY_SCAN_LINE:?}" ;;' \
+  '  duplicate) printf "%s\n%s\n" "${BETA_RECOVERY_SCAN_LINE:?}" "${BETA_RECOVERY_SCAN_LINE:?}" ;;' \
+  '  ambiguous|multiple) printf "%s\n%s\n" "${BETA_RECOVERY_SCAN_LINE:?}" "${BETA_RECOVERY_SCAN_ALT_LINE:?}" ;;' \
+  '  unexpected-host) printf "%s\n" "${BETA_RECOVERY_SCAN_UNEXPECTED_LINE:?}" ;;' \
+  '  wrong-type) printf "%s\n" "${BETA_RECOVERY_SCAN_WRONG_TYPE_LINE:?}" ;;' \
+  '  malformed-key) printf "%s ssh-rsa not-a-public-key\n" "${BETA_RECOVERY_SCAN_ENDPOINT:?}" ;;' \
   '  malformed) printf "not-a-valid-keyscan-line\n" ;;' \
   '  failure) exit 42 ;;' \
   '  *) echo "unknown fixture keyscan mode" >&2; exit 43 ;;' \
@@ -88,6 +96,7 @@ write_wrapper "$fixture_bin/ssh-keygen" \
   'for arg in "$@"; do printf " <%s>" "$arg" >>"$BETA_RECOVERY_BOUNDARY_LOG"; done' \
   'printf "\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '[ "${BETA_RECOVERY_KEYGEN_MODE:-delegate}" = fail ] && exit 44' \
+  '[ "${BETA_RECOVERY_KEYGEN_MODE:-delegate}" = malformed ] && { printf "malformed fingerprint\n"; exit 0; }' \
   'exec "${BETA_RECOVERY_REAL_SSH_KEYGEN:?}" "$@"'
 
 write_wrapper "$fixture_bin/ln" \
@@ -121,6 +130,11 @@ write_wrapper "$fixture_bin/stat" \
   '  kill -"${BETA_RECOVERY_PUBLICATION_SIGNAL:-TERM}" "$(cat "$BETA_RECOVERY_HELPER_PID_FILE")"' \
   '  sleep 1' \
   'fi'
+
+write_wrapper "$fixture_bin/rm" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'exec "${BETA_RECOVERY_REAL_RM:?}" "$@"'
 
 write_wrapper "$fixture_bin/ssh" \
   '#!/usr/bin/env bash' \
@@ -159,6 +173,7 @@ run_materializer() {
   local output=$case_dir/runner/output/known_hosts scan_line_for_case=$scan_line
   [ "$port" = 22 ] || scan_line_for_case="[$host]:$port $key_type $key_data"
   [ -n "$output_override" ] && output=$output_override
+  local scan_endpoint_for_case=${scan_line_for_case%% *}
   env \
     PATH="$fixture_bin:$original_path" \
     HOME="$case_dir/home" \
@@ -167,9 +182,13 @@ run_materializer() {
     BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
     BETA_RECOVERY_REAL_LN="$(command -v ln)" \
     BETA_RECOVERY_REAL_STAT="$(command -v stat)" \
+    BETA_RECOVERY_REAL_RM="$real_rm" \
     BETA_RECOVERY_SCAN_MODE="$mode" \
     BETA_RECOVERY_SCAN_LINE="$scan_line_for_case" \
     BETA_RECOVERY_SCAN_ALT_LINE="$scan_line_for_case" \
+    BETA_RECOVERY_SCAN_ENDPOINT="$scan_endpoint_for_case" \
+    BETA_RECOVERY_SCAN_UNEXPECTED_LINE="unexpected.example.test ssh-rsa $key_data" \
+    BETA_RECOVERY_SCAN_WRONG_TYPE_LINE="$scan_endpoint_for_case ssh-ed25519 $key_data" \
     BETA_RECOVERY_KEYGEN_MODE="$keygen_mode" \
     BETA_RECOVERY_LN_BARRIER_DIR="$ln_barrier" \
     "$materializer" \
@@ -212,12 +231,40 @@ assert_success_output() {
 
 assert_failure_case() {
   local case_dir=$1
-  local output=$case_dir/runner/output/known_hosts
+  local output=${2:-$case_dir/runner/output/known_hosts}
   if [ -e "$output" ] || [ -L "$output" ]; then
     fail "failed case published output: $(basename "$case_dir")"
   fi
   assert_no_staging "$case_dir"
   assert_no_private_output "$case_dir"
+}
+
+assert_sanitized_failure() {
+  local case_dir=$1
+  shift
+  for value in "$@"; do
+    ! grep -Fq -- "$value" "$case_dir/stderr" 2>/dev/null ||
+      fail "failure diagnostics disclosed sensitive value for $(basename "$case_dir")"
+  done
+}
+
+assert_no_boundary_crossing() {
+  local case_dir=$1
+  [ ! -s "$case_dir/boundary.log" ] ||
+    fail "invalid helper case crossed a boundary: $(basename "$case_dir")"
+}
+
+run_no_scan_failure_case() {
+  local name=$1 host=$2 port=$3 expected=$4 output_override=${5:-}
+  local case_dir output=$output_override
+  case_dir=$(make_case "$name")
+  [ -n "$output" ] || output=$case_dir/runner/output/known_hosts
+  if run_materializer "$case_dir" "$host" "$port" "$expected" valid delegate "$output"; then
+    fail "invalid pre-scan case unexpectedly succeeded: $name"
+  fi
+  assert_failure_case "$case_dir" "$output"
+  assert_no_boundary_crossing "$case_dir"
+  assert_sanitized_failure "$case_dir" "$host" "$expected" "$output"
 }
 
 assert_keyscan_invocation() {
@@ -255,6 +302,7 @@ run_failure_case() {
   assert_failure_case "$case_dir"
   grep -q '^ssh-keyscan args:' "$case_dir/boundary.log" ||
     fail "invalid case did not reach the fake keyscan boundary: $name"
+  assert_sanitized_failure "$case_dir" "$scan_host" "$expected" "$key_data"
 }
 
 run_success_case success-port-22 22 "$scan_line"
@@ -262,9 +310,41 @@ run_success_case success-non-default-port 2222 "[$scan_host]:2222 $key_type $key
 
 run_failure_case malformed-keyscan malformed
 run_failure_case mismatched-fingerprint mismatch "$wrong_fingerprint"
-run_failure_case ambiguous-keyscan ambiguous
+run_failure_case timeout-keyscan timeout
+run_failure_case empty-keyscan empty
+run_failure_case comment-keyscan comment
+run_failure_case extra-field-keyscan extra-field
+run_failure_case duplicate-keyscan duplicate
+run_failure_case multiple-keyscan multiple
+run_failure_case unexpected-host-keyscan unexpected-host
+run_failure_case wrong-type-keyscan wrong-type
+run_failure_case malformed-public-key malformed-key
 run_failure_case keyscan-failure failure
 run_failure_case fingerprint-failure valid "$expected_fingerprint" fail
+run_failure_case malformed-fingerprint-output valid "$expected_fingerprint" malformed
+
+run_no_scan_failure_case invalid-fingerprint "$scan_host" 22 "not-a-fingerprint"
+run_no_scan_failure_case invalid-host 'bad host' 22 "$expected_fingerprint"
+run_no_scan_failure_case invalid-port "$scan_host" 0 "$expected_fingerprint"
+
+missing_tools_case=$(make_case missing-tools)
+minimal_bin=$missing_tools_case/minimal-bin
+mkdir -p "$minimal_bin"
+ln -s "$(command -v bash)" "$minimal_bin/bash"
+if env \
+  PATH="$minimal_bin" \
+  HOME="$missing_tools_case/home" \
+  RUNNER_TEMP="$missing_tools_case/runner" \
+  BETA_RECOVERY_BOUNDARY_LOG="$missing_tools_case/boundary.log" \
+  "$materializer" --host "$scan_host" --port 22 \
+  --expected-fingerprint "$expected_fingerprint" \
+  --output "$missing_tools_case/runner/output/known_hosts" \
+  >"$missing_tools_case/stdout" 2>"$missing_tools_case/stderr"; then
+  fail "missing-tool case unexpectedly succeeded"
+fi
+assert_failure_case "$missing_tools_case"
+assert_no_boundary_crossing "$missing_tools_case"
+assert_sanitized_failure "$missing_tools_case" "$scan_host" "$expected_fingerprint"
 
 unsafe_case=$(make_case unsafe-output-directory)
 unsafe_output=$unsafe_case/runner/../known_hosts
@@ -275,6 +355,50 @@ fi
 assert_failure_case "$unsafe_case"
 [ ! -e "$unsafe_output" ] && [ ! -L "$unsafe_output" ] ||
   fail "unsafe output path was published"
+assert_sanitized_failure "$unsafe_case" "$scan_host" "$expected_fingerprint" "$unsafe_output"
+
+linked_case=$(make_case linked-output)
+linked_output=$linked_case/runner/output/known_hosts
+printf 'linked target\n' >"$linked_case/runner/output/target"
+ln -s target "$linked_output"
+if run_materializer "$linked_case" "$scan_host" 22 "$expected_fingerprint" valid; then
+  fail "linked output was accepted"
+fi
+if [ -L "$linked_output" ]; then
+  [ "$(<"$linked_case/runner/output/target")" = 'linked target' ] ||
+    fail "linked output target was changed"
+else
+  [ "$(<"$linked_output")" = 'linked target' ] ||
+    fail "linked output fixture was not preserved"
+fi
+assert_no_staging "$linked_case"
+assert_no_private_output "$linked_case"
+assert_sanitized_failure "$linked_case" "$scan_host" "$expected_fingerprint"
+
+wrong_mode_case=$(make_case wrong-mode-output)
+chmod 755 "$wrong_mode_case/runner/output"
+if [ "$(stat -c '%a' -- "$wrong_mode_case/runner/output")" = 755 ]; then
+  if run_materializer "$wrong_mode_case" "$scan_host" 22 "$expected_fingerprint" valid; then
+    fail "wrong-mode output directory was accepted"
+  fi
+  assert_failure_case "$wrong_mode_case"
+else
+  run_materializer "$wrong_mode_case" "$scan_host" 22 "$expected_fingerprint" valid ||
+    fail "mode-preserving platform rejected valid output"
+  assert_success_output "$wrong_mode_case" "$scan_line"
+fi
+assert_sanitized_failure "$wrong_mode_case" "$scan_host" "$expected_fingerprint"
+
+nested_case=$(make_case nested-output)
+nested_output=$nested_case/runner/output/nested/known_hosts
+mkdir -p "$nested_case/runner/output/nested"
+chmod 700 "$nested_case/runner/output/nested"
+if run_materializer "$nested_case" "$scan_host" 22 "$expected_fingerprint" valid \
+  delegate "$nested_output"; then
+  fail "nested output path was accepted"
+fi
+assert_failure_case "$nested_case" "$nested_output"
+assert_sanitized_failure "$nested_case" "$scan_host" "$expected_fingerprint" "$nested_output"
 
 collision_case=$(make_case occupied-output)
 collision_output=$collision_case/runner/output/known_hosts
@@ -342,6 +466,22 @@ write_wrapper "$failure_bin/rm" \
   '  exit 61' \
   'fi' \
   'exec "${BETA_RECOVERY_REAL_RM:?}" "$@"'
+
+signal_failure_bin=$temporary_root/signal-failure-bin
+mkdir -p "$signal_failure_bin"
+chmod 700 "$signal_failure_bin"
+write_wrapper "$signal_failure_bin/rm" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [ "${BETA_RECOVERY_FAIL_PUBLISHED_RM:-0}" = 1 ] &&' \
+  '  [ "${1:-}" = -f ] && [ "${2:-}" = -- ] &&' \
+  '  [ "${3:-}" = "${BETA_RECOVERY_OUTPUT:?}" ] &&' \
+  '  [ ! -e "${BETA_RECOVERY_RM_MARKER:?}" ]; then' \
+  '  : >"$BETA_RECOVERY_RM_MARKER"' \
+  '  "${BETA_RECOVERY_REAL_RM:?}" "$@"' \
+  '  exit 62' \
+  'fi' \
+  'exec "${BETA_RECOVERY_REAL_RM:?}" "$@"'
 failure_case=$(make_case cleanup-failure-after-publication)
 failure_output=$failure_case/runner/output/known_hosts
 set +e
@@ -387,6 +527,7 @@ for signal in HUP INT TERM; do
     BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
     BETA_RECOVERY_REAL_LN="$(command -v ln)" \
     BETA_RECOVERY_REAL_STAT="$(command -v stat)" \
+    BETA_RECOVERY_REAL_RM="$real_rm" \
     BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION=1 \
     BETA_RECOVERY_PUBLICATION_SIGNAL="$signal" \
     BETA_RECOVERY_OUTPUT="$published_signal_output" \
@@ -405,6 +546,40 @@ for signal in HUP INT TERM; do
     fail "post-publication $signal left published output"
   assert_no_staging "$published_signal_case"
   assert_no_private_output "$published_signal_case"
+done
+
+for signal in HUP INT TERM; do
+  signal_failure_case=$(make_case "post-publication-signal-$signal-cleanup-failure")
+  signal_failure_output=$signal_failure_case/runner/output/known_hosts
+  set +e
+  env PATH="$signal_failure_bin:$fixture_bin:$original_path" \
+    HOME="$signal_failure_case/home" \
+    RUNNER_TEMP="$signal_failure_case/runner" \
+    BETA_RECOVERY_BOUNDARY_LOG="$signal_failure_case/boundary.log" \
+    BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
+    BETA_RECOVERY_REAL_LN="$(command -v ln)" \
+    BETA_RECOVERY_REAL_STAT="$(command -v stat)" \
+    BETA_RECOVERY_REAL_RM="$real_rm" \
+    BETA_RECOVERY_FAIL_PUBLISHED_RM=1 \
+    BETA_RECOVERY_RM_MARKER="$signal_failure_case/rm.marker" \
+    BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION=1 \
+    BETA_RECOVERY_PUBLICATION_SIGNAL="$signal" \
+    BETA_RECOVERY_OUTPUT="$signal_failure_output" \
+    BETA_RECOVERY_HELPER_PID_FILE="$signal_failure_case/helper.pid" \
+    BETA_RECOVERY_SCAN_MODE=valid \
+    BETA_RECOVERY_SCAN_LINE="$scan_line" \
+    "$materializer" --host "$scan_host" --port 22 \
+    --expected-fingerprint "$expected_fingerprint" \
+    --output "$signal_failure_output" \
+    >"$signal_failure_case/stdout" 2>"$signal_failure_case/stderr"
+  signal_failure_status=$?
+  set -e
+  [ "$signal_failure_status" -eq 1 ] ||
+    fail "post-publication $signal cleanup failure returned $signal_failure_status"
+  [ ! -e "$signal_failure_output" ] && [ ! -L "$signal_failure_output" ] ||
+    fail "post-publication $signal cleanup failure left published output"
+  assert_no_staging "$signal_failure_case"
+  assert_no_private_output "$signal_failure_case"
 done
 
 boundary_case=$(make_case fake-ssh-scp-boundaries)
@@ -467,6 +642,15 @@ write_wrapper "$consumer_bin/ssh-keygen" \
   'set -euo pipefail' \
   'exec "${BETA_RECOVERY_REAL_SSH_KEYGEN:?}" "$@"'
 
+write_wrapper "$consumer_bin/ln" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'target=${@: -1}' \
+  '"${BETA_RECOVERY_REAL_LN:?}" "$@"' \
+  'if [ "$(basename -- "$target")" = known_hosts ]; then' \
+  '  printf "helper-success\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'fi'
+
 write_wrapper "$consumer_bin/install" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -476,6 +660,16 @@ write_wrapper "$consumer_bin/install" \
   '  private_key) printf "private-key-created\n" >>"$BETA_RECOVERY_BOUNDARY_LOG" ;;' \
   'esac' \
   'exec /usr/bin/install "$@"'
+
+write_wrapper "$consumer_bin/rm" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [[ "$*" == *"/beta-recovery-ssh."* ]] && [[ "$*" == *" -r "* || "$*" == "-r "* || "$*" == *" -r" ]]; then' \
+  '  "${BETA_RECOVERY_REAL_RM:?}" "$@"' \
+  '  printf "local-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'else' \
+  '  exec "${BETA_RECOVERY_REAL_RM:?}" "$@"' \
+  'fi'
 
 write_wrapper "$consumer_bin/ssh" \
   '#!/usr/bin/env bash' \
@@ -518,8 +712,10 @@ write_wrapper "$consumer_bin/ssh" \
   '  [ "${BETA_RECOVERY_REMOTE_CLEANUP_FAIL:-0}" = 1 ] && exit 44' \
   '  exit 0' \
   'fi' \
-  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi' \
-  'printf "remote-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"'
+  'printf "remote-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'touch "${BETA_RECOVERY_MUTATION_SENTINEL:?}"' \
+  'printf "remote-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi'
 
 write_wrapper "$consumer_bin/scp" \
   '#!/usr/bin/env bash' \
@@ -550,8 +746,10 @@ write_wrapper "$consumer_bin/scp" \
   '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG"' \
   'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
   'printf "scp-call\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scp ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi' \
-  'printf "scp-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"'
+  'printf "scp-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'touch "${BETA_RECOVERY_MUTATION_SENTINEL:?}"' \
+  'printf "scp-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scp ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi'
 
 extract_consumer() {
   local marker=$1 output=$2
@@ -587,6 +785,24 @@ assert_consumer_residue_absent() {
   ! grep -Eiq 'BEGIN[[:space:]]+[^ ]*PRIVATE KEY|OPENSSH PRIVATE KEY' \
     "$case_dir"/boundary.log "$case_dir"/effective.log "$case_dir"/effective.err \
     2>/dev/null || fail "consumer leaked private key material"
+}
+
+assert_event_order() {
+  local case_dir=$1
+  shift
+  awk -v expected="$*" '
+    BEGIN {
+      count = split(expected, events, " ")
+      next_event = 1
+    }
+    $0 == events[next_event] {
+      next_event++
+    }
+    END {
+      exit !(next_event > count)
+    }
+  ' "$case_dir/boundary.log" ||
+    fail "consumer event ordering was incomplete: $(basename "$case_dir")"
 }
 
 assert_signal_status() {
@@ -625,11 +841,13 @@ run_consumer_case() {
     RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
     GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$case_dir/output" \
     BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+    BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
     BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
     BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
     BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
     BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
     BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+    BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE="$phase" \
     BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
     bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
@@ -638,6 +856,8 @@ run_consumer_case() {
   [ "$status" -eq "$expected_status" ] ||
     fail "consumer $name returned $status instead of $expected_status"
   assert_consumer_residue_absent "$case_dir"
+  [ -f "$case_dir/mutation-sentinel" ] ||
+    fail "consumer $name did not record downstream mutation"
   [ "$(grep -c '^private-key-created$' "$case_dir/boundary.log")" -eq 1 ] ||
     fail "consumer $name did not materialize a private key"
   grep -Fxq 'config-created' "$case_dir/boundary.log" ||
@@ -647,9 +867,13 @@ run_consumer_case() {
       fail "capture $name did not attempt remote cleanup exactly once"
     grep -Fxq 'remote-admission' "$case_dir/boundary.log" ||
       fail "capture $name did not record remote admission"
+    assert_event_order "$case_dir" helper-success private-key-created remote-admission \
+      remote-cleanup local-cleanup
   else
     ! grep -q '^remote-cleanup$' "$case_dir/boundary.log" ||
       fail "probe $name attempted remote cleanup"
+    assert_event_order "$case_dir" helper-success private-key-created remote-admission \
+      local-cleanup
   fi
 }
 
@@ -682,10 +906,12 @@ for signal in HUP INT TERM; do
     RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
     GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$pre_case/output" \
     BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+    BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
     BETA_RECOVERY_BOUNDARY_LOG="$pre_case/boundary.log" \
     BETA_RECOVERY_EFFECTIVE_LOG="$pre_case/effective.log" BETA_RECOVERY_EFFECTIVE_ERR="$pre_case/effective.err" \
     BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
     BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+    BETA_RECOVERY_MUTATION_SENTINEL="$pre_case/mutation-sentinel" \
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE=scan \
     bash "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr"
   status=$?
@@ -694,6 +920,14 @@ for signal in HUP INT TERM; do
   [ "$status" -eq "$expected_status" ] ||
     fail "capture pre-verification $signal returned $status"
   assert_consumer_residue_absent "$pre_case"
+  [ ! -e "$pre_case/mutation-sentinel" ] ||
+    fail "capture pre-verification $signal crossed the mutation sentinel"
+  [ "$(grep -c '^local-cleanup$' "$pre_case/boundary.log")" -eq 1 ] ||
+    fail "capture pre-verification $signal did not record local cleanup"
+  ! grep -q '^helper-success$' "$pre_case/boundary.log" ||
+    fail "capture pre-verification $signal reported helper success"
+  ! grep -q '^private-key-created$' "$pre_case/boundary.log" ||
+    fail "capture pre-verification $signal created a private key"
   ! grep -q '^ssh-call$' "$pre_case/boundary.log" ||
     fail "capture pre-verification $signal crossed SSH"
   ! grep -q '^scp-call$' "$pre_case/boundary.log" ||

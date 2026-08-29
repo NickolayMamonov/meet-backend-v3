@@ -83,6 +83,7 @@ output_parent=$(realpath -- "$output_parent") || fail "output path is invalid"
 runner_prefix=$runner_temp/
 [[ "$output_parent/" == "$runner_prefix"* ]] && [ "$output_parent" != "$runner_temp" ] ||
   fail "output path is invalid"
+[ "${output_parent%/*}" = "$runner_temp" ] || fail "output path is invalid"
 [ "$(stat -c '%u' -- "$output_parent")" = "$(id -u)" ] || fail "output directory is unsafe"
 [ "$(stat -c '%a' -- "$output_parent")" = 700 ] || fail "output directory is unsafe"
 [ "$output" = "$output_parent/known_hosts" ] || fail "output path is invalid"
@@ -124,7 +125,7 @@ on_signal() {
   [ -z "$scan_file" ] || rm -f -- "$scan_file" || status=1
   [ -z "$fingerprint_file" ] || rm -f -- "$fingerprint_file" || status=1
   [ -z "$candidate_file" ] || rm -f -- "$candidate_file" || status=1
-  remove_published_output || true
+  remove_published_output || status=1
   exit "$status"
 }
 
