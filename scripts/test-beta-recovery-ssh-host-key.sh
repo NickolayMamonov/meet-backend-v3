@@ -504,7 +504,7 @@ run_publication_race_case() {
   fi
   set +e
   run_materializer "$case_dir" "$scan_host" 22 "$expected_fingerprint" valid \
-    delegate "$output" "$race_dir" "$fixture_bin" '' '' "$mode" "$race_dir" &
+    delegate "$output" '' "$fixture_bin" '' '' "$mode" "$race_dir" &
   race_pid=$!
   for _ in $(seq 1 500); do
     [ -e "$race_dir/ready" ] && break
