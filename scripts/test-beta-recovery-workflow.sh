@@ -37,11 +37,25 @@ for required in \
   '-o StrictHostKeyChecking=yes' \
   '-o UserKnownHostsFile="$known"' \
   '-o GlobalKnownHostsFile=/dev/null' \
-  '-o KnownHostsCommand=none' \
-  'trap cleanup_probe EXIT HUP INT TERM' \
-  'trap cleanup_capture EXIT HUP INT TERM'; do
+  '-o KnownHostsCommand=none'; do
   grep -Fq -- "$required" "$workflow"
 done
+for required in \
+  "trap 'cleanup_capture 129' HUP" \
+  "trap 'cleanup_capture 130' INT" \
+  "trap 'cleanup_capture 143' TERM" \
+  "trap 'cleanup_probe 129' HUP" \
+  "trap 'cleanup_probe 130' INT" \
+  "trap 'cleanup_probe 143' TERM"; do
+  grep -Fq -- "$required" "$workflow"
+done
+grep -Fq "trap 'cleanup_capture \"\$?\"' EXIT" "$workflow"
+grep -Fq "trap 'cleanup_probe \"\$?\"' EXIT" "$workflow"
+if grep -Fq 'trap cleanup_capture EXIT HUP INT TERM' "$workflow" ||
+  grep -Fq 'trap cleanup_probe EXIT HUP INT TERM' "$workflow"; then
+  echo "workflow uses signal-ambiguous cleanup traps" >&2
+  exit 1
+fi
 if grep -Fq 'printf '\''%s\n'\'' "$HOST_FINGERPRINT"' "$workflow"; then
   echo "workflow directly writes the configured fingerprint" >&2
   exit 1
@@ -54,6 +68,11 @@ for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
   key_line=$(grep -n 'install -m 600 /dev/null "$key"' <<<"$block" | head -1 | cut -d: -f1)
   [ "$helper_line" -lt "$key_line" ]
 done
+grep -Fq 'for signal in HUP INT TERM' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'capture-pre-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'effective-config-failed' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'argv-rejected' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'BETA_RECOVERY_REMOTE_CLEANUP_FAIL' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
 grep -Fq 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow"
 grep -Fq 'archive_size=10263766' "$root/scripts/install-beta-recovery-age.sh"

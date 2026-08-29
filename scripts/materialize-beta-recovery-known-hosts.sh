@@ -92,6 +92,7 @@ scan_file=
 fingerprint_file=
 candidate_file=
 success=false
+output_valid=false
 
 cleanup() {
   local status=$?
@@ -99,8 +100,10 @@ cleanup() {
   [ -z "$scan_file" ] || rm -f -- "$scan_file" || status=1
   [ -z "$fingerprint_file" ] || rm -f -- "$fingerprint_file" || status=1
   [ -z "$candidate_file" ] || rm -f -- "$candidate_file" || status=1
-  if [ "$success" != true ] && { [ -e "$output" ] || [ -L "$output" ]; }; then
-    rm -f -- "$output" || status=1
+  if [ "$success" != true ] || [ "$output_valid" != true ]; then
+    if [ -e "$output" ] || [ -L "$output" ]; then
+      rm -f -- "$output" || status=1
+    fi
   fi
   exit "$status"
 }
@@ -112,7 +115,7 @@ on_signal() {
   [ -z "$scan_file" ] || rm -f -- "$scan_file" || status=1
   [ -z "$fingerprint_file" ] || rm -f -- "$fingerprint_file" || status=1
   [ -z "$candidate_file" ] || rm -f -- "$candidate_file" || status=1
-  if [ "$success" != true ] && { [ -e "$output" ] || [ -L "$output" ]; }; then
+  if [ -e "$output" ] || [ -L "$output" ]; then
     rm -f -- "$output" || status=1
   fi
   exit "$status"
@@ -161,7 +164,8 @@ chmod 600 -- "$candidate_file" || fail "publication preparation failed"
 if ! ln -- "$candidate_file" "$output" 2>/dev/null; then
   fail "output publication collision"
 fi
+success=true
 [ -f "$output" ] && [ ! -L "$output" ] || fail "published output is unsafe"
 [ "$(stat -c '%a' -- "$output")" = 600 ] || fail "published output is unsafe"
 [ "$(wc -l <"$output" | tr -d '[:space:]')" = 1 ] || fail "published output is invalid"
-success=true
+output_valid=true

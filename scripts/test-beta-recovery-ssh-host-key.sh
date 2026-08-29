@@ -5,7 +5,7 @@ export LC_ALL=C
 umask 077
 
 fail() {
-  echo "beta recovery SSH host-key fixture failed: $*" >&2
+  echo "beta recovery SSH host-key fixture failed: $* (fixture root: ${temporary_root:-unknown})" >&2
   exit 1
 }
 
@@ -29,7 +29,9 @@ fi
 cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
-  rm -r -- "$temporary_root" || status=1
+  if [ "${KEEP_BETA_RECOVERY_FIXTURE:-0}" != 1 ]; then
+    rm -r -- "$temporary_root" || status=1
+  fi
   exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
@@ -87,6 +89,15 @@ write_wrapper "$fixture_bin/ssh-keygen" \
   '[ "${BETA_RECOVERY_KEYGEN_MODE:-delegate}" = fail ] && exit 44' \
   'exec "${BETA_RECOVERY_REAL_SSH_KEYGEN:?}" "$@"'
 
+write_wrapper "$fixture_bin/ln" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '"${BETA_RECOVERY_REAL_LN:?}" "$@"' \
+  'if [ "${BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION:-0}" = 1 ]; then' \
+  '  helper_pid=$PPID' \
+  '  (sleep 0.05; kill -TERM "$helper_pid" 2>/dev/null || true) &' \
+  'fi'
+
 write_wrapper "$fixture_bin/ssh" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -130,6 +141,7 @@ run_materializer() {
     RUNNER_TEMP="$case_dir/runner" \
     BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
     BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
+    BETA_RECOVERY_REAL_LN="$(command -v ln)" \
     BETA_RECOVERY_SCAN_MODE="$mode" \
     BETA_RECOVERY_SCAN_LINE="$scan_line_for_case" \
     BETA_RECOVERY_SCAN_ALT_LINE="$scan_line_for_case" \
@@ -252,6 +264,31 @@ fi
 assert_no_staging "$collision_case"
 assert_no_private_output "$collision_case"
 
+published_signal_case=$(make_case post-publication-signal)
+published_signal_output=$published_signal_case/runner/output/known_hosts
+set +e
+env PATH="$fixture_bin:$original_path" \
+  HOME="$published_signal_case/home" \
+  RUNNER_TEMP="$published_signal_case/runner" \
+  BETA_RECOVERY_BOUNDARY_LOG="$published_signal_case/boundary.log" \
+  BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
+  BETA_RECOVERY_REAL_LN="$(command -v ln)" \
+  BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION=1 \
+  BETA_RECOVERY_SCAN_MODE=valid \
+  BETA_RECOVERY_SCAN_LINE="$scan_line" \
+  "$materializer" --host "$scan_host" --port 22 \
+  --expected-fingerprint "$expected_fingerprint" \
+  --output "$published_signal_output" \
+  >"$published_signal_case/stdout" 2>"$published_signal_case/stderr"
+published_signal_status=$?
+set -e
+[ "$published_signal_status" -eq 143 ] ||
+  fail "post-publication TERM returned $published_signal_status"
+[ ! -e "$published_signal_output" ] && [ ! -L "$published_signal_output" ] ||
+  fail "post-publication TERM left published output"
+assert_no_staging "$published_signal_case"
+assert_no_private_output "$published_signal_case"
+
 boundary_case=$(make_case fake-ssh-scp-boundaries)
 known_for_boundary=$boundary_case/runner/output/known_hosts
 printf 'fake boundary input\n' >"$boundary_case/boundary-input"
@@ -294,5 +331,276 @@ if [ -f "$workflow" ]; then
   grep -Fq 'ssh_opts=(-F "$config" -i "$key" -p "$PORT"' "$workflow" ||
     fail "actual recovery workflow does not pin SSH options"
 fi
+
+consumer_root=$temporary_root/consumers
+consumer_bin=$consumer_root/bin
+mkdir -p "$consumer_bin"
+chmod 700 "$consumer_root" "$consumer_bin"
+
+write_wrapper "$consumer_bin/ssh-keyscan" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'printf "helper-scan" >>"$BETA_RECOVERY_BOUNDARY_LOG"; printf "\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'printf "%s\n" "$BETA_RECOVERY_SCAN_LINE"' \
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scan ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi'
+
+write_wrapper "$consumer_bin/ssh-keygen" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'exec "${BETA_RECOVERY_REAL_SSH_KEYGEN:?}" "$@"'
+
+write_wrapper "$consumer_bin/install" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'target=${@: -1}' \
+  'case "$(basename -- "$target")" in' \
+  '  ssh_config) printf "config-created\n" >>"$BETA_RECOVERY_BOUNDARY_LOG" ;;' \
+  '  private_key) printf "private-key-created\n" >>"$BETA_RECOVERY_BOUNDARY_LOG" ;;' \
+  'esac' \
+  'exec /usr/bin/install "$@"'
+
+write_wrapper "$consumer_bin/ssh" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'args=("$@")' \
+  'config= key= known=' \
+  'for ((i=0; i<${#args[@]}; i++)); do' \
+  '  case "${args[i]}" in' \
+  '    -F) config=${args[i+1]:-} ;; -i) key=${args[i+1]:-} ;;' \
+  '    -o) case "${args[i+1]:-}" in UserKnownHostsFile=*) known=${args[i+1]#UserKnownHostsFile=} ;; esac ;;' \
+  '  esac' \
+  'done' \
+  'required=("-F" "$config" "-i" "$key" "-p" "$PORT" "-o" "BatchMode=yes" "-o" "StrictHostKeyChecking=yes" "-o" "UserKnownHostsFile=$known" "-o" "GlobalKnownHostsFile=/dev/null" "-o" "KnownHostsCommand=none")' \
+  'for ((i=0; i<${#required[@]}; i++)); do' \
+  '  found=false' \
+  '  for ((j=0; j<${#args[@]}; j++)); do [ "${args[j]}" = "${required[i]}" ] && found=true; done' \
+  '  "$found" = true || { printf "argv-rejected ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 41; }' \
+  'done' \
+  'destination=' \
+  'for arg in "${args[@]}"; do [[ "$arg" == *"@"* ]] && destination=$arg && break; done' \
+  '[ "$destination" = "$SSH_USER@$HOST" ] || { printf "argv-rejected ssh-destination\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 42; }' \
+  'effective_args=()' \
+  'destination_seen=false' \
+  'for arg in "${args[@]}"; do' \
+  '  [ "$destination_seen" = false ] || break' \
+  '  effective_args+=("$arg")' \
+  '  [[ "$arg" == *"@"* ]] && destination_seen=true' \
+  'done' \
+  '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
+  'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fxq "port $PORT" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fq "userknownhostsfile $known" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fxq "globalknownhostsfile /dev/null" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'printf "ssh-call\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'if [[ "${args[*]}" == *"sudo test ! -e"* ]]; then' \
+  '  printf "remote-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  [ "${BETA_RECOVERY_REMOTE_CLEANUP_FAIL:-0}" = 1 ] && exit 44' \
+  '  exit 0' \
+  'fi' \
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi' \
+  'printf "remote-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"'
+
+write_wrapper "$consumer_bin/scp" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'args=("$@")' \
+  'config= key= known=' \
+  'for ((i=0; i<${#args[@]}; i++)); do' \
+  '  case "${args[i]}" in' \
+  '    -F) config=${args[i+1]:-} ;; -i) key=${args[i+1]:-} ;;' \
+  '    -o) case "${args[i+1]:-}" in UserKnownHostsFile=*) known=${args[i+1]#UserKnownHostsFile=} ;; esac ;;' \
+  '  esac' \
+  'done' \
+  'required=("-F" "$config" "-i" "$key" "-P" "$PORT" "-o" "BatchMode=yes" "-o" "StrictHostKeyChecking=yes" "-o" "UserKnownHostsFile=$known" "-o" "GlobalKnownHostsFile=/dev/null" "-o" "KnownHostsCommand=none")' \
+  'for ((i=0; i<${#required[@]}; i++)); do' \
+  '  found=false' \
+  '  for ((j=0; j<${#args[@]}; j++)); do [ "${args[j]}" = "${required[i]}" ] && found=true; done' \
+  '  "$found" = true || { printf "argv-rejected scp\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 51; }' \
+  'done' \
+  'destination=' \
+  'for arg in "${args[@]}"; do [[ "$arg" == *":"* ]] && destination=$arg && break; done' \
+  '[ "$destination" = "$SSH_USER@$HOST:$BETA_RECOVERY_REMOTE/" ] || { printf "argv-rejected scp-destination\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 52; }' \
+  '"${BETA_RECOVERY_REAL_SSH:?}" -G -F "$config" -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none "$SSH_USER@$HOST" >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed scp\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 53; }' \
+  'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fxq "port $PORT" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fq "userknownhostsfile $known" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fxq "globalknownhostsfile /dev/null" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'printf "scp-call\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scp ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi' \
+  'printf "scp-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"'
+
+extract_consumer() {
+  local marker=$1 output=$2
+  awk -v marker="$marker" '
+    index($0, marker) { selected=1 }
+    selected && /^        run: \|$/ { running=1; next }
+    running && /^      - / { exit }
+    running { sub(/^          /, ""); print }
+  ' "$workflow" >"$output"
+  sed -i 's/\${{ inputs.source_sha }}/0123456789abcdef0123456789abcdef01234567/g' "$output"
+  [ -s "$output" ] || fail "consumer body was not extracted: $marker"
+}
+
+capture_body=$consumer_root/capture.sh
+pre_probe_body=$consumer_root/pre-probe.sh
+post_probe_body=$consumer_root/post-probe.sh
+extract_consumer '      - name: Stage and run the locked VPS capture' "$capture_body"
+extract_consumer '      - name: SSH-only pre-probe' "$pre_probe_body"
+extract_consumer '      - id: post_probe' "$post_probe_body"
+chmod 700 "$capture_body" "$pre_probe_body" "$post_probe_body"
+
+assert_consumer_residue_absent() {
+  local case_dir=$1
+  [ -z "$(find "$case_dir/runner" -maxdepth 1 -type d \
+    -name 'beta-recovery-ssh.*' -print -quit)" ] ||
+    fail "consumer left runner SSH material: $(basename "$case_dir")"
+  [ -z "$(find "$case_dir/runner" -type f \
+    \( -name private_key -o -name known_hosts -o -name ssh_config \
+      -o -name '.beta-recovery-*' \) -print -quit)" ] ||
+    fail "consumer left runner SSH files: $(basename "$case_dir")"
+  grep -Fqx '  HostName hostile.example.invalid' "$case_dir/home/.ssh/config" ||
+    fail "consumer changed hostile HOME: $(basename "$case_dir")"
+  ! grep -Eiq 'BEGIN[[:space:]]+[^ ]*PRIVATE KEY|OPENSSH PRIVATE KEY' \
+    "$case_dir"/boundary.log "$case_dir"/effective.log "$case_dir"/effective.err \
+    2>/dev/null || fail "consumer leaked private key material"
+}
+
+assert_signal_status() {
+  local signal=$1
+  case "$signal" in
+    HUP) printf 129 ;;
+    INT) printf 130 ;;
+    TERM) printf 143 ;;
+    *) fail "unknown signal in fixture" ;;
+  esac
+}
+
+run_consumer_case() {
+  local name=$1 body=$2 signal=$3 phase=$4 cleanup_failure=${5:-0}
+  local case_dir=$consumer_root/cases/$name expected_status
+  expected_status=$(assert_signal_status "$signal")
+  [ "$cleanup_failure" -eq 0 ] || expected_status=1
+  mkdir -p "$case_dir/runner" "$case_dir/home/.ssh"
+  chmod 700 "$case_dir" "$case_dir/runner" "$case_dir/home" "$case_dir/home/.ssh"
+  printf '%s\n' \
+    'Host *' '  HostName hostile.example.invalid' '  Port 1' \
+    '  UserKnownHostsFile /tmp/hostile-user-known-hosts' \
+    '  GlobalKnownHostsFile /tmp/hostile-global-known-hosts' \
+    '  KnownHostsCommand /bin/false' '  ProxyCommand /bin/false' \
+    '  ProxyJump hostile-jump.invalid' '  HostKeyAlias hostile-alias' \
+    '  CanonicalizeHostname yes' >"$case_dir/home/.ssh/config"
+  chmod 600 "$case_dir/home/.ssh/config"
+  : >"$case_dir/boundary.log"; : >"$case_dir/effective.log"; : >"$case_dir/effective.err"
+  set +e
+  env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
+    RUNNER_TEMP="$case_dir/runner" HOST="$scan_host" PORT=2222 \
+    SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
+    SSH_PRIVATE_KEY=fixture-private-key \
+    AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+    PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
+    RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
+    GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$case_dir/output" \
+    BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+    BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
+    BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
+    BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
+    BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
+    BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+    BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE="$phase" \
+    BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
+    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  status=$?
+  set -e
+  [ "$status" -eq "$expected_status" ] ||
+    fail "consumer $name returned $status instead of $expected_status"
+  assert_consumer_residue_absent "$case_dir"
+  [ "$(grep -c '^private-key-created$' "$case_dir/boundary.log")" -eq 1 ] ||
+    fail "consumer $name did not materialize a private key"
+  grep -Fxq 'config-created' "$case_dir/boundary.log" ||
+    fail "consumer $name did not create an empty SSH config"
+  if [ "$body" = "$capture_body" ]; then
+    [ "$(grep -c '^remote-cleanup$' "$case_dir/boundary.log")" -eq 1 ] ||
+      fail "capture $name did not attempt remote cleanup exactly once"
+    grep -Fxq 'remote-admission' "$case_dir/boundary.log" ||
+      fail "capture $name did not record remote admission"
+  else
+    ! grep -q '^remote-cleanup$' "$case_dir/boundary.log" ||
+      fail "probe $name attempted remote cleanup"
+  fi
+}
+
+for signal in HUP INT TERM; do
+  run_consumer_case "capture-$signal" "$capture_body" "$signal" scp
+  run_consumer_case "pre-probe-$signal" "$pre_probe_body" "$signal" ssh
+  run_consumer_case "post-probe-$signal" "$post_probe_body" "$signal" ssh
+done
+run_consumer_case capture-TERM-remote-cleanup-failure "$capture_body" TERM scp 1
+
+for signal in HUP INT TERM; do
+  pre_case=$consumer_root/cases/capture-pre-$signal
+  mkdir -p "$pre_case/runner" "$pre_case/home/.ssh"
+  chmod 700 "$pre_case" "$pre_case/runner" "$pre_case/home" "$pre_case/home/.ssh"
+  printf '%s\n' \
+    'Host *' '  HostName hostile.example.invalid' '  Port 1' \
+    '  UserKnownHostsFile /tmp/hostile-user-known-hosts' \
+    '  GlobalKnownHostsFile /tmp/hostile-global-known-hosts' \
+    '  KnownHostsCommand /bin/false' '  ProxyCommand /bin/false' \
+    '  ProxyJump hostile-jump.invalid' '  HostKeyAlias hostile-alias' \
+    '  CanonicalizeHostname yes' >"$pre_case/home/.ssh/config"
+  chmod 600 "$pre_case/home/.ssh/config"
+  : >"$pre_case/boundary.log"; : >"$pre_case/effective.log"; : >"$pre_case/effective.err"
+  set +e
+  env PATH="$consumer_bin:$original_path" HOME="$pre_case/home" \
+    RUNNER_TEMP="$pre_case/runner" HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+    HOST_FINGERPRINT="$expected_fingerprint" SSH_PRIVATE_KEY=fixture-private-key \
+    AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+    PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
+    RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
+    GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$pre_case/output" \
+    BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+    BETA_RECOVERY_BOUNDARY_LOG="$pre_case/boundary.log" \
+    BETA_RECOVERY_EFFECTIVE_LOG="$pre_case/effective.log" BETA_RECOVERY_EFFECTIVE_ERR="$pre_case/effective.err" \
+    BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
+    BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+    BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE=scan \
+    bash "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr"
+  status=$?
+  set -e
+  expected_status=$(assert_signal_status "$signal")
+  [ "$status" -eq "$expected_status" ] ||
+    fail "capture pre-verification $signal returned $status"
+  assert_consumer_residue_absent "$pre_case"
+  ! grep -q '^ssh-call$' "$pre_case/boundary.log" ||
+    fail "capture pre-verification $signal crossed SSH"
+  ! grep -q '^scp-call$' "$pre_case/boundary.log" ||
+    fail "capture pre-verification $signal crossed SCP"
+  ! grep -q '^remote-cleanup$' "$pre_case/boundary.log" ||
+    fail "capture pre-verification $signal attempted remote cleanup"
+done
+
+if env PATH="$consumer_bin:$original_path" \
+  BETA_RECOVERY_BOUNDARY_LOG="$consumer_root/option-rejection.log" \
+  HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+  BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+  ssh -i "$consumer_root/key" fixture-user@"$scan_host" true; then
+  fail "fake SSH accepted incomplete isolation argv"
+fi
+if env PATH="$consumer_bin:$original_path" \
+  BETA_RECOVERY_BOUNDARY_LOG="$consumer_root/option-rejection.log" \
+  HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+  BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+  scp -i "$consumer_root/key" -P 2222 "$root/README.md" fixture-user@"$scan_host":/tmp/fixture; then
+  fail "fake SCP accepted incomplete isolation argv"
+fi
+grep -Fxq 'argv-rejected ssh' "$consumer_root/option-rejection.log" ||
+  fail "fake SSH did not record option rejection"
+grep -Fxq 'argv-rejected scp' "$consumer_root/option-rejection.log" ||
+  fail "fake SCP did not record option rejection"
 
 echo "beta recovery SSH host-key materialization fixture passed"
