@@ -172,6 +172,7 @@ run_materializer() {
   local output_override=${7:-} ln_barrier=${8:-}
   local path_prefix=${9:-$fixture_bin}
   local rm_marker=${10:-}
+  local staging_log=${11:-}
   local output=$case_dir/runner/output/known_hosts scan_line_for_case=$scan_line
   [ "$port" = 22 ] || scan_line_for_case="[$host]:$port $key_type $key_data"
   [ -n "$output_override" ] && output=$output_override
@@ -188,6 +189,7 @@ run_materializer() {
     BETA_RECOVERY_REAL_MKTEMP="$(command -v mktemp)" \
     BETA_RECOVERY_REAL_CHMOD="$(command -v chmod)" \
     BETA_RECOVERY_RM_MARKER="$rm_marker" \
+    BETA_RECOVERY_STAGING_LOG="$staging_log" \
     BETA_RECOVERY_SCAN_MODE="$mode" \
     BETA_RECOVERY_SCAN_LINE="$scan_line_for_case" \
     BETA_RECOVERY_SCAN_ALT_LINE="$scan_line_for_case" \
@@ -525,6 +527,7 @@ write_wrapper "$diagnostic_write_bin/mktemp" \
   '  *".beta-recovery-known-hosts.XXXXXX")' \
   '    "${BETA_RECOVERY_REAL_CHMOD:?}" 000 "$path" ;;' \
   'esac' \
+  '[ -z "${BETA_RECOVERY_STAGING_LOG:-}" ] || printf "%s\n" "$path" >>"$BETA_RECOVERY_STAGING_LOG"' \
   'printf "%s\n" "$path"'
 
 run_utility_failure_case() {
@@ -553,7 +556,20 @@ assert_failure_case "$cleanup_failure_case"
 assert_sanitized_failure "$cleanup_failure_case" "$scan_host" \
   "$expected_fingerprint" "$key_data" "$cleanup_failure_case/runner/output/known_hosts"
 
-run_utility_failure_case diagnostic-write-failure "$diagnostic_write_bin"
+write_failure_case=$(make_case diagnostic-write-failure)
+if run_materializer "$write_failure_case" "$scan_host" 22 "$expected_fingerprint" valid \
+  delegate '' '' "$diagnostic_write_bin:$fixture_bin" '' \
+  "$write_failure_case/staging.log"; then
+  fail "diagnostic write failure unexpectedly succeeded"
+fi
+assert_failure_case "$write_failure_case"
+assert_sanitized_failure "$write_failure_case" "$scan_host" \
+  "$expected_fingerprint" "$key_data" "$write_failure_case/runner/output/known_hosts"
+[ -s "$write_failure_case/staging.log" ] ||
+  fail "diagnostic write failure did not record staging paths"
+while IFS= read -r staging_path; do
+  assert_sanitized_failure "$write_failure_case" "$staging_path"
+done <"$write_failure_case/staging.log"
 
 failure_case=$(make_case cleanup-failure-after-publication)
 failure_output=$failure_case/runner/output/known_hosts

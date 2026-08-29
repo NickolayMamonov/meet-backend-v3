@@ -156,12 +156,13 @@ candidate_file=$(
 endpoint=$host
 [ "$port" = 22 ] || endpoint="[$host]:$port"
 
-if ! ssh-keyscan -T 5 -t rsa -p "$port" "$host" >"$scan_file" 2>/dev/null; then
+if ! ssh-keyscan -T 5 -t rsa -p "$port" "$host" 2>/dev/null >"$scan_file"; then
   fail "key scan failed"
 fi
-[ "$(wc -l <"$scan_file" 2>/dev/null | tr -d '[:space:]')" = 1 ] ||
+[ "$(wc -l 2>/dev/null <"$scan_file" | tr -d '[:space:]')" = 1 ] ||
   fail "key scan output is ambiguous"
-IFS= read -r scan_line <"$scan_file" || fail "key scan output is invalid"
+IFS= read -r scan_line 2>/dev/null <"$scan_file" ||
+  fail "key scan output is invalid"
 [ -n "$scan_line" ] && [[ "$scan_line" != *$'\r' ]] || fail "key scan output is invalid"
 [[ "$scan_line" =~ ^[^[:space:]]+\ ssh-rsa\ [A-Za-z0-9+/=]+$ ]] ||
   fail "key scan output is invalid"
@@ -169,18 +170,19 @@ read -r scan_endpoint scan_type scan_key scan_extra <<<"$scan_line"
 [ -z "${scan_extra:-}" ] && [ "$scan_endpoint" = "$endpoint" ] &&
   [ "$scan_type" = ssh-rsa ] && [ -n "$scan_key" ] || fail "key scan identity is invalid"
 
-if ! ssh-keygen -lf "$scan_file" -E sha256 >"$fingerprint_file" 2>/dev/null; then
+if ! ssh-keygen -lf "$scan_file" -E sha256 2>/dev/null >"$fingerprint_file"; then
   fail "key fingerprint failed"
 fi
-[ "$(wc -l <"$fingerprint_file" 2>/dev/null | tr -d '[:space:]')" = 1 ] ||
+[ "$(wc -l 2>/dev/null <"$fingerprint_file" | tr -d '[:space:]')" = 1 ] ||
   fail "key fingerprint output is invalid"
-fingerprint_line=$(<"$fingerprint_file")
+IFS= read -r fingerprint_line 2>/dev/null <"$fingerprint_file" ||
+  fail "key fingerprint output is invalid"
 [[ "$fingerprint_line" =~ ^[0-9]+\ (SHA256:[A-Za-z0-9+/]{43})\ [^[:space:]]+\ \(RSA\)$ ]] ||
   fail "key fingerprint output is invalid"
 observed=${BASH_REMATCH[1]}
 [ "$observed" = "$expected" ] || fail "key fingerprint mismatch"
 
-printf '%s\n' "$scan_line" >"$candidate_file" 2>/dev/null ||
+printf '%s\n' "$scan_line" 2>/dev/null >"$candidate_file" ||
   fail "publication preparation failed"
 chmod 600 -- "$candidate_file" 2>/dev/null ||
   fail "publication preparation failed"
@@ -195,6 +197,6 @@ success=true
 [ -f "$output" ] && [ ! -L "$output" ] || fail "published output is unsafe"
 [ "$(stat -c '%a' -- "$output" 2>/dev/null)" = 600 ] ||
   fail "published output is unsafe"
-[ "$(wc -l <"$output" 2>/dev/null | tr -d '[:space:]')" = 1 ] ||
+[ "$(wc -l 2>/dev/null <"$output" | tr -d '[:space:]')" = 1 ] ||
   fail "published output is invalid"
 output_valid=true
