@@ -338,6 +338,7 @@ write_wrapper "$failure_bin/rm" \
   '  [[ "$*" == *".beta-recovery-keyscan."* ]] &&' \
   '  [ ! -e "${BETA_RECOVERY_RM_MARKER:?}" ]; then' \
   '  : >"$BETA_RECOVERY_RM_MARKER"' \
+  '  "${BETA_RECOVERY_REAL_RM:?}" "$@"' \
   '  exit 61' \
   'fi' \
   'exec "${BETA_RECOVERY_REAL_RM:?}" "$@"'
