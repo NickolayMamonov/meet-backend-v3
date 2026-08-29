@@ -105,13 +105,8 @@ jobs:
         run: |
           set -euo pipefail
           [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
-          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
-          chmod 700 "$ssh_dir"
-          key="$ssh_dir/private_key"
-          known="$ssh_dir/known_hosts"
-          config="$ssh_dir/ssh_config"
-          recipient_file="$RUNNER_TEMP/age-recipient"
-          remote="/tmp/beta-recovery-$RECOVERY_ID"
+          ssh_dir=
+          recipient_file=
           remote_cleanup_allowed=false
           cleanup_capture() {
             local status=$1
@@ -121,14 +116,21 @@ jobs:
                 "sudo test ! -e '$remote' || sudo rm -r -- '$remote'"; then
               status=1
             fi
-            rm -f -- "$recipient_file" || status=1
+            [ -z "$recipient_file" ] || rm -f -- "$recipient_file" || status=1
             rm -r -- "$ssh_dir" || status=1
             exit "$status"
           }
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
           trap 'cleanup_capture "$?"' EXIT
           trap 'cleanup_capture 129' HUP
           trap 'cleanup_capture 130' INT
           trap 'cleanup_capture 143' TERM
+          key="$ssh_dir/private_key"
+          known="$ssh_dir/known_hosts"
+          config="$ssh_dir/ssh_config"
+          recipient_file="$RUNNER_TEMP/age-recipient"
+          remote="/tmp/beta-recovery-$RECOVERY_ID"
+          chmod 700 "$ssh_dir"
           install -m 600 /dev/null "$config"
           scripts/materialize-beta-recovery-known-hosts.sh \
             --host "$HOST" --port "$PORT" --expected-fingerprint "$HOST_FINGERPRINT" \
@@ -407,21 +409,22 @@ jobs:
         run: |
           set -euo pipefail
           [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
-          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
-          chmod 700 "$ssh_dir"
-          key="$ssh_dir/private_key"
-          known="$ssh_dir/known_hosts"
-          config="$ssh_dir/ssh_config"
+          ssh_dir=
           cleanup_probe() {
             local status=$1
             trap - EXIT HUP INT TERM
             rm -r -- "$ssh_dir" || status=1
             exit "$status"
           }
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
           trap 'cleanup_probe "$?"' EXIT
           trap 'cleanup_probe 129' HUP
           trap 'cleanup_probe 130' INT
           trap 'cleanup_probe 143' TERM
+          key="$ssh_dir/private_key"
+          known="$ssh_dir/known_hosts"
+          config="$ssh_dir/ssh_config"
+          chmod 700 "$ssh_dir"
           install -m 600 /dev/null "$config"
           scripts/materialize-beta-recovery-known-hosts.sh \
             --host "$HOST" --port "$PORT" --expected-fingerprint "$HOST_FINGERPRINT" \
@@ -729,21 +732,22 @@ jobs:
         run: |
           set -euo pipefail
           [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
-          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
-          chmod 700 "$ssh_dir"
-          key="$ssh_dir/private_key"
-          known="$ssh_dir/known_hosts"
-          config="$ssh_dir/ssh_config"
+          ssh_dir=
           cleanup_probe() {
             local status=$1
             trap - EXIT HUP INT TERM
             rm -r -- "$ssh_dir" || status=1
             exit "$status"
           }
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
           trap 'cleanup_probe "$?"' EXIT
           trap 'cleanup_probe 129' HUP
           trap 'cleanup_probe 130' INT
           trap 'cleanup_probe 143' TERM
+          key="$ssh_dir/private_key"
+          known="$ssh_dir/known_hosts"
+          config="$ssh_dir/ssh_config"
+          chmod 700 "$ssh_dir"
           install -m 600 /dev/null "$config"
           scripts/materialize-beta-recovery-known-hosts.sh \
             --host "$HOST" --port "$PORT" --expected-fingerprint "$HOST_FINGERPRINT" \

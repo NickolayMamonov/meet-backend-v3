@@ -30,6 +30,10 @@ grep -Fq 'scp_opts=(-F "$config" -i "$key" -P "$PORT"' "$workflow"
 grep -Fq 'scripts/materialize-beta-recovery-known-hosts.sh' "$workflow"
 grep -Fq 'published_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
 grep -Fq 'remove_published_output' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+grep -Fq 'ln -T --' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+grep -Fq 'published_output_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+grep -Fq '[ "$published_output_identity" = "$candidate_identity" ]' \
+  "$root/scripts/materialize-beta-recovery-known-hosts.sh"
 helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
 [ "$helper_count" -eq 3 ]
 for required in \
@@ -69,6 +73,10 @@ for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
   helper_line=$(grep -n 'scripts/materialize-beta-recovery-known-hosts.sh' <<<"$block" | head -1 | cut -d: -f1)
   key_line=$(grep -n 'install -m 600 /dev/null "$key"' <<<"$block" | head -1 | cut -d: -f1)
   [ "$helper_line" -lt "$key_line" ]
+  mktemp_line=$(grep -n 'ssh_dir=$(mktemp -d' <<<"$block" | head -1 | cut -d: -f1)
+  trap_line=$(grep -n "trap 'cleanup_" <<<"$block" | head -1 | cut -d: -f1)
+  chmod_line=$(grep -n 'chmod 700 "$ssh_dir"' <<<"$block" | head -1 | cut -d: -f1)
+  [ "$mktemp_line" -lt "$trap_line" ] && [ "$trap_line" -lt "$chmod_line" ]
 done
 grep -Fq 'for signal in HUP INT TERM' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'capture-pre-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh"

@@ -190,9 +190,13 @@ candidate_identity=$(stat -c '%d:%i' -- "$candidate_file" 2>/dev/null) ||
   fail "publication preparation failed"
 published_identity=$candidate_identity
 published=true
-if ! ln -- "$candidate_file" "$output" 2>/dev/null; then
+if ! ln -T -- "$candidate_file" "$output" 2>/dev/null; then
   fail "output publication collision"
 fi
+published_output_identity=$(stat -c '%d:%i' -- "$output" 2>/dev/null) ||
+  fail "published output is unsafe"
+[ "$published_output_identity" = "$candidate_identity" ] ||
+  fail "published output identity changed"
 success=true
 [ -f "$output" ] && [ ! -L "$output" ] || fail "published output is unsafe"
 [ "$(stat -c '%a' -- "$output" 2>/dev/null)" = 600 ] ||

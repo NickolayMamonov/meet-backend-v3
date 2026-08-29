@@ -111,7 +111,22 @@ write_wrapper "$fixture_bin/ln" \
   '  done' \
   '  [ "$(find "$BETA_RECOVERY_LN_BARRIER_DIR" -maxdepth 1 -name "*.ready" | wc -l | tr -d "[:space:]")" -ge 2 ]' \
   'fi' \
+  'race_output=${@: -1}' \
+  'case "${BETA_RECOVERY_LN_RACE_MODE:-}" in' \
+  '  directory|symlink-directory)' \
+  '    : >"${BETA_RECOVERY_LN_RACE_DIR:?}/ready"' \
+  '    for attempt in $(seq 1 500); do' \
+  '      [ -e "$BETA_RECOVERY_LN_RACE_DIR/go" ] && break' \
+  '      sleep 0.01' \
+  '    done' \
+  '    [ -e "$BETA_RECOVERY_LN_RACE_DIR/go" ]' \
+  '    ;;' \
+  'esac' \
   '"${BETA_RECOVERY_REAL_LN:?}" "$@"' \
+  'if [ "${BETA_RECOVERY_LN_RACE_MODE:-}" = replacement ]; then' \
+  '  "${BETA_RECOVERY_REAL_RM:?}" -f -- "$race_output"' \
+  '  printf "unrelated replacement\n" >"$race_output"' \
+  'fi' \
   'if [ "${BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION:-0}" = 1 ]; then' \
   '  helper_pid=$PPID' \
   '  printf "%s\n" "$helper_pid" >"$BETA_RECOVERY_HELPER_PID_FILE"' \
@@ -173,6 +188,7 @@ run_materializer() {
   local path_prefix=${9:-$fixture_bin}
   local rm_marker=${10:-}
   local staging_log=${11:-}
+  local ln_race_mode=${12:-} ln_race_dir=${13:-}
   local output=$case_dir/runner/output/known_hosts scan_line_for_case=$scan_line
   [ "$port" = 22 ] || scan_line_for_case="[$host]:$port $key_type $key_data"
   [ -n "$output_override" ] && output=$output_override
@@ -188,6 +204,8 @@ run_materializer() {
     BETA_RECOVERY_REAL_RM="$real_rm" \
     BETA_RECOVERY_REAL_MKTEMP="$(command -v mktemp)" \
     BETA_RECOVERY_REAL_CHMOD="$(command -v chmod)" \
+    BETA_RECOVERY_LN_RACE_MODE="$ln_race_mode" \
+    BETA_RECOVERY_LN_RACE_DIR="$ln_race_dir" \
     BETA_RECOVERY_RM_MARKER="$rm_marker" \
     BETA_RECOVERY_STAGING_LOG="$staging_log" \
     BETA_RECOVERY_SCAN_MODE="$mode" \
@@ -242,6 +260,14 @@ assert_failure_case() {
   if [ -e "$output" ] || [ -L "$output" ]; then
     fail "failed case published output: $(basename "$case_dir")"
   fi
+  assert_no_staging "$case_dir"
+  assert_no_private_output "$case_dir"
+}
+
+assert_collision_preserved() {
+  local case_dir=$1 output=$2
+  [ -e "$output" ] || [ -L "$output" ] ||
+    fail "publication collision entry disappeared: $(basename "$case_dir")"
   assert_no_staging "$case_dir"
   assert_no_private_output "$case_dir"
 }
@@ -458,6 +484,79 @@ race_identity=$(stat -c '%d:%i' -- "$race_output")
 [ "$(stat -c '%a' -- "$race_output")" = 600 ] ||
   fail "publication race changed winner mode"
 assert_no_staging "$race_case"
+
+run_publication_race_case() {
+  local name=$1 mode=$2
+  local case_dir output race_dir outside race_pid race_status
+  case_dir=$(make_case "$name")
+  output=$case_dir/runner/output/known_hosts
+  race_dir=$case_dir/publication-race
+  mkdir -p "$race_dir"
+  chmod 700 "$race_dir"
+  if [ "$mode" = directory ]; then
+    outside=$case_dir/outside
+    mkdir -p "$outside"
+    printf 'preserve directory entry\n' >"$outside/unrelated"
+  elif [ "$mode" = symlink-directory ]; then
+    outside=$case_dir/outside
+    mkdir -p "$outside/redirect"
+    printf 'preserve symlink target entry\n' >"$outside/unrelated"
+  fi
+  set +e
+  run_materializer "$case_dir" "$scan_host" 22 "$expected_fingerprint" valid \
+    delegate "$output" "$race_dir" "$fixture_bin" '' '' "$mode" "$race_dir" &
+  race_pid=$!
+  for attempt in $(seq 1 500); do
+    [ -e "$race_dir/ready" ] && break
+    sleep 0.01
+  done
+  [ -e "$race_dir/ready" ] || {
+    kill "$race_pid" 2>/dev/null || true
+    wait "$race_pid" 2>/dev/null || true
+    set -e
+    fail "publication $mode race did not reach ln"
+  }
+  if [ "$mode" = directory ]; then
+    mkdir "$output"
+  elif [ "$mode" = symlink-directory ]; then
+    ln -s "$outside/redirect" "$output"
+  fi
+  : >"$race_dir/go"
+  wait "$race_pid"
+  race_status=$?
+  set -e
+  [ "$race_status" -ne 0 ] ||
+    fail "publication $mode race unexpectedly succeeded"
+  if [ "$mode" = directory ]; then
+    [ -d "$output" ] && [ ! -L "$output" ] ||
+      fail "directory collision was replaced"
+    [ -z "$(find "$output" -mindepth 1 -print -quit)" ] ||
+      fail "directory collision received generated material"
+    [ "$(<"$outside/unrelated")" = 'preserve directory entry' ] ||
+      fail "directory race changed unrelated outside entry"
+  else
+    [ -L "$output" ] || fail "symlink-directory collision was replaced"
+    [ "$(<"$outside/unrelated")" = 'preserve symlink target entry' ] ||
+      fail "symlink-directory race changed unrelated outside entry"
+    [ -z "$(find "$outside/redirect" -mindepth 1 -print -quit)" ] ||
+      fail "symlink-directory race wrote outside the approved path"
+  fi
+  assert_collision_preserved "$case_dir" "$output"
+}
+
+run_publication_race_case directory-collision directory
+run_publication_race_case symlink-directory-collision symlink-directory
+
+replacement_case=$(make_case post-link-replacement)
+replacement_output=$replacement_case/runner/output/known_hosts
+if run_materializer "$replacement_case" "$scan_host" 22 "$expected_fingerprint" valid \
+  delegate "$replacement_output" '' "$fixture_bin" '' '' replacement \
+  "$replacement_case/publication-race"; then
+  fail "post-link replacement race unexpectedly succeeded"
+fi
+[ "$(<"$replacement_output")" = 'unrelated replacement' ] ||
+  fail "post-link replacement was removed or changed"
+assert_collision_preserved "$replacement_case" "$replacement_output"
 
 failure_bin=$temporary_root/failure-bin
 mkdir -p "$failure_bin"
@@ -750,6 +849,19 @@ write_wrapper "$consumer_bin/install" \
   'esac' \
   'exec /usr/bin/install "$@"'
 
+write_wrapper "$consumer_bin/chmod" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'target=${@: -1}' \
+  'if [[ -n "${BETA_RECOVERY_SETUP_CHMOD_MODE:-}" ]] &&' \
+  '  [[ "$target" == *"/beta-recovery-ssh."* ]]; then' \
+  '  printf "setup-chmod\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  if [ "$BETA_RECOVERY_SETUP_CHMOD_MODE" = fail ]; then exit 77; fi' \
+  '  kill -"${BETA_RECOVERY_SETUP_SIGNAL:?}" "$PPID"' \
+  '  sleep 1' \
+  'fi' \
+  'exec /usr/bin/chmod "$@"'
+
 write_wrapper "$consumer_bin/rm" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -903,6 +1015,77 @@ assert_signal_status() {
     *) fail "unknown signal in fixture" ;;
   esac
 }
+
+run_consumer_setup_case() {
+  local name=$1 body=$2 mode=$3 signal=${4:-}
+  local case_dir=$consumer_root/cases/$name expected_status
+  if [ "$mode" = fail ]; then
+    expected_status=77
+  else
+    expected_status=$(assert_signal_status "$signal")
+  fi
+  mkdir -p "$case_dir/runner" "$case_dir/home/.ssh"
+  chmod 700 "$case_dir" "$case_dir/runner" "$case_dir/home" "$case_dir/home/.ssh"
+  printf '%s\n' \
+    'Host *' '  HostName hostile.example.invalid' '  Port 1' \
+    '  UserKnownHostsFile /tmp/hostile-user-known-hosts' \
+    '  GlobalKnownHostsFile /tmp/hostile-global-known-hosts' \
+    '  KnownHostsCommand /bin/false' '  ProxyCommand /bin/false' \
+    '  ProxyJump hostile-jump.invalid' '  HostKeyAlias hostile-alias' \
+    '  CanonicalizeHostname yes' >"$case_dir/home/.ssh/config"
+  chmod 600 "$case_dir/home/.ssh/config"
+  : >"$case_dir/boundary.log"; : >"$case_dir/effective.log"; : >"$case_dir/effective.err"
+  set +e
+  env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
+    RUNNER_TEMP="$case_dir/runner" HOST="$scan_host" PORT=2222 \
+    SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
+    SSH_PRIVATE_KEY=fixture-private-key \
+    AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+    PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
+    RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
+    GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$case_dir/output" \
+    BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+    BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
+    BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
+    BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
+    BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
+    BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
+    BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+    BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
+    BETA_RECOVERY_SETUP_CHMOD_MODE="$mode" BETA_RECOVERY_SETUP_SIGNAL="$signal" \
+    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  status=$?
+  set -e
+  [ "$status" -eq "$expected_status" ] ||
+    fail "consumer setup $name returned $status instead of $expected_status"
+  assert_consumer_residue_absent "$case_dir"
+  [ ! -e "$case_dir/mutation-sentinel" ] ||
+    fail "consumer setup $name crossed the mutation sentinel"
+  ! grep -q '^helper-success$' "$case_dir/boundary.log" ||
+    fail "consumer setup $name reached helper publication"
+  ! grep -q '^private-key-created$' "$case_dir/boundary.log" ||
+    fail "consumer setup $name created a private key"
+  ! grep -q '^ssh-call$' "$case_dir/boundary.log" ||
+    fail "consumer setup $name crossed SSH"
+  ! grep -q '^scp-call$' "$case_dir/boundary.log" ||
+    fail "consumer setup $name crossed SCP"
+  ! grep -q '^remote-cleanup$' "$case_dir/boundary.log" ||
+    fail "consumer setup $name attempted remote cleanup"
+  [ "$(grep -c '^local-cleanup$' "$case_dir/boundary.log")" -eq 1 ] ||
+    fail "consumer setup $name did not record local cleanup"
+}
+
+for body_name in capture pre-probe post-probe; do
+  case "$body_name" in
+    capture) body=$capture_body ;;
+    pre-probe) body=$pre_probe_body ;;
+    post-probe) body=$post_probe_body ;;
+  esac
+  run_consumer_setup_case "$body_name-setup-chmod-failure" "$body" fail
+  for signal in HUP INT TERM; do
+    run_consumer_setup_case "$body_name-setup-$signal" "$body" signal "$signal"
+  done
+done
 
 run_consumer_case() {
   local name=$1 body=$2 signal=$3 phase=$4 cleanup_failure=${5:-0}
