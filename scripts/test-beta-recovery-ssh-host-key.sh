@@ -95,7 +95,21 @@ write_wrapper "$fixture_bin/ln" \
   '"${BETA_RECOVERY_REAL_LN:?}" "$@"' \
   'if [ "${BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION:-0}" = 1 ]; then' \
   '  helper_pid=$PPID' \
-  '  (sleep 0.05; kill -TERM "$helper_pid" 2>/dev/null || true) &' \
+  '  printf "%s\n" "$helper_pid" >"$BETA_RECOVERY_HELPER_PID_FILE"' \
+  '  kill -STOP "$helper_pid"' \
+  '  (sleep 0.1; kill -CONT "$helper_pid" 2>/dev/null || true) &' \
+  'fi'
+
+write_wrapper "$fixture_bin/stat" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'args=("$@")' \
+  '"${BETA_RECOVERY_REAL_STAT:?}" "${args[@]}"' \
+  'if [ "${BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION:-0}" = 1 ] &&' \
+  '  [ "${args[0]:-}" = -c ] && [ "${args[1]:-}" = %a ] &&' \
+  '  [ "${args[3]:-}" = "${BETA_RECOVERY_OUTPUT:?}" ]; then' \
+  '  kill -TERM "$(cat "$BETA_RECOVERY_HELPER_PID_FILE")"' \
+  '  sleep 1' \
   'fi'
 
 write_wrapper "$fixture_bin/ssh" \
@@ -142,6 +156,7 @@ run_materializer() {
     BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
     BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
     BETA_RECOVERY_REAL_LN="$(command -v ln)" \
+    BETA_RECOVERY_REAL_STAT="$(command -v stat)" \
     BETA_RECOVERY_SCAN_MODE="$mode" \
     BETA_RECOVERY_SCAN_LINE="$scan_line_for_case" \
     BETA_RECOVERY_SCAN_ALT_LINE="$scan_line_for_case" \
@@ -273,7 +288,10 @@ env PATH="$fixture_bin:$original_path" \
   BETA_RECOVERY_BOUNDARY_LOG="$published_signal_case/boundary.log" \
   BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
   BETA_RECOVERY_REAL_LN="$(command -v ln)" \
+  BETA_RECOVERY_REAL_STAT="$(command -v stat)" \
   BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION=1 \
+  BETA_RECOVERY_OUTPUT="$published_signal_output" \
+  BETA_RECOVERY_HELPER_PID_FILE="$published_signal_case/helper.pid" \
   BETA_RECOVERY_SCAN_MODE=valid \
   BETA_RECOVERY_SCAN_LINE="$scan_line" \
   "$materializer" --host "$scan_host" --port 22 \
