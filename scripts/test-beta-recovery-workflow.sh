@@ -28,6 +28,8 @@ grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
 grep -Fq 'Revalidate source immediately before identity access' "$workflow"
 grep -Fq 'scp_opts=(-F "$config" -i "$key" -P "$PORT"' "$workflow"
 grep -Fq 'scripts/materialize-beta-recovery-known-hosts.sh' "$workflow"
+grep -Fq 'published_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+grep -Fq 'remove_published_output' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
 helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
 [ "$helper_count" -eq 3 ]
 for required in \
@@ -73,6 +75,9 @@ grep -Fq 'capture-pre-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh
 grep -Fq 'effective-config-failed' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'argv-rejected' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'BETA_RECOVERY_REMOTE_CLEANUP_FAIL' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'publication-race' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'cleanup-failure-after-publication' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'post-publication-signal-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
 grep -Fq 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow"
 grep -Fq 'archive_size=10263766' "$root/scripts/install-beta-recovery-age.sh"

@@ -4,7 +4,7 @@ export LC_ALL=C
 umask 077
 
 usage() {
-  echo "usage: $0 --host HOST --port PORT --expected-fingerprint FINGERPRINT --output PATH" >&2
+  echo "beta recovery host-key materialization failed: invalid arguments" >&2
   exit 2
 }
 
@@ -93,6 +93,17 @@ fingerprint_file=
 candidate_file=
 success=false
 output_valid=false
+published=false
+published_identity=
+
+remove_published_output() {
+  local current_identity
+  [ "$published" = true ] || return 0
+  [ -e "$output" ] || [ -L "$output" ] || return 0
+  current_identity=$(stat -c '%d:%i' -- "$output") || return 1
+  [ "$current_identity" = "$published_identity" ] || return 0
+  rm -f -- "$output"
+}
 
 cleanup() {
   local status=$?
@@ -100,10 +111,8 @@ cleanup() {
   [ -z "$scan_file" ] || rm -f -- "$scan_file" || status=1
   [ -z "$fingerprint_file" ] || rm -f -- "$fingerprint_file" || status=1
   [ -z "$candidate_file" ] || rm -f -- "$candidate_file" || status=1
-  if [ "$success" != true ] || [ "$output_valid" != true ]; then
-    if [ -e "$output" ] || [ -L "$output" ]; then
-      rm -f -- "$output" || status=1
-    fi
+  if [ "$status" -ne 0 ] || [ "$success" != true ] || [ "$output_valid" != true ]; then
+    remove_published_output || status=1
   fi
   exit "$status"
 }
@@ -115,9 +124,7 @@ on_signal() {
   [ -z "$scan_file" ] || rm -f -- "$scan_file" || status=1
   [ -z "$fingerprint_file" ] || rm -f -- "$fingerprint_file" || status=1
   [ -z "$candidate_file" ] || rm -f -- "$candidate_file" || status=1
-  if [ -e "$output" ] || [ -L "$output" ]; then
-    rm -f -- "$output" || status=1
-  fi
+  remove_published_output || true
   exit "$status"
 }
 
@@ -161,6 +168,10 @@ observed=${BASH_REMATCH[1]}
 
 printf '%s\n' "$scan_line" >"$candidate_file"
 chmod 600 -- "$candidate_file" || fail "publication preparation failed"
+candidate_identity=$(stat -c '%d:%i' -- "$candidate_file") ||
+  fail "publication preparation failed"
+published_identity=$candidate_identity
+published=true
 if ! ln -- "$candidate_file" "$output" 2>/dev/null; then
   fail "output publication collision"
 fi

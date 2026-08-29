@@ -13,12 +13,13 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 materializer=$root/scripts/materialize-beta-recovery-known-hosts.sh
 [ -x "$materializer" ] || fail "materializer is missing or not executable"
 
-for tool in awk basename chmod env find grep mkdir mktemp rm scp ssh ssh-keygen stat tr wc; do
+for tool in awk basename chmod env find grep mkdir mktemp rm scp seq sleep ssh ssh-keygen stat tr wc; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tool is unavailable: $tool"
 done
 
 original_path=$PATH
 real_ssh_keygen=$(command -v ssh-keygen)
+real_rm=$(command -v rm)
 temporary_root=$(mktemp -d)
 chmod 700 -- "$temporary_root"
 if [ "$(stat -c '%a' -- "$temporary_root")" != 700 ]; then
@@ -92,6 +93,15 @@ write_wrapper "$fixture_bin/ssh-keygen" \
 write_wrapper "$fixture_bin/ln" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  'if [ -n "${BETA_RECOVERY_LN_BARRIER_DIR:-}" ]; then' \
+  '  ready="$BETA_RECOVERY_LN_BARRIER_DIR/$BASHPID.ready"' \
+  '  : >"$ready"' \
+  '  for attempt in $(seq 1 500); do' \
+  '    [ "$(find "$BETA_RECOVERY_LN_BARRIER_DIR" -maxdepth 1 -name "*.ready" | wc -l | tr -d "[:space:]")" -ge 2 ] && break' \
+  '    sleep 0.01' \
+  '  done' \
+  '  [ "$(find "$BETA_RECOVERY_LN_BARRIER_DIR" -maxdepth 1 -name "*.ready" | wc -l | tr -d "[:space:]")" -ge 2 ]' \
+  'fi' \
   '"${BETA_RECOVERY_REAL_LN:?}" "$@"' \
   'if [ "${BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION:-0}" = 1 ]; then' \
   '  helper_pid=$PPID' \
@@ -108,7 +118,7 @@ write_wrapper "$fixture_bin/stat" \
   'if [ "${BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION:-0}" = 1 ] &&' \
   '  [ "${args[0]:-}" = -c ] && [ "${args[1]:-}" = %a ] &&' \
   '  [ "${args[3]:-}" = "${BETA_RECOVERY_OUTPUT:?}" ]; then' \
-  '  kill -TERM "$(cat "$BETA_RECOVERY_HELPER_PID_FILE")"' \
+  '  kill -"${BETA_RECOVERY_PUBLICATION_SIGNAL:-TERM}" "$(cat "$BETA_RECOVERY_HELPER_PID_FILE")"' \
   '  sleep 1' \
   'fi'
 
@@ -145,7 +155,7 @@ make_case() {
 
 run_materializer() {
   local case_dir=$1 host=$2 port=$3 expected=$4 mode=$5 keygen_mode=${6:-delegate}
-  local output_override=${7:-}
+  local output_override=${7:-} ln_barrier=${8:-}
   local output=$case_dir/runner/output/known_hosts scan_line_for_case=$scan_line
   [ "$port" = 22 ] || scan_line_for_case="[$host]:$port $key_type $key_data"
   [ -n "$output_override" ] && output=$output_override
@@ -161,6 +171,7 @@ run_materializer() {
     BETA_RECOVERY_SCAN_LINE="$scan_line_for_case" \
     BETA_RECOVERY_SCAN_ALT_LINE="$scan_line_for_case" \
     BETA_RECOVERY_KEYGEN_MODE="$keygen_mode" \
+    BETA_RECOVERY_LN_BARRIER_DIR="$ln_barrier" \
     "$materializer" \
     --host "$host" \
     --port "$port" \
@@ -279,33 +290,121 @@ fi
 assert_no_staging "$collision_case"
 assert_no_private_output "$collision_case"
 
-published_signal_case=$(make_case post-publication-signal)
-published_signal_output=$published_signal_case/runner/output/known_hosts
+race_case=$(make_case publication-race)
+race_output=$race_case/runner/output/known_hosts
+race_gate=$race_case/ln-barrier
+mkdir -p "$race_gate"
+chmod 700 "$race_gate"
 set +e
-env PATH="$fixture_bin:$original_path" \
-  HOME="$published_signal_case/home" \
-  RUNNER_TEMP="$published_signal_case/runner" \
-  BETA_RECOVERY_BOUNDARY_LOG="$published_signal_case/boundary.log" \
+(
+  run_materializer "$race_case" "$scan_host" 22 "$expected_fingerprint" valid \
+    delegate "$race_output" "$race_gate"
+  printf '%s\n' "$?" >"$race_case/race-a.status"
+) &
+race_a_pid=$!
+(
+  run_materializer "$race_case" "$scan_host" 22 "$expected_fingerprint" valid \
+    delegate "$race_output" "$race_gate"
+  printf '%s\n' "$?" >"$race_case/race-b.status"
+) &
+race_b_pid=$!
+wait "$race_a_pid"
+wait "$race_b_pid"
+set -e
+race_a_status=$(<"$race_case/race-a.status")
+race_b_status=$(<"$race_case/race-b.status")
+[ "$race_a_status" -eq 0 ] || [ "$race_b_status" -eq 0 ] ||
+  fail "publication race had no winner"
+[ "$race_a_status" -ne 0 ] || [ "$race_b_status" -ne 0 ] ||
+  fail "publication race had no losing collision"
+[ -f "$race_output" ] && [ ! -L "$race_output" ] ||
+  fail "publication race lost the winner output"
+[ "$(<"$race_output")" = "$scan_line" ] ||
+  fail "publication race changed winner content"
+race_identity=$(stat -c '%d:%i' -- "$race_output")
+[ "$race_identity" = "$(stat -c '%d:%i' -- "$race_output")" ] ||
+  fail "publication race changed winner identity"
+[ "$(stat -c '%a' -- "$race_output")" = 600 ] ||
+  fail "publication race changed winner mode"
+assert_no_staging "$race_case"
+
+failure_bin=$temporary_root/failure-bin
+mkdir -p "$failure_bin"
+chmod 700 "$failure_bin"
+write_wrapper "$failure_bin/rm" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [[ "${BETA_RECOVERY_FAIL_FIRST_SCAN_RM:-0}" = 1 ]] &&' \
+  '  [[ "$*" == *".beta-recovery-keyscan."* ]] &&' \
+  '  [ ! -e "${BETA_RECOVERY_RM_MARKER:?}" ]; then' \
+  '  : >"$BETA_RECOVERY_RM_MARKER"' \
+  '  exit 61' \
+  'fi' \
+  'exec "${BETA_RECOVERY_REAL_RM:?}" "$@"'
+failure_case=$(make_case cleanup-failure-after-publication)
+failure_output=$failure_case/runner/output/known_hosts
+set +e
+env PATH="$failure_bin:$fixture_bin:$original_path" \
+  HOME="$failure_case/home" \
+  RUNNER_TEMP="$failure_case/runner" \
+  BETA_RECOVERY_BOUNDARY_LOG="$failure_case/boundary.log" \
   BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
   BETA_RECOVERY_REAL_LN="$(command -v ln)" \
   BETA_RECOVERY_REAL_STAT="$(command -v stat)" \
-  BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION=1 \
-  BETA_RECOVERY_OUTPUT="$published_signal_output" \
-  BETA_RECOVERY_HELPER_PID_FILE="$published_signal_case/helper.pid" \
+  BETA_RECOVERY_REAL_RM="$real_rm" \
+  BETA_RECOVERY_FAIL_FIRST_SCAN_RM=1 \
+  BETA_RECOVERY_RM_MARKER="$failure_case/rm.marker" \
   BETA_RECOVERY_SCAN_MODE=valid \
   BETA_RECOVERY_SCAN_LINE="$scan_line" \
   "$materializer" --host "$scan_host" --port 22 \
   --expected-fingerprint "$expected_fingerprint" \
-  --output "$published_signal_output" \
-  >"$published_signal_case/stdout" 2>"$published_signal_case/stderr"
-published_signal_status=$?
+  --output "$failure_output" \
+  >"$failure_case/stdout" 2>"$failure_case/stderr"
+failure_status=$?
 set -e
-[ "$published_signal_status" -eq 143 ] ||
-  fail "post-publication TERM returned $published_signal_status"
-[ ! -e "$published_signal_output" ] && [ ! -L "$published_signal_output" ] ||
-  fail "post-publication TERM left published output"
-assert_no_staging "$published_signal_case"
-assert_no_private_output "$published_signal_case"
+[ "$failure_status" -ne 0 ] ||
+  fail "cleanup failure unexpectedly succeeded"
+assert_failure_case "$failure_case"
+
+signal_status() {
+  case "$1" in
+    HUP) printf 129 ;;
+    INT) printf 130 ;;
+    TERM) printf 143 ;;
+    *) fail "unknown signal in fixture" ;;
+  esac
+}
+
+for signal in HUP INT TERM; do
+  published_signal_case=$(make_case "post-publication-signal-$signal")
+  published_signal_output=$published_signal_case/runner/output/known_hosts
+  set +e
+  env PATH="$fixture_bin:$original_path" \
+    HOME="$published_signal_case/home" \
+    RUNNER_TEMP="$published_signal_case/runner" \
+    BETA_RECOVERY_BOUNDARY_LOG="$published_signal_case/boundary.log" \
+    BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
+    BETA_RECOVERY_REAL_LN="$(command -v ln)" \
+    BETA_RECOVERY_REAL_STAT="$(command -v stat)" \
+    BETA_RECOVERY_SIGNAL_AFTER_PUBLICATION=1 \
+    BETA_RECOVERY_PUBLICATION_SIGNAL="$signal" \
+    BETA_RECOVERY_OUTPUT="$published_signal_output" \
+    BETA_RECOVERY_HELPER_PID_FILE="$published_signal_case/helper.pid" \
+    BETA_RECOVERY_SCAN_MODE=valid \
+    BETA_RECOVERY_SCAN_LINE="$scan_line" \
+    "$materializer" --host "$scan_host" --port 22 \
+    --expected-fingerprint "$expected_fingerprint" \
+    --output "$published_signal_output" \
+    >"$published_signal_case/stdout" 2>"$published_signal_case/stderr"
+  published_signal_status=$?
+  set -e
+  [ "$published_signal_status" -eq "$(signal_status "$signal")" ] ||
+    fail "post-publication $signal returned $published_signal_status"
+  [ ! -e "$published_signal_output" ] && [ ! -L "$published_signal_output" ] ||
+    fail "post-publication $signal left published output"
+  assert_no_staging "$published_signal_case"
+  assert_no_private_output "$published_signal_case"
+done
 
 boundary_case=$(make_case fake-ssh-scp-boundaries)
 known_for_boundary=$boundary_case/runner/output/known_hosts
