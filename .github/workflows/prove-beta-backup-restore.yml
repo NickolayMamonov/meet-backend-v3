@@ -105,27 +105,47 @@ jobs:
         run: |
           set -euo pipefail
           [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
-          key="$RUNNER_TEMP/ssh-key"
-          install -m 600 /dev/null "$key"
-          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
-          known="$RUNNER_TEMP/known-hosts"
-          printf '%s\n' "$HOST_FINGERPRINT" >"$known"
-          ssh_opts=(-i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known")
-          scp_opts=(-i "$key" -P "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known")
-          remote="/tmp/beta-recovery-$RECOVERY_ID"
-          recipient_file="$RUNNER_TEMP/age-recipient"
-          install -m 600 /dev/null "$recipient_file"
-          printf '%s\n' "$AGE_RECIPIENT" >"$recipient_file"
-          cleanup_remote() {
-            local status=$?
-            trap - EXIT
-            if ! ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" \
-              "sudo test ! -e '$remote' || sudo rm -r -- '$remote'"; then
+          ssh_dir=
+          recipient_file=
+          remote_cleanup_allowed=false
+          cleanup_capture() {
+            local status=$1
+            trap - EXIT HUP INT TERM
+            if [ "$remote_cleanup_allowed" = true ] &&
+              ! ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" \
+                "sudo test ! -e '$remote' || sudo rm -r -- '$remote'"; then
               status=1
             fi
+            [ -z "$recipient_file" ] || rm -f -- "$recipient_file" || status=1
+            rm -r -- "$ssh_dir" || status=1
             exit "$status"
           }
-          trap cleanup_remote EXIT
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
+          trap 'cleanup_capture "$?"' EXIT
+          trap 'cleanup_capture 129' HUP
+          trap 'cleanup_capture 130' INT
+          trap 'cleanup_capture 143' TERM
+          key="$ssh_dir/private_key"
+          known="$ssh_dir/known_hosts"
+          config="$ssh_dir/ssh_config"
+          recipient_file="$RUNNER_TEMP/age-recipient"
+          remote="/tmp/beta-recovery-$RECOVERY_ID"
+          chmod 700 "$ssh_dir"
+          install -m 600 /dev/null "$config"
+          scripts/materialize-beta-recovery-known-hosts.sh \
+            --host "$HOST" --port "$PORT" --expected-fingerprint "$HOST_FINGERPRINT" \
+            --output "$known"
+          install -m 600 /dev/null "$key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
+          ssh_opts=(-F "$config" -i "$key" -p "$PORT" -o BatchMode=yes
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known"
+            -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none)
+          scp_opts=(-F "$config" -i "$key" -P "$PORT" -o BatchMode=yes
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known"
+            -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none)
+          install -m 600 /dev/null "$recipient_file"
+          printf '%s\n' "$AGE_RECIPIENT" >"$recipient_file"
+          remote_cleanup_allowed=true
           ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "mkdir -p '$remote'"
           scp "${scp_opts[@]}" scripts/run-beta-recovery-capture.sh scripts/backup-production.sh \
             scripts/probe-test-vps-recovery-runtime.sh scripts/production-compose.sh \
@@ -210,6 +230,7 @@ jobs:
           observed_age=$((observed_epoch - point_epoch))
           chmod 600 "$RUNNER_TEMP/"*.age "$RUNNER_TEMP/"*.json
           ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo rm -r -- '$remote'"
+          remote_cleanup_allowed=false
           mkdir "$RUNNER_TEMP/artifact"
           scripts/build-beta-recovery-evidence.sh manifest \
             --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
@@ -219,7 +240,8 @@ jobs:
               scripts/run-beta-recovery-capture.sh scripts/run-beta-recovery-restore.sh \
               scripts/build-beta-recovery-evidence.sh scripts/probe-test-vps-recovery-runtime.sh \
               scripts/backup-production.sh scripts/beta-recovery-database-proof.sql \
-              scripts/beta-recovery-media-proof.sh scripts/install-beta-recovery-age.sh; do sha256sum "$file"; done |
+              scripts/beta-recovery-media-proof.sh scripts/install-beta-recovery-age.sh \
+              scripts/materialize-beta-recovery-known-hosts.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
@@ -387,13 +409,32 @@ jobs:
         run: |
           set -euo pipefail
           [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
-          key="$RUNNER_TEMP/ssh-key"
+          ssh_dir=
+          cleanup_probe() {
+            local status=$1
+            trap - EXIT HUP INT TERM
+            rm -r -- "$ssh_dir" || status=1
+            exit "$status"
+          }
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
+          trap 'cleanup_probe "$?"' EXIT
+          trap 'cleanup_probe 129' HUP
+          trap 'cleanup_probe 130' INT
+          trap 'cleanup_probe 143' TERM
+          key="$ssh_dir/private_key"
+          known="$ssh_dir/known_hosts"
+          config="$ssh_dir/ssh_config"
+          chmod 700 "$ssh_dir"
+          install -m 600 /dev/null "$config"
+          scripts/materialize-beta-recovery-known-hosts.sh \
+            --host "$HOST" --port "$PORT" --expected-fingerprint "$HOST_FINGERPRINT" \
+            --output "$known"
           install -m 600 /dev/null "$key"
           printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
-          known="$RUNNER_TEMP/known-hosts"
-          printf '%s\n' "$HOST_FINGERPRINT" >"$known"
-          ssh -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$known" "$SSH_USER@$HOST" \
+          ssh -F "$config" -i "$key" -p "$PORT" -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
+            -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none \
+            "$SSH_USER@$HOST" \
             "sudo bash -s -- '$PUBLIC_URL'" >"$RUNNER_TEMP/pre-probe.json" <<'REMOTE'
           set -euo pipefail
           url=$1
@@ -491,7 +532,7 @@ jobs:
               scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
               scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
-              scripts/install-beta-recovery-age.sh; do sha256sum "$file"; done |
+              scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
@@ -552,7 +593,7 @@ jobs:
               scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
               scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
-              scripts/install-beta-recovery-age.sh; do sha256sum "$file"; done |
+              scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
@@ -691,13 +732,32 @@ jobs:
         run: |
           set -euo pipefail
           [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
-          key="$RUNNER_TEMP/ssh-key"
+          ssh_dir=
+          cleanup_probe() {
+            local status=$1
+            trap - EXIT HUP INT TERM
+            rm -r -- "$ssh_dir" || status=1
+            exit "$status"
+          }
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
+          trap 'cleanup_probe "$?"' EXIT
+          trap 'cleanup_probe 129' HUP
+          trap 'cleanup_probe 130' INT
+          trap 'cleanup_probe 143' TERM
+          key="$ssh_dir/private_key"
+          known="$ssh_dir/known_hosts"
+          config="$ssh_dir/ssh_config"
+          chmod 700 "$ssh_dir"
+          install -m 600 /dev/null "$config"
+          scripts/materialize-beta-recovery-known-hosts.sh \
+            --host "$HOST" --port "$PORT" --expected-fingerprint "$HOST_FINGERPRINT" \
+            --output "$known"
           install -m 600 /dev/null "$key"
           printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
-          known="$RUNNER_TEMP/known-hosts"
-          printf '%s\n' "$HOST_FINGERPRINT" >"$known"
-          ssh -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$known" "$SSH_USER@$HOST" \
+          ssh -F "$config" -i "$key" -p "$PORT" -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
+            -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none \
+            "$SSH_USER@$HOST" \
             "sudo bash -s -- '$PUBLIC_URL'" >"$RUNNER_TEMP/post-probe.json" <<'REMOTE'
           set -euo pipefail
           url=$1
