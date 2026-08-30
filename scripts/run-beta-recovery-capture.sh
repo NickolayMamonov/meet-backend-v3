@@ -15,12 +15,19 @@ while [ "$#" -gt 0 ]; do
     *) usage;;
   esac
 done
+validate_release_root(){
+  [ -d "$root" ] && [ ! -L "$root" ] ||
+    fail "release root is unsafe"
+  [ -f "$root/.env.production" ] && [ ! -L "$root/.env.production" ] &&
+    [ -s "$root/.env.production" ] ||
+    fail "release configuration is unavailable"
+}
+validate_release_root
 if [ "$mode" = capture ]; then
   [[ "$recovery_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || usage
   [[ "$recipient" =~ ^age1[0-9a-z]+$ ]] || fail "recipient malformed"
   [ -n "$output" ] && [ -d "$output" ] && [ ! -L "$output" ] || usage
 fi
-[ -d "$root" ] && [ ! -L "$root" ] || usage
 [[ "$public_url" =~ ^https://[^/]+$ ]] || fail "public HTTPS URL is required"
 for tool in docker flock jq stat find mktemp; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

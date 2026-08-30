@@ -45,6 +45,7 @@ else
 fi
 capture_fixture="$fixture/capture"
 mkdir -p "$capture_fixture/bin" "$capture_fixture/root"
+printf 'BACKEND_IMAGE=fixture\n' >"$capture_fixture/root/.env.production"
 cat >"$capture_fixture/bin/install" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -65,6 +66,9 @@ EOF
 cat >"$capture_fixture/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${CAPTURE_CALLS_FILE:-}" ]; then
+  printf 'docker\n' >>"$CAPTURE_CALLS_FILE"
+fi
 case "${1:-}" in
   info) exit 0 ;;
   inspect)
@@ -83,11 +87,14 @@ case "${1:-}" in
       echo 'Error: No such container: aaaaaaaaaaaaaaaa' >&2
       exit 1
     fi
-    if [[ "${*: -1}" == *Mounts* ]]; then
-      printf 'volume|meet-production_uploads_data\n'
-    else
-      jq -cn '[{Id:"current-container",Image:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",State:{Running:true}}]'
-    fi
+    case "$*" in
+      *State.Running*) printf 'true\n' ;;
+      *Health.Status*) printf 'healthy\n' ;;
+      *'{{.Image}}'*) printf 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;;
+      *config-hash*) printf 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n' ;;
+      *Mounts*) printf 'volume|meet-production_uploads_data\n' ;;
+      *) jq -cn '[{Id:"current-container",Image:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",State:{Running:true}}]' ;;
+    esac
     ;;
   *) echo "unsupported docker fixture operation: $*" >&2; exit 2 ;;
 esac
@@ -95,11 +102,17 @@ EOF
 cat >"$capture_fixture/bin/compose" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${CAPTURE_CALLS_FILE:-}" ]; then
+  printf 'compose\n' >>"$CAPTURE_CALLS_FILE"
+fi
 [ "${1:-}" = ps ] && [ "${2:-}" = -q ] && [ "${3:-}" = backend ] && printf 'current-container\n'
 EOF
 cat >"$capture_fixture/bin/probe" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${CAPTURE_CALLS_FILE:-}" ]; then
+  printf 'probe\n' >>"$CAPTURE_CALLS_FILE"
+fi
 output=''
 while [ "$#" -gt 0 ]; do
   [ "$1" = --output ] && output=$2 && shift 2 || shift
@@ -109,8 +122,118 @@ jq -cnS '{schema:"meet-backend/test-vps-recovery-runtime/v1",healthy:true,
   configHash:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",uploadsMount:"volume"},
   https:{meetingsStatus:"200",meetingsJson:true,actuatorStatus:"404",httpRedirectHttps:true}}' >"$output"
 EOF
+cat >"$capture_fixture/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${CAPTURE_CALLS_FILE:-}" ]; then
+  printf 'curl\n' >>"$CAPTURE_CALLS_FILE"
+fi
+output=/dev/null
+headers=
+write=
+url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) output=$2; shift 2 ;;
+    -D) headers=$2; shift 2 ;;
+    -w) write=$2; shift 2 ;;
+    *) url=$1; shift ;;
+  esac
+done
+if [ -n "$headers" ]; then
+  printf 'location: https://api.whysoezzy.online/meetings\n' >"$headers"
+elif [[ "$url" == */meetings ]]; then
+  printf '[]\n' >"$output"
+  printf '200\n'
+elif [[ "$url" == */actuator ]]; then
+  printf '404\n'
+fi
+EOF
 chmod 700 "$capture_fixture/bin/install" "$capture_fixture/bin/flock" \
-  "$capture_fixture/bin/docker" "$capture_fixture/bin/compose" "$capture_fixture/bin/probe"
+  "$capture_fixture/bin/docker" "$capture_fixture/bin/compose" "$capture_fixture/bin/probe" \
+  "$capture_fixture/bin/curl"
+probe_output="$capture_fixture/probe.json"
+CAPTURE_CALLS_FILE="$capture_fixture/valid-calls.log" PATH="$capture_fixture/bin:$PATH" \
+  bash "$root/scripts/probe-test-vps-recovery-runtime.sh" \
+    --root "$capture_fixture/root" --compose-script "$capture_fixture/bin/compose" \
+    --output "$probe_output" --public-url https://api.whysoezzy.online
+jq -e '.schema=="meet-backend/test-vps-recovery-runtime/v1" and .healthy==true' \
+  "$probe_output" >/dev/null
+[ "$(grep -Fc 'compose' "$capture_fixture/valid-calls.log")" -ge 1 ]
+[ "$(grep -Fc 'docker' "$capture_fixture/valid-calls.log")" -ge 1 ]
+[ "$(grep -Fc 'curl' "$capture_fixture/valid-calls.log")" -ge 1 ]
+run_capture_admission_case(){
+  local label=$1 bad_root=$2 state_dir="$capture_fixture/admission-$1" output_dir="$capture_fixture/output-$1"
+  mkdir -p "$state_dir" "$output_dir"
+  printf 'before\n' >"$state_dir/sentinel"
+  : >"$capture_fixture/admission-calls.log"
+  if CAPTURE_CALLS_FILE="$capture_fixture/admission-calls.log" \
+    PATH="$capture_fixture/bin:$PATH" bash "$capture" \
+      --recovery-id recovery-fixture --root "$bad_root" --output-dir "$output_dir" \
+      --recipient age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+      --public-url https://api.whysoezzy.online --state-root "$state_dir" \
+      --compose-script "$capture_fixture/bin/compose" \
+      --probe-script "$capture_fixture/bin/probe" \
+      --backup-script "$capture_fixture/bin/compose"; then
+    fail "invalid $label release root was accepted"
+  fi
+  [ ! -s "$capture_fixture/admission-calls.log" ]
+  [ "$(cat "$state_dir/sentinel")" = before ]
+  [ ! -e "$output_dir/postgres.dump.age" ]
+}
+run_probe_admission_case(){
+  local label=$1 bad_root=$2 output="$capture_fixture/probe-$1.json"
+  rm -f -- "$output" "$capture_fixture/probe-$1.json."*
+  : >"$capture_fixture/admission-calls.log"
+  if CAPTURE_CALLS_FILE="$capture_fixture/admission-calls.log" \
+    PATH="$capture_fixture/bin:$PATH" bash "$root/scripts/probe-test-vps-recovery-runtime.sh" \
+      --root "$bad_root" --compose-script "$capture_fixture/bin/compose" \
+      --output "$output" --public-url https://api.whysoezzy.online; then
+    fail "invalid $label probe root was accepted"
+  fi
+  [ ! -s "$capture_fixture/admission-calls.log" ]
+  [ ! -e "$output" ]
+}
+mkdir "$capture_fixture/state-only" "$capture_fixture/missing-env" "$capture_fixture/empty-env" \
+  "$capture_fixture/symlink-env"
+: >"$capture_fixture/empty-env/.env.production"
+symlink_supported=false
+if ln -s "$capture_fixture/root" "$capture_fixture/symlink-root" &&
+  [ -L "$capture_fixture/symlink-root" ]; then
+  symlink_supported=true
+else
+  rm -r -- "$capture_fixture/symlink-root" 2>/dev/null || true
+fi
+if ln -s "$capture_fixture/root/.env.production" "$capture_fixture/symlink-env/.env.production" &&
+  [ -L "$capture_fixture/symlink-env/.env.production" ]; then
+  symlink_supported=true
+else
+  rm -f -- "$capture_fixture/symlink-env/.env.production"
+fi
+run_capture_admission_case missing "$capture_fixture/missing-root"
+run_capture_admission_case blank ''
+run_capture_admission_case relative relative/root
+run_capture_admission_case double-dot "$capture_fixture/missing-root/../missing-root"
+run_capture_admission_case metacharacter "$capture_fixture/missing-root;touch"
+run_capture_admission_case state-only "$capture_fixture/state-only"
+run_capture_admission_case missing-env "$capture_fixture/missing-env"
+run_capture_admission_case empty-env "$capture_fixture/empty-env"
+if [ "$symlink_supported" = true ]; then
+  run_capture_admission_case symlink "$capture_fixture/symlink-root"
+  run_capture_admission_case symlink-env "$capture_fixture/symlink-env"
+fi
+run_probe_admission_case missing "$capture_fixture/missing-root"
+run_probe_admission_case blank ''
+run_probe_admission_case relative relative/root
+run_probe_admission_case double-dot "$capture_fixture/missing-root/../missing-root"
+run_probe_admission_case metacharacter "$capture_fixture/missing-root;touch"
+run_probe_admission_case state-only "$capture_fixture/state-only"
+run_probe_admission_case missing-env "$capture_fixture/missing-env"
+run_probe_admission_case empty-env "$capture_fixture/empty-env"
+if [ "$symlink_supported" = true ]; then
+  run_probe_admission_case symlink "$capture_fixture/symlink-root"
+  run_probe_admission_case symlink-env "$capture_fixture/symlink-env"
+fi
 write_capture_journal() {
   local state_root=$1 healthy=$2 safe=$3 keep_owned=${4:-true} state_dir="$1/beta-recovery-recovery-fixture"
   mkdir -p "$state_dir"

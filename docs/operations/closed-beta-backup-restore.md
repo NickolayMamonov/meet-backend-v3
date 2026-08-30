@@ -34,6 +34,16 @@ fingerprint update, and a new authorized run. Do not trust a scanned key,
 enable TOFU or `accept-new`, retry or rotate automatically, or resume the
 failed August 28, 2026 capture.
 
+The protected `TEST_VPS_PATH` Environment value is the release and Compose
+root. It must already exist on the test VPS and contain the non-empty,
+non-symlink `.env.production` consumed by Compose. It is distinct from the
+runtime state root `/var/lib/meet-production`, which owns active and captured
+runtime files, and from the shared serialization lock
+`/var/lib/meet-test-vps-deploy/.deploy.lock`. Missing, unsafe, or incomplete
+release-root configuration requires correction on the VPS or in the protected
+Environment, followed by a new authorized run; there is no fallback and failed
+runs are not resumed.
+
 Capture holds `/var/lib/meet-test-vps-deploy/.deploy.lock` only for the bounded
 snapshot and runtime recovery section. It rejects an active SMTP transaction,
 proves a healthy populated runtime and HTTPS edge, and uses fixed

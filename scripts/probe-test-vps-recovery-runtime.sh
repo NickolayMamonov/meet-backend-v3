@@ -10,7 +10,13 @@ while [ "$#" -gt 0 ]; do
     --lock-path) lock_path=$2; shift 2;; *) usage;;
   esac
 done
-[ -d "$root" ] && [ -x "$compose" ] && [ -n "$output" ] || usage
+[ -n "$root" ] && [ -n "$compose" ] && [ -n "$output" ] || usage
+[ -d "$root" ] && [ ! -L "$root" ] ||
+  fail "release root is unsafe"
+[ -f "$root/.env.production" ] && [ ! -L "$root/.env.production" ] &&
+  [ -s "$root/.env.production" ] ||
+  fail "release configuration is unavailable"
+[ -x "$compose" ] || usage
 [ "$url" = https://api.whysoezzy.online ] || fail "reviewed HTTPS URL is required"
 [ ! -L "$output" ] && [ -d "$(dirname -- "$output")" ] || fail "unsafe output"
 for tool in docker jq curl flock; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
