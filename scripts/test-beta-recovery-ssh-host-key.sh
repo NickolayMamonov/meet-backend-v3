@@ -895,7 +895,7 @@ write_wrapper "$consumer_bin/chmod" \
   '  printf "setup-chmod\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '  if [ "$BETA_RECOVERY_SETUP_CHMOD_MODE" = fail ]; then exit 77; fi' \
   '  signal_parent "${BETA_RECOVERY_SETUP_SIGNAL:?}"' \
-  '  sleep 1' \
+  '  exit 0' \
   'fi' \
   'exec /usr/bin/chmod "$@"'
 
