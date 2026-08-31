@@ -7,6 +7,8 @@ backup=$root/scripts/backup-production.sh
 media=$root/scripts/beta-recovery-media-proof.sh
 for script in "$capture" "$backup" "$media"; do [ -x "$script" ] || fail "not executable: $script"; bash -n "$script"; done
 grep -Fq '.deploy.lock' "$capture"; grep -Fq 'reconcile_states' "$capture"; grep -Fq 'capture-database-proof.json' "$capture"
+grep -Fq 'export PRODUCTION_ROOT="$root"' "$capture"
+grep -Fq 'export PRODUCTION_ROOT="$root"' "$root/scripts/probe-test-vps-recovery-runtime.sh"
 grep -Fq 'pg_database_size(current_database())' "$backup"; grep -Fq 'validate_upload_archive' "$backup"; grep -Fq 'tar --list --gzip --verbose' "$backup"
 grep -Fq 'jq -cS' "$backup"; grep -Fq 'capacity_ok' "$backup"; grep -Fq -- '--reference-list' "$backup"
 grep -Fq 'decimal_add' "$media"; grep -Fq 'ln -- "$candidate" "$output"' "$media"
@@ -102,6 +104,11 @@ EOF
 cat >"$capture_fixture/bin/compose" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${CAPTURE_EXPECTED_PRODUCTION_ROOT:-}" ] &&
+  [ "${PRODUCTION_ROOT:-}" != "$CAPTURE_EXPECTED_PRODUCTION_ROOT" ]; then
+  echo "compose received an unexpected production root" >&2
+  exit 1
+fi
 if [ -n "${CAPTURE_CALLS_FILE:-}" ]; then
   printf 'compose\n' >>"$CAPTURE_CALLS_FILE"
 fi
@@ -153,7 +160,9 @@ chmod 700 "$capture_fixture/bin/install" "$capture_fixture/bin/flock" \
   "$capture_fixture/bin/docker" "$capture_fixture/bin/compose" "$capture_fixture/bin/probe" \
   "$capture_fixture/bin/curl"
 probe_output="$capture_fixture/probe.json"
-CAPTURE_CALLS_FILE="$capture_fixture/valid-calls.log" PATH="$capture_fixture/bin:$PATH" \
+CAPTURE_CALLS_FILE="$capture_fixture/valid-calls.log" \
+  CAPTURE_EXPECTED_PRODUCTION_ROOT="$capture_fixture/root" \
+  PATH="$capture_fixture/bin:$PATH" \
   bash "$root/scripts/probe-test-vps-recovery-runtime.sh" \
     --root "$capture_fixture/root" --compose-script "$capture_fixture/bin/compose" \
     --output "$probe_output" --public-url https://api.whysoezzy.online
@@ -255,7 +264,9 @@ write_capture_journal() {
 run_capture_reconcile() {
   local mode=$1 state_root=$2
   rm -f -- "$state_root/reconcile.json"
-  PATH="$capture_fixture/bin:$PATH" CAPTURE_INSPECT_MODE="$mode" \
+  PATH="$capture_fixture/bin:$PATH" \
+    CAPTURE_EXPECTED_PRODUCTION_ROOT="$capture_fixture/root" \
+    CAPTURE_INSPECT_MODE="$mode" \
     bash "$capture" reconcile --root "$capture_fixture/root" \
     --public-url https://example.test --state-root "$state_root" \
     --output "$state_root/reconcile.json" \

@@ -106,6 +106,17 @@ grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$pre_probe_block"
 grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$post_probe_block"
 grep -Fq '"$remote" "$RECOVERY_ID" "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$capture_block"
 grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$capture_block"
+grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$pre_probe_block"
+grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$post_probe_block"
+assert_root_export_before_consumer(){
+  local block=$1 consumer=$2 export_line consumer_line
+  export_line=$(grep -n 'export PRODUCTION_ROOT="\$root"' <<<"$block" | head -1 | cut -d: -f1)
+  consumer_line=$(grep -n "$consumer" <<<"$block" | head -1 | cut -d: -f1)
+  [ -n "$export_line" ] && [ -n "$consumer_line" ] && [ "$export_line" -lt "$consumer_line" ]
+}
+assert_root_export_before_consumer "$capture_block" 'bash "\$remote/run-beta-recovery-capture.sh"'
+assert_root_export_before_consumer "$pre_probe_block" 'bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh'
+assert_root_export_before_consumer "$post_probe_block" 'bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh'
 for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
   grep -Fq -- '--root "$root"' <<<"$block"
   ! grep -Fq -- '--root /var/lib/meet-production' <<<"$block"

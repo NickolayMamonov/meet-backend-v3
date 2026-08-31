@@ -16,6 +16,7 @@ done
 [ -f "$root/.env.production" ] && [ ! -L "$root/.env.production" ] &&
   [ -s "$root/.env.production" ] ||
   fail "release configuration is unavailable"
+export PRODUCTION_ROOT="$root"
 [ -x "$compose" ] || usage
 [ "$url" = https://api.whysoezzy.online ] || fail "reviewed HTTPS URL is required"
 [ ! -L "$output" ] && [ -d "$(dirname -- "$output")" ] || fail "unsafe output"

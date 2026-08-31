@@ -473,6 +473,7 @@ jobs:
           set -euo pipefail
           url=$1
           root=$2
+          export PRODUCTION_ROOT="$root"
           exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
           flock -n 9
           tmp=$(mktemp /tmp/beta-recovery-pre-probe.XXXXXX)
@@ -813,6 +814,7 @@ jobs:
           set -euo pipefail
           url=$1
           root=$2
+          export PRODUCTION_ROOT="$root"
           exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
           flock -n 9
           tmp=$(mktemp /tmp/beta-recovery-post-probe.XXXXXX)
