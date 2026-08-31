@@ -1109,7 +1109,7 @@ run_consumer_setup_case() {
     BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
     BETA_RECOVERY_SETUP_CHMOD_MODE="$mode" BETA_RECOVERY_SETUP_SIGNAL="$signal" \
     BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
-    bash -c 'printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+    bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
     _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
@@ -1180,7 +1180,7 @@ run_consumer_case() {
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE="$phase" \
     BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
     BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
-    bash -c 'printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+    bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
     _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
@@ -1245,7 +1245,7 @@ for signal in HUP INT TERM; do
     BETA_RECOVERY_MUTATION_SENTINEL="$pre_case/mutation-sentinel" \
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE=scan \
     BETA_RECOVERY_PARENT_PID_FILE="$pre_case/body.pid" \
-    bash -c 'printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+    bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
     _ "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr"
   status=$?
   set -e
