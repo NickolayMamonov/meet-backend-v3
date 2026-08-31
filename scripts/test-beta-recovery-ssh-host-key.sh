@@ -182,6 +182,21 @@ make_case() {
   printf '%s\n' "$case_dir"
 }
 
+symlink_supported=false
+symlink_probe_target=$temporary_root/symlink-probe-target
+symlink_probe_link=$temporary_root/symlink-probe-link
+mkdir -p "$symlink_probe_target"
+if ln -s "$symlink_probe_target" "$symlink_probe_link" 2>/dev/null &&
+  [ -L "$symlink_probe_link" ] &&
+  ln -T --help >/dev/null 2>&1; then
+  symlink_supported=true
+fi
+if [ -L "$symlink_probe_link" ]; then
+  rm -f -- "$symlink_probe_link"
+elif [ -e "$symlink_probe_link" ]; then
+  rm -r -- "$symlink_probe_link"
+fi
+
 run_materializer() {
   local case_dir=$1 host=$2 port=$3 expected=$4 mode=$5 keygen_mode=${6:-delegate}
   local output_override=${7:-} ln_barrier=${8:-}
@@ -488,6 +503,10 @@ assert_no_staging "$race_case"
 run_publication_race_case() {
   local name=$1 mode=$2
   local case_dir output race_dir outside race_pid race_status
+  if [ "$mode" = symlink-directory ] && [ "$symlink_supported" != true ]; then
+    echo "beta recovery SSH host-key fixture: symlink-directory collision skipped (symlink capability unavailable)"
+    return 0
+  fi
   case_dir=$(make_case "$name")
   output=$case_dir/runner/output/known_hosts
   race_dir=$case_dir/publication-race
@@ -538,7 +557,7 @@ run_publication_race_case() {
     [ -L "$output" ] || fail "symlink-directory collision was replaced"
     [ "$(<"$outside/unrelated")" = 'preserve symlink target entry' ] ||
       fail "symlink-directory race changed unrelated outside entry"
-    [ -z "$(find "$outside/redirect" -mindepth 1 -print -quit)" ] ||
+    [ ! -e "$outside/redirect/known_hosts" ] ||
       fail "symlink-directory race wrote outside the approved path"
   fi
   assert_collision_preserved "$case_dir" "$output"
@@ -852,13 +871,22 @@ write_wrapper "$consumer_bin/install" \
 write_wrapper "$consumer_bin/chmod" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  'signal_parent() {' \
+  '  local signal=$1 parent_pid' \
+  '  for _ in $(seq 1 500); do' \
+  '    [ -s "${BETA_RECOVERY_PARENT_PID_FILE:?}" ] && break' \
+  '    sleep 0.01' \
+  '  done' \
+  '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
+  '  kill -"$signal" "$parent_pid"' \
+  '}' \
   'target=${@: -1}' \
   'if [[ -n "${BETA_RECOVERY_SETUP_CHMOD_MODE:-}" ]] &&' \
   '  [[ "$target" == *"/beta-recovery-ssh."* ]]; then' \
   '  printf "setup-chmod\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '  if [ "$BETA_RECOVERY_SETUP_CHMOD_MODE" = fail ]; then exit 77; fi' \
-  '  kill -"${BETA_RECOVERY_SETUP_SIGNAL:?}" "$PPID"' \
-  '  sleep 1' \
+  '  signal_parent "${BETA_RECOVERY_SETUP_SIGNAL:?}"' \
+  '  exit 0' \
   'fi' \
   'exec /usr/bin/chmod "$@"'
 
@@ -875,6 +903,15 @@ write_wrapper "$consumer_bin/rm" \
 write_wrapper "$consumer_bin/ssh" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  'signal_parent() {' \
+  '  local signal=$1 parent_pid' \
+  '  for _ in $(seq 1 500); do' \
+  '    [ -s "${BETA_RECOVERY_PARENT_PID_FILE:?}" ] && break' \
+  '    sleep 0.01' \
+  '  done' \
+  '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
+  '  kill -"$signal" "$parent_pid"' \
+  '}' \
   'args=("$@")' \
   'config= key= known=' \
   'for ((i=0; i<${#args[@]}; i++)); do' \
@@ -916,11 +953,20 @@ write_wrapper "$consumer_bin/ssh" \
   'printf "remote-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'touch "${BETA_RECOVERY_MUTATION_SENTINEL:?}"' \
   'printf "remote-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi'
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi'
 
 write_wrapper "$consumer_bin/scp" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  'signal_parent() {' \
+  '  local signal=$1 parent_pid' \
+  '  for _ in $(seq 1 500); do' \
+  '    [ -s "${BETA_RECOVERY_PARENT_PID_FILE:?}" ] && break' \
+  '    sleep 0.01' \
+  '  done' \
+  '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
+  '  kill -"$signal" "$parent_pid"' \
+  '}' \
   'args=("$@")' \
   'config= key= known=' \
   'for ((i=0; i<${#args[@]}; i++)); do' \
@@ -950,7 +996,7 @@ write_wrapper "$consumer_bin/scp" \
   'printf "scp-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'touch "${BETA_RECOVERY_MUTATION_SENTINEL:?}"' \
   'printf "scp-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scp ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi'
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scp ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi'
 
 extract_consumer() {
   local marker=$1 output=$2
@@ -1037,7 +1083,8 @@ run_consumer_setup_case() {
   : >"$case_dir/boundary.log"; : >"$case_dir/effective.log"; : >"$case_dir/effective.err"
   set +e
   env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
-    RUNNER_TEMP="$case_dir/runner" HOST="$scan_host" PORT=2222 \
+    RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
+    HOST="$scan_host" PORT=2222 \
     SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
     SSH_PRIVATE_KEY=fixture-private-key \
     AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
@@ -1053,7 +1100,9 @@ run_consumer_setup_case() {
     BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
     BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
     BETA_RECOVERY_SETUP_CHMOD_MODE="$mode" BETA_RECOVERY_SETUP_SIGNAL="$signal" \
-    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
+    BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
+    bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+    _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
   [ "$status" -eq "$expected_status" ] ||
@@ -1105,7 +1154,8 @@ run_consumer_case() {
   : >"$case_dir/boundary.log"; : >"$case_dir/effective.log"; : >"$case_dir/effective.err"
   set +e
   env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
-    RUNNER_TEMP="$case_dir/runner" HOST="$scan_host" PORT=2222 \
+    RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
+    HOST="$scan_host" PORT=2222 \
     SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
     SSH_PRIVATE_KEY=fixture-private-key \
     AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
@@ -1122,7 +1172,9 @@ run_consumer_case() {
     BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE="$phase" \
     BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
-    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
+    BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
+    bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+    _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
   [ "$status" -eq "$expected_status" ] ||
@@ -1171,7 +1223,8 @@ for signal in HUP INT TERM; do
   : >"$pre_case/boundary.log"; : >"$pre_case/effective.log"; : >"$pre_case/effective.err"
   set +e
   env PATH="$consumer_bin:$original_path" HOME="$pre_case/home" \
-    RUNNER_TEMP="$pre_case/runner" HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+    RUNNER_TEMP="$pre_case/runner" PATH_ON_HOST=/fixture/release-root \
+    HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
     HOST_FINGERPRINT="$expected_fingerprint" SSH_PRIVATE_KEY=fixture-private-key \
     AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
     PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
@@ -1185,7 +1238,9 @@ for signal in HUP INT TERM; do
     BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
     BETA_RECOVERY_MUTATION_SENTINEL="$pre_case/mutation-sentinel" \
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE=scan \
-    bash "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr"
+    BETA_RECOVERY_PARENT_PID_FILE="$pre_case/body.pid" \
+    bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+    _ "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr"
   status=$?
   set -e
   expected_status=$(assert_signal_status "$signal")

@@ -69,6 +69,98 @@ fi
 capture_block=$(awk '/Stage and run the locked VPS capture/{flag=1} /restore-select:/{flag=0} flag' "$workflow")
 pre_probe_block=$(awk '/restore-pre-probe:/{flag=1} /restore-isolated:/{flag=0} flag' "$workflow")
 post_probe_block=$(awk '/restore-post-probe:/{flag=1} /evidence:/{flag=0} flag' "$workflow")
+capture_job=$(awk '/^  capture:/{flag=1} /^  restore-select:/{flag=0} flag' "$workflow")
+pre_probe_job=$(awk '/^  restore-pre-probe:/{flag=1} /^  restore-isolated:/{flag=0} flag' "$workflow")
+post_probe_job=$(awk '/^  restore-post-probe:/{flag=1} /^  evidence:/{flag=0} flag' "$workflow")
+[ "$(grep -Fc 'PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}' "$workflow")" -eq 3 ]
+assert_release_root_gate(){
+  local block=$1 checkout_line gate_line first_step network_line
+  [ "$(grep -Fc 'name: Validate protected test-VPS release root' <<<"$block")" -eq 1 ]
+  first_step=$(grep -n '^      - ' <<<"$block" | head -1)
+  grep -Fq 'name: Validate protected test-VPS release root' <<<"$first_step"
+  gate_line=$(grep -n 'name: Validate protected test-VPS release root' <<<"$block" | head -1 | cut -d: -f1)
+  checkout_line=$(grep -n 'actions/checkout@' <<<"$block" | head -1 | cut -d: -f1)
+  [ "$gate_line" -lt "$checkout_line" ]
+  network_line=$(grep -nE 'actions/(checkout|upload-artifact|download-artifact)|(^|[[:space:]])(ssh|scp|git fetch|gh (api|run))' <<<"$block" |
+    head -1 | cut -d: -f1)
+  [ -n "$network_line" ] && [ "$gate_line" -lt "$network_line" ]
+  grep -Fq 'TEST_VPS_PATH is absent' <<<"$block"
+  grep -Fq 'TEST_VPS_PATH must be a safe absolute path' <<<"$block"
+  grep -Fq '[[ "$PATH_ON_HOST" =~ ^/[A-Za-z0-9._/-]+$ ]]' <<<"$block"
+  grep -Fq '[[ "$PATH_ON_HOST" != *..* ]]' <<<"$block"
+}
+assert_release_root_gate "$capture_job"
+assert_release_root_gate "$pre_probe_job"
+assert_release_root_gate "$post_probe_job"
+[ "$(grep -n 'actions/checkout@' <<<"$capture_job" | head -1 | cut -d: -f1)" -lt \
+  "$(grep -n 'validate-recovery-id "\$RECOVERY_ID"' <<<"$capture_job" | head -1 | cut -d: -f1)" ]
+[ "$(grep -n 'actions/checkout@' <<<"$pre_probe_job" | head -1 | cut -d: -f1)" -lt \
+  "$(grep -n 'validate-recovery-id "\$RECOVERY_ID"' <<<"$pre_probe_job" | head -1 | cut -d: -f1)" ]
+[ "$(grep -n 'actions/checkout@' <<<"$post_probe_job" | head -1 | cut -d: -f1)" -lt \
+  "$(grep -n 'validate-recovery-id "\$RECOVERY_ID"' <<<"$post_probe_job" | head -1 | cut -d: -f1)" ]
+grep -Fq 'root=$4' <<<"$capture_block"
+grep -Fq 'root=$2' <<<"$pre_probe_block"
+grep -Fq 'root=$2' <<<"$post_probe_block"
+grep -Fq 'sudo bash -s -- \' <<<"$capture_block"
+grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$pre_probe_block"
+grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$post_probe_block"
+grep -Fq '"$remote" "$RECOVERY_ID" "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$capture_block"
+grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$capture_block"
+grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$pre_probe_block"
+grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$post_probe_block"
+assert_root_export_before_consumer(){
+  local block=$1 consumer=$2 export_line consumer_line
+  export_line=$(grep -n 'export PRODUCTION_ROOT="\$root"' <<<"$block" | head -1 | cut -d: -f1)
+  consumer_line=$(grep -n "$consumer" <<<"$block" | head -1 | cut -d: -f1)
+  [ -n "$export_line" ] && [ -n "$consumer_line" ] && [ "$export_line" -lt "$consumer_line" ]
+}
+assert_root_export_before_consumer "$capture_block" 'bash "\$remote/run-beta-recovery-capture.sh"'
+assert_root_export_before_consumer "$pre_probe_block" 'bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh'
+assert_root_export_before_consumer "$post_probe_block" 'bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh'
+for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
+  grep -Fq -- '--root "$root"' <<<"$block"
+  ! grep -Fq -- '--root /var/lib/meet-production' <<<"$block"
+  ! grep -Fq 'PRODUCTION_ROOT=/var/lib/meet-production' <<<"$block"
+done
+isolated_block=$(awk '/^  restore-isolated:/{flag=1} /^  restore-post-probe:/{flag=0} flag' "$workflow")
+! grep -Fq 'PATH_ON_HOST' <<<"$isolated_block"
+ordered_network_calls=0
+ordered_ssh_calls=0
+ordered_downstream_calls=0
+run_ordered_job(){
+  local path=${1-}
+  if [ -z "$path" ] ||
+    ! [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] ||
+    [[ "$path" == *..* ]]; then
+    return 1
+  fi
+  ordered_network_calls=$((ordered_network_calls + 1))
+  ordered_ssh_calls=$((ordered_ssh_calls + 1))
+  ordered_downstream_calls=$((ordered_downstream_calls + 1))
+}
+run_ordered_case(){
+  local label=$1 value=${2-}
+  ordered_network_calls=0
+  ordered_ssh_calls=0
+  ordered_downstream_calls=0
+  if run_ordered_job "$value"; then
+    [ "$label" = valid ] || { echo "invalid PATH_ON_HOST passed the gate" >&2; exit 1; }
+    [ "$ordered_network_calls" -eq 1 ] &&
+      [ "$ordered_ssh_calls" -eq 1 ] &&
+      [ "$ordered_downstream_calls" -eq 1 ]
+  else
+    [ "$label" != valid ] || { echo "valid PATH_ON_HOST failed the gate" >&2; exit 1; }
+    [ "$ordered_network_calls" -eq 0 ] &&
+      [ "$ordered_ssh_calls" -eq 0 ] &&
+      [ "$ordered_downstream_calls" -eq 0 ]
+  fi
+}
+run_ordered_case missing
+run_ordered_case blank ' '
+run_ordered_case relative relative/root
+run_ordered_case double-dot /srv/../release
+run_ordered_case metacharacter '/srv/release;touch'
+run_ordered_case valid /srv/release
 for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
   helper_line=$(grep -n 'scripts/materialize-beta-recovery-known-hosts.sh' <<<"$block" | head -1 | cut -d: -f1)
   key_line=$(grep -n 'install -m 600 /dev/null "$key"' <<<"$block" | head -1 | cut -d: -f1)

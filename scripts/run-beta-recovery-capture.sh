@@ -15,12 +15,20 @@ while [ "$#" -gt 0 ]; do
     *) usage;;
   esac
 done
+validate_release_root(){
+  [ -d "$root" ] && [ ! -L "$root" ] ||
+    fail "release root is unsafe"
+  [ -f "$root/.env.production" ] && [ ! -L "$root/.env.production" ] &&
+    [ -s "$root/.env.production" ] ||
+    fail "release configuration is unavailable"
+}
+validate_release_root
+export PRODUCTION_ROOT="$root"
 if [ "$mode" = capture ]; then
   [[ "$recovery_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || usage
   [[ "$recipient" =~ ^age1[0-9a-z]+$ ]] || fail "recipient malformed"
   [ -n "$output" ] && [ -d "$output" ] && [ ! -L "$output" ] || usage
 fi
-[ -d "$root" ] && [ ! -L "$root" ] || usage
 [[ "$public_url" =~ ^https://[^/]+$ ]] || fail "public HTTPS URL is required"
 for tool in docker flock jq stat find mktemp; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -194,7 +202,7 @@ container_id=$(docker inspect "$backend" --format '{{.Id}}'); image_id=$(docker 
 state=$state_root/beta-recovery-$recovery_id; install -d -m 700 "$state" "$state/private" "$state/staging"; mv -- "$pre_tmp" "$state/private/capture-runtime.json"; pre_tmp=''; journal=$state/journal.json
 write_journal(){ local phase=$1 tmp=$journal.tmp.$$; jq -cnS --arg id "$recovery_id" --arg phase "$phase" --arg c "$container_id" --arg i "$image_id" --arg h "$runtime_hash" --argjson owned "$owned" '{schema:"meet-backend/beta-recovery-journal/v1",recoveryId:$id,state:"nonterminal",phase:$phase,capturedContainerId:$c,capturedImageId:$i,capturedRuntimeDigest:$h,currentRuntimeHealthy:true,capturedContainerSafe:true,ownedPaths:$owned}' >"$tmp"; chmod 600 "$tmp"; mv -f -- "$tmp" "$journal"; }
 write_journal pre_stop
-export AGE_RECIPIENT="$recipient" BACKUP_DIR="$state/private" PRODUCTION_ROOT="$root"
+export AGE_RECIPIENT="$recipient" BACKUP_DIR="$state/private"
 production_scripts_dir=$(dirname -- "$compose"); export PRODUCTION_SCRIPTS_DIR="$production_scripts_dir"
 export BETA_DATABASE_PROOF_SCRIPT="$database_proof" BETA_MEDIA_PROOF_SCRIPT="$media_proof"
 "$backup" --beta --recovery-id "$recovery_id" --output-dir "$state/private" || fail "beta backup failed"
