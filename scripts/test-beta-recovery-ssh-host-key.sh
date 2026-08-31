@@ -840,9 +840,18 @@ chmod 700 "$consumer_root" "$consumer_bin"
 write_wrapper "$consumer_bin/ssh-keyscan" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  'signal_parent() {' \
+  '  local signal=$1 parent_pid' \
+  '  for _ in $(seq 1 500); do' \
+  '    [ -s "${BETA_RECOVERY_PARENT_PID_FILE:?}" ] && break' \
+  '    sleep 0.01' \
+  '  done' \
+  '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
+  '  kill -"$signal" "$parent_pid"' \
+  '}' \
   'printf "helper-scan" >>"$BETA_RECOVERY_BOUNDARY_LOG"; printf "\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'printf "%s\n" "$BETA_RECOVERY_SCAN_LINE"' \
-  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scan ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi'
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scan ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi'
 
 write_wrapper "$consumer_bin/ssh-keygen" \
   '#!/usr/bin/env bash' \
@@ -871,12 +880,21 @@ write_wrapper "$consumer_bin/install" \
 write_wrapper "$consumer_bin/chmod" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  'signal_parent() {' \
+  '  local signal=$1 parent_pid' \
+  '  for _ in $(seq 1 500); do' \
+  '    [ -s "${BETA_RECOVERY_PARENT_PID_FILE:?}" ] && break' \
+  '    sleep 0.01' \
+  '  done' \
+  '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
+  '  kill -"$signal" "$parent_pid"' \
+  '}' \
   'target=${@: -1}' \
   'if [[ -n "${BETA_RECOVERY_SETUP_CHMOD_MODE:-}" ]] &&' \
   '  [[ "$target" == *"/beta-recovery-ssh."* ]]; then' \
   '  printf "setup-chmod\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '  if [ "$BETA_RECOVERY_SETUP_CHMOD_MODE" = fail ]; then exit 77; fi' \
-  '  kill -"${BETA_RECOVERY_SETUP_SIGNAL:?}" "$PPID"' \
+  '  signal_parent "${BETA_RECOVERY_SETUP_SIGNAL:?}"' \
   '  sleep 1' \
   'fi' \
   'exec /usr/bin/chmod "$@"'
@@ -894,6 +912,15 @@ write_wrapper "$consumer_bin/rm" \
 write_wrapper "$consumer_bin/ssh" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  'signal_parent() {' \
+  '  local signal=$1 parent_pid' \
+  '  for _ in $(seq 1 500); do' \
+  '    [ -s "${BETA_RECOVERY_PARENT_PID_FILE:?}" ] && break' \
+  '    sleep 0.01' \
+  '  done' \
+  '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
+  '  kill -"$signal" "$parent_pid"' \
+  '}' \
   'args=("$@")' \
   'config= key= known=' \
   'for ((i=0; i<${#args[@]}; i++)); do' \
@@ -935,11 +962,20 @@ write_wrapper "$consumer_bin/ssh" \
   'printf "remote-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'touch "${BETA_RECOVERY_MUTATION_SENTINEL:?}"' \
   'printf "remote-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi'
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi'
 
 write_wrapper "$consumer_bin/scp" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  'signal_parent() {' \
+  '  local signal=$1 parent_pid' \
+  '  for _ in $(seq 1 500); do' \
+  '    [ -s "${BETA_RECOVERY_PARENT_PID_FILE:?}" ] && break' \
+  '    sleep 0.01' \
+  '  done' \
+  '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
+  '  kill -"$signal" "$parent_pid"' \
+  '}' \
   'args=("$@")' \
   'config= key= known=' \
   'for ((i=0; i<${#args[@]}; i++)); do' \
@@ -969,7 +1005,7 @@ write_wrapper "$consumer_bin/scp" \
   'printf "scp-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'touch "${BETA_RECOVERY_MUTATION_SENTINEL:?}"' \
   'printf "scp-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scp ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi'
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scp ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi'
 
 extract_consumer() {
   local marker=$1 output=$2
@@ -1037,7 +1073,7 @@ assert_signal_status() {
 
 run_consumer_setup_case() {
   local name=$1 body=$2 mode=$3 signal=${4:-}
-  local case_dir=$consumer_root/cases/$name expected_status
+  local case_dir=$consumer_root/cases/$name expected_status body_pid
   if [ "$mode" = fail ]; then
     expected_status=77
   else
@@ -1072,7 +1108,11 @@ run_consumer_setup_case() {
     BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
     BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
     BETA_RECOVERY_SETUP_CHMOD_MODE="$mode" BETA_RECOVERY_SETUP_SIGNAL="$signal" \
-    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
+    BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
+    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr" &
+  body_pid=$!
+  printf '%s\n' "$body_pid" >"$case_dir/body.pid"
+  wait "$body_pid"
   status=$?
   set -e
   [ "$status" -eq "$expected_status" ] ||
@@ -1108,7 +1148,7 @@ done
 
 run_consumer_case() {
   local name=$1 body=$2 signal=$3 phase=$4 cleanup_failure=${5:-0}
-  local case_dir=$consumer_root/cases/$name expected_status
+  local case_dir=$consumer_root/cases/$name expected_status body_pid
   expected_status=$(assert_signal_status "$signal")
   [ "$cleanup_failure" -eq 0 ] || expected_status=1
   mkdir -p "$case_dir/runner" "$case_dir/home/.ssh"
@@ -1141,7 +1181,11 @@ run_consumer_case() {
     BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE="$phase" \
     BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
-    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
+    BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
+    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr" &
+  body_pid=$!
+  printf '%s\n' "$body_pid" >"$case_dir/body.pid"
+  wait "$body_pid"
   status=$?
   set -e
   [ "$status" -eq "$expected_status" ] ||
@@ -1204,7 +1248,11 @@ for signal in HUP INT TERM; do
     BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
     BETA_RECOVERY_MUTATION_SENTINEL="$pre_case/mutation-sentinel" \
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE=scan \
-    bash "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr"
+    BETA_RECOVERY_PARENT_PID_FILE="$pre_case/body.pid" \
+    bash "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr" &
+  body_pid=$!
+  printf '%s\n' "$body_pid" >"$pre_case/body.pid"
+  wait "$body_pid"
   status=$?
   set -e
   expected_status=$(assert_signal_status "$signal")
