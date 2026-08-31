@@ -1073,7 +1073,7 @@ assert_signal_status() {
 
 run_consumer_setup_case() {
   local name=$1 body=$2 mode=$3 signal=${4:-}
-  local case_dir=$consumer_root/cases/$name expected_status body_pid
+  local case_dir=$consumer_root/cases/$name expected_status
   if [ "$mode" = fail ]; then
     expected_status=77
   else
@@ -1109,10 +1109,8 @@ run_consumer_setup_case() {
     BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
     BETA_RECOVERY_SETUP_CHMOD_MODE="$mode" BETA_RECOVERY_SETUP_SIGNAL="$signal" \
     BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
-    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr" &
-  body_pid=$!
-  printf '%s\n' "$body_pid" >"$case_dir/body.pid"
-  wait "$body_pid"
+    bash -c 'printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+    _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
   [ "$status" -eq "$expected_status" ] ||
@@ -1148,7 +1146,7 @@ done
 
 run_consumer_case() {
   local name=$1 body=$2 signal=$3 phase=$4 cleanup_failure=${5:-0}
-  local case_dir=$consumer_root/cases/$name expected_status body_pid
+  local case_dir=$consumer_root/cases/$name expected_status
   expected_status=$(assert_signal_status "$signal")
   [ "$cleanup_failure" -eq 0 ] || expected_status=1
   mkdir -p "$case_dir/runner" "$case_dir/home/.ssh"
@@ -1182,10 +1180,8 @@ run_consumer_case() {
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE="$phase" \
     BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
     BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
-    bash "$body" >"$case_dir/stdout" 2>"$case_dir/stderr" &
-  body_pid=$!
-  printf '%s\n' "$body_pid" >"$case_dir/body.pid"
-  wait "$body_pid"
+    bash -c 'printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+    _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
   [ "$status" -eq "$expected_status" ] ||
@@ -1249,10 +1245,8 @@ for signal in HUP INT TERM; do
     BETA_RECOVERY_MUTATION_SENTINEL="$pre_case/mutation-sentinel" \
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE=scan \
     BETA_RECOVERY_PARENT_PID_FILE="$pre_case/body.pid" \
-    bash "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr" &
-  body_pid=$!
-  printf '%s\n' "$body_pid" >"$pre_case/body.pid"
-  wait "$body_pid"
+    bash -c 'printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+    _ "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr"
   status=$?
   set -e
   expected_status=$(assert_signal_status "$signal")
