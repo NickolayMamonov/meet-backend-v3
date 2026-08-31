@@ -75,9 +75,25 @@ jobs:
       SSH_USER: ${{ vars.TEST_VPS_USER }}
       HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
       SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+      PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}
       PUBLIC_URL: https://api.whysoezzy.online
       AGE_RECIPIENT: ${{ vars.BETA_RECOVERY_AGE_RECIPIENT }}
     steps:
+      # Keep this before checkout: an empty or malformed protected path must
+      # fail before any repository-controlled network access.
+      - name: Validate protected test-VPS release root
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PATH_ON_HOST:-}" || {
+            echo "TEST_VPS_PATH is absent" >&2
+            exit 1
+          }
+          [[ "$PATH_ON_HOST" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+            [[ "$PATH_ON_HOST" != *..* ]] || {
+            echo "TEST_VPS_PATH must be a safe absolute path" >&2
+            exit 1
+          }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.source_sha }}
@@ -152,20 +168,22 @@ jobs:
             scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
             "$recipient_file" \
             "$SSH_USER@$HOST:$remote/"
-          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo bash -s -- '$remote' '$RECOVERY_ID' '$PUBLIC_URL'" <<'REMOTE'
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
+            "$remote" "$RECOVERY_ID" "$PUBLIC_URL" "$PATH_ON_HOST" <<'REMOTE'
           set -euo pipefail
           remote=$1
           recovery_id=$2
           public_url=$3
+          root=$4
           recipient=$(<"$remote/age-recipient")
           export AGE_RECIPIENT="$recipient"
           export PRODUCTION_COMPOSE_SCRIPT="$remote/production-compose.sh"
           export BETA_BACKUP_SCRIPT="$remote/backup-production.sh"
           export RECOVERY_PROBE_SCRIPT="$remote/probe-test-vps-recovery-runtime.sh"
           export TEST_VPS_STATE_ROOT=/var/lib/meet-test-vps-deploy
-          export PRODUCTION_ROOT=/var/lib/meet-production
+          export PRODUCTION_ROOT="$root"
           bash "$remote/run-beta-recovery-capture.sh" --recovery-id "$recovery_id" \
-            --root /var/lib/meet-production --output-dir "$remote" --recipient "$recipient" \
+            --root "$root" --output-dir "$remote" --recipient "$recipient" \
             --public-url "$public_url"
           REMOTE
           rm -f -- "$recipient_file"
@@ -392,8 +410,24 @@ jobs:
       SSH_USER: ${{ vars.TEST_VPS_USER }}
       HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
       SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+      PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}
       PUBLIC_URL: https://api.whysoezzy.online
     steps:
+      # Keep this before checkout: an empty or malformed protected path must
+      # fail before any repository-controlled network access.
+      - name: Validate protected test-VPS release root
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PATH_ON_HOST:-}" || {
+            echo "TEST_VPS_PATH is absent" >&2
+            exit 1
+          }
+          [[ "$PATH_ON_HOST" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+            [[ "$PATH_ON_HOST" != *..* ]] || {
+            echo "TEST_VPS_PATH must be a safe absolute path" >&2
+            exit 1
+          }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.source_sha }}
@@ -435,15 +469,17 @@ jobs:
             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
             -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none \
             "$SSH_USER@$HOST" \
-            "sudo bash -s -- '$PUBLIC_URL'" >"$RUNNER_TEMP/pre-probe.json" <<'REMOTE'
+            sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST" >"$RUNNER_TEMP/pre-probe.json" <<'REMOTE'
           set -euo pipefail
           url=$1
+          root=$2
+          export PRODUCTION_ROOT="$root"
           exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
           flock -n 9
           tmp=$(mktemp /tmp/beta-recovery-pre-probe.XXXXXX)
           trap 'rm -f -- "$tmp"' EXIT
           bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
-            --root /var/lib/meet-production \
+            --root "$root" \
             --compose-script /var/lib/meet-test-vps-deploy/scripts/production-compose.sh \
             --output "$tmp" --public-url "$url"
           cat "$tmp"
@@ -712,8 +748,24 @@ jobs:
       SSH_USER: ${{ vars.TEST_VPS_USER }}
       HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
       SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+      PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}
       PUBLIC_URL: https://api.whysoezzy.online
     steps:
+      # Keep this before checkout: an empty or malformed protected path must
+      # fail before any repository-controlled network access.
+      - name: Validate protected test-VPS release root
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PATH_ON_HOST:-}" || {
+            echo "TEST_VPS_PATH is absent" >&2
+            exit 1
+          }
+          [[ "$PATH_ON_HOST" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+            [[ "$PATH_ON_HOST" != *..* ]] || {
+            echo "TEST_VPS_PATH must be a safe absolute path" >&2
+            exit 1
+          }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.source_sha }}
@@ -758,15 +810,17 @@ jobs:
             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
             -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none \
             "$SSH_USER@$HOST" \
-            "sudo bash -s -- '$PUBLIC_URL'" >"$RUNNER_TEMP/post-probe.json" <<'REMOTE'
+            sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST" >"$RUNNER_TEMP/post-probe.json" <<'REMOTE'
           set -euo pipefail
           url=$1
+          root=$2
+          export PRODUCTION_ROOT="$root"
           exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
           flock -n 9
           tmp=$(mktemp /tmp/beta-recovery-post-probe.XXXXXX)
           trap 'rm -f -- "$tmp"' EXIT
           bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
-            --root /var/lib/meet-production \
+            --root "$root" \
             --compose-script /var/lib/meet-test-vps-deploy/scripts/production-compose.sh \
             --output "$tmp" --public-url "$url"
           cat "$tmp"
