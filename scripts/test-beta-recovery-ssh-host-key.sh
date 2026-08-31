@@ -840,18 +840,9 @@ chmod 700 "$consumer_root" "$consumer_bin"
 write_wrapper "$consumer_bin/ssh-keyscan" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
-  'signal_parent() {' \
-  '  local signal=$1 parent_pid' \
-  '  for _ in $(seq 1 500); do' \
-  '    [ -s "${BETA_RECOVERY_PARENT_PID_FILE:?}" ] && break' \
-  '    sleep 0.01' \
-  '  done' \
-  '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
-  '  kill -"$signal" "$parent_pid"' \
-  '}' \
   'printf "helper-scan" >>"$BETA_RECOVERY_BOUNDARY_LOG"; printf "\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'printf "%s\n" "$BETA_RECOVERY_SCAN_LINE"' \
-  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scan ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi'
+  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scan ]; then kill -"${BETA_RECOVERY_SIGNAL:?}" "$PPID"; fi'
 
 write_wrapper "$consumer_bin/ssh-keygen" \
   '#!/usr/bin/env bash' \
@@ -1092,7 +1083,8 @@ run_consumer_setup_case() {
   : >"$case_dir/boundary.log"; : >"$case_dir/effective.log"; : >"$case_dir/effective.err"
   set +e
   env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
-    RUNNER_TEMP="$case_dir/runner" HOST="$scan_host" PORT=2222 \
+    RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
+    HOST="$scan_host" PORT=2222 \
     SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
     SSH_PRIVATE_KEY=fixture-private-key \
     AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
@@ -1162,7 +1154,8 @@ run_consumer_case() {
   : >"$case_dir/boundary.log"; : >"$case_dir/effective.log"; : >"$case_dir/effective.err"
   set +e
   env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
-    RUNNER_TEMP="$case_dir/runner" HOST="$scan_host" PORT=2222 \
+    RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
+    HOST="$scan_host" PORT=2222 \
     SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
     SSH_PRIVATE_KEY=fixture-private-key \
     AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
@@ -1230,7 +1223,8 @@ for signal in HUP INT TERM; do
   : >"$pre_case/boundary.log"; : >"$pre_case/effective.log"; : >"$pre_case/effective.err"
   set +e
   env PATH="$consumer_bin:$original_path" HOME="$pre_case/home" \
-    RUNNER_TEMP="$pre_case/runner" HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+    RUNNER_TEMP="$pre_case/runner" PATH_ON_HOST=/fixture/release-root \
+    HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
     HOST_FINGERPRINT="$expected_fingerprint" SSH_PRIVATE_KEY=fixture-private-key \
     AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
     PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
