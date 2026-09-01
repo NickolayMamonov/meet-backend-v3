@@ -121,19 +121,57 @@ jobs:
         run: |
           set -euo pipefail
           [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
+          age_bin="$RUNNER_TEMP/beta-recovery-age-v1.3.1/bin"
+          scripts/install-beta-recovery-age.sh "$age_bin"
+          age_install_root=$(dirname -- "$age_bin")
+          age_path=$(realpath -e -- "$age_bin/age")
+          age_sha256=$(sha256sum "$age_path" | awk '{print $1}')
+          age_version=$("$age_path" --version)
+          age_os=$(uname -s)
+          age_arch=$(uname -m)
+          [[ "$age_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$age_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [ "$age_os" = Linux ] && [ "$age_arch" = x86_64 ]
+          owner_token=$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')
+          [[ "$owner_token" =~ ^[0-9a-f]{64}$ ]]
           ssh_dir=
           recipient_file=
-          remote_cleanup_allowed=false
+          remote_create_attempted=false
+          remote_cleanup_done=false
+          cleanup_remote() {
+            [ "$remote_cleanup_done" = false ] || return 0
+            remote_cleanup_done=true
+            ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
+              "$remote" "$owner_token" <<'CLEANUP'
+          set -euo pipefail
+          remote=$1
+          token=$2
+          [[ "$remote" =~ ^/tmp/beta-recovery-[A-Za-z0-9._-]{8,128}$ ]]
+          if [ ! -e "$remote" ] && [ ! -L "$remote" ]; then
+            exit 0
+          fi
+          [ -d "$remote" ] && [ ! -L "$remote" ]
+          [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$SUDO_UID:$SUDO_GID" ]
+          marker="$remote/.meet-beta-recovery-owner"
+          [ -f "$marker" ] && [ ! -L "$marker" ]
+          [ "$(stat -c '%a:%u:%g:%h' "$marker")" = "600:$SUDO_UID:$SUDO_GID:1" ]
+          expected=$(mktemp)
+          trap 'rm -f -- "$expected"' EXIT HUP INT TERM
+          printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$token" >"$expected"
+          cmp -- "$expected" "$marker" >/dev/null
+          rm -r -- "$remote"
+          [ ! -e "$remote" ] && [ ! -L "$remote" ]
+          CLEANUP
+          }
           cleanup_capture() {
             local status=$1
             trap - EXIT HUP INT TERM
-            if [ "$remote_cleanup_allowed" = true ] &&
-              ! ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" \
-                "sudo test ! -e '$remote' || sudo rm -r -- '$remote'"; then
+            if [ "$remote_create_attempted" = true ] && ! cleanup_remote; then
               status=1
             fi
             [ -z "$recipient_file" ] || rm -f -- "$recipient_file" || status=1
             rm -r -- "$ssh_dir" || status=1
+            [ ! -e "$age_install_root" ] || rm -r -- "$age_install_root" || status=1
             exit "$status"
           }
           ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
@@ -161,15 +199,62 @@ jobs:
             -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none)
           install -m 600 /dev/null "$recipient_file"
           printf '%s\n' "$AGE_RECIPIENT" >"$recipient_file"
-          remote_cleanup_allowed=true
-          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "mkdir -p '$remote'"
+          remote_create_attempted=true
+          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
+            "$remote" "$owner_token" <<'REMOTE_CREATE'
+          set -euo pipefail
+          remote=$1
+          token=$2
+          [[ "$remote" =~ ^/tmp/beta-recovery-[A-Za-z0-9._-]{8,128}$ ]]
+          owner_uid=${SUDO_UID:?SUDO_UID is required}
+          owner_gid=${SUDO_GID:?SUDO_GID is required}
+          marker="$remote/.meet-beta-recovery-owner"
+          expected=$(mktemp)
+          created=false
+          marker_published=false
+          cleanup_create() {
+            local status=$?
+            trap - EXIT HUP INT TERM
+            if [ "$created" = true ] && [ "$marker_published" = false ] &&
+              [ -d "$remote" ] && [ ! -L "$remote" ] &&
+              [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$owner_uid:$owner_gid" ]; then
+              rm -r -- "$remote" || status=1
+            fi
+            rm -f -- "$expected" || status=1
+            exit "$status"
+          }
+          trap 'cleanup_create' EXIT HUP INT TERM
+          printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$token" >"$expected"
+          if [ -e "$remote" ] || [ -L "$remote" ]; then
+            [ -d "$remote" ] && [ ! -L "$remote" ] || exit 1
+            [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$owner_uid:$owner_gid" ] || exit 1
+            [ -f "$marker" ] && [ ! -L "$marker" ] || exit 1
+            [ "$(stat -c '%a:%u:%g:%h' "$marker")" = "600:$owner_uid:$owner_gid:1" ] || exit 1
+            cmp -- "$expected" "$marker" >/dev/null || exit 1
+          else
+            mkdir -- "$remote"
+            chmod 700 "$remote"
+            chown "$owner_uid:$owner_gid" "$remote"
+            created=true
+            marker_tmp=$(mktemp "$remote/.meet-beta-recovery-owner.XXXXXX")
+            chmod 600 "$marker_tmp"
+            chown "$owner_uid:$owner_gid" "$marker_tmp"
+            cat "$expected" >"$marker_tmp"
+            mv -T -- "$marker_tmp" "$marker"
+            marker_published=true
+          fi
+          rm -f -- "$expected"
+          trap - EXIT HUP INT TERM
+          REMOTE_CREATE
           scp "${scp_opts[@]}" scripts/run-beta-recovery-capture.sh scripts/backup-production.sh \
             scripts/probe-test-vps-recovery-runtime.sh scripts/production-compose.sh \
             scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
+            "$age_path" \
             "$recipient_file" \
             "$SSH_USER@$HOST:$remote/"
           ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
-            "$remote" "$RECOVERY_ID" "$PUBLIC_URL" "$PATH_ON_HOST" <<'REMOTE'
+            "$remote" "$RECOVERY_ID" "$PUBLIC_URL" "$PATH_ON_HOST" \
+            "$age_sha256" "$age_version" "$age_os" "$age_arch" <<'REMOTE'
           set -euo pipefail
           remote=$1
           recovery_id=$2
@@ -184,7 +269,8 @@ jobs:
           export PRODUCTION_ROOT="$root"
           bash "$remote/run-beta-recovery-capture.sh" --recovery-id "$recovery_id" \
             --root "$root" --output-dir "$remote" --recipient "$recipient" \
-            --public-url "$public_url"
+            --public-url "$public_url" --age-binary "$remote/age" \
+            --age-sha256 "$5" --age-version "$6" --age-os "$7" --age-arch "$8"
           REMOTE
           rm -f -- "$recipient_file"
           ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo cat '$remote/postgres.dump.age'" \
@@ -247,8 +333,7 @@ jobs:
           [ "$observed_epoch" -ge "$point_epoch" ] || { echo "recovery point is in the future" >&2; exit 1; }
           observed_age=$((observed_epoch - point_epoch))
           chmod 600 "$RUNNER_TEMP/"*.age "$RUNNER_TEMP/"*.json
-          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "sudo rm -r -- '$remote'"
-          remote_cleanup_allowed=false
+          cleanup_remote || { echo "remote staging cleanup failed" >&2; exit 1; }
           mkdir "$RUNNER_TEMP/artifact"
           scripts/build-beta-recovery-evidence.sh manifest \
             --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \

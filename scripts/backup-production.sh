@@ -105,10 +105,16 @@ if [ "${1:-}" = "--beta" ]; then
     case "$1" in
       --recovery-id) recovery_id=$2; shift 2 ;;
       --output-dir) beta_dir=$2; shift 2 ;;
+      --age-binary) age_binary=$2; shift 2 ;;
       *) exit 2 ;;
     esac
   done
   [[ "$recovery_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || exit 2
+  case "${age_binary:-}" in /*) ;; *) exit 2;; esac
+  age_binary=$(realpath -e -- "$age_binary") || exit 1
+  [ -f "$age_binary" ] && [ ! -L "$age_binary" ] && [ -s "$age_binary" ] &&
+    [ -x "$age_binary" ] || exit 1
+  [ "$(stat -c '%a' "$age_binary")" = 755 ] || exit 1
   : "${AGE_RECIPIENT:?AGE_RECIPIENT is required}"
   database_sql=${BETA_DATABASE_PROOF_SCRIPT:-"$SCRIPTS_DIR/beta-recovery-database-proof.sql"}
   media_script=${BETA_MEDIA_PROOF_SCRIPT:-"$SCRIPTS_DIR/beta-recovery-media-proof.sh"}
@@ -171,11 +177,11 @@ if [ "${1:-}" = "--beta" ]; then
   fi
   "${COMPOSE[@]}" exec -T postgres sh -c \
     'pg_dump --format=custom -U "$POSTGRES_USER" -d "$POSTGRES_DB"' |
-    age -r "$AGE_RECIPIENT" -o "$db_file"
+    "$age_binary" -r "$AGE_RECIPIENT" -o "$db_file"
   validate_upload_archive "$upload_volume" "$image" "$temp/archive.list" "$temp/archive.types"
   docker run --rm --read-only --entrypoint tar \
     --mount "type=volume,source=$upload_volume,target=/source,readonly" \
-    "$image" -C /source -czf - . | age -r "$AGE_RECIPIENT" -o "$media_file"
+    "$image" -C /source -czf - . | "$age_binary" -r "$AGE_RECIPIENT" -o "$media_file"
   [ -s "$db_file" ] && [ -s "$media_file" ] || exit 1
   cat "$database_sql" | postgres_psql -X -qAt -f - |
     jq -cS 'if type=="object" and .schema=="meet-backend/closed-beta-database-proof/v1" then . else error("database proof schema") end' \
