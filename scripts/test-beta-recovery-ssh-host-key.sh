@@ -1550,7 +1550,7 @@ run_capture_proof_case() {
       fail "matching proof case did not prepare all artifact files"
     printf 'publication-eligible\n' >>"$case_dir/boundary.log"
     assert_event_order "$case_dir" remote-cleanup evidence-manifest \
-      evidence-validate-artifact publication-eligible local-cleanup
+      evidence-validate-artifact local-cleanup publication-eligible
   else
     [ ! -e "$case_dir/mutation-sentinel" ] ||
       fail "failed proof case crossed downstream mutation: $name"
