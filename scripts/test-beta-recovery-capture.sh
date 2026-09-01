@@ -45,6 +45,266 @@ if ln -s "$fixture/avatars/a.bin" "$fixture/meetings/link" && [ -L "$fixture/mee
 else
   rm -f -- "$fixture/meetings/link"
 fi
+backup_fixture="$fixture/backup"
+mkdir -p "$backup_fixture/bin" "$backup_fixture/root" "$backup_fixture/uploads"/{avatars,meetings,communities} \
+  "$backup_fixture/postgres" "$backup_fixture/docker"
+printf 'BACKEND_IMAGE=fixture\n' >"$backup_fixture/root/.env.production"
+printf avatar >"$backup_fixture/uploads/avatars/a.bin"
+printf meeting >"$backup_fixture/uploads/meetings/m.bin"
+printf community >"$backup_fixture/uploads/communities/c.bin"
+printf unchanged >"$backup_fixture/postgres/data-sentinel"
+printf running >"$backup_fixture/postgres/postgres-running"
+cat >"$backup_fixture/bin/install" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+paths=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d) shift ;;
+    -m) shift 2 ;;
+    -o|-g) shift 2 ;;
+    *) paths+=("$1"); shift ;;
+  esac
+done
+mkdir -p "${paths[@]}"
+EOF
+cat >"$backup_fixture/bin/flock" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in -n) exit 0;; *) exit 2;; esac
+EOF
+cat >"$backup_fixture/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+shift
+[ "$#" -gt 0 ] || exit 2
+EOF
+cat >"$backup_fixture/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+format=${2:-}; path=${3:-}
+case "$format" in
+  %u) id -u ;;
+  %g) id -g ;;
+  %a) [ -d "$path" ] && printf '700\n' || printf '600\n' ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+EOF
+cat >"$backup_fixture/bin/production-compose.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+events=${CAPTURE_BACKUP_EVENTS:?}
+printf 'compose %s\n' "$1 ${2:-} ${3:-}" >>"$events"
+if [ "${1:-}" = ps ] && [ "${2:-}" = -q ]; then
+  case "${3:-}" in
+    backend) printf 'aaaaaaaaaaaaaaaa\n' ;;
+    postgres) printf 'bbbbbbbbbbbbbbbb\n' ;;
+    *) exit 2 ;;
+  esac
+  exit 0
+fi
+[ "${1:-}" = exec ] && [ "${2:-}" = -T ] && [ "${3:-}" = postgres ] &&
+  [ "${4:-}" = sh ] && [ "${5:-}" = -c ] || exit 2
+inner=$6; shift 6; zero=${1:-_}; [ "$#" -eq 0 ] || shift
+POSTGRES_USER=configured_user POSTGRES_DB=configured_db \
+  CAPTURE_CLIENT_LOG="$CAPTURE_CLIENT_LOG" CAPTURE_BACKUP_EVENTS="$events" \
+  PATH="$CAPTURE_BACKUP_BIN:$PATH" sh -c "$inner" "$zero" "$@"
+EOF
+cat >"$backup_fixture/bin/psql" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+args=("$@"); log=${CAPTURE_CLIENT_LOG:?}; events=${CAPTURE_BACKUP_EVENTS:?}
+argv_json=$(printf '%s\0' "${args[@]}" | jq -Rs 'split("\u0000")[:-1]')
+[ "${args[0]:-}" = -U ] && [ "${args[1]:-}" = configured_user ] &&
+  [ "${args[2]:-}" = -d ] && [ "${args[3]:-}" = configured_db ] ||
+  { echo "psql did not receive configured identity" >&2; exit 91; }
+if [[ " ${args[*]} " == *"pg_database_size(current_database())"* ]]; then
+  consumer=size
+  [ "${CAPTURE_FAIL_SIZE:-0}" = 1 ] && status=42 || status=0
+  printf '%s\n' "$consumer" >>"$events"
+  jq -cn --arg consumer "$consumer" --argjson argv "$argv_json" \
+    '{consumer:$consumer,argv:$argv}' >>"$log"
+  [ "$status" -eq 0 ] && printf '123456789\n'
+  exit "$status"
+elif [[ " ${args[*]} " == *" -c "* ]] && [[ " ${args[*]} " == *"regexp_replace"* ]]; then
+  consumer=media
+  printf '%s\n' "$consumer" >>"$events"
+  jq -cn --arg consumer "$consumer" --argjson argv "$argv_json" \
+    '{consumer:$consumer,argv:$argv}' >>"$log"
+  printf 'avatars/a.bin\nmeetings/m.bin\ncommunities/c.bin\n'
+elif [ "${args[${#args[@]}-2]:-}" = -f ] && [ "${args[${#args[@]}-1]:-}" = - ]; then
+  consumer=proof
+  printf '%s\n' "$consumer" >>"$events"
+  jq -cn --arg consumer "$consumer" --argjson argv "$argv_json" \
+    '{consumer:$consumer,argv:$argv}' >>"$log"
+  printf '{"schema":"meet-backend/closed-beta-database-proof/v1","valid":true}\n'
+else
+  echo "unexpected psql fixture argv" >&2
+  exit 92
+fi
+EOF
+cat >"$backup_fixture/bin/pg_dump" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+args=("$@"); log=${CAPTURE_CLIENT_LOG:?}; events=${CAPTURE_BACKUP_EVENTS:?}
+argv_json=$(printf '%s\0' "${args[@]}" | jq -Rs 'split("\u0000")[:-1]')
+[ "${args[1]:-}" = -U ] && [ "${args[2]:-}" = configured_user ] &&
+  [ "${args[3]:-}" = -d ] && [ "${args[4]:-}" = configured_db ] ||
+  { echo "pg_dump did not receive configured identity" >&2; exit 93; }
+printf 'dump\n' >>"$events"
+jq -cn --arg consumer dump --argjson argv "$argv_json" \
+  '{consumer:$consumer,argv:$argv}' >>"$log"
+printf 'fixture-postgres-dump\n'
+EOF
+cat >"$backup_fixture/bin/age" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+events=${CAPTURE_BACKUP_EVENTS:?}; output=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -r) shift 2 ;;
+    -o) output=$2; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+[ -n "$output" ] || exit 2
+printf 'age\n' >>"$events"
+cat >"$output"
+EOF
+cat >"$backup_fixture/bin/df" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'fixture 1000000000 1000 999999000 1%% /fixture\n'
+EOF
+cat >"$backup_fixture/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+events=${CAPTURE_BACKUP_EVENTS:?}
+case "${1:-}" in
+  inspect)
+    id=${2:-}; format=${4:-}
+    [ "$id" = aaaaaaaaaaaaaaaa ] || [ "$id" = bbbbbbbbbbbbbbbb ] || exit 2
+    case "$format" in
+      *'{{.Id}}'*) printf '%s\n' "$id" ;;
+      *'{{.Image}}'*) printf 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;;
+      *Health.Status*|*State.Health*) printf 'healthy\n' ;;
+      *'{{.State.Running}}'*) printf 'true\n' ;;
+      *'{{range .Mounts}}'*) printf 'volume|meet-production_uploads_data\n' ;;
+      *) jq -cn --arg id "$id" '[{Id:$id,Image:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",State:{Running:true}}]' ;;
+    esac
+    ;;
+  volume)
+    [ "${2:-}" = inspect ] && [ "${3:-}" = --format ] || exit 2
+    volume_name=${5:-}
+    [ "$volume_name" = meet-production_uploads_data ] ||
+      [ "$volume_name" = meet-production_postgres_data ] || exit 2
+    if [ "$volume_name" = meet-production_uploads_data ]; then
+      printf '%s\n' "$CAPTURE_UPLOAD_ROOT"
+    else
+      printf '%s\n' "$CAPTURE_POSTGRES_ROOT"
+    fi
+    ;;
+  info) printf '%s\n' "$CAPTURE_DOCKER_ROOT" ;;
+  stop)
+    target=${4:-}; [ "$target" = aaaaaaaaaaaaaaaa ] || exit 94
+    printf 'stop backend\n' >>"$events"
+    ;;
+  start)
+    [ "${2:-}" = aaaaaaaaaaaaaaaa ] || exit 95
+    printf 'start backend\n' >>"$events"
+    ;;
+  run)
+    printf 'run archive\n' >>"$events"
+    tar -C "$CAPTURE_UPLOAD_ROOT" -czf - .
+    ;;
+  *) echo "unsupported docker fixture operation: $*" >&2; exit 2 ;;
+esac
+EOF
+cat >"$backup_fixture/bin/probe" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=''
+while [ "$#" -gt 0 ]; do
+  [ "$1" = --output ] && output=$2 && shift 2 || shift
+done
+jq -cnS '{schema:"meet-backend/test-vps-recovery-runtime/v1",healthy:true,
+  runtime:{health:"healthy",imageId:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  configHash:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",uploadsMount:"volume"},
+  https:{meetingsStatus:"200",meetingsJson:true,actuatorStatus:"404",httpRedirectHttps:true}}' >"$output"
+EOF
+chmod 700 "$backup_fixture/bin"/*
+run_backup_capture_case() {
+  local label=$1 fail_size=$2 state_root="$backup_fixture/state-$1" output="$backup_fixture/output-$1"
+  local events="$backup_fixture/$label.events" clients="$backup_fixture/$label.clients"
+  mkdir -p "$state_root" "$output"
+  printf untouched >"$state_root/.deploy.lock"
+  : >"$events"; : >"$clients"
+  if CAPTURE_FAIL_SIZE="$fail_size" CAPTURE_BACKUP_EVENTS="$events" \
+    CAPTURE_CLIENT_LOG="$clients" CAPTURE_BACKUP_BIN="$backup_fixture/bin" \
+    CAPTURE_UPLOAD_ROOT="$backup_fixture/uploads" CAPTURE_POSTGRES_ROOT="$backup_fixture/postgres" \
+    CAPTURE_DOCKER_ROOT="$backup_fixture/docker" SUDO_UID='' SUDO_GID='' \
+    USER=root PGUSER=root PGDATABASE=root PATH="$backup_fixture/bin:$PATH" \
+    bash "$capture" --recovery-id "recovery-$label" --root "$backup_fixture/root" \
+      --output-dir "$output" \
+      --recipient age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+      --public-url https://api.whysoezzy.online --state-root "$state_root" \
+      --compose-script "$backup_fixture/bin/production-compose.sh" \
+      --probe-script "$backup_fixture/bin/probe" --backup-script "$backup"; then
+    [ "$fail_size" = 0 ] || fail "injected size failure succeeded"
+  else
+    [ "$fail_size" = 1 ] || fail "success fixture failed"
+  fi
+  if [ "$fail_size" = 0 ]; then
+    jq -se 'length==4 and ([.[].consumer]|sort)==["dump","media","proof","size"] and
+      all(.[]; (.argv|index("-U")) != null and (.argv|index("configured_user")) != null and
+      (.argv|index("-d")) != null and (.argv|index("configured_db")) != null)' "$clients" >/dev/null ||
+      fail "configured identity was not explicit for every consumer"
+    jq -se 'map(select(.consumer=="media")) | length==1 and
+      ((.[0].argv|index("ON_ERROR_STOP=1"))!=null)' \
+      "$clients" >/dev/null || fail "media ON_ERROR_STOP was lost"
+    grep -Fq 'stop backend' "$events" && grep -Fq 'start backend' "$events" ||
+      fail "backend was not restarted"
+    ! grep -Fq 'root' "$clients" || fail "ambient identity reached a client"
+    expected='capture-database-proof.json capture-media-proof.json capture-result.json capture-runtime.json post-capture.json postgres.dump.age uploads.tar.gz.age'
+    actual=$(find "$output" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ' | sed 's/ $//')
+    [ "$actual" = "$expected" ] || fail "success publication set differs"
+    for file in "$output"/*; do
+      [ "$(PATH="$backup_fixture/bin:$PATH" stat -c '%a' "$file")" = 600 ] &&
+        [ "$(PATH="$backup_fixture/bin:$PATH" stat -c '%u' "$file")" = "$(id -u)" ] &&
+        [ "$(PATH="$backup_fixture/bin:$PATH" stat -c '%g' "$file")" = "$(id -g)" ] ||
+        fail "published mode or ownership differs"
+    done
+    [ ! -e "$state_root/beta-recovery-recovery-$label" ] &&
+      [ -f "$state_root/.deploy.lock" ] || fail "successful state cleanup was incomplete"
+  else
+    [ "$(wc -l <"$clients" | tr -d '[:space:]')" = 1 ] &&
+      jq -e '.consumer=="size" and (.argv|index("configured_user"))!=null and
+        (.argv|index("configured_db"))!=null' "$clients" >/dev/null ||
+      fail "size failure did not use configured identity"
+    [ "$(grep -Fc 'stop backend' "$events")" = 1 ] &&
+      [ "$(grep -Fc 'start backend' "$events")" = 1 ] || fail "failure restarted wrong backend"
+    ! grep -Eq '^(media|proof|dump|age|run archive)$' "$events" ||
+      fail "failure continued after size query"
+    [ "$(cat "$backup_fixture/postgres/data-sentinel")" = unchanged ] ||
+      fail "failure changed PostgreSQL sentinel"
+    [ "$(cat "$backup_fixture/postgres/postgres-running")" = running ] ||
+      fail "failure changed PostgreSQL state"
+    [ -z "$(find "$output" -mindepth 1 -print -quit)" ] || fail "failure published output"
+    state="$state_root/beta-recovery-recovery-$label"
+    jq -e '.state=="nonterminal" and .phase=="pre_stop" and
+      .ownedPaths==["private/capture-runtime.json","private/post-capture.json","private/capture-result.json",
+      "private/capture-database-proof.json","private/capture-media-proof.json","private/postgres.dump.age",
+      "private/uploads.tar.gz.age","staging"]' "$state/journal.json" >/dev/null ||
+      fail "failure journal was not retained at pre_stop"
+    [ "$(find "$state/private" -mindepth 1 -maxdepth 1 -type f -printf '%f\n')" = capture-runtime.json ] &&
+      [ -z "$(find "$state/staging" -mindepth 1 -print -quit)" ] ||
+      fail "failure left private snapshot output"
+    [ -f "$state_root/.deploy.lock" ] || fail "deploy lock was removed"
+  fi
+}
+run_backup_capture_case success 0
+run_backup_capture_case failure 1
 capture_fixture="$fixture/capture"
 mkdir -p "$capture_fixture/bin" "$capture_fixture/root"
 printf 'BACKEND_IMAGE=fixture\n' >"$capture_fixture/root/.env.production"

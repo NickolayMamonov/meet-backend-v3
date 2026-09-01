@@ -6,6 +6,11 @@ cd "$ROOT_DIR"
 SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
 COMPOSE=("$SCRIPTS_DIR/production-compose.sh")
 
+postgres_psql() {
+  "${COMPOSE[@]}" exec -T postgres sh -c \
+    'exec psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"' _ "$@"
+}
+
 restart_current() {
   local container=$1
   docker start "$container" >/dev/null
@@ -83,7 +88,7 @@ capacity_ok() {
 
 write_media_reference_list() {
   local output=$1
-  "${COMPOSE[@]}" exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -c \
+  postgres_psql -X -qAt -v ON_ERROR_STOP=1 -c \
     "SELECT regexp_replace(image_url, '^https://api[.]whysoezzy[.]online/demo-assets/v1/', '')
        FROM (
          SELECT avatar_url AS image_url FROM users WHERE avatar_url LIKE 'https://api.whysoezzy.online/demo-assets/v1/%'
@@ -140,8 +145,8 @@ if [ "${1:-}" = "--beta" ]; then
   docker stop --time 30 "$backend" >/dev/null
   trap 'cleanup' EXIT HUP INT TERM
   point_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  db_bytes=$("${COMPOSE[@]}" exec -T postgres sh -c \
-    'psql -X -Atqc "SELECT pg_database_size(current_database())"' | tr -d '[:space:]')
+  db_bytes=$(postgres_psql -X -Atqc 'SELECT pg_database_size(current_database())' |
+    tr -d '[:space:]')
   [[ "$db_bytes" =~ ^[1-9][0-9]*$ ]] || exit 1
   write_media_reference_list "$temp/reference-list"
   "$media_script" --root "$upload_root" --reference-list "$temp/reference-list" \
@@ -172,7 +177,7 @@ if [ "${1:-}" = "--beta" ]; then
     --mount "type=volume,source=$upload_volume,target=/source,readonly" \
     "$image" -C /source -czf - . | age -r "$AGE_RECIPIENT" -o "$media_file"
   [ -s "$db_file" ] && [ -s "$media_file" ] || exit 1
-  cat "$database_sql" | "${COMPOSE[@]}" exec -T postgres sh -c 'psql -X -qAt -f -' |
+  cat "$database_sql" | postgres_psql -X -qAt -f - |
     jq -cS 'if type=="object" and .schema=="meet-backend/closed-beta-database-proof/v1" then . else error("database proof schema") end' \
       >"$temp/database-proof.json"
   cp -- "$temp/database-proof.json" "$beta_dir/capture-database-proof.json"

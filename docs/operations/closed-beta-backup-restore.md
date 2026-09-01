@@ -49,6 +49,10 @@ snapshot and runtime recovery section. It rejects an active SMTP transaction,
 proves a healthy populated runtime and HTTPS edge, and uses fixed
 `postgres.dump.age` and `uploads.tar.gz.age` names in a fresh mode-0700
 run-owned directory. Plaintext never leaves the VPS.
+Every capture `psql` and `pg_dump` consumer receives the Compose service's
+explicit PostgreSQL user and database. If an early query fails, the exact
+backend is restarted, no partial output is published, and the owned
+nonterminal journal remains for reviewed reconciliation.
 
 Capture-local journals are not global gates. A fresh process validates their
 schema, digest, recovery ID, and owned paths. An unchanged interrupted runtime
