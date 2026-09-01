@@ -1171,9 +1171,13 @@ run_consumer_case() {
   local name=$1 body=$2 signal=$3 phase=$4 cleanup_failure=${5:-0} scenario=${6:-normal}
   local case_dir=$consumer_root/cases/$name expected_status remote_state
   local collision_root_metadata collision_marker_metadata collision_root_digest collision_marker_digest
-  expected_status=$(assert_signal_status "$signal")
+  case "$scenario" in
+    normal) expected_status=$(assert_signal_status "$signal") ;;
+    ambiguous) expected_status=47 ;;
+    collision-absent|collision-mismatch) expected_status=1 ;;
+    *) fail "unknown consumer marker scenario: $scenario" ;;
+  esac
   [ "$cleanup_failure" -eq 0 ] || expected_status=1
-  [ "$scenario" = normal ] || expected_status=1
   mkdir -p "$case_dir/runner" "$case_dir/home/.ssh"
   chmod 700 "$case_dir" "$case_dir/runner" "$case_dir/home" "$case_dir/home/.ssh"
   remote_state=$case_dir/remote-root
