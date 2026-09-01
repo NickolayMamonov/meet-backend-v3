@@ -969,10 +969,14 @@ write_wrapper "$consumer_bin/ssh" \
   'done' \
   'if [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ] &&' \
   '  [ "$command_start" -ge 0 ] && [[ "${args[command_start]:-}" == "sudo cat "* ]]; then' \
-  '  file=${args[command_start]##*/}' \
-  '  file=${file%?}' \
-  '  case "$file" in' \
-  '    postgres.dump.age|uploads.tar.gz.age|capture-runtime.json|database-proof.json|media-proof.json|capture-result.json) ;;' \
+  '  command_text=${args[command_start]}' \
+  '  case "$command_text" in' \
+  '    *postgres.dump.age*) file=postgres.dump.age ;;' \
+  '    *uploads.tar.gz.age*) file=uploads.tar.gz.age ;;' \
+  '    *capture-runtime.json*) file=capture-runtime.json ;;' \
+  '    *database-proof.json*) file=database-proof.json ;;' \
+  '    *media-proof.json*) file=media-proof.json ;;' \
+  '    *capture-result.json*) file=capture-result.json ;;' \
   '    *) printf "unexpected remote read\n" >&2; exit 54 ;;' \
   '  esac' \
   '  if [ "${BETA_RECOVERY_CAPTURE_READ_FAIL:-}" = "$file" ]; then exit 55; fi' \
