@@ -167,6 +167,7 @@ jobs:
             local status=$1
             trap - EXIT HUP INT TERM
             if [ "$remote_create_attempted" = true ] && ! cleanup_remote; then
+              echo "remote staging cleanup failed" >&2
               status=1
             fi
             [ -z "$recipient_file" ] || rm -f -- "$recipient_file" || status=1
@@ -317,11 +318,22 @@ jobs:
             [ "$uploads_cipher_size" = "$(jq -er '.ciphertexts.uploads.size' "$capture_result")" ] &&
             [ "$uploads_cipher_sha" = "$(jq -er '.ciphertexts.uploads.sha256' "$capture_result")" ] ||
             { echo "transferred ciphertext differs from quiesced capture result" >&2; exit 1; }
-          [ "$(sha256sum "$RUNNER_TEMP/database-proof.json" | awk '{print $1}')" =
-            "$(jq -er '.proofs.database.sha256' "$capture_result")" ] &&
-            [ "$(sha256sum "$RUNNER_TEMP/media-proof.json" | awk '{print $1}')" =
-            "$(jq -er '.proofs.media.sha256' "$capture_result")" ] ||
-            { echo "transferred proof differs from quiesced capture result" >&2; exit 1; }
+          database_proof_actual_sha=$(sha256sum "$RUNNER_TEMP/database-proof.json" | awk '{print $1}')
+          database_proof_expected_sha=$(jq -er '.proofs.database.sha256' "$capture_result")
+          media_proof_actual_sha=$(sha256sum "$RUNNER_TEMP/media-proof.json" | awk '{print $1}')
+          media_proof_expected_sha=$(jq -er '.proofs.media.sha256' "$capture_result")
+          [[ "$database_proof_actual_sha" =~ ^[0-9a-f]{64}$ ]] ||
+            { echo "database proof digest is invalid" >&2; exit 1; }
+          [[ "$database_proof_expected_sha" =~ ^[0-9a-f]{64}$ ]] ||
+            { echo "database proof expected digest is invalid" >&2; exit 1; }
+          [[ "$media_proof_actual_sha" =~ ^[0-9a-f]{64}$ ]] ||
+            { echo "media proof digest is invalid" >&2; exit 1; }
+          [[ "$media_proof_expected_sha" =~ ^[0-9a-f]{64}$ ]] ||
+            { echo "media proof expected digest is invalid" >&2; exit 1; }
+          [ "$database_proof_actual_sha" = "$database_proof_expected_sha" ] ||
+            { echo "database proof differs from quiesced capture result" >&2; exit 1; }
+          [ "$media_proof_actual_sha" = "$media_proof_expected_sha" ] ||
+            { echo "media proof differs from quiesced capture result" >&2; exit 1; }
           [ "$uploads_files" = "$(jq -er '.files' "$RUNNER_TEMP/media-proof.json")" ] &&
             [ "$uploads_bytes" = "$(jq -er '.bytes' "$RUNNER_TEMP/media-proof.json")" ] &&
             [ "$uploads_digest" = "$(jq -er '.canonicalDigest' "$RUNNER_TEMP/media-proof.json")" ] ||
