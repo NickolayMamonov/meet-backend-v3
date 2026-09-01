@@ -1415,9 +1415,9 @@ run_capture_proof_case() {
       db_expected=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
     media-mismatch)
       media_expected=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc ;;
-    malformed-expected)
+    malformed-expected|malformed-expected-cleanup)
       db_expected=not-a-digest ;;
-    missing-expected) ;;
+    missing-expected|missing-expected-cleanup) ;;
     remote-read-failure|hash-failure|local-proof-failure|matching) ;;
     cleanup-failure)
       db_expected=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd ;;
@@ -1477,7 +1477,9 @@ run_capture_proof_case() {
   : >"$case_dir/effective.log"
   : >"$case_dir/effective.err"
   remote_state=$case_dir/remote-root
-  if [ "$scenario" = cleanup-failure ]; then
+  if [ "$scenario" = cleanup-failure ] ||
+    [ "$scenario" = malformed-expected-cleanup ] ||
+    [ "$scenario" = missing-expected-cleanup ]; then
     cleanup_failure=1
   elif [ "$scenario" = remote-read-failure ]; then
     read_fail=database-proof.json
@@ -1565,16 +1567,27 @@ run_capture_proof_case() {
         grep -Fq 'media proof differs from quiesced capture result' \
           "$case_dir/stderr" ||
           fail "media proof diagnostic missing: $name" ;;
-      malformed-expected) ;;
+      malformed-expected|malformed-expected-cleanup)
+        grep -Fq 'database proof expected digest is invalid' \
+          "$case_dir/stderr" ||
+          fail "malformed expected digest diagnostic missing: $name" ;;
+      missing-expected|missing-expected-cleanup)
+        grep -Fq 'database proof expected digest is missing or malformed' \
+          "$case_dir/stderr" ||
+          fail "missing expected digest diagnostic missing: $name" ;;
     esac
-    if [ "$scenario" = cleanup-failure ]; then
+    if [ "$scenario" = cleanup-failure ] ||
+      [ "$scenario" = malformed-expected-cleanup ] ||
+      [ "$scenario" = missing-expected-cleanup ]; then
       grep -Fq 'remote staging cleanup failed' "$case_dir/stderr" ||
         fail "cleanup failure diagnostic missing: $name"
     fi
     ! grep -Fq 'publication-eligible' "$case_dir/boundary.log" ||
       fail "failed proof case opened publication eligibility: $name"
   fi
-  if [ "$scenario" = cleanup-failure ]; then
+  if [ "$scenario" = cleanup-failure ] ||
+    [ "$scenario" = malformed-expected-cleanup ] ||
+    [ "$scenario" = missing-expected-cleanup ]; then
     [ -d "$remote_state" ] ||
       fail "cleanup failure unexpectedly removed remote staging"
   else
@@ -1588,6 +1601,8 @@ run_capture_proof_case capture-proof-database-mismatch database-mismatch
 run_capture_proof_case capture-proof-media-mismatch media-mismatch
 run_capture_proof_case capture-proof-malformed-expected malformed-expected
 run_capture_proof_case capture-proof-missing-expected missing-expected
+run_capture_proof_case capture-proof-malformed-expected-cleanup malformed-expected-cleanup
+run_capture_proof_case capture-proof-missing-expected-cleanup missing-expected-cleanup
 run_capture_proof_case capture-proof-remote-read-failure remote-read-failure
 run_capture_proof_case capture-proof-hash-failure hash-failure
 run_capture_proof_case capture-proof-local-file-failure local-proof-failure
