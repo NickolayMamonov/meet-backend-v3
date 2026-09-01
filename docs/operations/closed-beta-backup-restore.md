@@ -13,7 +13,9 @@ in ephemeral runner storage, then transports exactly that one mode-0755
 encryption binary with the reviewed capture scripts and only the public age
 recipient. The capture VPS admits the absolute staged path, owner, mode,
 platform, exact version, and SHA-256 before taking the deploy lock, probing
-runtime state, creating a journal, or stopping the backend. Capture never uses
+runtime state, creating a journal, or stopping the backend. The beta backup
+consumer rechecks that the operand is already canonical and non-symlinked and
+verifies the same SHA-256 immediately before either encryption stream. Capture never uses
 an ambient `PATH` age, a VPS package/download, `age-keygen`, or a private
 identity. The
 protected `closed-beta-restore` job has only the private age identity and no

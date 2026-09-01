@@ -106,15 +106,21 @@ if [ "${1:-}" = "--beta" ]; then
       --recovery-id) recovery_id=$2; shift 2 ;;
       --output-dir) beta_dir=$2; shift 2 ;;
       --age-binary) age_binary=$2; shift 2 ;;
+      --age-sha256) age_sha256=$2; shift 2 ;;
       *) exit 2 ;;
     esac
   done
   [[ "$recovery_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || exit 2
   case "${age_binary:-}" in /*) ;; *) exit 2;; esac
-  age_binary=$(realpath -e -- "$age_binary") || exit 1
+  [ -e "$age_binary" ] && [ ! -L "$age_binary" ] || exit 1
+  age_binary_canonical=$(realpath -e -- "$age_binary") || exit 1
+  [ "$age_binary_canonical" = "$age_binary" ] || exit 1
+  age_binary=$age_binary_canonical
   [ -f "$age_binary" ] && [ ! -L "$age_binary" ] && [ -s "$age_binary" ] &&
     [ -x "$age_binary" ] || exit 1
   [ "$(stat -c '%a' "$age_binary")" = 755 ] || exit 1
+  [[ "${age_sha256:-}" =~ ^[0-9a-f]{64}$ ]] || exit 1
+  [ "$(sha256sum "$age_binary" | awk '{print $1}')" = "$age_sha256" ] || exit 1
   : "${AGE_RECIPIENT:?AGE_RECIPIENT is required}"
   database_sql=${BETA_DATABASE_PROOF_SCRIPT:-"$SCRIPTS_DIR/beta-recovery-database-proof.sql"}
   media_script=${BETA_MEDIA_PROOF_SCRIPT:-"$SCRIPTS_DIR/beta-recovery-media-proof.sh"}

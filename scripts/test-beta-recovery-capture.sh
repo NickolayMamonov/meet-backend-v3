@@ -15,6 +15,8 @@ grep -Fq -- '--age-os' "$capture"
 grep -Fq -- '--age-arch' "$capture"
 grep -Fq 'realpath -e' "$capture"
 grep -Fq '"$age_binary" --version' "$capture"
+grep -Fq -- '--age-sha256' "$backup"
+grep -Fq 'age_binary_canonical' "$backup"
 grep -Fq 'export PRODUCTION_ROOT="$root"' "$root/scripts/probe-test-vps-recovery-runtime.sh"
 grep -Fq 'pg_database_size(current_database())' "$backup"; grep -Fq 'validate_upload_archive' "$backup"; grep -Fq 'tar --list --gzip --verbose' "$backup"
 grep -Fq 'jq -cS' "$backup"; grep -Fq 'capacity_ok' "$backup"; grep -Fq -- '--reference-list' "$backup"
@@ -352,6 +354,21 @@ run_backup_capture_case success 0
 run_backup_capture_case failure 1
 run_backup_capture_case database-encryption 0 database
 run_backup_capture_case uploads-encryption 0 uploads
+direct_backup_dir="$backup_fixture/direct-symlink"
+mkdir -p "$direct_backup_dir"
+ln -s "$backup_fixture/bin/age" "$direct_backup_dir/age-link"
+: >"$backup_fixture/direct-symlink.events"
+if CAPTURE_BACKUP_EVENTS="$backup_fixture/direct-symlink.events" \
+  CAPTURE_CLIENT_LOG="$backup_fixture/direct-symlink.clients" \
+  CAPTURE_BACKUP_BIN="$backup_fixture/bin" \
+  PATH="$backup_fixture/bin:$PATH" AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+  bash "$backup" --beta --recovery-id recovery-direct-symlink \
+    --output-dir "$direct_backup_dir" --age-binary "$direct_backup_dir/age-link" \
+    --age-sha256 "$age_sha256"; then
+  fail "direct beta backup accepted a symlink age operand"
+fi
+[ ! -s "$backup_fixture/direct-symlink.events" ] ||
+  fail "symlink admission reached backup work"
 capture_fixture="$fixture/capture"
 mkdir -p "$capture_fixture/bin" "$capture_fixture/root"
 printf 'BACKEND_IMAGE=fixture\n' >"$capture_fixture/root/.env.production"
@@ -463,9 +480,26 @@ elif [[ "$url" == */actuator ]]; then
   printf '404\n'
 fi
 EOF
+cat >"$capture_fixture/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+format=${2:-}; path=${3:-}
+if [ "${CAPTURE_ADMISSION_OWNER:-}" = wrong ] &&
+  { [ "$format" = %u ] || [ "$format" = %g ]; } &&
+  { [[ "$path" == */age ]] || [ "$path" = "${CAPTURE_ADMISSION_OUTPUT:-}" ]; }; then
+  printf '999\n'
+  exit 0
+fi
+if [ "${CAPTURE_ADMISSION_MODE:-}" = wrong-age ] &&
+  [ "$format" = %a ] && [[ "$path" == */age ]]; then
+  printf '754\n'
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+EOF
 chmod 700 "$capture_fixture/bin/install" "$capture_fixture/bin/flock" \
   "$capture_fixture/bin/docker" "$capture_fixture/bin/compose" "$capture_fixture/bin/probe" \
-  "$capture_fixture/bin/curl"
+  "$capture_fixture/bin/curl" "$capture_fixture/bin/stat"
 probe_output="$capture_fixture/probe.json"
 CAPTURE_CALLS_FILE="$capture_fixture/valid-calls.log" \
   CAPTURE_EXPECTED_PRODUCTION_ROOT="$capture_fixture/root" \
@@ -538,6 +572,79 @@ if [ "$symlink_supported" = true ]; then
   run_capture_admission_case symlink "$capture_fixture/symlink-root"
   run_capture_admission_case symlink-env "$capture_fixture/symlink-env"
 fi
+run_age_admission_case() {
+  local label=$1 mutation=$2
+  local state_dir="$capture_fixture/age-admission-$label"
+  local output_dir="$capture_fixture/age-output-$label"
+  local age_digest age_version=v1.3.1 age_os=Linux age_arch=x86_64
+  mkdir -p "$state_dir" "$output_dir"
+  chmod 700 "$output_dir"
+  cp -- "$backup_fixture/bin/age" "$output_dir/age"
+  chmod 755 "$output_dir/age"
+  age_digest=$(sha256sum "$output_dir/age" | awk '{print $1}')
+  case "$mutation" in
+    missing) rm -f -- "$output_dir/age" ;;
+    empty) : >"$output_dir/age" ;;
+    non-executable) chmod 644 "$output_dir/age" ;;
+    wrong-mode) chmod 754 "$output_dir/age" ;;
+    wrong-root-mode) chmod 755 "$output_dir" ;;
+    symlink)
+      rm -f -- "$output_dir/age"
+      ln -s "$capture_fixture/valid-age" "$output_dir/age" ;;
+    non-regular)
+      rm -f -- "$output_dir/age"
+      mkdir "$output_dir/age" ;;
+    wrong-owner) ;;
+    wrong-digest) age_digest=0000000000000000000000000000000000000000000000000000000000000000 ;;
+    malformed-digest) age_digest=not-a-digest ;;
+    wrong-platform) age_os=Darwin ;;
+    wrong-architecture) age_arch=i686 ;;
+    wrong-version) age_version=v9.9.9 ;;
+    stat-mode) ;;
+    *) fail "unknown age admission mutation: $mutation" ;;
+  esac
+  printf before >"$state_dir/sentinel"
+  : >"$capture_fixture/age-admission-calls.log"
+  if CAPTURE_CALLS_FILE="$capture_fixture/age-admission-calls.log" \
+    CAPTURE_ADMISSION_OWNER="$([ "$mutation" = wrong-owner ] && echo wrong || true)" \
+    CAPTURE_ADMISSION_MODE="$([ "$mutation" = stat-mode ] && echo wrong-age || true)" \
+    CAPTURE_ADMISSION_OUTPUT="$output_dir" \
+    PATH="$capture_fixture/bin:$PATH" \
+    bash "$capture" --recovery-id "recovery-age-$label" \
+      --root "$capture_fixture/root" --output-dir "$output_dir" \
+      --recipient age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+      --public-url https://api.whysoezzy.online --state-root "$state_dir" \
+      --compose-script "$capture_fixture/bin/compose" \
+      --probe-script "$capture_fixture/bin/probe" \
+      --backup-script "$capture_fixture/bin/compose" \
+      --age-binary "$output_dir/age" --age-sha256 "$age_digest" \
+      --age-version "$age_version" --age-os "$age_os" --age-arch "$age_arch"; then
+    fail "invalid age admission $label was accepted"
+  fi
+  [ ! -s "$capture_fixture/age-admission-calls.log" ] ||
+    fail "invalid age admission $label reached downstream work"
+  [ "$(cat "$state_dir/sentinel")" = before ] ||
+    fail "invalid age admission $label changed state"
+  [ ! -e "$state_dir/.deploy.lock" ] ||
+    fail "invalid age admission $label acquired the deploy lock"
+  [ ! -e "$state_dir/beta-recovery-recovery-age-$label" ] ||
+    fail "invalid age admission $label created journal state"
+}
+cp -- "$backup_fixture/bin/age" "$capture_fixture/valid-age"
+chmod 755 "$capture_fixture/valid-age"
+age_mode_probe="$capture_fixture/age-mode-probe"
+mkdir "$age_mode_probe"
+chmod 700 "$age_mode_probe"
+if [ "$(stat -c '%a' "$age_mode_probe")" = 700 ]; then
+  for age_mutation in missing empty non-executable wrong-mode symlink non-regular \
+    wrong-root-mode wrong-owner wrong-digest malformed-digest wrong-platform wrong-architecture \
+    wrong-version stat-mode; do
+    run_age_admission_case "$age_mutation" "$age_mutation"
+  done
+else
+  echo "beta recovery capture fixture: executable admission matrix skipped (POSIX modes unavailable)"
+fi
+rm -r -- "$age_mode_probe"
 run_probe_admission_case missing "$capture_fixture/missing-root"
 run_probe_admission_case blank ''
 run_probe_admission_case relative relative/root

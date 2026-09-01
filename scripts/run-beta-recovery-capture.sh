@@ -248,7 +248,7 @@ export AGE_RECIPIENT="$recipient" BACKUP_DIR="$state/private"
 production_scripts_dir=$(dirname -- "$compose"); export PRODUCTION_SCRIPTS_DIR="$production_scripts_dir"
 export BETA_DATABASE_PROOF_SCRIPT="$database_proof" BETA_MEDIA_PROOF_SCRIPT="$media_proof"
 "$backup" --beta --recovery-id "$recovery_id" --output-dir "$state/private" \
-  --age-binary "$age_binary" || fail "beta backup failed"
+  --age-binary "$age_binary" --age-sha256 "$age_sha256" || fail "beta backup failed"
 write_journal snapshot_complete
 post=$state/private/post-capture.json; probe_runtime "$post"; cmp -- "$state/private/capture-runtime.json" "$post" || fail "runtime or HTTPS changed during capture"; write_journal runtime_verified
 for file in postgres.dump.age uploads.tar.gz.age capture-database-proof.json capture-media-proof.json capture-result.json capture-runtime.json post-capture.json; do [ -f "$state/private/$file" ] && [ ! -L "$state/private/$file" ] || fail "capture output incomplete"; done
