@@ -1389,7 +1389,7 @@ run_capture_proof_case() {
   local name=$1 scenario=$2
   local case_dir=$consumer_root/cases/$name remote_state
   local db_sha media_sha db_expected media_expected uploads_digest
-  local status expected_status cleanup_failure=0 read_fail='' sha_target='' sha_mode=''
+  local status cleanup_failure=0 read_fail='' sha_target='' sha_mode=''
   mkdir -p "$case_dir/runner" "$case_dir/home/.ssh" "$case_dir/remote-files"
   chmod 700 "$case_dir" "$case_dir/runner" "$case_dir/home" \
     "$case_dir/home/.ssh" "$case_dir/remote-files"
@@ -1477,10 +1477,7 @@ run_capture_proof_case() {
   : >"$case_dir/effective.log"
   : >"$case_dir/effective.err"
   remote_state=$case_dir/remote-root
-  expected_status=0
-  [ "$scenario" = matching ] || expected_status=1
   if [ "$scenario" = cleanup-failure ]; then
-    expected_status=1
     cleanup_failure=1
   elif [ "$scenario" = remote-read-failure ]; then
     read_fail=database-proof.json
@@ -1527,9 +1524,10 @@ run_capture_proof_case() {
   ) >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
-  if [ "$status" -ne "$expected_status" ]; then
+  if [ "$scenario" = matching ] && [ "$status" -ne 0 ] ||
+    [ "$scenario" != matching ] && [ "$status" -eq 0 ]; then
     sed -n '1,40p' "$case_dir/stderr" >&2
-    fail "proof case $name returned $status instead of $expected_status"
+    fail "proof case $name returned unexpected status $status (matching must be zero)"
   fi
   assert_consumer_residue_absent "$case_dir"
   [ "$(grep -c '^remote-create$' "$case_dir/boundary.log" || true)" -eq 1 ] ||
