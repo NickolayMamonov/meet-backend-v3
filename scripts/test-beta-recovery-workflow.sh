@@ -175,11 +175,27 @@ grep -Fq 'capture-pre-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh
 grep -Fq 'effective-config-failed' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'argv-rejected' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'BETA_RECOVERY_REMOTE_CLEANUP_FAIL' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'capture-ambiguous-create' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'capture-collision-absent-marker' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
+grep -Fq 'capture-collision-mismatched-marker' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'publication-race' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'cleanup-failure-after-publication' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'post-publication-signal-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
 grep -Fq 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow"
+grep -Fq 'owner_token=$(od -An -N32 -tx1 /dev/urandom | tr -d '\''[:space:]'\'')' "$workflow"
+grep -Fq 'remote_create_attempted=true' "$workflow"
+grep -Fq 'remote_cleanup_done=false' "$workflow"
+grep -Fq 'cleanup_remote' "$workflow"
+grep -Fq '.meet-beta-recovery-owner' "$workflow"
+grep -Fq 'meet-backend/beta-recovery-owner/v1:' "$workflow"
+grep -Fq 'cmp -- "$expected" "$marker"' "$workflow"
+grep -Fq 'stat -c '\''%a:%u:%g:%h'\'' "$marker"' "$workflow"
+grep -Fq -- '--age-binary "$remote/age"' "$workflow"
+grep -Fq -- '--age-sha256 "$5" --age-version "$6" --age-os "$7" --age-arch "$8"' "$workflow"
+age_transport_count=$(grep -Fc '            "$age_path" \' "$workflow")
+[ "$age_transport_count" -eq 1 ]
+! grep -Fq 'age-keygen' <<<"$capture_block"
 grep -Fq 'archive_size=10263766' "$root/scripts/install-beta-recovery-age.sh"
 grep -Fq 'archive_sha256=bdc69c09cbdd6cf8b1f333d372a1f58247b3a33146406333e30c0f26e8f51377' \
   "$root/scripts/install-beta-recovery-age.sh"
@@ -254,7 +270,7 @@ validation_count=$(grep -Fc 'scripts/authorize-beta-recovery.sh validate-recover
 [ "$validation_count" -eq 7 ]
 secret_expression_count=$(grep -Fc '${{ secrets.BETA_RECOVERY_AGE_IDENTITY }}' "$workflow")
 [ "$secret_expression_count" -eq 1 ]
-setup_line=$(grep -n 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow" | cut -d: -f1)
+setup_line=$(grep -n 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow" | tail -1 | cut -d: -f1)
 revalidate_line=$(grep -n 'Revalidate source immediately before identity access' "$workflow" | cut -d: -f1)
 restore_line=$(grep -n 'id: restore' "$workflow" | cut -d: -f1)
 [ "$setup_line" -lt "$revalidate_line" ] && [ "$revalidate_line" -lt "$restore_line" ]

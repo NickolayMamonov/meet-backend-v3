@@ -13,7 +13,7 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 materializer=$root/scripts/materialize-beta-recovery-known-hosts.sh
 [ -x "$materializer" ] || fail "materializer is missing or not executable"
 
-for tool in awk basename chmod env find grep mkdir mktemp rm scp seq sleep ssh ssh-keygen stat tr wc; do
+for tool in awk basename chmod env find grep mkdir mktemp rm scp seq sha256sum sleep ssh ssh-keygen stat tr wc; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tool is unavailable: $tool"
 done
 
@@ -945,10 +945,41 @@ write_wrapper "$consumer_bin/ssh" \
   '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG"' \
   'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
   'printf "ssh-call\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'if [[ "${args[*]}" == *"sudo test ! -e"* ]]; then' \
-  '  printf "remote-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  '  [ "${BETA_RECOVERY_REMOTE_CLEANUP_FAIL:-0}" = 1 ] && exit 44' \
-  '  exit 0' \
+  'command_start=-1' \
+  'for ((i=0; i<${#args[@]}; i++)); do' \
+  '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
+  'done' \
+  'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
+  '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -s ] &&' \
+  '  [ "${args[command_start+3]:-}" = -- ]; then' \
+  '  body=$(cat)' \
+  '  token_arg=${args[command_start+5]:-}' \
+  '  remote_state=${BETA_RECOVERY_REMOTE_STATE:?}' \
+  '  marker="$remote_state/.meet-beta-recovery-owner"' \
+  '  if printf "%s" "$body" | grep -Fq "owner_uid=\${SUDO_UID"; then' \
+  '    printf "remote-create\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '    if [ -e "$remote_state" ] || [ -L "$remote_state" ]; then' \
+  '      [ -d "$remote_state" ] && [ ! -L "$remote_state" ] || exit 46' \
+  '      [ -f "$marker" ] && [ ! -L "$marker" ] || exit 46' \
+  '      [ "$(<"$marker")" = "meet-backend/beta-recovery-owner/v1:$token_arg" ] || exit 46' \
+  '    else' \
+  '      mkdir "$remote_state"; chmod 700 "$remote_state"' \
+  '      printf "meet-backend/beta-recovery-owner/v1:%s\n" "$token_arg" >"$marker"; chmod 600 "$marker"' \
+  '    fi' \
+  '    if [ "${BETA_RECOVERY_CREATE_MODE:-}" = ambiguous ]; then' \
+  '      printf "remote-create-ambiguous\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 47' \
+  '    fi' \
+  '    exit 0' \
+  '  elif printf "%s" "$body" | grep -Fq "cmp -- \"\$expected\" \"\$marker\""; then' \
+  '    printf "remote-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '    [ "${BETA_RECOVERY_REMOTE_CLEANUP_FAIL:-0}" = 1 ] && exit 44' \
+  '    [ -d "$remote_state" ] && [ ! -L "$remote_state" ] || exit 0' \
+  '    [ "$(stat -c "%a" "$remote_state")" = 700 ] || exit 45' \
+  '    [ -f "$marker" ] && [ ! -L "$marker" ] || exit 45' \
+  '    [ "$(stat -c "%a:%h" "$marker")" = 600:1 ] || exit 45' \
+  '    [ "$(<"$marker")" = "meet-backend/beta-recovery-owner/v1:$token_arg" ] || exit 45' \
+  '    rm -r "$remote_state"; exit $?' \
+  '  fi' \
   'fi' \
   'printf "remote-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'touch "${BETA_RECOVERY_MUTATION_SENTINEL:?}"' \
@@ -1137,12 +1168,37 @@ for body_name in capture pre-probe post-probe; do
 done
 
 run_consumer_case() {
-  local name=$1 body=$2 signal=$3 phase=$4 cleanup_failure=${5:-0}
-  local case_dir=$consumer_root/cases/$name expected_status
-  expected_status=$(assert_signal_status "$signal")
+  local name=$1 body=$2 signal=$3 phase=$4 cleanup_failure=${5:-0} scenario=${6:-normal}
+  local case_dir=$consumer_root/cases/$name expected_status remote_state
+  local collision_root_metadata collision_marker_metadata collision_root_digest collision_marker_digest
+  case "$scenario" in
+    normal) expected_status=$(assert_signal_status "$signal") ;;
+    ambiguous) expected_status=47 ;;
+    collision-absent|collision-mismatch) expected_status=1 ;;
+    *) fail "unknown consumer marker scenario: $scenario" ;;
+  esac
   [ "$cleanup_failure" -eq 0 ] || expected_status=1
   mkdir -p "$case_dir/runner" "$case_dir/home/.ssh"
   chmod 700 "$case_dir" "$case_dir/runner" "$case_dir/home" "$case_dir/home/.ssh"
+  remote_state=$case_dir/remote-root
+  case "$scenario" in
+    normal|ambiguous) ;;
+    collision-absent)
+      mkdir "$remote_state"; chmod 700 "$remote_state"
+      printf collision >"$remote_state/sentinel"
+      collision_root_metadata=$(stat -c '%a:%u:%g:%h' "$remote_state")
+      collision_root_digest=$(sha256sum "$remote_state/sentinel") ;;
+    collision-mismatch)
+      mkdir "$remote_state"; chmod 700 "$remote_state"
+      printf 'meet-backend/beta-recovery-owner/v1:%064d\n' 0 \
+        >"$remote_state/.meet-beta-recovery-owner"
+      chmod 600 "$remote_state/.meet-beta-recovery-owner"
+      collision_root_metadata=$(stat -c '%a:%u:%g:%h' "$remote_state")
+      collision_marker_metadata=$(stat -c '%a:%u:%g:%h' \
+        "$remote_state/.meet-beta-recovery-owner")
+      collision_marker_digest=$(sha256sum "$remote_state/.meet-beta-recovery-owner") ;;
+    *) fail "unknown consumer marker scenario: $scenario" ;;
+  esac
   printf '%s\n' \
     'Host *' '  HostName hostile.example.invalid' '  Port 1' \
     '  UserKnownHostsFile /tmp/hostile-user-known-hosts' \
@@ -1169,6 +1225,8 @@ run_consumer_case() {
     BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
     BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
     BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+    BETA_RECOVERY_REMOTE_STATE="$remote_state" \
+    BETA_RECOVERY_CREATE_MODE="$scenario" \
     BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
     BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE="$phase" \
     BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
@@ -1180,18 +1238,58 @@ run_consumer_case() {
   [ "$status" -eq "$expected_status" ] ||
     fail "consumer $name returned $status instead of $expected_status"
   assert_consumer_residue_absent "$case_dir"
-  [ -f "$case_dir/mutation-sentinel" ] ||
-    fail "consumer $name did not record downstream mutation"
   [ "$(grep -c '^private-key-created$' "$case_dir/boundary.log")" -eq 1 ] ||
     fail "consumer $name did not materialize a private key"
   grep -Fxq 'config-created' "$case_dir/boundary.log" ||
     fail "consumer $name did not create an empty SSH config"
+  if [ "$scenario" != normal ]; then
+    [ ! -e "$case_dir/mutation-sentinel" ] ||
+      fail "marker case $name crossed downstream mutation"
+    ! grep -q '^scp-call$' "$case_dir/boundary.log" ||
+      fail "marker case $name crossed SCP"
+    ! grep -q '^remote-admission$' "$case_dir/boundary.log" ||
+      fail "marker case $name crossed remote admission"
+    [ "$(grep -c '^remote-cleanup$' "$case_dir/boundary.log")" -eq 1 ] ||
+      fail "marker case $name did not attempt remote cleanup exactly once"
+    assert_event_order "$case_dir" helper-success private-key-created remote-create \
+      remote-cleanup local-cleanup
+    case "$scenario" in
+      ambiguous)
+        [ ! -e "$remote_state" ] || fail "ambiguous marker root survived cleanup" ;;
+      collision-absent)
+        [ -e "$remote_state/sentinel" ] || fail "absent-marker collision changed"
+        [ ! -e "$remote_state/.meet-beta-recovery-owner" ] ||
+          fail "absent-marker collision was adopted"
+        [ "$collision_root_metadata" = "$(stat -c '%a:%u:%g:%h' "$remote_state")" ] ||
+          fail "absent-marker collision metadata changed"
+        [ "$collision_root_digest" = "$(sha256sum "$remote_state/sentinel")" ] ||
+          fail "absent-marker collision bytes changed" ;;
+      collision-mismatch)
+        [ -f "$remote_state/.meet-beta-recovery-owner" ] ||
+          fail "mismatched-marker collision disappeared"
+        grep -Fq \
+          'meet-backend/beta-recovery-owner/v1:0000000000000000000000000000000000000000000000000000000000000000' \
+          "$remote_state/.meet-beta-recovery-owner" ||
+          fail "mismatched-marker collision changed"
+        [ "$collision_root_metadata" = "$(stat -c '%a:%u:%g:%h' "$remote_state")" ] ||
+          fail "mismatched-marker root metadata changed"
+        [ "$collision_marker_metadata" = "$(stat -c '%a:%u:%g:%h' \
+          "$remote_state/.meet-beta-recovery-owner")" ] ||
+          fail "mismatched-marker metadata changed"
+        [ "$collision_marker_digest" = "$(sha256sum \
+          "$remote_state/.meet-beta-recovery-owner")" ] ||
+          fail "mismatched-marker bytes changed" ;;
+    esac
+    return
+  fi
+  [ -f "$case_dir/mutation-sentinel" ] ||
+    fail "consumer $name did not record downstream mutation"
   if [ "$body" = "$capture_body" ]; then
+    [ "$(grep -c '^remote-create$' "$case_dir/boundary.log")" -eq 1 ] ||
+      fail "capture $name did not attempt marker-authenticated creation exactly once"
     [ "$(grep -c '^remote-cleanup$' "$case_dir/boundary.log")" -eq 1 ] ||
       fail "capture $name did not attempt remote cleanup exactly once"
-    grep -Fxq 'remote-admission' "$case_dir/boundary.log" ||
-      fail "capture $name did not record remote admission"
-    assert_event_order "$case_dir" helper-success private-key-created remote-admission \
+    assert_event_order "$case_dir" helper-success private-key-created remote-create \
       remote-cleanup local-cleanup
   else
     ! grep -q '^remote-cleanup$' "$case_dir/boundary.log" ||
@@ -1207,6 +1305,9 @@ for signal in HUP INT TERM; do
   run_consumer_case "post-probe-$signal" "$post_probe_body" "$signal" ssh
 done
 run_consumer_case capture-TERM-remote-cleanup-failure "$capture_body" TERM scp 1
+run_consumer_case capture-ambiguous-create "$capture_body" HUP scp 0 ambiguous
+run_consumer_case capture-collision-absent-marker "$capture_body" HUP scp 0 collision-absent
+run_consumer_case capture-collision-mismatched-marker "$capture_body" HUP scp 0 collision-mismatch
 
 for signal in HUP INT TERM; do
   pre_case=$consumer_root/cases/capture-pre-$signal

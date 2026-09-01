@@ -8,6 +8,15 @@ media=$root/scripts/beta-recovery-media-proof.sh
 for script in "$capture" "$backup" "$media"; do [ -x "$script" ] || fail "not executable: $script"; bash -n "$script"; done
 grep -Fq '.deploy.lock' "$capture"; grep -Fq 'reconcile_states' "$capture"; grep -Fq 'capture-database-proof.json' "$capture"
 grep -Fq 'export PRODUCTION_ROOT="$root"' "$capture"
+grep -Fq -- '--age-binary' "$capture"
+grep -Fq -- '--age-sha256' "$capture"
+grep -Fq -- '--age-version' "$capture"
+grep -Fq -- '--age-os' "$capture"
+grep -Fq -- '--age-arch' "$capture"
+grep -Fq 'realpath -e' "$capture"
+grep -Fq '"$age_binary" --version' "$capture"
+grep -Fq -- '--age-sha256' "$backup"
+grep -Fq 'age_binary_canonical' "$backup"
 grep -Fq 'export PRODUCTION_ROOT="$root"' "$root/scripts/probe-test-vps-recovery-runtime.sh"
 grep -Fq 'pg_database_size(current_database())' "$backup"; grep -Fq 'validate_upload_archive' "$backup"; grep -Fq 'tar --list --gzip --verbose' "$backup"
 grep -Fq 'jq -cS' "$backup"; grep -Fq 'capacity_ok' "$backup"; grep -Fq -- '--reference-list' "$backup"
@@ -86,7 +95,9 @@ format=${2:-}; path=${3:-}
 case "$format" in
   %u) id -u ;;
   %g) id -g ;;
-  %a) [ -d "$path" ] && printf '700\n' || printf '600\n' ;;
+  %a) [ -d "$path" ] && printf '700\n' || {
+    case "$path" in */age) printf '755\n' ;; *) printf '600\n' ;; esac
+  } ;;
   *) exec /usr/bin/stat "$@" ;;
 esac
 EOF
@@ -160,6 +171,11 @@ cat >"$backup_fixture/bin/age" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 events=${CAPTURE_BACKUP_EVENTS:?}; output=''
+if [ "${1:-}" = --version ]; then
+  printf 'v1.3.1\n'
+  exit 0
+fi
+printf 'age-argv-zero=%s\n' "$0" >>"${CAPTURE_AGE_ARGS_FILE:-/dev/null}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -r) shift 2 ;;
@@ -168,6 +184,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ -n "$output" ] || exit 2
+case "${CAPTURE_AGE_FAIL:-}" in
+  database) [[ "$output" == */postgres.dump.age ]] && exit 88 ;;
+  uploads) [[ "$output" == */uploads.tar.gz.age ]] && exit 89 ;;
+esac
 printf 'age\n' >>"$events"
 cat >"$output"
 EOF
@@ -176,6 +196,15 @@ cat >"$backup_fixture/bin/df" <<'EOF'
 set -euo pipefail
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
 printf 'fixture 1000000000 1000 999999000 1%% /fixture\n'
+EOF
+cat >"$backup_fixture/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  -s) printf 'Linux\n' ;;
+  -m) printf 'x86_64\n' ;;
+  *) exit 2 ;;
+esac
 EOF
 cat >"$backup_fixture/bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -234,28 +263,37 @@ jq -cnS '{schema:"meet-backend/test-vps-recovery-runtime/v1",healthy:true,
   https:{meetingsStatus:"200",meetingsJson:true,actuatorStatus:"404",httpRedirectHttps:true}}' >"$output"
 EOF
 chmod 700 "$backup_fixture/bin"/*
+chmod 755 "$backup_fixture/bin/age"
+chmod 755 "$backup_fixture/bin/uname"
 run_backup_capture_case() {
-  local label=$1 fail_size=$2 state_root="$backup_fixture/state-$1" output="$backup_fixture/output-$1"
+  local label=$1 fail_size=$2 age_fail=${3:-} state_root="$backup_fixture/state-$1" output="$backup_fixture/output-$1"
   local events="$backup_fixture/$label.events" clients="$backup_fixture/$label.clients"
   mkdir -p "$state_root" "$output"
+  cp -- "$backup_fixture/bin/age" "$output/age"
+  chmod 700 "$output"
+  chmod 755 "$output/age"
+  age_sha256=$(sha256sum "$output/age" | awk '{print $1}')
   printf untouched >"$state_root/.deploy.lock"
   : >"$events"; : >"$clients"
-  if CAPTURE_FAIL_SIZE="$fail_size" CAPTURE_BACKUP_EVENTS="$events" \
+  if CAPTURE_FAIL_SIZE="$fail_size" CAPTURE_AGE_FAIL="$age_fail" CAPTURE_BACKUP_EVENTS="$events" \
     CAPTURE_CLIENT_LOG="$clients" CAPTURE_BACKUP_BIN="$backup_fixture/bin" \
     CAPTURE_UPLOAD_ROOT="$backup_fixture/uploads" CAPTURE_POSTGRES_ROOT="$backup_fixture/postgres" \
-    CAPTURE_DOCKER_ROOT="$backup_fixture/docker" SUDO_UID='' SUDO_GID='' \
+    CAPTURE_DOCKER_ROOT="$backup_fixture/docker" CAPTURE_AGE_ARGS_FILE="$events.argv" \
+    SUDO_UID='' SUDO_GID='' \
     USER=root PGUSER=root PGDATABASE=root PATH="$backup_fixture/bin:$PATH" \
     bash "$capture" --recovery-id "recovery-$label" --root "$backup_fixture/root" \
       --output-dir "$output" \
       --recipient age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
       --public-url https://api.whysoezzy.online --state-root "$state_root" \
       --compose-script "$backup_fixture/bin/production-compose.sh" \
-      --probe-script "$backup_fixture/bin/probe" --backup-script "$backup"; then
-    [ "$fail_size" = 0 ] || fail "injected size failure succeeded"
+      --probe-script "$backup_fixture/bin/probe" --backup-script "$backup" \
+      --age-binary "$output/age" --age-sha256 "$age_sha256" --age-version v1.3.1 \
+      --age-os Linux --age-arch x86_64; then
+    [ "$fail_size" = 0 ] && [ -z "$age_fail" ] || fail "injected failure succeeded"
   else
-    [ "$fail_size" = 1 ] || fail "success fixture failed"
+    [ "$fail_size" = 1 ] || [ -n "$age_fail" ] || fail "success fixture failed"
   fi
-  if [ "$fail_size" = 0 ]; then
+  if [ "$fail_size" = 0 ] && [ -z "$age_fail" ]; then
     jq -se 'length==4 and ([.[].consumer]|sort)==["dump","media","proof","size"] and
       all(.[]; (.argv|index("-U")) != null and (.argv|index("configured_user")) != null and
       (.argv|index("-d")) != null and (.argv|index("configured_db")) != null)' "$clients" >/dev/null ||
@@ -265,6 +303,8 @@ run_backup_capture_case() {
       "$clients" >/dev/null || fail "media ON_ERROR_STOP was lost"
     grep -Fq 'stop backend' "$events" && grep -Fq 'start backend' "$events" ||
       fail "backend was not restarted"
+    [ "$(grep -Fc 'age-argv-zero=' "$events.argv")" = 2 ] ||
+      fail "both encryption streams did not use the admitted argv zero"
     ! grep -Fq 'root' "$clients" || fail "ambient identity reached a client"
     expected='capture-database-proof.json capture-media-proof.json capture-result.json capture-runtime.json post-capture.json postgres.dump.age uploads.tar.gz.age'
     actual=$(find "$output" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ' | sed 's/ $//')
@@ -278,14 +318,21 @@ run_backup_capture_case() {
     [ ! -e "$state_root/beta-recovery-recovery-$label" ] &&
       [ -f "$state_root/.deploy.lock" ] || fail "successful state cleanup was incomplete"
   else
-    [ "$(wc -l <"$clients" | tr -d '[:space:]')" = 1 ] &&
-      jq -e '.consumer=="size" and (.argv|index("configured_user"))!=null and
-        (.argv|index("configured_db"))!=null' "$clients" >/dev/null ||
-      fail "size failure did not use configured identity"
     [ "$(grep -Fc 'stop backend' "$events")" = 1 ] &&
       [ "$(grep -Fc 'start backend' "$events")" = 1 ] || fail "failure restarted wrong backend"
-    ! grep -Eq '^(media|proof|dump|age|run archive)$' "$events" ||
-      fail "failure continued after size query"
+    if [ -n "$age_fail" ]; then
+      [ "$(grep -Fc 'stop backend' "$events")" = 1 ] &&
+        [ "$(grep -Fc 'start backend' "$events")" = 1 ] ||
+        fail "encryption failure did not restart backend"
+      ! grep -Eq '^proof$' "$events" || fail "encryption failure reached publication"
+    else
+      [ "$(wc -l <"$clients" | tr -d '[:space:]')" = 1 ] &&
+        jq -e '.consumer=="size" and (.argv|index("configured_user"))!=null and
+          (.argv|index("configured_db"))!=null' "$clients" >/dev/null ||
+        fail "size failure did not use configured identity"
+      ! grep -Eq '^(media|proof|dump|age|run archive)$' "$events" ||
+        fail "failure continued after size query"
+    fi
     [ "$(cat "$backup_fixture/postgres/data-sentinel")" = unchanged ] ||
       fail "failure changed PostgreSQL sentinel"
     [ "$(cat "$backup_fixture/postgres/postgres-running")" = running ] ||
@@ -305,6 +352,23 @@ run_backup_capture_case() {
 }
 run_backup_capture_case success 0
 run_backup_capture_case failure 1
+run_backup_capture_case database-encryption 0 database
+run_backup_capture_case uploads-encryption 0 uploads
+direct_backup_dir="$backup_fixture/direct-symlink"
+mkdir -p "$direct_backup_dir"
+ln -s "$backup_fixture/bin/age" "$direct_backup_dir/age-link"
+: >"$backup_fixture/direct-symlink.events"
+if CAPTURE_BACKUP_EVENTS="$backup_fixture/direct-symlink.events" \
+  CAPTURE_CLIENT_LOG="$backup_fixture/direct-symlink.clients" \
+  CAPTURE_BACKUP_BIN="$backup_fixture/bin" \
+  PATH="$backup_fixture/bin:$PATH" AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+  bash "$backup" --beta --recovery-id recovery-direct-symlink \
+    --output-dir "$direct_backup_dir" --age-binary "$direct_backup_dir/age-link" \
+    --age-sha256 "$age_sha256"; then
+  fail "direct beta backup accepted a symlink age operand"
+fi
+[ ! -s "$backup_fixture/direct-symlink.events" ] ||
+  fail "symlink admission reached backup work"
 capture_fixture="$fixture/capture"
 mkdir -p "$capture_fixture/bin" "$capture_fixture/root"
 printf 'BACKEND_IMAGE=fixture\n' >"$capture_fixture/root/.env.production"
@@ -416,9 +480,26 @@ elif [[ "$url" == */actuator ]]; then
   printf '404\n'
 fi
 EOF
+cat >"$capture_fixture/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+format=${2:-}; path=${3:-}
+if [ "${CAPTURE_ADMISSION_OWNER:-}" = wrong ] &&
+  { [ "$format" = %u ] || [ "$format" = %g ]; } &&
+  { [[ "$path" == */age ]] || [ "$path" = "${CAPTURE_ADMISSION_OUTPUT:-}" ]; }; then
+  printf '999\n'
+  exit 0
+fi
+if [ "${CAPTURE_ADMISSION_MODE:-}" = wrong-age ] &&
+  [ "$format" = %a ] && [[ "$path" == */age ]]; then
+  printf '754\n'
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+EOF
 chmod 700 "$capture_fixture/bin/install" "$capture_fixture/bin/flock" \
   "$capture_fixture/bin/docker" "$capture_fixture/bin/compose" "$capture_fixture/bin/probe" \
-  "$capture_fixture/bin/curl"
+  "$capture_fixture/bin/curl" "$capture_fixture/bin/stat"
 probe_output="$capture_fixture/probe.json"
 CAPTURE_CALLS_FILE="$capture_fixture/valid-calls.log" \
   CAPTURE_EXPECTED_PRODUCTION_ROOT="$capture_fixture/root" \
@@ -491,6 +572,79 @@ if [ "$symlink_supported" = true ]; then
   run_capture_admission_case symlink "$capture_fixture/symlink-root"
   run_capture_admission_case symlink-env "$capture_fixture/symlink-env"
 fi
+run_age_admission_case() {
+  local label=$1 mutation=$2
+  local state_dir="$capture_fixture/age-admission-$label"
+  local output_dir="$capture_fixture/age-output-$label"
+  local age_digest age_version=v1.3.1 age_os=Linux age_arch=x86_64
+  mkdir -p "$state_dir" "$output_dir"
+  chmod 700 "$output_dir"
+  cp -- "$backup_fixture/bin/age" "$output_dir/age"
+  chmod 755 "$output_dir/age"
+  age_digest=$(sha256sum "$output_dir/age" | awk '{print $1}')
+  case "$mutation" in
+    missing) rm -f -- "$output_dir/age" ;;
+    empty) : >"$output_dir/age" ;;
+    non-executable) chmod 644 "$output_dir/age" ;;
+    wrong-mode) chmod 754 "$output_dir/age" ;;
+    wrong-root-mode) chmod 755 "$output_dir" ;;
+    symlink)
+      rm -f -- "$output_dir/age"
+      ln -s "$capture_fixture/valid-age" "$output_dir/age" ;;
+    non-regular)
+      rm -f -- "$output_dir/age"
+      mkdir "$output_dir/age" ;;
+    wrong-owner) ;;
+    wrong-digest) age_digest=0000000000000000000000000000000000000000000000000000000000000000 ;;
+    malformed-digest) age_digest=not-a-digest ;;
+    wrong-platform) age_os=Darwin ;;
+    wrong-architecture) age_arch=i686 ;;
+    wrong-version) age_version=v9.9.9 ;;
+    stat-mode) ;;
+    *) fail "unknown age admission mutation: $mutation" ;;
+  esac
+  printf before >"$state_dir/sentinel"
+  : >"$capture_fixture/age-admission-calls.log"
+  if CAPTURE_CALLS_FILE="$capture_fixture/age-admission-calls.log" \
+    CAPTURE_ADMISSION_OWNER="$([ "$mutation" = wrong-owner ] && echo wrong || true)" \
+    CAPTURE_ADMISSION_MODE="$([ "$mutation" = stat-mode ] && echo wrong-age || true)" \
+    CAPTURE_ADMISSION_OUTPUT="$output_dir" \
+    PATH="$capture_fixture/bin:$PATH" \
+    bash "$capture" --recovery-id "recovery-age-$label" \
+      --root "$capture_fixture/root" --output-dir "$output_dir" \
+      --recipient age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+      --public-url https://api.whysoezzy.online --state-root "$state_dir" \
+      --compose-script "$capture_fixture/bin/compose" \
+      --probe-script "$capture_fixture/bin/probe" \
+      --backup-script "$capture_fixture/bin/compose" \
+      --age-binary "$output_dir/age" --age-sha256 "$age_digest" \
+      --age-version "$age_version" --age-os "$age_os" --age-arch "$age_arch"; then
+    fail "invalid age admission $label was accepted"
+  fi
+  [ ! -s "$capture_fixture/age-admission-calls.log" ] ||
+    fail "invalid age admission $label reached downstream work"
+  [ "$(cat "$state_dir/sentinel")" = before ] ||
+    fail "invalid age admission $label changed state"
+  [ ! -e "$state_dir/.deploy.lock" ] ||
+    fail "invalid age admission $label acquired the deploy lock"
+  [ ! -e "$state_dir/beta-recovery-recovery-age-$label" ] ||
+    fail "invalid age admission $label created journal state"
+}
+cp -- "$backup_fixture/bin/age" "$capture_fixture/valid-age"
+chmod 755 "$capture_fixture/valid-age"
+age_mode_probe="$capture_fixture/age-mode-probe"
+mkdir "$age_mode_probe"
+chmod 700 "$age_mode_probe"
+if [ "$(stat -c '%a' "$age_mode_probe")" = 700 ]; then
+  for age_mutation in missing empty non-executable wrong-mode symlink non-regular \
+    wrong-root-mode wrong-owner wrong-digest malformed-digest wrong-platform wrong-architecture \
+    wrong-version stat-mode; do
+    run_age_admission_case "$age_mutation" "$age_mutation"
+  done
+else
+  echo "beta recovery capture fixture: executable admission matrix skipped (POSIX modes unavailable)"
+fi
+rm -r -- "$age_mode_probe"
 run_probe_admission_case missing "$capture_fixture/missing-root"
 run_probe_admission_case blank ''
 run_probe_admission_case relative relative/root

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-usage(){ echo "usage: $0 --recovery-id ID --root PATH --output-dir PATH --recipient AGE-RECIPIENT --public-url https://HOST" >&2; exit 2; }
+usage(){ echo "usage: $0 [reconcile] --recovery-id ID --root PATH --output-dir PATH --recipient AGE-RECIPIENT --public-url https://HOST [--age-binary PATH --age-sha256 SHA256 --age-version VERSION --age-os OS --age-arch ARCH]" >&2; exit 2; }
 fail(){ echo "beta recovery capture failed: $*" >&2; exit 1; }
 mode=capture; recovery_id='' root='' output='' recipient='' public_url=''
+age_binary='' age_sha256='' age_version='' age_os='' age_arch=''
 state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}; compose=''; backup=''; probe=''; current_runtime=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -10,6 +11,9 @@ while [ "$#" -gt 0 ]; do
     --recovery-id) recovery_id=$2; shift 2;; --root) root=$2; shift 2;;
     --output-dir|--output) output=$2; shift 2;; --recipient) recipient=$2; shift 2;;
     --public-url) public_url=$2; shift 2;; --state-root) state_root=$2; shift 2;;
+    --age-binary) age_binary=$2; shift 2;; --age-sha256) age_sha256=$2; shift 2;;
+    --age-version) age_version=$2; shift 2;; --age-os) age_os=$2; shift 2;;
+    --age-arch) age_arch=$2; shift 2;;
     --compose-script) compose=$2; shift 2;; --backup-script) backup=$2; shift 2;;
     --probe-script) probe=$2; shift 2;; --current-runtime) current_runtime=$2; shift 2;;
     *) usage;;
@@ -28,9 +32,14 @@ if [ "$mode" = capture ]; then
   [[ "$recovery_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]] || usage
   [[ "$recipient" =~ ^age1[0-9a-z]+$ ]] || fail "recipient malformed"
   [ -n "$output" ] && [ -d "$output" ] && [ ! -L "$output" ] || usage
+  [ -n "$age_binary" ] && [ -n "$age_sha256" ] && [ -n "$age_version" ] &&
+    [ -n "$age_os" ] && [ -n "$age_arch" ] || usage
 fi
 [[ "$public_url" =~ ^https://[^/]+$ ]] || fail "public HTTPS URL is required"
 for tool in docker flock jq stat find mktemp; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
+if [ "$mode" = capture ]; then
+  for tool in realpath sha256sum uname; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
+fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 compose=${compose:-${PRODUCTION_COMPOSE_SCRIPT:-"$script_dir/production-compose.sh"}}
 backup=${backup:-${BETA_BACKUP_SCRIPT:-"$script_dir/backup-production.sh"}}
@@ -41,6 +50,33 @@ media_proof=${BETA_MEDIA_PROOF_SCRIPT:-"$script_dir/beta-recovery-media-proof.sh
 [ -f "$database_proof" ] && [ -x "$media_proof" ] || fail "capture proof tooling is unavailable"
 [ -z "$current_runtime" ] || { [ -f "$current_runtime" ] && [ ! -L "$current_runtime" ]; } || fail "current runtime proof is unsafe"
 reconcile_output=''; [ "$mode" = reconcile ] && { [ -n "$output" ] && [ ! -e "$output" ] && [ -d "$(dirname "$output")" ] || usage; reconcile_output=$output; }
+if [ "$mode" = capture ]; then
+  case "$output" in /*) ;; *) fail "capture output path must be absolute";; esac
+  case "$age_binary" in /*) ;; *) fail "age binary path must be absolute";; esac
+  canonical_output=$(realpath -e -- "$output") || fail "capture output path is unavailable"
+  canonical_age=$(realpath -e -- "$age_binary") || fail "age binary path is unavailable"
+  [ "$canonical_output" = "$output" ] || fail "capture output path is not canonical"
+  [ "$canonical_age" = "$output/age" ] || fail "age binary path is not the staged file"
+  [ -d "$output" ] && [ ! -L "$output" ] || fail "capture output root is unsafe"
+  [ "$(stat -c '%a' "$output")" = 700 ] || fail "capture output root mode differs"
+  expected_uid=${SUDO_UID:-$(id -u)}; expected_gid=${SUDO_GID:-$(id -g)}
+  [ "$(stat -c '%u' "$output")" = "$expected_uid" ] &&
+    [ "$(stat -c '%g' "$output")" = "$expected_gid" ] || fail "capture output owner differs"
+  [ -f "$age_binary" ] && [ ! -L "$age_binary" ] && [ -s "$age_binary" ] &&
+    [ -x "$age_binary" ] || fail "age binary is unsafe"
+  [ "$(stat -c '%a' "$age_binary")" = 755 ] || fail "age binary mode differs"
+  [ "$(stat -c '%u' "$age_binary")" = "$expected_uid" ] &&
+    [ "$(stat -c '%g' "$age_binary")" = "$expected_gid" ] || fail "age binary owner differs"
+  [[ "$age_sha256" =~ ^[0-9a-f]{64}$ ]] || fail "age digest is malformed"
+  [ "$(sha256sum "$age_binary" | awk '{print $1}')" = "$age_sha256" ] ||
+    fail "age digest differs"
+  [[ "$age_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "age version is malformed"
+  [[ "$age_os" =~ ^[A-Za-z0-9._-]+$ ]] || fail "age OS is malformed"
+  [[ "$age_arch" =~ ^[A-Za-z0-9._-]+$ ]] || fail "age architecture is malformed"
+  [ "$(uname -s)" = "$age_os" ] || fail "age OS differs"
+  [ "$(uname -m)" = "$age_arch" ] || fail "age architecture differs"
+  [ "$("$age_binary" --version)" = "$age_version" ] || fail "age version differs"
+fi
 install -d -m 700 "$state_root"; [ ! -L "$state_root" ] || fail "state root is unsafe"
 exec 9>"$state_root/.deploy.lock"; flock -n 9 || fail "deploy lock is busy"
 probe_runtime(){
@@ -180,10 +216,16 @@ published=(); pre_tmp=''
 cleanup_staged(){
   local file status=0
   case "$script_dir" in /tmp/beta-recovery-*|/var/tmp/beta-recovery-*)
-    for file in run-beta-recovery-capture.sh backup-production.sh probe-test-vps-recovery-runtime.sh production-compose.sh beta-recovery-database-proof.sql beta-recovery-media-proof.sh; do
+    for file in run-beta-recovery-capture.sh backup-production.sh probe-test-vps-recovery-runtime.sh production-compose.sh beta-recovery-database-proof.sql beta-recovery-media-proof.sh age; do
       [ ! -e "$script_dir/$file" ] || rm -f -- "$script_dir/$file" || status=1
       [ ! -e "$script_dir/$file" ] || status=1
     done;; esac
+  if [ "$mode" = capture ] && [ "$age_binary" = "$output/age" ]; then
+    if [ -e "$age_binary" ]; then
+      rm -f -- "$age_binary" || status=1
+    fi
+    [ ! -e "$age_binary" ] || status=1
+  fi
   return "$status"
 }
 cleanup(){
@@ -205,7 +247,8 @@ write_journal pre_stop
 export AGE_RECIPIENT="$recipient" BACKUP_DIR="$state/private"
 production_scripts_dir=$(dirname -- "$compose"); export PRODUCTION_SCRIPTS_DIR="$production_scripts_dir"
 export BETA_DATABASE_PROOF_SCRIPT="$database_proof" BETA_MEDIA_PROOF_SCRIPT="$media_proof"
-"$backup" --beta --recovery-id "$recovery_id" --output-dir "$state/private" || fail "beta backup failed"
+"$backup" --beta --recovery-id "$recovery_id" --output-dir "$state/private" \
+  --age-binary "$age_binary" --age-sha256 "$age_sha256" || fail "beta backup failed"
 write_journal snapshot_complete
 post=$state/private/post-capture.json; probe_runtime "$post"; cmp -- "$state/private/capture-runtime.json" "$post" || fail "runtime or HTTPS changed during capture"; write_journal runtime_verified
 for file in postgres.dump.age uploads.tar.gz.age capture-database-proof.json capture-media-proof.json capture-result.json capture-runtime.json post-capture.json; do [ -f "$state/private/$file" ] && [ ! -L "$state/private/$file" ] || fail "capture output incomplete"; done

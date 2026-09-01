@@ -8,7 +8,16 @@ The capture artifact contains exactly `postgres.dump.age`,
 `uploads.tar.gz.age`, and `recovery-point.json`; the aggregate proofs and
 runtime fingerprint are embedded only in that manifest.
 
-The capture job has `test-vps` SSH and only the public age recipient. The
+The capture job provisions and canaries the repository's pinned age executable
+in ephemeral runner storage, then transports exactly that one mode-0755
+encryption binary with the reviewed capture scripts and only the public age
+recipient. The capture VPS admits the absolute staged path, owner, mode,
+platform, exact version, and SHA-256 before taking the deploy lock, probing
+runtime state, creating a journal, or stopping the backend. The beta backup
+consumer rechecks that the operand is already canonical and non-symlinked and
+verifies the same SHA-256 immediately before either encryption stream. Capture never uses
+an ambient `PATH` age, a VPS package/download, `age-keygen`, or a private
+identity. The
 protected `closed-beta-restore` job has only the private age identity and no
 test-VPS variables, route, active-volume name, or host path. The pre- and
 post-restore probes have SSH only. Dispatch requires a new recovery ID and the
@@ -45,14 +54,23 @@ Environment, followed by a new authorized run; there is no fallback and failed
 runs are not resumed.
 
 Capture holds `/var/lib/meet-test-vps-deploy/.deploy.lock` only for the bounded
-snapshot and runtime recovery section. It rejects an active SMTP transaction,
+snapshot and runtime recovery section. The temporary remote root is
+authenticated by a per-run 64-hex ownership token in a strict
+`.meet-beta-recovery-owner` marker. If SSH reports failure after root and marker
+creation, cleanup still removes the root only when path, type, owner, modes,
+link count, and marker bytes authenticate this run; absent or mismatched-marker
+collisions are preserved byte-for-byte and metadata-for-metadata, and cleanup
+failure is fatal. It rejects an active SMTP transaction,
 proves a healthy populated runtime and HTTPS edge, and uses fixed
 `postgres.dump.age` and `uploads.tar.gz.age` names in a fresh mode-0700
 run-owned directory. Plaintext never leaves the VPS.
 Every capture `psql` and `pg_dump` consumer receives the Compose service's
-explicit PostgreSQL user and database. If an early query fails, the exact
-backend is restarted, no partial output is published, and the owned
-nonterminal journal remains for reviewed reconciliation.
+explicit PostgreSQL user and database. If an early query or either
+post-quiescence encryption stream fails, the exact backend is restarted once,
+all partial or completed capture products and staging are removed, no output or
+artifact is published, and the owned nonterminal `pre_stop` journal remains for
+reviewed reconciliation. A new authorized run is required after any failed
+capture; interrupted runs are not retried or resumed.
 
 Capture-local journals are not global gates. A fresh process validates their
 schema, digest, recovery ID, and owned paths. An unchanged interrupted runtime
