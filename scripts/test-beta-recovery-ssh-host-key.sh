@@ -865,7 +865,7 @@ write_wrapper "$consumer_bin/sha256sum" \
   '    fi' \
   '    ;;' \
   'esac' \
-  'exec "${BETA_RECOVERY_REAL_SHA256SUM:?}" "$@"'
+  'exec "${BETA_RECOVERY_REAL_SHA256SUM:-/usr/bin/sha256sum}" "$@"'
 
 write_wrapper "$consumer_bin/ln" \
   '#!/usr/bin/env bash' \
