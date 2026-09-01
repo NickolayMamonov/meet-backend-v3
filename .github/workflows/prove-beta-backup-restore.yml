@@ -167,6 +167,7 @@ jobs:
             local status=$1
             trap - EXIT HUP INT TERM
             if [ "$remote_create_attempted" = true ] && ! cleanup_remote; then
+              echo "remote staging cleanup failed" >&2
               status=1
             fi
             [ -z "$recipient_file" ] || rm -f -- "$recipient_file" || status=1
@@ -300,8 +301,9 @@ jobs:
               (.size|type=="number" and floor==. and .>0) and
               (.sha256|type=="string" and test("^[0-9a-f]{64}$"))) and
             (.proofs|type=="object" and (keys|sort)==["database","media"]) and
-            all(.proofs[]; (keys|sort)==["name","sha256"] and
-              (.sha256|type=="string" and test("^[0-9a-f]{64}$"))) and
+            all(.proofs[];
+              (keys | map(select(. != "sha256")) | sort)==["name"] and
+              (.name|type=="string")) and
             (.recoveryId==$id) and (.capturedAt==.recoveryPointTime)
           ' --arg id "$RECOVERY_ID" "$capture_result" >/dev/null
           db_bytes=$(jq -er '.databaseBytes' "$capture_result")
@@ -317,11 +319,38 @@ jobs:
             [ "$uploads_cipher_size" = "$(jq -er '.ciphertexts.uploads.size' "$capture_result")" ] &&
             [ "$uploads_cipher_sha" = "$(jq -er '.ciphertexts.uploads.sha256' "$capture_result")" ] ||
             { echo "transferred ciphertext differs from quiesced capture result" >&2; exit 1; }
-          [ "$(sha256sum "$RUNNER_TEMP/database-proof.json" | awk '{print $1}')" =
-            "$(jq -er '.proofs.database.sha256' "$capture_result")" ] &&
-            [ "$(sha256sum "$RUNNER_TEMP/media-proof.json" | awk '{print $1}')" =
-            "$(jq -er '.proofs.media.sha256' "$capture_result")" ] ||
-            { echo "transferred proof differs from quiesced capture result" >&2; exit 1; }
+          if ! database_proof_actual_sha=$(sha256sum "$RUNNER_TEMP/database-proof.json" |
+            awk '{print $1}'); then
+            echo "database proof hash failed" >&2
+            exit 1
+          fi
+          if ! database_proof_expected_sha=$(jq -er \
+            '.proofs.database.sha256 // empty' "$capture_result" 2>/dev/null); then
+            echo "database proof expected digest is missing or malformed" >&2
+            exit 1
+          fi
+          if ! media_proof_actual_sha=$(sha256sum "$RUNNER_TEMP/media-proof.json" |
+            awk '{print $1}'); then
+            echo "media proof hash failed" >&2
+            exit 1
+          fi
+          if ! media_proof_expected_sha=$(jq -er \
+            '.proofs.media.sha256 // empty' "$capture_result" 2>/dev/null); then
+            echo "media proof expected digest is missing or malformed" >&2
+            exit 1
+          fi
+          [[ "$database_proof_actual_sha" =~ ^[0-9a-f]{64}$ ]] ||
+            { echo "database proof digest is invalid" >&2; exit 1; }
+          [[ "$database_proof_expected_sha" =~ ^[0-9a-f]{64}$ ]] ||
+            { echo "database proof expected digest is invalid" >&2; exit 1; }
+          [[ "$media_proof_actual_sha" =~ ^[0-9a-f]{64}$ ]] ||
+            { echo "media proof digest is invalid" >&2; exit 1; }
+          [[ "$media_proof_expected_sha" =~ ^[0-9a-f]{64}$ ]] ||
+            { echo "media proof expected digest is invalid" >&2; exit 1; }
+          [ "$database_proof_actual_sha" = "$database_proof_expected_sha" ] ||
+            { echo "database proof differs from quiesced capture result" >&2; exit 1; }
+          [ "$media_proof_actual_sha" = "$media_proof_expected_sha" ] ||
+            { echo "media proof differs from quiesced capture result" >&2; exit 1; }
           [ "$uploads_files" = "$(jq -er '.files' "$RUNNER_TEMP/media-proof.json")" ] &&
             [ "$uploads_bytes" = "$(jq -er '.bytes' "$RUNNER_TEMP/media-proof.json")" ] &&
             [ "$uploads_digest" = "$(jq -er '.canonicalDigest' "$RUNNER_TEMP/media-proof.json")" ] ||
@@ -335,26 +364,27 @@ jobs:
           chmod 600 "$RUNNER_TEMP/"*.age "$RUNNER_TEMP/"*.json
           cleanup_remote || { echo "remote staging cleanup failed" >&2; exit 1; }
           mkdir "$RUNNER_TEMP/artifact"
-          scripts/build-beta-recovery-evidence.sh manifest \
-            --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
-            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
-            --artifact-name "beta-recovery-$RECOVERY_ID-$GITHUB_RUN_ID" \
-            --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh \
+          tooling_digest=$(for file in scripts/authorize-beta-recovery.sh \
               scripts/run-beta-recovery-capture.sh scripts/run-beta-recovery-restore.sh \
               scripts/build-beta-recovery-evidence.sh scripts/probe-test-vps-recovery-runtime.sh \
               scripts/backup-production.sh scripts/beta-recovery-database-proof.sql \
               scripts/beta-recovery-media-proof.sh scripts/install-beta-recovery-age.sh \
               scripts/materialize-beta-recovery-known-hosts.sh; do sha256sum "$file"; done |
-              sort | sha256sum | awk '{print $1}')" \
+              sort | sha256sum | awk '{print $1}')
+          scripts/build-beta-recovery-evidence.sh manifest \
+            --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --artifact-name "beta-recovery-$RECOVERY_ID-$GITHUB_RUN_ID" \
+            --tooling-digest "$tooling_digest" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
             --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')" \
             --captured-at "$captured_at" \
             --point-time "$point_time" --observed-age-seconds "$observed_age" \
             --database-bytes "$db_bytes" \
-            --uploads-files "$(jq -r '.files' "$RUNNER_TEMP/media-proof.json')" \
-            --uploads-bytes "$(jq -r '.bytes' "$RUNNER_TEMP/media-proof.json")" \
-            --uploads-digest "$(jq -r '.canonicalDigest' "$RUNNER_TEMP/media-proof.json")" \
+            --uploads-files "$uploads_files" \
+            --uploads-bytes "$uploads_bytes" \
+            --uploads-digest "$uploads_digest" \
             --database-proof "$RUNNER_TEMP/database-proof.json" --media-proof "$RUNNER_TEMP/media-proof.json" \
             --runtime-proof "$RUNNER_TEMP/capture-runtime.json" \
             --database-ciphertext "$RUNNER_TEMP/postgres.dump.age" \

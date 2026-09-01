@@ -72,6 +72,15 @@ artifact is published, and the owned nonterminal `pre_stop` journal remains for
 reviewed reconciliation. A new authorized run is required after any failed
 capture; interrupted runs are not retried or resumed.
 
+After transfer, the database and media proof files are independently hashed and
+matched against the exact lowercase SHA-256 digests in the quiesced capture
+result before authenticated remote cleanup, evidence construction, or artifact
+publication. A malformed, missing, unreadable, unhashable, or mismatched proof
+is terminal; authenticated cleanup remains mandatory and a cleanup failure is
+fatal. No artifact is eligible and restore custody is never reached after such
+a failure. Remediate the reported cause and dispatch a brand-new authorized
+recovery; do not retry or resume the failed run.
+
 Capture-local journals are not global gates. A fresh process validates their
 schema, digest, recovery ID, and owned paths. An unchanged interrupted runtime
 is restarted and terminalized as `incident_resolved`. A healthy independent

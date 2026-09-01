@@ -19,6 +19,7 @@ done
 
 original_path=$PATH
 real_ssh_keygen=$(command -v ssh-keygen)
+real_sha256sum=$(command -v sha256sum)
 real_rm=$(command -v rm)
 temporary_root=$(mktemp -d)
 chmod 700 -- "$temporary_root"
@@ -849,6 +850,23 @@ write_wrapper "$consumer_bin/ssh-keygen" \
   'set -euo pipefail' \
   'exec "${BETA_RECOVERY_REAL_SSH_KEYGEN:?}" "$@"'
 
+write_wrapper "$consumer_bin/sha256sum" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'target=${@: -1}' \
+  'case "$(basename -- "$target")" in' \
+  '  database-proof.json|media-proof.json)' \
+  '    if [ "${BETA_RECOVERY_CAPTURE_SHA_TARGET:-}" = "$(basename -- "$target")" ]; then' \
+  '      case "${BETA_RECOVERY_CAPTURE_SHA_MODE:-}" in' \
+  '        fail) exit 43 ;;' \
+  '        malformed) printf "not-a-digest  %s\n" "$target"; exit 0 ;;' \
+  '        missing) "${BETA_RECOVERY_REAL_RM:?}" -f -- "$target" ;;' \
+  '      esac' \
+  '    fi' \
+  '    ;;' \
+  'esac' \
+  'exec "${BETA_RECOVERY_REAL_SHA256SUM:-/usr/bin/sha256sum}" "$@"'
+
 write_wrapper "$consumer_bin/ln" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -949,6 +967,23 @@ write_wrapper "$consumer_bin/ssh" \
   'for ((i=0; i<${#args[@]}; i++)); do' \
   '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
   'done' \
+  'if [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ] &&' \
+  '  [ "$command_start" -ge 0 ] && [[ "${args[command_start]:-}" == "sudo cat "* ]]; then' \
+  '  command_text=${args[command_start]}' \
+  '  case "$command_text" in' \
+  '    *postgres.dump.age*) file=postgres.dump.age ;;' \
+  '    *uploads.tar.gz.age*) file=uploads.tar.gz.age ;;' \
+  '    *capture-runtime.json*) file=capture-runtime.json ;;' \
+  '    *database-proof.json*) file=database-proof.json ;;' \
+  '    *media-proof.json*) file=media-proof.json ;;' \
+  '    *capture-result.json*) file=capture-result.json ;;' \
+  '    *) printf "unexpected remote read\n" >&2; exit 54 ;;' \
+  '  esac' \
+  '  if [ "${BETA_RECOVERY_CAPTURE_READ_FAIL:-}" = "$file" ]; then exit 55; fi' \
+  '  printf "remote-read-%s\n" "$file" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  cat "$BETA_RECOVERY_CAPTURE_SOURCE_DIR/$file"' \
+  '  exit 0' \
+  'fi' \
   'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
   '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -s ] &&' \
   '  [ "${args[command_start+3]:-}" = -- ]; then' \
@@ -979,6 +1014,10 @@ write_wrapper "$consumer_bin/ssh" \
   '    [ "$(stat -c "%a:%h" "$marker")" = 600:1 ] || exit 45' \
   '    [ "$(<"$marker")" = "meet-backend/beta-recovery-owner/v1:$token_arg" ] || exit 45' \
   '    rm -r "$remote_state"; exit $?' \
+  '  elif [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ] &&' \
+  '    printf "%s" "$body" | grep -Fq '\''bash "$remote/run-beta-recovery-capture.sh"'\''; then' \
+  '    printf "remote-capture\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '    exit 0' \
   '  fi' \
   'fi' \
   'printf "remote-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
@@ -1024,6 +1063,10 @@ write_wrapper "$consumer_bin/scp" \
   '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG"' \
   'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
   'printf "scp-call\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'if [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ]; then' \
+  '  printf "scp-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  exit 0' \
+  'fi' \
   'printf "scp-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'touch "${BETA_RECOVERY_MUTATION_SENTINEL:?}"' \
   'printf "scp-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
@@ -1048,6 +1091,39 @@ extract_consumer '      - name: Stage and run the locked VPS capture' "$capture_
 extract_consumer '      - name: SSH-only pre-probe' "$pre_probe_body"
 extract_consumer '      - id: post_probe' "$post_probe_body"
 chmod 700 "$capture_body" "$pre_probe_body" "$post_probe_body"
+
+semantic_workspace=$consumer_root/semantic-workspace
+mkdir -p "$semantic_workspace/scripts"
+cp -- "$root/scripts/materialize-beta-recovery-known-hosts.sh" \
+  "$semantic_workspace/scripts/materialize-beta-recovery-known-hosts.sh"
+chmod 700 "$semantic_workspace/scripts/materialize-beta-recovery-known-hosts.sh"
+fake_age=$semantic_workspace/fake-age
+write_wrapper "$fake_age" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '[ "${1:-}" = --version ] && printf "v1.3.1\n" || exit 0'
+write_wrapper "$semantic_workspace/scripts/install-beta-recovery-age.sh" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'install_dir=$1' \
+  'mkdir -p "$install_dir"' \
+  'cp -- "${BETA_RECOVERY_FAKE_AGE:?}" "$install_dir/age"' \
+  'chmod 755 "$install_dir/age"'
+write_wrapper "$semantic_workspace/scripts/build-beta-recovery-evidence.sh" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'kind=${1:?}' \
+  'printf "evidence-%s\n" "$kind" >>"${BETA_RECOVERY_BOUNDARY_LOG:?}"' \
+  '[ -z "${BETA_RECOVERY_MUTATION_SENTINEL:-}" ] || : >"$BETA_RECOVERY_MUTATION_SENTINEL"' \
+  'if [ "$kind" = manifest ]; then' \
+  '  output=' \
+  '  args=("$@")' \
+  '  for ((i=0; i<${#args[@]}; i++)); do' \
+  '    [ "${args[i]}" = --output ] && output=${args[i+1]:-}' \
+  '  done' \
+  '  [ -n "$output" ] || exit 61' \
+  '  printf "{}\n" >"$output"' \
+  'fi'
 
 assert_consumer_residue_absent() {
   local case_dir=$1
@@ -1308,6 +1384,230 @@ run_consumer_case capture-TERM-remote-cleanup-failure "$capture_body" TERM scp 1
 run_consumer_case capture-ambiguous-create "$capture_body" HUP scp 0 ambiguous
 run_consumer_case capture-collision-absent-marker "$capture_body" HUP scp 0 collision-absent
 run_consumer_case capture-collision-mismatched-marker "$capture_body" HUP scp 0 collision-mismatch
+
+run_capture_proof_case() {
+  local name=$1 scenario=$2
+  local case_dir=$consumer_root/cases/$name remote_state
+  local db_sha media_sha db_expected media_expected uploads_digest
+  local status cleanup_failure=0 read_fail='' sha_target='' sha_mode=''
+  mkdir -p "$case_dir/runner" "$case_dir/home/.ssh" "$case_dir/remote-files"
+  chmod 700 "$case_dir" "$case_dir/runner" "$case_dir/home" \
+    "$case_dir/home/.ssh" "$case_dir/remote-files"
+  printf '%s\n' \
+    'encrypted database fixture' >"$case_dir/remote-files/postgres.dump.age"
+  printf '%s\n' \
+    'encrypted uploads fixture' >"$case_dir/remote-files/uploads.tar.gz.age"
+  printf '{}\n' >"$case_dir/remote-files/capture-runtime.json"
+  printf '{"schema":"fixture-database-proof"}\n' \
+    >"$case_dir/remote-files/database-proof.json"
+  printf '%s\n' \
+    '{"bytes":23,"canonicalDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","files":1,"referencesResolved":1,"referencesTotal":1,"schema":"fixture-media-proof"}' \
+    >"$case_dir/remote-files/media-proof.json"
+  db_sha=$("$real_sha256sum" "$case_dir/remote-files/database-proof.json" |
+    awk '{print $1}')
+  media_sha=$("$real_sha256sum" "$case_dir/remote-files/media-proof.json" |
+    awk '{print $1}')
+  uploads_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  db_expected=$db_sha
+  media_expected=$media_sha
+  case "$scenario" in
+    database-mismatch)
+      db_expected=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+    media-mismatch)
+      media_expected=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc ;;
+    malformed-expected|malformed-expected-cleanup)
+      db_expected=not-a-digest ;;
+    missing-expected|missing-expected-cleanup) ;;
+    remote-read-failure|hash-failure|local-proof-failure|matching) ;;
+    cleanup-failure)
+      db_expected=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd ;;
+    *) fail "unknown proof scenario: $scenario" ;;
+  esac
+  jq -cn \
+    --arg db "$db_expected" --arg media "$media_expected" \
+    --arg uploads "$uploads_digest" \
+    '{
+      capturedAt:"2026-09-01T00:00:00Z",
+      ciphertexts:{
+        database:{name:"postgres.dump.age",sha256:"",size:25},
+        uploads:{name:"uploads.tar.gz.age",sha256:"",size:25}
+      },
+      databaseBytes:23,
+      proofs:{
+        database:{name:"capture-database-proof.json",sha256:$db},
+        media:{name:"capture-media-proof.json",sha256:$media}
+      },
+      recoveryId:"recovery-fixture",
+      recoveryPointTime:"2026-09-01T00:00:00Z",
+      schema:"meet-backend/beta-recovery-capture/v1",
+      uploads:{bytes:23,digest:$uploads,files:1}
+    }' >"$case_dir/remote-files/capture-result.json"
+  if [ "$scenario" = missing-expected ] ||
+    [ "$scenario" = missing-expected-cleanup ]; then
+    jq 'del(.proofs.database.sha256)' "$case_dir/remote-files/capture-result.json" \
+      >"$case_dir/remote-files/capture-result.tmp"
+    mv -- "$case_dir/remote-files/capture-result.tmp" \
+      "$case_dir/remote-files/capture-result.json"
+  fi
+  db_cipher_sha=$("$real_sha256sum" "$case_dir/remote-files/postgres.dump.age" |
+    awk '{print $1}')
+  uploads_cipher_sha=$("$real_sha256sum" "$case_dir/remote-files/uploads.tar.gz.age" |
+    awk '{print $1}')
+  jq --arg db "$db_cipher_sha" --arg uploads "$uploads_cipher_sha" \
+    --arg db_size "$(wc -c <"$case_dir/remote-files/postgres.dump.age" |
+      tr -d '[:space:]')" \
+    --arg uploads_size "$(wc -c <"$case_dir/remote-files/uploads.tar.gz.age" |
+      tr -d '[:space:]')" \
+    '.ciphertexts.database.sha256=$db |
+     .ciphertexts.database.size=($db_size|tonumber) |
+     .ciphertexts.uploads.sha256=$uploads |
+     .ciphertexts.uploads.size=($uploads_size|tonumber)' \
+    "$case_dir/remote-files/capture-result.json" \
+    >"$case_dir/remote-files/capture-result.final"
+  mv -- "$case_dir/remote-files/capture-result.final" \
+    "$case_dir/remote-files/capture-result.json"
+  printf '%s\n' \
+    'Host *' '  HostName hostile.example.invalid' '  Port 1' \
+    '  UserKnownHostsFile /tmp/hostile-user-known-hosts' \
+    '  GlobalKnownHostsFile /tmp/hostile-global-known-hosts' \
+    '  KnownHostsCommand /bin/false' '  ProxyCommand /bin/false' \
+    '  ProxyJump hostile-jump.invalid' '  HostKeyAlias hostile-alias' \
+    '  CanonicalizeHostname yes' >"$case_dir/home/.ssh/config"
+  chmod 600 "$case_dir/home/.ssh/config"
+  : >"$case_dir/boundary.log"
+  : >"$case_dir/effective.log"
+  : >"$case_dir/effective.err"
+  remote_state=$case_dir/remote-root
+  if [ "$scenario" = cleanup-failure ] ||
+    [ "$scenario" = malformed-expected-cleanup ] ||
+    [ "$scenario" = missing-expected-cleanup ]; then
+    cleanup_failure=1
+  elif [ "$scenario" = remote-read-failure ]; then
+    read_fail=database-proof.json
+  elif [ "$scenario" = hash-failure ]; then
+    sha_target=database-proof.json
+    sha_mode=fail
+  elif [ "$scenario" = local-proof-failure ]; then
+    sha_target=database-proof.json
+    sha_mode=missing
+  fi
+  set +e
+  (
+    cd -- "$semantic_workspace"
+    env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
+      RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
+      HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+      HOST_FINGERPRINT="$expected_fingerprint" SSH_PRIVATE_KEY=fixture-private-key \
+      AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+      PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
+      RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
+      GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 \
+      GITHUB_OUTPUT="$case_dir/output" \
+      BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" \
+      BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+      BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
+      BETA_RECOVERY_REAL_SHA256SUM="$real_sha256sum" \
+      BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
+      BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
+      BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
+      BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
+      BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+      BETA_RECOVERY_REMOTE_STATE="$remote_state" \
+      BETA_RECOVERY_CAPTURE_SOURCE_DIR="$case_dir/remote-files" \
+      BETA_RECOVERY_CAPTURE_FIXTURE=1 \
+      BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
+      BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
+      BETA_RECOVERY_CAPTURE_READ_FAIL="$read_fail" \
+      BETA_RECOVERY_CAPTURE_SHA_TARGET="$sha_target" \
+      BETA_RECOVERY_CAPTURE_SHA_MODE="$sha_mode" \
+      BETA_RECOVERY_FAKE_AGE="$fake_age" \
+      BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
+      bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+      _ "$capture_body"
+  ) >"$case_dir/stdout" 2>"$case_dir/stderr"
+  status=$?
+  set -e
+  if [ "$scenario" = matching ] && [ "$status" -ne 0 ] ||
+    [ "$scenario" != matching ] && [ "$status" -eq 0 ]; then
+    sed -n '1,40p' "$case_dir/stderr" >&2
+    fail "proof case $name returned unexpected status $status (matching must be zero)"
+  fi
+  assert_consumer_residue_absent "$case_dir"
+  [ "$(grep -c '^remote-create$' "$case_dir/boundary.log" || true)" -eq 1 ] ||
+    fail "proof case $name did not create remote staging exactly once"
+  [ "$(grep -c '^remote-cleanup$' "$case_dir/boundary.log" || true)" -eq 1 ] ||
+    fail "proof case $name did not clean remote staging exactly once"
+  [ "$(grep -c '^restore-' "$case_dir/boundary.log" || true)" -eq 0 ] ||
+    fail "proof case $name reached restore work"
+  if [ "$scenario" = matching ]; then
+    [ -e "$case_dir/mutation-sentinel" ] ||
+      fail "matching proof case did not reach downstream boundary"
+    [ "$(grep -c '^evidence-manifest$' "$case_dir/boundary.log" || true)" -eq 1 ] ||
+      fail "matching proof case did not construct evidence"
+    [ "$(grep -c '^evidence-validate-artifact$' "$case_dir/boundary.log" || true)" -eq 1 ] ||
+      fail "matching proof case did not validate prepared artifact"
+    [ "$(find "$case_dir/runner/artifact" -type f | wc -l |
+      tr -d '[:space:]')" -eq 3 ] ||
+      fail "matching proof case did not prepare all artifact files"
+    printf 'publication-eligible\n' >>"$case_dir/boundary.log"
+    assert_event_order "$case_dir" remote-cleanup evidence-manifest \
+      evidence-validate-artifact local-cleanup publication-eligible
+  else
+    [ ! -e "$case_dir/mutation-sentinel" ] ||
+      fail "failed proof case crossed downstream mutation: $name"
+    [ "$(grep -c '^evidence-' "$case_dir/boundary.log" || true)" -eq 0 ] ||
+      fail "failed proof case constructed evidence: $name"
+    [ ! -e "$case_dir/runner/artifact" ] ||
+      fail "failed proof case prepared an artifact: $name"
+    case "$scenario" in
+      database-mismatch|cleanup-failure)
+        grep -Fq 'database proof differs from quiesced capture result' \
+          "$case_dir/stderr" ||
+          fail "database proof diagnostic missing: $name" ;;
+      media-mismatch)
+        grep -Fq 'media proof differs from quiesced capture result' \
+          "$case_dir/stderr" ||
+          fail "media proof diagnostic missing: $name" ;;
+      malformed-expected|malformed-expected-cleanup)
+        grep -Fq 'database proof expected digest is invalid' \
+          "$case_dir/stderr" ||
+          fail "malformed expected digest diagnostic missing: $name" ;;
+      missing-expected|missing-expected-cleanup)
+        grep -Fq 'database proof expected digest is missing or malformed' \
+          "$case_dir/stderr" ||
+          fail "missing expected digest diagnostic missing: $name" ;;
+    esac
+    if [ "$scenario" = cleanup-failure ] ||
+      [ "$scenario" = malformed-expected-cleanup ] ||
+      [ "$scenario" = missing-expected-cleanup ]; then
+      grep -Fq 'remote staging cleanup failed' "$case_dir/stderr" ||
+        fail "cleanup failure diagnostic missing: $name"
+    fi
+    ! grep -Fq 'publication-eligible' "$case_dir/boundary.log" ||
+      fail "failed proof case opened publication eligibility: $name"
+  fi
+  if [ "$scenario" = cleanup-failure ] ||
+    [ "$scenario" = malformed-expected-cleanup ] ||
+    [ "$scenario" = missing-expected-cleanup ]; then
+    [ -d "$remote_state" ] ||
+      fail "cleanup failure unexpectedly removed remote staging"
+  else
+    [ ! -e "$remote_state" ] && [ ! -L "$remote_state" ] ||
+      fail "proof case left remote staging after successful cleanup: $name"
+  fi
+}
+
+run_capture_proof_case capture-proof-matching matching
+run_capture_proof_case capture-proof-database-mismatch database-mismatch
+run_capture_proof_case capture-proof-media-mismatch media-mismatch
+run_capture_proof_case capture-proof-malformed-expected malformed-expected
+run_capture_proof_case capture-proof-missing-expected missing-expected
+run_capture_proof_case capture-proof-malformed-expected-cleanup malformed-expected-cleanup
+run_capture_proof_case capture-proof-missing-expected-cleanup missing-expected-cleanup
+run_capture_proof_case capture-proof-remote-read-failure remote-read-failure
+run_capture_proof_case capture-proof-hash-failure hash-failure
+run_capture_proof_case capture-proof-local-file-failure local-proof-failure
+run_capture_proof_case capture-proof-cleanup-failure cleanup-failure
 
 for signal in HUP INT TERM; do
   pre_case=$consumer_root/cases/capture-pre-$signal

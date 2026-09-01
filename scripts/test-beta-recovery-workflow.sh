@@ -341,7 +341,50 @@ run_safe_capture_preflight "$valid_recipient"
 [ "$(wc -l <"$received_recipient" | tr -d '[:space:]')" -eq 1 ]
 [ "$(<"$received_recipient")" = "$valid_recipient" ]
 grep -Fq 'transferred ciphertext differs from quiesced capture result' "$workflow"
-grep -Fq 'transferred proof differs from quiesced capture result' "$workflow"
+for required in \
+  'database_proof_actual_sha=$(sha256sum "$RUNNER_TEMP/database-proof.json" |' \
+  'media_proof_actual_sha=$(sha256sum "$RUNNER_TEMP/media-proof.json" |' \
+  'database proof hash failed' \
+  'media proof hash failed' \
+  'database proof expected digest is missing or malformed' \
+  'media proof expected digest is missing or malformed' \
+  '[[ "$database_proof_actual_sha" =~ ^[0-9a-f]{64}$ ]]' \
+  '[[ "$database_proof_expected_sha" =~ ^[0-9a-f]{64}$ ]]' \
+  '[[ "$media_proof_actual_sha" =~ ^[0-9a-f]{64}$ ]]' \
+  '[[ "$media_proof_expected_sha" =~ ^[0-9a-f]{64}$ ]]' \
+  'database proof differs from quiesced capture result' \
+  'media proof differs from quiesced capture result' \
+  'remote staging cleanup failed'; do
+  grep -Fq -- "$required" "$workflow"
+done
+grep -Fq 'database_proof_expected_sha=$(jq -er' "$workflow"
+grep -Fq ".proofs.database.sha256 // empty" "$workflow"
+grep -Fq 'media_proof_expected_sha=$(jq -er' "$workflow"
+grep -Fq ".proofs.media.sha256 // empty" "$workflow"
+grep -Fq '2>/dev/null); then' "$workflow"
+! grep -Fq 'all(.proofs[]; (keys|sort)==["name","sha256"]' "$workflow"
+grep -Fq 'tooling_digest=$(for file in scripts/authorize-beta-recovery.sh' "$workflow"
+grep -Fq -- '--tooling-digest "$tooling_digest"' "$workflow"
+! grep -Fq 'transferred proof differs from quiesced capture result' "$workflow"
+proof_gate_line=$(grep -n 'database_proof_actual_sha=' "$workflow" | head -1 | cut -d: -f1)
+proof_shape_line=$(grep -n 'database proof expected digest is missing or malformed' "$workflow" |
+  head -1 | cut -d: -f1)
+proof_compare_line=$(grep -n 'media proof differs from quiesced capture result' "$workflow" |
+  head -1 | cut -d: -f1)
+[ "$proof_gate_line" -lt "$proof_shape_line" ] &&
+  [ "$proof_shape_line" -lt "$proof_compare_line" ]
+aggregate_line=$(grep -n '\[ "$uploads_files"' "$workflow" | head -1 | cut -d: -f1)
+time_line=$(grep -n 'point_epoch=$(date -u' "$workflow" | head -1 | cut -d: -f1)
+cleanup_line=$(grep -n 'cleanup_remote ||' "$workflow" | head -1 | cut -d: -f1)
+evidence_line=$(grep -n 'scripts/build-beta-recovery-evidence.sh manifest' "$workflow" |
+  head -1 | cut -d: -f1)
+[ "$proof_gate_line" -lt "$proof_compare_line" ] &&
+  [ "$proof_compare_line" -lt "$aggregate_line" ] &&
+  [ "$aggregate_line" -lt "$time_line" ] &&
+  [ "$time_line" -lt "$cleanup_line" ] &&
+  [ "$cleanup_line" -lt "$evidence_line" ]
+publish_block=$(awk '/^      - id: publish$/{flag=1} flag' "$workflow")
+! grep -Fq 'if: always()' <<<"$publish_block"
 grep -Fq '.capturedAt==.recoveryPointTime' "$workflow"
 grep -Fq 'observed_age=$((observed_epoch - point_epoch))' "$workflow"
 grep -Fq '.created_at | (type=="string"' "$workflow"
