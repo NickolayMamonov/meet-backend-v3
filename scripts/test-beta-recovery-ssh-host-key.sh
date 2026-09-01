@@ -1442,7 +1442,8 @@ run_capture_proof_case() {
       schema:"meet-backend/beta-recovery-capture/v1",
       uploads:{bytes:23,digest:$uploads,files:1}
     }' >"$case_dir/remote-files/capture-result.json"
-  if [ "$scenario" = missing-expected ]; then
+  if [ "$scenario" = missing-expected ] ||
+    [ "$scenario" = missing-expected-cleanup ]; then
     jq 'del(.proofs.database.sha256)' "$case_dir/remote-files/capture-result.json" \
       >"$case_dir/remote-files/capture-result.tmp"
     mv -- "$case_dir/remote-files/capture-result.tmp" \
