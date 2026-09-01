@@ -355,6 +355,8 @@ for required in \
   'remote staging cleanup failed'; do
   grep -Fq -- "$required" "$workflow"
 done
+grep -Fq 'tooling_digest=$(for file in scripts/authorize-beta-recovery.sh' "$workflow"
+grep -Fq -- '--tooling-digest "$tooling_digest"' "$workflow"
 ! grep -Fq 'transferred proof differs from quiesced capture result' "$workflow"
 proof_gate_line=$(grep -n 'database_proof_actual_sha=' "$workflow" | head -1 | cut -d: -f1)
 proof_compare_line=$(grep -n 'media proof differs from quiesced capture result' "$workflow" |

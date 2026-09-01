@@ -347,26 +347,27 @@ jobs:
           chmod 600 "$RUNNER_TEMP/"*.age "$RUNNER_TEMP/"*.json
           cleanup_remote || { echo "remote staging cleanup failed" >&2; exit 1; }
           mkdir "$RUNNER_TEMP/artifact"
-          scripts/build-beta-recovery-evidence.sh manifest \
-            --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
-            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
-            --artifact-name "beta-recovery-$RECOVERY_ID-$GITHUB_RUN_ID" \
-            --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh \
+          tooling_digest=$(for file in scripts/authorize-beta-recovery.sh \
               scripts/run-beta-recovery-capture.sh scripts/run-beta-recovery-restore.sh \
               scripts/build-beta-recovery-evidence.sh scripts/probe-test-vps-recovery-runtime.sh \
               scripts/backup-production.sh scripts/beta-recovery-database-proof.sql \
               scripts/beta-recovery-media-proof.sh scripts/install-beta-recovery-age.sh \
               scripts/materialize-beta-recovery-known-hosts.sh; do sha256sum "$file"; done |
-              sort | sha256sum | awk '{print $1}')" \
+              sort | sha256sum | awk '{print $1}')
+          scripts/build-beta-recovery-evidence.sh manifest \
+            --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --artifact-name "beta-recovery-$RECOVERY_ID-$GITHUB_RUN_ID" \
+            --tooling-digest "$tooling_digest" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
             --media-digest "$(sha256sum scripts/beta-recovery-media-proof.sh | awk '{print $1}')" \
             --captured-at "$captured_at" \
             --point-time "$point_time" --observed-age-seconds "$observed_age" \
             --database-bytes "$db_bytes" \
-            --uploads-files "$(jq -r '.files' "$RUNNER_TEMP/media-proof.json')" \
-            --uploads-bytes "$(jq -r '.bytes' "$RUNNER_TEMP/media-proof.json")" \
-            --uploads-digest "$(jq -r '.canonicalDigest' "$RUNNER_TEMP/media-proof.json")" \
+            --uploads-files "$uploads_files" \
+            --uploads-bytes "$uploads_bytes" \
+            --uploads-digest "$uploads_digest" \
             --database-proof "$RUNNER_TEMP/database-proof.json" --media-proof "$RUNNER_TEMP/media-proof.json" \
             --runtime-proof "$RUNNER_TEMP/capture-runtime.json" \
             --database-ciphertext "$RUNNER_TEMP/postgres.dump.age" \
