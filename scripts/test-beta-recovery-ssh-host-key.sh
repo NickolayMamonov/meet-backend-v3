@@ -1385,7 +1385,7 @@ run_capture_proof_case() {
   local name=$1 scenario=$2
   local case_dir=$consumer_root/cases/$name remote_state
   local db_sha media_sha db_expected media_expected uploads_digest
-  local status expected_status
+  local status expected_status cleanup_failure=0 read_fail='' sha_target='' sha_mode=''
   mkdir -p "$case_dir/runner" "$case_dir/home/.ssh" "$case_dir/remote-files"
   chmod 700 "$case_dir" "$case_dir/runner" "$case_dir/home" \
     "$case_dir/home/.ssh" "$case_dir/remote-files"
@@ -1475,7 +1475,18 @@ run_capture_proof_case() {
   remote_state=$case_dir/remote-root
   expected_status=0
   [ "$scenario" = matching ] || expected_status=1
-  [ "$scenario" = cleanup-failure ] && expected_status=1
+  if [ "$scenario" = cleanup-failure ]; then
+    expected_status=1
+    cleanup_failure=1
+  elif [ "$scenario" = remote-read-failure ]; then
+    read_fail=database-proof.json
+  elif [ "$scenario" = hash-failure ]; then
+    sha_target=database-proof.json
+    sha_mode=fail
+  elif [ "$scenario" = local-proof-failure ]; then
+    sha_target=database-proof.json
+    sha_mode=missing
+  fi
   set +e
   (
     cd -- "$semantic_workspace"
@@ -1501,15 +1512,10 @@ run_capture_proof_case() {
       BETA_RECOVERY_CAPTURE_SOURCE_DIR="$case_dir/remote-files" \
       BETA_RECOVERY_CAPTURE_FIXTURE=1 \
       BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
-      BETA_RECOVERY_REMOTE_CLEANUP_FAIL=$([ "$scenario" = cleanup-failure ] && echo 1 || echo 0) \
-      BETA_RECOVERY_CAPTURE_READ_FAIL=$([ "$scenario" = remote-read-failure ] && \
-        echo database-proof.json || true) \
-      BETA_RECOVERY_CAPTURE_SHA_TARGET=$(if [ "$scenario" = hash-failure ] ||
-        [ "$scenario" = local-proof-failure ]; then
-        printf 'database-proof.json'
-      fi) \
-      BETA_RECOVERY_CAPTURE_SHA_MODE=$([ "$scenario" = hash-failure ] && echo fail || \
-        [ "$scenario" = local-proof-failure ] && echo missing || true) \
+      BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
+      BETA_RECOVERY_CAPTURE_READ_FAIL="$read_fail" \
+      BETA_RECOVERY_CAPTURE_SHA_TARGET="$sha_target" \
+      BETA_RECOVERY_CAPTURE_SHA_MODE="$sha_mode" \
       BETA_RECOVERY_FAKE_AGE="$fake_age" \
       BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
       bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
