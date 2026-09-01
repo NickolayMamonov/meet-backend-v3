@@ -1527,8 +1527,10 @@ run_capture_proof_case() {
   ) >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
-  [ "$status" -eq "$expected_status" ] ||
+  if [ "$status" -ne "$expected_status" ]; then
+    sed -n '1,40p' "$case_dir/stderr" >&2
     fail "proof case $name returned $status instead of $expected_status"
+  fi
   assert_consumer_residue_absent "$case_dir"
   [ "$(grep -c '^remote-create$' "$case_dir/boundary.log" || true)" -eq 1 ] ||
     fail "proof case $name did not create remote staging exactly once"
