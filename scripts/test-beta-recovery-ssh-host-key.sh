@@ -1281,11 +1281,11 @@ run_consumer_case() {
   [ -f "$case_dir/mutation-sentinel" ] ||
     fail "consumer $name did not record downstream mutation"
   if [ "$body" = "$capture_body" ]; then
+    [ "$(grep -c '^remote-create$' "$case_dir/boundary.log")" -eq 1 ] ||
+      fail "capture $name did not attempt marker-authenticated creation exactly once"
     [ "$(grep -c '^remote-cleanup$' "$case_dir/boundary.log")" -eq 1 ] ||
       fail "capture $name did not attempt remote cleanup exactly once"
-    grep -Fxq 'remote-admission' "$case_dir/boundary.log" ||
-      fail "capture $name did not record remote admission"
-    assert_event_order "$case_dir" helper-success private-key-created remote-admission \
+    assert_event_order "$case_dir" helper-success private-key-created remote-create \
       remote-cleanup local-cleanup
   else
     ! grep -q '^remote-cleanup$' "$case_dir/boundary.log" ||
