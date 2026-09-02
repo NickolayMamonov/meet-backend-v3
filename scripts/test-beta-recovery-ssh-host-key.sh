@@ -1255,16 +1255,10 @@ run_consumer_setup_case() {
     fail "consumer setup $name did not record local cleanup"
 }
 
-for body_name in capture; do
-  case "$body_name" in
-    capture) body=$capture_body ;;
-    pre-probe) body=$pre_probe_body ;;
-    post-probe) body=$post_probe_body ;;
-  esac
-  run_consumer_setup_case "$body_name-setup-chmod-failure" "$body" fail
-  for signal in HUP INT TERM; do
-    run_consumer_setup_case "$body_name-setup-$signal" "$body" signal "$signal"
-  done
+body=$capture_body
+run_consumer_setup_case capture-setup-chmod-failure "$body" fail
+for signal in HUP INT TERM; do
+  run_consumer_setup_case "capture-setup-$signal" "$body" signal "$signal"
 done
 
 run_consumer_case() {
