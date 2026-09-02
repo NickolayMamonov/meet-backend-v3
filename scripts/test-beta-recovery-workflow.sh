@@ -115,11 +115,11 @@ assert_root_export_before_consumer(){
   [ -n "$export_line" ] && [ -n "$consumer_line" ] && [ "$export_line" -lt "$consumer_line" ]
 }
 assert_root_export_before_consumer "$capture_block" 'bash "\$remote/run-beta-recovery-capture.sh"'
-for block in "$capture_block"; do
+block=$capture_block
   grep -Fq -- '--root "$root"' <<<"$block"
   ! grep -Fq -- '--root /var/lib/meet-production' <<<"$block"
   ! grep -Fq 'PRODUCTION_ROOT=/var/lib/meet-production' <<<"$block"
-done
+unset block
 isolated_block=$(awk '/^  restore-isolated:/{flag=1} /^  restore-post-probe:/{flag=0} flag' "$workflow")
 ! grep -Fq 'PATH_ON_HOST' <<<"$isolated_block"
 ordered_network_calls=0
@@ -159,7 +159,7 @@ run_ordered_case relative relative/root
 run_ordered_case double-dot /srv/../release
 run_ordered_case metacharacter '/srv/release;touch'
 run_ordered_case valid /srv/release
-for block in "$capture_block"; do
+block=$capture_block
   helper_line=$(grep -n 'scripts/materialize-beta-recovery-known-hosts.sh' <<<"$block" | head -1 | cut -d: -f1)
   key_line=$(grep -n 'install -m 600 /dev/null "$key"' <<<"$block" | head -1 | cut -d: -f1)
   [ "$helper_line" -lt "$key_line" ]
@@ -167,7 +167,7 @@ for block in "$capture_block"; do
   trap_line=$(grep -n "trap 'cleanup_" <<<"$block" | head -1 | cut -d: -f1)
   chmod_line=$(grep -n 'chmod 700 "$ssh_dir"' <<<"$block" | head -1 | cut -d: -f1)
   [ "$mktemp_line" -lt "$trap_line" ] && [ "$trap_line" -lt "$chmod_line" ]
-done
+unset block
 grep -Fq 'for signal in HUP INT TERM' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'capture-pre-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'effective-config-failed' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
