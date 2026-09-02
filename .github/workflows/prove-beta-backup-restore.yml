@@ -369,7 +369,8 @@ jobs:
               scripts/build-beta-recovery-evidence.sh scripts/probe-test-vps-recovery-runtime.sh \
               scripts/backup-production.sh scripts/beta-recovery-database-proof.sql \
               scripts/beta-recovery-media-proof.sh scripts/install-beta-recovery-age.sh \
-              scripts/materialize-beta-recovery-known-hosts.sh; do sha256sum "$file"; done |
+              scripts/materialize-beta-recovery-known-hosts.sh \
+              scripts/validate-beta-recovery-artifact-retention.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')
           scripts/build-beta-recovery-evidence.sh manifest \
             --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
@@ -418,15 +419,10 @@ jobs:
           artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id")
           jq -e --arg name "beta-recovery-$RECOVERY_ID-$GITHUB_RUN_ID" \
             '.id == ($artifact_id|tonumber) and .name == $name and .expired == false and
-             .size_in_bytes > 0 and .workflow_run.id == ($run_id|tonumber) and
-             (.created_at | (type=="string" and length > 0)) and
-             (.expires_at | (type=="string" and length > 0))' \
+             .size_in_bytes > 0 and .workflow_run.id == ($run_id|tonumber)' \
             --arg run_id "$GITHUB_RUN_ID" --arg artifact_id "$artifact_id" \
             <<<"$artifact_json"
-          created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$artifact_json")" +%s)
-          expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$artifact_json")" +%s)
-          [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
-            { echo "published artifact expiry is not exactly 30 days" >&2; exit 1; }
+          scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"
 
   restore-select:
     name: Validate numeric artifact
@@ -460,15 +456,10 @@ jobs:
           run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
           jq -e --arg prefix "beta-recovery-$RECOVERY_ID-" '
             .id == ($id|tonumber) and .expired == false and .size_in_bytes > 0 and
-            (.name | startswith($prefix)) and
-            (.created_at | (type=="string" and length > 0)) and
-            (.expires_at | (type=="string" and length > 0))
+            (.name | startswith($prefix))
           ' --arg id "$ARTIFACT_ID" \
             --arg sha "${{ inputs.source_sha }}" <<<"$artifact_json"
-          created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$artifact_json")" +%s)
-          expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$artifact_json")" +%s)
-          [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
-            { echo "selected artifact expiry is not exactly 30 days" >&2; exit 1; }
+          scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"
           jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
             .status == "completed" and .conclusion == "success" and
             .event == "workflow_dispatch" and .head_branch == "dev" and
@@ -683,7 +674,8 @@ jobs:
               scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
               scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
-              scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh; do sha256sum "$file"; done |
+              scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh \
+              scripts/validate-beta-recovery-artifact-retention.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
@@ -744,7 +736,8 @@ jobs:
               scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
               scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
-              scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh; do sha256sum "$file"; done |
+              scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh \
+              scripts/validate-beta-recovery-artifact-retention.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
@@ -1034,14 +1027,9 @@ jobs:
           jq -e --arg name "$artifact_name" --argjson run "$artifact_run" \
             --arg sha "${{ inputs.source_sha }}" \
             '.id == ($id|tonumber) and .name == $name and .expired == false and
-             .size_in_bytes > 0 and .workflow_run.id == $run and
-             (.created_at | (type=="string" and length > 0)) and
-             (.expires_at | (type=="string" and length > 0))' \
+             .size_in_bytes > 0 and .workflow_run.id == $run' \
             --arg id "${{ inputs.artifact_id }}" <<<"$artifact_json"
-          created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$artifact_json")" +%s)
-          expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$artifact_json")" +%s)
-          [ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ] ||
-            { echo "final artifact expiry is not exactly 30 days" >&2; exit 1; }
+          scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"
           dispatch_at=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" |
             jq -er 'select(.event == "workflow_dispatch" and .head_branch == "dev" and
               .head_sha == $sha) | .created_at |

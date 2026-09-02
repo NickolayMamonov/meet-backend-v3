@@ -1094,9 +1094,24 @@ chmod 700 "$capture_body" "$pre_probe_body" "$post_probe_body"
 
 semantic_workspace=$consumer_root/semantic-workspace
 mkdir -p "$semantic_workspace/scripts"
-cp -- "$root/scripts/materialize-beta-recovery-known-hosts.sh" \
-  "$semantic_workspace/scripts/materialize-beta-recovery-known-hosts.sh"
-chmod 700 "$semantic_workspace/scripts/materialize-beta-recovery-known-hosts.sh"
+tooling_files=(
+  scripts/authorize-beta-recovery.sh
+  scripts/backup-production.sh
+  scripts/beta-recovery-database-proof.sql
+  scripts/beta-recovery-media-proof.sh
+  scripts/build-beta-recovery-evidence.sh
+  scripts/install-beta-recovery-age.sh
+  scripts/materialize-beta-recovery-known-hosts.sh
+  scripts/probe-test-vps-recovery-runtime.sh
+  scripts/run-beta-recovery-capture.sh
+  scripts/run-beta-recovery-restore.sh
+  scripts/validate-beta-recovery-artifact-retention.sh
+)
+for tooling_file in "${tooling_files[@]}"; do
+  cp -- "$root/$tooling_file" "$semantic_workspace/$tooling_file"
+done
+chmod 700 "$semantic_workspace/scripts/materialize-beta-recovery-known-hosts.sh" \
+  "$semantic_workspace/scripts/validate-beta-recovery-artifact-retention.sh"
 fake_age=$semantic_workspace/fake-age
 write_wrapper "$fake_age" \
   '#!/usr/bin/env bash' \

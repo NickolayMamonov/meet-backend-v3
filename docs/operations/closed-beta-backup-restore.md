@@ -72,6 +72,11 @@ artifact is published, and the owned nonterminal `pre_stop` journal remains for
 reviewed reconciliation. A new authorized run is required after any failed
 capture; interrupted runs are not retried or resumed.
 
+Artifact configuration and manifest evidence continue to use the 30-day policy.
+GitHub API timestamp serialization may round the observed interval downward by
+up to 60 seconds; malformed metadata or any interval outside that bounded
+window is terminal and requires a newly authorized run.
+
 After transfer, the database and media proof files are independently hashed and
 matched against the exact lowercase SHA-256 digests in the quiesced capture
 result before authenticated remote cleanup, evidence construction, or artifact
