@@ -125,7 +125,8 @@ run_restore_fixture() {
     scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
     scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
     scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
-    scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh; do
+    scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh \
+    scripts/validate-beta-recovery-artifact-retention.sh; do
     sha256sum "$file"
   done | sort | sha256sum | awk '{print $1}')
   workflow_digest=$(sha256sum .github/workflows/prove-beta-backup-restore.yml | awk '{print $1}')
@@ -189,6 +190,52 @@ run_restore_fixture() {
   export FAKE_DATABASE_DUMP="$case_dir/database.dump"
   export FAKE_UPLOADS_ARCHIVE="$case_dir/uploads.tar.gz"
   export POSTGRES_IMAGE=repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  if [ "$behavior" = tooling-drift ]; then
+    stale_tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+      scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
+      scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
+      scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
+      scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh; do
+      sha256sum "$file"
+    done | sort | sha256sum | awk '{print $1}')
+    for mode in capacity normal; do
+      drift_output="$case_dir/drift-$mode-output"
+      drift_temp="$case_dir/drift-$mode-temp"
+      : >"$case_dir/events.log"
+      if [ "$mode" = capacity ]; then
+        if PATH="$case_dir/bin:$PATH" bash "$script" --capacity-only \
+          --artifact-dir "$case_dir/artifact" --recovery-id recovery-fixture \
+          --output-dir "$drift_output" --temp-root "$drift_temp" \
+          --docker-root "$case_dir/docker-root" \
+          --sql-proof "$root/scripts/beta-recovery-database-proof.sql" \
+          --media-script "$root/scripts/beta-recovery-media-proof.sh" \
+          --source-sha 0123456789abcdef0123456789abcdef01234567 \
+          --repository NickolayMamonov/meet-backend-v3 --tooling-digest "$stale_tooling" \
+          --workflow-digest "$workflow_digest" --database-digest "$database_digest" \
+          --media-digest "$media_digest" 2>"$case_dir/$mode.stderr"; then
+          echo "capacity-only stale tooling digest was accepted" >&2
+          exit 1
+        fi
+      else
+        if PATH="$case_dir/bin:$PATH" bash "$script" \
+          --artifact-dir "$case_dir/artifact" --recovery-id recovery-fixture \
+          --output-dir "$drift_output" --identity "$case_dir/identity" \
+          --sql-proof "$root/scripts/beta-recovery-database-proof.sql" \
+          --media-script "$root/scripts/beta-recovery-media-proof.sh" \
+          --temp-root "$drift_temp" --source-sha 0123456789abcdef0123456789abcdef01234567 \
+          --repository NickolayMamonov/meet-backend-v3 --tooling-digest "$stale_tooling" \
+          --workflow-digest "$workflow_digest" --database-digest "$database_digest" \
+          --media-digest "$media_digest" 2>"$case_dir/$mode.stderr"; then
+          echo "normal stale tooling digest was accepted" >&2
+          exit 1
+        fi
+      fi
+      grep -Fq 'tooling contract digest differs' "$case_dir/$mode.stderr"
+      [ ! -s "$case_dir/events.log" ] ||
+        { echo "$mode stale tooling digest reached identity or Docker" >&2; exit 1; }
+    done
+    return
+  fi
   if [ "$behavior" = collision ]; then
     collision_token=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
     PATH="$case_dir/bin:$PATH" docker network create \
@@ -354,6 +401,7 @@ run_restore_fixture success 0 valid capacity
 run_restore_fixture restore-failure 1 valid restore-failure
 run_restore_fixture restore-retry 0 valid retry
 run_restore_fixture restore-volume-retry 0 valid volume-retry
+run_restore_fixture tooling-digest-drift 1 valid tooling-drift
 run_restore_fixture restore-persistent-cleanup-failure 1 valid persistent-cleanup-failure
 run_restore_fixture restore-bind 1 bind
 run_restore_fixture restore-named 1 named

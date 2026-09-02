@@ -114,7 +114,8 @@ expected_tooling_digest=$(cd "$source" && for file in scripts/authorize-beta-rec
   scripts/build-beta-recovery-evidence.sh scripts/probe-test-vps-recovery-runtime.sh \
   scripts/backup-production.sh scripts/beta-recovery-database-proof.sql \
   scripts/beta-recovery-media-proof.sh scripts/install-beta-recovery-age.sh \
-  scripts/materialize-beta-recovery-known-hosts.sh; do
+  scripts/materialize-beta-recovery-known-hosts.sh \
+  scripts/validate-beta-recovery-artifact-retention.sh; do
   sha256sum -- "$file"
 done | sort | sha256sum | awk '{print $1}')
 jq -e --arg digest "$expected_tooling_digest" '.toolingDigest == $digest' \

@@ -387,9 +387,149 @@ publish_block=$(awk '/^      - id: publish$/{flag=1} flag' "$workflow")
 ! grep -Fq 'if: always()' <<<"$publish_block"
 grep -Fq '.capturedAt==.recoveryPointTime' "$workflow"
 grep -Fq 'observed_age=$((observed_epoch - point_epoch))' "$workflow"
-grep -Fq '.created_at | (type=="string"' "$workflow"
-grep -Fq '.expires_at | (type=="string"' "$workflow"
-grep -Fq '30 * 24 * 60 * 60' "$workflow"
+[ "$(grep -Fc 'retention-days: 30' "$workflow")" -eq 6 ]
+[ "$(grep -Fc 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow")" -eq 3 ]
+! grep -Eq 'created_epoch|expires_epoch|30 \* 24 \* 60 \* 60' "$workflow"
+publish_line=$(grep -n '^      - id: publish$' "$workflow" | head -1 | cut -d: -f1)
+capture_retention_line=$(grep -n 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow" |
+  sed -n '1p' | cut -d: -f1)
+restore_retention_line=$(grep -n 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow" |
+  sed -n '2p' | cut -d: -f1)
+final_retention_line=$(grep -n 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow" |
+  sed -n '3p' | cut -d: -f1)
+zip_line=$(grep -n 'actions/artifacts/\$ARTIFACT_ID/zip' "$workflow" | head -1 | cut -d: -f1)
+cleanup_marker_line=$(grep -n '^      - id: final_cleanup$' "$workflow" | head -1 | cut -d: -f1)
+evidence_manifest_line=$(grep -n 'scripts/build-beta-recovery-evidence.sh final' "$workflow" | head -1 | cut -d: -f1)
+[ "$publish_line" -lt "$capture_retention_line" ] &&
+  [ "$restore_retention_line" -lt "$zip_line" ] &&
+  [ "$cleanup_marker_line" -lt "$final_retention_line" ] &&
+  [ "$final_retention_line" -lt "$evidence_manifest_line" ]
+
+retention_helper=$root/scripts/validate-beta-recovery-artifact-retention.sh
+[ -x "$retention_helper" ]
+retention_fixture=$fixture_dir/retention
+mkdir -p "$retention_fixture/bin"
+real_date=$(command -v date)
+date_count_file=$retention_fixture/date-count
+fake_date=$retention_fixture/bin/date
+cat >"$fake_date" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+count=$(<"$FAKE_DATE_COUNT_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$FAKE_DATE_COUNT_FILE"
+case "${FAKE_DATE_MODE:-}" in
+  first-failure) [ "$count" -ne 1 ] || exit 1 ;;
+  second-failure) [ "$count" -ne 2 ] || exit 1 ;;
+  non-decimal) [ "$count" -ne 1 ] || { printf 'not-a-number\n'; exit 0; } ;;
+esac
+exec "$REAL_DATE" "$@"
+EOF
+chmod 700 "$fake_date"
+retention_json() {
+  local seconds=$1 created_epoch expires_at
+  created_epoch=$("$real_date" -u -d 2026-08-01T00:00:00Z +%s)
+  expires_at=$("$real_date" -u -d "@$((created_epoch + seconds))" +%Y-%m-%dT%H:%M:%SZ)
+  jq -cn --arg created 2026-08-01T00:00:00Z --arg expires "$expires_at" \
+    '{created_at:$created,expires_at:$expires}'
+}
+expect_retention_success() {
+  local label=$1 input=$2 output status
+  if output=$(printf '%s\n' "$input" | bash "$retention_helper"); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] && [ -z "$output" ] ||
+    { echo "retention success fixture failed: $label" >&2; exit 1; }
+}
+expect_retention_failure() {
+  local label=$1 input=$2 output status
+  if output=$(printf '%s\n' "$input" | bash "$retention_helper"); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] && [ -z "$output" ] ||
+    { echo "retention failure fixture passed: $label" >&2; exit 1; }
+}
+expect_fake_date_failure() {
+  local label=$1 mode=$2 input=$3 output status
+  : >"$date_count_file"
+  if output=$(printf '%s\n' "$input" |
+    env PATH="$retention_fixture/bin:$PATH" REAL_DATE="$real_date" \
+      FAKE_DATE_COUNT_FILE="$date_count_file" FAKE_DATE_MODE="$mode" \
+      bash "$retention_helper"); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] && [ -z "$output" ] ||
+    { echo "retention parse fixture passed: $label" >&2; exit 1; }
+}
+expect_retention_success exact-30-days "$(retention_json 2592000)"
+expect_retention_success one-second-rounding "$(retention_json 2591999)"
+expect_retention_success lower-bound "$(retention_json 2591940)"
+expect_retention_failure below-lower-bound "$(retention_json 2591939)"
+expect_retention_failure above-upper-bound "$(retention_json 2592001)"
+for invalid in \
+  invalid-json \
+  '{"expires_at":"2026-08-31T00:00:00Z"}' \
+  '{"created_at":"","expires_at":"2026-08-31T00:00:00Z"}' \
+  '{"created_at":123,"expires_at":"2026-08-31T00:00:00Z"}' \
+  '{"created_at":"not-a-date","expires_at":"2026-08-31T00:00:00Z"}' \
+  '{"created_at":"2026-08-01T00:00:00Z"}' \
+  '{"created_at":"2026-08-01T00:00:00Z","expires_at":""}' \
+  '{"created_at":"2026-08-01T00:00:00Z","expires_at":123}' \
+  '{"created_at":"2026-08-01T00:00:00Z","expires_at":"not-a-date"}'; do
+  expect_retention_failure "invalid metadata: $invalid" "$invalid"
+done
+valid_retention=$(retention_json 2592000)
+expect_fake_date_failure first-date-failure first-failure "$valid_retention"
+expect_fake_date_failure second-date-failure second-failure "$valid_retention"
+expect_fake_date_failure non-decimal-date-output non-decimal "$valid_retention"
+
+canonical_inventory=$retention_fixture/canonical-inventory
+cat >"$canonical_inventory" <<'EOF'
+scripts/authorize-beta-recovery.sh
+scripts/backup-production.sh
+scripts/beta-recovery-database-proof.sql
+scripts/beta-recovery-media-proof.sh
+scripts/build-beta-recovery-evidence.sh
+scripts/install-beta-recovery-age.sh
+scripts/materialize-beta-recovery-known-hosts.sh
+scripts/probe-test-vps-recovery-runtime.sh
+scripts/run-beta-recovery-capture.sh
+scripts/run-beta-recovery-restore.sh
+scripts/validate-beta-recovery-artifact-retention.sh
+EOF
+extract_paths() { grep -oE 'scripts/[A-Za-z0-9._-]+' | sort -u; }
+workflow_inventory() {
+  local wanted=$1
+  awk -v wanted="$wanted" '
+    /for file in scripts\/authorize-beta-recovery.sh/ {
+      number++
+      active=(number == wanted)
+    }
+    active { print }
+    active && /; do/ { exit }
+  ' "$workflow" | extract_paths
+}
+assert_inventory() {
+  local label=$1 actual=$2
+  diff -u "$canonical_inventory" "$actual" ||
+    { echo "$label tooling inventory differs" >&2; exit 1; }
+}
+[ "$(grep -Fc 'for file in scripts/authorize-beta-recovery.sh' "$workflow")" -eq 3 ]
+for index in 1 2 3; do
+  actual=$retention_fixture/workflow-$index
+  workflow_inventory "$index" >"$actual"
+  assert_inventory "workflow inventory $index" "$actual"
+done
+actual=$retention_fixture/authorization
+awk '/^files=\(/{active=1} active {print} active && /^\)/{exit}' \
+  "$root/scripts/authorize-beta-recovery.sh" | extract_paths >"$actual"
+assert_inventory authorization "$actual"
+actual=$retention_fixture/restore-runtime
+awk '/^actual_tooling=\$\(for file/{active=1} active {print} active && /^done/{exit}' \
+  "$root/scripts/run-beta-recovery-restore.sh" | extract_paths >"$actual"
+assert_inventory restore-runtime "$actual"
+actual=$retention_fixture/authorization-fixture
+awk '/^expected_tooling_digest=.*for file/{active=1} active {print} active && /; do/{exit}' \
+  "$root/scripts/test-beta-recovery-authorization.sh" | extract_paths >"$actual"
+assert_inventory authorization-fixture "$actual"
+actual=$retention_fixture/restore-fixture
+awk '/^  tooling=\$\(for file/{active=1} active {print} active && /; do/{exit}' \
+  "$root/scripts/test-beta-recovery-restore.sh" | extract_paths >"$actual"
+assert_inventory restore-fixture "$actual"
 grep -Fq 'select(.event == "workflow_dispatch" and .head_branch == "dev"' "$workflow"
 valid_dispatch=$(jq -cn --arg sha "$valid_recovery_id" \
   '{event:"workflow_dispatch",head_branch:"dev",head_sha:$sha,created_at:"2026-08-28T12:00:00Z"}')
@@ -449,17 +589,6 @@ jq -e --arg db "$capture_db_sha" --arg media "$capture_media_sha" '
 point_epoch=$(date -u -d 2026-08-27T19:00:00Z +%s)
 observed_epoch=$((point_epoch + 120))
 [ "$((observed_epoch - point_epoch))" -eq 120 ]
-expiry_fixture='{"created_at":"2026-08-01T00:00:00Z","expires_at":"2026-08-31T00:00:00Z"}'
-jq -e '(.created_at|type=="string") and (.expires_at|type=="string")' \
-  <<<"$expiry_fixture" >/dev/null
-created_epoch=$(date -u -d "$(jq -er '.created_at' <<<"$expiry_fixture")" +%s)
-expires_epoch=$(date -u -d "$(jq -er '.expires_at' <<<"$expiry_fixture")" +%s)
-[ "$expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ]
-short_expires_epoch=$(date -u -d 2026-08-30T00:00:00Z +%s)
-if [ "$short_expires_epoch" -eq "$((created_epoch + 30 * 24 * 60 * 60))" ]; then
-  echo "short artifact expiry fixture was accepted" >&2
-  exit 1
-fi
 grep -Fq 'capture-database-proof.json' "$workflow"
 if grep -Fq '${{ runner.temp }}/database-proof.json' "$workflow" ||
   grep -Fq '${{ runner.temp }}/media-proof.json' "$workflow"; then
