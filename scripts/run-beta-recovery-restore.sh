@@ -364,6 +364,7 @@ workflow_file=.github/workflows/prove-beta-backup-restore.yml
   fail "workflow contract digest differs"
 actual_tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
+  scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \
   scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
   scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
   scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh \

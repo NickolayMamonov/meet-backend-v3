@@ -35,7 +35,9 @@ grep -Fq 'published_output_identity=' "$root/scripts/materialize-beta-recovery-k
 grep -Fq '[ "$published_output_identity" = "$candidate_identity" ]' \
   "$root/scripts/materialize-beta-recovery-known-hosts.sh"
 helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
-[ "$helper_count" -eq 3 ]
+[ "$helper_count" -eq 1 ]
+grep -Fq 'scripts/run-beta-recovery-remote-probe.sh' "$workflow"
+probe_helper="$root/scripts/run-beta-recovery-remote-probe.sh"
 for required in \
   'ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")' \
   'install -m 600 /dev/null "$config"' \
@@ -44,19 +46,19 @@ for required in \
   '-o UserKnownHostsFile="$known"' \
   '-o GlobalKnownHostsFile=/dev/null' \
   '-o KnownHostsCommand=none'; do
-  grep -Fq -- "$required" "$workflow"
+  grep -Fq -- "$required" "$workflow" || grep -Fq -- "$required" "$probe_helper"
 done
 for required in \
   "trap 'cleanup_capture 129' HUP" \
   "trap 'cleanup_capture 130' INT" \
   "trap 'cleanup_capture 143' TERM" \
-  "trap 'cleanup_probe 129' HUP" \
-  "trap 'cleanup_probe 130' INT" \
-  "trap 'cleanup_probe 143' TERM"; do
-  grep -Fq -- "$required" "$workflow"
+  "trap 'on_signal 129' HUP" \
+  "trap 'on_signal 130' INT" \
+  "trap 'on_signal 143' TERM"; do
+  grep -Fq -- "$required" "$workflow" || grep -Fq -- "$required" "$probe_helper"
 done
 grep -Fq "trap 'cleanup_capture \"\$?\"' EXIT" "$workflow"
-grep -Fq "trap 'cleanup_probe \"\$?\"' EXIT" "$workflow"
+grep -Fq 'trap cleanup' "$probe_helper"
 if grep -Fq 'trap cleanup_capture EXIT HUP INT TERM' "$workflow" ||
   grep -Fq 'trap cleanup_probe EXIT HUP INT TERM' "$workflow"; then
   echo "workflow uses signal-ambiguous cleanup traps" >&2
@@ -99,15 +101,13 @@ assert_release_root_gate "$post_probe_job"
 [ "$(grep -n 'actions/checkout@' <<<"$post_probe_job" | head -1 | cut -d: -f1)" -lt \
   "$(grep -n 'validate-recovery-id "\$RECOVERY_ID"' <<<"$post_probe_job" | head -1 | cut -d: -f1)" ]
 grep -Fq 'root=$4' <<<"$capture_block"
-grep -Fq 'root=$2' <<<"$pre_probe_block"
-grep -Fq 'root=$2' <<<"$post_probe_block"
+! grep -Fq 'root=$2' <<<"$pre_probe_block"
+! grep -Fq 'root=$2' <<<"$post_probe_block"
 grep -Fq 'sudo bash -s -- \' <<<"$capture_block"
-grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$pre_probe_block"
-grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$post_probe_block"
+! grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$pre_probe_block"
+! grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$post_probe_block"
 grep -Fq '"$remote" "$RECOVERY_ID" "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$capture_block"
 grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$capture_block"
-grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$pre_probe_block"
-grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$post_probe_block"
 assert_root_export_before_consumer(){
   local block=$1 consumer=$2 export_line consumer_line
   export_line=$(grep -n 'export PRODUCTION_ROOT="\$root"' <<<"$block" | head -1 | cut -d: -f1)
@@ -115,9 +115,7 @@ assert_root_export_before_consumer(){
   [ -n "$export_line" ] && [ -n "$consumer_line" ] && [ "$export_line" -lt "$consumer_line" ]
 }
 assert_root_export_before_consumer "$capture_block" 'bash "\$remote/run-beta-recovery-capture.sh"'
-assert_root_export_before_consumer "$pre_probe_block" 'bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh'
-assert_root_export_before_consumer "$post_probe_block" 'bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh'
-for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
+for block in "$capture_block"; do
   grep -Fq -- '--root "$root"' <<<"$block"
   ! grep -Fq -- '--root /var/lib/meet-production' <<<"$block"
   ! grep -Fq 'PRODUCTION_ROOT=/var/lib/meet-production' <<<"$block"
@@ -161,7 +159,7 @@ run_ordered_case relative relative/root
 run_ordered_case double-dot /srv/../release
 run_ordered_case metacharacter '/srv/release;touch'
 run_ordered_case valid /srv/release
-for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
+for block in "$capture_block"; do
   helper_line=$(grep -n 'scripts/materialize-beta-recovery-known-hosts.sh' <<<"$block" | head -1 | cut -d: -f1)
   key_line=$(grep -n 'install -m 600 /dev/null "$key"' <<<"$block" | head -1 | cut -d: -f1)
   [ "$helper_line" -lt "$key_line" ]
@@ -487,7 +485,9 @@ scripts/build-beta-recovery-evidence.sh
 scripts/install-beta-recovery-age.sh
 scripts/materialize-beta-recovery-known-hosts.sh
 scripts/probe-test-vps-recovery-runtime.sh
+scripts/production-compose.sh
 scripts/run-beta-recovery-capture.sh
+scripts/run-beta-recovery-remote-probe.sh
 scripts/run-beta-recovery-restore.sh
 scripts/validate-beta-recovery-artifact-retention.sh
 EOF

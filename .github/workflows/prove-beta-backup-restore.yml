@@ -366,7 +366,8 @@ jobs:
           mkdir "$RUNNER_TEMP/artifact"
           tooling_digest=$(for file in scripts/authorize-beta-recovery.sh \
               scripts/run-beta-recovery-capture.sh scripts/run-beta-recovery-restore.sh \
-              scripts/build-beta-recovery-evidence.sh scripts/probe-test-vps-recovery-runtime.sh \
+              scripts/build-beta-recovery-evidence.sh scripts/run-beta-recovery-remote-probe.sh \
+              scripts/production-compose.sh scripts/probe-test-vps-recovery-runtime.sh \
               scripts/backup-production.sh scripts/beta-recovery-database-proof.sql \
               scripts/beta-recovery-media-proof.sh scripts/install-beta-recovery-age.sh \
               scripts/materialize-beta-recovery-known-hosts.sh \
@@ -548,48 +549,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
-          ssh_dir=
-          cleanup_probe() {
-            local status=$1
-            trap - EXIT HUP INT TERM
-            rm -r -- "$ssh_dir" || status=1
-            exit "$status"
-          }
-          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
-          trap 'cleanup_probe "$?"' EXIT
-          trap 'cleanup_probe 129' HUP
-          trap 'cleanup_probe 130' INT
-          trap 'cleanup_probe 143' TERM
-          key="$ssh_dir/private_key"
-          known="$ssh_dir/known_hosts"
-          config="$ssh_dir/ssh_config"
-          chmod 700 "$ssh_dir"
-          install -m 600 /dev/null "$config"
-          scripts/materialize-beta-recovery-known-hosts.sh \
-            --host "$HOST" --port "$PORT" --expected-fingerprint "$HOST_FINGERPRINT" \
-            --output "$known"
-          install -m 600 /dev/null "$key"
-          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
-          ssh -F "$config" -i "$key" -p "$PORT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
-            -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none \
-            "$SSH_USER@$HOST" \
-            sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST" >"$RUNNER_TEMP/pre-probe.json" <<'REMOTE'
-          set -euo pipefail
-          url=$1
-          root=$2
-          export PRODUCTION_ROOT="$root"
-          exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
-          flock -n 9
-          tmp=$(mktemp /tmp/beta-recovery-pre-probe.XXXXXX)
-          trap 'rm -f -- "$tmp"' EXIT
-          bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
-            --root "$root" \
-            --compose-script /var/lib/meet-test-vps-deploy/scripts/production-compose.sh \
-            --output "$tmp" --public-url "$url"
-          cat "$tmp"
-          REMOTE
+          scripts/run-beta-recovery-remote-probe.sh \
+            --phase pre --host "$HOST" --port "$PORT" --ssh-user "$SSH_USER" \
+            --host-fingerprint "$HOST_FINGERPRINT" --release-root "$PATH_ON_HOST" \
+            --public-url "$PUBLIC_URL" --source-sha "${{ inputs.source_sha }}" \
+            --recovery-id "$RECOVERY_ID" --output "$RUNNER_TEMP/pre-probe.json"
           scripts/build-beta-recovery-evidence.sh validate-runtime \
             --runtime-proof "$RUNNER_TEMP/pre-probe.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -672,6 +636,7 @@ jobs:
             --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
             --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
               scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
+              scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
               scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
               scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh \
@@ -734,6 +699,7 @@ jobs:
             --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
             --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
               scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
+              scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
               scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
               scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh \
@@ -891,48 +857,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [ "$PUBLIC_URL" = https://api.whysoezzy.online ]
-          ssh_dir=
-          cleanup_probe() {
-            local status=$1
-            trap - EXIT HUP INT TERM
-            rm -r -- "$ssh_dir" || status=1
-            exit "$status"
-          }
-          ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")
-          trap 'cleanup_probe "$?"' EXIT
-          trap 'cleanup_probe 129' HUP
-          trap 'cleanup_probe 130' INT
-          trap 'cleanup_probe 143' TERM
-          key="$ssh_dir/private_key"
-          known="$ssh_dir/known_hosts"
-          config="$ssh_dir/ssh_config"
-          chmod 700 "$ssh_dir"
-          install -m 600 /dev/null "$config"
-          scripts/materialize-beta-recovery-known-hosts.sh \
-            --host "$HOST" --port "$PORT" --expected-fingerprint "$HOST_FINGERPRINT" \
-            --output "$known"
-          install -m 600 /dev/null "$key"
-          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key"
-          ssh -F "$config" -i "$key" -p "$PORT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
-            -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none \
-            "$SSH_USER@$HOST" \
-            sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST" >"$RUNNER_TEMP/post-probe.json" <<'REMOTE'
-          set -euo pipefail
-          url=$1
-          root=$2
-          export PRODUCTION_ROOT="$root"
-          exec 9>/var/lib/meet-test-vps-deploy/.deploy.lock
-          flock -n 9
-          tmp=$(mktemp /tmp/beta-recovery-post-probe.XXXXXX)
-          trap 'rm -f -- "$tmp"' EXIT
-          bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh \
-            --root "$root" \
-            --compose-script /var/lib/meet-test-vps-deploy/scripts/production-compose.sh \
-            --output "$tmp" --public-url "$url"
-          cat "$tmp"
-          REMOTE
+          scripts/run-beta-recovery-remote-probe.sh \
+            --phase post --host "$HOST" --port "$PORT" --ssh-user "$SSH_USER" \
+            --host-fingerprint "$HOST_FINGERPRINT" --release-root "$PATH_ON_HOST" \
+            --public-url "$PUBLIC_URL" --source-sha "${{ inputs.source_sha }}" \
+            --recovery-id "$RECOVERY_ID" --output "$RUNNER_TEMP/post-probe.json"
           scripts/build-beta-recovery-evidence.sh validate-runtime \
             --runtime-proof "$RUNNER_TEMP/post-probe.json"
           gh run download "$GITHUB_RUN_ID" --name "beta-recovery-pre-probe-$GITHUB_RUN_ID" \

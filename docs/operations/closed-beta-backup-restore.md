@@ -38,6 +38,19 @@ scan or parser failure, ambiguous or unexpected key output, fingerprint
 mismatch, unsafe path, timeout, and publication collision fail closed before
 SSH/SCP or downstream recovery work.
 
+Restore pre- and post-probes use `scripts/run-beta-recovery-remote-probe.sh`.
+The helper stages the checked-out `probe-test-vps-recovery-runtime.sh` and
+`production-compose.sh` into a unique, phase-bound, marker-authenticated remote
+directory, then admits each file by checksum, regular-file type, link count,
+owner, and numeric mode before taking the deployment lock or executing the
+probe. It never falls back to a persistent recovery script under the deploy
+directory. Cleanup removes only a directory authenticated by this recovery's
+marker; existing, foreign, symlinked, ambiguous, or drifted state is preserved
+and fails the run, while owned state is removed after success, failure,
+SSH/SCP ambiguity, or HUP, INT, or TERM. The next live drill is a new
+authorized run after exact-head CI, review, QA, compliance, release, and final
+autoreview gates.
+
 A mismatch or host-key rotation requires out-of-band review, an approved
 fingerprint update, and a new authorized run. Do not trust a scanned key,
 enable TOFU or `accept-new`, retry or rotate automatically, or resume the
