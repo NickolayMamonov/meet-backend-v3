@@ -177,8 +177,7 @@ make_remote_boundary() {
   local scan_line
   command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen is required"
   ssh-keygen -q -t rsa -b 2048 -N '' -f "$fixture/remote-key" >/dev/null
-  scan_line=$(awk 'NR == 1 { print }' "$fixture/remote-key.pub")
-  scan_line=${scan_line#* }
+  scan_line=$(awk 'NR == 1 { print $2 }' "$fixture/remote-key.pub")
   export BETA_SEMANTIC_SCAN_LINE="$scan_line"
   export BETA_SEMANTIC_FINGERPRINT
   BETA_SEMANTIC_FINGERPRINT=$(ssh-keygen -lf "$fixture/remote-key.pub" -E sha256 |
@@ -186,7 +185,7 @@ make_remote_boundary() {
   cat >"$bin/ssh-keyscan" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s %s\n' fixture.example.test "${BETA_SEMANTIC_SCAN_LINE:?}"
+printf '%s ssh-rsa %s\n' fixture.example.test "${BETA_SEMANTIC_SCAN_LINE:?}"
 EOF
   cat >"$bin/ssh-keygen" <<'EOF'
 #!/usr/bin/env bash
@@ -198,7 +197,7 @@ EOF
 set -euo pipefail
 body=$(cat)
 printf '%s\n' "ssh-boundary" >>"${BETA_SEMANTIC_EVENTS:?}"
-if grep -Fq 'created=true' <<<"$body"; then
+if grep -Fq 'created_identity=' <<<"$body"; then
   printf 'created\n1:1\n'
 elif grep -Fq 'probe_payload=${13}' <<<"$body"; then
   printf '%s\n' '{"schema":"meet-backend/test-vps-recovery-runtime/v1","healthy":true,"runtime":{"imageId":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","configHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","health":"healthy","uploadsMount":"volume"},"https":{"meetingsStatus":"200","actuatorStatus":"404","httpRedirectHttps":true,"meetingsJson":true}}'
