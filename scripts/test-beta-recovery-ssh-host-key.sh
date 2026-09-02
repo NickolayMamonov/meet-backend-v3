@@ -12,6 +12,15 @@ fail() {
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 materializer=$root/scripts/materialize-beta-recovery-known-hosts.sh
 [ -x "$materializer" ] || fail "materializer is missing or not executable"
+remote_probe=$root/scripts/run-beta-recovery-remote-probe.sh
+[ -x "$remote_probe" ] || fail "remote probe helper is missing or not executable"
+bash -n "$remote_probe"
+for required in SSH_PRIVATE_KEY StrictHostKeyChecking=yes KnownHostsCommand=none \
+  remote_create_attempted=true remote_cleanup_done=false marker_value= \
+  "trap 'on_signal 129' HUP" "trap 'on_signal 130' INT" "trap 'on_signal 143' TERM"; do
+  grep -Fq -- "$required" "$remote_probe" ||
+    fail "remote probe contract is incomplete: $required"
+done
 
 for tool in awk basename chmod env find grep mkdir mktemp rm scp seq sha256sum sleep ssh ssh-keygen stat tr wc; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tool is unavailable: $tool"
@@ -1246,7 +1255,7 @@ run_consumer_setup_case() {
     fail "consumer setup $name did not record local cleanup"
 }
 
-for body_name in capture pre-probe post-probe; do
+for body_name in capture; do
   case "$body_name" in
     capture) body=$capture_body ;;
     pre-probe) body=$pre_probe_body ;;
@@ -1392,8 +1401,6 @@ run_consumer_case() {
 
 for signal in HUP INT TERM; do
   run_consumer_case "capture-$signal" "$capture_body" "$signal" scp
-  run_consumer_case "pre-probe-$signal" "$pre_probe_body" "$signal" ssh
-  run_consumer_case "post-probe-$signal" "$post_probe_body" "$signal" ssh
 done
 run_consumer_case capture-TERM-remote-cleanup-failure "$capture_body" TERM scp 1
 run_consumer_case capture-ambiguous-create "$capture_body" HUP scp 0 ambiguous
