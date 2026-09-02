@@ -997,7 +997,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -s ] &&' \
   '  [ "${args[command_start+3]:-}" = -- ]; then' \
   '  body=$(cat)' \
-  '  if printf "%s" "$body" | grep -Fq "created=true"; then' \
+  '  if printf "%s" "$body" | grep -Fq "created_identity="; then' \
   '    printf "created\n1:1\n"; exit 0' \
   '  elif printf "%s" "$body" | grep -Fq "probe_payload=\${13}"; then' \
   '    printf "{\"schema\":\"meet-backend/test-vps-recovery-runtime/v1\",\"healthy\":true,\"runtime\":{\"imageId\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"configHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"health\":\"healthy\",\"uploadsMount\":\"volume\"},\"https\":{\"meetingsStatus\":\"200\",\"actuatorStatus\":\"404\",\"httpRedirectHttps\":true,\"meetingsJson\":true}}\n"; exit 0' \
