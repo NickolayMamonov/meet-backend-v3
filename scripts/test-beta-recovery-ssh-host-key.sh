@@ -997,6 +997,13 @@ write_wrapper "$consumer_bin/ssh" \
   '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -s ] &&' \
   '  [ "${args[command_start+3]:-}" = -- ]; then' \
   '  body=$(cat)' \
+  '  if printf "%s" "$body" | grep -Fq "created=true"; then' \
+  '    printf "created\n1:1\n"; exit 0' \
+  '  elif printf "%s" "$body" | grep -Fq "probe_payload=\${13}"; then' \
+  '    printf "{\"schema\":\"meet-backend/test-vps-recovery-runtime/v1\",\"healthy\":true,\"runtime\":{\"imageId\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"configHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"health\":\"healthy\",\"uploadsMount\":\"volume\"},\"https\":{\"meetingsStatus\":\"200\",\"actuatorStatus\":\"404\",\"httpRedirectHttps\":true,\"meetingsJson\":true}}\n"; exit 0' \
+  '  elif printf "%s" "$body" | grep -Fq "find \"/proc/\$\$/fd/\$remote_fd\""; then' \
+  '    printf "remote-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 0' \
+  '  fi' \
   '  token_arg=${args[command_start+5]:-}' \
   '  remote_state=${BETA_RECOVERY_REMOTE_STATE:?}' \
   '  marker="$remote_state/.meet-beta-recovery-owner"' \
@@ -1111,6 +1118,8 @@ tooling_files=(
   scripts/build-beta-recovery-evidence.sh
   scripts/install-beta-recovery-age.sh
   scripts/materialize-beta-recovery-known-hosts.sh
+  scripts/run-beta-recovery-remote-probe.sh
+  scripts/production-compose.sh
   scripts/probe-test-vps-recovery-runtime.sh
   scripts/run-beta-recovery-capture.sh
   scripts/run-beta-recovery-restore.sh

@@ -159,7 +159,7 @@ for source_file in "$probe_source" "$compose_source" "$materializer"; do
     fail "checked-out recovery tooling is unsafe"
 done
 
-for tool in awk cat chmod cmp id install ln mktemp od realpath rm sha256sum stat tr wc; do
+for tool in awk base64 cat chmod cmp id install ln mktemp od realpath rm sed sha256sum stat tr wc; do
   command -v "$tool" >/dev/null 2>&1 || fail "required local tooling is unavailable"
 done
 for tool in ssh scp; do
@@ -195,6 +195,7 @@ remote_cleanup_required=false
 remote_cleanup_done=false
 published=false
 success=false
+remote_identity=
 
 remove_published_output() {
   local current_identity
@@ -232,13 +233,15 @@ cleanup_remote() {
   [ "$remote_cleanup_required" = true ] || return 0
   [ "$remote_cleanup_done" = false ] || return 0
   if ssh "${ssh_opts[@]}" "$ssh_user@$host" sudo bash -s -- \
-    "$remote" "$owner_token" "$source_sha" "$phase" <<'REMOTE_CLEANUP'
+    "$remote" "$remote_identity" "$owner_token" "$source_sha" "$phase" <<'REMOTE_CLEANUP'
 set -euo pipefail
 remote=$1
-token=$2
-source_sha=$3
-phase=$4
+remote_identity=$2
+token=$3
+source_sha=$4
+phase=$5
 [[ "$remote" =~ ^/tmp/beta-recovery-probe-(pre|post)-[0-9a-f]{32,64}$ ]]
+[[ "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]
 [[ "$phase" = pre || "$phase" = post ]]
 [[ "$token" =~ ^[0-9a-f]{32,64}$ ]]
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
@@ -247,19 +250,38 @@ owner_gid=${SUDO_GID:?SUDO_GID is required}
 [[ "$owner_uid" =~ ^[0-9]+$ ]] && [[ "$owner_gid" =~ ^[0-9]+$ ]]
 marker="$remote/.meet-beta-recovery-owner"
 marker_value="meet-backend/beta-recovery-remote-probe-owner/v1:$token:$source_sha:$phase"
+secure="/tmp/beta-recovery-probe-secure-$token"
 expected=$(mktemp)
 trap 'rm -f -- "$expected"' EXIT HUP INT TERM
+secure_marker="$secure/.meet-beta-recovery-secure"
+printf '%s\n' "$marker_value" >"$expected"
 if [ ! -e "$remote" ] && [ ! -L "$remote" ]; then
+  if [ -e "$secure" ] || [ -L "$secure" ]; then
+    [ -d "$secure" ] && [ ! -L "$secure" ]
+    [ "$(stat -c '%a:%u:%g' -- "$secure")" = "700:0:0" ]
+    [ -f "$secure_marker" ] && [ ! -L "$secure_marker" ]
+    cmp -- "$expected" "$secure_marker" >/dev/null
+    rm -r -- "$secure"
+  fi
   exit 0
 fi
 [ -d "$remote" ] && [ ! -L "$remote" ]
+[ "$(stat -c '%d:%i' -- "$remote")" = "$remote_identity" ]
 [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]
 [ -f "$marker" ] && [ ! -L "$marker" ]
 [ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "600:$owner_uid:$owner_gid:1" ]
-printf '%s\n' "$marker_value" >"$expected"
 cmp -- "$expected" "$marker" >/dev/null
-rm -r -- "$remote"
+if [ -e "$secure" ] || [ -L "$secure" ]; then
+  [ -d "$secure" ] && [ ! -L "$secure" ]
+  [ "$(stat -c '%a:%u:%g' -- "$secure")" = "700:0:0" ]
+  rm -r -- "$secure"
+fi
+exec {remote_fd}<"$remote"
+[ "$(stat -c '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
+find "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
+rmdir "/proc/$$/fd/$remote_fd"
 [ ! -e "$remote" ] && [ ! -L "$remote" ]
+[ ! -e "$secure" ] && [ ! -L "$secure" ]
 REMOTE_CLEANUP
   then
     remote_cleanup_done=true
@@ -340,9 +362,6 @@ unset SSH_PRIVATE_KEY
 ssh_opts=(-F "$config" -i "$key" -p "$port" -o BatchMode=yes
   -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known"
   -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none)
-scp_opts=(-F "$config" -i "$key" -P "$port" -o BatchMode=yes
-  -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known"
-  -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none)
 
 owner_token=$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]') ||
   fail "remote staging identity generation failed"
@@ -376,6 +395,7 @@ marker_value="meet-backend/beta-recovery-remote-probe-owner/v1:$token:$source_sh
 created=false
 marker_published=false
 marker_tmp=
+created_identity=
 cleanup_create() {
   local status=$?
   trap - EXIT HUP INT TERM
@@ -384,8 +404,14 @@ cleanup_create() {
   fi
   if [ "$created" = true ] && [ "$marker_published" = false ] &&
     [ -d "$remote" ] && [ ! -L "$remote" ] &&
+    [ -n "$created_identity" ] &&
+    [ "$(stat -c '%d:%i' -- "$remote")" = "$created_identity" ] &&
     [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]; then
-    rm -r -- "$remote" || status=1
+    exec {created_fd}<"$remote" || status=1
+    [ "$(stat -c '%d:%i' -- "/proc/$$/fd/$created_fd")" = "$created_identity" ] ||
+      status=1
+    find "/proc/$$/fd/$created_fd" -mindepth 1 -delete || status=1
+    rmdir "/proc/$$/fd/$created_fd" || status=1
   fi
   exit "$status"
 }
@@ -400,6 +426,7 @@ chmod 700 -- "$remote"
 chown "$owner_uid:$owner_gid" -- "$remote"
 [ -d "$remote" ] && [ ! -L "$remote" ]
 [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]
+created_identity=$(stat -c '%d:%i' -- "$remote")
 marker_tmp=$(mktemp "$remote/.meet-beta-recovery-owner.XXXXXX")
 chmod 600 -- "$marker_tmp"
 chown "$owner_uid:$owner_gid" -- "$marker_tmp"
@@ -416,51 +443,59 @@ cmp -- "$expected" "$marker" >/dev/null
 rm -f -- "$expected"
 trap - EXIT HUP INT TERM
 printf 'created\n'
+stat -c '%d:%i' -- "$remote"
 REMOTE_CREATE
 then
   create_status=0
 else
   create_status=$?
 fi
-create_result=
+create_result=$(sed -n '1p' "$create_result_tmp" 2>/dev/null || true)
+remote_identity=$(sed -n '2p' "$create_result_tmp" 2>/dev/null || true)
 create_result_lines=$(wc -l <"$create_result_tmp" | tr -d '[:space:]')
-if [ "$create_result_lines" = 1 ]; then
-  IFS= read -r create_result <"$create_result_tmp" || true
-fi
 if [ "$create_status" -eq 73 ] && [ "$create_result" = collision ]; then
   remote_cleanup_required=false
   fail "remote staging path is already occupied"
 fi
-[ "$create_status" -eq 0 ] && [ "$create_result" = created ] ||
+[ "$create_status" -eq 0 ] && [ "$create_result" = created ] &&
+  [ "$create_result_lines" = 2 ] &&
+  [[ "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]] ||
   fail "remote staging creation was ambiguous or failed"
 remove_create_result_tmp || fail "remote staging protocol cleanup failed"
 create_result_tmp=
 create_result_identity=
-
-scp "${scp_opts[@]}" "$probe_source" "$compose_source" "$ssh_user@$host:$remote/"
 
 proof_tmp=$(mktemp "$output_parent/.beta-recovery-probe-output.XXXXXX") ||
   fail "proof staging creation failed"
 proof_tmp_identity=$(stat -c '%d:%i' -- "$proof_tmp" 2>/dev/null) ||
   fail "proof staging setup failed"
 chmod 600 -- "$proof_tmp" || fail "proof staging setup failed"
+probe_payload=$(base64 --wrap=0 -- "$probe_source") ||
+  fail "probe receiver payload preparation failed"
+compose_payload=$(base64 --wrap=0 -- "$compose_source") ||
+  fail "Compose receiver payload preparation failed"
 ssh "${ssh_opts[@]}" "$ssh_user@$host" sudo bash -s -- \
-  "$remote" "$owner_token" "$source_sha" "$phase" "$probe_sha" "$probe_mode" \
-  "$compose_sha" "$compose_mode" "$release_root" "$public_url" "$recovery_id" <<'REMOTE_RUN' \
+  "$remote" "$remote_identity" "$owner_token" "$source_sha" "$phase" \
+  "$probe_sha" "$probe_mode" "$compose_sha" "$compose_mode" "$release_root" \
+  "$public_url" "$recovery_id" "$probe_payload" "$compose_payload" <<'REMOTE_RUN' \
   >"$proof_tmp"
 set -euo pipefail
 remote=$1
-token=$2
-source_sha=$3
-phase=$4
-probe_sha=$5
-probe_mode=$6
-compose_sha=$7
-compose_mode=$8
-release_root=$9
-public_url=${10}
-recovery_id=${11}
+remote_identity=$2
+token=$3
+source_sha=$4
+phase=$5
+probe_sha=$6
+probe_mode=$7
+compose_sha=$8
+compose_mode=$9
+release_root=${10}
+public_url=${11}
+recovery_id=${12}
+probe_payload=${13}
+compose_payload=${14}
 [[ "$remote" =~ ^/tmp/beta-recovery-probe-(pre|post)-[0-9a-f]{32,64}$ ]]
+[[ "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]
 [[ "$token" =~ ^[0-9a-f]{32,64}$ ]]
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
 [[ "$phase" = pre || "$phase" = post ]]
@@ -476,35 +511,64 @@ owner_gid=${SUDO_GID:?SUDO_GID is required}
 [[ "$owner_uid" =~ ^[0-9]+$ ]] && [[ "$owner_gid" =~ ^[0-9]+$ ]]
 marker="$remote/.meet-beta-recovery-owner"
 marker_value="meet-backend/beta-recovery-remote-probe-owner/v1:$token:$source_sha:$phase"
+secure="/tmp/beta-recovery-probe-secure-$token"
 expected=$(mktemp)
 trap 'rm -f -- "$expected"' EXIT HUP INT TERM
 printf '%s\n' "$marker_value" >"$expected"
-[ -d "$remote" ] && [ ! -L "$remote" ]
+exec {remote_fd}<"$remote"
+[ "$(stat -c '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
+[ -d "/proc/$$/fd/$remote_fd" ] && [ ! -L "/proc/$$/fd/$remote_fd" ]
 [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]
 [ -f "$marker" ] && [ ! -L "$marker" ]
 [ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "600:$owner_uid:$owner_gid:1" ]
 cmp -- "$expected" "$marker" >/dev/null
-probe="$remote/probe-test-vps-recovery-runtime.sh"
-compose="$remote/production-compose.sh"
+if [ -e "$secure" ] || [ -L "$secure" ]; then
+  exit 1
+fi
+install -d -m 700 -- "$secure"
+chown 0:0 -- "$secure"
+secure_marker="$secure/.meet-beta-recovery-secure"
+printf '%s\n' "$marker_value" >"$secure_marker"
+chmod 600 -- "$secure_marker"
+chown 0:0 -- "$secure_marker"
+probe_tmp="$secure/.probe.tmp"
+compose_tmp="$secure/.compose.tmp"
+printf '%s' "$probe_payload" | base64 --decode >"$probe_tmp"
+printf '%s' "$compose_payload" | base64 --decode >"$compose_tmp"
+chmod 755 -- "$probe_tmp" "$compose_tmp"
+chown 0:0 -- "$probe_tmp" "$compose_tmp"
+ln -T -- "$probe_tmp" "$secure/probe-test-vps-recovery-runtime.sh"
+ln -T -- "$compose_tmp" "$secure/production-compose.sh"
+rm -f -- "$probe_tmp" "$compose_tmp"
+probe="$secure/probe-test-vps-recovery-runtime.sh"
+compose="$secure/production-compose.sh"
 for tool in "$probe" "$compose"; do
   [ -f "$tool" ] && [ ! -L "$tool" ]
   [ "$(stat -c '%a:%u:%g:%h' -- "$tool")" = \
-    "$([ "$tool" = "$probe" ] && printf '%s' "$probe_mode" || printf '%s' "$compose_mode"):$owner_uid:$owner_gid:1" ]
+    "$([ "$tool" = "$probe" ] && printf '%s' "$probe_mode" || printf '%s' "$compose_mode"):0:0:1" ]
 done
 [ "$(sha256sum -- "$probe" | awk '{print $1}')" = "$probe_sha" ]
 [ "$(sha256sum -- "$compose" | awk '{print $1}')" = "$compose_sha" ]
-proof="$remote/runtime-proof.json"
+proof="$secure/runtime-proof.json"
 [ ! -e "$proof" ] && [ ! -L "$proof" ]
+exec {probe_fd}<"$probe"
+exec {compose_fd}<"$compose"
+[ "$(stat -c '%d:%i' -- "/proc/$$/fd/$probe_fd")" = \
+  "$(stat -c '%d:%i' -- "$probe")" ]
+[ "$(stat -c '%d:%i' -- "/proc/$$/fd/$compose_fd")" = \
+  "$(stat -c '%d:%i' -- "$compose")" ]
 export PRODUCTION_ROOT="$release_root"
 lock_path=/var/lib/meet-test-vps-deploy/.deploy.lock
 [ -f "$lock_path" ] && [ ! -L "$lock_path" ]
 exec 9>>"$lock_path"
 flock -n 9
-bash "$probe" --root "$release_root" --compose-script "$compose" \
+bash "/proc/$$/fd/$probe_fd" --root "$release_root" \
+  --compose-script "/proc/$$/fd/$compose_fd" \
   --output "$proof" --public-url "$public_url"
 [ -f "$proof" ] && [ ! -L "$proof" ]
 [ "$(stat -c '%a:%h' -- "$proof")" = 600:1 ]
-cat -- "$proof"
+exec {proof_fd}<"$proof"
+cat -- "/proc/$$/fd/$proof_fd"
 REMOTE_RUN
 [ -f "$proof_tmp" ] && [ ! -L "$proof_tmp" ] ||
   fail "runtime proof transfer is unsafe"
