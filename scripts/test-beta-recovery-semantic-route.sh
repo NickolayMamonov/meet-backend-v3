@@ -232,7 +232,12 @@ run_remote_body() {
   if [ "$(id -u)" -eq 0 ]; then
     SUDO_UID=$(id -u) SUDO_GID=$(id -g) bash -s -- "$@"
   else
-    sudo -n bash -s -- "$@"
+    if [ -n "${FAKE_RUNTIME_PROBE:-}" ]; then
+      sudo -n env "PATH=$PATH" "FAKE_RUNTIME_PROBE=$FAKE_RUNTIME_PROBE" \
+        bash -s -- "$@"
+    else
+      sudo -n env "PATH=$PATH" bash -s -- "$@"
+    fi
   fi
 }
 case "${#protocol[@]}" in
