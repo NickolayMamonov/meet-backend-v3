@@ -652,6 +652,7 @@ for admission_failure in artifact-id artifact-name retention expiry size run-sta
   run_admission_failure "$admission_failure"
 done
 publication_race_bin=$fixture/publication-race-bin
+real_mv=$(command -v mv)
 mkdir -- "$publication_race_bin"
 chmod 700 -- "$publication_race_bin"
 cat >"$publication_race_bin/mv" <<'EOF'
@@ -673,7 +674,7 @@ exec "${BETA_SEMANTIC_REAL_MV:?}" "$@"
 EOF
 chmod 700 -- "$publication_race_bin/mv"
 run_publication_race() {
-  local mode=$1 runner="$fixture/publication-race-$1" target=$fixture/publication-race-target
+  local mode=$1 runner="$fixture/publication-race-$1" target="$fixture/publication-race-target-$1"
   mkdir -- "$runner"
   chmod 700 -- "$runner"
   mkdir -- "$target"
@@ -684,7 +685,7 @@ run_publication_race() {
     GITHUB_OUTPUT="$runner/output" PATH="$publication_race_bin:$fixture/bin:$PATH" \
     BETA_SEMANTIC_PUBLICATION_RACE_MODE="$mode" \
     BETA_SEMANTIC_PUBLICATION_RACE_TARGET="$target" \
-    BETA_SEMANTIC_REAL_MV="$(command -v mv)" \
+    BETA_SEMANTIC_REAL_MV="$real_mv" \
     "$admit" --artifact-id "$ARTIFACT_ID" --recovery-id "$recovery_id" \
     --source-sha "$source_sha" --repository "$repository" \
     --workflow-path "$RECOVERY_WORKFLOW" \
@@ -702,7 +703,7 @@ run_publication_race() {
       [ -L "$runner/artifact" ] ||
         fail "symlink publication survivor was not preserved" ;;
   esac
-  [ "$(sha256sum "$target/entry")" = "$(printf 'outside survivor\n' | sha256sum)" ] ||
+  printf 'outside survivor\n' | cmp -- "$target/entry" - ||
     fail "publication race changed the foreign target"
   [ ! -e "$runner/artifact.zip" ] || fail "publication race left a ZIP"
   [ -z "$(find "$runner" -maxdepth 1 -name '.beta-recovery-*' -print -quit)" ] ||
