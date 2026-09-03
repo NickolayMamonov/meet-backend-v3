@@ -220,12 +220,26 @@ model_lock=$model_root/deploy.lock
 mkdir -p -- "$model_root"
 touch -- "$model_lock"
 body=$(sed "s|/var/lib/meet-test-vps-deploy/.deploy.lock|$model_lock|g" <<<"$body")
+run_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+run_remote_body() {
+  if [ "$(id -u)" -eq 0 ]; then
+    SUDO_UID=$(id -u) SUDO_GID=$(id -g) bash -s -- "$@"
+  else
+    sudo -n bash -s -- "$@"
+  fi
+}
 case "${#protocol[@]}" in
   4)
     printf '%s\n' remote-create >>"${BETA_SEMANTIC_EVENTS:?}"
     printf '%s-remote-create\n' "${protocol[3]}" >>"${BETA_SEMANTIC_EVENTS:?}"
     printf '%s\n' "${protocol[0]}" >"$model_root/remote-path"
-    SUDO_UID=$(id -u) SUDO_GID=$(id -g) bash -s -- "${protocol[@]}" <<<"$body"
+    run_remote_body "${protocol[@]}" <<<"$body"
     ;;
   14)
     case "${BETA_SEMANTIC_MUTATION:-}" in
@@ -237,22 +251,21 @@ case "${#protocol[@]}" in
         chmod 700 -- "${protocol[0]}" ;;
       secure-foreign)
         secure="/tmp/beta-recovery-probe-secure-${protocol[2]}"
-        mkdir -- "$secure"
-        chmod 700 -- "$secure"
-        chown 0:0 -- "$secure"
-        printf '%s\n' foreign-secure >"$secure/.meet-beta-recovery-secure"
-        chmod 600 -- "$secure/.meet-beta-recovery-secure"
-        chown 0:0 -- "$secure/.meet-beta-recovery-secure" ;;
+        run_as_root mkdir -- "$secure"
+        run_as_root chmod 700 -- "$secure"
+        run_as_root chown 0:0 -- "$secure"
+        printf '%s\n' foreign-secure | run_as_root tee "$secure/.meet-beta-recovery-secure" >/dev/null
+        run_as_root chmod 600 -- "$secure/.meet-beta-recovery-secure"
+        run_as_root chown 0:0 -- "$secure/.meet-beta-recovery-secure" ;;
     esac
     printf '%s\n' remote-run >>"${BETA_SEMANTIC_EVENTS:?}"
     printf '%s-remote-run\n' "${protocol[4]}" >>"${BETA_SEMANTIC_EVENTS:?}"
-    FAKE_RUNTIME_PROBE=1 SUDO_UID=$(id -u) SUDO_GID=$(id -g) \
-      bash -s -- "${protocol[@]}" <<<"$body"
+    FAKE_RUNTIME_PROBE=1 run_remote_body "${protocol[@]}" <<<"$body"
     ;;
   5)
     printf '%s\n' remote-cleanup >>"${BETA_SEMANTIC_EVENTS:?}"
     printf '%s-remote-cleanup\n' "${protocol[4]}" >>"${BETA_SEMANTIC_EVENTS:?}"
-    SUDO_UID=$(id -u) SUDO_GID=$(id -g) bash -s -- "${protocol[@]}" <<<"$body"
+    run_remote_body "${protocol[@]}" <<<"$body"
     ;;
   *) printf 'unsupported semantic SSH protocol\n' >&2; exit 2 ;;
 esac
@@ -409,13 +422,20 @@ remote_failure() {
   remote_path=$(cat "$fixture/remote-model/remote-path")
   [ -e "$remote_path" ] || [ -L "$remote_path" ] ||
     fail "foreign remote survivor was not preserved: $mutation"
+  remove_remote_path() {
+    if [ "$(id -u)" -eq 0 ]; then
+      rm -r -- "$1"
+    else
+      sudo -n rm -r -- "$1"
+    fi
+  }
   if [ "$mutation" = secure-foreign ]; then
     secure_path=/tmp/beta-recovery-probe-secure-$(basename "$remote_path" | sed 's/.*-//')
     [ -e "$secure_path" ] || [ -L "$secure_path" ] ||
       fail "foreign secure survivor was not preserved"
-    rm -r -- "$secure_path"
+    remove_remote_path "$secure_path"
   fi
-  rm -r -- "$remote_path"
+  remove_remote_path "$remote_path"
 }
 remote_failure marker-drift
 remote_failure directory-replacement
