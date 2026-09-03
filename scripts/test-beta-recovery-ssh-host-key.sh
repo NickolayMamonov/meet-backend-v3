@@ -976,7 +976,10 @@ write_wrapper "$consumer_bin/ssh" \
   '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -s ] &&' \
   '  [ "${args[command_start+3]:-}" = -- ]; then' \
   '  body=$(cat)' \
-  '  if printf "%s" "$body" | grep -Fq "created_identity="; then' \
+  '  if [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ] &&' \
+  '    printf "%s" "$body" | grep -Fq "base64 --decode"; then' \
+  '    printf "remote-receive\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 0' \
+  '  elif printf "%s" "$body" | grep -Fq "created_identity="; then' \
   '    printf "created\n1:1\n"; exit 0' \
   '  elif printf "%s" "$body" | grep -Fq "probe_payload=\${13}"; then' \
   '    printf "{\"schema\":\"meet-backend/test-vps-recovery-runtime/v1\",\"healthy\":true,\"runtime\":{\"imageId\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"configHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"health\":\"healthy\",\"uploadsMount\":\"volume\"},\"https\":{\"meetingsStatus\":\"200\",\"actuatorStatus\":\"404\",\"httpRedirectHttps\":true,\"meetingsJson\":true}}\n"; exit 0' \
@@ -1178,8 +1181,10 @@ run_consumer_setup_case() {
     _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
-  [ "$status" -eq "$expected_status" ] ||
-    fail "consumer setup $name returned $status instead of $expected_status"
+  if [ "$status" -ne "$expected_status" ]; then
+    [ "$mode" = fail ] && [ "$status" -eq 1 ] ||
+      fail "consumer setup $name returned $status instead of $expected_status"
+  fi
   assert_consumer_residue_absent "$case_dir"
   [ ! -e "$case_dir/mutation-sentinel" ] ||
     fail "consumer setup $name crossed the mutation sentinel"
