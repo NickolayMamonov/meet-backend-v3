@@ -267,7 +267,21 @@ case "${#protocol[@]}" in
     esac
     printf '%s\n' remote-run >>"${BETA_SEMANTIC_EVENTS:?}"
     printf '%s-remote-run\n' "${protocol[4]}" >>"${BETA_SEMANTIC_EVENTS:?}"
-    FAKE_RUNTIME_PROBE=1 run_remote_body "${protocol[@]}" <<<"$body"
+    if [ "${FAKE_RUNTIME_PROBE:-}" = 1 ]; then
+      runtime_root=$model_root/runtime-docker-root
+      runtime_state=$model_root/runtime-docker-state
+      if FAKE_RUNTIME_PROBE=1 FAKE_DOCKER_ROOT="$runtime_root" \
+        FAKE_DOCKER_STATE="$runtime_state" \
+        run_remote_body "${protocol[@]}" <<<"$body"; then
+        remote_status=0
+      else
+        remote_status=$?
+      fi
+      [ ! -e "$runtime_root" ] || run_as_root rm -r -- "$runtime_root"
+      [ ! -e "$runtime_state" ] || run_as_root rm -r -- "$runtime_state"
+      return "$remote_status"
+    fi
+    run_remote_body "${protocol[@]}" <<<"$body"
     ;;
   5)
     printf '%s\n' remote-cleanup >>"${BETA_SEMANTIC_EVENTS:?}"
