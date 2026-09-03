@@ -6,7 +6,11 @@ root=${FAKE_DOCKER_ROOT:?}
 event_log=${FAKE_RECOVERY_EVENT_LOG:-}
 log_event() {
   [ -n "$event_log" ] || return 0
-  printf 'docker-%s\n' "$1" >>"$event_log"
+  if [ "${FAKE_RUNTIME_PROBE:-0}" = 1 ]; then
+    printf 'runtime-docker-%s\n' "$1" >>"$event_log"
+  else
+    printf 'docker-%s\n' "$1" >>"$event_log"
+  fi
 }
 mkdir -p "$state" "$root/volumes"
 volume=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
@@ -97,6 +101,25 @@ case "${1:-}" in
   info)
     log_event info
     if [ "${2:-}" = --format ]; then printf '%s\n' "$root"; else printf 'fixture\n'; fi
+    ;;
+  compose)
+    log_event compose
+    printf '%s\n' "$*" | grep -Fq 'ps -q backend' ||
+      { echo 'unsupported fixture compose operation' >&2; exit 2; }
+    printf '%s\n' fixture-container
+    ;;
+  inspect)
+    log_event inspect
+    [ "${2:-}" = fixture-container ] || exit 1
+    format=${4:-}
+    case "$format" in
+      *State.Running*) printf 'true\n' ;;
+      *State.Health*) printf 'healthy\n' ;;
+      *'.Image'*) printf '%s\n' 'repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
+      *config-hash*) printf '%s\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ;;
+      *'.Mounts'*) printf '%s\n' 'volume|meet-production_uploads_data' ;;
+      *) exit 2 ;;
+    esac
     ;;
   pull) log_event pull ;;
   image)

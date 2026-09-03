@@ -255,14 +255,34 @@ expected=$(mktemp)
 trap 'rm -f -- "$expected"' EXIT HUP INT TERM
 secure_marker="$secure/.meet-beta-recovery-secure"
 printf '%s\n' "$marker_value" >"$expected"
-if [ ! -e "$remote" ] && [ ! -L "$remote" ]; then
-  if [ -e "$secure" ] || [ -L "$secure" ]; then
-    [ -d "$secure" ] && [ ! -L "$secure" ]
-    [ "$(stat -c '%a:%u:%g' -- "$secure")" = "700:0:0" ]
-    [ -f "$secure_marker" ] && [ ! -L "$secure_marker" ]
-    cmp -- "$expected" "$secure_marker" >/dev/null
-    rm -r -- "$secure"
+remove_secure() {
+  local secure_identity secure_fd entry name
+  if [ ! -e "$secure" ] && [ ! -L "$secure" ]; then
+    return 0
   fi
+  [ -d "$secure" ] && [ ! -L "$secure" ]
+  [ "$(stat -c '%a:%u:%g' -- "$secure")" = "700:0:0" ]
+  [ -f "$secure_marker" ] && [ ! -L "$secure_marker" ]
+  [ "$(stat -c '%a:%u:%g:%h' -- "$secure_marker")" = "600:0:0:1" ]
+  cmp -- "$expected" "$secure_marker" >/dev/null
+  secure_identity=$(stat -c '%d:%i' -- "$secure")
+  exec {secure_fd}<"$secure"
+  [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$secure_fd")" = "$secure_identity" ]
+  [ "$(stat -Lc '%a:%u:%g' -- "/proc/$$/fd/$secure_fd")" = "700:0:0" ]
+  while IFS= read -r -d '' entry; do
+    name=${entry##*/}
+    case "$name" in
+      .meet-beta-recovery-secure|probe-test-vps-recovery-runtime.sh|production-compose.sh|runtime-proof.json|runtime-proof.json.response.*|runtime-proof.json.headers.*|runtime-proof.json.tmp.*) ;;
+      *) return 1 ;;
+    esac
+  done < <(find -L "/proc/$$/fd/$secure_fd" -mindepth 1 -maxdepth 1 -print0)
+  find -L "/proc/$$/fd/$secure_fd" -mindepth 1 -delete
+  [ "$(stat -c '%d:%i' -- "$secure")" = "$secure_identity" ]
+  rmdir -- "$secure"
+  [ ! -e "$secure" ] && [ ! -L "$secure" ]
+}
+if [ ! -e "$remote" ] && [ ! -L "$remote" ]; then
+  remove_secure
   exit 0
 fi
 [ -d "$remote" ] && [ ! -L "$remote" ]
@@ -271,15 +291,12 @@ fi
 [ -f "$marker" ] && [ ! -L "$marker" ]
 [ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "600:$owner_uid:$owner_gid:1" ]
 cmp -- "$expected" "$marker" >/dev/null
-if [ -e "$secure" ] || [ -L "$secure" ]; then
-  [ -d "$secure" ] && [ ! -L "$secure" ]
-  [ "$(stat -c '%a:%u:%g' -- "$secure")" = "700:0:0" ]
-  rm -r -- "$secure"
-fi
 exec {remote_fd}<"$remote"
-[ "$(stat -c '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
-find "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
-rmdir "/proc/$$/fd/$remote_fd"
+[ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
+remove_secure
+find -L "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
+[ "$(stat -c '%d:%i' -- "$remote")" = "$remote_identity" ]
+rmdir -- "$remote"
 [ ! -e "$remote" ] && [ ! -L "$remote" ]
 [ ! -e "$secure" ] && [ ! -L "$secure" ]
 REMOTE_CLEANUP
@@ -408,10 +425,11 @@ cleanup_create() {
     [ "$(stat -c '%d:%i' -- "$remote")" = "$created_identity" ] &&
     [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]; then
     exec {created_fd}<"$remote" || status=1
-    [ "$(stat -c '%d:%i' -- "/proc/$$/fd/$created_fd")" = "$created_identity" ] ||
+    [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$created_fd")" = "$created_identity" ] ||
       status=1
-    find "/proc/$$/fd/$created_fd" -mindepth 1 -delete || status=1
-    rmdir "/proc/$$/fd/$created_fd" || status=1
+    find -L "/proc/$$/fd/$created_fd" -mindepth 1 -delete || status=1
+    [ "$(stat -c '%d:%i' -- "$remote")" = "$created_identity" ] || status=1
+    rmdir -- "$remote" || status=1
   fi
   exit "$status"
 }
@@ -431,7 +449,8 @@ marker_tmp=$(mktemp "$remote/.meet-beta-recovery-owner.XXXXXX")
 chmod 600 -- "$marker_tmp"
 chown "$owner_uid:$owner_gid" -- "$marker_tmp"
 printf '%s\n' "$marker_value" >"$marker_tmp"
-mv -T -- "$marker_tmp" "$marker"
+ln -T -- "$marker_tmp" "$marker"
+rm -f -- "$marker_tmp"
 marker_tmp=
 marker_published=true
 [ -f "$marker" ] && [ ! -L "$marker" ]
@@ -516,8 +535,8 @@ expected=$(mktemp)
 trap 'rm -f -- "$expected"' EXIT HUP INT TERM
 printf '%s\n' "$marker_value" >"$expected"
 exec {remote_fd}<"$remote"
-[ "$(stat -c '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
-[ -d "/proc/$$/fd/$remote_fd" ] && [ ! -L "/proc/$$/fd/$remote_fd" ]
+[ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
+[ -d "/proc/$$/fd/$remote_fd" ]
 [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]
 [ -f "$marker" ] && [ ! -L "$marker" ]
 [ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "600:$owner_uid:$owner_gid:1" ]
@@ -525,12 +544,24 @@ cmp -- "$expected" "$marker" >/dev/null
 if [ -e "$secure" ] || [ -L "$secure" ]; then
   exit 1
 fi
-install -d -m 700 -- "$secure"
+mkdir -- "$secure"
+secure_identity=$(stat -c '%d:%i' -- "$secure")
+chmod 700 -- "$secure"
 chown 0:0 -- "$secure"
 secure_marker="$secure/.meet-beta-recovery-secure"
-printf '%s\n' "$marker_value" >"$secure_marker"
+secure_marker_tmp=$(mktemp "$secure/.meet-beta-recovery-secure.XXXXXX")
+chmod 600 -- "$secure_marker_tmp"
+chown 0:0 -- "$secure_marker_tmp"
+printf '%s\n' "$marker_value" >"$secure_marker_tmp"
+ln -T -- "$secure_marker_tmp" "$secure_marker"
+rm -f -- "$secure_marker_tmp"
 chmod 600 -- "$secure_marker"
 chown 0:0 -- "$secure_marker"
+[ "$(stat -c '%d:%i' -- "$secure")" = "$secure_identity" ]
+[ "$(stat -c '%a:%u:%g' -- "$secure")" = "700:0:0" ]
+[ -f "$secure_marker" ] && [ ! -L "$secure_marker" ]
+[ "$(stat -c '%a:%u:%g:%h' -- "$secure_marker")" = "600:0:0:1" ]
+cmp -- "$expected" "$secure_marker" >/dev/null
 probe_tmp="$secure/.probe.tmp"
 compose_tmp="$secure/.compose.tmp"
 printf '%s' "$probe_payload" | base64 --decode >"$probe_tmp"
@@ -540,6 +571,11 @@ chown 0:0 -- "$probe_tmp" "$compose_tmp"
 ln -T -- "$probe_tmp" "$secure/probe-test-vps-recovery-runtime.sh"
 ln -T -- "$compose_tmp" "$secure/production-compose.sh"
 rm -f -- "$probe_tmp" "$compose_tmp"
+[ "$(stat -c '%d:%i' -- "$secure")" = "$secure_identity" ]
+[ "$(stat -c '%a:%u:%g' -- "$secure")" = "700:0:0" ]
+[ -f "$secure_marker" ] && [ ! -L "$secure_marker" ]
+[ "$(stat -c '%a:%u:%g:%h' -- "$secure_marker")" = "600:0:0:1" ]
+cmp -- "$expected" "$secure_marker" >/dev/null
 probe="$secure/probe-test-vps-recovery-runtime.sh"
 compose="$secure/production-compose.sh"
 for tool in "$probe" "$compose"; do
@@ -553,9 +589,9 @@ proof="$secure/runtime-proof.json"
 [ ! -e "$proof" ] && [ ! -L "$proof" ]
 exec {probe_fd}<"$probe"
 exec {compose_fd}<"$compose"
-[ "$(stat -c '%d:%i' -- "/proc/$$/fd/$probe_fd")" = \
+[ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$probe_fd")" = \
   "$(stat -c '%d:%i' -- "$probe")" ]
-[ "$(stat -c '%d:%i' -- "/proc/$$/fd/$compose_fd")" = \
+[ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$compose_fd")" = \
   "$(stat -c '%d:%i' -- "$compose")" ]
 export PRODUCTION_ROOT="$release_root"
 lock_path=/var/lib/meet-test-vps-deploy/.deploy.lock
