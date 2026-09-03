@@ -232,12 +232,13 @@ run_remote_body() {
   if [ "$(id -u)" -eq 0 ]; then
     SUDO_UID=$(id -u) SUDO_GID=$(id -g) bash -s -- "$@"
   else
-    if [ -n "${FAKE_RUNTIME_PROBE:-}" ]; then
-      sudo -n env "PATH=$PATH" "FAKE_RUNTIME_PROBE=$FAKE_RUNTIME_PROBE" \
-        bash -s -- "$@"
-    else
-      sudo -n env "PATH=$PATH" bash -s -- "$@"
-    fi
+    remote_env=("PATH=$PATH")
+    for name in FAKE_RUNTIME_PROBE FAKE_DOCKER_STATE FAKE_DOCKER_ROOT \
+      FAKE_RECOVERY_ID FAKE_RECOVERY_EVENT_LOG FAKE_DATABASE_PROOF \
+      FAKE_DATABASE_DUMP FAKE_UPLOADS_ARCHIVE FAKE_MEDIA_REFERENCE POSTGRES_IMAGE; do
+      [ "${!name+x}" = x ] && remote_env+=("$name=${!name}")
+    done
+    sudo -n env "${remote_env[@]}" bash -s -- "$@"
   fi
 }
 case "${#protocol[@]}" in
