@@ -412,6 +412,7 @@ case "${#protocol[@]}" in
     if [ -n "${BETA_SEMANTIC_MUTATION_READY:-}" ]; then
       : >"$BETA_SEMANTIC_MUTATION_READY"
       for attempt in $(seq 1 500); do
+        : "$attempt"
         [ -e "${BETA_SEMANTIC_MUTATION_GO:?}" ] && break
         sleep 0.01
       done
@@ -588,7 +589,7 @@ run_gate_failure() {
     fail "restore-select crossed a prohibited boundary: $mode"
 }
 run_admission_failure() {
-  local mode=$1 runner="$fixture/admission-failure-$1" residue_path= residue_metadata=
+  local mode=$1 runner="$fixture/admission-failure-$1" residue_path='' residue_metadata=''
   mkdir -p -- "$runner"
   chmod 700 -- "$runner"
   : >"$runner/events.log"
@@ -619,19 +620,19 @@ run_admission_failure() {
     residue-file)
       [ -f "$residue_path" ] && [ ! -L "$residue_path" ] ||
         fail "regular residue was not preserved: $mode"
-      [ "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$residue_path")" =
+      [ "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$residue_path")" = \
         "$(sed -n '1p' "$residue_metadata")" ] &&
-        [ "$(sha256sum "$residue_path")" =
+        [ "$(sha256sum "$residue_path")" = \
           "$(sed -n '2p' "$residue_metadata")" ] ||
         fail "regular residue bytes changed: $mode" ;;
     residue-directory)
       [ -d "$residue_path" ] && [ ! -L "$residue_path" ] ||
         fail "directory residue was not preserved: $mode"
-      [ "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$residue_path")" =
+      [ "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$residue_path")" = \
         "$(sed -n '1p' "$residue_metadata")" ] &&
-        [ "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$residue_path/entry")" =
+        [ "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$residue_path/entry")" = \
           "$(sed -n '2p' "$residue_metadata")" ] &&
-        [ "$(sha256sum "$residue_path/entry")" =
+        [ "$(sha256sum "$residue_path/entry")" = \
           "$(sed -n '3p' "$residue_metadata")" ] ||
         fail "directory residue bytes changed: $mode" ;;
   esac
@@ -767,6 +768,7 @@ remote_failure() {
     run_probe pre "$output" &
   probe_pid=$!
   for attempt in $(seq 1 500); do
+    : "$attempt"
     [ -e "$mutation_ready" ] && break
     sleep 0.01
   done
