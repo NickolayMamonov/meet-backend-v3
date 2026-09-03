@@ -371,7 +371,8 @@ jobs:
               scripts/backup-production.sh scripts/beta-recovery-database-proof.sql \
               scripts/beta-recovery-media-proof.sh scripts/install-beta-recovery-age.sh \
               scripts/materialize-beta-recovery-known-hosts.sh \
-              scripts/validate-beta-recovery-artifact-retention.sh; do sha256sum "$file"; done |
+              scripts/validate-beta-recovery-artifact-retention.sh \
+              scripts/admit-beta-recovery-artifact.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')
           scripts/build-beta-recovery-evidence.sh manifest \
             --recovery-id "$RECOVERY_ID" --source-sha "${{ inputs.source_sha }}" \
@@ -451,35 +452,12 @@ jobs:
           ARTIFACT_ID: ${{ inputs.artifact_id }}
         run: |
           set -euo pipefail
-          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
-          artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID")
-          workflow_run_id=$(jq -er '.workflow_run.id' <<<"$artifact_json")
-          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
-          jq -e --arg prefix "beta-recovery-$RECOVERY_ID-" '
-            .id == ($id|tonumber) and .expired == false and .size_in_bytes > 0 and
-            (.name | startswith($prefix))
-          ' --arg id "$ARTIFACT_ID" \
-            --arg sha "${{ inputs.source_sha }}" <<<"$artifact_json"
-          scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"
-          jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
-            .status == "completed" and .conclusion == "success" and
-            .event == "workflow_dispatch" and .head_branch == "dev" and
-            .head_sha == $sha and
-            ((.path // .workflow_path // "") == $workflow) and
-            ((.display_title // "") | startswith("Beta recovery capture "))
-          ' <<<"$run_json"
-          directory="$RUNNER_TEMP/artifact"
-          mkdir "$directory"
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" >"$RUNNER_TEMP/artifact.zip"
-          unzip -q "$RUNNER_TEMP/artifact.zip" -d "$directory"
-          scripts/build-beta-recovery-evidence.sh validate-artifact \
-            --artifact-dir "$directory" --recovery-id "$RECOVERY_ID" \
-            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
-            --run-id "$(jq -r '.runId' "$directory/recovery-point.json")"
-          jq -e --argjson run "$(jq -r '.runId' "$directory/recovery-point.json")" \
-            --arg name "$(jq -r '.artifactName' "$directory/recovery-point.json")" \
-            '.workflow_run.id == $run and .name == $name' <<<"$artifact_json"
-          echo "artifact_dir=$directory" >>"$GITHUB_OUTPUT"
+          scripts/admit-beta-recovery-artifact.sh \
+            --artifact-id "$ARTIFACT_ID" --recovery-id "$RECOVERY_ID" \
+            --source-sha "${{ inputs.source_sha }}" \
+            --repository "$GITHUB_REPOSITORY" --workflow-path "$RECOVERY_WORKFLOW" \
+            --destination "$RUNNER_TEMP/artifact" --zip-path "$RUNNER_TEMP/artifact.zip"
+          echo "artifact_dir=$RUNNER_TEMP/artifact" >>"$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: beta-recovery-selected-${{ github.run_id }}
@@ -601,29 +579,11 @@ jobs:
           ARTIFACT_ID: ${{ inputs.artifact_id }}
         run: |
           set -euo pipefail
-          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
-          mkdir "$RUNNER_TEMP/artifact"
-          artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID")
-          workflow_run_id=$(jq -er '.workflow_run.id' <<<"$artifact_json")
-          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
-          jq -e --arg sha "${{ inputs.source_sha }}" --arg workflow "$RECOVERY_WORKFLOW" '
-            .status == "completed" and .conclusion == "success" and
-            .event == "workflow_dispatch" and .head_branch == "dev" and .head_sha == $sha and
-            ((.path // .workflow_path // "") == $workflow) and
-            ((.display_title // "") | startswith("Beta recovery capture "))
-          ' <<<"$run_json"
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
-            >"$RUNNER_TEMP/artifact.zip"
-          unzip -q "$RUNNER_TEMP/artifact.zip" -d "$RUNNER_TEMP/artifact"
-          scripts/build-beta-recovery-evidence.sh validate-artifact \
-            --artifact-dir "$RUNNER_TEMP/artifact" --recovery-id "$RECOVERY_ID" \
-            --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
-            --run-id "$(jq -r '.runId' "$RUNNER_TEMP/artifact/recovery-point.json")"
-          jq -e --arg name "$(jq -r '.artifactName' "$RUNNER_TEMP/artifact/recovery-point.json")" \
-            --argjson run "$(jq -r '.runId' "$RUNNER_TEMP/artifact/recovery-point.json")" \
-            --arg sha "${{ inputs.source_sha }}" \
-            '.name == $name and .workflow_run.id == $run' \
-            <<<"$artifact_json"
+          scripts/admit-beta-recovery-artifact.sh \
+            --artifact-id "$ARTIFACT_ID" --recovery-id "$RECOVERY_ID" \
+            --source-sha "${{ inputs.source_sha }}" \
+            --repository "$GITHUB_REPOSITORY" --workflow-path "$RECOVERY_WORKFLOW" \
+            --destination "$RUNNER_TEMP/artifact" --zip-path "$RUNNER_TEMP/artifact.zip"
       - name: Validate runner capacity
         shell: bash
         run: |
@@ -640,7 +600,8 @@ jobs:
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
               scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
               scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh \
-              scripts/validate-beta-recovery-artifact-retention.sh; do sha256sum "$file"; done |
+              scripts/validate-beta-recovery-artifact-retention.sh \
+              scripts/admit-beta-recovery-artifact.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \
@@ -703,7 +664,8 @@ jobs:
               scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
               scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
               scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh \
-              scripts/validate-beta-recovery-artifact-retention.sh; do sha256sum "$file"; done |
+              scripts/validate-beta-recovery-artifact-retention.sh \
+              scripts/admit-beta-recovery-artifact.sh; do sha256sum "$file"; done |
               sort | sha256sum | awk '{print $1}')" \
             --workflow-digest "$(sha256sum "$RECOVERY_WORKFLOW" | awk '{print $1}')" \
             --database-digest "$(sha256sum scripts/beta-recovery-database-proof.sql | awk '{print $1}')" \

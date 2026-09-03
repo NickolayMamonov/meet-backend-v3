@@ -1123,6 +1123,7 @@ tooling_files=(
   scripts/probe-test-vps-recovery-runtime.sh
   scripts/run-beta-recovery-capture.sh
   scripts/run-beta-recovery-restore.sh
+  scripts/admit-beta-recovery-artifact.sh
   scripts/validate-beta-recovery-artifact-retention.sh
 )
 for tooling_file in "${tooling_files[@]}"; do

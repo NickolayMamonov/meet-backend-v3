@@ -38,6 +38,8 @@ helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
 [ "$helper_count" -eq 1 ]
 grep -Fq 'scripts/run-beta-recovery-remote-probe.sh' "$workflow"
 probe_helper="$root/scripts/run-beta-recovery-remote-probe.sh"
+! grep -Fq 'scp' "$probe_helper"
+grep -Fq 'base64 --decode' "$probe_helper"
 for required in \
   'ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")' \
   'install -m 600 /dev/null "$config"' \
@@ -386,20 +388,16 @@ publish_block=$(awk '/^      - id: publish$/{flag=1} flag' "$workflow")
 grep -Fq '.capturedAt==.recoveryPointTime' "$workflow"
 grep -Fq 'observed_age=$((observed_epoch - point_epoch))' "$workflow"
 [ "$(grep -Fc 'retention-days: 30' "$workflow")" -eq 6 ]
-[ "$(grep -Fc 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow")" -eq 3 ]
+[ "$(grep -Fc 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow")" -eq 2 ]
 ! grep -Eq 'created_epoch|expires_epoch|30 \* 24 \* 60 \* 60' "$workflow"
 publish_line=$(grep -n '^      - id: publish$' "$workflow" | head -1 | cut -d: -f1)
 capture_retention_line=$(grep -n 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow" |
   sed -n '1p' | cut -d: -f1)
-restore_retention_line=$(grep -n 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow" |
-  sed -n '2p' | cut -d: -f1)
 final_retention_line=$(grep -n 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow" |
-  sed -n '3p' | cut -d: -f1)
-zip_line=$(grep -n 'actions/artifacts/\$ARTIFACT_ID/zip' "$workflow" | head -1 | cut -d: -f1)
+  sed -n '2p' | cut -d: -f1)
 cleanup_marker_line=$(grep -n '^      - id: final_cleanup$' "$workflow" | head -1 | cut -d: -f1)
 evidence_manifest_line=$(grep -n 'scripts/build-beta-recovery-evidence.sh final' "$workflow" | head -1 | cut -d: -f1)
 [ "$publish_line" -lt "$capture_retention_line" ] &&
-  [ "$restore_retention_line" -lt "$zip_line" ] &&
   [ "$cleanup_marker_line" -lt "$final_retention_line" ] &&
   [ "$final_retention_line" -lt "$evidence_manifest_line" ]
 
@@ -477,6 +475,7 @@ expect_fake_date_failure non-decimal-date-output non-decimal "$valid_retention"
 
 canonical_inventory=$retention_fixture/canonical-inventory
 cat >"$canonical_inventory" <<'EOF'
+scripts/admit-beta-recovery-artifact.sh
 scripts/authorize-beta-recovery.sh
 scripts/backup-production.sh
 scripts/beta-recovery-database-proof.sql

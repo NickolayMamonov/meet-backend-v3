@@ -36,7 +36,7 @@ checking. The private key, empty SSH configuration, generated known-hosts file,
 and staging directory are removed on every exit path. Malformed configuration,
 scan or parser failure, ambiguous or unexpected key output, fingerprint
 mismatch, unsafe path, timeout, and publication collision fail closed before
-SSH/SCP or downstream recovery work.
+SSH receiver or downstream recovery work.
 
 Restore pre- and post-probes use `scripts/run-beta-recovery-remote-probe.sh`.
 The helper stages the checked-out `probe-test-vps-recovery-runtime.sh` and
@@ -47,7 +47,7 @@ probe. It never falls back to a persistent recovery script under the deploy
 directory. Cleanup removes only a directory authenticated by this recovery's
 marker; existing, foreign, symlinked, ambiguous, or drifted state is preserved
 and fails the run, while owned state is removed after success, failure,
-SSH/SCP ambiguity, or HUP, INT, or TERM. The next live drill is a new
+SSH receiver ambiguity, or HUP, INT, or TERM. The next live drill is a new
 authorized run after exact-head CI, review, QA, compliance, release, and final
 autoreview gates.
 

@@ -162,7 +162,7 @@ done
 for tool in awk base64 cat chmod cmp id install ln mktemp od realpath rm sed sha256sum stat tr wc; do
   command -v "$tool" >/dev/null 2>&1 || fail "required local tooling is unavailable"
 done
-for tool in ssh scp; do
+for tool in ssh; do
   command -v "$tool" >/dev/null 2>&1 || fail "required SSH tooling is unavailable"
 done
 

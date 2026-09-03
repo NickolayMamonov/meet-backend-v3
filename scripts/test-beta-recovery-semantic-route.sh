@@ -10,9 +10,10 @@ restore=$root/scripts/run-beta-recovery-restore.sh
 evidence=$root/scripts/build-beta-recovery-evidence.sh
 media=$root/scripts/beta-recovery-media-proof.sh
 retention=$root/scripts/validate-beta-recovery-artifact-retention.sh
+admit=$root/scripts/admit-beta-recovery-artifact.sh
 helper=$root/scripts/run-beta-recovery-remote-probe.sh
 age_installer=$root/scripts/install-beta-recovery-age.sh
-for file in "$workflow" "$restore" "$evidence" "$media" "$retention" "$helper"; do
+for file in "$workflow" "$restore" "$evidence" "$media" "$retention" "$admit" "$helper"; do
   [ -f "$file" ] || fail "required recovery file is missing: $file"
 done
 [ -x "$age_installer" ] || fail "pinned age installer is missing or not executable"
@@ -37,9 +38,10 @@ for block in "$pre_block" "$post_block"; do
   ! grep -Fq '/var/lib/meet-test-vps-deploy/scripts/' <<<"$block" ||
     fail "ambient probe tooling path remains"
 done
-grep -Fq 'base64 --decode' "$helper" || fail "secure receiver is not present"
 grep -Fq 'remote_identity' "$helper" || fail "remote inode binding is not present"
 grep -Fq '/proc/$$/fd/' "$helper" || fail "descriptor-bound execution is not present"
+! grep -Fq 'scp' "$helper" || fail "pathname SCP remains in the probe helper"
+grep -Fq 'base64 --decode' "$helper" || fail "base64 receiver is not present"
 
 fixture=$(mktemp -d)
 cleanup() {
@@ -114,7 +116,8 @@ tooling_digest=$(cd "$root" && for file in \
   scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \
   scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
   scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh \
-  scripts/validate-beta-recovery-artifact-retention.sh; do
+  scripts/validate-beta-recovery-artifact-retention.sh \
+  scripts/admit-beta-recovery-artifact.sh; do
   sha256sum "$file"
 done | sort | sha256sum | awk '{print $1}')
 workflow_digest=$(sha256sum "$workflow" | awk '{print $1}')
@@ -138,10 +141,86 @@ cp -- "$fixture/recovery-point.json" "$fixture/artifact/"
 "$evidence" validate-artifact --artifact-dir "$fixture/artifact" \
   --recovery-id "$recovery_id" --source-sha "$source_sha" \
   --repository "$repository" --run-id "$run_id"
-printf '%s\n' '{"created_at":"2026-09-02T18:00:00Z","expires_at":"2026-10-02T18:00:00Z"}' |
-  "$retention"
-
-printf '%s\n' artifact-selected artifact-validated retention-validated >>"$fixture/events.log"
+command -v zip >/dev/null 2>&1 || fail "zip is required for the semantic route"
+artifact_zip=$fixture/artifact.zip
+zip -q -j "$artifact_zip" "$fixture/artifact/postgres.dump.age" \
+  "$fixture/artifact/uploads.tar.gz.age" "$fixture/artifact/recovery-point.json"
+cat >"$fixture/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+url=${2:-}
+mode=${BETA_SEMANTIC_GH_MODE:-success}
+case "$url" in
+  */actions/artifacts/7)
+    printf '%s\n' "${BETA_SEMANTIC_GATE:-unknown}-artifact-api" \
+      >>"${BETA_SEMANTIC_EVENTS:?}"
+    case "$mode" in
+      artifact-id) id=8; name=beta-recovery-semantic-route-7 ;;
+      artifact-name) id=7; name=unrelated-artifact ;;
+      artifact-identity) id=7; name=beta-recovery-semantic-route-8 ;;
+      retention) id=7; name=beta-recovery-semantic-route-7 ;;
+      *) id=7; name=beta-recovery-semantic-route-7 ;;
+    esac
+    if [ "$mode" = retention ]; then
+      printf '%s\n' \
+        "{\"id\":$id,\"name\":\"$name\",\"expired\":false,\"size_in_bytes\":1,\"workflow_run\":{\"id\":7},\"created_at\":\"2026-09-02T18:00:00Z\",\"expires_at\":\"2026-09-02T18:00:00Z\"}"
+    else
+      printf '%s\n' \
+        "{\"id\":$id,\"name\":\"$name\",\"expired\":false,\"size_in_bytes\":1,\"workflow_run\":{\"id\":7},\"created_at\":\"2026-09-02T18:00:00Z\",\"expires_at\":\"2026-10-02T18:00:00Z\"}"
+    fi
+    ;;
+  */actions/runs/7)
+    printf '%s\n' "${BETA_SEMANTIC_GATE:-unknown}-run-api" \
+      >>"${BETA_SEMANTIC_EVENTS:?}"
+    event=workflow_dispatch; branch=dev; sha=$BETA_SEMANTIC_SOURCE_SHA
+    path=.github/workflows/prove-beta-backup-restore.yml
+    title='Beta recovery capture semantic route'
+    case "$mode" in
+      run-status) status=queued; conclusion=success ;;
+      run-event) status=completed; conclusion=success; event=push ;;
+      run-branch) status=completed; conclusion=success; branch=master ;;
+      run-source) status=completed; conclusion=success; sha=ffffffffffffffffffffffffffffffffffffffff ;;
+      run-workflow) status=completed; conclusion=success; path=.github/workflows/other.yml ;;
+      run-title) status=completed; conclusion=success; title=unrelated ;;
+      *) status=completed; conclusion=success ;;
+    esac
+    printf '%s\n' \
+      "{\"id\":7,\"status\":\"$status\",\"conclusion\":\"$conclusion\",\"event\":\"$event\",\"head_branch\":\"$branch\",\"head_sha\":\"$sha\",\"path\":\"$path\",\"display_title\":\"$title\"}"
+    ;;
+  */actions/artifacts/7/zip)
+    printf '%s\n' "${BETA_SEMANTIC_GATE:-unknown}-artifact-transfer" \
+      >>"${BETA_SEMANTIC_EVENTS:?}"
+    [ "$mode" != transfer-failure ] || exit 55
+    cat "${BETA_SEMANTIC_ARTIFACT_ZIP:?}"
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 700 "$fixture/bin/gh"
+mkdir -p "$fixture/selection-runner" "$fixture/admission-runner"
+chmod 700 "$fixture/selection-runner" "$fixture/admission-runner"
+export GITHUB_REPOSITORY="$repository"
+export RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml
+export GITHUB_RUN_ID=99
+export ARTIFACT_ID=7
+export BETA_SEMANTIC_SOURCE_SHA="$source_sha"
+export BETA_SEMANTIC_ARTIFACT_ZIP="$artifact_zip"
+export BETA_SEMANTIC_ARTIFACT_SOURCE="$fixture/artifact"
+export SOURCE_SHA="$source_sha"
+export RECOVERY_ID="$recovery_id"
+export BETA_SEMANTIC_EVENTS="$fixture/events.log"
+BETA_SEMANTIC_GATE=restore-select RUNNER_TEMP="$fixture/selection-runner" \
+  GITHUB_OUTPUT="$fixture/selection-output" PATH="$fixture/bin:$PATH" \
+  "$admit" --artifact-id "$ARTIFACT_ID" --recovery-id "$recovery_id" \
+  --source-sha "$source_sha" --repository "$repository" \
+  --workflow-path "$RECOVERY_WORKFLOW" \
+  --destination "$fixture/selection-runner/artifact" \
+  --zip-path "$fixture/selection-runner/artifact.zip"
+selected_artifact=$fixture/selection-runner/artifact
+[ -d "$selected_artifact" ] || fail "restore-select did not publish an artifact"
+cmp -- "$fixture/artifact/postgres.dump.age" "$selected_artifact/postgres.dump.age"
+cmp -- "$fixture/artifact/uploads.tar.gz.age" "$selected_artifact/uploads.tar.gz.age"
+printf '%s\n' restore-select-admitted >>"$fixture/events.log"
 cp -- "$root/scripts/fixtures/beta-recovery/fake-docker.sh" "$fixture/bin/docker"
 cat >"$fixture/bin/df" <<'EOF'
 #!/usr/bin/env bash
@@ -164,7 +243,7 @@ run_restore() {
   [ "$(uname -s)" = Linux ] ||
     fail "semantic route requires Linux restore and remote-filesystem semantics"
   printf '%s\n' age-identity-access >>"$fixture/events.log"
-  PATH="$fixture/age-bin:$fixture/bin:$PATH" bash "$restore" --artifact-dir "$fixture/artifact" \
+  PATH="$fixture/age-bin:$fixture/bin:$PATH" bash "$restore" --artifact-dir "$admitted_artifact" \
     --recovery-id "$recovery_id" --output-dir "$fixture/output" --identity "$fixture/identity" \
     --sql-proof "$root/scripts/beta-recovery-database-proof.sql" --media-script "$media" \
     --temp-root "$fixture/temp" --docker-root "$fixture/docker-root" \
@@ -256,14 +335,8 @@ case "${#protocol[@]}" in
         rm -r -- "${protocol[0]}"
         mkdir -- "${protocol[0]}"
         chmod 700 -- "${protocol[0]}" ;;
-      secure-foreign)
-        secure="/tmp/beta-recovery-probe-secure-${protocol[2]}"
-        run_as_root mkdir -- "$secure"
-        run_as_root chmod 700 -- "$secure"
-        run_as_root chown 0:0 -- "$secure"
-        printf '%s\n' foreign-secure | run_as_root tee "$secure/.meet-beta-recovery-secure" >/dev/null
-        run_as_root chmod 600 -- "$secure/.meet-beta-recovery-secure"
-        run_as_root chown 0:0 -- "$secure/.meet-beta-recovery-secure" ;;
+      foreign-file)
+        printf '%s\n' foreign-state >"${protocol[0]}/foreign-survivor" ;;
     esac
     printf '%s\n' remote-run >>"${BETA_SEMANTIC_EVENTS:?}"
     printf '%s-remote-run\n' "${protocol[4]}" >>"${BETA_SEMANTIC_EVENTS:?}"
@@ -332,7 +405,7 @@ if [ "$(uname -s)" = Linux ]; then
   export SSH_PRIVATE_KEY=fixture-private-key
   run_probe() {
     local phase=$1 output=$2
-    FAKE_RUNTIME_PROBE=1 PATH="$fixture/bin:$PATH" HOST=fixture.example.test \
+    FAKE_RUNTIME_PROBE=1 BETA_SEMANTIC_PHASE="$phase" PATH="$fixture/bin:$PATH" HOST=fixture.example.test \
       "$helper" --phase "$phase" --host fixture.example.test --port 22 \
       --ssh-user fixture-user --host-fingerprint "$BETA_SEMANTIC_FINGERPRINT" \
       --release-root "$fixture/release" --public-url https://api.whysoezzy.online \
@@ -345,6 +418,18 @@ if [ "$(uname -s)" = Linux ]; then
 else
   fail "semantic route requires Linux remote-filesystem semantics"
 fi
+BETA_SEMANTIC_GATE=run-admission RUNNER_TEMP="$fixture/admission-runner" \
+  GITHUB_OUTPUT="$fixture/admission-output" PATH="$fixture/bin:$PATH" \
+  "$admit" --artifact-id "$ARTIFACT_ID" --recovery-id "$recovery_id" \
+  --source-sha "$source_sha" --repository "$repository" \
+  --workflow-path "$RECOVERY_WORKFLOW" \
+  --destination "$fixture/admission-runner/artifact" \
+  --zip-path "$fixture/admission-runner/artifact.zip"
+admitted_artifact=$fixture/admission-runner/artifact
+[ -d "$admitted_artifact" ] || fail "run admission did not publish an artifact"
+cmp -- "$selected_artifact/postgres.dump.age" "$admitted_artifact/postgres.dump.age"
+cmp -- "$selected_artifact/uploads.tar.gz.age" "$admitted_artifact/uploads.tar.gz.age"
+printf '%s\n' run-admission-admitted >>"$fixture/events.log"
 run_restore
 printf '%s\n' post-probe-start >>"$fixture/events.log"
 run_probe post "$post_output"
@@ -368,20 +453,6 @@ jq -cnS '{schema:"meet-backend/beta-recovery-mount/v1",type:"volume",
   --healthy true --equal true --artifact-verified true --cleanup-complete true \
   --anonymous-volume-absent true --status success --output "$fixture/output/final.json"
 
-cat >"$fixture/bin/gh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' github-boundary >>"${BETA_SEMANTIC_EVENTS:?}"
-case "${1:-}" in
-  api) printf '%s\n' '{"id":7,"head_sha":"0123456789abcdef0123456789abcdef01234567"}' ;;
-  run) exit 0 ;;
-  *) exit 2 ;;
-esac
-EOF
-chmod 700 "$fixture/bin/gh"
-export BETA_SEMANTIC_EVENTS="$fixture/events.log"
-PATH="$fixture/bin:$PATH" gh api repos/fixture/actions/runs/7 >/dev/null
-grep -Fxq github-boundary "$fixture/events.log" || fail "GitHub boundary was not exercised"
 printf '%s\n' evidence-final >>"$fixture/events.log"
 
 event_line() {
@@ -397,8 +468,11 @@ assert_event_order() {
   done
 }
 assert_event_order age-install age-keygen age-encrypt-database age-encrypt-uploads \
-  artifact-selected artifact-validated retention-validated \
+  restore-select-artifact-api restore-select-run-api \
+  restore-select-artifact-transfer restore-select-admitted \
   pre-probe-start pre-remote-create pre-remote-run pre-probe-complete \
+  run-admission-artifact-api run-admission-run-api \
+  run-admission-artifact-transfer run-admission-admitted \
   age-identity-access docker-pull restore-cleanup post-probe-start \
   post-remote-create post-remote-run post-probe-complete evidence-final
 
@@ -407,6 +481,51 @@ assert_failure() {
   shift
   if "$@"; then fail "injected failure unexpectedly succeeded: $name"; fi
 }
+run_gate_failure() {
+  local mode=$1 runner="$fixture/gate-failure-$1"
+  mkdir -p -- "$runner"
+  chmod 700 -- "$runner"
+  if BETA_SEMANTIC_GATE="failure-$mode" BETA_SEMANTIC_GH_MODE="$mode" \
+    RUNNER_TEMP="$runner" GITHUB_OUTPUT="$runner/output" PATH="$fixture/bin:$PATH" \
+    "$admit" --artifact-id "$ARTIFACT_ID" --recovery-id "$recovery_id" \
+    --source-sha "$source_sha" --repository "$repository" \
+    --workflow-path "$RECOVERY_WORKFLOW" \
+    --destination "$runner/artifact" --zip-path "$runner/artifact.zip"; then
+    fail "restore-select accepted injected gate drift: $mode"
+  fi
+  if [ -e "$runner/artifact" ] || [ -L "$runner/artifact" ]; then
+    [ ! -L "$runner/artifact" ] || fail "restore-select failure created a symlink: $mode"
+    rm -r -- "$runner/artifact"
+  fi
+  [ ! -e "$runner/artifact" ] || fail "restore-select left failed artifact state: $mode"
+}
+run_admission_failure() {
+  local mode=$1 runner="$fixture/admission-failure-$1"
+  mkdir -p -- "$runner"
+  chmod 700 -- "$runner"
+  if BETA_SEMANTIC_GATE="admission-failure-$mode" BETA_SEMANTIC_GH_MODE="$mode" \
+    RUNNER_TEMP="$runner" GITHUB_OUTPUT="$runner/output" PATH="$fixture/bin:$PATH" \
+    "$admit" --artifact-id "$ARTIFACT_ID" --recovery-id "$recovery_id" \
+    --source-sha "$source_sha" --repository "$repository" \
+    --workflow-path "$RECOVERY_WORKFLOW" \
+    --destination "$runner/artifact" --zip-path "$runner/artifact.zip"; then
+    fail "run admission accepted injected drift: $mode"
+  fi
+  if [ -e "$runner/artifact" ] || [ -L "$runner/artifact" ]; then
+    [ ! -L "$runner/artifact" ] || fail "run admission failure created a symlink: $mode"
+    rm -r -- "$runner/artifact"
+  fi
+  [ ! -e "$runner/artifact" ] || fail "run admission left failed artifact state: $mode"
+}
+for gate_failure in artifact-id artifact-name retention run-status run-event \
+  run-branch run-source run-workflow run-title artifact-identity transfer-failure; do
+  run_gate_failure "$gate_failure"
+done
+for admission_failure in run-status run-event run-branch run-source \
+  artifact-identity \
+  run-workflow run-title transfer-failure; do
+  run_admission_failure "$admission_failure"
+done
 if [ "$(uname -s)" = Linux ]; then
   assert_failure restore-injected env FAKE_DOCKER_FAIL_RESTORE=1 \
     PATH="$fixture/age-bin:$fixture/bin:$PATH" \
@@ -452,17 +571,11 @@ remote_failure() {
       sudo -n rm -r -- "$1"
     fi
   }
-  if [ "$mutation" = secure-foreign ]; then
-    secure_path=/tmp/beta-recovery-probe-secure-$(basename "$remote_path" | sed 's/.*-//')
-    [ -e "$secure_path" ] || [ -L "$secure_path" ] ||
-      fail "foreign secure survivor was not preserved"
-    remove_remote_path "$secure_path"
-  fi
   remove_remote_path "$remote_path"
 }
 remote_failure marker-drift
 remote_failure directory-replacement
-remote_failure secure-foreign
+remote_failure foreign-file
 [ ! -e "$fixture/identity" ] && [ ! -e "$fixture/failure-identity" ] ||
   fail "age identity was not removed during restore cleanup"
 
@@ -476,5 +589,5 @@ grep -Fxq remote-cleanup "$fixture/events.log" || fail "success route did not cl
 printf '%s\n' \
   'beta recovery semantic route fixture passed' \
   'route=generated-capture-artifact,public-gates,pre-probe,postgresql-16-restore,cleanup,post-probe,evidence' \
-  'assertions=age-v1.3.1-boundary,github-ssh-scp-boundaries,source-binding,foreign-survivor,'\
+  'assertions=age-v1.3.1-boundary,github-artifact-zip-ssh-boundaries,source-binding,foreign-survivor,'\
 'database-media-equality,retention,rto,secret-free,injected-failure'
