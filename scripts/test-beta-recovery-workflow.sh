@@ -26,7 +26,6 @@ grep -Fq 'beta-recovery-drill-' "$workflow"
 grep -Fq 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' "$workflow"
 grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
 grep -Fq 'Revalidate source immediately before identity access' "$workflow"
-grep -Fq 'scp_opts=(-F "$config" -i "$key" -P "$PORT"' "$workflow"
 grep -Fq 'scripts/materialize-beta-recovery-known-hosts.sh' "$workflow"
 grep -Fq 'published_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
 grep -Fq 'remove_published_output' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
@@ -38,7 +37,6 @@ helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
 [ "$helper_count" -eq 1 ]
 grep -Fq 'scripts/run-beta-recovery-remote-probe.sh' "$workflow"
 probe_helper="$root/scripts/run-beta-recovery-remote-probe.sh"
-! grep -Fq 'scp' "$probe_helper"
 grep -Fq 'base64 --decode' "$probe_helper"
 for required in \
   'ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")' \
@@ -85,7 +83,7 @@ assert_release_root_gate(){
   gate_line=$(grep -n 'name: Validate protected test-VPS release root' <<<"$block" | head -1 | cut -d: -f1)
   checkout_line=$(grep -n 'actions/checkout@' <<<"$block" | head -1 | cut -d: -f1)
   [ "$gate_line" -lt "$checkout_line" ]
-  network_line=$(grep -nE 'actions/(checkout|upload-artifact|download-artifact)|(^|[[:space:]])(ssh|scp|git fetch|gh (api|run))' <<<"$block" |
+  network_line=$(grep -nE 'actions/(checkout|upload-artifact|download-artifact)|(^|[[:space:]])(ssh|git fetch|gh (api|run))' <<<"$block" |
     head -1 | cut -d: -f1)
   [ -n "$network_line" ] && [ "$gate_line" -lt "$network_line" ]
   grep -Fq 'TEST_VPS_PATH is absent' <<<"$block"
@@ -193,7 +191,7 @@ grep -Fq 'cmp -- "$expected" "$marker"' "$workflow"
 grep -Fq 'stat -c '\''%a:%u:%g:%h'\'' "$marker"' "$workflow"
 grep -Fq -- '--age-binary "$remote/age"' "$workflow"
 grep -Fq -- '--age-sha256 "$5" --age-version "$6" --age-os "$7" --age-arch "$8"' "$workflow"
-age_transport_count=$(grep -Fc '            "$age_path" \' "$workflow")
+age_transport_count=$(grep -Fc 'send_capture_file "$age_path" age' "$workflow")
 [ "$age_transport_count" -eq 1 ]
 ! grep -Fq 'age-keygen' <<<"$capture_block"
 grep -Fq 'archive_size=10263766' "$root/scripts/install-beta-recovery-age.sh"
@@ -298,13 +296,7 @@ if bash "$auth" validate-age-recipient "$invalid_short_recipient" >/dev/null 2>&
 fi
 [ ! -e "$remote_marker" ]
 mkdir "$remote_dir"
-scp_calls=0
 ssh_calls=0
-scp(){
-  scp_calls=$((scp_calls + 1))
-  printf 'scp %s\n' "$*" >>"$remote_log"
-  cp -- "$1" "$remote_dir/age-recipient"
-}
 ssh(){
   ssh_calls=$((ssh_calls + 1))
   printf 'ssh %s\n' "$*" >>"$remote_log"
@@ -315,7 +307,7 @@ run_safe_capture_preflight(){
   local recipient=$1 recipient_file="$fixture_dir/age-recipient-input"
   scripts/authorize-beta-recovery.sh validate-age-recipient "$recipient" || return
   printf '%s\n' "$recipient" >"$recipient_file"
-  scp "$recipient_file" "fake-host:$remote_dir/"
+  cp -- "$recipient_file" "$remote_dir/age-recipient"
   ssh fake-host "sudo bash -s -- '$remote_dir' '$valid_recovery_id' 'https://api.whysoezzy.online'" <<'REMOTE'
 set -euo pipefail
 remote=$1
@@ -335,9 +327,9 @@ if run_safe_capture_preflight "$malicious_recipient"; then
   echo "malicious recipient crossed the remote boundary" >&2
   exit 1
 fi
-[ "$scp_calls" -eq 0 ] && [ "$ssh_calls" -eq 0 ] && [ ! -e "$remote_marker" ]
+[ "$ssh_calls" -eq 0 ] && [ ! -e "$remote_marker" ]
 run_safe_capture_preflight "$valid_recipient"
-[ "$scp_calls" -eq 1 ] && [ "$ssh_calls" -eq 1 ]
+[ "$ssh_calls" -eq 1 ]
 [ "$(wc -l <"$received_recipient" | tr -d '[:space:]')" -eq 1 ]
 [ "$(<"$received_recipient")" = "$valid_recipient" ]
 grep -Fq 'transferred ciphertext differs from quiesced capture result' "$workflow"

@@ -22,7 +22,7 @@ for required in SSH_PRIVATE_KEY StrictHostKeyChecking=yes KnownHostsCommand=none
     fail "remote probe contract is incomplete: $required"
 done
 
-for tool in awk basename chmod env find grep mkdir mktemp rm scp seq sha256sum sleep ssh ssh-keygen stat tr wc; do
+for tool in awk basename chmod env find grep mkdir mktemp rm seq sha256sum sleep ssh ssh-keygen stat tr wc; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tool is unavailable: $tool"
 done
 
@@ -166,13 +166,6 @@ write_wrapper "$fixture_bin/ssh" \
   'set -euo pipefail' \
   ': "${BETA_RECOVERY_BOUNDARY_LOG:?}"' \
   'printf "ssh fake boundary argc=%s\n" "$#" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'exit 0'
-
-write_wrapper "$fixture_bin/scp" \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  ': "${BETA_RECOVERY_BOUNDARY_LOG:?}"' \
-  'printf "scp fake boundary argc=%s\n" "$#" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'exit 0'
 
 make_case() {
@@ -337,8 +330,6 @@ assert_keyscan_invocation() {
     fail "keygen boundary was not called exactly once"
   ! grep -q '^ssh fake boundary' "$case_dir/boundary.log" ||
     fail "materializer crossed the SSH boundary"
-  ! grep -q '^scp fake boundary' "$case_dir/boundary.log" ||
-    fail "materializer crossed the SCP boundary"
 }
 
 run_success_case() {
@@ -799,7 +790,7 @@ for signal in HUP INT TERM; do
   assert_no_private_output "$signal_failure_case"
 done
 
-boundary_case=$(make_case fake-ssh-scp-boundaries)
+boundary_case=$(make_case fake-ssh-boundary)
 known_for_boundary=$boundary_case/runner/output/known_hosts
 printf 'fake boundary input\n' >"$boundary_case/boundary-input"
 env PATH="$fixture_bin:$original_path" \
@@ -810,18 +801,8 @@ env PATH="$fixture_bin:$original_path" \
   -o GlobalKnownHostsFile=/dev/null \
   -o KnownHostsCommand=none \
   fixture-host true
-env PATH="$fixture_bin:$original_path" \
-  HOME="$boundary_case/home" \
-  BETA_RECOVERY_BOUNDARY_LOG="$boundary_case/boundary.log" \
-  scp -F "$boundary_case/home/.ssh/config" \
-  -o UserKnownHostsFile="$known_for_boundary" \
-  -o GlobalKnownHostsFile=/dev/null \
-  -o KnownHostsCommand=none \
-  "$boundary_case/boundary-input" fixture-host:/tmp/fake-boundary
 grep -q '^ssh fake boundary argc=' "$boundary_case/boundary.log" ||
   fail "SSH fake boundary was not exercised"
-grep -q '^scp fake boundary argc=' "$boundary_case/boundary.log" ||
-  fail "SCP fake boundary was not exercised"
 assert_no_private_output "$boundary_case"
 
 workflow=$root/.github/workflows/prove-beta-backup-restore.yml
@@ -836,8 +817,6 @@ if [ -f "$workflow" ]; then
     fail "actual recovery workflow does not disable KnownHostsCommand"
   grep -Fq 'StrictHostKeyChecking=yes' "$workflow" ||
     fail "actual recovery workflow does not require strict host-key checking"
-  grep -Fq 'scp_opts=(-F "$config" -i "$key" -P "$PORT"' "$workflow" ||
-    fail "actual recovery workflow does not pin SCP options"
   grep -Fq 'ssh_opts=(-F "$config" -i "$key" -p "$PORT"' "$workflow" ||
     fail "actual recovery workflow does not pin SSH options"
 fi
@@ -1041,53 +1020,6 @@ write_wrapper "$consumer_bin/ssh" \
   'printf "remote-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi'
 
-write_wrapper "$consumer_bin/scp" \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'signal_parent() {' \
-  '  local signal=$1 parent_pid' \
-  '  for _ in $(seq 1 500); do' \
-  '    [ -s "${BETA_RECOVERY_PARENT_PID_FILE:?}" ] && break' \
-  '    sleep 0.01' \
-  '  done' \
-  '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
-  '  kill -"$signal" "$parent_pid"' \
-  '}' \
-  'args=("$@")' \
-  'config= key= known=' \
-  'for ((i=0; i<${#args[@]}; i++)); do' \
-  '  case "${args[i]}" in' \
-  '    -F) config=${args[i+1]:-} ;; -i) key=${args[i+1]:-} ;;' \
-  '    -o) case "${args[i+1]:-}" in UserKnownHostsFile=*) known=${args[i+1]#UserKnownHostsFile=} ;; esac ;;' \
-  '  esac' \
-  'done' \
-  'required=("-F" "$config" "-i" "$key" "-P" "$PORT" "-o" "BatchMode=yes" "-o" "StrictHostKeyChecking=yes" "-o" "UserKnownHostsFile=$known" "-o" "GlobalKnownHostsFile=/dev/null" "-o" "KnownHostsCommand=none")' \
-  'for ((i=0; i<${#required[@]}; i++)); do' \
-  '  found=false' \
-  '  for ((j=0; j<${#args[@]}; j++)); do [ "${args[j]}" = "${required[i]}" ] && found=true; done' \
-  '  "$found" = true || { printf "argv-rejected scp\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 51; }' \
-  'done' \
-  'destination=' \
-  'for arg in "${args[@]}"; do [[ "$arg" == *":"* ]] && destination=$arg && break; done' \
-  '[ "$destination" = "$SSH_USER@$HOST:$BETA_RECOVERY_REMOTE/" ] || { printf "argv-rejected scp-destination\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 52; }' \
-  '"${BETA_RECOVERY_REAL_SSH:?}" -G -F "$config" -i "$key" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none "$SSH_USER@$HOST" >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed scp\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 53; }' \
-  'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "port $PORT" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fq "userknownhostsfile $known" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "globalknownhostsfile /dev/null" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'printf "scp-call\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'if [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ]; then' \
-  '  printf "scp-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  '  exit 0' \
-  'fi' \
-  'printf "scp-mutation\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'touch "${BETA_RECOVERY_MUTATION_SENTINEL:?}"' \
-  'printf "scp-admission\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = scp ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi'
-
 extract_consumer() {
   local marker=$1 output=$2
   awk -v marker="$marker" '
@@ -1257,8 +1189,6 @@ run_consumer_setup_case() {
     fail "consumer setup $name created a private key"
   ! grep -q '^ssh-call$' "$case_dir/boundary.log" ||
     fail "consumer setup $name crossed SSH"
-  ! grep -q '^scp-call$' "$case_dir/boundary.log" ||
-    fail "consumer setup $name crossed SCP"
   ! grep -q '^remote-cleanup$' "$case_dir/boundary.log" ||
     fail "consumer setup $name attempted remote cleanup"
   [ "$(grep -c '^local-cleanup$' "$case_dir/boundary.log")" -eq 1 ] ||
@@ -1349,8 +1279,6 @@ run_consumer_case() {
   if [ "$scenario" != normal ]; then
     [ ! -e "$case_dir/mutation-sentinel" ] ||
       fail "marker case $name crossed downstream mutation"
-    ! grep -q '^scp-call$' "$case_dir/boundary.log" ||
-      fail "marker case $name crossed SCP"
     ! grep -q '^remote-admission$' "$case_dir/boundary.log" ||
       fail "marker case $name crossed remote admission"
     [ "$(grep -c '^remote-cleanup$' "$case_dir/boundary.log")" -eq 1 ] ||
@@ -1404,12 +1332,12 @@ run_consumer_case() {
 }
 
 for signal in HUP INT TERM; do
-  run_consumer_case "capture-$signal" "$capture_body" "$signal" scp
+  run_consumer_case "capture-$signal" "$capture_body" "$signal" ssh
 done
-run_consumer_case capture-TERM-remote-cleanup-failure "$capture_body" TERM scp 1
-run_consumer_case capture-ambiguous-create "$capture_body" HUP scp 0 ambiguous
-run_consumer_case capture-collision-absent-marker "$capture_body" HUP scp 0 collision-absent
-run_consumer_case capture-collision-mismatched-marker "$capture_body" HUP scp 0 collision-mismatch
+run_consumer_case capture-TERM-remote-cleanup-failure "$capture_body" TERM ssh 1
+run_consumer_case capture-ambiguous-create "$capture_body" HUP ssh 0 ambiguous
+run_consumer_case capture-collision-absent-marker "$capture_body" HUP ssh 0 collision-absent
+run_consumer_case capture-collision-mismatched-marker "$capture_body" HUP ssh 0 collision-mismatch
 
 run_capture_proof_case() {
   local name=$1 scenario=$2
@@ -1684,8 +1612,6 @@ for signal in HUP INT TERM; do
     fail "capture pre-verification $signal created a private key"
   ! grep -q '^ssh-call$' "$pre_case/boundary.log" ||
     fail "capture pre-verification $signal crossed SSH"
-  ! grep -q '^scp-call$' "$pre_case/boundary.log" ||
-    fail "capture pre-verification $signal crossed SCP"
   ! grep -q '^remote-cleanup$' "$pre_case/boundary.log" ||
     fail "capture pre-verification $signal attempted remote cleanup"
 done
@@ -1697,16 +1623,7 @@ if env PATH="$consumer_bin:$original_path" \
   ssh -i "$consumer_root/key" fixture-user@"$scan_host" true; then
   fail "fake SSH accepted incomplete isolation argv"
 fi
-if env PATH="$consumer_bin:$original_path" \
-  BETA_RECOVERY_BOUNDARY_LOG="$consumer_root/option-rejection.log" \
-  HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
-  BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
-  scp -i "$consumer_root/key" -P 2222 "$root/README.md" fixture-user@"$scan_host":/tmp/fixture; then
-  fail "fake SCP accepted incomplete isolation argv"
-fi
 grep -Fxq 'argv-rejected ssh' "$consumer_root/option-rejection.log" ||
   fail "fake SSH did not record option rejection"
-grep -Fxq 'argv-rejected scp' "$consumer_root/option-rejection.log" ||
-  fail "fake SCP did not record option rejection"
 
 echo "beta recovery SSH host-key materialization fixture passed"

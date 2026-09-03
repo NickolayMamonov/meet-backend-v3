@@ -115,6 +115,8 @@ download_identity=
 download_owned=false
 zip_identity=
 zip_owned=false
+extracted_identity=
+published_identity=
 published=false
 remove_work_root() {
   local current_identity
@@ -216,7 +218,15 @@ ln -T -- "$download_zip" "$zip_path" || fail "artifact ZIP publication failed"
 zip_identity=$download_identity
 zip_owned=true
 remove_download || fail "private ZIP staging cleanup failed"
-mv -- "$extracted" "$destination" || fail "artifact publication failed"
+extracted_identity=$(stat -c '%d:%i' -- "$extracted" 2>/dev/null) ||
+  fail "artifact publication identity is unavailable"
+mv -T --no-clobber -- "$extracted" "$destination" ||
+  fail "artifact publication failed"
+published_identity=$(stat -c '%d:%i' -- "$destination" 2>/dev/null) ||
+  fail "artifact publication identity is unavailable"
+[ "$published_identity" = "$extracted_identity" ] || fail "artifact publication collision"
+[ -d "$destination" ] && [ ! -L "$destination" ] ||
+  fail "artifact publication is unsafe"
 published=true
 trap - EXIT HUP INT TERM
 rm -r -- "$work_root"

@@ -195,9 +195,6 @@ jobs:
           ssh_opts=(-F "$config" -i "$key" -p "$PORT" -o BatchMode=yes
             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known"
             -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none)
-          scp_opts=(-F "$config" -i "$key" -P "$PORT" -o BatchMode=yes
-            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known"
-            -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none)
           install -m 600 /dev/null "$recipient_file"
           printf '%s\n' "$AGE_RECIPIENT" >"$recipient_file"
           remote_create_attempted=true
@@ -247,12 +244,75 @@ jobs:
           rm -f -- "$expected"
           trap - EXIT HUP INT TERM
           REMOTE_CREATE
-          scp "${scp_opts[@]}" scripts/run-beta-recovery-capture.sh scripts/backup-production.sh \
-            scripts/probe-test-vps-recovery-runtime.sh scripts/production-compose.sh \
-            scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh \
-            "$age_path" \
-            "$recipient_file" \
-            "$SSH_USER@$HOST:$remote/"
+          remote_identity=$(ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
+            "$remote" "$owner_token" <<'REMOTE_IDENTITY'
+          set -euo pipefail
+          remote=$1
+          token=$2
+          [[ "$remote" =~ ^/tmp/beta-recovery-[A-Za-z0-9._-]{8,128}$ ]]
+          [[ "$token" =~ ^[0-9a-f]{64}$ ]]
+          stat -c '%d:%i' -- "$remote"
+          REMOTE_IDENTITY
+          )
+          [[ "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]
+          send_capture_file() {
+            local source=$1 name=$2 mode digest payload
+            mode=$(stat -c '%a' -- "$source")
+            digest=$(sha256sum -- "$source" | awk '{print $1}')
+            payload=$(base64 --wrap=0 -- "$source")
+            ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
+              "$remote" "$remote_identity" "$owner_token" "$name" "$digest" "$mode" \
+              "$payload" <<'REMOTE_RECEIVE'
+          set -euo pipefail
+          remote=$1
+          remote_identity=$2
+          token=$3
+          name=$4
+          expected_sha=$5
+          expected_mode=$6
+          payload=$7
+          [[ "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]
+          [[ "$token" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$expected_mode" =~ ^[0-7]{3,4}$ ]]
+          case "$name" in
+            run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|\
+            production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|\
+            age|age-recipient) ;;
+            *) exit 1 ;;
+          esac
+          owner_uid=${SUDO_UID:?SUDO_UID is required}
+          owner_gid=${SUDO_GID:?SUDO_GID is required}
+          marker="$remote/.meet-beta-recovery-owner"
+          expected=$(mktemp)
+          trap 'rm -f -- "$expected"' EXIT HUP INT TERM
+          printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$token" >"$expected"
+          exec {remote_fd}<"$remote"
+          [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
+          [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]
+          [ -f "$marker" ] && [ ! -L "$marker" ]
+          [ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "600:$owner_uid:$owner_gid:1" ]
+          cmp -- "$expected" "$marker" >/dev/null
+          target="/proc/$$/fd/$remote_fd/$name"
+          [ ! -e "$target" ] && [ ! -L "$target" ]
+          temp=$(mktemp "/proc/$$/fd/$remote_fd/.$name.XXXXXX")
+          chmod "$expected_mode" -- "$temp"
+          printf '%s' "$payload" | base64 --decode >"$temp"
+          [ "$(sha256sum -- "$temp" | awk '{print $1}')" = "$expected_sha" ]
+          [ "$(stat -c '%a' -- "$temp")" = "$expected_mode" ]
+          chown "$owner_uid:$owner_gid" -- "$temp"
+          ln -T -- "$temp" "$target"
+          rm -f -- "$temp"
+          REMOTE_RECEIVE
+          }
+          send_capture_file scripts/run-beta-recovery-capture.sh run-beta-recovery-capture.sh
+          send_capture_file scripts/backup-production.sh backup-production.sh
+          send_capture_file scripts/probe-test-vps-recovery-runtime.sh probe-test-vps-recovery-runtime.sh
+          send_capture_file scripts/production-compose.sh production-compose.sh
+          send_capture_file scripts/beta-recovery-database-proof.sql beta-recovery-database-proof.sql
+          send_capture_file scripts/beta-recovery-media-proof.sh beta-recovery-media-proof.sh
+          send_capture_file "$age_path" age
+          send_capture_file "$recipient_file" age-recipient
           ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
             "$remote" "$RECOVERY_ID" "$PUBLIC_URL" "$PATH_ON_HOST" \
             "$age_sha256" "$age_version" "$age_os" "$age_arch" <<'REMOTE'

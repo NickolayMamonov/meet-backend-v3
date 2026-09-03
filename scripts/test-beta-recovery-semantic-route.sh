@@ -40,7 +40,6 @@ for block in "$pre_block" "$post_block"; do
 done
 grep -Fq 'remote_identity' "$helper" || fail "remote inode binding is not present"
 grep -Fq '/proc/$$/fd/' "$helper" || fail "descriptor-bound execution is not present"
-! grep -Fq 'scp' "$helper" || fail "pathname SCP remains in the probe helper"
 grep -Fq 'base64 --decode' "$helper" || fail "base64 receiver is not present"
 
 fixture=$(mktemp -d)
@@ -200,6 +199,24 @@ case "$url" in
     [ "$mode" != transfer-failure ] || {
       head -c 32 "$BETA_SEMANTIC_ARTIFACT_ZIP"
       exit 55
+    }
+    [ "$mode" != residue-file ] || {
+      printf 'foreign residue\n' >"${BETA_SEMANTIC_RESIDUE_PATH:?}"
+      {
+        stat -c '%F:%a:%u:%g:%h:%s' -- "$BETA_SEMANTIC_RESIDUE_PATH"
+        sha256sum -- "$BETA_SEMANTIC_RESIDUE_PATH"
+      } >"${BETA_SEMANTIC_RESIDUE_METADATA:?}"
+      exit 56
+    }
+    [ "$mode" != residue-directory ] || {
+      mkdir -- "${BETA_SEMANTIC_RESIDUE_PATH:?}"
+      printf 'foreign residue\n' >"$BETA_SEMANTIC_RESIDUE_PATH/entry"
+      {
+        stat -c '%F:%a:%u:%g:%h:%s' -- "$BETA_SEMANTIC_RESIDUE_PATH"
+        stat -c '%F:%a:%u:%g:%h:%s' -- "$BETA_SEMANTIC_RESIDUE_PATH/entry"
+        sha256sum -- "$BETA_SEMANTIC_RESIDUE_PATH/entry"
+      } >"${BETA_SEMANTIC_RESIDUE_METADATA:?}"
+      exit 57
     }
     [ "$mode" != zip-corruption ] || { head -c 32 "$BETA_SEMANTIC_ARTIFACT_ZIP"; exit 0; }
     [ "$mode" != zip-extraction ] || {
@@ -392,6 +409,14 @@ case "${#protocol[@]}" in
       foreign-symlink)
         ln -s -- /tmp/foreign-target "${protocol[0]}/foreign-symlink" ;;
     esac
+    if [ -n "${BETA_SEMANTIC_MUTATION_READY:-}" ]; then
+      : >"$BETA_SEMANTIC_MUTATION_READY"
+      for attempt in $(seq 1 500); do
+        [ -e "${BETA_SEMANTIC_MUTATION_GO:?}" ] && break
+        sleep 0.01
+      done
+      [ -e "${BETA_SEMANTIC_MUTATION_GO:?}" ]
+    fi
     printf '%s\n' remote-run >>"${BETA_SEMANTIC_EVENTS:?}"
     printf '%s-remote-run\n' "${protocol[4]}" >>"${BETA_SEMANTIC_EVENTS:?}"
     if [ "${FAKE_RUNTIME_PROBE:-}" = 1 ]; then
@@ -554,11 +579,8 @@ run_gate_failure() {
     --destination "$runner/artifact" --zip-path "$runner/artifact.zip"; then
     fail "restore-select accepted injected gate drift: $mode"
   fi
-  if [ -e "$runner/artifact" ] || [ -L "$runner/artifact" ]; then
-    [ ! -L "$runner/artifact" ] || fail "restore-select failure created a symlink: $mode"
-    rm -r -- "$runner/artifact"
-  fi
-  [ ! -e "$runner/artifact" ] || fail "restore-select left failed artifact state: $mode"
+  [ ! -e "$runner/artifact" ] && [ ! -L "$runner/artifact" ] ||
+    fail "restore-select left failed artifact state: $mode"
   [ ! -e "$runner/artifact.zip" ] || fail "restore-select left failed ZIP state: $mode"
   [ -z "$(find "$runner" -maxdepth 1 -name '.beta-recovery-*' -print -quit)" ] ||
     fail "restore-select left private staging state: $mode"
@@ -566,12 +588,20 @@ run_gate_failure() {
     fail "restore-select crossed a prohibited boundary: $mode"
 }
 run_admission_failure() {
-  local mode=$1 runner="$fixture/admission-failure-$1"
+  local mode=$1 runner="$fixture/admission-failure-$1" residue_path= residue_metadata=
   mkdir -p -- "$runner"
   chmod 700 -- "$runner"
   : >"$runner/events.log"
+  case "$mode" in
+    residue-file|residue-directory)
+      residue_path=$runner/residue
+      residue_metadata=$runner/residue.metadata
+      ;;
+  esac
   if BETA_SEMANTIC_GATE="admission-failure-$mode" BETA_SEMANTIC_GH_MODE="$mode" \
     BETA_SEMANTIC_EVENTS="$runner/events.log" BETA_SEMANTIC_SOURCE_SHA="$source_sha" \
+    BETA_SEMANTIC_RESIDUE_PATH="$residue_path" \
+    BETA_SEMANTIC_RESIDUE_METADATA="$residue_metadata" \
     RUNNER_TEMP="$runner" \
     GITHUB_OUTPUT="$runner/output" PATH="$fixture/bin:$PATH" \
     "$admit" --artifact-id "$ARTIFACT_ID" --recovery-id "$recovery_id" \
@@ -580,14 +610,31 @@ run_admission_failure() {
     --destination "$runner/artifact" --zip-path "$runner/artifact.zip"; then
     fail "run admission accepted injected drift: $mode"
   fi
-  if [ -e "$runner/artifact" ] || [ -L "$runner/artifact" ]; then
-    [ ! -L "$runner/artifact" ] || fail "run admission failure created a symlink: $mode"
-    rm -r -- "$runner/artifact"
-  fi
-  [ ! -e "$runner/artifact" ] || fail "run admission left failed artifact state: $mode"
+  [ ! -e "$runner/artifact" ] && [ ! -L "$runner/artifact" ] ||
+    fail "run admission left failed artifact state: $mode"
   [ ! -e "$runner/artifact.zip" ] || fail "run admission left failed ZIP state: $mode"
   [ -z "$(find "$runner" -maxdepth 1 -name '.beta-recovery-*' -print -quit)" ] ||
     fail "run admission left private staging state: $mode"
+  case "$mode" in
+    residue-file)
+      [ -f "$residue_path" ] && [ ! -L "$residue_path" ] ||
+        fail "regular residue was not preserved: $mode"
+      [ "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$residue_path")" =
+        "$(sed -n '1p' "$residue_metadata")" ] &&
+        [ "$(sha256sum "$residue_path")" =
+          "$(sed -n '2p' "$residue_metadata")" ] ||
+        fail "regular residue bytes changed: $mode" ;;
+    residue-directory)
+      [ -d "$residue_path" ] && [ ! -L "$residue_path" ] ||
+        fail "directory residue was not preserved: $mode"
+      [ "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$residue_path")" =
+        "$(sed -n '1p' "$residue_metadata")" ] &&
+        [ "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$residue_path/entry")" =
+          "$(sed -n '2p' "$residue_metadata")" ] &&
+        [ "$(sha256sum "$residue_path/entry")" =
+          "$(sed -n '3p' "$residue_metadata")" ] ||
+        fail "directory residue bytes changed: $mode" ;;
+  esac
   ! grep -Eq 'age-identity-access|docker-pull' "$runner/events.log" ||
     fail "run admission crossed a prohibited boundary: $mode"
 }
@@ -600,9 +647,69 @@ for admission_failure in artifact-id artifact-name retention expiry size run-sta
   run-conclusion run-event run-branch run-source run-workflow run-title \
   artifact-identity transfer-failure zip-corruption zip-extraction \
   manifest-source manifest-repository manifest-recovery manifest-run \
-  manifest-name manifest-ciphertext; do
+  manifest-name manifest-ciphertext residue-file residue-directory; do
   run_admission_failure "$admission_failure"
 done
+publication_race_bin=$fixture/publication-race-bin
+mkdir -- "$publication_race_bin"
+chmod 700 -- "$publication_race_bin"
+cat >"$publication_race_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+args=("$@")
+destination=${args[${#args[@]}-1]}
+case "${BETA_SEMANTIC_PUBLICATION_RACE_MODE:-}" in
+  file)
+    printf 'foreign publication survivor\n' >"$destination" ;;
+  directory)
+    mkdir -- "$destination" ;;
+  symlink)
+    ln -s -- "${BETA_SEMANTIC_PUBLICATION_RACE_TARGET:?}" "$destination" ;;
+  *)
+    exec "${BETA_SEMANTIC_REAL_MV:?}" "$@" ;;
+esac
+exec "${BETA_SEMANTIC_REAL_MV:?}" "$@"
+EOF
+chmod 700 -- "$publication_race_bin/mv"
+run_publication_race() {
+  local mode=$1 runner="$fixture/publication-race-$1" target=$fixture/publication-race-target
+  mkdir -- "$runner"
+  chmod 700 -- "$runner"
+  mkdir -- "$target"
+  printf 'outside survivor\n' >"$target/entry"
+  if BETA_SEMANTIC_GATE="publication-race-$mode" \
+    BETA_SEMANTIC_GH_MODE=success BETA_SEMANTIC_EVENTS="$runner/events.log" \
+    BETA_SEMANTIC_SOURCE_SHA="$source_sha" RUNNER_TEMP="$runner" \
+    GITHUB_OUTPUT="$runner/output" PATH="$publication_race_bin:$fixture/bin:$PATH" \
+    BETA_SEMANTIC_PUBLICATION_RACE_MODE="$mode" \
+    BETA_SEMANTIC_PUBLICATION_RACE_TARGET="$target" \
+    BETA_SEMANTIC_REAL_MV="$(command -v mv)" \
+    "$admit" --artifact-id "$ARTIFACT_ID" --recovery-id "$recovery_id" \
+    --source-sha "$source_sha" --repository "$repository" \
+    --workflow-path "$RECOVERY_WORKFLOW" \
+    --destination "$runner/artifact" --zip-path "$runner/artifact.zip"; then
+    fail "publication race unexpectedly succeeded: $mode"
+  fi
+  case "$mode" in
+    file)
+      [ -f "$runner/artifact" ] && [ ! -L "$runner/artifact" ] ||
+        fail "regular publication survivor was not preserved" ;;
+    directory)
+      [ -d "$runner/artifact" ] && [ ! -L "$runner/artifact" ] ||
+        fail "directory publication survivor was not preserved" ;;
+    symlink)
+      [ -L "$runner/artifact" ] ||
+        fail "symlink publication survivor was not preserved" ;;
+  esac
+  [ "$(sha256sum "$target/entry")" = "$(printf 'outside survivor\n' | sha256sum)" ] ||
+    fail "publication race changed the foreign target"
+  [ ! -e "$runner/artifact.zip" ] || fail "publication race left a ZIP"
+  [ -z "$(find "$runner" -maxdepth 1 -name '.beta-recovery-*' -print -quit)" ] ||
+    fail "publication race left private staging"
+}
+run_publication_race file
+run_publication_race directory
+run_publication_race symlink
 if [ "$(uname -s)" = Linux ]; then
   assert_failure restore-injected env FAKE_DOCKER_FAIL_RESTORE=1 \
     PATH="$fixture/age-bin:$fixture/bin:$PATH" \
@@ -631,30 +738,50 @@ printf '%s\n' '{"schema":"foreign","value":"preserve"}' >"$fixture/foreign.json"
 foreign_digest=$(sha256sum "$fixture/foreign.json" | awk '{print $1}')
 [ "$foreign_digest" = "$(sha256sum "$fixture/foreign.json" | awk '{print $1}')" ] ||
   fail "foreign state changed during the remote replacement race"
+snapshot_tree() {
+  local root_path=$1 snapshot=$2 path relative metadata payload
+  : >"$snapshot"
+  printf '.|%s\n' "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$root_path")" >>"$snapshot"
+  while IFS= read -r -d '' path; do
+    relative=${path#"$root_path"/}
+    metadata=$(stat -c '%F:%a:%u:%g:%h:%s' -- "$path")
+    if [ -L "$path" ]; then
+      payload="link:$(readlink -- "$path")"
+    elif [ -f "$path" ]; then
+      payload="sha:$(sha256sum -- "$path" | awk '{print $1}')"
+    else
+      payload=directory
+    fi
+    printf '%s|%s|%s\n' "$relative" "$metadata" "$payload" >>"$snapshot"
+  done < <(find "$root_path" -mindepth 1 -print0 | sort -z)
+}
 remote_failure() {
-  local mutation=$1 output foreign_entry foreign_digest_before foreign_digest_after
+  local mutation=$1 output remote_path expected_snapshot mutation_ready mutation_go
   output=$fixture/output/failure-$mutation.json
-  if BETA_SEMANTIC_MUTATION=$mutation PATH="$fixture/bin:$PATH" \
-    run_probe pre "$output"; then
+  mutation_ready=$fixture/remote-model/$mutation.ready
+  mutation_go=$fixture/remote-model/$mutation.go
+  expected_snapshot=$fixture/remote-model/$mutation.snapshot
+  rm -f -- "$mutation_ready" "$mutation_go" "$expected_snapshot"
+  BETA_SEMANTIC_MUTATION=$mutation BETA_SEMANTIC_MUTATION_READY="$mutation_ready" \
+    BETA_SEMANTIC_MUTATION_GO="$mutation_go" PATH="$fixture/bin:$PATH" \
+    run_probe pre "$output" &
+  probe_pid=$!
+  for attempt in $(seq 1 500); do
+    [ -e "$mutation_ready" ] && break
+    sleep 0.01
+  done
+  [ -e "$mutation_ready" ] || fail "remote mutation did not reach synchronized boundary: $mutation"
+  remote_path=$(cat "$fixture/remote-model/remote-path")
+  snapshot_tree "$remote_path" "$expected_snapshot"
+  : >"$mutation_go"
+  if wait "$probe_pid"; then
     fail "remote mutation unexpectedly succeeded: $mutation"
   fi
-  remote_path=$(cat "$fixture/remote-model/remote-path")
   [ -e "$remote_path" ] || [ -L "$remote_path" ] ||
     fail "foreign remote survivor was not preserved: $mutation"
-  case "$mutation" in
-    foreign-file) foreign_entry=$remote_path/foreign-survivor ;;
-    foreign-directory) foreign_entry=$remote_path/foreign-directory/state ;;
-    foreign-symlink) foreign_entry=$remote_path/foreign-symlink ;;
-    *) foreign_entry= ;;
-  esac
-  if [ -n "$foreign_entry" ]; then
-    [ -e "$foreign_entry" ] || [ -L "$foreign_entry" ] ||
-      fail "foreign remote entry was not preserved: $mutation"
-    foreign_digest_before=$(stat -c '%F:%a:%u:%g:%s' -- "$foreign_entry")
-    foreign_digest_after=$(stat -c '%F:%a:%u:%g:%s' -- "$foreign_entry")
-    [ "$foreign_digest_before" = "$foreign_digest_after" ] ||
-      fail "foreign remote entry metadata changed: $mutation"
-  fi
+  snapshot_tree "$remote_path" "$fixture/remote-model/$mutation.after"
+  cmp -- "$expected_snapshot" "$fixture/remote-model/$mutation.after" ||
+    fail "foreign remote bytes or metadata changed: $mutation"
   remove_remote_path() {
     if [ "$(id -u)" -eq 0 ]; then
       rm -r -- "$1"

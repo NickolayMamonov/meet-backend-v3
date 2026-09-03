@@ -254,14 +254,16 @@ trap 'rm -f -- "$expected"' EXIT HUP INT TERM
 secure_marker="$secure/.meet-beta-recovery-secure"
 printf '%s\n' "$marker_value" >"$expected"
 remove_secure() {
-  local secure_identity secure_fd entry name
+  local secure_identity secure_fd secure_marker_identity secure_marker_metadata entry name
   if [ ! -e "$secure" ] && [ ! -L "$secure" ]; then
     return 0
   fi
   [ -d "$secure" ] && [ ! -L "$secure" ]
   [ "$(stat -c '%a:%u:%g' -- "$secure")" = "700:0:0" ]
   [ -f "$secure_marker" ] && [ ! -L "$secure_marker" ]
-  [ "$(stat -c '%a:%u:%g:%h' -- "$secure_marker")" = "600:0:0:1" ]
+  secure_marker_identity=$(stat -c '%d:%i' -- "$secure_marker")
+  secure_marker_metadata=$(stat -c '%a:%u:%g:%h' -- "$secure_marker")
+  [ "$secure_marker_metadata" = "600:0:0:1" ]
   cmp -- "$expected" "$secure_marker" >/dev/null
   secure_identity=$(stat -c '%d:%i' -- "$secure")
   exec {secure_fd}<"$secure"
@@ -273,8 +275,11 @@ remove_secure() {
       .meet-beta-recovery-secure|probe-test-vps-recovery-runtime.sh|production-compose.sh|runtime-proof.json|runtime-proof.json.response.*|runtime-proof.json.headers.*|runtime-proof.json.tmp.*) ;;
       *) return 1 ;;
     esac
-  done < <(find -L "/proc/$$/fd/$secure_fd" -mindepth 1 -maxdepth 1 -print0)
-  find -L "/proc/$$/fd/$secure_fd" -mindepth 1 -delete
+  done < <(find -P "/proc/$$/fd/$secure_fd" -mindepth 1 -maxdepth 1 -print0)
+  [ "$(stat -c '%d:%i' -- "$secure_marker")" = "$secure_marker_identity" ]
+  [ "$(stat -c '%a:%u:%g:%h' -- "$secure_marker")" = "$secure_marker_metadata" ]
+  cmp -- "$expected" "$secure_marker" >/dev/null
+  find -P "/proc/$$/fd/$secure_fd" -mindepth 1 -delete
   [ "$(stat -c '%d:%i' -- "$secure")" = "$secure_identity" ]
   rmdir -- "$secure"
   [ ! -e "$secure" ] && [ ! -L "$secure" ]
@@ -292,14 +297,19 @@ cmp -- "$expected" "$marker" >/dev/null
 exec {remote_fd}<"$remote"
 [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
 remove_secure
+marker_identity=$(stat -c '%d:%i' -- "$marker")
+marker_metadata=$(stat -c '%a:%u:%g:%h' -- "$marker")
 while IFS= read -r -d '' entry; do
   name=${entry##*/}
   case "$name" in
     .meet-beta-recovery-owner) ;;
     *) exit 1 ;;
   esac
-done < <(find -L "/proc/$$/fd/$remote_fd" -mindepth 1 -maxdepth 1 -print0)
-find -L "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
+done < <(find -P "/proc/$$/fd/$remote_fd" -mindepth 1 -maxdepth 1 -print0)
+[ "$(stat -c '%d:%i' -- "$marker")" = "$marker_identity" ]
+[ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "$marker_metadata" ]
+cmp -- "$expected" "$marker" >/dev/null
+find -P "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
 [ "$(stat -c '%d:%i' -- "$remote")" = "$remote_identity" ]
 rmdir -- "$remote"
 [ ! -e "$remote" ] && [ ! -L "$remote" ]
@@ -435,7 +445,7 @@ cleanup_create() {
     exec {created_fd}<"$remote" || status=1
     [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$created_fd")" = "$created_identity" ] ||
       status=1
-    [ -z "$(find -L "/proc/$$/fd/$created_fd" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
+    [ -z "$(find -P "/proc/$$/fd/$created_fd" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
       status=1
     [ "$(stat -c '%d:%i' -- "$remote")" = "$created_identity" ] || status=1
     [ "$status" -eq 0 ] && rmdir -- "$remote" || true
