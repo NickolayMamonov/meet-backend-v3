@@ -275,11 +275,11 @@ remove_secure() {
       .meet-beta-recovery-secure|probe-test-vps-recovery-runtime.sh|production-compose.sh|runtime-proof.json|runtime-proof.json.response.*|runtime-proof.json.headers.*|runtime-proof.json.tmp.*) ;;
       *) return 1 ;;
     esac
-  done < <(find -P "/proc/$$/fd/$secure_fd" -mindepth 1 -maxdepth 1 -print0)
+  done < <(find -H "/proc/$$/fd/$secure_fd" -mindepth 1 -maxdepth 1 -print0)
   [ "$(stat -c '%d:%i' -- "$secure_marker")" = "$secure_marker_identity" ]
   [ "$(stat -c '%a:%u:%g:%h' -- "$secure_marker")" = "$secure_marker_metadata" ]
   cmp -- "$expected" "$secure_marker" >/dev/null
-  find -P "/proc/$$/fd/$secure_fd" -mindepth 1 -delete
+  find -H "/proc/$$/fd/$secure_fd" -mindepth 1 -delete
   [ "$(stat -c '%d:%i' -- "$secure")" = "$secure_identity" ]
   rmdir -- "$secure"
   [ ! -e "$secure" ] && [ ! -L "$secure" ]
@@ -305,11 +305,11 @@ while IFS= read -r -d '' entry; do
     .meet-beta-recovery-owner) ;;
     *) exit 1 ;;
   esac
-done < <(find -P "/proc/$$/fd/$remote_fd" -mindepth 1 -maxdepth 1 -print0)
+done < <(find -H "/proc/$$/fd/$remote_fd" -mindepth 1 -maxdepth 1 -print0)
 [ "$(stat -c '%d:%i' -- "$marker")" = "$marker_identity" ]
 [ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "$marker_metadata" ]
 cmp -- "$expected" "$marker" >/dev/null
-find -P "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
+find -H "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
 [ "$(stat -c '%d:%i' -- "$remote")" = "$remote_identity" ]
 rmdir -- "$remote"
 [ ! -e "$remote" ] && [ ! -L "$remote" ]
@@ -445,7 +445,7 @@ cleanup_create() {
     exec {created_fd}<"$remote" || status=1
     [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$created_fd")" = "$created_identity" ] ||
       status=1
-    [ -z "$(find -P "/proc/$$/fd/$created_fd" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
+    [ -z "$(find -H "/proc/$$/fd/$created_fd" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
       status=1
     [ "$(stat -c '%d:%i' -- "$remote")" = "$created_identity" ] || status=1
     [ "$status" -eq 0 ] && rmdir -- "$remote" || true
