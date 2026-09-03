@@ -158,12 +158,18 @@ case "$url" in
       artifact-id) id=8; name=beta-recovery-semantic-route-7 ;;
       artifact-name) id=7; name=unrelated-artifact ;;
       artifact-identity) id=7; name=beta-recovery-semantic-route-8 ;;
-      retention) id=7; name=beta-recovery-semantic-route-7 ;;
+      retention|expiry|size) id=7; name=beta-recovery-semantic-route-7 ;;
       *) id=7; name=beta-recovery-semantic-route-7 ;;
     esac
     if [ "$mode" = retention ]; then
       printf '%s\n' \
         "{\"id\":$id,\"name\":\"$name\",\"expired\":false,\"size_in_bytes\":1,\"workflow_run\":{\"id\":7},\"created_at\":\"2026-09-02T18:00:00Z\",\"expires_at\":\"2026-09-02T18:00:00Z\"}"
+    elif [ "$mode" = expiry ]; then
+      printf '%s\n' \
+        "{\"id\":$id,\"name\":\"$name\",\"expired\":true,\"size_in_bytes\":1,\"workflow_run\":{\"id\":7},\"created_at\":\"2026-09-02T18:00:00Z\",\"expires_at\":\"2026-09-02T18:00:00Z\"}"
+    elif [ "$mode" = size ]; then
+      printf '%s\n' \
+        "{\"id\":$id,\"name\":\"$name\",\"expired\":false,\"size_in_bytes\":0,\"workflow_run\":{\"id\":7},\"created_at\":\"2026-09-02T18:00:00Z\",\"expires_at\":\"2026-10-02T18:00:00Z\"}"
     else
       printf '%s\n' \
         "{\"id\":$id,\"name\":\"$name\",\"expired\":false,\"size_in_bytes\":1,\"workflow_run\":{\"id\":7},\"created_at\":\"2026-09-02T18:00:00Z\",\"expires_at\":\"2026-10-02T18:00:00Z\"}"
@@ -177,6 +183,7 @@ case "$url" in
     title='Beta recovery capture semantic route'
     case "$mode" in
       run-status) status=queued; conclusion=success ;;
+      run-conclusion) status=completed; conclusion=failure ;;
       run-event) status=completed; conclusion=success; event=push ;;
       run-branch) status=completed; conclusion=success; branch=master ;;
       run-source) status=completed; conclusion=success; sha=ffffffffffffffffffffffffffffffffffffffff ;;
@@ -190,13 +197,55 @@ case "$url" in
   */actions/artifacts/7/zip)
     printf '%s\n' "${BETA_SEMANTIC_GATE:-unknown}-artifact-transfer" \
       >>"${BETA_SEMANTIC_EVENTS:?}"
-    [ "$mode" != transfer-failure ] || exit 55
+    [ "$mode" != transfer-failure ] || {
+      head -c 32 "$BETA_SEMANTIC_ARTIFACT_ZIP"
+      exit 55
+    }
+    [ "$mode" != zip-corruption ] || { head -c 32 "$BETA_SEMANTIC_ARTIFACT_ZIP"; exit 0; }
+    [ "$mode" != zip-extraction ] || {
+      cp -- "$BETA_SEMANTIC_ARTIFACT_ZIP" "$BETA_SEMANTIC_ARTIFACT_ZIP.extraction"
+      dd if=/dev/zero of="$BETA_SEMANTIC_ARTIFACT_ZIP.extraction" \
+        bs=1 seek=128 count=1 conv=notrunc status=none
+      cat "$BETA_SEMANTIC_ARTIFACT_ZIP.extraction"
+      rm -f -- "$BETA_SEMANTIC_ARTIFACT_ZIP.extraction"
+      exit 0
+    }
+    if [[ "$mode" = manifest-* ]]; then
+      variant=${mode#manifest-}
+      variant_var=BETA_SEMANTIC_ARTIFACT_VARIANT_$variant
+      variant_file=${!variant_var}
+      cat "$variant_file"
+      exit 0
+    fi
     cat "${BETA_SEMANTIC_ARTIFACT_ZIP:?}"
     ;;
   *) exit 2 ;;
 esac
 EOF
 chmod 700 "$fixture/bin/gh"
+for manifest_field in source repository recovery run name ciphertext; do
+  variant_dir="$fixture/manifest-$manifest_field"
+  mkdir -p -- "$variant_dir/files"
+  unzip -q "$artifact_zip" -d "$variant_dir/files"
+  case "$manifest_field" in
+    source) jq '.sourceSha = "ffffffffffffffffffffffffffffffffffffffff"' \
+      "$variant_dir/files/recovery-point.json" >"$variant_dir/manifest.json" ;;
+    repository) jq '.repository = "foreign/repository"' \
+      "$variant_dir/files/recovery-point.json" >"$variant_dir/manifest.json" ;;
+    recovery) jq '.recoveryId = "foreign-recovery"' \
+      "$variant_dir/files/recovery-point.json" >"$variant_dir/manifest.json" ;;
+    run) jq '.runId = 8' "$variant_dir/files/recovery-point.json" \
+      >"$variant_dir/manifest.json" ;;
+    name) jq '.artifactName = "foreign-artifact"' \
+      "$variant_dir/files/recovery-point.json" >"$variant_dir/manifest.json" ;;
+    ciphertext) jq '.source.ciphertexts.database.sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+      "$variant_dir/files/recovery-point.json" >"$variant_dir/manifest.json" ;;
+  esac
+  mv -- "$variant_dir/manifest.json" "$variant_dir/files/recovery-point.json"
+  (cd "$variant_dir/files" && zip -q -j "$variant_dir.zip" \
+    postgres.dump.age uploads.tar.gz.age recovery-point.json)
+  eval "export BETA_SEMANTIC_ARTIFACT_VARIANT_$manifest_field=\"$variant_dir.zip\""
+done
 mkdir -p "$fixture/selection-runner" "$fixture/admission-runner"
 chmod 700 "$fixture/selection-runner" "$fixture/admission-runner"
 export GITHUB_REPOSITORY="$repository"
@@ -337,6 +386,11 @@ case "${#protocol[@]}" in
         chmod 700 -- "${protocol[0]}" ;;
       foreign-file)
         printf '%s\n' foreign-state >"${protocol[0]}/foreign-survivor" ;;
+      foreign-directory)
+        mkdir -- "${protocol[0]}/foreign-directory"
+        printf '%s\n' foreign-state >"${protocol[0]}/foreign-directory/state" ;;
+      foreign-symlink)
+        ln -s -- /tmp/foreign-target "${protocol[0]}/foreign-symlink" ;;
     esac
     printf '%s\n' remote-run >>"${BETA_SEMANTIC_EVENTS:?}"
     printf '%s-remote-run\n' "${protocol[4]}" >>"${BETA_SEMANTIC_EVENTS:?}"
@@ -441,11 +495,15 @@ grep -Fxq remote-cleanup "$fixture/events.log" || fail "remote cleanup was not e
 mount="$fixture/output/mount-contract.json"
 jq -cnS '{schema:"meet-backend/beta-recovery-mount/v1",type:"volume",
   destination:"/var/lib/postgresql/data",readWrite:true,anonymous:true}' >"$mount"
+admitted_database_proof="$fixture/output/admitted-database-proof.json"
+admitted_media_proof="$fixture/output/admitted-media-proof.json"
+jq -cS '.databaseProof' "$admitted_artifact/recovery-point.json" >"$admitted_database_proof"
+jq -cS '.mediaProof' "$admitted_artifact/recovery-point.json" >"$admitted_media_proof"
 "$evidence" final --recovery-id "$recovery_id" --source-sha "$source_sha" \
-  --repository "$repository" --run-id "$run_id" --artifact-id 9 \
-  --artifact-name "beta-recovery-$recovery_id-$run_id" \
-  --manifest "$fixture/recovery-point.json" --database-proof "$fixture/database-proof.json" \
-  --media-proof "$fixture/media-proof.json" --restored-database-proof \
+  --repository "$repository" --run-id "$run_id" --artifact-id "$ARTIFACT_ID" \
+  --artifact-name "$(jq -er '.artifactName' "$admitted_artifact/recovery-point.json")" \
+  --manifest "$admitted_artifact/recovery-point.json" --database-proof \
+  "$admitted_database_proof" --media-proof "$admitted_media_proof" --restored-database-proof \
   "$fixture/output/restored-database-proof.json" --restored-media-proof \
   "$fixture/output/restored-media-proof.json" --pre-probe "$pre_output" \
   --post-probe "$post_output" --mount-contract "$mount" \
@@ -485,8 +543,11 @@ run_gate_failure() {
   local mode=$1 runner="$fixture/gate-failure-$1"
   mkdir -p -- "$runner"
   chmod 700 -- "$runner"
+  : >"$runner/events.log"
   if BETA_SEMANTIC_GATE="failure-$mode" BETA_SEMANTIC_GH_MODE="$mode" \
-    RUNNER_TEMP="$runner" GITHUB_OUTPUT="$runner/output" PATH="$fixture/bin:$PATH" \
+    BETA_SEMANTIC_EVENTS="$runner/events.log" BETA_SEMANTIC_SOURCE_SHA="$source_sha" \
+    RUNNER_TEMP="$runner" \
+    GITHUB_OUTPUT="$runner/output" PATH="$fixture/bin:$PATH" \
     "$admit" --artifact-id "$ARTIFACT_ID" --recovery-id "$recovery_id" \
     --source-sha "$source_sha" --repository "$repository" \
     --workflow-path "$RECOVERY_WORKFLOW" \
@@ -498,13 +559,21 @@ run_gate_failure() {
     rm -r -- "$runner/artifact"
   fi
   [ ! -e "$runner/artifact" ] || fail "restore-select left failed artifact state: $mode"
+  [ ! -e "$runner/artifact.zip" ] || fail "restore-select left failed ZIP state: $mode"
+  [ -z "$(find "$runner" -maxdepth 1 -name '.beta-recovery-*' -print -quit)" ] ||
+    fail "restore-select left private staging state: $mode"
+  ! grep -Eq 'pre-probe-start|age-identity-access|docker-pull' "$runner/events.log" ||
+    fail "restore-select crossed a prohibited boundary: $mode"
 }
 run_admission_failure() {
   local mode=$1 runner="$fixture/admission-failure-$1"
   mkdir -p -- "$runner"
   chmod 700 -- "$runner"
+  : >"$runner/events.log"
   if BETA_SEMANTIC_GATE="admission-failure-$mode" BETA_SEMANTIC_GH_MODE="$mode" \
-    RUNNER_TEMP="$runner" GITHUB_OUTPUT="$runner/output" PATH="$fixture/bin:$PATH" \
+    BETA_SEMANTIC_EVENTS="$runner/events.log" BETA_SEMANTIC_SOURCE_SHA="$source_sha" \
+    RUNNER_TEMP="$runner" \
+    GITHUB_OUTPUT="$runner/output" PATH="$fixture/bin:$PATH" \
     "$admit" --artifact-id "$ARTIFACT_ID" --recovery-id "$recovery_id" \
     --source-sha "$source_sha" --repository "$repository" \
     --workflow-path "$RECOVERY_WORKFLOW" \
@@ -516,14 +585,22 @@ run_admission_failure() {
     rm -r -- "$runner/artifact"
   fi
   [ ! -e "$runner/artifact" ] || fail "run admission left failed artifact state: $mode"
+  [ ! -e "$runner/artifact.zip" ] || fail "run admission left failed ZIP state: $mode"
+  [ -z "$(find "$runner" -maxdepth 1 -name '.beta-recovery-*' -print -quit)" ] ||
+    fail "run admission left private staging state: $mode"
+  ! grep -Eq 'age-identity-access|docker-pull' "$runner/events.log" ||
+    fail "run admission crossed a prohibited boundary: $mode"
 }
-for gate_failure in artifact-id artifact-name retention run-status run-event \
-  run-branch run-source run-workflow run-title artifact-identity transfer-failure; do
+for gate_failure in artifact-id artifact-name retention expiry size run-status run-conclusion run-event \
+  run-branch run-source run-workflow run-title artifact-identity transfer-failure zip-corruption \
+  zip-extraction; do
   run_gate_failure "$gate_failure"
 done
-for admission_failure in run-status run-event run-branch run-source \
-  artifact-identity \
-  run-workflow run-title transfer-failure; do
+for admission_failure in artifact-id artifact-name retention expiry size run-status \
+  run-conclusion run-event run-branch run-source run-workflow run-title \
+  artifact-identity transfer-failure zip-corruption zip-extraction \
+  manifest-source manifest-repository manifest-recovery manifest-run \
+  manifest-name manifest-ciphertext; do
   run_admission_failure "$admission_failure"
 done
 if [ "$(uname -s)" = Linux ]; then
@@ -555,7 +632,7 @@ foreign_digest=$(sha256sum "$fixture/foreign.json" | awk '{print $1}')
 [ "$foreign_digest" = "$(sha256sum "$fixture/foreign.json" | awk '{print $1}')" ] ||
   fail "foreign state changed during the remote replacement race"
 remote_failure() {
-  local mutation=$1 output
+  local mutation=$1 output foreign_entry foreign_digest_before foreign_digest_after
   output=$fixture/output/failure-$mutation.json
   if BETA_SEMANTIC_MUTATION=$mutation PATH="$fixture/bin:$PATH" \
     run_probe pre "$output"; then
@@ -564,6 +641,20 @@ remote_failure() {
   remote_path=$(cat "$fixture/remote-model/remote-path")
   [ -e "$remote_path" ] || [ -L "$remote_path" ] ||
     fail "foreign remote survivor was not preserved: $mutation"
+  case "$mutation" in
+    foreign-file) foreign_entry=$remote_path/foreign-survivor ;;
+    foreign-directory) foreign_entry=$remote_path/foreign-directory/state ;;
+    foreign-symlink) foreign_entry=$remote_path/foreign-symlink ;;
+    *) foreign_entry= ;;
+  esac
+  if [ -n "$foreign_entry" ]; then
+    [ -e "$foreign_entry" ] || [ -L "$foreign_entry" ] ||
+      fail "foreign remote entry was not preserved: $mutation"
+    foreign_digest_before=$(stat -c '%F:%a:%u:%g:%s' -- "$foreign_entry")
+    foreign_digest_after=$(stat -c '%F:%a:%u:%g:%s' -- "$foreign_entry")
+    [ "$foreign_digest_before" = "$foreign_digest_after" ] ||
+      fail "foreign remote entry metadata changed: $mutation"
+  fi
   remove_remote_path() {
     if [ "$(id -u)" -eq 0 ]; then
       rm -r -- "$1"
@@ -576,6 +667,8 @@ remote_failure() {
 remote_failure marker-drift
 remote_failure directory-replacement
 remote_failure foreign-file
+remote_failure foreign-directory
+remote_failure foreign-symlink
 [ ! -e "$fixture/identity" ] && [ ! -e "$fixture/failure-identity" ] ||
   fail "age identity was not removed during restore cleanup"
 

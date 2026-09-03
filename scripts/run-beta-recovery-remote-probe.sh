@@ -162,9 +162,7 @@ done
 for tool in awk base64 cat chmod cmp id install ln mktemp od realpath rm sed sha256sum stat tr wc; do
   command -v "$tool" >/dev/null 2>&1 || fail "required local tooling is unavailable"
 done
-for tool in ssh; do
-  command -v "$tool" >/dev/null 2>&1 || fail "required SSH tooling is unavailable"
-done
+command -v ssh >/dev/null 2>&1 || fail "required SSH tooling is unavailable"
 
 [ -n "${SSH_PRIVATE_KEY:-}" ] || fail "SSH_PRIVATE_KEY is absent"
 probe_sha=$(sha256sum -- "$probe_source" | awk '{print $1}')
@@ -294,6 +292,13 @@ cmp -- "$expected" "$marker" >/dev/null
 exec {remote_fd}<"$remote"
 [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
 remove_secure
+while IFS= read -r -d '' entry; do
+  name=${entry##*/}
+  case "$name" in
+    .meet-beta-recovery-owner) ;;
+    *) exit 1 ;;
+  esac
+done < <(find -L "/proc/$$/fd/$remote_fd" -mindepth 1 -maxdepth 1 -print0)
 find -L "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
 [ "$(stat -c '%d:%i' -- "$remote")" = "$remote_identity" ]
 rmdir -- "$remote"
@@ -412,12 +417,15 @@ marker_value="meet-backend/beta-recovery-remote-probe-owner/v1:$token:$source_sh
 created=false
 marker_published=false
 marker_tmp=
+marker_tmp_identity=
 created_identity=
 cleanup_create() {
   local status=$?
   trap - EXIT HUP INT TERM
   if [ -n "$marker_tmp" ] && { [ -e "$marker_tmp" ] || [ -L "$marker_tmp" ]; }; then
-    rm -f -- "$marker_tmp" || status=1
+    [ ! -L "$marker_tmp" ] &&
+      [ "$(stat -c '%d:%i' -- "$marker_tmp" 2>/dev/null)" = "$marker_tmp_identity" ] &&
+      rm -f -- "$marker_tmp" || status=1
   fi
   if [ "$created" = true ] && [ "$marker_published" = false ] &&
     [ -d "$remote" ] && [ ! -L "$remote" ] &&
@@ -427,9 +435,10 @@ cleanup_create() {
     exec {created_fd}<"$remote" || status=1
     [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$created_fd")" = "$created_identity" ] ||
       status=1
-    find -L "/proc/$$/fd/$created_fd" -mindepth 1 -delete || status=1
+    [ -z "$(find -L "/proc/$$/fd/$created_fd" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
+      status=1
     [ "$(stat -c '%d:%i' -- "$remote")" = "$created_identity" ] || status=1
-    rmdir -- "$remote" || status=1
+    [ "$status" -eq 0 ] && rmdir -- "$remote" || true
   fi
   exit "$status"
 }
@@ -446,6 +455,7 @@ chown "$owner_uid:$owner_gid" -- "$remote"
 [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]
 created_identity=$(stat -c '%d:%i' -- "$remote")
 marker_tmp=$(mktemp "$remote/.meet-beta-recovery-owner.XXXXXX")
+marker_tmp_identity=$(stat -c '%d:%i' -- "$marker_tmp")
 chmod 600 -- "$marker_tmp"
 chown "$owner_uid:$owner_gid" -- "$marker_tmp"
 printf '%s\n' "$marker_value" >"$marker_tmp"

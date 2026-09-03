@@ -73,7 +73,7 @@ done
 [[ "$zip_path" = /* && "$zip_path" != *$'\n'* && "$zip_path" != *$'\r'* ]] ||
   fail "ZIP path is malformed"
 
-for tool in gh jq date find id mktemp mv realpath rm sha256sum stat unzip wc; do
+for tool in gh jq date find id ln mktemp mv realpath rm sha256sum stat unzip wc; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tooling is unavailable"
 done
 validator=${BETA_RECOVERY_EVIDENCE_VALIDATOR:-}
@@ -109,25 +109,60 @@ zip_path=$zip_parent/${zip_path##*/}
   fail "ZIP path is already occupied"
 
 work_root=
+work_root_identity=
+download_zip=
+download_identity=
+download_owned=false
+zip_identity=
 zip_owned=false
 published=false
+remove_work_root() {
+  local current_identity
+  [ -n "$work_root" ] || return 0
+  [ -e "$work_root" ] || [ -L "$work_root" ] || return 0
+  [ ! -L "$work_root" ] || return 1
+  current_identity=$(stat -c '%d:%i' -- "$work_root" 2>/dev/null) || return 1
+  [ "$current_identity" = "$work_root_identity" ] || return 1
+  rm -r -- "$work_root"
+}
+remove_download() {
+  local current_identity
+  [ "$download_owned" = true ] || return 0
+  [ -e "$download_zip" ] || [ -L "$download_zip" ] || return 0
+  [ ! -L "$download_zip" ] || return 1
+  current_identity=$(stat -c '%d:%i' -- "$download_zip" 2>/dev/null) || return 1
+  [ "$current_identity" = "$download_identity" ] || return 1
+  rm -f -- "$download_zip"
+}
+remove_zip() {
+  local current_identity
+  [ "$zip_owned" = true ] || return 0
+  [ -e "$zip_path" ] || [ -L "$zip_path" ] || return 0
+  [ ! -L "$zip_path" ] || return 1
+  current_identity=$(stat -c '%d:%i' -- "$zip_path" 2>/dev/null) || return 1
+  [ "$current_identity" = "$zip_identity" ] || return 1
+  rm -f -- "$zip_path"
+}
 cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
-  if [ "$published" = false ] && [ -n "$work_root" ] &&
-    { [ -e "$work_root" ] || [ -L "$work_root" ]; }; then
-    rm -r -- "$work_root" || status=1
-  fi
-  if [ "$zip_owned" = true ] && { [ -e "$zip_path" ] || [ -L "$zip_path" ]; }; then
-    [ ! -L "$zip_path" ] && rm -f -- "$zip_path" || status=1
-  fi
+  [ "$published" = true ] || remove_work_root || status=1
+  remove_download || status=1
+  remove_zip || status=1
   exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
 
 work_root=$(mktemp -d "$destination_parent/.beta-recovery-admission.XXXXXX") ||
   fail "private staging creation failed"
+work_root_identity=$(stat -c '%d:%i' -- "$work_root" 2>/dev/null) ||
+  fail "private staging identity is unavailable"
 chmod 700 -- "$work_root"
+download_zip=$(mktemp "$zip_parent/.beta-recovery-download.XXXXXX") ||
+  fail "private ZIP staging creation failed"
+download_identity=$(stat -c '%d:%i' -- "$download_zip" 2>/dev/null) ||
+  fail "private ZIP staging identity is unavailable"
+download_owned=true
 artifact_json=$(gh api "repos/$repository/actions/artifacts/$artifact_id") ||
   fail "artifact metadata lookup failed"
 jq -e --arg id "$artifact_id" '
@@ -151,21 +186,20 @@ jq -e --arg sha "$source_sha" --arg workflow "$workflow_path" '
 ' --arg run_id "$workflow_run_id" <<<"$run_json" >/dev/null ||
   fail "workflow run metadata is invalid"
 
-gh api "repos/$repository/actions/artifacts/$artifact_id/zip" >"$zip_path" ||
+gh api "repos/$repository/actions/artifacts/$artifact_id/zip" >"$download_zip" ||
   fail "artifact ZIP download failed"
-zip_owned=true
-[ -s "$zip_path" ] || fail "artifact ZIP is empty"
+[ -s "$download_zip" ] || fail "artifact ZIP is empty"
 expected_zip=$work_root/expected-zip
 printf '%s\n' postgres.dump.age recovery-point.json uploads.tar.gz.age |
   sort >"$expected_zip"
-unzip -Z1 "$zip_path" | sort >"$work_root/actual-zip" ||
+unzip -Z1 "$download_zip" | sort >"$work_root/actual-zip" ||
   fail "artifact ZIP listing failed"
 cmp -- "$expected_zip" "$work_root/actual-zip" >/dev/null ||
   fail "artifact ZIP contents are not exact"
 extracted=$work_root/extracted
 mkdir -- "$extracted"
 chmod 700 -- "$extracted"
-unzip -q "$zip_path" -d "$extracted" || fail "artifact ZIP extraction failed"
+unzip -q "$download_zip" -d "$extracted" || fail "artifact ZIP extraction failed"
 "$validator" validate-artifact --artifact-dir "$extracted" \
   --recovery-id "$recovery_id" --source-sha "$source_sha" \
   --repository "$repository" --run-id "$workflow_run_id"
@@ -178,6 +212,10 @@ jq -e --arg id "$artifact_id" --arg name "$manifest_name" --argjson run "$manife
   .workflow_run.id == $run
 ' <<<"$artifact_json" >/dev/null || fail "artifact metadata is not manifest-bound"
 [ "$manifest_run" = "$workflow_run_id" ] || fail "manifest run differs from artifact run"
+ln -T -- "$download_zip" "$zip_path" || fail "artifact ZIP publication failed"
+zip_identity=$download_identity
+zip_owned=true
+remove_download || fail "private ZIP staging cleanup failed"
 mv -- "$extracted" "$destination" || fail "artifact publication failed"
 published=true
 trap - EXIT HUP INT TERM
