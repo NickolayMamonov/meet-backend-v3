@@ -270,9 +270,11 @@ case "${#protocol[@]}" in
     if [ "${FAKE_RUNTIME_PROBE:-}" = 1 ]; then
       runtime_root=$model_root/runtime-docker-root
       runtime_state=$model_root/runtime-docker-state
-      if FAKE_RUNTIME_PROBE=1 FAKE_DOCKER_ROOT="$runtime_root" \
-        FAKE_DOCKER_STATE="$runtime_state" \
-        run_remote_body "${protocol[@]}" <<<"$body"; then
+      if (
+        export FAKE_RUNTIME_PROBE=1 FAKE_DOCKER_ROOT="$runtime_root"
+        export FAKE_DOCKER_STATE="$runtime_state"
+        run_remote_body "${protocol[@]}" <<<"$body"
+      ); then
         remote_status=0
       else
         remote_status=$?
