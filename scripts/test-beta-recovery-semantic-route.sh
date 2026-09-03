@@ -281,7 +281,7 @@ case "${#protocol[@]}" in
       fi
       [ ! -e "$runtime_root" ] || run_as_root rm -r -- "$runtime_root"
       [ ! -e "$runtime_state" ] || run_as_root rm -r -- "$runtime_state"
-      return "$remote_status"
+      exit "$remote_status"
     fi
     run_remote_body "${protocol[@]}" <<<"$body"
     ;;
@@ -332,7 +332,7 @@ if [ "$(uname -s)" = Linux ]; then
   export SSH_PRIVATE_KEY=fixture-private-key
   run_probe() {
     local phase=$1 output=$2
-    PATH="$fixture/bin:$PATH" HOST=fixture.example.test \
+    FAKE_RUNTIME_PROBE=1 PATH="$fixture/bin:$PATH" HOST=fixture.example.test \
       "$helper" --phase "$phase" --host fixture.example.test --port 22 \
       --ssh-user fixture-user --host-fingerprint "$BETA_SEMANTIC_FINGERPRINT" \
       --release-root "$fixture/release" --public-url https://api.whysoezzy.online \
