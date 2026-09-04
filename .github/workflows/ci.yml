@@ -241,6 +241,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-beta-recovery-evidence.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-capture.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-restore.sh"
+          bash "$TOOLING_SCRIPTS/test-beta-recovery-semantic-route.sh"
           bash "$TOOLING_SCRIPTS/test-release-post-publication-routing.sh"
           bash "$TOOLING_SCRIPTS/test-release-protected-snapshot.sh"
           bash "$TOOLING_SCRIPTS/test-release-mutation-revalidation.sh"

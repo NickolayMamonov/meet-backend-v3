@@ -26,7 +26,6 @@ grep -Fq 'beta-recovery-drill-' "$workflow"
 grep -Fq 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' "$workflow"
 grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
 grep -Fq 'Revalidate source immediately before identity access' "$workflow"
-grep -Fq 'scp_opts=(-F "$config" -i "$key" -P "$PORT"' "$workflow"
 grep -Fq 'scripts/materialize-beta-recovery-known-hosts.sh' "$workflow"
 grep -Fq 'published_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
 grep -Fq 'remove_published_output' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
@@ -35,7 +34,10 @@ grep -Fq 'published_output_identity=' "$root/scripts/materialize-beta-recovery-k
 grep -Fq '[ "$published_output_identity" = "$candidate_identity" ]' \
   "$root/scripts/materialize-beta-recovery-known-hosts.sh"
 helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
-[ "$helper_count" -eq 3 ]
+[ "$helper_count" -eq 1 ]
+grep -Fq 'scripts/run-beta-recovery-remote-probe.sh' "$workflow"
+probe_helper="$root/scripts/run-beta-recovery-remote-probe.sh"
+grep -Fq 'base64 --decode' "$probe_helper"
 for required in \
   'ssh_dir=$(mktemp -d "$RUNNER_TEMP/beta-recovery-ssh.XXXXXX")' \
   'install -m 600 /dev/null "$config"' \
@@ -44,19 +46,19 @@ for required in \
   '-o UserKnownHostsFile="$known"' \
   '-o GlobalKnownHostsFile=/dev/null' \
   '-o KnownHostsCommand=none'; do
-  grep -Fq -- "$required" "$workflow"
+  grep -Fq -- "$required" "$workflow" || grep -Fq -- "$required" "$probe_helper"
 done
 for required in \
   "trap 'cleanup_capture 129' HUP" \
   "trap 'cleanup_capture 130' INT" \
   "trap 'cleanup_capture 143' TERM" \
-  "trap 'cleanup_probe 129' HUP" \
-  "trap 'cleanup_probe 130' INT" \
-  "trap 'cleanup_probe 143' TERM"; do
-  grep -Fq -- "$required" "$workflow"
+  "trap 'on_signal 129' HUP" \
+  "trap 'on_signal 130' INT" \
+  "trap 'on_signal 143' TERM"; do
+  grep -Fq -- "$required" "$workflow" || grep -Fq -- "$required" "$probe_helper"
 done
 grep -Fq "trap 'cleanup_capture \"\$?\"' EXIT" "$workflow"
-grep -Fq "trap 'cleanup_probe \"\$?\"' EXIT" "$workflow"
+grep -Fq 'trap cleanup' "$probe_helper"
 if grep -Fq 'trap cleanup_capture EXIT HUP INT TERM' "$workflow" ||
   grep -Fq 'trap cleanup_probe EXIT HUP INT TERM' "$workflow"; then
   echo "workflow uses signal-ambiguous cleanup traps" >&2
@@ -81,7 +83,7 @@ assert_release_root_gate(){
   gate_line=$(grep -n 'name: Validate protected test-VPS release root' <<<"$block" | head -1 | cut -d: -f1)
   checkout_line=$(grep -n 'actions/checkout@' <<<"$block" | head -1 | cut -d: -f1)
   [ "$gate_line" -lt "$checkout_line" ]
-  network_line=$(grep -nE 'actions/(checkout|upload-artifact|download-artifact)|(^|[[:space:]])(ssh|scp|git fetch|gh (api|run))' <<<"$block" |
+  network_line=$(grep -nE 'actions/(checkout|upload-artifact|download-artifact)|(^|[[:space:]])(ssh|git fetch|gh (api|run))' <<<"$block" |
     head -1 | cut -d: -f1)
   [ -n "$network_line" ] && [ "$gate_line" -lt "$network_line" ]
   grep -Fq 'TEST_VPS_PATH is absent' <<<"$block"
@@ -99,15 +101,13 @@ assert_release_root_gate "$post_probe_job"
 [ "$(grep -n 'actions/checkout@' <<<"$post_probe_job" | head -1 | cut -d: -f1)" -lt \
   "$(grep -n 'validate-recovery-id "\$RECOVERY_ID"' <<<"$post_probe_job" | head -1 | cut -d: -f1)" ]
 grep -Fq 'root=$4' <<<"$capture_block"
-grep -Fq 'root=$2' <<<"$pre_probe_block"
-grep -Fq 'root=$2' <<<"$post_probe_block"
+! grep -Fq 'root=$2' <<<"$pre_probe_block"
+! grep -Fq 'root=$2' <<<"$post_probe_block"
 grep -Fq 'sudo bash -s -- \' <<<"$capture_block"
-grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$pre_probe_block"
-grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$post_probe_block"
+! grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$pre_probe_block"
+! grep -Fq 'sudo bash -s -- "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$post_probe_block"
 grep -Fq '"$remote" "$RECOVERY_ID" "$PUBLIC_URL" "$PATH_ON_HOST"' <<<"$capture_block"
 grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$capture_block"
-grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$pre_probe_block"
-grep -Fq 'export PRODUCTION_ROOT="$root"' <<<"$post_probe_block"
 assert_root_export_before_consumer(){
   local block=$1 consumer=$2 export_line consumer_line
   export_line=$(grep -n 'export PRODUCTION_ROOT="\$root"' <<<"$block" | head -1 | cut -d: -f1)
@@ -115,13 +115,11 @@ assert_root_export_before_consumer(){
   [ -n "$export_line" ] && [ -n "$consumer_line" ] && [ "$export_line" -lt "$consumer_line" ]
 }
 assert_root_export_before_consumer "$capture_block" 'bash "\$remote/run-beta-recovery-capture.sh"'
-assert_root_export_before_consumer "$pre_probe_block" 'bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh'
-assert_root_export_before_consumer "$post_probe_block" 'bash /var/lib/meet-test-vps-deploy/scripts/probe-test-vps-recovery-runtime.sh'
-for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
+block=$capture_block
   grep -Fq -- '--root "$root"' <<<"$block"
   ! grep -Fq -- '--root /var/lib/meet-production' <<<"$block"
   ! grep -Fq 'PRODUCTION_ROOT=/var/lib/meet-production' <<<"$block"
-done
+unset block
 isolated_block=$(awk '/^  restore-isolated:/{flag=1} /^  restore-post-probe:/{flag=0} flag' "$workflow")
 ! grep -Fq 'PATH_ON_HOST' <<<"$isolated_block"
 ordered_network_calls=0
@@ -161,7 +159,7 @@ run_ordered_case relative relative/root
 run_ordered_case double-dot /srv/../release
 run_ordered_case metacharacter '/srv/release;touch'
 run_ordered_case valid /srv/release
-for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
+block=$capture_block
   helper_line=$(grep -n 'scripts/materialize-beta-recovery-known-hosts.sh' <<<"$block" | head -1 | cut -d: -f1)
   key_line=$(grep -n 'install -m 600 /dev/null "$key"' <<<"$block" | head -1 | cut -d: -f1)
   [ "$helper_line" -lt "$key_line" ]
@@ -169,7 +167,7 @@ for block in "$capture_block" "$pre_probe_block" "$post_probe_block"; do
   trap_line=$(grep -n "trap 'cleanup_" <<<"$block" | head -1 | cut -d: -f1)
   chmod_line=$(grep -n 'chmod 700 "$ssh_dir"' <<<"$block" | head -1 | cut -d: -f1)
   [ "$mktemp_line" -lt "$trap_line" ] && [ "$trap_line" -lt "$chmod_line" ]
-done
+unset block
 grep -Fq 'for signal in HUP INT TERM' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'capture-pre-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'effective-config-failed' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
@@ -193,7 +191,7 @@ grep -Fq 'cmp -- "$expected" "$marker"' "$workflow"
 grep -Fq 'stat -c '\''%a:%u:%g:%h'\'' "$marker"' "$workflow"
 grep -Fq -- '--age-binary "$remote/age"' "$workflow"
 grep -Fq -- '--age-sha256 "$5" --age-version "$6" --age-os "$7" --age-arch "$8"' "$workflow"
-age_transport_count=$(grep -Fc '            "$age_path" \' "$workflow")
+age_transport_count=$(grep -Fc 'send_capture_file "$age_path" age' "$workflow")
 [ "$age_transport_count" -eq 1 ]
 ! grep -Fq 'age-keygen' <<<"$capture_block"
 grep -Fq 'archive_size=10263766' "$root/scripts/install-beta-recovery-age.sh"
@@ -298,13 +296,7 @@ if bash "$auth" validate-age-recipient "$invalid_short_recipient" >/dev/null 2>&
 fi
 [ ! -e "$remote_marker" ]
 mkdir "$remote_dir"
-scp_calls=0
 ssh_calls=0
-scp(){
-  scp_calls=$((scp_calls + 1))
-  printf 'scp %s\n' "$*" >>"$remote_log"
-  cp -- "$1" "$remote_dir/age-recipient"
-}
 ssh(){
   ssh_calls=$((ssh_calls + 1))
   printf 'ssh %s\n' "$*" >>"$remote_log"
@@ -315,7 +307,7 @@ run_safe_capture_preflight(){
   local recipient=$1 recipient_file="$fixture_dir/age-recipient-input"
   scripts/authorize-beta-recovery.sh validate-age-recipient "$recipient" || return
   printf '%s\n' "$recipient" >"$recipient_file"
-  scp "$recipient_file" "fake-host:$remote_dir/"
+  cp -- "$recipient_file" "$remote_dir/age-recipient"
   ssh fake-host "sudo bash -s -- '$remote_dir' '$valid_recovery_id' 'https://api.whysoezzy.online'" <<'REMOTE'
 set -euo pipefail
 remote=$1
@@ -335,9 +327,9 @@ if run_safe_capture_preflight "$malicious_recipient"; then
   echo "malicious recipient crossed the remote boundary" >&2
   exit 1
 fi
-[ "$scp_calls" -eq 0 ] && [ "$ssh_calls" -eq 0 ] && [ ! -e "$remote_marker" ]
+[ "$ssh_calls" -eq 0 ] && [ ! -e "$remote_marker" ]
 run_safe_capture_preflight "$valid_recipient"
-[ "$scp_calls" -eq 1 ] && [ "$ssh_calls" -eq 1 ]
+[ "$ssh_calls" -eq 1 ]
 [ "$(wc -l <"$received_recipient" | tr -d '[:space:]')" -eq 1 ]
 [ "$(<"$received_recipient")" = "$valid_recipient" ]
 grep -Fq 'transferred ciphertext differs from quiesced capture result' "$workflow"
@@ -388,20 +380,16 @@ publish_block=$(awk '/^      - id: publish$/{flag=1} flag' "$workflow")
 grep -Fq '.capturedAt==.recoveryPointTime' "$workflow"
 grep -Fq 'observed_age=$((observed_epoch - point_epoch))' "$workflow"
 [ "$(grep -Fc 'retention-days: 30' "$workflow")" -eq 6 ]
-[ "$(grep -Fc 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow")" -eq 3 ]
+[ "$(grep -Fc 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow")" -eq 2 ]
 ! grep -Eq 'created_epoch|expires_epoch|30 \* 24 \* 60 \* 60' "$workflow"
 publish_line=$(grep -n '^      - id: publish$' "$workflow" | head -1 | cut -d: -f1)
 capture_retention_line=$(grep -n 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow" |
   sed -n '1p' | cut -d: -f1)
-restore_retention_line=$(grep -n 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow" |
-  sed -n '2p' | cut -d: -f1)
 final_retention_line=$(grep -n 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow" |
-  sed -n '3p' | cut -d: -f1)
-zip_line=$(grep -n 'actions/artifacts/\$ARTIFACT_ID/zip' "$workflow" | head -1 | cut -d: -f1)
+  sed -n '2p' | cut -d: -f1)
 cleanup_marker_line=$(grep -n '^      - id: final_cleanup$' "$workflow" | head -1 | cut -d: -f1)
 evidence_manifest_line=$(grep -n 'scripts/build-beta-recovery-evidence.sh final' "$workflow" | head -1 | cut -d: -f1)
 [ "$publish_line" -lt "$capture_retention_line" ] &&
-  [ "$restore_retention_line" -lt "$zip_line" ] &&
   [ "$cleanup_marker_line" -lt "$final_retention_line" ] &&
   [ "$final_retention_line" -lt "$evidence_manifest_line" ]
 
@@ -479,6 +467,7 @@ expect_fake_date_failure non-decimal-date-output non-decimal "$valid_retention"
 
 canonical_inventory=$retention_fixture/canonical-inventory
 cat >"$canonical_inventory" <<'EOF'
+scripts/admit-beta-recovery-artifact.sh
 scripts/authorize-beta-recovery.sh
 scripts/backup-production.sh
 scripts/beta-recovery-database-proof.sql
@@ -487,7 +476,9 @@ scripts/build-beta-recovery-evidence.sh
 scripts/install-beta-recovery-age.sh
 scripts/materialize-beta-recovery-known-hosts.sh
 scripts/probe-test-vps-recovery-runtime.sh
+scripts/production-compose.sh
 scripts/run-beta-recovery-capture.sh
+scripts/run-beta-recovery-remote-probe.sh
 scripts/run-beta-recovery-restore.sh
 scripts/validate-beta-recovery-artifact-retention.sh
 EOF

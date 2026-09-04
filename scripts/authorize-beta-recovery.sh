@@ -172,10 +172,11 @@ jq -e '
 files=(
   scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh
+  scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh
   scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh
   scripts/beta-recovery-database-proof.sql scripts/beta-recovery-media-proof.sh
   scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh
-  scripts/validate-beta-recovery-artifact-retention.sh
+  scripts/validate-beta-recovery-artifact-retention.sh scripts/admit-beta-recovery-artifact.sh
 )
 tooling_digest=$(for file in "${files[@]}"; do [ -f "$checkout/$file" ] || fail "missing tooling: $file"; (cd "$checkout" && sha256sum -- "$file"); done | sort | sha256sum | awk '{print $1}')
 workflow_digest=$(git -C "$checkout" show "HEAD:$workflow" | sha256sum | awk '{print $1}')

@@ -251,6 +251,25 @@ case "$kind" in
     expected=$(jq -cS '.artifactFiles' "$artifact_dir/recovery-point.json")
     actual=$(artifact_files_json "$artifact_dir" | jq -cS .)
     [ "$expected" = "$actual" ] || fail "artifact exact-byte contract mismatch"
+    database_name=postgres.dump.age
+    uploads_name=uploads.tar.gz.age
+    database_size=$(wc -c <"$artifact_dir/$database_name" | tr -d '[:space:]')
+    uploads_size=$(wc -c <"$artifact_dir/$uploads_name" | tr -d '[:space:]')
+    database_sha=$(sha256sum -- "$artifact_dir/$database_name" | awk '{print $1}')
+    uploads_sha=$(sha256sum -- "$artifact_dir/$uploads_name" | awk '{print $1}')
+    jq -e --arg dbname "$database_name" --arg uname "$uploads_name" \
+      --arg dbsha "$database_sha" --arg usha "$uploads_sha" \
+      --argjson dbsize "$database_size" --argjson usize "$uploads_size" '
+      (.source | (keys | sort) == ["ciphertexts","postgresDatabaseBytes","uploads"]) and
+      (.source.ciphertexts | (keys | sort) == ["database","uploads"]) and
+      (.source.ciphertexts.database |
+        (keys | sort) == ["name","sha256","size"] and
+        .name == $dbname and .size == $dbsize and .sha256 == $dbsha) and
+      (.source.ciphertexts.uploads |
+        (keys | sort) == ["name","sha256","size"] and
+        .name == $uname and .size == $usize and .sha256 == $usha)
+    ' "$artifact_dir/recovery-point.json" >/dev/null ||
+      fail "manifest ciphertext bindings are invalid"
     ;;
   final)
     safe_path "$output" || usage
