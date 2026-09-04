@@ -178,13 +178,14 @@ workflow_run_id=$(jq -er '.workflow_run.id' <<<"$artifact_json") ||
   fail "artifact workflow run is unavailable"
 run_json=$(gh api "repos/$repository/actions/runs/$workflow_run_id") ||
   fail "workflow run metadata lookup failed"
-jq -e --arg sha "$source_sha" --arg workflow "$workflow_path" '
+jq -e --arg sha "$source_sha" --arg workflow "$workflow_path" \
+  --arg recovery "$recovery_id" '
   type == "object" and .id == ($run_id|tonumber) and
   .status == "completed" and .conclusion == "success" and
   .event == "workflow_dispatch" and .head_branch == "dev" and
   .head_sha == $sha and
   ((.path // .workflow_path // "") == $workflow) and
-  ((.display_title // "") | startswith("Beta recovery capture "))
+  .display_title == ("Beta recovery capture " + $recovery)
 ' --arg run_id "$workflow_run_id" <<<"$run_json" >/dev/null ||
   fail "workflow run metadata is invalid"
 

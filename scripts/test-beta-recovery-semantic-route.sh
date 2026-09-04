@@ -179,7 +179,7 @@ case "$url" in
       >>"${BETA_SEMANTIC_EVENTS:?}"
     event=workflow_dispatch; branch=dev; sha=$BETA_SEMANTIC_SOURCE_SHA
     path=.github/workflows/prove-beta-backup-restore.yml
-    title='Beta recovery capture semantic route'
+    title='Beta recovery capture semantic-route'
     case "$mode" in
       run-status) status=queued; conclusion=success ;;
       run-conclusion) status=completed; conclusion=failure ;;
@@ -188,6 +188,8 @@ case "$url" in
       run-source) status=completed; conclusion=success; sha=ffffffffffffffffffffffffffffffffffffffff ;;
       run-workflow) status=completed; conclusion=success; path=.github/workflows/other.yml ;;
       run-title) status=completed; conclusion=success; title=unrelated ;;
+      run-title-wrong-recovery) status=completed; conclusion=success; \
+        title='Beta recovery capture other-recovery' ;;
       *) status=completed; conclusion=success ;;
     esac
     printf '%s\n' \
@@ -366,6 +368,21 @@ model_lock=$model_root/deploy.lock
 mkdir -p -- "$model_root"
 touch -- "$model_lock"
 body=$(sed "s|/var/lib/meet-test-vps-deploy/.deploy.lock|$model_lock|g" <<<"$body")
+mutation=${BETA_SEMANTIC_MUTATION:-}
+mutation_ready=${BETA_SEMANTIC_MUTATION_READY:-}
+mutation_go=${BETA_SEMANTIC_MUTATION_GO:-}
+mutation_done=${BETA_SEMANTIC_MUTATION_DONE:-}
+mutation_finish=${BETA_SEMANTIC_MUTATION_FINISH:-}
+receiver_prefix=$model_root/receiver-${mutation:-none}
+mutation_ready=${mutation_ready:-$receiver_prefix.ready}
+mutation_go=${mutation_go:-$receiver_prefix.go}
+mutation_done=${mutation_done:-$receiver_prefix.done}
+mutation_finish=${mutation_finish:-$receiver_prefix.finish}
+remote_path=${protocol[0]:-}
+secure_path=/tmp/beta-recovery-probe-secure-${protocol[2]:-}
+export BETA_SEMANTIC_REMOTE_PATH="$remote_path"
+export BETA_SEMANTIC_SECURE_PATH="$secure_path"
+printf '%s\n' "$secure_path" >"$model_root/secure-path"
 run_as_root() {
   if [ "$(id -u)" -eq 0 ]; then
     "$@"
@@ -375,12 +392,22 @@ run_as_root() {
 }
 run_remote_body() {
   if [ "$(id -u)" -eq 0 ]; then
-    SUDO_UID=$(id -u) SUDO_GID=$(id -g) bash -s -- "$@"
+    SUDO_UID=$(id -u) SUDO_GID=$(id -g) \
+      BETA_SEMANTIC_MUTATION="$mutation" \
+      BETA_SEMANTIC_RECEIVER_READY="$mutation_ready" \
+      BETA_SEMANTIC_RECEIVER_GO="$mutation_go" \
+      BETA_SEMANTIC_RECEIVER_DONE="$mutation_done" \
+      BETA_SEMANTIC_MUTATION_FINISH="$mutation_finish" \
+      bash -s -- "$@"
   else
     remote_env=("PATH=$PATH")
     for name in FAKE_RUNTIME_PROBE FAKE_DOCKER_STATE FAKE_DOCKER_ROOT \
       FAKE_RECOVERY_ID FAKE_RECOVERY_EVENT_LOG FAKE_DATABASE_PROOF \
-      FAKE_DATABASE_DUMP FAKE_UPLOADS_ARCHIVE FAKE_MEDIA_REFERENCE POSTGRES_IMAGE; do
+      FAKE_DATABASE_DUMP FAKE_UPLOADS_ARCHIVE FAKE_MEDIA_REFERENCE POSTGRES_IMAGE \
+      BETA_SEMANTIC_MUTATION BETA_SEMANTIC_RECEIVER_READY \
+      BETA_SEMANTIC_RECEIVER_GO BETA_SEMANTIC_RECEIVER_DONE \
+      BETA_SEMANTIC_FIND_COUNTER BETA_SEMANTIC_REMOTE_PATH \
+      BETA_SEMANTIC_SECURE_PATH; do
       [ "${!name+x}" = x ] && remote_env+=("$name=${!name}")
     done
     sudo -n env "${remote_env[@]}" bash -s -- "$@"
@@ -394,22 +421,44 @@ case "${#protocol[@]}" in
     run_remote_body "${protocol[@]}" <<<"$body"
     ;;
   14)
-    case "${BETA_SEMANTIC_MUTATION:-}" in
-      marker-drift)
-        printf '%s\n' foreign-marker >"${protocol[0]}/.meet-beta-recovery-owner" ;;
-      directory-replacement)
-        rm -r -- "${protocol[0]}"
-        mkdir -- "${protocol[0]}"
-        chmod 700 -- "${protocol[0]}" ;;
-      foreign-file)
-        printf '%s\n' foreign-state >"${protocol[0]}/foreign-survivor" ;;
-      foreign-directory)
-        mkdir -- "${protocol[0]}/foreign-directory"
-        printf '%s\n' foreign-state >"${protocol[0]}/foreign-directory/state" ;;
-      foreign-symlink)
-        ln -s -- /tmp/foreign-target "${protocol[0]}/foreign-symlink" ;;
+    case "$mutation" in
+      marker-drift|directory-replacement|foreign-file|foreign-directory|foreign-symlink)
+        [ -n "$mutation_ready" ] || exit 2
+        : >"$mutation_ready"
+        for attempt in $(seq 1 500); do
+          : "$attempt"
+          [ -e "$mutation_go" ] && break
+          sleep 0.01
+        done
+        [ -e "$mutation_go" ]
+        case "$mutation" in
+          marker-drift)
+            printf '%s\n' foreign-marker >"$remote_path/.meet-beta-recovery-owner" ;;
+          directory-replacement)
+            rm -r -- "$remote_path"
+            mkdir -- "$remote_path"
+            chmod 700 -- "$remote_path" ;;
+          foreign-file)
+            printf '%s\n' foreign-state >"$remote_path/foreign-survivor" ;;
+          foreign-directory)
+            mkdir -- "$remote_path/foreign-directory"
+            printf '%s\n' foreign-state >"$remote_path/foreign-directory/state" ;;
+          foreign-symlink)
+            ln -s -- /tmp/foreign-target "$remote_path/foreign-symlink" ;;
+        esac
+        : >"$mutation_done"
+        for attempt in $(seq 1 500); do
+          : "$attempt"
+          [ -e "$mutation_finish" ] && break
+          sleep 0.01
+        done
+        [ -e "$mutation_finish" ]
+        ;;
     esac
-    if [ -n "${BETA_SEMANTIC_MUTATION_READY:-}" ]; then
+    if [ -n "${BETA_SEMANTIC_MUTATION_READY:-}" ] &&
+      [ "$mutation" != marker-drift ] && [ "$mutation" != directory-replacement ] &&
+      [ "$mutation" != foreign-file ] && [ "$mutation" != foreign-directory ] &&
+      [ "$mutation" != foreign-symlink ]; then
       : >"$BETA_SEMANTIC_MUTATION_READY"
       for attempt in $(seq 1 500); do
         : "$attempt"
@@ -441,6 +490,26 @@ case "${#protocol[@]}" in
   5)
     printf '%s\n' remote-cleanup >>"${BETA_SEMANTIC_EVENTS:?}"
     printf '%s-remote-cleanup\n' "${protocol[4]}" >>"${BETA_SEMANTIC_EVENTS:?}"
+    if [ "$mutation" = cleanup-ambiguity ]; then
+      [ -n "$mutation_ready" ] || exit 2
+      : >"$mutation_ready"
+      for attempt in $(seq 1 500); do
+        : "$attempt"
+        [ -e "$mutation_go" ] && break
+        sleep 0.01
+      done
+      [ -e "$mutation_go" ]
+      : >"$mutation_done"
+      if [ -n "$mutation_finish" ]; then
+        for attempt in $(seq 1 500); do
+          : "$attempt"
+          [ -e "$mutation_finish" ] && break
+          sleep 0.01
+        done
+        [ -e "$mutation_finish" ]
+      fi
+      exit 88
+    fi
     run_remote_body "${protocol[@]}" <<<"$body"
     ;;
   *) printf 'unsupported semantic SSH protocol\n' >&2; exit 2 ;;
@@ -464,6 +533,17 @@ while [ "$#" -gt 0 ]; do
 done
 case "$url" in
   https://api.whysoezzy.online/meetings)
+    if [ "${BETA_SEMANTIC_MUTATION:-}" = probe-failure ]; then
+      : >"${BETA_SEMANTIC_RECEIVER_READY:?}"
+      for attempt in $(seq 1 500); do
+        : "$attempt"
+        [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ] && break
+        sleep 0.01
+      done
+      [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ]
+      : >"${BETA_SEMANTIC_RECEIVER_DONE:?}"
+      exit 77
+    fi
     [ -z "$output" ] || printf '[]\n' >"$output"
     [ "$write" = '%{http_code}' ] && printf '200' ;;
   https://api.whysoezzy.online/actuator)
@@ -472,6 +552,190 @@ case "$url" in
     [ -z "$headers" ] || printf 'HTTP/1.1 301 Moved Permanently\nLocation: https://api.whysoezzy.online/meetings\n\n' >"$headers" ;;
   *) exit 2 ;;
 esac
+EOF
+  cat >"$bin/base64" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_base64=${BETA_SEMANTIC_REAL_BASE64:-/usr/bin/base64}
+mode=${BETA_SEMANTIC_MUTATION:-}
+if [[ "$*" == *--decode* ]] &&
+  [[ "$mode" = base64-corruption || "$mode" = base64-truncation ||
+    "$mode" = signal-HUP || "$mode" = signal-INT || "$mode" = signal-TERM ]]; then
+  input=$(cat)
+  ready=${BETA_SEMANTIC_RECEIVER_READY:?}
+  go=${BETA_SEMANTIC_RECEIVER_GO:?}
+  done_file=${BETA_SEMANTIC_RECEIVER_DONE:?}
+  : >"$ready"
+  for attempt in $(seq 1 500); do
+    : "$attempt"
+    [ -e "$go" ] && break
+    sleep 0.01
+  done
+  [ -e "$go" ]
+  case "$mode" in
+    base64-corruption)
+      set +e
+      printf '%s' 'not-valid-base64!' | "$real_base64" --decode
+      status=$?
+      set -e
+      ;;
+    base64-truncation)
+      set +e
+      printf '%s' "${input:0:${#input}-4}" | "$real_base64" --decode
+      status=$?
+      set -e
+      ;;
+    signal-*)
+      : >"$done_file"
+      kill "-${mode#signal-}" "$PPID"
+      sleep 1
+      status=0
+      ;;
+  esac
+  : >"$done_file"
+  exit "$status"
+fi
+exec "$real_base64" "$@"
+EOF
+  cat >"$bin/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_sha256sum=${BETA_SEMANTIC_REAL_SHA256SUM:-/usr/bin/sha256sum}
+target=${@: -1}
+if [ "${BETA_SEMANTIC_MUTATION:-}" = checksum-drift ] &&
+  [ -n "${BETA_SEMANTIC_SECURE_PATH:-}" ] &&
+  [ "$target" = "${BETA_SEMANTIC_SECURE_PATH}/probe-test-vps-recovery-runtime.sh" ] &&
+  [ "$(basename -- "$target")" = probe-test-vps-recovery-runtime.sh ]; then
+  : >"${BETA_SEMANTIC_RECEIVER_READY:?}"
+  for attempt in $(seq 1 500); do
+    : "$attempt"
+    [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ] && break
+    sleep 0.01
+  done
+  [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ]
+  printf '%s\n' corrupted-receiver-state >"$target"
+  : >"${BETA_SEMANTIC_RECEIVER_DONE:?}"
+fi
+exec "$real_sha256sum" "$@"
+EOF
+  cat >"$bin/stat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_stat=${BETA_SEMANTIC_REAL_STAT:-/usr/bin/stat}
+args=("$@")
+target=${args[${#args[@]}-1]:-}
+if [ "${BETA_SEMANTIC_MUTATION:-}" = mode-drift ] &&
+  [ -n "${BETA_SEMANTIC_SECURE_PATH:-}" ] &&
+  [ "$target" = "${BETA_SEMANTIC_SECURE_PATH}/probe-test-vps-recovery-runtime.sh" ] &&
+  [ "$(basename -- "$target")" = probe-test-vps-recovery-runtime.sh ] &&
+  [[ "$*" == *'%a:%u:%g:%h'* ]]; then
+  : >"${BETA_SEMANTIC_RECEIVER_READY:?}"
+  for attempt in $(seq 1 500); do
+    : "$attempt"
+    [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ] && break
+    sleep 0.01
+  done
+  [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ]
+  chmod 644 -- "$target"
+  : >"${BETA_SEMANTIC_RECEIVER_DONE:?}"
+fi
+exec "$real_stat" "$@"
+EOF
+  cat >"$bin/ln" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_ln=${BETA_SEMANTIC_REAL_LN:-/usr/bin/ln}
+args=("$@")
+target=${args[${#args[@]}-1]:-}
+"$real_ln" "$@"
+if [ -n "${BETA_SEMANTIC_SECURE_PATH:-}" ] &&
+  [ "$target" = "${BETA_SEMANTIC_SECURE_PATH}/probe-test-vps-recovery-runtime.sh" ] &&
+  [ "$(basename -- "$target")" = probe-test-vps-recovery-runtime.sh ] &&
+  [[ "${BETA_SEMANTIC_MUTATION:-}" = type-drift || "${BETA_SEMANTIC_MUTATION:-}" = link-drift ]]; then
+  : >"${BETA_SEMANTIC_RECEIVER_READY:?}"
+  for attempt in $(seq 1 500); do
+    : "$attempt"
+    [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ] && break
+    sleep 0.01
+  done
+  [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ]
+  rm -f -- "$target"
+  if [ "${BETA_SEMANTIC_MUTATION:-}" = type-drift ]; then
+    mkdir -- "$target"
+  else
+    "$real_ln" -s -- /tmp/foreign-probe-target "$target"
+  fi
+  : >"${BETA_SEMANTIC_RECEIVER_DONE:?}"
+fi
+EOF
+  cat >"$bin/flock" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_flock=${BETA_SEMANTIC_REAL_FLOCK:-/usr/bin/flock}
+if [ "${BETA_SEMANTIC_MUTATION:-}" = lock-failure ]; then
+  : >"${BETA_SEMANTIC_RECEIVER_READY:?}"
+  for attempt in $(seq 1 500); do
+    : "$attempt"
+    [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ] && break
+    sleep 0.01
+  done
+  [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ]
+  : >"${BETA_SEMANTIC_RECEIVER_DONE:?}"
+  exit 89
+fi
+exec "$real_flock" "$@"
+EOF
+  cat >"$bin/find" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_find=${BETA_SEMANTIC_REAL_FIND:-/usr/bin/find}
+mode=${BETA_SEMANTIC_MUTATION:-}
+if [ -n "${BETA_SEMANTIC_SECURE_PATH:-}" ] &&
+  [[ "$mode" = cleanup-secure-marker-drift || "$mode" = cleanup-secure-directory-drift ||
+  "$mode" = cleanup-outer-marker-drift ]]; then
+  counter=${BETA_SEMANTIC_FIND_COUNTER:?}
+  count=0
+  [ -f "$counter" ] && count=$(<"$counter")
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$counter"
+  expected=1
+  [ "$mode" = cleanup-outer-marker-drift ] && expected=1
+  if [ "$count" -eq "$expected" ]; then
+    : >"${BETA_SEMANTIC_RECEIVER_READY:?}"
+    for attempt in $(seq 1 500); do
+      : "$attempt"
+      [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ] && break
+      sleep 0.01
+    done
+    [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ]
+    case "$mode" in
+      cleanup-secure-marker-drift)
+        secure=${BETA_SEMANTIC_SECURE_PATH:?}
+        rm -f -- "$secure/.meet-beta-recovery-secure"
+        printf '%s\n' foreign-secure-marker >"$secure/.meet-beta-recovery-secure" ;;
+      cleanup-secure-directory-drift)
+        secure=${BETA_SEMANTIC_SECURE_PATH:?}
+        mv -- "$secure" "$secure.foreign"
+        mkdir -- "$secure"
+        chmod 700 -- "$secure"
+        printf '%s\n' foreign-secure-state >"$secure/foreign-survivor" ;;
+      cleanup-outer-marker-drift)
+        remote=${BETA_SEMANTIC_REMOTE_PATH:?}
+        rm -f -- "$remote/.meet-beta-recovery-owner"
+        printf '%s\n' foreign-outer-marker >"$remote/.meet-beta-recovery-owner" ;;
+    esac
+    : >"${BETA_SEMANTIC_RECEIVER_DONE:?}"
+    if [ -n "${BETA_SEMANTIC_MUTATION_FINISH:-}" ]; then
+      for attempt in $(seq 1 500); do
+        : "$attempt"
+        [ -e "${BETA_SEMANTIC_MUTATION_FINISH:?}" ] && break
+        sleep 0.01
+      done
+      [ -e "${BETA_SEMANTIC_MUTATION_FINISH:?}" ]
+    fi
+  fi
+fi
+exec "$real_find" "$@"
 EOF
   chmod 700 "$bin/"*
 }
@@ -490,7 +754,7 @@ if [ "$(uname -s)" = Linux ]; then
       --ssh-user fixture-user --host-fingerprint "$BETA_SEMANTIC_FINGERPRINT" \
       --release-root "$fixture/release" --public-url https://api.whysoezzy.online \
       --source-sha "$source_sha" --recovery-id "$recovery_id" --output "$output" \
-      >/dev/null
+      > /dev/null
   }
   printf '%s\n' pre-probe-start >>"$fixture/events.log"
   run_probe pre "$pre_output"
@@ -640,12 +904,12 @@ run_admission_failure() {
     fail "run admission crossed a prohibited boundary: $mode"
 }
 for gate_failure in artifact-id artifact-name retention expiry size run-status run-conclusion run-event \
-  run-branch run-source run-workflow run-title artifact-identity transfer-failure zip-corruption \
+  run-branch run-source run-workflow run-title run-title-wrong-recovery artifact-identity transfer-failure zip-corruption \
   zip-extraction; do
   run_gate_failure "$gate_failure"
 done
 for admission_failure in artifact-id artifact-name retention expiry size run-status \
-  run-conclusion run-event run-branch run-source run-workflow run-title \
+  run-conclusion run-event run-branch run-source run-workflow run-title run-title-wrong-recovery \
   artifact-identity transfer-failure zip-corruption zip-extraction \
   manifest-source manifest-repository manifest-recovery manifest-run \
   manifest-name manifest-ciphertext residue-file residue-directory; do
@@ -758,14 +1022,20 @@ snapshot_tree() {
   done < <(find "$root_path" -mindepth 1 -print0 | sort -z)
 }
 remote_failure() {
-  local mutation=$1 output remote_path expected_snapshot mutation_ready mutation_go
+  local mutation=$1 output remote_path original_snapshot expected_snapshot
+  local mutation_ready mutation_go mutation_done mutation_finish
   output=$fixture/output/failure-$mutation.json
   mutation_ready=$fixture/remote-model/$mutation.ready
   mutation_go=$fixture/remote-model/$mutation.go
+  mutation_done=$fixture/remote-model/$mutation.done
+  mutation_finish=$fixture/remote-model/$mutation.finish
+  original_snapshot=$fixture/remote-model/$mutation.before
   expected_snapshot=$fixture/remote-model/$mutation.snapshot
-  rm -f -- "$mutation_ready" "$mutation_go" "$expected_snapshot"
+  rm -f -- "$mutation_ready" "$mutation_go" "$mutation_done" "$mutation_finish" \
+    "$original_snapshot" "$expected_snapshot"
   BETA_SEMANTIC_MUTATION=$mutation BETA_SEMANTIC_MUTATION_READY="$mutation_ready" \
-    BETA_SEMANTIC_MUTATION_GO="$mutation_go" PATH="$fixture/bin:$PATH" \
+    BETA_SEMANTIC_MUTATION_GO="$mutation_go" BETA_SEMANTIC_MUTATION_DONE="$mutation_done" \
+    BETA_SEMANTIC_MUTATION_FINISH="$mutation_finish" PATH="$fixture/bin:$PATH" \
     run_probe pre "$output" &
   probe_pid=$!
   for attempt in $(seq 1 500); do
@@ -775,8 +1045,16 @@ remote_failure() {
   done
   [ -e "$mutation_ready" ] || fail "remote mutation did not reach synchronized boundary: $mutation"
   remote_path=$(cat "$fixture/remote-model/remote-path")
-  snapshot_tree "$remote_path" "$expected_snapshot"
+  snapshot_tree "$remote_path" "$original_snapshot"
   : >"$mutation_go"
+  for attempt in $(seq 1 500); do
+    : "$attempt"
+    [ -e "$mutation_done" ] && break
+    sleep 0.01
+  done
+  [ -e "$mutation_done" ] || fail "remote mutation did not complete: $mutation"
+  snapshot_tree "$remote_path" "$expected_snapshot"
+  : >"$mutation_finish"
   if wait "$probe_pid"; then
     fail "remote mutation unexpectedly succeeded: $mutation"
   fi
@@ -799,6 +1077,93 @@ remote_failure directory-replacement
 remote_failure foreign-file
 remote_failure foreign-directory
 remote_failure foreign-symlink
+
+receiver_failure() {
+  local mutation=$1 case_dir="$fixture/receiver-failure-$1"
+  local runner="$case_dir/runner" output="$case_dir/output.json"
+  local ready="$fixture/remote-model/receiver-$1.ready"
+  local go="$fixture/remote-model/receiver-$1.go"
+  local done_file="$fixture/remote-model/receiver-$1.done"
+  local finish="$fixture/remote-model/receiver-$1.finish" pid remote secure
+  mkdir -p -- "$runner"
+  chmod 700 -- "$case_dir" "$runner"
+  : >"$case_dir/events.log"
+  (
+    export BETA_SEMANTIC_MUTATION="$mutation"
+    export BETA_SEMANTIC_RECEIVER_READY="$ready"
+    export BETA_SEMANTIC_RECEIVER_GO="$go"
+    export BETA_SEMANTIC_RECEIVER_DONE="$done_file"
+    export BETA_SEMANTIC_MUTATION_FINISH="$finish"
+    export BETA_SEMANTIC_FIND_COUNTER="$case_dir/find.count"
+    export BETA_SEMANTIC_EVENTS="$case_dir/events.log"
+    export RUNNER_TEMP="$runner"
+    run_probe pre "$output"
+  ) &
+  pid=$!
+  for attempt in $(seq 1 500); do
+    : "$attempt"
+    [ -e "$ready" ] && break
+    sleep 0.01
+  done
+  [ -e "$ready" ] || fail "receiver mutation did not reach synchronized boundary: $mutation"
+  remote=$(cat "$fixture/remote-model/remote-path")
+  secure=$(cat "$fixture/remote-model/secure-path")
+  : >"$go"
+  for attempt in $(seq 1 500); do
+    : "$attempt"
+    [ -e "$done_file" ] && break
+    sleep 0.01
+  done
+  [ -e "$done_file" ] || fail "receiver mutation did not complete: $mutation"
+  if [[ "$mutation" = cleanup-* ]]; then
+    snapshot_tree "$remote" "$case_dir/remote.expected"
+    if [ -e "$secure" ] || [ -L "$secure" ]; then
+      snapshot_tree "$secure" "$case_dir/secure.expected"
+    fi
+    if [ -e "$secure.foreign" ] || [ -L "$secure.foreign" ]; then
+      snapshot_tree "$secure.foreign" "$case_dir/secure-foreign.expected"
+    fi
+    : >"$finish"
+  fi
+  if wait "$pid"; then
+    fail "receiver mutation unexpectedly succeeded: $mutation"
+  fi
+  [ ! -e "$output" ] && [ ! -L "$output" ] ||
+    fail "receiver mutation published output: $mutation"
+  if [[ "$mutation" = cleanup-* ]]; then
+    snapshot_tree "$remote" "$case_dir/remote.after"
+    cmp -- "$case_dir/remote.expected" "$case_dir/remote.after" ||
+      fail "cleanup mutation changed remote survivor: $mutation"
+    if [ -e "$case_dir/secure.expected" ]; then
+      snapshot_tree "$secure" "$case_dir/secure.after"
+      cmp -- "$case_dir/secure.expected" "$case_dir/secure.after" ||
+        fail "cleanup mutation changed secure survivor: $mutation"
+    fi
+    if [ -e "$case_dir/secure-foreign.expected" ]; then
+      snapshot_tree "$secure.foreign" "$case_dir/secure-foreign.after"
+      cmp -- "$case_dir/secure-foreign.expected" "$case_dir/secure-foreign.after" ||
+        fail "cleanup mutation changed foreign secure survivor: $mutation"
+    fi
+  else
+    [ ! -e "$remote" ] && [ ! -L "$remote" ] ||
+      fail "receiver failure left remote staging: $mutation"
+    [ ! -e "$secure" ] && [ ! -L "$secure" ] ||
+      fail "receiver failure left secure staging: $mutation"
+  fi
+  grep -Fxq remote-run "$case_dir/events.log" ||
+    fail "receiver failure did not execute the remote receiver: $mutation"
+  grep -Fxq remote-cleanup "$case_dir/events.log" ||
+    fail "receiver failure did not execute authenticated cleanup: $mutation"
+  ! grep -Eq 'age-identity-access|docker-pull' "$case_dir/events.log" ||
+    fail "receiver failure crossed the protected boundary: $mutation"
+}
+
+for receiver_mutation in base64-corruption base64-truncation checksum-drift mode-drift \
+  type-drift link-drift lock-failure probe-failure signal-HUP signal-INT signal-TERM \
+  cleanup-ambiguity cleanup-secure-marker-drift cleanup-secure-directory-drift \
+  cleanup-outer-marker-drift; do
+  receiver_failure "$receiver_mutation"
+done
 [ ! -e "$fixture/identity" ] && [ ! -e "$fixture/failure-identity" ] ||
   fail "age identity was not removed during restore cleanup"
 

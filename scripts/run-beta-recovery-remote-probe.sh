@@ -272,7 +272,7 @@ remove_secure() {
   while IFS= read -r -d '' entry; do
     name=${entry##*/}
     case "$name" in
-      .meet-beta-recovery-secure|probe-test-vps-recovery-runtime.sh|production-compose.sh|runtime-proof.json|runtime-proof.json.response.*|runtime-proof.json.headers.*|runtime-proof.json.tmp.*) ;;
+      .meet-beta-recovery-secure|.probe.tmp|.compose.tmp|probe-test-vps-recovery-runtime.sh|production-compose.sh|runtime-proof.json|runtime-proof.json.response.*|runtime-proof.json.headers.*|runtime-proof.json.tmp.*) ;;
       *) return 1 ;;
     esac
   done < <(find -H "/proc/$$/fd/$secure_fd" -mindepth 1 -maxdepth 1 -print0)
@@ -296,7 +296,6 @@ fi
 cmp -- "$expected" "$marker" >/dev/null
 exec {remote_fd}<"$remote"
 [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
-remove_secure
 marker_identity=$(stat -c '%d:%i' -- "$marker")
 marker_metadata=$(stat -c '%a:%u:%g:%h' -- "$marker")
 while IFS= read -r -d '' entry; do
@@ -309,6 +308,8 @@ done < <(find -H "/proc/$$/fd/$remote_fd" -mindepth 1 -maxdepth 1 -print0)
 [ "$(stat -c '%d:%i' -- "$marker")" = "$marker_identity" ]
 [ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "$marker_metadata" ]
 cmp -- "$expected" "$marker" >/dev/null
+remove_secure
+[ "$(stat -c '%d:%i' -- "$remote")" = "$remote_identity" ]
 find -H "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
 [ "$(stat -c '%d:%i' -- "$remote")" = "$remote_identity" ]
 rmdir -- "$remote"
