@@ -1675,7 +1675,12 @@ direct_frame_case create-canonical create \
   "$(printf 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
     "$direct_remote" "$direct_token")"
 direct_owned_root=$consumer_root/cases/direct-frame-create-canonical/remote-root
-[ -d "$direct_owned_root" ] || fail "canonical direct create did not create root"
+if [ ! -d "$direct_owned_root" ]; then
+  printf 'consumer create-canonical direct-frame events:\n' >&2
+  grep -E '^(direct-input|framed-input|ssh-call|argv-scan|argv-rejected|effective-|framed-|remote-|local-|helper-)' \
+    "$consumer_root/cases/direct-frame-create-canonical/boundary.log" >&2 || true
+  fail "canonical direct create did not create root"
+fi
 printf -v direct_cleanup_header 'meet-backend/beta-recovery-cleanup/v1|%s|%s\n' \
   "$direct_remote" "$direct_token"
 direct_frame_case cleanup-canonical cleanup "$direct_cleanup_header" '' '' \
