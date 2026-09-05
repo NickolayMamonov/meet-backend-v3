@@ -938,7 +938,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  kill -"$signal" "$parent_pid"' \
   '}' \
   'scan_secret() {' \
-  '  local secret=$1 encoded hex pattern encoded_pattern hex_pattern' \
+  '  local secret=$1 label=$2 encoded hex pattern encoded_pattern hex_pattern proc_name' \
   '  [ -n "$secret" ] || return 0' \
   '  encoded=$(printf "%s" "$secret" | base64 --wrap=0)' \
   '  hex=$(printf "%s" "$secret" | od -An -v -tx1 | tr -d "[:space:]")' \
@@ -947,11 +947,12 @@ write_wrapper "$consumer_bin/ssh" \
   '  printf "%s\n" "$secret" >"$pattern"' \
   '  printf "%s\n" "$encoded" >"$encoded_pattern"' \
   '  printf "%s\n" "$hex" >"$hex_pattern"' \
-  '  for proc_file in /proc/$$/cmdline /proc/$PPID/cmdline; do' \
+  '  for proc_name in self parent; do' \
+  '    case "$proc_name" in self) proc_file=/proc/$$/cmdline ;; parent) proc_file=/proc/$PPID/cmdline ;; esac' \
   '    [ -r "$proc_file" ] || continue' \
-  '    ! grep -aFq -f "$pattern" "$proc_file" || { rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; }' \
-  '    ! grep -aFq -f "$encoded_pattern" "$proc_file" || { rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; }' \
-  '    ! grep -aFq -f "$hex_pattern" "$proc_file" || { rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; }' \
+  '    if grep -aFq -f "$pattern" "$proc_file"; then printf "argv-scan-fail-%s-%s-raw\n" "$label" "$proc_name" >>"$BETA_RECOVERY_BOUNDARY_LOG"; rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; fi' \
+  '    if grep -aFq -f "$encoded_pattern" "$proc_file"; then printf "argv-scan-fail-%s-%s-base64\n" "$label" "$proc_name" >>"$BETA_RECOVERY_BOUNDARY_LOG"; rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; fi' \
+  '    if grep -aFq -f "$hex_pattern" "$proc_file"; then printf "argv-scan-fail-%s-%s-hex\n" "$label" "$proc_name" >>"$BETA_RECOVERY_BOUNDARY_LOG"; rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; fi' \
   '  done' \
   '  rm -f "$pattern" "$encoded_pattern" "$hex_pattern"' \
   '  return 0' \
@@ -960,20 +961,20 @@ write_wrapper "$consumer_bin/ssh" \
   '  local oracle=${BETA_RECOVERY_TOKEN_ORACLE:-}' \
   '  local token encoded hex' \
   '  [ -n "$oracle" ] || { printf "argv-scan-pass\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 0; }' \
-  '  [ -f "$oracle" ] && [ ! -L "$oracle" ] && [ "$(stat -c "%a" "$oracle")" = 600 ]' \
+  '  [ -f "$oracle" ] && [ ! -L "$oracle" ] && [ "$(stat -c "%a" "$oracle")" = 600 ] || { printf "argv-scan-fail-oracle\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
   '  token=$(<"$oracle")' \
-  '  [ "${#token}" -eq 64 ] && [[ "$token" =~ ^[0-9a-f]{64}$ ]]' \
+  '  [ "${#token}" -eq 64 ] && [[ "$token" =~ ^[0-9a-f]{64}$ ]] || { printf "argv-scan-fail-token-format\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
   '  encoded=$(printf "%s" "$token" | base64 --wrap=0)' \
   '  hex=$(printf "%s" "$token" | od -An -v -tx1 | tr -d "[:space:]")' \
   '  for arg in "$@"; do' \
-  '    [[ "$arg" != *"$token"* ]] || return 1' \
-  '    [[ "$arg" != *"$encoded"* ]] || return 1' \
-  '    [[ "$arg" != *"$hex"* ]] || return 1' \
+  '    [[ "$arg" != *"$token"* ]] || { printf "argv-scan-fail-arg-token\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
+  '    [[ "$arg" != *"$encoded"* ]] || { printf "argv-scan-fail-arg-base64\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
+  '    [[ "$arg" != *"$hex"* ]] || { printf "argv-scan-fail-arg-hex\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
   '  done' \
-  '  scan_secret "$token"' \
+  '  scan_secret "$token" token' \
   '  for secret_name in BETA_RECOVERY_PAYLOAD_SENTINEL BETA_RECOVERY_PRIVATE_KEY_SENTINEL; do' \
   '    secret_value=${!secret_name:-}' \
-  '    [ -z "$secret_value" ] || scan_secret "$secret_value" || return 1' \
+  '    [ -z "$secret_value" ] || scan_secret "$secret_value" "$secret_name" || return 1' \
   '  done' \
   '  for proc_file in /proc/$$/cmdline /proc/$PPID/cmdline; do' \
   '    [ -r "$proc_file" ] || continue' \
