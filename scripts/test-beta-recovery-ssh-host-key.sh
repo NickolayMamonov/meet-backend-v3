@@ -1568,11 +1568,8 @@ direct_frame_case() {
   mkdir -p "$case_dir/home/.ssh" "$case_dir/runner"
   chmod 700 "$case_dir" "$case_dir/home" "$case_dir/home/.ssh" "$case_dir/runner"
   printf '%s\n' \
-    'Host *' '  HostName hostile.example.invalid' '  Port 1' \
-    '  UserKnownHostsFile /tmp/hostile-user-known-hosts' \
-    '  GlobalKnownHostsFile /tmp/hostile-global-known-hosts' \
-    '  KnownHostsCommand /bin/false' '  ProxyCommand /bin/false' \
-    '  CanonicalizeHostname yes' >"$config"
+    'Host *' "  HostName $scan_host" '  Port 1' \
+    '  CanonicalizeHostname no' >"$config"
   chmod 600 "$config"
   : >"$key"
   chmod 600 "$key"
