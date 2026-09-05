@@ -1591,7 +1591,7 @@ direct_frame_case() {
   else
     : >"$suffix_file"
   fi
-  printf 'direct-input-suffix-size=%s\n' "$(stat -c '%s' "$suffix_file")" >"$case_dir/input.log"
+  printf 'direct-input-suffix-size=%s\n' "$(stat -c '%s' "$suffix_file")" >>"$case_dir/boundary.log"
   printf '%s' "$program" | base64 --wrap=0 >"$case_dir/program.b64"
   frame_stdin() {
     printf '%s' "$prefix"
