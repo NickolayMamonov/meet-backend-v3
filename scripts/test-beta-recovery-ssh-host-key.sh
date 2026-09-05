@@ -1009,13 +1009,13 @@ write_wrapper "$consumer_bin/ssh" \
   '  [[ "$arg" == *"@"* ]] && destination_seen=true' \
   'done' \
   '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
-  'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "port $PORT" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fq "userknownhostsfile $known" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "globalknownhostsfile /dev/null" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-user\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-host\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fxq "port $PORT" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-port\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fq "userknownhostsfile $known" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-known\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fxq "globalknownhostsfile /dev/null" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-global\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-unsafe\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-canonicalize\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
   'printf "ssh-call\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'command_start=-1' \
   'for ((i=0; i<${#args[@]}; i++)); do' \
@@ -1456,7 +1456,7 @@ run_consumer_case() {
   set -e
   if [ "$status" -ne "$expected_status" ]; then
     printf 'consumer %s boundary events:\n' "$name" >&2
-    grep -E '^(ssh-call|argv-scan|remote-|local-|helper-|private-key|config-created|ssh-keyscan args|ssh-keygen args)' \
+    grep -E '^(ssh-call|argv-scan|argv-rejected|effective-|remote-|local-|helper-|private-key|config-created|ssh-keyscan args|ssh-keygen args)' \
       "$case_dir/boundary.log" >&2 || true
     fail "consumer $name returned $status instead of $expected_status"
   fi
