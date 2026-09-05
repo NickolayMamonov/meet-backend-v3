@@ -1126,6 +1126,7 @@ write_wrapper "$consumer_bin/ssh" \
   '      dd iflag=fullblock bs=1 count=1 status=none of="$probe"' \
   '      test ! -s "$probe"' \
   '      printf "remote-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '      [ "${BETA_RECOVERY_REMOTE_CLEANUP_FAIL:-0}" = 1 ] && exit 44' \
   '      [ -d "$remote_state" ] && [ ! -L "$remote_state" ] || exit 0' \
   '      [ -f "$remote_state/.meet-beta-recovery-owner" ] && [ "$(<"$remote_state/.meet-beta-recovery-owner")" = "meet-backend/beta-recovery-owner/v1:$token" ] || exit 1' \
   '      rm -r -- "$remote_state"; exit 0 ;;' \
