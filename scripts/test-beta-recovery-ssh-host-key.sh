@@ -1279,8 +1279,12 @@ assert_consumer_residue_absent() {
   local ssh_calls scan_passes
   ssh_calls=$(grep -c '^ssh-call$' "$case_dir/boundary.log" 2>/dev/null || true)
   scan_passes=$(grep -c '^argv-scan-pass$' "$case_dir/boundary.log" 2>/dev/null || true)
-  [ "$ssh_calls" -eq "$scan_passes" ] ||
+  if [ "$ssh_calls" -ne "$scan_passes" ]; then
+    printf 'consumer %s residue boundary events:\n' "$(basename "$case_dir")" >&2
+    grep -E '^(ssh-call|argv-scan|argv-rejected|effective-|framed-|remote-|local-|helper-|private-key|config-created)' \
+      "$case_dir/boundary.log" >&2 || true
     fail "consumer SSH scan count mismatch: $(basename "$case_dir")"
+  fi
   [ -z "$(find "$case_dir/runner" -maxdepth 1 -type d \
     -name 'beta-recovery-ssh.*' -print -quit)" ] ||
     fail "consumer left runner SSH material: $(basename "$case_dir")"
