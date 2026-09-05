@@ -1452,8 +1452,12 @@ run_consumer_case() {
     _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
-  [ "$status" -eq "$expected_status" ] ||
+  if [ "$status" -ne "$expected_status" ]; then
+    printf 'consumer %s boundary events:\n' "$name" >&2
+    grep -E '^(ssh-call|argv-scan|remote-|local-|helper-|private-key|config-created|ssh-keyscan args|ssh-keygen args)' \
+      "$case_dir/boundary.log" >&2 || true
     fail "consumer $name returned $status instead of $expected_status"
+  fi
   assert_consumer_residue_absent "$case_dir"
   [ "$(grep -c '^private-key-created$' "$case_dir/boundary.log")" -eq 1 ] ||
     fail "consumer $name did not materialize a private key"
