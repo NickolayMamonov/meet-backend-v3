@@ -1012,7 +1012,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  effective_args+=("$arg")' \
   '  [[ "$arg" == *"@"* ]] && destination_seen=true' \
   'done' \
-  '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
+  '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" </dev/null >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
   'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-user\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
   'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-host\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
   'grep -Fxq "port $PORT" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-port\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
