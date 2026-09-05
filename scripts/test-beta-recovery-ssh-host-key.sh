@@ -833,6 +833,8 @@ chmod 600 "$token_oracle"
   fail "consumer token oracle is not mode 0600"
 export BETA_RECOVERY_TOKEN_ORACLE="$token_oracle"
 export BETA_RECOVERY_REAL_OD="$real_od"
+export SUDO_UID="$(id -u)"
+export SUDO_GID="$(id -g)"
 
 write_wrapper "$consumer_bin/ssh-keyscan" \
   '#!/usr/bin/env bash' \
