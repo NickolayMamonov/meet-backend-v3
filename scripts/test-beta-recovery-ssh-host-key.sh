@@ -1012,6 +1012,19 @@ write_wrapper "$consumer_bin/ssh" \
   '  effective_args+=("$arg")' \
   '  [[ "$arg" == *"@"* ]] && destination_seen=true' \
   'done' \
+  'command_start=-1' \
+  'for ((i=0; i<${#args[@]}; i++)); do' \
+  '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
+  'done' \
+  'frame_input=' \
+  'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
+  '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -c ] &&' \
+  '  [ "${args[command_start+3]:-}" = '\''exec bash <(printf "%s" "$1" | base64 --decode)'\'' ] &&' \
+  '  [ "${args[command_start+4]:-}" = -- ] && [ -n "${args[command_start+5]:-}" ]; then' \
+  '  frame_input=$(mktemp)' \
+  '  cat >"$frame_input"' \
+  '  exec <"$frame_input"' \
+  'fi' \
   '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" </dev/null >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
   'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-user\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
   'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-host\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
@@ -1032,7 +1045,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  remote_state=${BETA_RECOVERY_REMOTE_STATE:?}' \
   '  static_program="$BETA_RECOVERY_REMOTE_STATE.static.$BASHPID"' \
   '  frame_dir=' \
-  '  trap '\''status=$?; rm -f -- "$static_program"; [ -z "$frame_dir" ] || rm -rf -- "$frame_dir"; exit "$status"'\'' EXIT' \
+  '  trap '\''status=$?; rm -f -- "$static_program" "$frame_input"; [ -z "$frame_dir" ] || rm -rf -- "$frame_dir"; exit "$status"'\'' EXIT' \
   '  frame_dir=$(mktemp -d)' \
   '  base64 --decode <<<"${args[command_start+5]}" >"$static_program"' \
   '  if grep -Fq "meet-backend/beta-recovery-create/v1" "$static_program"; then' \
