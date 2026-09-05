@@ -49,7 +49,7 @@ jq -n --arg digest "sha256:$ROOT_DIGEST" '
 ' >"$LAYOUT/index.json"
 jq -n '
   {
-    schema:"meet-backend/test-promotion-protected-state/v1",
+    schema:"meet-backend/test-promotion-protected-state/v2",
     protected:{subjectDigests:[
       "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
     ]}
@@ -62,7 +62,7 @@ jq -e '.protectedSubjectsExcluded == true and .rootDigest == ("sha256:" + $root)
 
 jq -n --arg root "sha256:$ROOT_DIGEST" '
   {
-    schema:"meet-backend/test-promotion-protected-state/v1",
+    schema:"meet-backend/test-promotion-protected-state/v2",
     protected:{subjectDigests:[$root]}
   }
 ' >"$TMP/collision.json"
