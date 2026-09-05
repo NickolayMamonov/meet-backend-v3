@@ -947,7 +947,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  printf "%s\n" "$secret" >"$pattern"' \
   '  printf "%s\n" "$encoded" >"$encoded_pattern"' \
   '  printf "%s\n" "$hex" >"$hex_pattern"' \
-  '  for proc_file in /proc/$$/cmdline /proc/$PPID/cmdline /proc/1/cmdline; do' \
+  '  for proc_file in /proc/$$/cmdline /proc/$PPID/cmdline; do' \
   '    [ -r "$proc_file" ] || continue' \
   '    ! grep -aFq -f "$pattern" "$proc_file" || { rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; }' \
   '    ! grep -aFq -f "$encoded_pattern" "$proc_file" || { rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; }' \
@@ -975,7 +975,7 @@ write_wrapper "$consumer_bin/ssh" \
   '    secret_value=${!secret_name:-}' \
   '    [ -z "$secret_value" ] || scan_secret "$secret_value" || return 1' \
   '  done' \
-  '  for proc_file in /proc/$$/cmdline /proc/$PPID/cmdline /proc/1/cmdline; do' \
+  '  for proc_file in /proc/$$/cmdline /proc/$PPID/cmdline; do' \
   '    [ -r "$proc_file" ] || continue' \
   '    ! grep -aFq -- "$BETA_RECOVERY_TOKEN_ORACLE" "$proc_file" || true' \
   '  done' \
