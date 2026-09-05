@@ -1124,15 +1124,15 @@ write_wrapper "$consumer_bin/ssh" \
   '      printf "framed-receive-stage-owner\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; if [ "$(<"$remote_state/.meet-beta-recovery-owner")" = "meet-backend/beta-recovery-owner/v1:$token" ]; then printf "framed-receive-owner-match\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else printf "framed-receive-owner-mismatch\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
   '      owner_uid=${SUDO_UID:-$(id -u)}; owner_gid=${SUDO_GID:-$(id -g)}' \
   '      actual_identity=$(stat -Lc "%d:%i" "$remote_state"); if [ "$remote_identity" = 1:1 ] || [ "$actual_identity" = "$remote_identity" ]; then printf "framed-receive-identity-match\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else printf "framed-receive-identity-mismatch\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
-  '      target="$remote_state/$name"; [ ! -e "$target" ] && [ ! -L "$target" ]' \
-  '      payload="$frame_dir/payload"; install -m 600 /dev/null "$payload"' \
-  '      dd iflag=fullblock bs=1 count="$((expected_length + 1))" status=none of="$payload"' \
-  '      [ "$(stat -c "%s" "$payload")" -eq "$expected_length" ]' \
-  '      [ "$(sha256sum "$payload" | awk "{print \$1}")" = "$expected_sha" ]' \
-  '      chmod "$expected_mode" -- "$payload"; temp_identity=$(stat -Lc "%d:%i" "$payload")' \
-  '      ln -T -- "$payload" "$target"; rm -f -- "$payload"' \
-  '      [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c "%h" "$target")" -eq 1 ]' \
-  '      [ "$(stat -c "%a:%u:%g:%h" "$target")" = "$expected_mode:$owner_uid:$owner_gid:1" ]' \
+  '      printf "framed-receive-stage-target\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; target="$remote_state/$name"; [ ! -e "$target" ] && [ ! -L "$target" ]' \
+  '      printf "framed-receive-stage-payload\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; payload="$frame_dir/payload"; install -m 600 /dev/null "$payload"' \
+  '      printf "framed-receive-stage-read\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; dd iflag=fullblock bs=1 count="$((expected_length + 1))" status=none of="$payload"' \
+  '      printf "framed-receive-stage-size\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(stat -c "%s" "$payload")" -eq "$expected_length" ]' \
+  '      printf "framed-receive-stage-sha\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(sha256sum "$payload" | awk "{print \$1}")" = "$expected_sha" ]' \
+  '      printf "framed-receive-stage-chmod\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; chmod "$expected_mode" -- "$payload"; temp_identity=$(stat -Lc "%d:%i" "$payload")' \
+  '      printf "framed-receive-stage-link\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; ln -T -- "$payload" "$target"; rm -f -- "$payload"' \
+  '      printf "framed-receive-stage-type\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c "%h" "$target")" -eq 1 ]' \
+  '      printf "framed-receive-stage-mode\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(stat -c "%a:%u:%g:%h" "$target")" = "$expected_mode:$owner_uid:$owner_gid:1" ]' \
   '      printf "remote-receive\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '      if [ "${BETA_RECOVERY_REPLACE_AFTER_LINK:-0}" = 1 ]; then' \
   '        replacement="$frame_dir/replacement"; cp -- "$target" "$replacement"; chmod "$expected_mode" -- "$replacement"; rm -f -- "$target"; mv -T -- "$replacement" "$target"' \
