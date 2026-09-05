@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.4.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.3.0...v1.4.0) (2026-09-05)
+
+
+### Features
+
+* prove beta backup restore ([47ab2ef](https://github.com/NickolayMamonov/meet-backend-v3/commit/47ab2efbe26dfb2e77040e2b7ff605a174219a4d))
+* prove beta backup restore ([66f2882](https://github.com/NickolayMamonov/meet-backend-v3/commit/66f2882fbaf076a9ad9d1fdc854b5bff6c772eb0))
+
+
+### Fixes
+
+* bind restore capacity and authority contracts ([1df09d0](https://github.com/NickolayMamonov/meet-backend-v3/commit/1df09d0e8787bf68d29b29595c704fdac7925a03))
+* close beta recovery rework blockers ([f7dd646](https://github.com/NickolayMamonov/meet-backend-v3/commit/f7dd646f0b2813ad1cd2a7a67fa4519d3c0abb3d))
+* close beta recovery rework blockers ([b763d01](https://github.com/NickolayMamonov/meet-backend-v3/commit/b763d01dc13044bb33e145f7b27797de986a9b25))
+* close beta recovery rework gaps ([64dbbd1](https://github.com/NickolayMamonov/meet-backend-v3/commit/64dbbd16995a89f2baf245f8b567b955d656a855))
+* close beta recovery rework gaps ([589190d](https://github.com/NickolayMamonov/meet-backend-v3/commit/589190d44be03fd81e2a5ecb4d7fa598523dbe99))
+* close beta recovery security gaps ([950a35b](https://github.com/NickolayMamonov/meet-backend-v3/commit/950a35b30d3fe1c61f59c900acdacd853f7af380))
+* close recovery journal and residue gaps ([a40f26a](https://github.com/NickolayMamonov/meet-backend-v3/commit/a40f26a8eb13743847bc7c83299f477edc1c9264))
+* close release publication races ([65b4f4f](https://github.com/NickolayMamonov/meet-backend-v3/commit/65b4f4f31623cf126544663e9800fa8fb7a57ac0))
+* gate recovery evidence on final cleanup ([17e7cf1](https://github.com/NickolayMamonov/meet-backend-v3/commit/17e7cf1921a84557fb10e6a31c8f4451472268d3))
+* harden beta backup restore proof ([8fd02e3](https://github.com/NickolayMamonov/meet-backend-v3/commit/8fd02e399ba1762f4b148551d39d83c63fc8074e))
+* harden v1.3.0 release recovery ([af499d1](https://github.com/NickolayMamonov/meet-backend-v3/commit/af499d160718dcd285c9e419e21da6066ea0afc6))
+* recover exact v1.3.0 release draft ([79263bf](https://github.com/NickolayMamonov/meet-backend-v3/commit/79263bfed6427dc1a45900e338805c52dbd5f59d))
+* recover exact v1.3.0 release draft ([25adf8f](https://github.com/NickolayMamonov/meet-backend-v3/commit/25adf8f0d481ede59fa30d1a03f67168a4c8f9cb))
+* **recovery:** close cleanup admission race ([7185e3b](https://github.com/NickolayMamonov/meet-backend-v3/commit/7185e3bf74f17a0ebbdbc8fd63317389e28c8b85))
+* rework beta recovery proof gates ([c5fa114](https://github.com/NickolayMamonov/meet-backend-v3/commit/c5fa1140dd8cc14dc2e03b06a0422c25e3017e7d))
+* satisfy shellcheck for recovery authorization ([8a3e17d](https://github.com/NickolayMamonov/meet-backend-v3/commit/8a3e17d0ecfd4d901cc1e276a8b94028495a252b))
+* tolerate artifact retention rounding ([bbaec8b](https://github.com/NickolayMamonov/meet-backend-v3/commit/bbaec8b7ae60794cf1e0ebfa2ec2a5f1db3f5dbc))
+* tolerate artifact retention rounding ([f29ceec](https://github.com/NickolayMamonov/meet-backend-v3/commit/f29ceec9a7e17539c80169ebe185d501dd246146))
+
 ## [1.3.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.2.0...v1.3.0) (2026-08-23)
 
 
