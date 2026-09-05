@@ -1115,6 +1115,7 @@ write_wrapper "$consumer_bin/ssh" \
   '      [ "${#fields[@]}" -eq 8 ] && [ "${fields[0]}" = meet-backend/beta-recovery-file/v1 ]' \
   '      remote=${fields[1]}; remote_identity=${fields[2]}; frame_token=${fields[3]}' \
   '      name=${fields[4]}; expected_sha=${fields[5]}; expected_mode=${fields[6]}; expected_length=${fields[7]}' \
+  '      printf "framed-receive-fields-%s-meta-%s-%s-%s\n" "${#fields[@]}" "$name" "$expected_mode" "$expected_length" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '      [[ "$frame_token" = "$token" && "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]' \
   '      [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$expected_length" =~ ^[0-9]+$ ]]' \
   '      case "$name" in run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|age|age-recipient) ;; *) exit 1 ;; esac' \
