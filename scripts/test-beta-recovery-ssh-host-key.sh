@@ -1116,12 +1116,12 @@ write_wrapper "$consumer_bin/ssh" \
   '      remote=${fields[1]}; remote_identity=${fields[2]}; frame_token=${fields[3]}' \
   '      name=${fields[4]}; expected_sha=${fields[5]}; expected_mode=${fields[6]}; expected_length=${fields[7]}' \
   '      printf "framed-receive-fields-%s-meta-%s-%s-%s\n" "${#fields[@]}" "$name" "$expected_mode" "$expected_length" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  '      [[ "$frame_token" = "$token" && "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]' \
-  '      [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$expected_length" =~ ^[0-9]+$ ]]' \
-  '      case "$name" in run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|age|age-recipient) ;; *) exit 1 ;; esac' \
-  '      (( expected_length > 0 && expected_length <= 9223372036854775806 ))' \
-  '      [ -d "$remote_state" ] && [ -f "$remote_state/.meet-beta-recovery-owner" ]' \
-  '      [ "$(<"$remote_state/.meet-beta-recovery-owner")" = "meet-backend/beta-recovery-owner/v1:$token" ]' \
+  '      printf "framed-receive-stage-token\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [[ "$frame_token" = "$token" && "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]' \
+  '      printf "framed-receive-stage-format\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$expected_length" =~ ^[0-9]+$ ]]' \
+  '      printf "framed-receive-stage-name\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; case "$name" in run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|age|age-recipient) ;; *) exit 1 ;; esac' \
+  '      printf "framed-receive-stage-length\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; (( expected_length > 0 && expected_length <= 9223372036854775806 ))' \
+  '      printf "framed-receive-stage-root\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ -d "$remote_state" ] && [ -f "$remote_state/.meet-beta-recovery-owner" ]' \
+  '      printf "framed-receive-stage-owner\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(<"$remote_state/.meet-beta-recovery-owner")" = "meet-backend/beta-recovery-owner/v1:$token" ]' \
   '      owner_uid=${SUDO_UID:-$(id -u)}; owner_gid=${SUDO_GID:-$(id -g)}' \
   '      [ "$remote_identity" = 1:1 ] || [ "$(stat -Lc "%d:%i" "$remote_state")" = "$remote_identity" ]' \
   '      target="$remote_state/$name"; [ ! -e "$target" ] && [ ! -L "$target" ]' \
