@@ -1082,6 +1082,7 @@ write_wrapper "$consumer_bin/ssh" \
   '        chmod 600 -- "$remote_state/.meet-beta-recovery-owner"' \
   '      fi' \
   '      [ "${BETA_RECOVERY_CREATE_MODE:-}" != ambiguous ] || { printf "remote-create-ambiguous\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 47; }' \
+  '      if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi' \
   '      exit 0 ;;' \
   '    receive)' \
   '      [ "${#fields[@]}" -eq 8 ] && [ "${fields[0]}" = meet-backend/beta-recovery-file/v1 ]' \
