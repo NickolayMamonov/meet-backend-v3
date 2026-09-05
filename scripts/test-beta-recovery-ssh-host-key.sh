@@ -1023,6 +1023,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  [ "${args[command_start+4]:-}" = -- ] && [ -n "${args[command_start+5]:-}" ]; then' \
   '  frame_input=$(mktemp)' \
   '  cat >"$frame_input"' \
+  '  printf "framed-input-size-%s\n" "$(stat -c "%s" "$frame_input")" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '  exec <"$frame_input"' \
   'fi' \
   '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" </dev/null >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
