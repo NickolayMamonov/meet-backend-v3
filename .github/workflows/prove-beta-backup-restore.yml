@@ -156,14 +156,22 @@ jobs:
           trap cleanup_parser_and_eof_probe EXIT HUP INT TERM
           read_frame() {
             local prefix_file="$scratch/prefix" header_file="$scratch/header"
-            local header_body="$scratch/header-body" prefix_hex header_hex
+            local header_body="$scratch/header-body" prefix_hex prefix_text header_hex
             local header_length byte byte_value i
             install -m 600 /dev/null "$prefix_file"
             dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
             [ "$(stat -c '%s' -- "$prefix_file")" -eq 8 ]
             prefix_hex=$(od -An -v -tx1 "$prefix_file" | tr -d '[:space:]')
-            [ "${#prefix_hex}" -eq 16 ] && [[ "$prefix_hex" =~ ^[0-9a-f]{16}$ ]]
-            header_length=$((16#$prefix_hex))
+            [ "${#prefix_hex}" -eq 16 ]
+            for ((i=0; i<${#prefix_hex}; i+=2)); do
+              byte=${prefix_hex:i:2}
+              byte_value=$((16#$byte))
+              (( (byte_value >= 48 && byte_value <= 57) ||
+                 (byte_value >= 97 && byte_value <= 102) ))
+            done
+            prefix_text=$(head -c 8 "$prefix_file")
+            [[ "$prefix_text" =~ ^[0-9a-f]{8}$ ]]
+            header_length=$((16#$prefix_text))
             (( header_length >= 1 && header_length <= 4096 ))
             install -m 600 /dev/null "$header_file"
             dd iflag=fullblock bs=1 count="$header_length" status=none of="$header_file"
@@ -250,14 +258,22 @@ jobs:
           trap cleanup_receiver EXIT HUP INT TERM
           read_frame() {
             local prefix_file="$scratch/prefix" header_file="$scratch/header"
-            local header_body="$scratch/header-body" prefix_hex header_hex
+            local header_body="$scratch/header-body" prefix_hex prefix_text header_hex
             local header_length byte byte_value i
             install -m 600 /dev/null "$prefix_file"
             dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
             [ "$(stat -c '%s' -- "$prefix_file")" -eq 8 ]
             prefix_hex=$(od -An -v -tx1 "$prefix_file" | tr -d '[:space:]')
-            [ "${#prefix_hex}" -eq 16 ] && [[ "$prefix_hex" =~ ^[0-9a-f]{16}$ ]]
-            header_length=$((16#$prefix_hex))
+            [ "${#prefix_hex}" -eq 16 ]
+            for ((i=0; i<${#prefix_hex}; i+=2)); do
+              byte=${prefix_hex:i:2}
+              byte_value=$((16#$byte))
+              (( (byte_value >= 48 && byte_value <= 57) ||
+                 (byte_value >= 97 && byte_value <= 102) ))
+            done
+            prefix_text=$(head -c 8 "$prefix_file")
+            [[ "$prefix_text" =~ ^[0-9a-f]{8}$ ]]
+            header_length=$((16#$prefix_text))
             (( header_length >= 1 && header_length <= 4096 ))
             install -m 600 /dev/null "$header_file"
             dd iflag=fullblock bs=1 count="$header_length" status=none of="$header_file"
@@ -354,8 +370,16 @@ jobs:
           dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
           [ "$(stat -c '%s' -- "$prefix_file")" -eq 8 ]
           prefix_hex=$(od -An -v -tx1 "$prefix_file" | tr -d '[:space:]')
-          [ "${#prefix_hex}" -eq 16 ] && [[ "$prefix_hex" =~ ^[0-9a-f]{16}$ ]]
-          header_length=$((16#$prefix_hex))
+          [ "${#prefix_hex}" -eq 16 ]
+          for ((i=0; i<${#prefix_hex}; i+=2)); do
+            byte=${prefix_hex:i:2}
+            byte_value=$((16#$byte))
+            (( (byte_value >= 48 && byte_value <= 57) ||
+               (byte_value >= 97 && byte_value <= 102) ))
+          done
+          prefix_text=$(head -c 8 "$prefix_file")
+          [[ "$prefix_text" =~ ^[0-9a-f]{8}$ ]]
+          header_length=$((16#$prefix_text))
           (( header_length >= 1 && header_length <= 4096 ))
           install -m 600 /dev/null "$header_file"
           dd iflag=fullblock bs=1 count="$header_length" status=none of="$header_file"

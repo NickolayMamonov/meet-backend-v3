@@ -1060,13 +1060,19 @@ write_wrapper "$consumer_bin/ssh" \
   '  fi' \
   '  read_frame() {' \
   '    local prefix="$frame_dir/prefix" header_file="$frame_dir/header"' \
-  '    local prefix_hex header_hex header_length byte byte_value i' \
+  '    local prefix_hex prefix_text header_hex header_length byte byte_value i' \
   '    install -m 600 /dev/null "$prefix"' \
   '    dd iflag=fullblock bs=1 count=8 status=none of="$prefix"' \
   '    [ "$(stat -c "%s" "$prefix")" -eq 8 ]' \
   '    prefix_hex=$(od -An -v -tx1 "$prefix" | tr -d "[:space:]")' \
-  '    [ "${#prefix_hex}" -eq 16 ] && [[ "$prefix_hex" =~ ^[0-9a-f]{16}$ ]]' \
-  '    header_length=$((16#$prefix_hex))' \
+  '    [ "${#prefix_hex}" -eq 16 ]' \
+  '    for ((i=0; i<${#prefix_hex}; i+=2)); do' \
+  '      byte=${prefix_hex:i:2}; byte_value=$((16#$byte))' \
+  '      (( (byte_value >= 48 && byte_value <= 57) || (byte_value >= 97 && byte_value <= 102) ))' \
+  '    done' \
+  '    prefix_text=$(head -c 8 "$prefix")' \
+  '    [[ "$prefix_text" =~ ^[0-9a-f]{8}$ ]]' \
+  '    header_length=$((16#$prefix_text))' \
   '    (( header_length >= 1 && header_length <= 4096 ))' \
   '    install -m 600 /dev/null "$header_file"' \
   '    dd iflag=fullblock bs=1 count="$header_length" status=none of="$header_file"' \
