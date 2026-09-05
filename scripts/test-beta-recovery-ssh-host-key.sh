@@ -832,6 +832,7 @@ chmod 600 "$token_oracle"
 [ "$(stat -c '%a' -- "$token_oracle")" = 600 ] ||
   fail "consumer token oracle is not mode 0600"
 export BETA_RECOVERY_TOKEN_ORACLE="$token_oracle"
+export BETA_RECOVERY_REAL_OD="$real_od"
 
 write_wrapper "$consumer_bin/ssh-keyscan" \
   '#!/usr/bin/env bash' \
