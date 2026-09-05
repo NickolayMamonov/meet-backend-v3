@@ -1077,7 +1077,8 @@ write_wrapper "$consumer_bin/ssh" \
   '      [[ "$frame_token" = "$token" ]] || { printf "framed-token-mismatch\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; }' \
   '      probe="$frame_dir/eof-probe"; install -m 600 /dev/null "$probe"' \
   '      dd iflag=fullblock bs=1 count=1 status=none of="$probe"' \
-  '      test ! -s "$probe" || { printf "framed-create-eof-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; }' \
+  '      probe_size=$(stat -c "%s" "$probe"); printf "framed-create-eof-size-%s\n" "$probe_size" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '      test "$probe_size" -eq 0 || { printf "framed-create-eof-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; }' \
   '      printf "remote-create\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '      if [ -e "$remote_state" ] || [ -L "$remote_state" ]; then' \
   '        [ -d "$remote_state" ] && [ ! -L "$remote_state" ]' \
@@ -1590,6 +1591,7 @@ direct_frame_case() {
   else
     : >"$suffix_file"
   fi
+  printf 'direct-input-suffix-size=%s\n' "$(stat -c '%s' "$suffix_file")" >"$case_dir/input.log"
   printf '%s' "$program" | base64 --wrap=0 >"$case_dir/program.b64"
   frame_stdin() {
     printf '%s' "$prefix"
