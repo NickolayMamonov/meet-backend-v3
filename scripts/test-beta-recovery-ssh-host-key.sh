@@ -1725,7 +1725,7 @@ printf -v binary_header \
   'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s\n' \
   "$direct_remote" "$binary_identity" "$direct_token" "$binary_sha" "$binary_length"
 direct_frame_case binary-payload receive "$binary_header" '' \
-  "$binary_case/source/payload"
+  "$binary_case/source/payload" "$binary_remote"
 binary_case_root=$consumer_root/cases/direct-frame-binary-payload
 if [ "$(<"$binary_case/status")" -ne 0 ]; then
   printf 'consumer binary-payload direct-frame events (status=%s):\n' \
@@ -1755,7 +1755,8 @@ large_identity=$(stat -Lc '%d:%i' "$large_case/remote-root")
 printf -v large_header \
   'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s\n' \
   "$direct_remote" "$large_identity" "$direct_token" "$large_sha" "$large_length"
-direct_frame_case arg-max-payload receive "$large_header" '' "$large_payload"
+direct_frame_case arg-max-payload receive "$large_header" '' \
+  "$large_payload" "$large_case/remote-root"
 [ "$(<"$large_case/status")" -eq 0 ] ||
   fail "ARG_MAX-sized payload receive failed"
 cmp "$large_payload" "$large_case/remote-root/age" ||
