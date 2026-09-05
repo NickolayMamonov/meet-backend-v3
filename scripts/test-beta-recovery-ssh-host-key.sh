@@ -1537,7 +1537,7 @@ assert_framed_runtime_contract() {
     fail "framed cleanup invocation is missing"
   grep -Fq 'remote staging publication identity changed' "$workflow_file" ||
     fail "publication identity diagnostic contract is missing"
-  grep -Fq 'scan_entry "$@"' "$BASH_SOURCE" ||
+  grep -Fq 'scan_entry "$@"' "${BASH_SOURCE[0]}" ||
     fail "fake SSH entry scan contract is missing"
 }
 
