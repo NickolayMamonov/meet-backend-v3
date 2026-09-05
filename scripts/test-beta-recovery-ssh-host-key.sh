@@ -1067,16 +1067,17 @@ write_wrapper "$consumer_bin/ssh" \
   '    header=$(head -c "$((header_length - 1))" "$header_file")' \
   '    IFS="|" read -r -a fields <<<"$header"' \
   '  }' \
-  '  read_frame' \
+  '  if ! read_frame; then printf "framed-read-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
+  '  printf "framed-read-ok\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '  token=$(<"${BETA_RECOVERY_TOKEN_ORACLE:?}")' \
   '  case "$operation" in' \
   '    create)' \
   '      [ "${#fields[@]}" -eq 3 ] && [ "${fields[0]}" = meet-backend/beta-recovery-create/v1 ]' \
   '      remote=${fields[1]}; frame_token=${fields[2]}' \
-  '      [[ "$frame_token" = "$token" ]]' \
+  '      [[ "$frame_token" = "$token" ]] || { printf "framed-token-mismatch\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; }' \
   '      probe="$frame_dir/eof-probe"; install -m 600 /dev/null "$probe"' \
   '      dd iflag=fullblock bs=1 count=1 status=none of="$probe"' \
-  '      test ! -s "$probe"' \
+  '      test ! -s "$probe" || { printf "framed-create-eof-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; }' \
   '      printf "remote-create\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '      if [ -e "$remote_state" ] || [ -L "$remote_state" ]; then' \
   '        [ -d "$remote_state" ] && [ ! -L "$remote_state" ]' \
