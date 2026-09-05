@@ -1130,7 +1130,7 @@ write_wrapper "$consumer_bin/ssh" \
   '      printf "framed-receive-stage-size\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(stat -c "%s" "$payload")" -eq "$expected_length" ]' \
   '      printf "framed-receive-stage-sha\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(sha256sum "$payload" | awk "{print \$1}")" = "$expected_sha" ]' \
   '      printf "framed-receive-stage-chmod\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; chmod "$expected_mode" -- "$payload"; temp_identity=$(stat -Lc "%d:%i" "$payload")' \
-  '      printf "framed-receive-stage-link\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; ln -T -- "$payload" "$target"; rm -f -- "$payload"' \
+  '      printf "framed-receive-stage-link\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; if ln -T -- "$payload" "$target"; then printf "framed-receive-link-ok\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else printf "framed-receive-link-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi; if rm -f -- "$payload"; then printf "framed-receive-rm-ok\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else printf "framed-receive-rm-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
   '      printf "framed-receive-stage-type\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c "%h" "$target")" -eq 1 ]' \
   '      printf "framed-receive-stage-mode\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(stat -c "%a:%u:%g:%h" "$target")" = "$expected_mode:$owner_uid:$owner_gid:1" ]' \
   '      printf "remote-receive\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
