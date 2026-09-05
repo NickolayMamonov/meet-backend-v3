@@ -398,6 +398,7 @@ run_remote_body() {
       BETA_SEMANTIC_RECEIVER_GO="$mutation_go" \
       BETA_SEMANTIC_RECEIVER_DONE="$mutation_done" \
       BETA_SEMANTIC_MUTATION_FINISH="$mutation_finish" \
+      BETA_SEMANTIC_FIND_COUNTER="${BETA_SEMANTIC_FIND_COUNTER:-}" \
       bash -s -- "$@"
   else
     remote_env=("PATH=$PATH")
@@ -406,7 +407,8 @@ run_remote_body() {
       FAKE_DATABASE_DUMP FAKE_UPLOADS_ARCHIVE FAKE_MEDIA_REFERENCE POSTGRES_IMAGE \
       BETA_SEMANTIC_MUTATION BETA_SEMANTIC_RECEIVER_READY \
       BETA_SEMANTIC_RECEIVER_GO BETA_SEMANTIC_RECEIVER_DONE \
-      BETA_SEMANTIC_FIND_COUNTER BETA_SEMANTIC_REMOTE_PATH \
+      BETA_SEMANTIC_MUTATION_FINISH BETA_SEMANTIC_FIND_COUNTER \
+      BETA_SEMANTIC_REMOTE_PATH \
       BETA_SEMANTIC_SECURE_PATH; do
       [ "${!name+x}" = x ] && remote_env+=("$name=${!name}")
     done
@@ -696,18 +698,21 @@ if [ -n "${BETA_SEMANTIC_SECURE_PATH:-}" ] &&
   counter=${BETA_SEMANTIC_FIND_COUNTER:?}
   count=0
   [ -f "$counter" ] && count=$(<"$counter")
+  [[ "$count" =~ ^[0-9]+$ ]]
   count=$((count + 1))
   printf '%s\n' "$count" >"$counter"
-  expected=1
-  [ "$mode" = cleanup-outer-marker-drift ] && expected=1
-  if [ "$count" -eq "$expected" ]; then
-    : >"${BETA_SEMANTIC_RECEIVER_READY:?}"
+  if [ "$count" -eq 2 ]; then
+    ready=${BETA_SEMANTIC_RECEIVER_READY:?}
+    go=${BETA_SEMANTIC_RECEIVER_GO:?}
+    done_file=${BETA_SEMANTIC_RECEIVER_DONE:?}
+    finish=${BETA_SEMANTIC_MUTATION_FINISH:?}
+    : >"$ready"
     for attempt in $(seq 1 500); do
       : "$attempt"
-      [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ] && break
+      [ -e "$go" ] && break
       sleep 0.01
     done
-    [ -e "${BETA_SEMANTIC_RECEIVER_GO:?}" ]
+    [ -e "$go" ]
     case "$mode" in
       cleanup-secure-marker-drift)
         secure=${BETA_SEMANTIC_SECURE_PATH:?}
@@ -724,15 +729,13 @@ if [ -n "${BETA_SEMANTIC_SECURE_PATH:-}" ] &&
         rm -f -- "$remote/.meet-beta-recovery-owner"
         printf '%s\n' foreign-outer-marker >"$remote/.meet-beta-recovery-owner" ;;
     esac
-    : >"${BETA_SEMANTIC_RECEIVER_DONE:?}"
-    if [ -n "${BETA_SEMANTIC_MUTATION_FINISH:-}" ]; then
-      for attempt in $(seq 1 500); do
-        : "$attempt"
-        [ -e "${BETA_SEMANTIC_MUTATION_FINISH:?}" ] && break
-        sleep 0.01
-      done
-      [ -e "${BETA_SEMANTIC_MUTATION_FINISH:?}" ]
-    fi
+    : >"$done_file"
+    for attempt in $(seq 1 500); do
+      : "$attempt"
+      [ -e "$finish" ] && break
+      sleep 0.01
+    done
+    [ -e "$finish" ]
   fi
 fi
 exec "$real_find" "$@"
@@ -1006,20 +1009,27 @@ foreign_digest=$(sha256sum "$fixture/foreign.json" | awk '{print $1}')
   fail "foreign state changed during the remote replacement race"
 snapshot_tree() {
   local root_path=$1 snapshot=$2 path relative metadata payload
+  snapshot_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+      "$@"
+    else
+      sudo -n "$@"
+    fi
+  }
   : >"$snapshot"
-  printf '.|%s\n' "$(stat -c '%F:%a:%u:%g:%h:%s' -- "$root_path")" >>"$snapshot"
+  printf '.|%s\n' "$(snapshot_as_root stat -c '%F:%a:%u:%g:%h:%s' -- "$root_path")" >>"$snapshot"
   while IFS= read -r -d '' path; do
     relative=${path#"$root_path"/}
-    metadata=$(stat -c '%F:%a:%u:%g:%h:%s' -- "$path")
-    if [ -L "$path" ]; then
-      payload="link:$(readlink -- "$path")"
-    elif [ -f "$path" ]; then
-      payload="sha:$(sha256sum -- "$path" | awk '{print $1}')"
+    metadata=$(snapshot_as_root stat -c '%F:%a:%u:%g:%h:%s' -- "$path")
+    if [ "$(snapshot_as_root stat -c '%F' -- "$path")" = "symbolic link" ]; then
+      payload="link:$(snapshot_as_root readlink -- "$path")"
+    elif [ "$(snapshot_as_root stat -c '%F' -- "$path")" = "regular file" ]; then
+      payload="sha:$(snapshot_as_root sha256sum -- "$path" | awk '{print $1}')"
     else
       payload=directory
     fi
     printf '%s|%s|%s\n' "$relative" "$metadata" "$payload" >>"$snapshot"
-  done < <(find "$root_path" -mindepth 1 -print0 | sort -z)
+  done < <(snapshot_as_root find "$root_path" -mindepth 1 -print0 | sort -z)
 }
 remote_failure() {
   local mutation=$1 output remote_path original_snapshot expected_snapshot
@@ -1088,6 +1098,8 @@ receiver_failure() {
   mkdir -p -- "$runner"
   chmod 700 -- "$case_dir" "$runner"
   : >"$case_dir/events.log"
+  printf '0\n' >"$case_dir/find.count"
+  chmod 600 -- "$case_dir/find.count"
   (
     export BETA_SEMANTIC_MUTATION="$mutation"
     export BETA_SEMANTIC_RECEIVER_READY="$ready"
@@ -1116,13 +1128,29 @@ receiver_failure() {
   done
   [ -e "$done_file" ] || fail "receiver mutation did not complete: $mutation"
   if [[ "$mutation" = cleanup-* ]]; then
+    if [[ "$mutation" = cleanup-secure-marker-drift ||
+      "$mutation" = cleanup-secure-directory-drift ||
+      "$mutation" = cleanup-outer-marker-drift ]]; then
+      [ -f "$case_dir/find.count" ] ||
+        fail "receiver cleanup did not publish a find counter: $mutation"
+      [ "$(cat "$case_dir/find.count")" = 2 ] ||
+        fail "receiver cleanup did not synchronize at counted find 2: $mutation"
+      kill -0 "$pid" 2>/dev/null ||
+        fail "receiver continued past the cleanup mutation before finish: $mutation"
+      [ "$(cat "$case_dir/find.count")" = 2 ] ||
+        fail "receiver cleanup advanced past counted find 2 before finish: $mutation"
+    fi
     snapshot_tree "$remote" "$case_dir/remote.expected"
-    if [ -e "$secure" ] || [ -L "$secure" ]; then
-      snapshot_tree "$secure" "$case_dir/secure.expected"
-    fi
-    if [ -e "$secure.foreign" ] || [ -L "$secure.foreign" ]; then
-      snapshot_tree "$secure.foreign" "$case_dir/secure-foreign.expected"
-    fi
+    case "$mutation" in
+      cleanup-secure-marker-drift)
+        snapshot_tree "$secure" "$case_dir/secure.expected" ;;
+      cleanup-secure-directory-drift)
+        snapshot_tree "$secure" "$case_dir/secure.expected"
+        snapshot_tree "$secure.foreign" "$case_dir/secure-foreign.expected" ;;
+      cleanup-outer-marker-drift)
+        [ -e "$secure" ] || [ -L "$secure" ] ||
+          fail "outer marker mutation removed secure state before finish" ;;
+    esac
     : >"$finish"
   fi
   if wait "$pid"; then
@@ -1131,18 +1159,31 @@ receiver_failure() {
   [ ! -e "$output" ] && [ ! -L "$output" ] ||
     fail "receiver mutation published output: $mutation"
   if [[ "$mutation" = cleanup-* ]]; then
+    case "$mutation" in
+      cleanup-secure-marker-drift|cleanup-secure-directory-drift)
+        [ "$(cat "$case_dir/find.count")" = 2 ] ||
+          fail "secure cleanup mutation reached an unexpected find count: $mutation" ;;
+      cleanup-outer-marker-drift)
+        [ "$(cat "$case_dir/find.count")" = 3 ] ||
+          fail "outer marker cleanup mutation reached an unexpected find count: $mutation" ;;
+    esac
     snapshot_tree "$remote" "$case_dir/remote.after"
     cmp -- "$case_dir/remote.expected" "$case_dir/remote.after" ||
       fail "cleanup mutation changed remote survivor: $mutation"
-    if [ -e "$case_dir/secure.expected" ]; then
+    if [ "$mutation" = cleanup-secure-marker-drift ] ||
+      [ "$mutation" = cleanup-secure-directory-drift ]; then
       snapshot_tree "$secure" "$case_dir/secure.after"
       cmp -- "$case_dir/secure.expected" "$case_dir/secure.after" ||
         fail "cleanup mutation changed secure survivor: $mutation"
     fi
-    if [ -e "$case_dir/secure-foreign.expected" ]; then
+    if [ "$mutation" = cleanup-secure-directory-drift ]; then
       snapshot_tree "$secure.foreign" "$case_dir/secure-foreign.after"
       cmp -- "$case_dir/secure-foreign.expected" "$case_dir/secure-foreign.after" ||
         fail "cleanup mutation changed foreign secure survivor: $mutation"
+    fi
+    if [ "$mutation" = cleanup-outer-marker-drift ]; then
+      [ ! -e "$secure" ] && [ ! -L "$secure" ] ||
+        fail "outer marker cleanup left authenticated secure state: $mutation"
     fi
   else
     [ ! -e "$remote" ] && [ ! -L "$remote" ] ||

@@ -252,6 +252,7 @@ secure="/tmp/beta-recovery-probe-secure-$token"
 expected=$(mktemp)
 trap 'rm -f -- "$expected"' EXIT HUP INT TERM
 secure_marker="$secure/.meet-beta-recovery-secure"
+marker_fd=
 printf '%s\n' "$marker_value" >"$expected"
 remove_secure() {
   local secure_identity secure_fd secure_marker_identity secure_marker_metadata entry name
@@ -310,6 +311,25 @@ done < <(find -H "/proc/$$/fd/$remote_fd" -mindepth 1 -maxdepth 1 -print0)
 cmp -- "$expected" "$marker" >/dev/null
 remove_secure
 [ "$(stat -c '%d:%i' -- "$remote")" = "$remote_identity" ]
+[ -d "$remote" ] && [ ! -L "$remote" ]
+[ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]
+[ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
+[ "$(stat -Lc '%a:%u:%g' -- "/proc/$$/fd/$remote_fd")" = "700:$owner_uid:$owner_gid" ]
+[ -f "$marker" ] && [ ! -L "$marker" ]
+[ "$(stat -c '%d:%i' -- "$marker")" = "$marker_identity" ]
+[ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "$marker_metadata" ]
+exec {marker_fd}<"/proc/$$/fd/$remote_fd/.meet-beta-recovery-owner"
+[ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$marker_fd")" = "$marker_identity" ]
+[ "$(stat -Lc '%a:%u:%g:%h' -- "/proc/$$/fd/$marker_fd")" = "$marker_metadata" ]
+cmp -- "$expected" "/proc/$$/fd/$marker_fd" >/dev/null
+exec {marker_fd}<&-
+while IFS= read -r -d '' entry; do
+  name=${entry##*/}
+  case "$name" in
+    .meet-beta-recovery-owner) ;;
+    *) exit 1 ;;
+  esac
+done < <(find -H "/proc/$$/fd/$remote_fd" -mindepth 1 -maxdepth 1 -print0)
 find -H "/proc/$$/fd/$remote_fd" -mindepth 1 -delete
 [ "$(stat -c '%d:%i' -- "$remote")" = "$remote_identity" ]
 rmdir -- "$remote"
