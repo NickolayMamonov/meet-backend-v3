@@ -4,34 +4,51 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 workflow=$root/.github/workflows/prove-beta-backup-restore.yml
 [ -f "$workflow" ] || exit 1
 command -v jq >/dev/null 2>&1
-grep -Fq 'workflow_dispatch:' "$workflow"
+require_literals_file() {
+  local file=$1 needles=$2
+  shift 2
+  printf -v needles '%s\034' "$@"
+  awk -v needles="$needles" '
+    BEGIN {
+      count = split(needles, required, "\034")
+      for (i = 1; i <= count; i++) found[i] = 0
+    }
+    {
+      for (i = 1; i <= count; i++)
+        if (!found[i] && index($0, required[i])) found[i] = 1
+    }
+    END {
+      for (i = 1; i <= count; i++) if (!found[i]) exit 1
+    }
+  ' "$file"
+}
+require_literals_file "$workflow" '' \
+  'workflow_dispatch:' \
+  'cancel-in-progress: false' \
+  'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' \
+  'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' \
+  'retention-days: 30' 'closed-beta-restore' 'restore-pre-probe' \
+  'restore-post-probe' 'run-beta-recovery-restore.sh' \
+  'BETA_RECOVERY_AGE_IDENTITY' 'PUBLIC_URL: https://api.whysoezzy.online' \
+  '--public-url' 'scripts/build-beta-recovery-evidence.sh validate-artifact' \
+  'scripts/build-beta-recovery-evidence.sh validate-runtime' \
+  '--temp-root "$restore_temp"' 'anonymous_volume_absent' \
+  'beta-recovery-restore-evidence-' 'beta-recovery-drill-' \
+  'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' \
+  'Revalidate source immediately before VPS access' \
+  'Revalidate source immediately before identity access' \
+  'scripts/materialize-beta-recovery-known-hosts.sh'
 if grep -Eq '^[[:space:]]+(push|pull_request|schedule):' "$workflow"; then exit 1; fi
-grep -Fq 'cancel-in-progress: false' "$workflow"
-grep -Fq 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' "$workflow"
-grep -Fq 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' "$workflow"
-grep -Fq 'retention-days: 30' "$workflow"
-grep -Fq 'closed-beta-restore' "$workflow"
-grep -Fq 'restore-pre-probe' "$workflow"
-grep -Fq 'restore-post-probe' "$workflow"
-grep -Fq 'run-beta-recovery-restore.sh' "$workflow"
-grep -Fq 'BETA_RECOVERY_AGE_IDENTITY' "$workflow"
-grep -Fq 'PUBLIC_URL: https://api.whysoezzy.online' "$workflow"
-grep -Fq -- '--public-url' "$workflow"
-grep -Fq 'scripts/build-beta-recovery-evidence.sh validate-artifact' "$workflow"
-grep -Fq 'scripts/build-beta-recovery-evidence.sh validate-runtime' "$workflow"
-grep -Fq -- '--temp-root "$restore_temp"' "$workflow"
-grep -Fq 'anonymous_volume_absent' "$workflow"
-grep -Fq 'beta-recovery-restore-evidence-' "$workflow"
-grep -Fq 'beta-recovery-drill-' "$workflow"
-grep -Fq 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' "$workflow"
-grep -Fq 'Revalidate source immediately before VPS access' "$workflow"
-grep -Fq 'Revalidate source immediately before identity access' "$workflow"
-grep -Fq 'scripts/materialize-beta-recovery-known-hosts.sh' "$workflow"
-grep -Fq 'published_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
-grep -Fq 'remove_published_output' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
-grep -Fq 'ln -T --' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
-grep -Fq 'published_output_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
-grep -Fq '[ "$published_output_identity" = "$candidate_identity" ]' \
+contains_literal_file() {
+  local needle=$1 file=$2
+  awk -v needle="$needle" 'index($0, needle) { found=1; exit } END { exit !found }' \
+    "$file"
+}
+contains_literal_file 'published_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+contains_literal_file 'remove_published_output' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+contains_literal_file 'ln -T --' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+contains_literal_file 'published_output_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
+contains_literal_file '[ "$published_output_identity" = "$candidate_identity" ]' \
   "$root/scripts/materialize-beta-recovery-known-hosts.sh"
 helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
 [ "$helper_count" -eq 1 ]
@@ -46,7 +63,8 @@ for required in \
   '-o UserKnownHostsFile="$known"' \
   '-o GlobalKnownHostsFile=/dev/null' \
   '-o KnownHostsCommand=none'; do
-  grep -Fq -- "$required" "$workflow" || grep -Fq -- "$required" "$probe_helper"
+  contains_literal_file "$required" "$workflow" ||
+    contains_literal_file "$required" "$probe_helper"
 done
 for required in \
   "trap 'cleanup_capture 129' HUP" \
@@ -55,7 +73,8 @@ for required in \
   "trap 'on_signal 129' HUP" \
   "trap 'on_signal 130' INT" \
   "trap 'on_signal 143' TERM"; do
-  grep -Fq -- "$required" "$workflow" || grep -Fq -- "$required" "$probe_helper"
+  contains_literal_file "$required" "$workflow" ||
+    contains_literal_file "$required" "$probe_helper"
 done
 grep -Fq "trap 'cleanup_capture \"\$?\"' EXIT" "$workflow"
 grep -Fq 'trap cleanup' "$probe_helper"
@@ -74,6 +93,160 @@ post_probe_block=$(awk '/restore-post-probe:/{flag=1} /evidence:/{flag=0} flag' 
 capture_job=$(awk '/^  capture:/{flag=1} /^  restore-select:/{flag=0} flag' "$workflow")
 pre_probe_job=$(awk '/^  restore-pre-probe:/{flag=1} /^  restore-isolated:/{flag=0} flag' "$workflow")
 post_probe_job=$(awk '/^  restore-post-probe:/{flag=1} /^  evidence:/{flag=0} flag' "$workflow")
+
+assert_capture_count_at_least(){
+  local label=$1 expected=$2 pattern=$3 actual
+  actual=$(grep -Fc -- "$pattern" <<<"$capture_block" || true)
+  [ "$actual" -ge "$expected" ] ||
+    { echo "$label is missing: expected at least $expected occurrences of $pattern" >&2; exit 1; }
+}
+assert_capture_regex(){
+  local label=$1 pattern=$2
+  grep -Eq -- "$pattern" <<<"$capture_block" ||
+    { echo "$label is missing" >&2; exit 1; }
+}
+extract_capture_program(){
+  local keyword=$1 marker
+  marker=$(grep -Eo "<<'[A-Za-z0-9_.-]+'" <<<"$capture_block" |
+    sed -E "s/^<<'//; s/'$//" | grep -Ei "$keyword" | head -1 || true)
+  [ -n "$marker" ] || return 1
+  awk -v marker="$marker" '
+    index($0, "<<" "'"'"'" marker "'"'"'") { active=1; next }
+    active && $0 ~ "^[[:space:]]*" marker "[[:space:]]*$" { exit }
+    active { print }
+  ' <<<"$capture_block"
+}
+assert_control_program(){
+  local label=$1 program=$2
+  [ -n "$program" ] || { echo "$label program is missing" >&2; exit 1; }
+  grep -Fq 'LC_ALL=C' <<<"$program" ||
+    { echo "$label parser does not force byte locale" >&2; exit 1; }
+  grep -Fq 'umask 077' <<<"$program" ||
+    { echo "$label parser does not set a restrictive umask" >&2; exit 1; }
+  grep -Fq 'dd iflag=fullblock bs=1 count=8 status=none' <<<"$program" ||
+    { echo "$label parser does not copy the exact eight-byte prefix" >&2; exit 1; }
+  grep -Fq 'od -An -v -tx1' <<<"$program" ||
+    { echo "$label parser does not inspect control bytes with od" >&2; exit 1; }
+  grep -Eq 'header_length.*(4096|4[[:space:]]*\\*\\*?[[:space:]]*3)' <<<"$program" ||
+    { echo "$label parser does not enforce the 4096-byte header bound" >&2; exit 1; }
+  grep -Eq 'count=.*header_length|header_length.*count=' <<<"$program" ||
+    { echo "$label parser does not copy the declared header length" >&2; exit 1; }
+  grep -Eq 'test[[:space:]]+-s|test[[:space:]]+![[:space:]]+-s|\\[[[:space:]]*!?[[:space:]]+-s' <<<"$program" ||
+    { echo "$label parser does not use a file-size predicate" >&2; exit 1; }
+}
+assert_eof_probe_contract(){
+  local label=$1 program=$2 probe_section
+  grep -Fq 'dd iflag=fullblock bs=1 count=1 status=none' <<<"$program" ||
+    { echo "$label lacks the one-byte GNU dd EOF probe" >&2; exit 1; }
+  grep -Eq '(eof|probe)' <<<"$program" ||
+    { echo "$label lacks a distinct EOF-probe name" >&2; exit 1; }
+  grep -Eq 'chmod 600.*(eof|probe)|(eof|probe).*chmod 600|install -m 600.*(eof|probe)' \
+    <<<"$program" ||
+    { echo "$label EOF probe is not mode 600" >&2; exit 1; }
+  grep -Eq 'trap[[:space:]]+[^[:space:]]+.*(EXIT|HUP|INT|TERM)|trap[[:space:]]+.*(EXIT|HUP|INT|TERM)' \
+    <<<"$program" ||
+    { echo "$label parser scratch is not trapped for cleanup" >&2; exit 1; }
+  grep -Eq 'test[[:space:]]+![[:space:]]+-s.*(eof|probe)|(eof|probe).*test[[:space:]]+![[:space:]]+-s' \
+    <<<"$program" ||
+    { echo "$label EOF probe does not use a zero-size predicate" >&2; exit 1; }
+  probe_section=$(awk '
+    /dd iflag=fullblock bs=1 count=1 status=none.*probe/ { active=1 }
+    active { print }
+    active && index($0, "test ! -s") { exit }
+  ' <<<"$program")
+  if grep -Eq '(^|[[:space:];])(read|mapfile)([[:space:];]|$)' <<<"$probe_section" ||
+    grep -Eq '\$\([^)]*(cat|dd|od|wc|head|tail)[^)]*(eof|probe)|\$\([^)]*(eof|probe)[^)]*(cat|dd|od|wc|head|tail)' \
+      <<<"$probe_section" ||
+    grep -Eq '\[\[?[^]]*\$[A-Za-z_][A-Za-z0-9_]*(eof|probe)|case[[:space:]]+\$[A-Za-z_][A-Za-z0-9_]*(eof|probe)' \
+      <<<"$probe_section"; then
+    echo "$label EOF boundary uses read, content command substitution, or a string test" >&2
+    exit 1
+  fi
+}
+create_program=$(extract_capture_program CREATE || true)
+receive_program=$(extract_capture_program RECEIVE || true)
+cleanup_program=$(extract_capture_program CLEANUP || true)
+assert_control_program create "$create_program"
+assert_control_program receive "$receive_program"
+assert_control_program cleanup "$cleanup_program"
+assert_eof_probe_contract create "$create_program"
+assert_eof_probe_contract cleanup "$cleanup_program"
+assert_capture_count_at_least 'static control-program encoding' 3 'base64 --wrap=0'
+assert_capture_count_at_least 'static decoder launch' 3 'sudo bash -c'
+assert_capture_count_at_least 'binary prefix validation' 3 'dd iflag=fullblock bs=1 count=8 status=none'
+assert_capture_count_at_least 'binary header inspection' 3 'od -An -v -tx1'
+assert_capture_count_at_least 'create/cleanup EOF probes' 2 \
+  'dd iflag=fullblock bs=1 count=1 status=none'
+assert_capture_count_at_least 'create/cleanup zero-size predicates' 2 'test ! -s'
+for schema in \
+  'meet-backend/beta-recovery-create/v1' \
+  'meet-backend/beta-recovery-file/v1' \
+  'meet-backend/beta-recovery-cleanup/v1'; do
+  grep -Fq -- "$schema" <<<"$capture_block" ||
+    { echo "control-frame schema is missing: $schema" >&2; exit 1; }
+done
+assert_capture_regex 'lowercase hexadecimal prefix-byte admission' \
+  '(30|31|32|33|34|35|36|37|38|39|61|62|63|64|65|66)'
+assert_capture_regex 'printable-ASCII/LF header-byte admission' \
+  '(0a|20|7e)'
+assert_capture_regex 'header length range check' \
+  'header_length[^[:alnum:]]*(4096|1).*header_length|header_length[^[:alnum:]]*([1-9][0-9]?|4096)'
+assert_capture_regex 'operation field-count validation' \
+  '(create|cleanup).*(3|three)|(3|three).*(create|cleanup).*receive.*(8|eight)|(8|eight).*receive'
+assert_capture_regex 'raw receive payload stream' \
+  'cat[[:space:]]+--[[:space:]]*"\$source"|cat[[:space:]]+"\$source"'
+if grep -Fq 'payload=$(base64' <<<"$capture_block" ||
+  grep -Fq 'payload=$7' <<<"$capture_block" ||
+  grep -Fq 'base64 --decode >"$temp"' <<<"$receive_program"; then
+  echo "capture receiver still buffers or base64-decodes payload content" >&2
+  exit 1
+fi
+assert_capture_regex 'declared-length-plus-one payload bound' \
+  'expected_length[^[:space:]]*[[:space:]]*[+][[:space:]]*1|expected_length_plus_one|payload_limit[^[:space:]]*=[^[:space:]]*[+][^[:space:]]*1'
+assert_capture_regex 'temporary device/inode capture' \
+  '(temp|temporary|candidate)_identity[^\\n]*stat[^\\n]*%d:%i|stat[^\\n]*%d:%i[^\\n]*(temp|temporary|candidate)'
+assert_capture_regex 'published device/inode capture' \
+  '(final|published)_identity[^\\n]*stat[^\\n]*%d:%i|stat[^\\n]*%d:%i[^\\n]*(final|published)'
+assert_capture_regex 'temporary/final device-inode equality' \
+  'final_identity.*temp_identity|temp_identity.*final_identity'
+grep -Fq 'ln -T --' <<<"$receive_program" ||
+  { echo "receiver publication is not no-overwrite hard-link based" >&2; exit 1; }
+identity_block=$(awk '
+  /remote_identity=.*ssh/ { active=1 }
+  active { print }
+  active && /REMOTE_[A-Z_]+/ { exit }
+' <<<"$capture_block")
+if grep -Fq 'owner_token' <<<"$identity_block" ||
+  grep -Eq '(^|[[:space:]])token[[:space:]]*=' <<<"$identity_block"; then
+  echo "remote identity custody still accepts an owner token" >&2
+  exit 1
+fi
+grep -Eq 'stat -L?c[^[:space:]]*[[:space:]]+[^%]*%d:%i' <<<"$capture_block" ||
+  { echo "token-free identity call does not return a device/inode identity" >&2; exit 1; }
+ssh_invocations=$(awk '
+  /(^|[|;&[:space:]])ssh[[:space:]]/ { active=1 }
+  active { print }
+  active && $0 !~ /\\[[:space:]]*$/ { active=0 }
+' <<<"$capture_block")
+if grep -Eq 'owner_token|payload|expected_length|header|frame' <<<"$ssh_invocations"; then
+  echo "dynamic control or payload data entered an SSH launch" >&2
+  exit 1
+fi
+if grep -Eq 'owner_token.*(ssh|sudo|bash|export)|(ssh|sudo|bash|export).*owner_token' \
+  <<<"$capture_block"; then
+  echo "owner token is present in SSH custody or exported environment" >&2
+  exit 1
+fi
+grep -Fq 'printf -v' <<<"$capture_block" ||
+  { echo "control frames are not built in a non-exported Bash variable" >&2; exit 1; }
+grep -Eq 'LC_ALL=C[[:space:]]+printf|LC_ALL=C' <<<"$capture_block" ||
+  { echo "control-frame generation does not force byte locale" >&2; exit 1; }
+grep -Eq '\[\[?[[:space:]]*-r[[:space:]]+"\$source"|\[\[.*-f.*\$source' <<<"$capture_block" ||
+  { echo "sender does not require a readable regular source" >&2; exit 1; }
+grep -Eq '\[\[.*![[:space:]]*-L.*\$source|\[[[:space:]]*!.*-L.*\$source' <<<"$capture_block" ||
+  { echo "sender does not reject symlink sources" >&2; exit 1; }
+grep -Fq 'send_capture_file "$age_path" age' "$workflow" ||
+  { echo "pinned age is not sent through the shared raw-stream receiver" >&2; exit 1; }
 [ "$(grep -Fc 'PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}' "$workflow")" -eq 3 ]
 assert_release_root_gate(){
   local block=$1 checkout_line gate_line first_step network_line
