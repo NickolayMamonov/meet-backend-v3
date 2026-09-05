@@ -1671,9 +1671,9 @@ for trailing_case in printable:20 nul:00 control:01 nonascii:c3; do
     fail "$direct_case_name cleanup did not accept absent root"
 done
 
-direct_frame_case create-canonical create \
-  "$(printf 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
-    "$direct_remote" "$direct_token")"
+printf -v direct_create_header 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
+  "$direct_remote" "$direct_token"
+direct_frame_case create-canonical create "$direct_create_header"
 direct_owned_root=$consumer_root/cases/direct-frame-create-canonical/remote-root
 if [ ! -d "$direct_owned_root" ]; then
   printf 'consumer create-canonical direct-frame events:\n' >&2
