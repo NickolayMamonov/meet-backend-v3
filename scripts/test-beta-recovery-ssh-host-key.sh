@@ -1727,8 +1727,13 @@ printf -v binary_header \
 direct_frame_case binary-payload receive "$binary_header" '' \
   "$binary_case/source/payload"
 binary_case_root=$consumer_root/cases/direct-frame-binary-payload
-[ "$(<"$binary_case/status")" -eq 0 ] ||
+if [ "$(<"$binary_case/status")" -ne 0 ]; then
+  printf 'consumer binary-payload direct-frame events (status=%s):\n' \
+    "$(<"$binary_case/status")" >&2
+  grep -E '^(direct-input|framed-input|ssh-call|argv-scan|argv-rejected|effective-|framed-|remote-|local-|helper-)' \
+    "$binary_case/boundary.log" >&2 || true
   fail "binary payload receive failed"
+fi
 [ -f "$binary_case_root/remote-root/age" ] ||
   fail "binary payload target missing"
 cmp "$binary_case/source/payload" "$binary_case_root/remote-root/age" ||
