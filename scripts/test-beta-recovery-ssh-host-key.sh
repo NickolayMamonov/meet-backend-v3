@@ -1121,9 +1121,9 @@ write_wrapper "$consumer_bin/ssh" \
   '      printf "framed-receive-stage-name\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; case "$name" in run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|age|age-recipient) ;; *) exit 1 ;; esac' \
   '      printf "framed-receive-stage-length\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; (( expected_length > 0 && expected_length <= 9223372036854775806 ))' \
   '      printf "framed-receive-stage-root\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ -d "$remote_state" ] && [ -f "$remote_state/.meet-beta-recovery-owner" ]' \
-  '      printf "framed-receive-stage-owner\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(<"$remote_state/.meet-beta-recovery-owner")" = "meet-backend/beta-recovery-owner/v1:$token" ]' \
+  '      printf "framed-receive-stage-owner\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; if [ "$(<"$remote_state/.meet-beta-recovery-owner")" = "meet-backend/beta-recovery-owner/v1:$token" ]; then printf "framed-receive-owner-match\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else printf "framed-receive-owner-mismatch\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
   '      owner_uid=${SUDO_UID:-$(id -u)}; owner_gid=${SUDO_GID:-$(id -g)}' \
-  '      [ "$remote_identity" = 1:1 ] || [ "$(stat -Lc "%d:%i" "$remote_state")" = "$remote_identity" ]' \
+  '      actual_identity=$(stat -Lc "%d:%i" "$remote_state"); if [ "$remote_identity" = 1:1 ] || [ "$actual_identity" = "$remote_identity" ]; then printf "framed-receive-identity-match\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else printf "framed-receive-identity-mismatch\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
   '      target="$remote_state/$name"; [ ! -e "$target" ] && [ ! -L "$target" ]' \
   '      payload="$frame_dir/payload"; install -m 600 /dev/null "$payload"' \
   '      dd iflag=fullblock bs=1 count="$((expected_length + 1))" status=none of="$payload"' \
