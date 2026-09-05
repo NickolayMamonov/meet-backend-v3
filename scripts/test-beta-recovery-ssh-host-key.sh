@@ -1632,8 +1632,12 @@ for trailing_case in printable:20 nul:00 control:01 nonascii:c3; do
   printf -v direct_header 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
     "$direct_remote" "$direct_token"
   direct_frame_case "$direct_case_name" create "$direct_header" "$suffix"
-  [ "$(<"$consumer_root/cases/direct-frame-$direct_case_name/status")" -ne 0 ] ||
+  if [ "$(<"$consumer_root/cases/direct-frame-$direct_case_name/status")" -eq 0 ]; then
+    printf 'consumer %s direct-frame events:\n' "$direct_case_name" >&2
+    grep -E '^(ssh-call|argv-scan|argv-rejected|effective-|framed-|remote-|local-|helper-)' \
+      "$consumer_root/cases/direct-frame-$direct_case_name/boundary.log" >&2 || true
     fail "$direct_case_name unexpectedly succeeded"
+  fi
   [ ! -e "$consumer_root/cases/direct-frame-$direct_case_name/remote-root" ] ||
     fail "$direct_case_name mutated the root"
   printf -v direct_cleanup_header 'meet-backend/beta-recovery-cleanup/v1|%s|%s\n' \
