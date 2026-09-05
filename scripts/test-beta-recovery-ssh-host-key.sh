@@ -1569,7 +1569,9 @@ direct_frame_case() {
   chmod 700 "$case_dir" "$case_dir/home" "$case_dir/home/.ssh" "$case_dir/runner"
   printf '%s\n' \
     'Host *' "  HostName $scan_host" '  Port 1' \
-    '  CanonicalizeHostname no' >"$config"
+    '  CanonicalizeHostname no' \
+    'Host hostile-preservation' \
+    '  HostName hostile.example.invalid' >"$config"
   chmod 600 "$config"
   : >"$key"
   chmod 600 "$key"
