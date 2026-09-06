@@ -69,11 +69,17 @@ runs are not resumed.
 Capture holds `/var/lib/meet-test-vps-deploy/.deploy.lock` only for the bounded
 snapshot and runtime recovery section. The temporary remote root is
 authenticated by a per-run 64-hex ownership token in a strict
-`.meet-beta-recovery-owner` marker. If SSH reports failure after root and marker
-creation, cleanup still removes the root only when path, type, owner, modes,
-link count, and marker bytes authenticate this run; absent or mismatched-marker
-collisions are preserved byte-for-byte and metadata-for-metadata, and cleanup
-failure is fatal. It rejects an active SMTP transaction,
+`.meet-beta-recovery-owner` marker. Authenticated creation and cleanup use
+bounded, validated binary-safe stdin control frames; the identity query carries
+no credential. Each allowlisted capture input uses one exact-length-bounded raw
+stdin stream, while invariant remote programs are separate from dynamic input.
+No payload, owner token, or reversible encoding of either is carried in SSH
+argv, remote command source, or exported environment. If SSH reports failure
+after root and marker creation, cleanup still removes the root only when path,
+type, owner, modes, link count, and marker bytes authenticate this run; absent
+or mismatched-marker collisions are preserved byte-for-byte and
+metadata-for-metadata, and cleanup failure is fatal. It rejects an active SMTP
+transaction,
 proves a healthy populated runtime and HTTPS edge, and uses fixed
 `postgres.dump.age` and `uploads.tar.gz.age` names in a fresh mode-0700
 run-owned directory. Plaintext never leaves the VPS.
@@ -96,8 +102,11 @@ result before authenticated remote cleanup, evidence construction, or artifact
 publication. A malformed, missing, unreadable, unhashable, or mismatched proof
 is terminal; authenticated cleanup remains mandatory and a cleanup failure is
 fatal. No artifact is eligible and restore custody is never reached after such
-a failure. Remediate the reported cause and dispatch a brand-new authorized
-recovery; do not retry or resume the failed run.
+a failure. Framing, authentication, transfer, integrity, collision, signal, or
+cleanup failures must be reviewed and remediated before dispatching a
+brand-new authorized recovery with a new recovery ID. Never rerun or resume
+the historical failure, and never substitute SCP, SFTP, or an unreviewed
+fallback transport.
 
 Capture-local journals are not global gates. A fresh process validates their
 schema, digest, recovery ID, and owned paths. An unchanged interrupted runtime

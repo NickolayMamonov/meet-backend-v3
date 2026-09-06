@@ -22,7 +22,7 @@ for required in SSH_PRIVATE_KEY StrictHostKeyChecking=yes KnownHostsCommand=none
     fail "remote probe contract is incomplete: $required"
 done
 
-for tool in awk basename chmod env find grep mkdir mktemp rm seq sha256sum sleep ssh ssh-keygen stat tr wc; do
+for tool in awk base64 basename cat chmod cmp dd env find getconf grep head mkdir mktemp od rm seq sha256sum sleep ssh ssh-keygen stat tr wc; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tool is unavailable: $tool"
 done
 
@@ -30,6 +30,7 @@ original_path=$PATH
 real_ssh_keygen=$(command -v ssh-keygen)
 real_sha256sum=$(command -v sha256sum)
 real_rm=$(command -v rm)
+real_od=$(command -v od)
 temporary_root=$(mktemp -d)
 chmod 700 -- "$temporary_root"
 if [ "$(stat -c '%a' -- "$temporary_root")" != 700 ]; then
@@ -825,6 +826,17 @@ consumer_root=$temporary_root/consumers
 consumer_bin=$consumer_root/bin
 mkdir -p "$consumer_bin"
 chmod 700 "$consumer_root" "$consumer_bin"
+token_oracle=$consumer_root/token-oracle
+"$real_od" -An -N32 -tx1 /dev/urandom | tr -d '[:space:]' >"$token_oracle"
+chmod 600 "$token_oracle"
+[ "$(stat -c '%a' -- "$token_oracle")" = 600 ] ||
+  fail "consumer token oracle is not mode 0600"
+export BETA_RECOVERY_TOKEN_ORACLE="$token_oracle"
+export BETA_RECOVERY_REAL_OD="$real_od"
+fixture_sudo_uid=$(id -u)
+fixture_sudo_gid=$(id -g)
+export SUDO_UID="$fixture_sudo_uid"
+export SUDO_GID="$fixture_sudo_gid"
 
 write_wrapper "$consumer_bin/ssh-keyscan" \
   '#!/usr/bin/env bash' \
@@ -854,6 +866,18 @@ write_wrapper "$consumer_bin/sha256sum" \
   '    ;;' \
   'esac' \
   'exec "${BETA_RECOVERY_REAL_SHA256SUM:-/usr/bin/sha256sum}" "$@"'
+
+write_wrapper "$consumer_bin/od" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [ "${1:-}" = -An ] && [ "${2:-}" = -N32 ] && [ "${3:-}" = -tx1 ] &&' \
+  '  [ "${4:-}" = /dev/urandom ] && [ -n "${BETA_RECOVERY_TOKEN_ORACLE:-}" ]; then' \
+  '  token=$(<"${BETA_RECOVERY_TOKEN_ORACLE:?}")' \
+  '  for ((i=0; i<${#token}; i+=2)); do printf " %s" "${token:i:2}"; done' \
+  '  printf "\n"' \
+  'else' \
+  '  exec "${BETA_RECOVERY_REAL_OD:?}" "$@"' \
+  'fi'
 
 write_wrapper "$consumer_bin/ln" \
   '#!/usr/bin/env bash' \
@@ -899,7 +923,15 @@ write_wrapper "$consumer_bin/chmod" \
 write_wrapper "$consumer_bin/rm" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
-  'if [[ "$*" == *"/beta-recovery-ssh."* ]] && [[ "$*" == *" -r "* || "$*" == "-r "* || "$*" == *" -r" ]]; then' \
+  'if [ "${BETA_RECOVERY_REMOTE_CLEANUP_FAIL:-0}" = 1 ] &&' \
+  '  [ "${1:-}" = -r ] && [ "${2:-}" = -- ] &&' \
+  '  [[ "${3:-}" == /tmp/beta-recovery-* ]]; then' \
+  '  printf "remote-cleanup-failure-injected\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  exit 44' \
+  'fi' \
+  'target=${@: -1}' \
+  'if [[ "$target" == *"/beta-recovery-ssh."* ]] &&' \
+  '  { [ "${1:-}" = -r ] || [ "${1:-}" = -rf ]; }; then' \
   '  "${BETA_RECOVERY_REAL_RM:?}" "$@"' \
   '  printf "local-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'else' \
@@ -918,6 +950,52 @@ write_wrapper "$consumer_bin/ssh" \
   '  parent_pid=$(<"${BETA_RECOVERY_PARENT_PID_FILE:?}")' \
   '  kill -"$signal" "$parent_pid"' \
   '}' \
+  'scan_secret() {' \
+  '  local secret=$1 label=$2 encoded hex pattern encoded_pattern hex_pattern proc_name' \
+  '  [ -n "$secret" ] || return 0' \
+  '  encoded=$(printf "%s" "$secret" | base64 --wrap=0)' \
+  '  hex=$(printf "%s" "$secret" | od -An -v -tx1 | tr -d "[:space:]")' \
+  '  pattern=$(mktemp); encoded_pattern=$(mktemp); hex_pattern=$(mktemp)' \
+  '  chmod 600 "$pattern" "$encoded_pattern" "$hex_pattern"' \
+  '  printf "%s\n" "$secret" >"$pattern"' \
+  '  printf "%s\n" "$encoded" >"$encoded_pattern"' \
+  '  printf "%s\n" "$hex" >"$hex_pattern"' \
+  '  for proc_name in self parent; do' \
+  '    case "$proc_name" in self) proc_file=/proc/$$/cmdline ;; parent) proc_file=/proc/$PPID/cmdline ;; esac' \
+  '    [ -r "$proc_file" ] || continue' \
+  '    if grep -aFq -f "$pattern" "$proc_file"; then printf "argv-scan-fail-%s-%s-raw\n" "$label" "$proc_name" >>"$BETA_RECOVERY_BOUNDARY_LOG"; rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; fi' \
+  '    if grep -aFq -f "$encoded_pattern" "$proc_file"; then printf "argv-scan-fail-%s-%s-base64\n" "$label" "$proc_name" >>"$BETA_RECOVERY_BOUNDARY_LOG"; rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; fi' \
+  '    if grep -aFq -f "$hex_pattern" "$proc_file"; then printf "argv-scan-fail-%s-%s-hex\n" "$label" "$proc_name" >>"$BETA_RECOVERY_BOUNDARY_LOG"; rm -f "$pattern" "$encoded_pattern" "$hex_pattern"; return 1; fi' \
+  '  done' \
+  '  rm -f "$pattern" "$encoded_pattern" "$hex_pattern"' \
+  '  return 0' \
+  '}' \
+  'scan_entry() {' \
+  '  local oracle=${BETA_RECOVERY_TOKEN_ORACLE:-}' \
+  '  local token encoded hex' \
+  '  [ -n "$oracle" ] || { printf "argv-scan-pass\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 0; }' \
+  '  [ -f "$oracle" ] && [ ! -L "$oracle" ] && [ "$(stat -c "%a" "$oracle")" = 600 ] || { printf "argv-scan-fail-oracle\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
+  '  token=$(<"$oracle")' \
+  '  [ "${#token}" -eq 64 ] && [[ "$token" =~ ^[0-9a-f]{64}$ ]] || { printf "argv-scan-fail-token-format\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
+  '  encoded=$(printf "%s" "$token" | base64 --wrap=0)' \
+  '  hex=$(printf "%s" "$token" | od -An -v -tx1 | tr -d "[:space:]")' \
+  '  for arg in "$@"; do' \
+  '    [[ "$arg" != *"$token"* ]] || { printf "argv-scan-fail-arg-token\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
+  '    [[ "$arg" != *"$encoded"* ]] || { printf "argv-scan-fail-arg-base64\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
+  '    [[ "$arg" != *"$hex"* ]] || { printf "argv-scan-fail-arg-hex\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; return 1; }' \
+  '  done' \
+  '  scan_secret "$token" token' \
+  '  for secret_name in BETA_RECOVERY_PAYLOAD_SENTINEL BETA_RECOVERY_PRIVATE_KEY_SENTINEL; do' \
+  '    secret_value=${!secret_name:-}' \
+  '    [ -z "$secret_value" ] || scan_secret "$secret_value" "$secret_name" || return 1' \
+  '  done' \
+  '  for proc_file in /proc/$$/cmdline /proc/$PPID/cmdline; do' \
+  '    [ -r "$proc_file" ] || continue' \
+  '    ! grep -aFq -- "$BETA_RECOVERY_TOKEN_ORACLE" "$proc_file" || true' \
+  '  done' \
+  '  printf "argv-scan-pass\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '}' \
+  'scan_entry "$@" || { printf "argv-scan-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 48; }' \
   'args=("$@")' \
   'config= key= known=' \
   'for ((i=0; i<${#args[@]}; i++)); do' \
@@ -942,19 +1020,75 @@ write_wrapper "$consumer_bin/ssh" \
   '  effective_args+=("$arg")' \
   '  [[ "$arg" == *"@"* ]] && destination_seen=true' \
   'done' \
-  '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
-  'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "port $PORT" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fq "userknownhostsfile $known" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "globalknownhostsfile /dev/null" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG"' \
-  'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG"' \
+  'command_start=-1' \
+  'for ((i=0; i<${#args[@]}; i++)); do' \
+  '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
+  'done' \
+  'frame_input=' \
+  'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
+  '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -c ] &&' \
+  '  [ "${args[command_start+3]:-}" = '\''exec bash <(printf "%s" "$1" | base64 --decode)'\'' ] &&' \
+  '  [ "${args[command_start+4]:-}" = -- ] && [ -n "${args[command_start+5]:-}" ]; then' \
+  '  frame_input=$(mktemp)' \
+  '  cat >"$frame_input"' \
+  '  exec <"$frame_input"' \
+  'fi' \
+  '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" </dev/null >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
+  'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-user\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-host\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fxq "port $PORT" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-port\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fq "userknownhostsfile $known" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-known\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fxq "globalknownhostsfile /dev/null" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-global\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  '! grep -Eq "^(knownhostscommand|proxycommand|proxyjump|hostkeyalias) " "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-unsafe\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
+  'grep -Fxq "canonicalizehostname false" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-canonicalize\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
   'printf "ssh-call\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'command_start=-1' \
   'for ((i=0; i<${#args[@]}; i++)); do' \
   '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
   'done' \
+  'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
+  '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -c ] &&' \
+  '  [ "${args[command_start+3]:-}" = '\''exec bash <(printf "%s" "$1" | base64 --decode)'\'' ] &&' \
+  '  [ "${args[command_start+4]:-}" = -- ] && [ -n "${args[command_start+5]:-}" ]; then' \
+  '  remote_state=${BETA_RECOVERY_REMOTE_STATE:-}' \
+  '  static_program="$remote_state.static.$BASHPID"' \
+  '  trap '\''status=$?; rm -f -- "$static_program" "$frame_input"; exit "$status"'\'' EXIT' \
+  '  base64 --decode <<<"${args[command_start+5]}" >"$static_program"' \
+  '  if grep -Fq "meet-backend/beta-recovery-create/v1" "$static_program"; then' \
+  '    operation=create' \
+  '  elif grep -Fq "meet-backend/beta-recovery-file/v1" "$static_program"; then' \
+  '    operation=receive' \
+  '  elif grep -Fq "meet-backend/beta-recovery-cleanup/v1" "$static_program"; then' \
+  '    operation=cleanup' \
+  '  else' \
+  '    printf "argv-unclassified\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 49' \
+  '  fi' \
+  '  printf "decoded-program-%s\n" "$operation" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  set +e' \
+  '  bash "$static_program" <"$frame_input"' \
+  '  status=$?' \
+  '  set -e' \
+  '  if [ "$operation" = create ] &&' \
+  '    { [ "$status" -eq 0 ] || [ -n "${BETA_RECOVERY_CREATE_MODE:-}" ]; }; then' \
+  '    printf "remote-create\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  fi' \
+  '  if [ "$operation" = create ] && [ "$status" -eq 0 ] &&' \
+  '    [ "${BETA_RECOVERY_CREATE_MODE:-}" = ambiguous ]; then' \
+  '    printf "remote-create-ambiguous\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '    status=47' \
+  '  fi' \
+  '  if [ "$operation" = receive ] && [ "$status" -eq 0 ]; then' \
+  '    printf "remote-receive\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '    if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi' \
+  '  fi' \
+  '  if [ "$operation" = cleanup ] &&' \
+  '    { [ "$status" -eq 0 ] || [ "${BETA_RECOVERY_REMOTE_CLEANUP_FAIL:-0}" = 1 ] ||' \
+  '      [ -n "${BETA_RECOVERY_CREATE_MODE:-}" ]; }; then' \
+  '    printf "remote-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  fi' \
+  '  printf "decoded-program-status=%s\n" "$status" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  exit "$status"' \
+  'fi' \
   'if [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ] &&' \
   '  [ "$command_start" -ge 0 ] && [[ "${args[command_start]:-}" == "sudo cat "* ]]; then' \
   '  command_text=${args[command_start]}' \
@@ -981,7 +1115,7 @@ write_wrapper "$consumer_bin/ssh" \
   '    printf "remote-receive\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 0' \
   '  elif [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ] &&' \
   '    printf "%s" "$body" | grep -Fq '\''stat -c '\''"'\''%d:%i'\''"'\'' -- "$remote"'\''; then' \
-  '    printf "1:1\n"; exit 0' \
+  '    stat -Lc "%d:%i" -- "${BETA_RECOVERY_REMOTE_STATE:?}"; exit 0' \
   '  elif printf "%s" "$body" | grep -Fq "created_identity="; then' \
   '    printf "created\n1:1\n"; exit 0' \
   '  elif printf "%s" "$body" | grep -Fq "probe_payload=\${13}"; then' \
@@ -1099,6 +1233,15 @@ write_wrapper "$semantic_workspace/scripts/build-beta-recovery-evidence.sh" \
 
 assert_consumer_residue_absent() {
   local case_dir=$1
+  local ssh_calls scan_passes
+  ssh_calls=$(grep -c '^ssh-call$' "$case_dir/boundary.log" 2>/dev/null || true)
+  scan_passes=$(grep -c '^argv-scan-pass$' "$case_dir/boundary.log" 2>/dev/null || true)
+  if [ "$ssh_calls" -ne "$scan_passes" ]; then
+    printf 'consumer %s residue boundary events:\n' "$(basename "$case_dir")" >&2
+    grep -E '^(ssh-call|argv-scan|argv-rejected|effective-|framed-|remote-|local-|helper-|private-key|config-created)' \
+      "$case_dir/boundary.log" >&2 || true
+    fail "consumer SSH scan count mismatch: $(basename "$case_dir")"
+  fi
   [ -z "$(find "$case_dir/runner" -maxdepth 1 -type d \
     -name 'beta-recovery-ssh.*' -print -quit)" ] ||
     fail "consumer left runner SSH material: $(basename "$case_dir")"
@@ -1222,7 +1365,8 @@ run_consumer_case() {
   [ "$cleanup_failure" -eq 0 ] || expected_status=1
   mkdir -p "$case_dir/runner" "$case_dir/home/.ssh"
   chmod 700 "$case_dir" "$case_dir/runner" "$case_dir/home" "$case_dir/home/.ssh"
-  remote_state=$case_dir/remote-root
+  remote_state=/tmp/beta-recovery-fixture-$name
+  rm -rf -- "$remote_state"
   case "$scenario" in
     normal|ambiguous) ;;
     collision-absent)
@@ -1257,7 +1401,7 @@ run_consumer_case() {
     SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
     SSH_PRIVATE_KEY=fixture-private-key \
     AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
-    PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
+    PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID="$name" \
     RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
     GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$case_dir/output" \
     BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
@@ -1266,7 +1410,7 @@ run_consumer_case() {
     BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
     BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
     BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
-    BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+    BETA_RECOVERY_REMOTE="$remote_state" \
     BETA_RECOVERY_REMOTE_STATE="$remote_state" \
     BETA_RECOVERY_CREATE_MODE="$scenario" \
     BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
@@ -1277,8 +1421,12 @@ run_consumer_case() {
     _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
-  [ "$status" -eq "$expected_status" ] ||
+  if [ "$status" -ne "$expected_status" ]; then
+    printf 'consumer %s boundary events:\n' "$name" >&2
+    grep -E '^(ssh-call|argv-scan|argv-rejected|effective-|remote-|local-|helper-|private-key|config-created|ssh-keyscan args|ssh-keygen args)' \
+      "$case_dir/boundary.log" >&2 || true
     fail "consumer $name returned $status instead of $expected_status"
+  fi
   assert_consumer_residue_absent "$case_dir"
   [ "$(grep -c '^private-key-created$' "$case_dir/boundary.log")" -eq 1 ] ||
     fail "consumer $name did not materialize a private key"
@@ -1320,6 +1468,7 @@ run_consumer_case() {
           "$remote_state/.meet-beta-recovery-owner")" ] ||
           fail "mismatched-marker bytes changed" ;;
     esac
+    rm -rf -- "$remote_state"
     return
   fi
   [ -f "$case_dir/mutation-sentinel" ] ||
@@ -1337,6 +1486,7 @@ run_consumer_case() {
     assert_event_order "$case_dir" helper-success private-key-created remote-admission \
       local-cleanup
   fi
+  rm -rf -- "$remote_state"
 }
 
 for signal in HUP INT TERM; do
@@ -1344,8 +1494,448 @@ for signal in HUP INT TERM; do
 done
 run_consumer_case capture-TERM-remote-cleanup-failure "$capture_body" TERM ssh 1
 run_consumer_case capture-ambiguous-create "$capture_body" HUP ssh 0 ambiguous
-run_consumer_case capture-collision-absent-marker "$capture_body" HUP ssh 0 collision-absent
-run_consumer_case capture-collision-mismatched-marker "$capture_body" HUP ssh 0 collision-mismatch
+run_consumer_case capture-collision-absent-marker "$capture_body" '' '' 0 collision-absent
+run_consumer_case capture-collision-mismatched-marker "$capture_body" '' '' 0 collision-mismatch
+
+assert_framed_runtime_contract() {
+  local workflow_file=$root/.github/workflows/prove-beta-backup-restore.yml
+  grep -Fq 'create_remote_cmd=(sudo bash -c' "$workflow_file" ||
+    fail "static create launch contract is missing"
+  grep -Fq 'receive_remote_cmd=(sudo bash -c' "$workflow_file" ||
+    fail "static receive launch contract is missing"
+  grep -Fq 'cleanup_remote_cmd=(sudo bash -c' "$workflow_file" ||
+    fail "static cleanup launch contract is missing"
+  grep -Fq 'frame_stdin "$create_header"' "$workflow_file" ||
+    fail "framed create invocation is missing"
+  grep -Fq 'frame_stdin "$receive_header"' "$workflow_file" ||
+    fail "framed receive invocation is missing"
+  grep -Fq 'frame_stdin "$cleanup_header"' "$workflow_file" ||
+    fail "framed cleanup invocation is missing"
+  grep -Fq 'remote staging publication identity changed' "$workflow_file" ||
+    fail "publication identity diagnostic contract is missing"
+  grep -Fq 'scan_entry "$@"' "${BASH_SOURCE[0]}" ||
+    fail "fake SSH entry scan contract is missing"
+  grep -Fq 'bash "$static_program" <"$frame_input"' "${BASH_SOURCE[0]}" ||
+    fail "fake SSH boundary does not execute the decoded invariant program"
+  grep -Fq 'set +e' "${BASH_SOURCE[0]}" ||
+    fail "decoded-program return status is not captured explicitly"
+}
+
+assert_framed_runtime_contract
+
+direct_frame_case() {
+  local name=$1 operation=$2 header=$3 suffix_hex=${4:-} payload_file=${5:-}
+  local remote_root=${6:-} prefix_override=${7:-}
+  local case_dir=$consumer_root/cases/direct-frame-$name
+  local config=$case_dir/home/.ssh/config key=$case_dir/key
+  local program prefix frame_file suffix_file
+  mkdir -p "$case_dir/home/.ssh" "$case_dir/runner"
+  chmod 700 "$case_dir" "$case_dir/home" "$case_dir/home/.ssh" "$case_dir/runner"
+  printf '%s\n' \
+    'Host *' "  HostName $scan_host" '  Port 1' \
+    '  CanonicalizeHostname no' \
+    'Host hostile-preservation' \
+    '  HostName hostile.example.invalid' >"$config"
+  chmod 600 "$config"
+  : >"$key"
+  chmod 600 "$key"
+  case "$operation" in
+    create) program='meet-backend/beta-recovery-create/v1' ;;
+    receive) program='meet-backend/beta-recovery-file/v1' ;;
+    cleanup) program='meet-backend/beta-recovery-cleanup/v1' ;;
+    *) fail "unknown direct frame operation: $operation" ;;
+  esac
+  frame_file=$case_dir/frame
+  if [[ "$header" == @* ]]; then
+    cp -- "${header#@}" "$frame_file"
+  else
+    printf '%s' "$header" >"$frame_file"
+  fi
+  if [ -n "$prefix_override" ]; then
+    printf '%s' "$prefix_override" >"$case_dir/prefix"
+  else
+    prefix=$(printf '%08x' "$(stat -c '%s' "$frame_file")")
+    printf '%s' "$prefix" >"$case_dir/prefix"
+  fi
+  suffix_file=$case_dir/suffix
+  if [ -n "$suffix_hex" ]; then
+    printf '%b' "\\x$suffix_hex" >"$suffix_file"
+  else
+    : >"$suffix_file"
+  fi
+  printf '%s' "$program" | base64 --wrap=0 >"$case_dir/program.b64"
+  frame_stdin() {
+    cat "$case_dir/prefix"
+    cat "$frame_file"
+    cat "$suffix_file"
+    [ -z "$payload_file" ] || cat "$payload_file"
+  }
+  set +e
+  frame_stdin | env \
+    PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
+    HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+    BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+    BETA_RECOVERY_REAL_LN="$(command -v ln)" \
+    BETA_RECOVERY_REAL_RM="$real_rm" \
+    BETA_RECOVERY_TOKEN_ORACLE="$token_oracle" \
+    BETA_RECOVERY_PAYLOAD_SENTINEL=fixture-payload-sentinel \
+    BETA_RECOVERY_PRIVATE_KEY_SENTINEL=fixture-private-key-sentinel \
+    BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
+    BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
+    BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
+    BETA_RECOVERY_REMOTE_STATE="${remote_root:-$case_dir/remote-root}" \
+    ssh -F "$config" -i "$key" -p 2222 \
+    -o BatchMode=yes -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile="$case_dir/known_hosts" \
+    -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none \
+    fixture-user@"$scan_host" \
+    sudo bash -c 'exec bash <(printf "%s" "$1" | base64 --decode)' -- \
+    "$(<"$case_dir/program.b64")" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  direct_status=$?
+  set -e
+  rm -f -- "$frame_file" "$suffix_file" "$case_dir/prefix" "$case_dir/program.b64"
+  assert_consumer_residue_absent "$case_dir"
+  [ "$(grep -c '^ssh-call$' "$case_dir/boundary.log")" -eq 1 ] ||
+    fail "direct frame $name did not make one SSH call"
+  grep -Fxq "decoded-program-$operation" "$case_dir/boundary.log" ||
+    fail "direct frame $name did not execute the decoded $operation program"
+  grep -Fxq "decoded-program-status=$direct_status" "$case_dir/boundary.log" ||
+    fail "direct frame $name did not record the decoded program status"
+  printf '%s\n' "$direct_status" >"$case_dir/status"
+}
+
+direct_token=$(<"$token_oracle")
+direct_remote=/tmp/beta-recovery-direct-frame
+rm -rf -- "$direct_remote"
+assert_internal_lf_header() {
+  local header=$1
+  [ "$(printf '%s' "$header" | od -An -v -tx1 |
+    awk '{ for (i = 1; i <= NF; i++) if ($i == "0a") count++ }
+         END { print count + 0 }')" -eq 2 ] ||
+    fail "internal-LF fixture does not contain exactly two header LF bytes"
+}
+for trailing_case in printable:20 nul:00 control:01 nonascii:c3; do
+  direct_case_name="create-trailing-${trailing_case%%:*}"
+  suffix=${trailing_case##*:}
+  printf -v direct_header 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
+    "$direct_remote" "$direct_token"
+  direct_frame_case "$direct_case_name" create "$direct_header" "$suffix"
+  if [ "$(<"$consumer_root/cases/direct-frame-$direct_case_name/status")" -eq 0 ]; then
+    printf 'consumer %s direct-frame events:\n' "$direct_case_name" >&2
+    grep -E '^(direct-input|ssh-call|argv-scan|argv-rejected|effective-|framed-|remote-|local-|helper-)' \
+      "$consumer_root/cases/direct-frame-$direct_case_name/boundary.log" >&2 || true
+    fail "$direct_case_name unexpectedly succeeded"
+  fi
+  [ ! -e "$direct_remote" ] && [ ! -L "$direct_remote" ] ||
+    fail "$direct_case_name mutated the root"
+  printf -v direct_cleanup_header 'meet-backend/beta-recovery-cleanup/v1|%s|%s\n' \
+    "$direct_remote" "$direct_token"
+  direct_frame_case "$direct_case_name-cleanup" cleanup \
+    "$direct_cleanup_header" '' '' \
+    "$direct_remote"
+  [ "$(<"$consumer_root/cases/direct-frame-$direct_case_name-cleanup/status")" -eq 0 ] ||
+    fail "$direct_case_name cleanup did not accept absent root"
+done
+
+direct_encoded=$(printf '%s' "$direct_token" | base64 --wrap=0)
+direct_hex=$(printf '%s' "$direct_token" | od -An -v -tx1 | tr -d '[:space:]')
+assert_malformed_direct_case() {
+  local name=$1 operation=$2 remote=$3 before_root=${4:-} before_marker=${5:-}
+  local case_dir=$consumer_root/cases/direct-frame-$1
+  local event
+  case "$operation" in
+    create) event='remote-create' ;;
+    receive) event='remote-receive' ;;
+    cleanup) event='remote-cleanup' ;;
+    *) fail "unknown malformed direct operation: $operation" ;;
+  esac
+  [ "$(<"$case_dir/status")" -ne 0 ] ||
+    fail "malformed $operation frame unexpectedly succeeded: $name"
+  [ "$(grep -c "^$event$" "$case_dir/boundary.log" || true)" -eq 0 ] ||
+    fail "malformed $operation frame crossed its downstream event: $name"
+  [ "$(grep -c '^decoded-program-' "$case_dir/boundary.log" || true)" -eq 2 ] ||
+    fail "malformed $operation frame did not execute and record the decoded program: $name"
+  ! grep -aFq "$direct_token" "$case_dir"/boundary.log "$case_dir"/stdout \
+    "$case_dir"/stderr "$case_dir"/effective.log "$case_dir"/effective.err ||
+    fail "malformed frame disclosed the owner token: $name"
+  ! grep -aFq "$direct_encoded" "$case_dir"/boundary.log "$case_dir"/stdout \
+    "$case_dir"/stderr "$case_dir"/effective.log "$case_dir"/effective.err ||
+    fail "malformed frame disclosed the encoded owner token: $name"
+  ! grep -aFq "$direct_hex" "$case_dir"/boundary.log "$case_dir"/stdout \
+    "$case_dir"/stderr "$case_dir"/effective.log "$case_dir"/effective.err ||
+    fail "malformed frame disclosed the hexadecimal owner token: $name"
+  ! grep -aFq fixture-payload-sentinel "$case_dir"/boundary.log "$case_dir"/stdout \
+    "$case_dir"/stderr "$case_dir"/effective.log "$case_dir"/effective.err ||
+    fail "malformed frame disclosed the payload sentinel: $name"
+  ! grep -aFq fixture-private-key-sentinel "$case_dir"/boundary.log "$case_dir"/stdout \
+    "$case_dir"/stderr "$case_dir"/effective.log "$case_dir"/effective.err ||
+    fail "malformed frame disclosed the private-key sentinel: $name"
+  [ ! -e "$case_dir/frame" ] && [ ! -e "$case_dir/prefix" ] &&
+    [ ! -e "$case_dir/suffix" ] && [ ! -e "$case_dir/program.b64" ] ||
+    fail "malformed frame left parser residue: $name"
+  case "$operation" in
+    create)
+      [ ! -e "$remote" ] && [ ! -L "$remote" ] ||
+        fail "malformed create mutated the remote root: $name" ;;
+    receive|cleanup)
+      [ -d "$remote" ] && [ ! -L "$remote" ] ||
+        fail "malformed $operation removed the owned root: $name" ;;
+  esac
+  if [ "$operation" != create ]; then
+    [ "$before_root" = "$(stat -c '%a:%u:%g:%h' "$remote")" ] ||
+      fail "malformed $operation changed root metadata: $name"
+    [ "$before_marker" = "$(sha256sum "$remote/.meet-beta-recovery-owner")" ] ||
+      fail "malformed $operation changed marker bytes: $name"
+  fi
+  ! grep -Eq '^remote-(create|receive|cleanup|admission|capture)$' \
+    "$case_dir/boundary.log" ||
+    fail "malformed frame crossed a downstream event: $name"
+  rm -rf -- "$remote"
+  rm -f -- "$case_dir/raw-header" "$case_dir/payload"
+}
+
+run_malformed_direct_case() {
+  local kind=$1 operation=$2 state=${3:-owned}
+  local name="$operation-malformed-$kind${state:+-$state}"
+  local case_dir=$consumer_root/cases/direct-frame-$name
+  local raw=$case_dir/raw-header remote=/tmp/beta-recovery-direct-$name
+  local prefix_override='' canonical short_token payload payload_length payload_sha
+  local marker_token=$direct_token before_root='' before_marker=''
+  rm -rf -- "$remote"
+  mkdir -p "$case_dir"
+  case "$operation" in
+    create)
+      printf -v canonical 'meet-backend/beta-recovery-create/v1|%s|%s' \
+        "$remote" "$direct_token" ;;
+    receive)
+      mkdir -p "$remote"
+      chmod 700 "$remote"
+      printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
+        >"$remote/.meet-beta-recovery-owner"
+      chmod 600 "$remote/.meet-beta-recovery-owner"
+      payload=$case_dir/payload
+      printf 'malformed-frame-payload\n' >"$payload"
+      payload_length=$(stat -c '%s' "$payload")
+      payload_sha=$(sha256sum "$payload" | awk '{print $1}')
+      printf -v canonical \
+        'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s' \
+        "$remote" "$(stat -Lc '%d:%i' "$remote")" "$direct_token" \
+        "$payload_sha" "$payload_length" ;;
+    cleanup)
+      mkdir -p "$remote"
+      chmod 700 "$remote"
+      [ "$state" = foreign ] && marker_token=0000000000000000000000000000000000000000000000000000000000000000
+      printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
+        >"$remote/.meet-beta-recovery-owner"
+      chmod 600 "$remote/.meet-beta-recovery-owner"
+      printf -v canonical 'meet-backend/beta-recovery-cleanup/v1|%s|%s' \
+        "$remote" "$direct_token" ;;
+  esac
+  case "$kind" in
+    declared-nul)
+      printf '%s\0\n' "$canonical" >"$raw" ;;
+    declared-control)
+      printf '%s\001\n' "$canonical" >"$raw" ;;
+    declared-non-ascii)
+      printf '%s\303\251\n' "$canonical" >"$raw" ;;
+    malformed-prefix)
+      printf '%s\n' "$canonical" >"$raw"
+      prefix_override=0000000g ;;
+    delimiter-missing)
+      printf '%s\n' "${canonical//|/}" >"$raw" ;;
+    delimiter-extra)
+      printf '%s|extra\n' "$canonical" >"$raw" ;;
+    overlong)
+      printf '%s' "$canonical" >"$raw"
+      dd if=/dev/zero bs=1 count=4096 status=none | tr '\0' x >>"$raw"
+      printf '\n' >>"$raw" ;;
+    truncated-header)
+      printf '%s\n' "$canonical" >"$raw"
+      prefix_override=00001000 ;;
+    truncated-token)
+      short_token=${direct_token:0:63}
+      printf '%s\n' "${canonical//$direct_token/$short_token}" >"$raw" ;;
+    *) fail "unknown malformed frame kind: $kind" ;;
+  esac
+  if [ "$operation" = cleanup ] && [ "$state" = foreign ]; then
+    printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$marker_token" \
+      >"$remote/.meet-beta-recovery-owner"
+  fi
+  if [ "$operation" != create ]; then
+    before_root=$(stat -c '%a:%u:%g:%h' "$remote")
+    before_marker=$(sha256sum "$remote/.meet-beta-recovery-owner")
+  fi
+  direct_frame_case "$name" "$operation" "@$raw" '' \
+    "${payload:-}" "$remote" "$prefix_override"
+  assert_malformed_direct_case "$name" "$operation" "$remote" \
+    "$before_root" "$before_marker"
+}
+
+for malformed_kind in declared-nul declared-control declared-non-ascii \
+  malformed-prefix delimiter-missing delimiter-extra overlong truncated-header \
+  truncated-token; do
+  for malformed_operation in create receive cleanup; do
+    run_malformed_direct_case "$malformed_kind" "$malformed_operation"
+    [ "$malformed_operation" = cleanup ] &&
+      run_malformed_direct_case "$malformed_kind" cleanup foreign
+  done
+done
+
+printf -v internal_create_header 'meet-backend/beta-recovery-create/v1|%s|%s\ninternal\n' \
+  "$direct_remote" "$direct_token"
+assert_internal_lf_header "$internal_create_header"
+direct_frame_case create-internal-lf create "$internal_create_header"
+internal_create_case=$consumer_root/cases/direct-frame-create-internal-lf
+[ "$(<"$internal_create_case/status")" -ne 0 ] ||
+  fail "create-internal-lf unexpectedly succeeded"
+[ ! -e "$direct_remote" ] && [ ! -L "$direct_remote" ] ||
+  fail "create-internal-lf created the remote root"
+
+internal_receive_case=$consumer_root/cases/direct-frame-receive-internal-lf
+internal_receive_remote=/tmp/beta-recovery-direct-receive-internal-lf
+rm -rf -- "$internal_receive_remote"
+mkdir -p "$internal_receive_case/source" "$internal_receive_remote"
+chmod 700 "$internal_receive_remote"
+printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
+  >"$internal_receive_remote/.meet-beta-recovery-owner"
+chmod 600 "$internal_receive_remote/.meet-beta-recovery-owner"
+printf 'internal-LF payload\n' >"$internal_receive_case/source/payload"
+internal_receive_length=$(stat -c '%s' "$internal_receive_case/source/payload")
+internal_receive_sha=$(sha256sum "$internal_receive_case/source/payload" | awk '{print $1}')
+internal_receive_identity=$(stat -Lc '%d:%i' "$internal_receive_remote")
+printf -v internal_receive_header \
+  'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s\ninternal\n' \
+  "$internal_receive_remote" "$internal_receive_identity" "$direct_token" \
+  "$internal_receive_sha" "$internal_receive_length"
+assert_internal_lf_header "$internal_receive_header"
+direct_frame_case receive-internal-lf receive "$internal_receive_header" '' \
+  "$internal_receive_case/source/payload" "$internal_receive_remote"
+[ "$(<"$internal_receive_case/status")" -ne 0 ] ||
+  fail "receive-internal-lf unexpectedly succeeded"
+[ -d "$internal_receive_remote" ] &&
+  [ -f "$internal_receive_remote/.meet-beta-recovery-owner" ] &&
+  [ ! -e "$internal_receive_remote/age" ] ||
+  fail "receive-internal-lf mutated the owned root"
+rm -rf -- "$internal_receive_remote"
+
+internal_cleanup_case=$consumer_root/cases/direct-frame-cleanup-internal-lf
+internal_cleanup_remote=/tmp/beta-recovery-direct-cleanup-internal-lf
+rm -rf -- "$internal_cleanup_remote"
+mkdir -p "$internal_cleanup_remote"
+chmod 700 "$internal_cleanup_remote"
+printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
+  >"$internal_cleanup_remote/.meet-beta-recovery-owner"
+chmod 600 "$internal_cleanup_remote/.meet-beta-recovery-owner"
+internal_cleanup_metadata=$(stat -c '%a:%u:%g:%h' "$internal_cleanup_remote")
+internal_cleanup_marker_metadata=$(stat -c '%a:%u:%g:%h' \
+  "$internal_cleanup_remote/.meet-beta-recovery-owner")
+internal_cleanup_marker_digest=$(sha256sum \
+  "$internal_cleanup_remote/.meet-beta-recovery-owner")
+printf -v internal_cleanup_header \
+  'meet-backend/beta-recovery-cleanup/v1|%s|%s\ninternal\n' \
+  "$internal_cleanup_remote" "$direct_token"
+assert_internal_lf_header "$internal_cleanup_header"
+direct_frame_case cleanup-internal-lf cleanup "$internal_cleanup_header" '' '' \
+  "$internal_cleanup_remote"
+[ "$(<"$internal_cleanup_case/status")" -ne 0 ] ||
+  fail "cleanup-internal-lf unexpectedly succeeded"
+[ -d "$internal_cleanup_remote" ] &&
+  [ -f "$internal_cleanup_remote/.meet-beta-recovery-owner" ] ||
+  fail "cleanup-internal-lf removed owned state"
+[ "$internal_cleanup_metadata" = "$(stat -c '%a:%u:%g:%h' \
+  "$internal_cleanup_remote")" ] ||
+  fail "cleanup-internal-lf changed root metadata"
+[ "$internal_cleanup_marker_metadata" = "$(stat -c '%a:%u:%g:%h' \
+  "$internal_cleanup_remote/.meet-beta-recovery-owner")" ] ||
+  fail "cleanup-internal-lf changed marker metadata"
+[ "$internal_cleanup_marker_digest" = "$(sha256sum \
+  "$internal_cleanup_remote/.meet-beta-recovery-owner")" ] ||
+  fail "cleanup-internal-lf changed marker bytes"
+rm -rf -- "$internal_cleanup_remote"
+
+printf -v direct_create_header 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
+  "$direct_remote" "$direct_token"
+direct_frame_case create-canonical create "$direct_create_header"
+direct_owned_root=$direct_remote
+[ -d "$direct_owned_root" ] || fail "canonical direct create did not create root"
+printf -v direct_cleanup_header 'meet-backend/beta-recovery-cleanup/v1|%s|%s\n' \
+  "$direct_remote" "$direct_token"
+direct_frame_case cleanup-canonical cleanup "$direct_cleanup_header" '' '' \
+  "$direct_owned_root"
+[ ! -e "$direct_owned_root" ] ||
+  fail "canonical direct cleanup did not remove owned root"
+
+for trailing_case in printable:20 nul:00 control:01 nonascii:c3; do
+  direct_case_name="cleanup-trailing-${trailing_case%%:*}"
+  suffix=${trailing_case##*:}
+  cleanup_case_root=$consumer_root/cases/direct-frame-$direct_case_name
+  rm -rf -- "$direct_remote"
+  mkdir -p "$direct_remote"
+  chmod 700 "$direct_remote"
+  printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
+    >"$direct_remote/.meet-beta-recovery-owner"
+  chmod 600 "$direct_remote/.meet-beta-recovery-owner"
+  printf -v cleanup_header 'meet-backend/beta-recovery-cleanup/v1|%s|%s\n' \
+    "$direct_remote" "$direct_token"
+  direct_frame_case "$direct_case_name" cleanup \
+    "$cleanup_header" "$suffix"
+  [ "$(<"$cleanup_case_root/status")" -ne 0 ] ||
+    fail "$direct_case_name unexpectedly succeeded"
+  [ -d "$direct_remote" ] &&
+    [ -f "$direct_remote/.meet-beta-recovery-owner" ] ||
+    fail "$direct_case_name removed owned state"
+  rm -r -- "$direct_remote"
+done
+
+binary_case=$consumer_root/cases/direct-frame-binary-payload
+mkdir -p "$binary_case/source"
+printf 'A\0B\n\303\251\001\177Z' >"$binary_case/source/payload"
+binary_length=$(stat -c '%s' "$binary_case/source/payload")
+binary_sha=$(sha256sum "$binary_case/source/payload" | awk '{print $1}')
+binary_remote=/tmp/beta-recovery-direct-binary
+rm -rf -- "$binary_remote"
+mkdir -p "$binary_remote"
+chmod 700 "$binary_remote"
+printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
+  >"$binary_remote/.meet-beta-recovery-owner"
+chmod 600 "$binary_remote/.meet-beta-recovery-owner"
+binary_identity=$(stat -Lc '%d:%i' "$binary_remote")
+printf -v binary_header \
+  'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s\n' \
+  "$binary_remote" "$binary_identity" "$direct_token" "$binary_sha" "$binary_length"
+direct_frame_case binary-payload receive "$binary_header" '' \
+  "$binary_case/source/payload" "$binary_remote"
+[ "$(<"$binary_case/status")" -eq 0 ] || fail "binary payload receive failed"
+[ -f "$binary_remote/age" ] ||
+  fail "binary payload target missing"
+cmp "$binary_case/source/payload" "$binary_remote/age" ||
+  fail "binary payload bytes changed"
+rm -r -- "$binary_remote"
+
+large_case=$consumer_root/cases/direct-frame-arg-max-payload
+large_remote=/tmp/beta-recovery-direct-arg-max
+rm -rf -- "$large_remote"
+mkdir -p "$large_case/source" "$large_remote"
+chmod 700 "$large_remote"
+printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
+  >"$large_remote/.meet-beta-recovery-owner"
+chmod 600 "$large_remote/.meet-beta-recovery-owner"
+large_payload=$large_case/source/age
+arg_max=$(getconf ARG_MAX)
+dd if=/dev/zero of="$large_payload" bs=1 count="$((arg_max + 1))" status=none
+large_length=$(stat -c '%s' "$large_payload")
+large_sha=$(sha256sum "$large_payload" | awk '{print $1}')
+large_identity=$(stat -Lc '%d:%i' "$large_remote")
+printf -v large_header \
+  'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s\n' \
+  "$large_remote" "$large_identity" "$direct_token" "$large_sha" "$large_length"
+direct_frame_case arg-max-payload receive "$large_header" '' \
+  "$large_payload" "$large_remote"
+[ "$(<"$large_case/status")" -eq 0 ] ||
+  fail "ARG_MAX-sized payload receive failed"
+cmp "$large_payload" "$large_remote/age" ||
+  fail "ARG_MAX-sized payload bytes changed"
+rm -r -- "$large_remote"
 
 run_capture_proof_case() {
   local name=$1 scenario=$2
@@ -1387,7 +1977,7 @@ run_capture_proof_case() {
   esac
   jq -cn \
     --arg db "$db_expected" --arg media "$media_expected" \
-    --arg uploads "$uploads_digest" \
+    --arg uploads "$uploads_digest" --arg id "$name" \
     '{
       capturedAt:"2026-09-01T00:00:00Z",
       ciphertexts:{
@@ -1399,7 +1989,7 @@ run_capture_proof_case() {
         database:{name:"capture-database-proof.json",sha256:$db},
         media:{name:"capture-media-proof.json",sha256:$media}
       },
-      recoveryId:"recovery-fixture",
+      recoveryId:$id,
       recoveryPointTime:"2026-09-01T00:00:00Z",
       schema:"meet-backend/beta-recovery-capture/v1",
       uploads:{bytes:23,digest:$uploads,files:1}
@@ -1439,7 +2029,8 @@ run_capture_proof_case() {
   : >"$case_dir/boundary.log"
   : >"$case_dir/effective.log"
   : >"$case_dir/effective.err"
-  remote_state=$case_dir/remote-root
+  remote_state=/tmp/beta-recovery-proof-$name
+  rm -rf -- "$remote_state"
   if [ "$scenario" = cleanup-failure ] ||
     [ "$scenario" = malformed-expected-cleanup ] ||
     [ "$scenario" = missing-expected-cleanup ]; then
@@ -1461,7 +2052,7 @@ run_capture_proof_case() {
       HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
       HOST_FINGERPRINT="$expected_fingerprint" SSH_PRIVATE_KEY=fixture-private-key \
       AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
-      PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
+      PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID="$name" \
       RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
       GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 \
       GITHUB_OUTPUT="$case_dir/output" \
@@ -1473,7 +2064,7 @@ run_capture_proof_case() {
       BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
       BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
       BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
-      BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+      BETA_RECOVERY_REMOTE="$remote_state" \
       BETA_RECOVERY_REMOTE_STATE="$remote_state" \
       BETA_RECOVERY_CAPTURE_SOURCE_DIR="$case_dir/remote-files" \
       BETA_RECOVERY_CAPTURE_FIXTURE=1 \
@@ -1557,6 +2148,7 @@ run_capture_proof_case() {
     [ ! -e "$remote_state" ] && [ ! -L "$remote_state" ] ||
       fail "proof case left remote staging after successful cleanup: $name"
   fi
+  rm -rf -- "$remote_state"
 }
 
 run_capture_proof_case capture-proof-matching matching

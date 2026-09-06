@@ -134,6 +134,311 @@ jobs:
           [ "$age_os" = Linux ] && [ "$age_arch" = x86_64 ]
           owner_token=$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')
           [[ "$owner_token" =~ ^[0-9a-f]{64}$ ]]
+          LC_ALL=C
+          frame_stdin() {
+            local header=$1 header_length prefix
+            header_length=${#header}
+            (( header_length >= 1 && header_length <= 4096 ))
+            printf -v prefix '%08x' "$header_length"
+            printf '%s%s' "$prefix" "$header"
+          }
+          create_program=$(cat <<'REMOTE_CREATE_PROGRAM'
+          set -euo pipefail
+          LC_ALL=C
+          umask 077
+          scratch=$(mktemp -d)
+          cleanup_parser_and_eof_probe() {
+            local status=$?
+            trap - EXIT HUP INT TERM
+            rm -rf -- "$scratch" || status=1
+            exit "$status"
+          }
+          trap cleanup_parser_and_eof_probe EXIT HUP INT TERM
+          read_frame() {
+            local prefix_file="$scratch/prefix" header_file="$scratch/header"
+            local header_body="$scratch/header-body" prefix_hex prefix_text header_hex header_body_hex
+            local header_length byte byte_value i newline_count
+            install -m 600 /dev/null "$prefix_file"
+            dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
+            [ "$(stat -c '%s' -- "$prefix_file")" -eq 8 ]
+            prefix_hex=$(od -An -v -tx1 "$prefix_file" | tr -d '[:space:]')
+            [ "${#prefix_hex}" -eq 16 ]
+            for ((i=0; i<${#prefix_hex}; i+=2)); do
+              byte=${prefix_hex:i:2}
+              byte_value=$((16#$byte))
+              (( (byte_value >= 48 && byte_value <= 57) ||
+                 (byte_value >= 97 && byte_value <= 102) ))
+            done
+            prefix_text=$(head -c 8 "$prefix_file")
+            [[ "$prefix_text" =~ ^[0-9a-f]{8}$ ]]
+            header_length=$((16#$prefix_text))
+            (( header_length >= 1 && header_length <= 4096 ))
+            install -m 600 /dev/null "$header_file"
+            dd iflag=fullblock bs=1 count="$header_length" status=none of="$header_file"
+            [ "$(stat -c '%s' -- "$header_file")" -eq "$header_length" ]
+            header_hex=$(od -An -v -tx1 "$header_file" | tr -d '[:space:]')
+            [ "${#header_hex}" -eq "$((header_length * 2))" ]
+            newline_count=0
+            for ((i=0; i<${#header_hex}; i+=2)); do
+              byte=${header_hex:i:2}
+              byte_value=$((16#$byte))
+              (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))
+              [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
+            done
+            header_body_hex=${header_hex:0:${#header_hex}-2}
+            [[ "$header_body_hex" != *0a* ]] || return 1
+            [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || return 1
+            head -c "$((header_length - 1))" "$header_file" >"$header_body"
+            header=$(<"$header_body")
+            IFS='|' read -r -a fields <<<"$header"
+            [ "${#fields[@]}" -eq 3 ]
+            [ "${fields[0]}" = meet-backend/beta-recovery-create/v1 ]
+            remote=${fields[1]}
+            token=${fields[2]}
+            [[ "$remote" =~ ^/tmp/beta-recovery-[A-Za-z0-9._-]{8,128}$ ]]
+            [[ "$token" =~ ^[0-9a-f]{64}$ ]]
+            probe="$scratch/eof-probe"
+            install -m 600 /dev/null "$probe"
+            dd iflag=fullblock bs=1 count=1 status=none of="$probe"
+            test ! -s "$probe"
+          }
+          read_frame
+          owner_uid=${SUDO_UID:?SUDO_UID is required}
+          owner_gid=${SUDO_GID:?SUDO_GID is required}
+          marker="$remote/.meet-beta-recovery-owner"
+          expected="$scratch/expected"
+          created=false
+          marker_published=false
+          cleanup_create() {
+            local status=$?
+            trap - EXIT HUP INT TERM
+            if [ "$created" = true ] && [ "$marker_published" = false ] &&
+              [ -d "$remote" ] && [ ! -L "$remote" ] &&
+              [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$owner_uid:$owner_gid" ]; then
+              rm -r -- "$remote" || status=1
+            fi
+            exit "$status"
+          }
+          trap cleanup_create EXIT HUP INT TERM
+          printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$token" >"$expected"
+          if [ -e "$remote" ] || [ -L "$remote" ]; then
+            [ -d "$remote" ] && [ ! -L "$remote" ]
+            [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$owner_uid:$owner_gid" ]
+            [ -f "$marker" ] && [ ! -L "$marker" ]
+            [ "$(stat -c '%a:%u:%g:%h' "$marker")" = "600:$owner_uid:$owner_gid:1" ]
+            cmp -- "$expected" "$marker" >/dev/null
+          else
+            mkdir -- "$remote"
+            chmod 700 "$remote"
+            chown "$owner_uid:$owner_gid" "$remote"
+            created=true
+            marker_tmp=$(mktemp "$remote/.meet-beta-recovery-owner.XXXXXX")
+            chmod 600 "$marker_tmp"
+            chown "$owner_uid:$owner_gid" "$marker_tmp"
+            cat "$expected" >"$marker_tmp"
+            mv -T -- "$marker_tmp" "$marker"
+            marker_published=true
+          fi
+          trap - EXIT HUP INT TERM
+          rm -rf -- "$scratch"
+          REMOTE_CREATE_PROGRAM
+          )
+          receive_program=$(cat <<'REMOTE_RECEIVE_PROGRAM'
+          set -euo pipefail
+          LC_ALL=C
+          umask 077
+          scratch=$(mktemp -d)
+          temp=
+          published=false
+          cleanup_receiver() {
+            local status=$?
+            trap - EXIT HUP INT TERM
+            if [ "$published" = false ] && [ -n "$temp" ] && [ -e "$temp" ]; then
+              rm -f -- "$temp" || status=1
+            fi
+            rm -rf -- "$scratch" || status=1
+            exit "$status"
+          }
+          trap cleanup_receiver EXIT HUP INT TERM
+          read_frame() {
+            local prefix_file="$scratch/prefix" header_file="$scratch/header"
+            local header_body="$scratch/header-body" prefix_hex prefix_text header_hex header_body_hex
+            local header_length byte byte_value i newline_count
+            install -m 600 /dev/null "$prefix_file"
+            dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
+            [ "$(stat -c '%s' -- "$prefix_file")" -eq 8 ]
+            prefix_hex=$(od -An -v -tx1 "$prefix_file" | tr -d '[:space:]')
+            [ "${#prefix_hex}" -eq 16 ]
+            for ((i=0; i<${#prefix_hex}; i+=2)); do
+              byte=${prefix_hex:i:2}
+              byte_value=$((16#$byte))
+              (( (byte_value >= 48 && byte_value <= 57) ||
+                 (byte_value >= 97 && byte_value <= 102) ))
+            done
+            prefix_text=$(head -c 8 "$prefix_file")
+            [[ "$prefix_text" =~ ^[0-9a-f]{8}$ ]]
+            header_length=$((16#$prefix_text))
+            (( header_length >= 1 && header_length <= 4096 ))
+            install -m 600 /dev/null "$header_file"
+            dd iflag=fullblock bs=1 count="$header_length" status=none of="$header_file"
+            [ "$(stat -c '%s' -- "$header_file")" -eq "$header_length" ]
+            header_hex=$(od -An -v -tx1 "$header_file" | tr -d '[:space:]')
+            [ "${#header_hex}" -eq "$((header_length * 2))" ]
+            newline_count=0
+            for ((i=0; i<${#header_hex}; i+=2)); do
+              byte=${header_hex:i:2}
+              byte_value=$((16#$byte))
+              (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))
+              [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
+            done
+            header_body_hex=${header_hex:0:${#header_hex}-2}
+            [[ "$header_body_hex" != *0a* ]] || return 1
+            [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || return 1
+            head -c "$((header_length - 1))" "$header_file" >"$header_body"
+            header=$(<"$header_body")
+            IFS='|' read -r -a fields <<<"$header"
+            [ "${#fields[@]}" -eq 8 ]
+            [ "${fields[0]}" = meet-backend/beta-recovery-file/v1 ]
+            remote=${fields[1]}
+            remote_identity=${fields[2]}
+            token=${fields[3]}
+            name=${fields[4]}
+            expected_sha=${fields[5]}
+            expected_mode=${fields[6]}
+            expected_length=${fields[7]}
+            [[ "$remote" =~ ^/tmp/beta-recovery-[A-Za-z0-9._-]{8,128}$ ]]
+            [[ "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]
+            [[ "$token" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$expected_mode" =~ ^[0-7]{3,4}$ ]]
+            case "$name" in
+              run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|\
+              production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|\
+              age|age-recipient) ;;
+              *) exit 1 ;;
+            esac
+            [[ "$expected_length" =~ ^[0-9]+$ ]]
+            (( expected_length > 0 && expected_length <= 9223372036854775806 ))
+          }
+          read_frame
+          owner_uid=${SUDO_UID:?SUDO_UID is required}
+          owner_gid=${SUDO_GID:?SUDO_GID is required}
+          marker="$remote/.meet-beta-recovery-owner"
+          expected="$scratch/expected"
+          printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$token" >"$expected"
+          exec {remote_fd}<"$remote"
+          [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
+          [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]
+          [ -f "$marker" ] && [ ! -L "$marker" ]
+          [ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "600:$owner_uid:$owner_gid:1" ]
+          cmp -- "$expected" "$marker" >/dev/null
+          target="/proc/$$/fd/$remote_fd/$name"
+          [ ! -e "$target" ] && [ ! -L "$target" ]
+          temp=$(mktemp "/proc/$$/fd/$remote_fd/.$name.XXXXXX")
+          dd iflag=fullblock bs=1 count="$((expected_length + 1))" status=none of="$temp"
+          test -s "$temp"
+          [ "$(stat -c '%s' -- "$temp")" -eq "$expected_length" ]
+          [ "$(sha256sum -- "$temp" | awk '{print $1}')" = "$expected_sha" ]
+          [ -f "$temp" ] && [ ! -L "$temp" ] && [ "$(stat -c '%h' -- "$temp")" -eq 1 ]
+          chmod "$expected_mode" -- "$temp"
+          chown "$owner_uid:$owner_gid" -- "$temp"
+          [ "$(stat -c '%a:%u:%g:%h' -- "$temp")" = "$expected_mode:$owner_uid:$owner_gid:1" ]
+          temp_identity=$(stat -Lc '%d:%i' -- "$temp")
+          ln -T -- "$temp" "$target"
+          published=true
+          rm -f -- "$temp"
+          final_identity=$(stat -Lc '%d:%i' -- "$target")
+          if [ "$final_identity" != "$temp_identity" ]; then
+            echo 'remote staging publication identity changed' >&2
+            exit 1
+          fi
+          [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c '%h' -- "$target")" -eq 1 ]
+          [ "$(stat -c '%s' -- "$target")" -eq "$expected_length" ]
+          [ "$(sha256sum -- "$target" | awk '{print $1}')" = "$expected_sha" ]
+          [ "$(stat -c '%a:%u:%g:%h' -- "$target")" = "$expected_mode:$owner_uid:$owner_gid:1" ]
+          REMOTE_RECEIVE_PROGRAM
+          )
+          cleanup_program=$(cat <<'REMOTE_CLEANUP_PROGRAM'
+          set -euo pipefail
+          LC_ALL=C
+          umask 077
+          scratch=$(mktemp -d)
+          cleanup_parser_and_eof_probe() {
+            local status=$?
+            trap - EXIT HUP INT TERM
+            rm -rf -- "$scratch" || status=1
+            exit "$status"
+          }
+          trap cleanup_parser_and_eof_probe EXIT HUP INT TERM
+          prefix_file="$scratch/prefix"
+          header_file="$scratch/header"
+          header_body="$scratch/header-body"
+          probe="$scratch/eof-probe"
+          install -m 600 /dev/null "$prefix_file"
+          dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
+          [ "$(stat -c '%s' -- "$prefix_file")" -eq 8 ]
+          prefix_hex=$(od -An -v -tx1 "$prefix_file" | tr -d '[:space:]')
+          [ "${#prefix_hex}" -eq 16 ]
+          for ((i=0; i<${#prefix_hex}; i+=2)); do
+            byte=${prefix_hex:i:2}
+            byte_value=$((16#$byte))
+            (( (byte_value >= 48 && byte_value <= 57) ||
+               (byte_value >= 97 && byte_value <= 102) ))
+          done
+          prefix_text=$(head -c 8 "$prefix_file")
+          [[ "$prefix_text" =~ ^[0-9a-f]{8}$ ]]
+          header_length=$((16#$prefix_text))
+          (( header_length >= 1 && header_length <= 4096 ))
+          install -m 600 /dev/null "$header_file"
+          dd iflag=fullblock bs=1 count="$header_length" status=none of="$header_file"
+          [ "$(stat -c '%s' -- "$header_file")" -eq "$header_length" ]
+          header_hex=$(od -An -v -tx1 "$header_file" | tr -d '[:space:]')
+          [ "${#header_hex}" -eq "$((header_length * 2))" ]
+          newline_count=0
+          for ((i=0; i<${#header_hex}; i+=2)); do
+            byte=${header_hex:i:2}
+            byte_value=$((16#$byte))
+            (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))
+            [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
+          done
+          header_body_hex=${header_hex:0:${#header_hex}-2}
+          [[ "$header_body_hex" != *0a* ]] || exit 1
+          [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || exit 1
+          head -c "$((header_length - 1))" "$header_file" >"$header_body"
+          header=$(<"$header_body")
+          IFS='|' read -r -a fields <<<"$header"
+          [ "${#fields[@]}" -eq 3 ]
+          [ "${fields[0]}" = meet-backend/beta-recovery-cleanup/v1 ]
+          remote=${fields[1]}
+          token=${fields[2]}
+          [[ "$remote" =~ ^/tmp/beta-recovery-[A-Za-z0-9._-]{8,128}$ ]]
+          [[ "$token" =~ ^[0-9a-f]{64}$ ]]
+          install -m 600 /dev/null "$probe"
+          dd iflag=fullblock bs=1 count=1 status=none of="$probe"
+          test ! -s "$probe"
+          owner_uid=${SUDO_UID:?SUDO_UID is required}
+          owner_gid=${SUDO_GID:?SUDO_GID is required}
+          if [ ! -e "$remote" ] && [ ! -L "$remote" ]; then
+            exit 0
+          fi
+          [ -d "$remote" ] && [ ! -L "$remote" ]
+          [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$owner_uid:$owner_gid" ]
+          marker="$remote/.meet-beta-recovery-owner"
+          [ -f "$marker" ] && [ ! -L "$marker" ]
+          [ "$(stat -c '%a:%u:%g:%h' "$marker")" = "600:$owner_uid:$owner_gid:1" ]
+          expected="$scratch/expected"
+          printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$token" >"$expected"
+          cmp -- "$expected" "$marker" >/dev/null
+          rm -r -- "$remote"
+          [ ! -e "$remote" ] && [ ! -L "$remote" ]
+          REMOTE_CLEANUP_PROGRAM
+          )
+          create_program_b64=$(printf '%s' "$create_program" | base64 --wrap=0)
+          receive_program_b64=$(printf '%s' "$receive_program" | base64 --wrap=0)
+          cleanup_program_b64=$(printf '%s' "$cleanup_program" | base64 --wrap=0)
+          create_remote_cmd=(sudo bash -c 'exec bash <(printf "%s" "$1" | base64 --decode)' -- "$create_program_b64")
+          receive_remote_cmd=(sudo bash -c 'exec bash <(printf "%s" "$1" | base64 --decode)' -- "$receive_program_b64")
+          cleanup_remote_cmd=(sudo bash -c 'exec bash <(printf "%s" "$1" | base64 --decode)' -- "$cleanup_program_b64")
           ssh_dir=
           recipient_file=
           remote_create_attempted=false
@@ -141,27 +446,11 @@ jobs:
           cleanup_remote() {
             [ "$remote_cleanup_done" = false ] || return 0
             remote_cleanup_done=true
-            ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
-              "$remote" "$owner_token" <<'CLEANUP'
-          set -euo pipefail
-          remote=$1
-          token=$2
-          [[ "$remote" =~ ^/tmp/beta-recovery-[A-Za-z0-9._-]{8,128}$ ]]
-          if [ ! -e "$remote" ] && [ ! -L "$remote" ]; then
-            exit 0
-          fi
-          [ -d "$remote" ] && [ ! -L "$remote" ]
-          [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$SUDO_UID:$SUDO_GID" ]
-          marker="$remote/.meet-beta-recovery-owner"
-          [ -f "$marker" ] && [ ! -L "$marker" ]
-          [ "$(stat -c '%a:%u:%g:%h' "$marker")" = "600:$SUDO_UID:$SUDO_GID:1" ]
-          expected=$(mktemp)
-          trap 'rm -f -- "$expected"' EXIT HUP INT TERM
-          printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$token" >"$expected"
-          cmp -- "$expected" "$marker" >/dev/null
-          rm -r -- "$remote"
-          [ ! -e "$remote" ] && [ ! -L "$remote" ]
-          CLEANUP
+            cleanup_header=
+            printf -v cleanup_header 'meet-backend/beta-recovery-cleanup/v1|%s|%s\n' \
+              "$remote" "$owner_token"
+            frame_stdin "$cleanup_header" |
+              ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "${cleanup_remote_cmd[@]}"
           }
           cleanup_capture() {
             local status=$1
@@ -198,112 +487,42 @@ jobs:
           install -m 600 /dev/null "$recipient_file"
           printf '%s\n' "$AGE_RECIPIENT" >"$recipient_file"
           remote_create_attempted=true
-          ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
-            "$remote" "$owner_token" <<'REMOTE_CREATE'
-          set -euo pipefail
-          remote=$1
-          token=$2
-          [[ "$remote" =~ ^/tmp/beta-recovery-[A-Za-z0-9._-]{8,128}$ ]]
-          owner_uid=${SUDO_UID:?SUDO_UID is required}
-          owner_gid=${SUDO_GID:?SUDO_GID is required}
-          marker="$remote/.meet-beta-recovery-owner"
-          expected=$(mktemp)
-          created=false
-          marker_published=false
-          cleanup_create() {
-            local status=$?
-            trap - EXIT HUP INT TERM
-            if [ "$created" = true ] && [ "$marker_published" = false ] &&
-              [ -d "$remote" ] && [ ! -L "$remote" ] &&
-              [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$owner_uid:$owner_gid" ]; then
-              rm -r -- "$remote" || status=1
-            fi
-            rm -f -- "$expected" || status=1
-            exit "$status"
-          }
-          trap 'cleanup_create' EXIT HUP INT TERM
-          printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$token" >"$expected"
-          if [ -e "$remote" ] || [ -L "$remote" ]; then
-            [ -d "$remote" ] && [ ! -L "$remote" ] || exit 1
-            [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$owner_uid:$owner_gid" ] || exit 1
-            [ -f "$marker" ] && [ ! -L "$marker" ] || exit 1
-            [ "$(stat -c '%a:%u:%g:%h' "$marker")" = "600:$owner_uid:$owner_gid:1" ] || exit 1
-            cmp -- "$expected" "$marker" >/dev/null || exit 1
-          else
-            mkdir -- "$remote"
-            chmod 700 "$remote"
-            chown "$owner_uid:$owner_gid" "$remote"
-            created=true
-            marker_tmp=$(mktemp "$remote/.meet-beta-recovery-owner.XXXXXX")
-            chmod 600 "$marker_tmp"
-            chown "$owner_uid:$owner_gid" "$marker_tmp"
-            cat "$expected" >"$marker_tmp"
-            mv -T -- "$marker_tmp" "$marker"
-            marker_published=true
-          fi
-          rm -f -- "$expected"
-          trap - EXIT HUP INT TERM
-          REMOTE_CREATE
+          create_header=
+          printf -v create_header 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
+            "$remote" "$owner_token"
+          frame_stdin "$create_header" |
+            ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "${create_remote_cmd[@]}"
           remote_identity=$(ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
-            "$remote" "$owner_token" <<'REMOTE_IDENTITY'
+            "$remote" <<'REMOTE_IDENTITY'
           set -euo pipefail
           remote=$1
-          token=$2
           [[ "$remote" =~ ^/tmp/beta-recovery-[A-Za-z0-9._-]{8,128}$ ]]
-          [[ "$token" =~ ^[0-9a-f]{64}$ ]]
           stat -c '%d:%i' -- "$remote"
           REMOTE_IDENTITY
           )
           [[ "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]
           send_capture_file() {
-            local source=$1 name=$2 mode digest payload
+            local source=$1 name=$2 mode digest payload_length receive_header
+            [ -f "$source" ] && [ ! -L "$source" ] && [ -r "$source" ]
+            case "$name" in
+              run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|\
+              production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|\
+              age|age-recipient) ;;
+              *) return 1 ;;
+            esac
             mode=$(stat -c '%a' -- "$source")
             digest=$(sha256sum -- "$source" | awk '{print $1}')
-            payload=$(base64 --wrap=0 -- "$source")
-            ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
+            payload_length=$(stat -c '%s' -- "$source")
+            [[ "$payload_length" =~ ^[0-9]+$ ]] && (( payload_length > 0 ))
+            (( payload_length <= 9223372036854775806 ))
+            printf -v receive_header \
+              'meet-backend/beta-recovery-file/v1|%s|%s|%s|%s|%s|%s|%s\n' \
               "$remote" "$remote_identity" "$owner_token" "$name" "$digest" "$mode" \
-              "$payload" <<'REMOTE_RECEIVE'
-          set -euo pipefail
-          remote=$1
-          remote_identity=$2
-          token=$3
-          name=$4
-          expected_sha=$5
-          expected_mode=$6
-          payload=$7
-          [[ "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]
-          [[ "$token" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$expected_mode" =~ ^[0-7]{3,4}$ ]]
-          case "$name" in
-            run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|\
-            production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|\
-            age|age-recipient) ;;
-            *) exit 1 ;;
-          esac
-          owner_uid=${SUDO_UID:?SUDO_UID is required}
-          owner_gid=${SUDO_GID:?SUDO_GID is required}
-          marker="$remote/.meet-beta-recovery-owner"
-          expected=$(mktemp)
-          trap 'rm -f -- "$expected"' EXIT HUP INT TERM
-          printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$token" >"$expected"
-          exec {remote_fd}<"$remote"
-          [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$remote_fd")" = "$remote_identity" ]
-          [ "$(stat -c '%a:%u:%g' -- "$remote")" = "700:$owner_uid:$owner_gid" ]
-          [ -f "$marker" ] && [ ! -L "$marker" ]
-          [ "$(stat -c '%a:%u:%g:%h' -- "$marker")" = "600:$owner_uid:$owner_gid:1" ]
-          cmp -- "$expected" "$marker" >/dev/null
-          target="/proc/$$/fd/$remote_fd/$name"
-          [ ! -e "$target" ] && [ ! -L "$target" ]
-          temp=$(mktemp "/proc/$$/fd/$remote_fd/.$name.XXXXXX")
-          chmod "$expected_mode" -- "$temp"
-          printf '%s' "$payload" | base64 --decode >"$temp"
-          [ "$(sha256sum -- "$temp" | awk '{print $1}')" = "$expected_sha" ]
-          [ "$(stat -c '%a' -- "$temp")" = "$expected_mode" ]
-          chown "$owner_uid:$owner_gid" -- "$temp"
-          ln -T -- "$temp" "$target"
-          rm -f -- "$temp"
-          REMOTE_RECEIVE
+              "$payload_length"
+            {
+              frame_stdin "$receive_header"
+              cat -- "$source"
+            } | ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "${receive_remote_cmd[@]}"
           }
           send_capture_file scripts/run-beta-recovery-capture.sh run-beta-recovery-capture.sh
           send_capture_file scripts/backup-production.sh backup-production.sh
