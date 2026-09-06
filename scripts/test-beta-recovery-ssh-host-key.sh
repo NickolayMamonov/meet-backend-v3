@@ -1494,8 +1494,8 @@ for signal in HUP INT TERM; do
 done
 run_consumer_case capture-TERM-remote-cleanup-failure "$capture_body" TERM ssh 1
 run_consumer_case capture-ambiguous-create "$capture_body" HUP ssh 0 ambiguous
-run_consumer_case capture-collision-absent-marker "$capture_body" HUP ssh 0 collision-absent
-run_consumer_case capture-collision-mismatched-marker "$capture_body" HUP ssh 0 collision-mismatch
+run_consumer_case capture-collision-absent-marker "$capture_body" '' '' 0 collision-absent
+run_consumer_case capture-collision-mismatched-marker "$capture_body" '' '' 0 collision-mismatch
 
 assert_framed_runtime_contract() {
   local workflow_file=$root/.github/workflows/prove-beta-backup-restore.yml
