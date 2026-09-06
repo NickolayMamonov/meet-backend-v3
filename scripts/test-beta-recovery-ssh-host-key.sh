@@ -1644,9 +1644,9 @@ assert_malformed_direct_case() {
   local case_dir=$consumer_root/cases/direct-frame-$1
   local event
   case "$operation" in
-    create) event=remote-create ;;
-    receive) event=remote-receive ;;
-    cleanup) event=remote-cleanup ;;
+    create) event='remote-create' ;;
+    receive) event='remote-receive' ;;
+    cleanup) event='remote-cleanup' ;;
     *) fail "unknown malformed direct operation: $operation" ;;
   esac
   [ "$(<"$case_dir/status")" -ne 0 ] ||
@@ -1699,8 +1699,8 @@ run_malformed_direct_case() {
   local name="$operation-malformed-$kind${state:+-$state}"
   local case_dir=$consumer_root/cases/direct-frame-$name
   local raw=$case_dir/raw-header remote=/tmp/beta-recovery-direct-$name
-  local prefix_override= canonical short_token payload payload_length payload_sha
-  local marker_token=$direct_token before_root= before_marker=
+  local prefix_override='' canonical short_token payload payload_length payload_sha
+  local marker_token=$direct_token before_root='' before_marker=''
   rm -rf -- "$remote"
   mkdir -p "$case_dir"
   case "$operation" in
