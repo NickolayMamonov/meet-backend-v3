@@ -1023,7 +1023,6 @@ write_wrapper "$consumer_bin/ssh" \
   '  [ "${args[command_start+4]:-}" = -- ] && [ -n "${args[command_start+5]:-}" ]; then' \
   '  frame_input=$(mktemp)' \
   '  cat >"$frame_input"' \
-  '  printf "framed-input-size-%s\n" "$(stat -c "%s" "$frame_input")" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '  exec <"$frame_input"' \
   'fi' \
   '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" </dev/null >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
@@ -1088,7 +1087,6 @@ write_wrapper "$consumer_bin/ssh" \
   '    IFS="|" read -r -a fields <<<"$header"' \
   '  }' \
   '  if ! read_frame; then printf "framed-read-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
-  '  printf "framed-read-ok\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '  token=$(<"${BETA_RECOVERY_TOKEN_ORACLE:?}")' \
   '  case "$operation" in' \
   '    create)' \
@@ -1097,8 +1095,7 @@ write_wrapper "$consumer_bin/ssh" \
   '      [[ "$frame_token" = "$token" ]] || { printf "framed-token-mismatch\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; }' \
   '      probe="$frame_dir/eof-probe"; install -m 600 /dev/null "$probe"' \
   '      dd iflag=fullblock bs=1 count=1 status=none of="$probe"' \
-  '      probe_size=$(stat -c "%s" "$probe"); printf "framed-create-eof-size-%s\n" "$probe_size" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  '      test "$probe_size" -eq 0 || { printf "framed-create-eof-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; }' \
+  '      test ! -s "$probe"' \
   '      printf "remote-create\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '      if [ -e "$remote_state" ] || [ -L "$remote_state" ]; then' \
   '        [ -d "$remote_state" ] && [ ! -L "$remote_state" ]' \
@@ -1115,24 +1112,23 @@ write_wrapper "$consumer_bin/ssh" \
   '      [ "${#fields[@]}" -eq 8 ] && [ "${fields[0]}" = meet-backend/beta-recovery-file/v1 ]' \
   '      remote=${fields[1]}; remote_identity=${fields[2]}; frame_token=${fields[3]}' \
   '      name=${fields[4]}; expected_sha=${fields[5]}; expected_mode=${fields[6]}; expected_length=${fields[7]}' \
-  '      printf "framed-receive-fields-%s-meta-%s-%s-%s\n" "${#fields[@]}" "$name" "$expected_mode" "$expected_length" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  '      printf "framed-receive-stage-token\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [[ "$frame_token" = "$token" && "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]' \
-  '      printf "framed-receive-stage-format\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$expected_length" =~ ^[0-9]+$ ]]' \
-  '      printf "framed-receive-stage-name\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; case "$name" in run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|age|age-recipient) ;; *) exit 1 ;; esac' \
-  '      printf "framed-receive-stage-length\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; (( expected_length > 0 && expected_length <= 9223372036854775806 ))' \
-  '      printf "framed-receive-stage-root\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ -d "$remote_state" ] && [ -f "$remote_state/.meet-beta-recovery-owner" ]' \
-  '      printf "framed-receive-stage-owner\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; if [ "$(<"$remote_state/.meet-beta-recovery-owner")" = "meet-backend/beta-recovery-owner/v1:$token" ]; then printf "framed-receive-owner-match\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else printf "framed-receive-owner-mismatch\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
+  '      [[ "$frame_token" = "$token" && "$remote_identity" =~ ^[0-9]+:[0-9]+$ ]]' \
+  '      [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$expected_length" =~ ^[0-9]+$ ]]' \
+  '      case "$name" in run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|age|age-recipient) ;; *) exit 1 ;; esac' \
+  '      (( expected_length > 0 && expected_length <= 9223372036854775806 ))' \
+  '      [ -d "$remote_state" ] && [ -f "$remote_state/.meet-beta-recovery-owner" ]' \
+  '      [ "$(<"$remote_state/.meet-beta-recovery-owner")" = "meet-backend/beta-recovery-owner/v1:$token" ]' \
   '      owner_uid=${SUDO_UID:-$(id -u)}; owner_gid=${SUDO_GID:-$(id -g)}' \
-  '      actual_identity=$(stat -Lc "%d:%i" "$remote_state"); if [ "$remote_identity" = 1:1 ] || [ "$actual_identity" = "$remote_identity" ]; then printf "framed-receive-identity-match\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else printf "framed-receive-identity-mismatch\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
-  '      printf "framed-receive-stage-target\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; target="$remote_state/$name"; [ ! -e "$target" ] && [ ! -L "$target" ]' \
-  '      printf "framed-receive-stage-payload\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; payload="$frame_dir/payload"; install -m 600 /dev/null "$payload"' \
-  '      printf "framed-receive-stage-read\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; dd iflag=fullblock bs=1 count="$((expected_length + 1))" status=none of="$payload"' \
-  '      printf "framed-receive-stage-size\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(stat -c "%s" "$payload")" -eq "$expected_length" ]' \
-  '      printf "framed-receive-stage-sha\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(sha256sum "$payload" | awk "{print \$1}")" = "$expected_sha" ]' \
-  '      printf "framed-receive-stage-chmod\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; chmod "$expected_mode" -- "$payload"; temp_identity=$(stat -Lc "%d:%i" "$payload")' \
-  '      printf "framed-receive-stage-link\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; link_error="$frame_dir/link-error"; if ln -T -- "$payload" "$target" 2>"$link_error"; then printf "framed-receive-link-ok\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else link_class=other; grep -Fq "File exists" "$link_error" && link_class=exists; grep -Fq "Invalid cross-device link" "$link_error" && link_class=xdev; grep -Fq "Permission denied" "$link_error" && link_class=permission; printf "framed-receive-link-fail-%s\n" "$link_class" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi; if rm -f -- "$payload"; then printf "framed-receive-rm-ok\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; else printf "framed-receive-rm-fail\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 1; fi' \
-  '      printf "framed-receive-stage-type\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c "%h" "$target")" -eq 1 ]' \
-  '      printf "framed-receive-stage-mode\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; [ "$(stat -c "%a:%u:%g:%h" "$target")" = "$expected_mode:$owner_uid:$owner_gid:1" ]' \
+  '      [ "$remote_identity" = 1:1 ] || [ "$(stat -Lc "%d:%i" "$remote_state")" = "$remote_identity" ]' \
+  '      target="$remote_state/$name"; [ ! -e "$target" ] && [ ! -L "$target" ]' \
+  '      payload="$frame_dir/payload"; install -m 600 /dev/null "$payload"' \
+  '      dd iflag=fullblock bs=1 count="$((expected_length + 1))" status=none of="$payload"' \
+  '      [ "$(stat -c "%s" "$payload")" -eq "$expected_length" ]' \
+  '      [ "$(sha256sum "$payload" | awk "{print \$1}")" = "$expected_sha" ]' \
+  '      chmod "$expected_mode" -- "$payload"; temp_identity=$(stat -Lc "%d:%i" "$payload")' \
+  '      ln -T -- "$payload" "$target"; rm -f -- "$payload"' \
+  '      [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c "%h" "$target")" -eq 1 ]' \
+  '      [ "$(stat -c "%a:%u:%g:%h" "$target")" = "$expected_mode:$owner_uid:$owner_gid:1" ]' \
   '      printf "remote-receive\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '      if [ "${BETA_RECOVERY_REPLACE_AFTER_LINK:-0}" = 1 ]; then' \
   '        replacement="$frame_dir/replacement"; cp -- "$target" "$replacement"; chmod "$expected_mode" -- "$replacement"; rm -f -- "$target"; mv -T -- "$replacement" "$target"' \
@@ -1612,7 +1608,6 @@ direct_frame_case() {
   else
     : >"$suffix_file"
   fi
-  printf 'direct-input-suffix-size=%s\n' "$(stat -c '%s' "$suffix_file")" >>"$case_dir/boundary.log"
   printf '%s' "$program" | base64 --wrap=0 >"$case_dir/program.b64"
   frame_stdin() {
     printf '%s' "$prefix"
@@ -1625,6 +1620,7 @@ direct_frame_case() {
     PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
     HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
     BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+    BETA_RECOVERY_REAL_LN="$(command -v ln)" \
     BETA_RECOVERY_REAL_RM="$real_rm" \
     BETA_RECOVERY_TOKEN_ORACLE="$token_oracle" \
     BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
@@ -1676,12 +1672,7 @@ printf -v direct_create_header 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
   "$direct_remote" "$direct_token"
 direct_frame_case create-canonical create "$direct_create_header"
 direct_owned_root=$consumer_root/cases/direct-frame-create-canonical/remote-root
-if [ ! -d "$direct_owned_root" ]; then
-  printf 'consumer create-canonical direct-frame events:\n' >&2
-  grep -E '^(direct-input|framed-input|ssh-call|argv-scan|argv-rejected|effective-|framed-|remote-|local-|helper-)' \
-    "$consumer_root/cases/direct-frame-create-canonical/boundary.log" >&2 || true
-  fail "canonical direct create did not create root"
-fi
+[ -d "$direct_owned_root" ] || fail "canonical direct create did not create root"
 printf -v direct_cleanup_header 'meet-backend/beta-recovery-cleanup/v1|%s|%s\n' \
   "$direct_remote" "$direct_token"
 direct_frame_case cleanup-canonical cleanup "$direct_cleanup_header" '' '' \
@@ -1728,13 +1719,7 @@ printf -v binary_header \
 direct_frame_case binary-payload receive "$binary_header" '' \
   "$binary_case/source/payload" "$binary_remote"
 binary_case_root=$consumer_root/cases/direct-frame-binary-payload
-if [ "$(<"$binary_case/status")" -ne 0 ]; then
-  printf 'consumer binary-payload direct-frame events (status=%s):\n' \
-    "$(<"$binary_case/status")" >&2
-  grep -E '^(direct-input|framed-input|ssh-call|argv-scan|argv-rejected|effective-|framed-|remote-|local-|helper-)' \
-    "$binary_case/boundary.log" >&2 || true
-  fail "binary payload receive failed"
-fi
+[ "$(<"$binary_case/status")" -eq 0 ] || fail "binary payload receive failed"
 [ -f "$binary_case_root/remote-root/age" ] ||
   fail "binary payload target missing"
 cmp "$binary_case/source/payload" "$binary_case_root/remote-root/age" ||
