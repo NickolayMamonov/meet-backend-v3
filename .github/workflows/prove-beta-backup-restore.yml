@@ -156,7 +156,7 @@ jobs:
           trap cleanup_parser_and_eof_probe EXIT HUP INT TERM
           read_frame() {
             local prefix_file="$scratch/prefix" header_file="$scratch/header"
-            local header_body="$scratch/header-body" prefix_hex prefix_text header_hex
+            local header_body="$scratch/header-body" prefix_hex prefix_text header_hex header_body_hex
             local header_length byte byte_value i newline_count
             install -m 600 /dev/null "$prefix_file"
             dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
@@ -185,6 +185,8 @@ jobs:
               (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))
               [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
             done
+            header_body_hex=${header_hex:0:${#header_hex}-2}
+            [[ "$header_body_hex" != *0a* ]] || exit 1
             [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || exit 1
             head -c "$((header_length - 1))" "$header_file" >"$header_body"
             header=$(<"$header_body")
@@ -260,7 +262,7 @@ jobs:
           trap cleanup_receiver EXIT HUP INT TERM
           read_frame() {
             local prefix_file="$scratch/prefix" header_file="$scratch/header"
-            local header_body="$scratch/header-body" prefix_hex prefix_text header_hex
+            local header_body="$scratch/header-body" prefix_hex prefix_text header_hex header_body_hex
             local header_length byte byte_value i newline_count
             install -m 600 /dev/null "$prefix_file"
             dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
@@ -289,6 +291,8 @@ jobs:
               (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))
               [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
             done
+            header_body_hex=${header_hex:0:${#header_hex}-2}
+            [[ "$header_body_hex" != *0a* ]] || exit 1
             [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || exit 1
             head -c "$((header_length - 1))" "$header_file" >"$header_body"
             header=$(<"$header_body")
@@ -397,6 +401,8 @@ jobs:
             (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))
             [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
           done
+          header_body_hex=${header_hex:0:${#header_hex}-2}
+          [[ "$header_body_hex" != *0a* ]] || exit 1
           [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || exit 1
           head -c "$((header_length - 1))" "$header_file" >"$header_body"
           header=$(<"$header_body")

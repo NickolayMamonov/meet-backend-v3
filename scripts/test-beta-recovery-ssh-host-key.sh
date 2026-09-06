@@ -1059,7 +1059,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  fi' \
   '  read_frame() {' \
   '    local prefix="$frame_dir/prefix" header_file="$frame_dir/header"' \
-  '    local prefix_hex prefix_text header_hex header_length byte byte_value i newline_count' \
+  '    local prefix_hex prefix_text header_hex header_body_hex header_length byte byte_value i newline_count' \
   '    install -m 600 /dev/null "$prefix"' \
   '    dd iflag=fullblock bs=1 count=8 status=none of="$prefix"' \
   '    [ "$(stat -c "%s" "$prefix")" -eq 8 ]' \
@@ -1084,6 +1084,8 @@ write_wrapper "$consumer_bin/ssh" \
   '      (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))' \
   '      [ "$byte" = 0a ] && newline_count=$((newline_count + 1))' \
   '    done' \
+  '    header_body_hex=${header_hex:0:${#header_hex}-2}' \
+  '    [[ "$header_body_hex" != *0a* ]]' \
   '    [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]]' \
   '    header=$(head -c "$((header_length - 1))" "$header_file")' \
   '    IFS="|" read -r -a fields <<<"$header"' \
@@ -1647,6 +1649,13 @@ direct_frame_case() {
 
 direct_token=$(<"$token_oracle")
 direct_remote=/tmp/beta-recovery-direct-frame
+assert_internal_lf_header() {
+  local header=$1
+  [ "$(printf '%s' "$header" | od -An -v -tx1 |
+    awk '{ for (i = 1; i <= NF; i++) if ($i == "0a") count++ }
+         END { print count + 0 }')" -eq 2 ] ||
+    fail "internal-LF fixture does not contain exactly two header LF bytes"
+}
 for trailing_case in printable:20 nul:00 control:01 nonascii:c3; do
   direct_case_name="create-trailing-${trailing_case%%:*}"
   suffix=${trailing_case##*:}
@@ -1672,6 +1681,7 @@ done
 
 printf -v internal_create_header 'meet-backend/beta-recovery-create/v1|%s|%s\ninternal\n' \
   "$direct_remote" "$direct_token"
+assert_internal_lf_header "$internal_create_header"
 direct_frame_case create-internal-lf create "$internal_create_header"
 internal_create_case=$consumer_root/cases/direct-frame-create-internal-lf
 [ "$(<"$internal_create_case/status")" -ne 0 ] ||
@@ -1693,6 +1703,7 @@ printf -v internal_receive_header \
   'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s\ninternal\n' \
   "$direct_remote" "$internal_receive_identity" "$direct_token" \
   "$internal_receive_sha" "$internal_receive_length"
+assert_internal_lf_header "$internal_receive_header"
 direct_frame_case receive-internal-lf receive "$internal_receive_header" '' \
   "$internal_receive_case/source/payload" "$internal_receive_case/remote-root"
 [ "$(<"$internal_receive_case/status")" -ne 0 ] ||
@@ -1716,6 +1727,7 @@ internal_cleanup_marker_digest=$(sha256sum \
 printf -v internal_cleanup_header \
   'meet-backend/beta-recovery-cleanup/v1|%s|%s\ninternal\n' \
   "$direct_remote" "$direct_token"
+assert_internal_lf_header "$internal_cleanup_header"
 direct_frame_case cleanup-internal-lf cleanup "$internal_cleanup_header" '' '' \
   "$internal_cleanup_case/remote-root"
 [ "$(<"$internal_cleanup_case/status")" -ne 0 ] ||

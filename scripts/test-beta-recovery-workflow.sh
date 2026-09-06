@@ -131,6 +131,10 @@ assert_control_program(){
     { echo "$label parser does not count header LF bytes" >&2; exit 1; }
   grep -Fq 'newline_count=$((newline_count + 1))' <<<"$program" ||
     { echo "$label parser does not reject internal header LF bytes" >&2; exit 1; }
+  grep -Fq 'header_body_hex=${header_hex:0:${#header_hex}-2}' <<<"$program" ||
+    { echo "$label parser does not isolate the final header LF" >&2; exit 1; }
+  grep -Fq '[[ "$header_body_hex" != *0a* ]]' <<<"$program" ||
+    { echo "$label parser does not reject LF before the final header byte" >&2; exit 1; }
   grep -Fq '[ "$newline_count" -eq 1 ]' <<<"$program" ||
     { echo "$label parser does not require exactly one header LF" >&2; exit 1; }
   grep -Eq 'header_length.*(4096|4[[:space:]]*\\*\\*?[[:space:]]*3)' <<<"$program" ||
