@@ -186,8 +186,8 @@ jobs:
               [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
             done
             header_body_hex=${header_hex:0:${#header_hex}-2}
-            [[ "$header_body_hex" != *0a* ]] || exit 1
-            [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || exit 1
+            [[ "$header_body_hex" != *0a* ]] || return 1
+            [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || return 1
             head -c "$((header_length - 1))" "$header_file" >"$header_body"
             header=$(<"$header_body")
             IFS='|' read -r -a fields <<<"$header"
@@ -292,8 +292,8 @@ jobs:
               [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
             done
             header_body_hex=${header_hex:0:${#header_hex}-2}
-            [[ "$header_body_hex" != *0a* ]] || exit 1
-            [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || exit 1
+            [[ "$header_body_hex" != *0a* ]] || return 1
+            [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || return 1
             head -c "$((header_length - 1))" "$header_file" >"$header_body"
             header=$(<"$header_body")
             IFS='|' read -r -a fields <<<"$header"
