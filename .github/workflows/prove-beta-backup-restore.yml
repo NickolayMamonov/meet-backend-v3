@@ -157,7 +157,7 @@ jobs:
           read_frame() {
             local prefix_file="$scratch/prefix" header_file="$scratch/header"
             local header_body="$scratch/header-body" prefix_hex prefix_text header_hex
-            local header_length byte byte_value i
+            local header_length byte byte_value i newline_count
             install -m 600 /dev/null "$prefix_file"
             dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
             [ "$(stat -c '%s' -- "$prefix_file")" -eq 8 ]
@@ -178,12 +178,14 @@ jobs:
             [ "$(stat -c '%s' -- "$header_file")" -eq "$header_length" ]
             header_hex=$(od -An -v -tx1 "$header_file" | tr -d '[:space:]')
             [ "${#header_hex}" -eq "$((header_length * 2))" ]
+            newline_count=0
             for ((i=0; i<${#header_hex}; i+=2)); do
               byte=${header_hex:i:2}
               byte_value=$((16#$byte))
               (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))
+              [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
             done
-            [[ "$header_hex" == *0a ]] || exit 1
+            [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || exit 1
             head -c "$((header_length - 1))" "$header_file" >"$header_body"
             header=$(<"$header_body")
             IFS='|' read -r -a fields <<<"$header"
@@ -259,7 +261,7 @@ jobs:
           read_frame() {
             local prefix_file="$scratch/prefix" header_file="$scratch/header"
             local header_body="$scratch/header-body" prefix_hex prefix_text header_hex
-            local header_length byte byte_value i
+            local header_length byte byte_value i newline_count
             install -m 600 /dev/null "$prefix_file"
             dd iflag=fullblock bs=1 count=8 status=none of="$prefix_file"
             [ "$(stat -c '%s' -- "$prefix_file")" -eq 8 ]
@@ -280,12 +282,14 @@ jobs:
             [ "$(stat -c '%s' -- "$header_file")" -eq "$header_length" ]
             header_hex=$(od -An -v -tx1 "$header_file" | tr -d '[:space:]')
             [ "${#header_hex}" -eq "$((header_length * 2))" ]
+            newline_count=0
             for ((i=0; i<${#header_hex}; i+=2)); do
               byte=${header_hex:i:2}
               byte_value=$((16#$byte))
               (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))
+              [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
             done
-            [[ "$header_hex" == *0a ]] || exit 1
+            [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || exit 1
             head -c "$((header_length - 1))" "$header_file" >"$header_body"
             header=$(<"$header_body")
             IFS='|' read -r -a fields <<<"$header"
@@ -386,12 +390,14 @@ jobs:
           [ "$(stat -c '%s' -- "$header_file")" -eq "$header_length" ]
           header_hex=$(od -An -v -tx1 "$header_file" | tr -d '[:space:]')
           [ "${#header_hex}" -eq "$((header_length * 2))" ]
+          newline_count=0
           for ((i=0; i<${#header_hex}; i+=2)); do
             byte=${header_hex:i:2}
             byte_value=$((16#$byte))
             (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))
+            [ "$byte" = 0a ] && newline_count=$((newline_count + 1))
           done
-          [[ "$header_hex" == *0a ]] || exit 1
+          [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]] || exit 1
           head -c "$((header_length - 1))" "$header_file" >"$header_body"
           header=$(<"$header_body")
           IFS='|' read -r -a fields <<<"$header"

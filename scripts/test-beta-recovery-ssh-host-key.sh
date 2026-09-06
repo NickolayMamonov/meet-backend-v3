@@ -1059,7 +1059,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  fi' \
   '  read_frame() {' \
   '    local prefix="$frame_dir/prefix" header_file="$frame_dir/header"' \
-  '    local prefix_hex prefix_text header_hex header_length byte byte_value i' \
+  '    local prefix_hex prefix_text header_hex header_length byte byte_value i newline_count' \
   '    install -m 600 /dev/null "$prefix"' \
   '    dd iflag=fullblock bs=1 count=8 status=none of="$prefix"' \
   '    [ "$(stat -c "%s" "$prefix")" -eq 8 ]' \
@@ -1078,11 +1078,13 @@ write_wrapper "$consumer_bin/ssh" \
   '    [ "$(stat -c "%s" "$header_file")" -eq "$header_length" ]' \
   '    header_hex=$(od -An -v -tx1 "$header_file" | tr -d "[:space:]")' \
   '    [ "${#header_hex}" -eq "$((header_length * 2))" ]' \
+  '    newline_count=0' \
   '    for ((i=0; i<${#header_hex}; i+=2)); do' \
   '      byte=${header_hex:i:2}; byte_value=$((16#$byte))' \
   '      (( byte_value == 10 || (byte_value >= 32 && byte_value <= 126) ))' \
+  '      [ "$byte" = 0a ] && newline_count=$((newline_count + 1))' \
   '    done' \
-  '    [[ "$header_hex" == *0a ]]' \
+  '    [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]]' \
   '    header=$(head -c "$((header_length - 1))" "$header_file")' \
   '    IFS="|" read -r -a fields <<<"$header"' \
   '  }' \
@@ -1667,6 +1669,69 @@ for trailing_case in printable:20 nul:00 control:01 nonascii:c3; do
   [ "$(<"$consumer_root/cases/direct-frame-$direct_case_name-cleanup/status")" -eq 0 ] ||
     fail "$direct_case_name cleanup did not accept absent root"
 done
+
+printf -v internal_create_header 'meet-backend/beta-recovery-create/v1|%s|%s\ninternal\n' \
+  "$direct_remote" "$direct_token"
+direct_frame_case create-internal-lf create "$internal_create_header"
+internal_create_case=$consumer_root/cases/direct-frame-create-internal-lf
+[ "$(<"$internal_create_case/status")" -ne 0 ] ||
+  fail "create-internal-lf unexpectedly succeeded"
+[ ! -e "$internal_create_case/remote-root" ] && [ ! -L "$internal_create_case/remote-root" ] ||
+  fail "create-internal-lf created the remote root"
+
+internal_receive_case=$consumer_root/cases/direct-frame-receive-internal-lf
+mkdir -p "$internal_receive_case/source" "$internal_receive_case/remote-root"
+chmod 700 "$internal_receive_case/remote-root"
+printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
+  >"$internal_receive_case/remote-root/.meet-beta-recovery-owner"
+chmod 600 "$internal_receive_case/remote-root/.meet-beta-recovery-owner"
+printf 'internal-LF payload\n' >"$internal_receive_case/source/payload"
+internal_receive_length=$(stat -c '%s' "$internal_receive_case/source/payload")
+internal_receive_sha=$(sha256sum "$internal_receive_case/source/payload" | awk '{print $1}')
+internal_receive_identity=$(stat -Lc '%d:%i' "$internal_receive_case/remote-root")
+printf -v internal_receive_header \
+  'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s\ninternal\n' \
+  "$direct_remote" "$internal_receive_identity" "$direct_token" \
+  "$internal_receive_sha" "$internal_receive_length"
+direct_frame_case receive-internal-lf receive "$internal_receive_header" '' \
+  "$internal_receive_case/source/payload" "$internal_receive_case/remote-root"
+[ "$(<"$internal_receive_case/status")" -ne 0 ] ||
+  fail "receive-internal-lf unexpectedly succeeded"
+[ -d "$internal_receive_case/remote-root" ] &&
+  [ -f "$internal_receive_case/remote-root/.meet-beta-recovery-owner" ] &&
+  [ ! -e "$internal_receive_case/remote-root/age" ] ||
+  fail "receive-internal-lf mutated the owned root"
+
+internal_cleanup_case=$consumer_root/cases/direct-frame-cleanup-internal-lf
+mkdir -p "$internal_cleanup_case/remote-root"
+chmod 700 "$internal_cleanup_case/remote-root"
+printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
+  >"$internal_cleanup_case/remote-root/.meet-beta-recovery-owner"
+chmod 600 "$internal_cleanup_case/remote-root/.meet-beta-recovery-owner"
+internal_cleanup_metadata=$(stat -c '%a:%u:%g:%h' "$internal_cleanup_case/remote-root")
+internal_cleanup_marker_metadata=$(stat -c '%a:%u:%g:%h' \
+  "$internal_cleanup_case/remote-root/.meet-beta-recovery-owner")
+internal_cleanup_marker_digest=$(sha256sum \
+  "$internal_cleanup_case/remote-root/.meet-beta-recovery-owner")
+printf -v internal_cleanup_header \
+  'meet-backend/beta-recovery-cleanup/v1|%s|%s\ninternal\n' \
+  "$direct_remote" "$direct_token"
+direct_frame_case cleanup-internal-lf cleanup "$internal_cleanup_header" '' '' \
+  "$internal_cleanup_case/remote-root"
+[ "$(<"$internal_cleanup_case/status")" -ne 0 ] ||
+  fail "cleanup-internal-lf unexpectedly succeeded"
+[ -d "$internal_cleanup_case/remote-root" ] &&
+  [ -f "$internal_cleanup_case/remote-root/.meet-beta-recovery-owner" ] ||
+  fail "cleanup-internal-lf removed owned state"
+[ "$internal_cleanup_metadata" = "$(stat -c '%a:%u:%g:%h' \
+  "$internal_cleanup_case/remote-root")" ] ||
+  fail "cleanup-internal-lf changed root metadata"
+[ "$internal_cleanup_marker_metadata" = "$(stat -c '%a:%u:%g:%h' \
+  "$internal_cleanup_case/remote-root/.meet-beta-recovery-owner")" ] ||
+  fail "cleanup-internal-lf changed marker metadata"
+[ "$internal_cleanup_marker_digest" = "$(sha256sum \
+  "$internal_cleanup_case/remote-root/.meet-beta-recovery-owner")" ] ||
+  fail "cleanup-internal-lf changed marker bytes"
 
 printf -v direct_create_header 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
   "$direct_remote" "$direct_token"

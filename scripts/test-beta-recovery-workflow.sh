@@ -127,6 +127,12 @@ assert_control_program(){
     { echo "$label parser does not copy the exact eight-byte prefix" >&2; exit 1; }
   grep -Fq 'od -An -v -tx1' <<<"$program" ||
     { echo "$label parser does not inspect control bytes with od" >&2; exit 1; }
+  grep -Fq 'newline_count=0' <<<"$program" ||
+    { echo "$label parser does not count header LF bytes" >&2; exit 1; }
+  grep -Fq 'newline_count=$((newline_count + 1))' <<<"$program" ||
+    { echo "$label parser does not reject internal header LF bytes" >&2; exit 1; }
+  grep -Fq '[ "$newline_count" -eq 1 ]' <<<"$program" ||
+    { echo "$label parser does not require exactly one header LF" >&2; exit 1; }
   grep -Eq 'header_length.*(4096|4[[:space:]]*\\*\\*?[[:space:]]*3)' <<<"$program" ||
     { echo "$label parser does not enforce the 4096-byte header bound" >&2; exit 1; }
   grep -Eq 'count=.*header_length|header_length.*count=' <<<"$program" ||
