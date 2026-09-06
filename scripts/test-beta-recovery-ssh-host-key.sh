@@ -1085,6 +1085,7 @@ write_wrapper "$consumer_bin/ssh" \
   '      [ "$byte" = 0a ] && newline_count=$((newline_count + 1))' \
   '    done' \
   '    header_body_hex=${header_hex:0:${#header_hex}-2}' \
+  '    printf "framed-header-bytes-%s-lf-%s\n" "${#header_hex}" "$newline_count" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '    [[ "$header_body_hex" != *0a* ]]' \
   '    [ "$newline_count" -eq 1 ] && [[ "$header_hex" == *0a ]]' \
   '    header=$(head -c "$((header_length - 1))" "$header_file")' \
