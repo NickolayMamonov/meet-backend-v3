@@ -1376,7 +1376,7 @@ run_consumer_case() {
   [ "$cleanup_failure" -eq 0 ] || expected_status=1
   mkdir -p "$case_dir/runner" "$case_dir/home/.ssh"
   chmod 700 "$case_dir" "$case_dir/runner" "$case_dir/home" "$case_dir/home/.ssh"
-  remote_state=/tmp/beta-recovery-fixture-$name
+  remote_state=/tmp/beta-recovery-$name
   rm -rf -- "$remote_state"
   case "$scenario" in
     normal|ambiguous) ;;
@@ -2048,7 +2048,7 @@ run_capture_proof_case() {
   : >"$case_dir/boundary.log"
   : >"$case_dir/effective.log"
   : >"$case_dir/effective.err"
-  remote_state=/tmp/beta-recovery-proof-$name
+  remote_state=/tmp/beta-recovery-$name
   rm -rf -- "$remote_state"
   if [ "$scenario" = cleanup-failure ] ||
     [ "$scenario" = malformed-expected-cleanup ] ||
