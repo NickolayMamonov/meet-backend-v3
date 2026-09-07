@@ -1033,6 +1033,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  fi' \
   'done' \
   'frame_input=' \
+  'printf "decoded-dispatch-arg=%s\n" "$decoded_program_arg" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'if [ "$decoded_program_arg" -ge 0 ]; then' \
   '  frame_input=$(mktemp)' \
   '  cat >"$frame_input"' \
@@ -1312,6 +1313,7 @@ run_consumer_setup_case() {
     RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
     HOST="$scan_host" PORT=2222 \
     SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
+    SUDO_UID="$fixture_sudo_uid" SUDO_GID="$fixture_sudo_gid" \
     SSH_PRIVATE_KEY=fixture-private-key \
     AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
     PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
