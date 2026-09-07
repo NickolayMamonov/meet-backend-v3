@@ -1074,6 +1074,11 @@ write_wrapper "$consumer_bin/ssh" \
   '  bash "$static_program" <"$frame_input"' \
   '  status=$?' \
   '  set -e' \
+  '  if [ "$operation" = create ]; then' \
+  '    [ -e "${BETA_RECOVERY_REMOTE_STATE:?}" ] &&' \
+  '      printf "decoded-create-state=present\n" >>"$BETA_RECOVERY_BOUNDARY_LOG" ||' \
+  '      printf "decoded-create-state=absent\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  fi' \
   '  if [ "$operation" = create ] &&' \
   '    { [ "$status" -eq 0 ] || [ -n "${BETA_RECOVERY_CREATE_MODE:-}" ]; }; then' \
   '    printf "remote-create\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
