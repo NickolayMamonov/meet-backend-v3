@@ -1429,6 +1429,10 @@ run_consumer_case() {
     printf 'consumer %s boundary events:\n' "$name" >&2
     grep -E '^(ssh-call|argv-scan|argv-rejected|effective-|remote-|local-|helper-|private-key|config-created|ssh-keyscan args|ssh-keygen args)' \
       "$case_dir/boundary.log" >&2 || true
+    printf 'consumer %s stderr:\n' "$name" >&2
+    cat "$case_dir/stderr" >&2 || true
+    printf 'consumer %s stdout:\n' "$name" >&2
+    cat "$case_dir/stdout" >&2 || true
     fail "consumer $name returned $status instead of $expected_status"
   fi
   assert_consumer_residue_absent "$case_dir"
