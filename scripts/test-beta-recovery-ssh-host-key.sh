@@ -1046,6 +1046,8 @@ write_wrapper "$consumer_bin/ssh" \
   'for ((i=0; i<${#args[@]}; i++)); do' \
   '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
   'done' \
+  'printf "decoded-command-start=%s\n" "$command_start" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'printf "decoded-command-text=%s\n" "${args[command_start+3]:-}" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
   '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -c ] &&' \
   '  [[ "${args[command_start+3]:-}" == *base64*--decode* ]] &&' \
@@ -1436,8 +1438,11 @@ run_consumer_case() {
   grep -Fxq 'config-created' "$case_dir/boundary.log" ||
     fail "consumer $name did not create an empty SSH config"
   if [ "$scenario" != normal ]; then
-    [ ! -e "$case_dir/mutation-sentinel" ] ||
+    if [ -e "$case_dir/mutation-sentinel" ]; then
+      printf 'consumer %s boundary events:\n' "$name" >&2
+      cat "$case_dir/boundary.log" >&2
       fail "marker case $name crossed downstream mutation"
+    fi
     ! grep -q '^remote-admission$' "$case_dir/boundary.log" ||
       fail "marker case $name crossed remote admission"
     [ "$(grep -c '^remote-cleanup$' "$case_dir/boundary.log")" -eq 1 ] ||
