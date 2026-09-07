@@ -723,13 +723,13 @@ scripts/install-beta-recovery-age.sh
 scripts/materialize-beta-recovery-known-hosts.sh
 scripts/probe-test-vps-recovery-runtime.sh
 scripts/production-compose.sh
-scripts/run-beta-recovery-capture.sh
 scripts/run-beta-recovery-capture-stage.sh
+scripts/run-beta-recovery-capture.sh
 scripts/run-beta-recovery-remote-probe.sh
 scripts/run-beta-recovery-restore.sh
 scripts/validate-beta-recovery-artifact-retention.sh
 EOF
-extract_paths() { grep -oE 'scripts/[A-Za-z0-9._-]+' | sort -u; }
+extract_paths() { grep -oE 'scripts/[A-Za-z0-9._-]+' | LC_ALL=C sort -u; }
 workflow_inventory() {
   local wanted=$1
   awk -v wanted="$wanted" '
