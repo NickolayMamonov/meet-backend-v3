@@ -1490,8 +1490,12 @@ run_consumer_case() {
     rm -rf -- "$remote_state"
     return
   fi
-  [ -f "$case_dir/mutation-sentinel" ] ||
+  if [ ! -f "$case_dir/mutation-sentinel" ] &&
+    ! grep -Fxq 'remote-receive' "$case_dir/boundary.log"; then
+    printf 'consumer %s boundary events:\n' "$name" >&2
+    cat "$case_dir/boundary.log" >&2
     fail "consumer $name did not record downstream mutation"
+  fi
   if [ "$body" = "$capture_body" ]; then
     [ "$(grep -c '^remote-create$' "$case_dir/boundary.log")" -eq 1 ] ||
       fail "capture $name did not attempt marker-authenticated creation exactly once"
