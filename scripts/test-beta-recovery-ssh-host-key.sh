@@ -1024,11 +1024,16 @@ write_wrapper "$consumer_bin/ssh" \
   'for ((i=0; i<${#args[@]}; i++)); do' \
   '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
   'done' \
+  'decoded_program_arg=-1' \
+  'for ((i=0; i<${#args[@]}; i++)); do' \
+  '  if [ "${args[i]:-}" = -c ] &&' \
+  '    [[ "${args[i+1]:-}" == *base64*--decode* ]] &&' \
+  '    [ "${args[i+2]:-}" = -- ] && [ -n "${args[i+3]:-}" ]; then' \
+  '    decoded_program_arg=$((i + 3)); break' \
+  '  fi' \
+  'done' \
   'frame_input=' \
-  'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
-  '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -c ] &&' \
-  '  [[ "${args[command_start+3]:-}" == *base64*--decode* ]] &&' \
-  '  [ "${args[command_start+4]:-}" = -- ] && [ -n "${args[command_start+5]:-}" ]; then' \
+  'if [ "$decoded_program_arg" -ge 0 ]; then' \
   '  frame_input=$(mktemp)' \
   '  cat >"$frame_input"' \
   '  exec <"$frame_input"' \
@@ -1046,16 +1051,11 @@ write_wrapper "$consumer_bin/ssh" \
   'for ((i=0; i<${#args[@]}; i++)); do' \
   '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
   'done' \
-  'printf "decoded-command-start=%s\n" "$command_start" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'printf "decoded-command-text=%s\n" "${args[command_start+3]:-}" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
-  '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -c ] &&' \
-  '  [[ "${args[command_start+3]:-}" == *base64*--decode* ]] &&' \
-  '  [ "${args[command_start+4]:-}" = -- ] && [ -n "${args[command_start+5]:-}" ]; then' \
+  'if [ "$decoded_program_arg" -ge 0 ]; then' \
   '  remote_state=${BETA_RECOVERY_REMOTE_STATE:-}' \
   '  static_program="$remote_state.static.$BASHPID"' \
   '  trap '\''status=$?; rm -f -- "$static_program" "$frame_input"; exit "$status"'\'' EXIT' \
-  '  base64 --decode <<<"${args[command_start+5]}" >"$static_program"' \
+  '  base64 --decode <<<"${args[decoded_program_arg]}" >"$static_program"' \
   '  if dd iflag=fullblock bs=1 skip=8 count=128 status=none if="$frame_input" |' \
   '    grep -aFq "meet-backend/beta-recovery-create/v1|" ; then' \
   '    operation=create' \
