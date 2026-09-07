@@ -1033,7 +1033,6 @@ write_wrapper "$consumer_bin/ssh" \
   '  fi' \
   'done' \
   'frame_input=' \
-  'printf "decoded-dispatch-arg=%s\n" "$decoded_program_arg" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'if [ "$decoded_program_arg" -ge 0 ]; then' \
   '  frame_input=$(mktemp)' \
   '  cat >"$frame_input"' \
@@ -1074,11 +1073,6 @@ write_wrapper "$consumer_bin/ssh" \
   '  bash "$static_program" <"$frame_input"' \
   '  status=$?' \
   '  set -e' \
-  '  if [ "$operation" = create ]; then' \
-  '    [ -e "${BETA_RECOVERY_REMOTE_STATE:?}" ] &&' \
-  '      printf "decoded-create-state=present\n" >>"$BETA_RECOVERY_BOUNDARY_LOG" ||' \
-  '      printf "decoded-create-state=absent\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  '  fi' \
   '  if [ "$operation" = create ] &&' \
   '    { [ "$status" -eq 0 ] || [ -n "${BETA_RECOVERY_CREATE_MODE:-}" ]; }; then' \
   '    printf "remote-create\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
@@ -1434,13 +1428,6 @@ run_consumer_case() {
   status=$?
   set -e
   if [ "$status" -ne "$expected_status" ]; then
-    printf 'consumer %s boundary events:\n' "$name" >&2
-    grep -E '^(ssh-call|argv-scan|argv-rejected|effective-|decoded-|remote-|local-|helper-|private-key|config-created|ssh-keyscan args|ssh-keygen args)' \
-      "$case_dir/boundary.log" >&2 || true
-    printf 'consumer %s stderr:\n' "$name" >&2
-    cat "$case_dir/stderr" >&2 || true
-    printf 'consumer %s stdout:\n' "$name" >&2
-    cat "$case_dir/stdout" >&2 || true
     fail "consumer $name returned $status instead of $expected_status"
   fi
   assert_consumer_residue_absent "$case_dir"
@@ -1450,8 +1437,6 @@ run_consumer_case() {
     fail "consumer $name did not create an empty SSH config"
   if [ "$scenario" != normal ]; then
     if [ -e "$case_dir/mutation-sentinel" ]; then
-      printf 'consumer %s boundary events:\n' "$name" >&2
-      cat "$case_dir/boundary.log" >&2
       fail "marker case $name crossed downstream mutation"
     fi
     ! grep -q '^remote-admission$' "$case_dir/boundary.log" ||
@@ -1492,8 +1477,6 @@ run_consumer_case() {
   fi
   if [ ! -f "$case_dir/mutation-sentinel" ] &&
     ! grep -Fxq 'remote-receive' "$case_dir/boundary.log"; then
-    printf 'consumer %s boundary events:\n' "$name" >&2
-    cat "$case_dir/boundary.log" >&2
     fail "consumer $name did not record downstream mutation"
   fi
   if [ "$body" = "$capture_body" ]; then
@@ -1546,12 +1529,39 @@ assert_framed_runtime_contract() {
 
 assert_framed_runtime_contract
 
+workflow_file=$root/.github/workflows/prove-beta-backup-restore.yml
+remote_program_dir=$consumer_root/remote-programs
+mkdir -p "$remote_program_dir"
+
+extract_workflow_program() {
+  local marker=$1 output=$2
+  awk -v marker="$marker" '
+    !in_program && index($0, "cat <<") && index($0, marker) {
+      in_program=1
+      next
+    }
+    in_program {
+      line=$0
+      sub(/^[[:space:]]*/, "", line)
+      if (line == marker) exit
+      sub(/^          /, "", $0)
+      print
+    }
+  ' "$workflow_file" >"$output"
+  [ -s "$output" ] || fail "workflow program extraction produced no body: $marker"
+  bash -n "$output" || fail "workflow program extraction produced invalid shell: $marker"
+}
+
+extract_workflow_program REMOTE_CREATE_PROGRAM "$remote_program_dir/create"
+extract_workflow_program REMOTE_RECEIVE_PROGRAM "$remote_program_dir/receive"
+extract_workflow_program REMOTE_CLEANUP_PROGRAM "$remote_program_dir/cleanup"
+
 direct_frame_case() {
   local name=$1 operation=$2 header=$3 suffix_hex=${4:-} payload_file=${5:-}
   local remote_root=${6:-} prefix_override=${7:-}
   local case_dir=$consumer_root/cases/direct-frame-$name
   local config=$case_dir/home/.ssh/config key=$case_dir/key
-  local program prefix frame_file suffix_file
+  local program_file prefix frame_file suffix_file
   mkdir -p "$case_dir/home/.ssh" "$case_dir/runner"
   chmod 700 "$case_dir" "$case_dir/home" "$case_dir/home/.ssh" "$case_dir/runner"
   printf '%s\n' \
@@ -1562,12 +1572,8 @@ direct_frame_case() {
   chmod 600 "$config"
   : >"$key"
   chmod 600 "$key"
-  case "$operation" in
-    create) program='meet-backend/beta-recovery-create/v1' ;;
-    receive) program='meet-backend/beta-recovery-file/v1' ;;
-    cleanup) program='meet-backend/beta-recovery-cleanup/v1' ;;
-    *) fail "unknown direct frame operation: $operation" ;;
-  esac
+  program_file=$remote_program_dir/$operation
+  [ -f "$program_file" ] || fail "unknown direct frame operation: $operation"
   frame_file=$case_dir/frame
   if [[ "$header" == @* ]]; then
     cp -- "${header#@}" "$frame_file"
@@ -1586,7 +1592,7 @@ direct_frame_case() {
   else
     : >"$suffix_file"
   fi
-  printf '%s' "$program" | base64 --wrap=0 >"$case_dir/program.b64"
+  base64 --wrap=0 <"$program_file" >"$case_dir/program.b64"
   frame_stdin() {
     cat "$case_dir/prefix"
     cat "$frame_file"
@@ -1617,12 +1623,6 @@ direct_frame_case() {
     "$(<"$case_dir/program.b64")" >"$case_dir/stdout" 2>"$case_dir/stderr"
   direct_status=$?
   set -e
-  if [ "$direct_status" -ne 0 ]; then
-    printf 'direct frame %s boundary events:\n' "$name" >&2
-    cat "$case_dir/boundary.log" >&2
-    printf 'direct frame %s stderr:\n' "$name" >&2
-    cat "$case_dir/stderr" >&2 || true
-  fi
   rm -f -- "$frame_file" "$suffix_file" "$case_dir/prefix" "$case_dir/program.b64"
   assert_consumer_residue_absent "$case_dir"
   [ "$(grep -c '^ssh-call$' "$case_dir/boundary.log")" -eq 1 ] ||
@@ -1651,9 +1651,6 @@ for trailing_case in printable:20 nul:00 control:01 nonascii:c3; do
     "$direct_remote" "$direct_token"
   direct_frame_case "$direct_case_name" create "$direct_header" "$suffix"
   if [ "$(<"$consumer_root/cases/direct-frame-$direct_case_name/status")" -eq 0 ]; then
-    printf 'consumer %s direct-frame events:\n' "$direct_case_name" >&2
-    grep -E '^(direct-input|ssh-call|argv-scan|argv-rejected|effective-|framed-|remote-|local-|helper-)' \
-      "$consumer_root/cases/direct-frame-$direct_case_name/boundary.log" >&2 || true
     fail "$direct_case_name unexpectedly succeeded"
   fi
   [ ! -e "$direct_remote" ] && [ ! -L "$direct_remote" ] ||
@@ -2113,7 +2110,6 @@ run_capture_proof_case() {
   set -e
   if [ "$scenario" = matching ] && [ "$status" -ne 0 ] ||
     [ "$scenario" != matching ] && [ "$status" -eq 0 ]; then
-    sed -n '1,40p' "$case_dir/stderr" >&2
     fail "proof case $name returned unexpected status $status (matching must be zero)"
   fi
   assert_consumer_residue_absent "$case_dir"
