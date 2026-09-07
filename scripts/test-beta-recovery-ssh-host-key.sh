@@ -1027,7 +1027,7 @@ write_wrapper "$consumer_bin/ssh" \
   'frame_input=' \
   'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
   '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -c ] &&' \
-  '  [ "${args[command_start+3]:-}" = '\''exec bash <(printf "%s" "$1" | base64 --decode)'\'' ] &&' \
+  '  [[ "${args[command_start+3]:-}" == *base64*--decode* ]] &&' \
   '  [ "${args[command_start+4]:-}" = -- ] && [ -n "${args[command_start+5]:-}" ]; then' \
   '  frame_input=$(mktemp)' \
   '  cat >"$frame_input"' \
@@ -1048,7 +1048,7 @@ write_wrapper "$consumer_bin/ssh" \
   'done' \
   'if [ "$command_start" -ge 0 ] && [ "${args[command_start]:-}" = sudo ] &&' \
   '  [ "${args[command_start+1]:-}" = bash ] && [ "${args[command_start+2]:-}" = -c ] &&' \
-  '  [ "${args[command_start+3]:-}" = '\''exec bash <(printf "%s" "$1" | base64 --decode)'\'' ] &&' \
+  '  [[ "${args[command_start+3]:-}" == *base64*--decode* ]] &&' \
   '  [ "${args[command_start+4]:-}" = -- ] && [ -n "${args[command_start+5]:-}" ]; then' \
   '  remote_state=${BETA_RECOVERY_REMOTE_STATE:-}' \
   '  static_program="$remote_state.static.$BASHPID"' \
