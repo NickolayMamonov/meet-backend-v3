@@ -1057,13 +1057,13 @@ write_wrapper "$consumer_bin/ssh" \
   '  trap '\''status=$?; rm -f -- "$static_program" "$frame_input"; exit "$status"'\'' EXIT' \
   '  base64 --decode <<<"${args[decoded_program_arg]}" >"$static_program"' \
   '  if dd iflag=fullblock bs=1 skip=8 count=128 status=none if="$frame_input" |' \
-  '    grep -aFq "meet-backend/beta-recovery-create/v1|" ; then' \
+  '    grep -aFq "meet-backend/beta-recovery-create/v1" ; then' \
   '    operation=create' \
   '  elif dd iflag=fullblock bs=1 skip=8 count=128 status=none if="$frame_input" |' \
-  '    grep -aFq "meet-backend/beta-recovery-file/v1|" ; then' \
+  '    grep -aFq "meet-backend/beta-recovery-file/v1" ; then' \
   '    operation=receive' \
   '  elif dd iflag=fullblock bs=1 skip=8 count=128 status=none if="$frame_input" |' \
-  '    grep -aFq "meet-backend/beta-recovery-cleanup/v1|" ; then' \
+  '    grep -aFq "meet-backend/beta-recovery-cleanup/v1" ; then' \
   '    operation=cleanup' \
   '  else' \
   '    printf "argv-unclassified\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 49' \
