@@ -181,6 +181,8 @@ assert_control_program receive "$receive_program"
 assert_control_program cleanup "$cleanup_program"
 assert_eof_probe_contract create "$create_program"
 assert_eof_probe_contract cleanup "$cleanup_program"
+grep -Fq 'rm -rf -- "$scratch" || status=1' <<<"$create_program" ||
+  { echo "create cleanup trap does not remove parser scratch" >&2; exit 1; }
 assert_capture_count_at_least 'static control-program encoding' 3 'base64 --wrap=0'
 assert_capture_count_at_least 'static decoder launch' 3 'sudo bash -c'
 assert_capture_count_at_least 'binary prefix validation' 3 'dd iflag=fullblock bs=1 count=8 status=none'

@@ -217,6 +217,7 @@ jobs:
               [ "$(stat -c '%a:%u:%g' "$remote")" = "700:$owner_uid:$owner_gid" ]; then
               rm -r -- "$remote" || status=1
             fi
+            rm -rf -- "$scratch" || status=1
             exit "$status"
           }
           trap cleanup_create EXIT HUP INT TERM

@@ -1558,7 +1558,7 @@ extract_workflow_program REMOTE_CLEANUP_PROGRAM "$remote_program_dir/cleanup"
 
 direct_frame_case() {
   local name=$1 operation=$2 header=$3 suffix_hex=${4:-} payload_file=${5:-}
-  local remote_root=${6:-} prefix_override=${7:-}
+  local remote_root=${6:-} prefix_override=${7:-} scratch_dir=${8:-}
   local case_dir=$consumer_root/cases/direct-frame-$name
   local config=$case_dir/home/.ssh/config key=$case_dir/key
   local program_file prefix frame_file suffix_file
@@ -1610,6 +1610,7 @@ direct_frame_case() {
     BETA_RECOVERY_TOKEN_ORACLE="$token_oracle" \
     BETA_RECOVERY_PAYLOAD_SENTINEL=fixture-payload-sentinel \
     BETA_RECOVERY_PRIVATE_KEY_SENTINEL=fixture-private-key-sentinel \
+    TMPDIR="${scratch_dir:-/tmp}" \
     BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
     BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
     BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
@@ -1879,6 +1880,47 @@ direct_frame_case cleanup-internal-lf cleanup "$internal_cleanup_header" '' '' \
   "$internal_cleanup_remote/.meet-beta-recovery-owner")" ] ||
   fail "cleanup-internal-lf changed marker bytes"
 rm -rf -- "$internal_cleanup_remote"
+
+post_parse_collision_case=$consumer_root/cases/direct-frame-create-post-parse-collision
+post_parse_collision_remote=/tmp/beta-recovery-direct-post-parse-collision
+post_parse_collision_tmp=$post_parse_collision_case/parser-tmp
+rm -rf -- "$post_parse_collision_remote"
+rm -rf -- "$post_parse_collision_case"
+mkdir -p "$post_parse_collision_remote" "$post_parse_collision_tmp"
+chmod 700 "$post_parse_collision_remote" "$post_parse_collision_tmp"
+printf 'post-parse collision sentinel\n' >"$post_parse_collision_remote/sentinel"
+post_parse_collision_root_metadata=$(stat -c '%a:%u:%g:%h' \
+  "$post_parse_collision_remote")
+post_parse_collision_digest=$(sha256sum \
+  "$post_parse_collision_remote/sentinel")
+printf -v post_parse_collision_header \
+  'meet-backend/beta-recovery-create/v1|%s|%s\n' \
+  "$post_parse_collision_remote" "$direct_token"
+direct_frame_case create-post-parse-collision create \
+  "$post_parse_collision_header" '' '' "$post_parse_collision_remote" '' \
+  "$post_parse_collision_tmp"
+[ "$(<"$post_parse_collision_case/status")" -ne 0 ] ||
+  fail "post-parse create collision unexpectedly succeeded"
+[ -e "$post_parse_collision_remote/sentinel" ] &&
+  [ ! -e "$post_parse_collision_remote/.meet-beta-recovery-owner" ] ||
+  fail "post-parse create collision changed foreign state"
+[ "$post_parse_collision_root_metadata" = "$(stat -c '%a:%u:%g:%h' \
+  "$post_parse_collision_remote")" ] ||
+  fail "post-parse create collision changed root metadata"
+[ "$post_parse_collision_digest" = "$(sha256sum \
+  "$post_parse_collision_remote/sentinel")" ] ||
+  fail "post-parse create collision changed foreign bytes"
+[ -d "$post_parse_collision_tmp" ] &&
+  [ -z "$(find "$post_parse_collision_tmp" -mindepth 1 -print -quit)" ] ||
+  fail "post-parse create collision left parser scratch"
+! grep -R -aFq "$direct_token" "$post_parse_collision_tmp" 2>/dev/null ||
+  fail "post-parse create collision left owner-token residue"
+! grep -aFq "$direct_token" "$post_parse_collision_case/boundary.log" \
+  "$post_parse_collision_case/stdout" "$post_parse_collision_case/stderr" \
+  "$post_parse_collision_case/effective.log" \
+  "$post_parse_collision_case/effective.err" ||
+  fail "post-parse create collision disclosed owner token"
+rm -rf -- "$post_parse_collision_remote"
 
 printf -v direct_create_header 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
   "$direct_remote" "$direct_token"
