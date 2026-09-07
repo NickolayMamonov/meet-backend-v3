@@ -362,7 +362,8 @@ workflow_file=.github/workflows/prove-beta-backup-restore.yml
 [ -f "$workflow_file" ] || fail "workflow contract file is unavailable"
 [ "$(sha256sum "$workflow_file" | awk '{print $1}')" = "$workflow" ] ||
   fail "workflow contract digest differs"
-actual_tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+actual_tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh \
+  scripts/run-beta-recovery-capture.sh \
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
   scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \
   scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \

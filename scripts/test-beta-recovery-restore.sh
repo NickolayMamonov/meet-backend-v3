@@ -121,7 +121,8 @@ run_restore_fixture() {
     runtime:{imageId:"sha256:test",configHash:$hash,health:"healthy",uploadsMount:"volume"},
     https:{meetingsStatus:"200",actuatorStatus:"404",httpRedirectHttps:true,meetingsJson:true}}' \
     >"$case_dir/runtime.json"
-  tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+  tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh \
+    scripts/run-beta-recovery-capture.sh \
     scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
     scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \
     scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \

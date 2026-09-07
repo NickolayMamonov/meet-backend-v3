@@ -29,6 +29,16 @@ After reviewer approval, the restore runner provisions and canaries its pinned
 age toolchain, then revalidates the source before the one step that materializes
 the private identity.
 
+The workflow `exec`s the runner-side
+`scripts/run-beta-recovery-capture-stage.sh` production stage. That stage owns
+the capture traps, cleanup, and status propagation; the similarly named
+`scripts/run-beta-recovery-capture.sh` remains the VPS-side backup consumer and
+is transferred to the authenticated remote staging directory. Keep every
+expression-backed recovery YAML scalar, including its indicator line,
+indentation, and LF bytes, at or below the tracked-source budget of 16,384
+bytes. The workflow contract fixture enforces this budget so extraction cannot
+be silently reversed.
+
 At each SSH boundary, the runner performs one bounded RSA key scan for the
 configured host and port, verifies that key against the configured SHA-256
 fingerprint, and uses the resulting temporary known-hosts record with strict
