@@ -231,10 +231,32 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          gh attestation verify \
-            "oci://${IMAGE}@${{ steps.publish.outputs.root_digest }}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --source-digest "$SOURCE_SHA" >/dev/null
+          root_digest="${{ steps.publish.outputs.root_digest }}"
+          platform_digest="${{ steps.publish.outputs.platform_digest }}"
+          raw="$RUNNER_TEMP/post-attestation-image-index.json"
+          docker buildx imagetools inspect "$IMAGE@$root_digest" --raw >"$raw"
+          gh api --paginate --slurp \
+            "users/${GITHUB_REPOSITORY%%/*}/packages/container/${GITHUB_REPOSITORY##*/}/versions?per_page=100" \
+            >"$RUNNER_TEMP/post-attestation-package-versions.json"
+          scripts/normalize-ghcr-package-inventory.sh \
+            --package-versions-file "$RUNNER_TEMP/post-attestation-package-versions.json" \
+            --digest "$root_digest" \
+            --output "$RUNNER_TEMP/post-attestation-registry-inventory.json"
+          scripts/verify-oci-referrer-closure.sh \
+            --image "$IMAGE" --index-file "$raw" \
+            --inventory-file "$RUNNER_TEMP/post-attestation-registry-inventory.json" \
+            --subject-digest "$root_digest" --platform-subject "$platform_digest" \
+            --require-bundle --bundle-output "$RUNNER_TEMP/candidate-bundle.json" \
+            --output "$RUNNER_TEMP/post-attestation-closure.json" >/dev/null
+          scripts/resolve-image-attestation-authority.sh test-candidate \
+            --source "$SOURCE_SHA" --root "$root_digest" --platform "$platform_digest" \
+            >"$RUNNER_TEMP/candidate-authority.json"
+          scripts/verify-image-attestation-authority.sh \
+            --authority "$RUNNER_TEMP/candidate-authority.json" \
+            --subject-file "$raw" \
+            --bundle "$RUNNER_TEMP/candidate-bundle.json" \
+            --closure "$RUNNER_TEMP/post-attestation-closure.json" \
+            --output "$RUNNER_TEMP/candidate-attestation-evidence.json"
       - name: Read-only image admission
         shell: bash
         env:

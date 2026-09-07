@@ -209,6 +209,7 @@ fi
 if [ ! -f "$INPUT" ] || [ ! -r "$INPUT" ] ||
   ! jq -e '
     type == "object" and
+    .schema == "meet-backend/test-image-state/v2" and
     (.bindings | type == "array") and
     all(.bindings[];
       type == "object" and
@@ -268,7 +269,7 @@ if ! jq -e \
     (.root | type == "object") and
     (.platform | type == "object") and
     (.referrers | type == "array") and
-    (.githubAttestations | type == "array") and
+    (.attestationEvidence | type == "array") and
     (.root.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
     (.platform.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
     (.digest == .root.digest) and
@@ -338,16 +339,38 @@ if ! jq -e \
   --arg source "$SOURCE" \
   --arg version "$VERSION" \
   --arg source_repository "$SOURCE_REPOSITORY" '
-    (.githubAttestations | length == 1) and
-    (.githubAttestations[0].subject == $root or
-     .githubAttestations[0].subject == $platform) and
-    (.githubAttestations[0].repository == $source_repository) and
-    (.githubAttestations[0].source == $source) and
-    (.githubAttestations[0].revision == $source) and
-    (.githubAttestations[0].version == $version) and
-    (.githubAttestations[0].workflow | type == "string" and
-      startswith($source_repository + "/.github/workflows/") and
-      contains("@refs/"))
+    (.attestationEvidence | length == 1) and
+    (.attestationEvidence[0].schema ==
+      "meet-backend/image-attestation-evidence/v2") and
+    (.attestationEvidence[0].sourceRepository == $source_repository) and
+    (.attestationEvidence[0].releaseSourceDigest == $source) and
+    (.attestationEvidence[0].certificateSourceDigest == $source) and
+    (.attestationEvidence[0].signerDigest == $source) and
+    (.attestationEvidence[0].sourceRef == "refs/heads/dev") and
+    (.attestationEvidence[0].signerWorkflow ==
+      ".github/workflows/promote-dev-digest-to-test-vps.yml") and
+    (.attestationEvidence[0].certificateIdentity ==
+      ($source_repository +
+       "/.github/workflows/promote-dev-digest-to-test-vps.yml@refs/heads/dev")) and
+    (.attestationEvidence[0].oidcIssuer ==
+      "https://token.actions.githubusercontent.com") and
+    (.attestationEvidence[0].predicateType ==
+      "https://slsa.dev/provenance/v1") and
+    (.attestationEvidence[0].rootDigest == $root) and
+    (.attestationEvidence[0].platformDigest == $platform) and
+    (.attestationEvidence[0].subject.digest == $root) and
+    (.attestationEvidence[0].evidenceStorage.kind ==
+      "oci-registry-bundle") and
+    (.attestationEvidence[0].evidenceStorage.bundleDigest |
+      type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+    (.attestationEvidence[0].evidenceStorage.signatureManifestDigest |
+      type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+    (.attestationEvidence[0].evidenceStorage.bundleLayerDigest |
+      type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+    (.attestationEvidence[0].evidenceStorage.bundleLayerMediaType ==
+      "application/vnd.dev.sigstore.bundle.v0.3+json") and
+    (.attestationEvidence[0].evidenceStorage.bundleLayerSize |
+      type == "number" and floor == . and . > 0)
   ' <<<"$BINDING" >/dev/null; then
   emit rejected missing-github-attestation
   exit 1

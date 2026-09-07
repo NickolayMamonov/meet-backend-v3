@@ -25,7 +25,7 @@ expected_json() {
 make_fixture() {
   local name=$1 output=$TMP/$1.json
   case "$name" in
-    absent) jq -cn '{bindings:[]}' >"$output" ;;
+    absent) jq -cn '{schema:"meet-backend/test-image-state/v2",bindings:[]}' >"$output" ;;
     reusable) cp "$REUSABLE" "$output" ;;
     duplicate) jq '.bindings += [.bindings[0]]' "$REUSABLE" >"$output" ;;
     mismatch) jq '.bindings[0].root.manifests[0].digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"' "$REUSABLE" >"$output" ;;

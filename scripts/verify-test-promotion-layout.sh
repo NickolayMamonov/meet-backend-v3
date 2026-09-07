@@ -110,7 +110,7 @@ done <<<"$candidate_digests"
 
 protected=$(jq -cS '
   if type == "object" and
-     (.schema == "meet-backend/test-promotion-protected-state/v1") and
+     (.schema == "meet-backend/test-promotion-protected-state/v2") and
      (.protected | type == "object") and
      (.protected.subjectDigests | type == "array" and
        all(.[]; type == "string" and test("^sha256:[0-9a-f]{64}$")))
@@ -131,7 +131,7 @@ jq -cnS --arg root "$root_digest" \
   --argjson descriptors "$(jq '.descriptors' <<<"$root_state")" \
   --argjson referrerTargets "$(jq '.referrerTargets' <<<"$root_state")" \
   '{
-    schema:"meet-backend/test-promotion-layout/v1",
+    schema:"meet-backend/test-promotion-layout/v2",
     rootDigest:$root,
     platformDigest:$platform,
     descriptors:$descriptors,

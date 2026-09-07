@@ -1,4 +1,5 @@
 {
+  "schema": "meet-backend/test-image-state/v2",
   "bindings": [
     {
       "alias": "test-sha-0123456789abcdef0123456789abcdef01234567",
@@ -47,14 +48,32 @@
           "predicateType": "https://spdx.dev/Document"
         }
       ],
-      "githubAttestations": [
+      "attestationEvidence": [
         {
-          "subject": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "repository": "https://github.com/NickolayMamonov/meet-backend-v3",
-          "source": "0123456789abcdef0123456789abcdef01234567",
-          "revision": "0123456789abcdef0123456789abcdef01234567",
-          "version": "1.2.3",
-          "workflow": "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/build.yml@refs/heads/dev"
+          "schema": "meet-backend/image-attestation-evidence/v2",
+          "sourceRepository": "https://github.com/NickolayMamonov/meet-backend-v3",
+          "releaseSourceDigest": "0123456789abcdef0123456789abcdef01234567",
+          "certificateSourceDigest": "0123456789abcdef0123456789abcdef01234567",
+          "signerDigest": "0123456789abcdef0123456789abcdef01234567",
+          "sourceRef": "refs/heads/dev",
+          "signerWorkflow": ".github/workflows/promote-dev-digest-to-test-vps.yml",
+          "certificateIdentity": "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/promote-dev-digest-to-test-vps.yml@refs/heads/dev",
+          "oidcIssuer": "https://token.actions.githubusercontent.com",
+          "predicateType": "https://slsa.dev/provenance/v1",
+          "rootDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "platformDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "subject": {
+            "name": "ghcr.io/nickolaymamonov/meet-backend-v3",
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "evidenceStorage": {
+            "kind": "oci-registry-bundle",
+            "bundleDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "signatureManifestDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "bundleLayerDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bundleLayerSize": 10,
+            "bundleLayerMediaType": "application/vnd.dev.sigstore.bundle.v0.3+json"
+          }
         }
       ]
     }
