@@ -1617,6 +1617,12 @@ direct_frame_case() {
     "$(<"$case_dir/program.b64")" >"$case_dir/stdout" 2>"$case_dir/stderr"
   direct_status=$?
   set -e
+  if [ "$direct_status" -ne 0 ]; then
+    printf 'direct frame %s boundary events:\n' "$name" >&2
+    cat "$case_dir/boundary.log" >&2
+    printf 'direct frame %s stderr:\n' "$name" >&2
+    cat "$case_dir/stderr" >&2 || true
+  fi
   rm -f -- "$frame_file" "$suffix_file" "$case_dir/prefix" "$case_dir/program.b64"
   assert_consumer_residue_absent "$case_dir"
   [ "$(grep -c '^ssh-call$' "$case_dir/boundary.log")" -eq 1 ] ||
