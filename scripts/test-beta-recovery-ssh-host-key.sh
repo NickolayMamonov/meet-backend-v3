@@ -1597,6 +1597,7 @@ direct_frame_case() {
   frame_stdin | env \
     PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
     HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+    SUDO_UID="$fixture_sudo_uid" SUDO_GID="$fixture_sudo_gid" \
     BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
     BETA_RECOVERY_REAL_LN="$(command -v ln)" \
     BETA_RECOVERY_REAL_RM="$real_rm" \
@@ -2073,6 +2074,7 @@ run_capture_proof_case() {
     env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
       RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
       HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+      SUDO_UID="$fixture_sudo_uid" SUDO_GID="$fixture_sudo_gid" \
       HOST_FINGERPRINT="$expected_fingerprint" SSH_PRIVATE_KEY=fixture-private-key \
       AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
       PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID="$name" \
