@@ -129,6 +129,15 @@ recovery_scalar_budget() {
         base_indent=current_indent
         bytes=length($0) + 1
         expression=index($0, "${{") > 0
+        next
+      }
+      if (index($0, "${{")) {
+        non_block_bytes=length($0) + 1
+        if (non_block_bytes > limit) {
+          printf "%s:%d: expression-backed non-block scalar is %d bytes (limit %d)\n",
+            file, NR, non_block_bytes, limit > "/dev/stderr"
+          failed=1
+        }
       }
     }
     END {
@@ -521,6 +530,18 @@ restore_line=$(grep -n 'id: restore' "$workflow" | cut -d: -f1)
 auth="$root/scripts/authorize-beta-recovery.sh"
 fixture_dir=$(mktemp -d)
 trap 'rm -r -- "$fixture_dir"' EXIT HUP INT TERM
+non_block_fixture=$fixture_dir/non-block-expression.yml
+non_block_padding=$(printf '%*s' 16384 '' | tr ' ' x)
+printf 'plain: ${{ %s }}\n' "$non_block_padding" >"$non_block_fixture"
+if recovery_scalar_budget "$non_block_fixture" >/dev/null 2>&1; then
+  echo "oversized plain expression scalar was accepted" >&2
+  exit 1
+fi
+printf 'quoted: '\''${{ %s }}'\''\n' "$non_block_padding" >"$non_block_fixture"
+if recovery_scalar_budget "$non_block_fixture" >/dev/null 2>&1; then
+  echo "oversized quoted expression scalar was accepted" >&2
+  exit 1
+fi
 valid_recovery_id=recovery-fixture
 valid_recipient=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m
 invalid_short_recipient=age1x
