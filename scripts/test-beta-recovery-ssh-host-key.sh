@@ -1118,8 +1118,7 @@ write_wrapper "$consumer_bin/ssh" \
   '  if [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ] &&' \
   '    printf "%s" "$body" | grep -Fq "base64 --decode"; then' \
   '    printf "remote-receive\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 0' \
-  '  elif [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ] &&' \
-  '    printf "%s" "$body" | grep -Fq '\''stat -c '\''"'\''%d:%i'\''"'\'' -- "$remote"'\''; then' \
+  '  elif printf "%s" "$body" | grep -Fq '\''stat -c '\''"'\''%d:%i'\''"'\'' -- "$remote"'\''; then' \
   '    stat -Lc "%d:%i" -- "${BETA_RECOVERY_REMOTE_STATE:?}"; exit 0' \
   '  elif printf "%s" "$body" | grep -Fq "created_identity="; then' \
   '    printf "created\n1:1\n"; exit 0' \
