@@ -1,0 +1,41 @@
+{
+  "schema": "meet-backend/beta-recovery-real-docker-volume-provenance/v1",
+  "image": "postgres:16-alpine@sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2",
+  "dockerRootDir": "/var/lib/docker",
+  "volumeIdentity": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "baseline": {
+    "accepted": false,
+    "failedClauses": [
+      "labels"
+    ]
+  },
+  "volume": {
+    "Name": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "Driver": "local",
+    "Mountpoint": "/var/lib/docker/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/_data",
+    "Labels": {
+      "com.docker.volume.anonymous": ""
+    },
+    "Options": null
+  },
+  "container": {
+    "HostConfig": {
+      "Binds": null,
+      "Mounts": null
+    },
+    "Mounts": [
+      {
+        "Type": "volume",
+        "Name": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "Destination": "/var/lib/postgresql/data",
+        "RW": true,
+        "Source": "/var/lib/docker/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/_data"
+      }
+    ]
+  },
+  "absence": {
+    "status": 1,
+    "stdout": "[]\n",
+    "stderr": "Error response from daemon: get <volume>: no such volume\n"
+  }
+}

@@ -198,8 +198,12 @@ jobs:
         working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
           set -euo pipefail
-          bash -n "$TOOLING_SCRIPTS"/*.sh
-          shellcheck --severity=warning "$TOOLING_SCRIPTS"/*.sh
+          mapfile -t shell_files < <(find "$TOOLING_SCRIPTS" -maxdepth 1 -type f -name '*.sh' -print | sort)
+          shell_files+=("$TOOLING_SCRIPTS/fixtures/beta-recovery/fake-docker.sh")
+          for script in "${shell_files[@]}"; do
+            bash -n "$script"
+          done
+          shellcheck --severity=warning "${shell_files[@]}"
           bash "$TOOLING_SCRIPTS/test-release-asset-inventory.sh"
           bash "$TOOLING_SCRIPTS/test-release-page-normalization.sh"
           bash "$TOOLING_SCRIPTS/test-release-registry-state.sh"
@@ -241,6 +245,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-beta-recovery-evidence.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-capture.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-restore.sh"
+          bash "$TOOLING_SCRIPTS/test-beta-recovery-restore-docker.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-semantic-route.sh"
           bash "$TOOLING_SCRIPTS/test-release-post-publication-routing.sh"
           bash "$TOOLING_SCRIPTS/test-release-protected-snapshot.sh"
@@ -269,7 +274,8 @@ jobs:
           tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
           test -x "$binary"
           "$binary" -version
-          "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
+          WORKFLOW=.github/workflows/ci.yml \
+            "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
           WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
       - name: Verify Release Please state

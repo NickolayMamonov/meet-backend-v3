@@ -143,8 +143,22 @@ Each required filesystem must retain 20 percent after its requirement. The
 pinned PostgreSQL 16 image must declare exactly
 `/var/lib/postgresql/data` as its only image volume. The restore creates no
 operator-supplied mount and accepts only one inspected read-write anonymous
-volume at that destination. Bind, named, production, duplicate, missing, or
-unexpected mounts fail before start.
+volume at that destination. Docker's anonymous-volume representation is
+evidence-backed: the local volume has the exact
+`com.docker.volume.anonymous=""` label, a null or empty options object, and a
+daemon-root-derived mountpoint. `HostConfig.Binds` and `HostConfig.Mounts` must
+remain absent or empty; the realized `Mounts` entry must prove the same local
+volume, source, destination, and read-write association. Bind, named,
+production, duplicate, missing, foreign, or unexpected mounts fail before
+start.
+
+The restore's Docker inspection boundary keeps stdout and stderr separate.
+For the persisted volume selected by the already authenticated cleanup marker,
+the exact status-1 tuple of `[]` stdout and Docker's lowercase
+`no such volume` response confirms absence. It does not authorize deletion or
+substitution of another volume. Malformed JSON, mixed or contradictory output,
+transport, daemon, authorization, and unknown errors remain fatal and prevent
+`cleanup_complete=true`.
 
 The identity is parsed and both ciphertexts are decrypted into a private
 mode-0700 directory before any Docker command. Missing, empty, malformed,

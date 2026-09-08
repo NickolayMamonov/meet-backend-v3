@@ -43,7 +43,7 @@ json_container() {
           Config:{Labels:{"com.meet-backend.beta-recovery/owner":"restore",
             "com.meet-backend.beta-recovery/recovery-id":env.FAKE_RECOVERY_ID,
             "com.meet-backend.beta-recovery/owner-token":$token}},
-          HostConfig:{Binds:[],Mounts:[]},
+          HostConfig:{Binds:[],Mounts:null},
           Mounts:[{Type:"volume",Name:$volume,Destination:"/var/lib/postgresql/data",RW:true,Source:$source}]}]'
       ;;
     bind)
@@ -118,6 +118,7 @@ case "${1:-}" in
       *'.Image'*) printf '%s\n' 'repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
       *config-hash*) printf '%s\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ;;
       *'.Mounts'*) printf '%s\n' 'volume|meet-production_uploads_data' ;;
+      '') json_container ;;
       *) exit 2 ;;
     esac
     ;;
@@ -206,9 +207,35 @@ case "${1:-}" in
     log_event volume-"${2:-}"
     case "${2:-}" in
       inspect)
-        [ "${3:-}" = "$volume" ] && [ -e "$state/volume" ] || { echo 'No such volume' >&2; exit 1; }
+        [ "${3:-}" = "$volume" ] && [ -e "$state/volume" ] || {
+          case "${FAKE_DOCKER_VOLUME_ABSENCE_MODE:-lowercase}" in
+            lowercase)
+              printf '[]\n'
+              printf 'Error response from daemon: get %s: no such volume\n' "${3:-}" >&2 ;;
+            legacy)
+              echo 'No such volume' >&2 ;;
+            malformed)
+              printf '{\n'
+              exit 0 ;;
+            mixed)
+              printf '[]\n'
+              printf 'Error response from daemon: get %s: no such volume\npermission denied\n' "${3:-}" >&2 ;;
+            daemon)
+              printf '[]\n'
+              printf 'Error response from daemon: daemon unavailable\n' >&2 ;;
+            authorization)
+              printf '[]\n'
+              printf 'Error response from daemon: permission denied\n' >&2 ;;
+            unknown)
+              printf '[]\n'
+              printf 'volume inspection failed\n' >&2 ;;
+            *) printf '[]\n'; printf 'unexpected volume inspection response\n' >&2 ;;
+          esac
+          exit 1
+        }
         jq -cn --arg volume "$volume" --arg source "$volume_root" \
-          '[{Name:$volume,Driver:"local",Mountpoint:$source,Labels:{},Options:{}}]' ;;
+          '[{Name:$volume,Driver:"local",Mountpoint:$source,
+            Labels:{"com.docker.volume.anonymous":""},Options:null}]' ;;
       rm)
         if [ "${FAKE_DOCKER_FAIL_VOLUME_RM_ONCE:-0}" = 1 ] &&
           [ ! -e "$state/volume-rm-failed" ]; then
