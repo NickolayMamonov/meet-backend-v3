@@ -807,18 +807,19 @@ grep -q '^ssh fake boundary argc=' "$boundary_case/boundary.log" ||
 assert_no_private_output "$boundary_case"
 
 workflow=$root/.github/workflows/prove-beta-backup-restore.yml
+capture_stage=$root/scripts/run-beta-recovery-capture-stage.sh
 if [ -f "$workflow" ]; then
-  grep -Fq 'scripts/materialize-beta-recovery-known-hosts.sh' "$workflow" ||
+  grep -Fq 'scripts/materialize-beta-recovery-known-hosts.sh' "$capture_stage" ||
     fail "actual recovery workflow does not call the materializer"
-  grep -Fq 'UserKnownHostsFile="$known"' "$workflow" ||
+  grep -Fq 'UserKnownHostsFile="$known"' "$capture_stage" ||
     fail "actual recovery workflow does not pin UserKnownHostsFile"
-  grep -Fq 'GlobalKnownHostsFile=/dev/null' "$workflow" ||
+  grep -Fq 'GlobalKnownHostsFile=/dev/null' "$capture_stage" ||
     fail "actual recovery workflow does not isolate global known hosts"
-  grep -Fq 'KnownHostsCommand=none' "$workflow" ||
+  grep -Fq 'KnownHostsCommand=none' "$capture_stage" ||
     fail "actual recovery workflow does not disable KnownHostsCommand"
-  grep -Fq 'StrictHostKeyChecking=yes' "$workflow" ||
+  grep -Fq 'StrictHostKeyChecking=yes' "$capture_stage" ||
     fail "actual recovery workflow does not require strict host-key checking"
-  grep -Fq 'ssh_opts=(-F "$config" -i "$key" -p "$PORT"' "$workflow" ||
+  grep -Fq 'ssh_opts=(-F "$config" -i "$key" -p "$PORT"' "$capture_stage" ||
     fail "actual recovery workflow does not pin SSH options"
 fi
 
@@ -1179,12 +1180,11 @@ extract_consumer() {
 capture_body=$consumer_root/capture.sh
 pre_probe_body=$consumer_root/pre-probe.sh
 post_probe_body=$consumer_root/post-probe.sh
-extract_consumer '      - name: Stage and run the locked VPS capture' "$capture_body"
 extract_consumer '      - name: SSH-only pre-probe' "$pre_probe_body"
 extract_consumer '      - id: post_probe' "$post_probe_body"
-chmod 700 "$capture_body" "$pre_probe_body" "$post_probe_body"
 
 semantic_workspace=$consumer_root/semantic-workspace
+export SOURCE_SHA=0123456789abcdef0123456789abcdef01234567
 mkdir -p "$semantic_workspace/scripts"
 tooling_files=(
   scripts/authorize-beta-recovery.sh
@@ -1197,6 +1197,7 @@ tooling_files=(
   scripts/run-beta-recovery-remote-probe.sh
   scripts/production-compose.sh
   scripts/probe-test-vps-recovery-runtime.sh
+  scripts/run-beta-recovery-capture-stage.sh
   scripts/run-beta-recovery-capture.sh
   scripts/run-beta-recovery-restore.sh
   scripts/admit-beta-recovery-artifact.sh
@@ -1205,6 +1206,8 @@ tooling_files=(
 for tooling_file in "${tooling_files[@]}"; do
   cp -- "$root/$tooling_file" "$semantic_workspace/$tooling_file"
 done
+cp -- "$semantic_workspace/scripts/run-beta-recovery-capture-stage.sh" "$capture_body"
+chmod 700 "$capture_body" "$pre_probe_body" "$post_probe_body"
 chmod 700 "$semantic_workspace/scripts/materialize-beta-recovery-known-hosts.sh" \
   "$semantic_workspace/scripts/validate-beta-recovery-artifact-retention.sh"
 fake_age=$semantic_workspace/fake-age
@@ -1308,28 +1311,32 @@ run_consumer_setup_case() {
   chmod 600 "$case_dir/home/.ssh/config"
   : >"$case_dir/boundary.log"; : >"$case_dir/effective.log"; : >"$case_dir/effective.err"
   set +e
-  env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
-    RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
-    HOST="$scan_host" PORT=2222 \
-    SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
-    SUDO_UID="$fixture_sudo_uid" SUDO_GID="$fixture_sudo_gid" \
-    SSH_PRIVATE_KEY=fixture-private-key \
-    AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
-    PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
-    RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
-    GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$case_dir/output" \
-    BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
-    BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
-    BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
-    BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
-    BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
-    BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
-    BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
-    BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
-    BETA_RECOVERY_SETUP_CHMOD_MODE="$mode" BETA_RECOVERY_SETUP_SIGNAL="$signal" \
-    BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
-    bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
-    _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  (
+    cd -- "$semantic_workspace"
+    env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
+      RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
+      HOST="$scan_host" PORT=2222 \
+      SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
+      SUDO_UID="$fixture_sudo_uid" SUDO_GID="$fixture_sudo_gid" \
+      SSH_PRIVATE_KEY=fixture-private-key \
+      AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+      PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
+      RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
+      GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$case_dir/output" \
+      BETA_RECOVERY_FAKE_AGE="$fake_age" \
+      BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+      BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
+      BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
+      BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
+      BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
+      BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
+      BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+      BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
+      BETA_RECOVERY_SETUP_CHMOD_MODE="$mode" BETA_RECOVERY_SETUP_SIGNAL="$signal" \
+      BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
+      bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+      _ "$body"
+  ) >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
   if [ "$status" -ne "$expected_status" ]; then
@@ -1400,31 +1407,35 @@ run_consumer_case() {
   chmod 600 "$case_dir/home/.ssh/config"
   : >"$case_dir/boundary.log"; : >"$case_dir/effective.log"; : >"$case_dir/effective.err"
   set +e
-  env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
-    RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
-    HOST="$scan_host" PORT=2222 \
-    SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
-    SUDO_UID="$fixture_sudo_uid" SUDO_GID="$fixture_sudo_gid" \
-    SSH_PRIVATE_KEY=fixture-private-key \
-    AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
-    PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID="$name" \
-    RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
-    GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$case_dir/output" \
-    BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
-    BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
-    BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
-    BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
-    BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
-    BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
-    BETA_RECOVERY_REMOTE="$remote_state" \
-    BETA_RECOVERY_REMOTE_STATE="$remote_state" \
-    BETA_RECOVERY_CREATE_MODE="$scenario" \
-    BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
-    BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE="$phase" \
-    BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
-    BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
-    bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
-    _ "$body" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  (
+    cd -- "$semantic_workspace"
+    env PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
+      RUNNER_TEMP="$case_dir/runner" PATH_ON_HOST=/fixture/release-root \
+      HOST="$scan_host" PORT=2222 \
+      SSH_USER=fixture-user HOST_FINGERPRINT="$expected_fingerprint" \
+      SUDO_UID="$fixture_sudo_uid" SUDO_GID="$fixture_sudo_gid" \
+      SSH_PRIVATE_KEY=fixture-private-key \
+      AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+      PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID="$name" \
+      RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
+      GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$case_dir/output" \
+      BETA_RECOVERY_FAKE_AGE="$fake_age" \
+      BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+      BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
+      BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
+      BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
+      BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
+      BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
+      BETA_RECOVERY_REMOTE="$remote_state" \
+      BETA_RECOVERY_REMOTE_STATE="$remote_state" \
+      BETA_RECOVERY_CREATE_MODE="$scenario" \
+      BETA_RECOVERY_MUTATION_SENTINEL="$case_dir/mutation-sentinel" \
+      BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE="$phase" \
+      BETA_RECOVERY_REMOTE_CLEANUP_FAIL="$cleanup_failure" \
+      BETA_RECOVERY_PARENT_PID_FILE="$case_dir/body.pid" \
+      bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+      _ "$body"
+  ) >"$case_dir/stdout" 2>"$case_dir/stderr"
   status=$?
   set -e
   if [ "$status" -ne "$expected_status" ]; then
@@ -1505,19 +1516,20 @@ run_consumer_case capture-collision-mismatched-marker "$capture_body" '' '' 0 co
 
 assert_framed_runtime_contract() {
   local workflow_file=$root/.github/workflows/prove-beta-backup-restore.yml
-  grep -Fq 'create_remote_cmd=(sudo bash -c' "$workflow_file" ||
+  local stage_file=$root/scripts/run-beta-recovery-capture-stage.sh
+  grep -Fq 'create_remote_cmd=(sudo bash -c' "$stage_file" ||
     fail "static create launch contract is missing"
-  grep -Fq 'receive_remote_cmd=(sudo bash -c' "$workflow_file" ||
+  grep -Fq 'receive_remote_cmd=(sudo bash -c' "$stage_file" ||
     fail "static receive launch contract is missing"
-  grep -Fq 'cleanup_remote_cmd=(sudo bash -c' "$workflow_file" ||
+  grep -Fq 'cleanup_remote_cmd=(sudo bash -c' "$stage_file" ||
     fail "static cleanup launch contract is missing"
-  grep -Fq 'frame_stdin "$create_header"' "$workflow_file" ||
+  grep -Fq 'frame_stdin "$create_header"' "$stage_file" ||
     fail "framed create invocation is missing"
-  grep -Fq 'frame_stdin "$receive_header"' "$workflow_file" ||
+  grep -Fq 'frame_stdin "$receive_header"' "$stage_file" ||
     fail "framed receive invocation is missing"
-  grep -Fq 'frame_stdin "$cleanup_header"' "$workflow_file" ||
+  grep -Fq 'frame_stdin "$cleanup_header"' "$stage_file" ||
     fail "framed cleanup invocation is missing"
-  grep -Fq 'remote staging publication identity changed' "$workflow_file" ||
+  grep -Fq 'remote staging publication identity changed' "$stage_file" ||
     fail "publication identity diagnostic contract is missing"
   grep -Fq 'scan_entry "$@"' "${BASH_SOURCE[0]}" ||
     fail "fake SSH entry scan contract is missing"
@@ -1529,7 +1541,7 @@ assert_framed_runtime_contract() {
 
 assert_framed_runtime_contract
 
-workflow_file=$root/.github/workflows/prove-beta-backup-restore.yml
+workflow_file=$root/scripts/run-beta-recovery-capture-stage.sh
 remote_program_dir=$consumer_root/remote-programs
 mkdir -p "$remote_program_dir"
 
@@ -1989,21 +2001,25 @@ chmod 700 "$large_remote"
 printf 'meet-backend/beta-recovery-owner/v1:%s\n' "$direct_token" \
   >"$large_remote/.meet-beta-recovery-owner"
 chmod 600 "$large_remote/.meet-beta-recovery-owner"
-large_payload=$large_case/source/age
-arg_max=$(getconf ARG_MAX)
-dd if=/dev/zero of="$large_payload" bs=1 count="$((arg_max + 1))" status=none
-large_length=$(stat -c '%s' "$large_payload")
-large_sha=$(sha256sum "$large_payload" | awk '{print $1}')
-large_identity=$(stat -Lc '%d:%i' "$large_remote")
-printf -v large_header \
-  'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s\n' \
-  "$large_remote" "$large_identity" "$direct_token" "$large_sha" "$large_length"
-direct_frame_case arg-max-payload receive "$large_header" '' \
-  "$large_payload" "$large_remote"
-[ "$(<"$large_case/status")" -eq 0 ] ||
-  fail "ARG_MAX-sized payload receive failed"
-cmp "$large_payload" "$large_remote/age" ||
-  fail "ARG_MAX-sized payload bytes changed"
+arg_max=$(getconf ARG_MAX 2>/dev/null || true)
+if [[ "$arg_max" =~ ^[0-9]+$ ]]; then
+  large_payload=$large_case/source/age
+  dd if=/dev/zero of="$large_payload" bs=1 count="$((arg_max + 1))" status=none
+  large_length=$(stat -c '%s' "$large_payload")
+  large_sha=$(sha256sum "$large_payload" | awk '{print $1}')
+  large_identity=$(stat -Lc '%d:%i' "$large_remote")
+  printf -v large_header \
+    'meet-backend/beta-recovery-file/v1|%s|%s|%s|age|%s|600|%s\n' \
+    "$large_remote" "$large_identity" "$direct_token" "$large_sha" "$large_length"
+  direct_frame_case arg-max-payload receive "$large_header" '' \
+    "$large_payload" "$large_remote"
+  [ "$(<"$large_case/status")" -eq 0 ] ||
+    fail "ARG_MAX-sized payload receive failed"
+  cmp "$large_payload" "$large_remote/age" ||
+    fail "ARG_MAX-sized payload bytes changed"
+else
+  echo "beta recovery SSH host-key fixture: ARG_MAX matrix skipped (getconf unsupported)"
+fi
 rm -r -- "$large_remote"
 
 run_capture_proof_case() {
@@ -2246,25 +2262,29 @@ for signal in HUP INT TERM; do
   chmod 600 "$pre_case/home/.ssh/config"
   : >"$pre_case/boundary.log"; : >"$pre_case/effective.log"; : >"$pre_case/effective.err"
   set +e
-  env PATH="$consumer_bin:$original_path" HOME="$pre_case/home" \
-    RUNNER_TEMP="$pre_case/runner" PATH_ON_HOST=/fixture/release-root \
-    HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
-    HOST_FINGERPRINT="$expected_fingerprint" SSH_PRIVATE_KEY=fixture-private-key \
-    AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
-    PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
-    RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
-    GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$pre_case/output" \
-    BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
-    BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
-    BETA_RECOVERY_BOUNDARY_LOG="$pre_case/boundary.log" \
-    BETA_RECOVERY_EFFECTIVE_LOG="$pre_case/effective.log" BETA_RECOVERY_EFFECTIVE_ERR="$pre_case/effective.err" \
-    BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
-    BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
-    BETA_RECOVERY_MUTATION_SENTINEL="$pre_case/mutation-sentinel" \
-    BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE=scan \
-    BETA_RECOVERY_PARENT_PID_FILE="$pre_case/body.pid" \
-    bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
-    _ "$capture_body" >"$pre_case/stdout" 2>"$pre_case/stderr"
+  (
+    cd -- "$semantic_workspace"
+    env PATH="$consumer_bin:$original_path" HOME="$pre_case/home" \
+      RUNNER_TEMP="$pre_case/runner" PATH_ON_HOST=/fixture/release-root \
+      HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+      HOST_FINGERPRINT="$expected_fingerprint" SSH_PRIVATE_KEY=fixture-private-key \
+      AGE_RECIPIENT=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m \
+      PUBLIC_URL=https://api.whysoezzy.online RECOVERY_ID=recovery-fixture \
+      RECOVERY_WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
+      GITHUB_REPOSITORY=fixture/repository GITHUB_RUN_ID=7 GITHUB_OUTPUT="$pre_case/output" \
+      BETA_RECOVERY_FAKE_AGE="$fake_age" \
+      BETA_RECOVERY_REAL_SSH_KEYGEN="$real_ssh_keygen" BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+      BETA_RECOVERY_REAL_LN="$(command -v ln)" BETA_RECOVERY_REAL_RM="$real_rm" \
+      BETA_RECOVERY_BOUNDARY_LOG="$pre_case/boundary.log" \
+      BETA_RECOVERY_EFFECTIVE_LOG="$pre_case/effective.log" BETA_RECOVERY_EFFECTIVE_ERR="$pre_case/effective.err" \
+      BETA_RECOVERY_SCAN_LINE="[$scan_host]:2222 $key_type $key_data" \
+      BETA_RECOVERY_REMOTE=/tmp/beta-recovery-recovery-fixture \
+      BETA_RECOVERY_MUTATION_SENTINEL="$pre_case/mutation-sentinel" \
+      BETA_RECOVERY_SIGNAL="$signal" BETA_RECOVERY_SIGNAL_PHASE=scan \
+      BETA_RECOVERY_PARENT_PID_FILE="$pre_case/body.pid" \
+      bash -c 'trap - HUP INT TERM; printf "%s\n" "$BASHPID" >"$BETA_RECOVERY_PARENT_PID_FILE"; exec bash "$1"' \
+      _ "$capture_body"
+  ) >"$pre_case/stdout" 2>"$pre_case/stderr"
   status=$?
   set -e
   expected_status=$(assert_signal_status "$signal")

@@ -76,7 +76,8 @@ for path in "${remote_executables[@]}"; do
   require_workflow_reference "$path"
 done
 
-for path in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+for path in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh \
+  scripts/run-beta-recovery-capture.sh \
   scripts/run-beta-recovery-restore.sh scripts/probe-test-vps-recovery-runtime.sh \
   scripts/build-beta-recovery-evidence.sh scripts/beta-recovery-media-proof.sh \
   scripts/install-beta-recovery-age.sh scripts/materialize-beta-recovery-known-hosts.sh; do

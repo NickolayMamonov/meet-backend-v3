@@ -109,7 +109,8 @@ else
 fi
 printf '%s\n' age-install age-keygen age-encrypt-database age-encrypt-uploads >>"$fixture/events.log"
 tooling_digest=$(cd "$root" && for file in \
-  scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
+  scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh \
+  scripts/run-beta-recovery-capture.sh \
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
   scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \
   scripts/probe-test-vps-recovery-runtime.sh scripts/backup-production.sh \

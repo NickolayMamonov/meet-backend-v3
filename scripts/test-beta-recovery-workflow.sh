@@ -2,7 +2,9 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 workflow=$root/.github/workflows/prove-beta-backup-restore.yml
+stage=$root/scripts/run-beta-recovery-capture-stage.sh
 [ -f "$workflow" ] || exit 1
+[ -x "$stage" ] || exit 1
 command -v jq >/dev/null 2>&1
 require_literals_file() {
   local file=$1 needles=$2
@@ -50,7 +52,7 @@ contains_literal_file 'ln -T --' "$root/scripts/materialize-beta-recovery-known-
 contains_literal_file 'published_output_identity=' "$root/scripts/materialize-beta-recovery-known-hosts.sh"
 contains_literal_file '[ "$published_output_identity" = "$candidate_identity" ]' \
   "$root/scripts/materialize-beta-recovery-known-hosts.sh"
-helper_count=$(grep -Fc -- '--output "$known"' "$workflow")
+helper_count=$(grep -Fc -- '--output "$known"' "$stage")
 [ "$helper_count" -eq 1 ]
 grep -Fq 'scripts/run-beta-recovery-remote-probe.sh' "$workflow"
 probe_helper="$root/scripts/run-beta-recovery-remote-probe.sh"
@@ -63,6 +65,7 @@ for required in \
   '-o UserKnownHostsFile="$known"' \
   '-o GlobalKnownHostsFile=/dev/null' \
   '-o KnownHostsCommand=none'; do
+  contains_literal_file "$required" "$stage" ||
   contains_literal_file "$required" "$workflow" ||
     contains_literal_file "$required" "$probe_helper"
 done
@@ -73,12 +76,13 @@ for required in \
   "trap 'on_signal 129' HUP" \
   "trap 'on_signal 130' INT" \
   "trap 'on_signal 143' TERM"; do
+  contains_literal_file "$required" "$stage" ||
   contains_literal_file "$required" "$workflow" ||
     contains_literal_file "$required" "$probe_helper"
 done
-grep -Fq "trap 'cleanup_capture \"\$?\"' EXIT" "$workflow"
+grep -Fq "trap 'cleanup_capture \"\$?\"' EXIT" "$stage"
 grep -Fq 'trap cleanup' "$probe_helper"
-if grep -Fq 'trap cleanup_capture EXIT HUP INT TERM' "$workflow" ||
+if grep -Fq 'trap cleanup_capture EXIT HUP INT TERM' "$stage" ||
   grep -Fq 'trap cleanup_probe EXIT HUP INT TERM' "$workflow"; then
   echo "workflow uses signal-ambiguous cleanup traps" >&2
   exit 1
@@ -87,7 +91,73 @@ if grep -Fq 'printf '\''%s\n'\'' "$HOST_FINGERPRINT"' "$workflow"; then
   echo "workflow directly writes the configured fingerprint" >&2
   exit 1
 fi
-capture_block=$(awk '/Stage and run the locked VPS capture/{flag=1} /restore-select:/{flag=0} flag' "$workflow")
+recovery_scalar_budget() {
+  local file=$1
+  LC_ALL=C awk -v file="$file" -v limit=16384 '
+    function leading_spaces(value) {
+      match(value, /^[ ]*/)
+      return RLENGTH
+    }
+    function finish_scalar() {
+      if (active && expression && bytes > limit) {
+        printf "%s:%d: expression-backed scalar is %d bytes (limit %d)\n",
+          file, start, bytes, limit > "/dev/stderr"
+        failed=1
+      }
+      active=0
+      expression=0
+      bytes=0
+    }
+    {
+      if (index($0, "\r")) {
+        printf "%s:%d: CR byte is not permitted\n", file, NR > "/dev/stderr"
+        failed=1
+        exit 1
+      }
+      current_indent=leading_spaces($0)
+      if (active) {
+        if ($0 == "" || current_indent > base_indent) {
+          bytes += length($0) + 1
+          if (index($0, "${{")) expression=1
+          next
+        }
+        finish_scalar()
+      }
+      if ($0 ~ /^[[:space:]-]*[A-Za-z0-9_.-]+:[[:space:]]*[|>][0-9+-]*([[:space:]]*#.*)?$/) {
+        active=1
+        start=NR
+        base_indent=current_indent
+        bytes=length($0) + 1
+        expression=index($0, "${{") > 0
+        next
+      }
+      if (index($0, "${{")) {
+        non_block_bytes=length($0) + 1
+        if (non_block_bytes > limit) {
+          printf "%s:%d: expression-backed non-block scalar is %d bytes (limit %d)\n",
+            file, NR, non_block_bytes, limit > "/dev/stderr"
+          failed=1
+        }
+      }
+    }
+    END {
+      finish_scalar()
+      exit failed
+    }
+  ' "$file"
+}
+fixture=$root/scripts/fixtures/beta-recovery/oversized-expression-scalar.yml
+[ "$(wc -c <"$fixture" | tr -d '[:space:]')" -eq 30264 ]
+[ "$(wc -l <"$fixture" | tr -d '[:space:]')" -eq 561 ]
+if recovery_scalar_budget "$fixture" >/dev/null 2>&1; then
+  echo "oversized expression scalar fixture was accepted" >&2
+  exit 1
+fi
+recovery_scalar_budget "$workflow"
+capture_block=$(<"$stage")
+grep -Fq 'SOURCE_SHA' "$stage"
+grep -Fq 'run: exec scripts/run-beta-recovery-capture-stage.sh' "$workflow"
+grep -Fq 'SOURCE_SHA: ${{ inputs.source_sha }}' "$workflow"
 pre_probe_block=$(awk '/restore-pre-probe:/{flag=1} /restore-isolated:/{flag=0} flag' "$workflow")
 post_probe_block=$(awk '/restore-post-probe:/{flag=1} /evidence:/{flag=0} flag' "$workflow")
 capture_job=$(awk '/^  capture:/{flag=1} /^  restore-select:/{flag=0} flag' "$workflow")
@@ -257,7 +327,7 @@ grep -Eq '\[\[?[[:space:]]*-r[[:space:]]+"\$source"|\[\[.*-f.*\$source' <<<"$cap
   { echo "sender does not require a readable regular source" >&2; exit 1; }
 grep -Eq '\[\[.*![[:space:]]*-L.*\$source|\[[[:space:]]*!.*-L.*\$source' <<<"$capture_block" ||
   { echo "sender does not reject symlink sources" >&2; exit 1; }
-grep -Fq 'send_capture_file "$age_path" age' "$workflow" ||
+grep -Fq 'send_capture_file "$age_path" age' "$stage" ||
   { echo "pinned age is not sent through the shared raw-stream receiver" >&2; exit 1; }
 [ "$(grep -Fc 'PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}' "$workflow")" -eq 3 ]
 assert_release_root_gate(){
@@ -366,17 +436,17 @@ grep -Fq 'cleanup-failure-after-publication' "$root/scripts/test-beta-recovery-s
 grep -Fq 'post-publication-signal-$signal' "$root/scripts/test-beta-recovery-ssh-host-key.sh"
 grep -Fq 'unset AGE_IDENTITY' "$workflow"
 grep -Fq 'scripts/install-beta-recovery-age.sh "$age_bin"' "$workflow"
-grep -Fq 'owner_token=$(od -An -N32 -tx1 /dev/urandom | tr -d '\''[:space:]'\'')' "$workflow"
-grep -Fq 'remote_create_attempted=true' "$workflow"
-grep -Fq 'remote_cleanup_done=false' "$workflow"
-grep -Fq 'cleanup_remote' "$workflow"
-grep -Fq '.meet-beta-recovery-owner' "$workflow"
-grep -Fq 'meet-backend/beta-recovery-owner/v1:' "$workflow"
-grep -Fq 'cmp -- "$expected" "$marker"' "$workflow"
-grep -Fq 'stat -c '\''%a:%u:%g:%h'\'' "$marker"' "$workflow"
-grep -Fq -- '--age-binary "$remote/age"' "$workflow"
-grep -Fq -- '--age-sha256 "$5" --age-version "$6" --age-os "$7" --age-arch "$8"' "$workflow"
-age_transport_count=$(grep -Fc 'send_capture_file "$age_path" age' "$workflow")
+grep -Fq 'owner_token=$(od -An -N32 -tx1 /dev/urandom | tr -d '\''[:space:]'\'')' "$stage"
+grep -Fq 'remote_create_attempted=true' "$stage"
+grep -Fq 'remote_cleanup_done=false' "$stage"
+grep -Fq 'cleanup_remote' "$stage"
+grep -Fq '.meet-beta-recovery-owner' "$stage"
+grep -Fq 'meet-backend/beta-recovery-owner/v1:' "$stage"
+grep -Fq 'cmp -- "$expected" "$marker"' "$stage"
+grep -Fq 'stat -c '\''%a:%u:%g:%h'\'' "$marker"' "$stage"
+grep -Fq -- '--age-binary "$remote/age"' "$stage"
+grep -Fq -- '--age-sha256 "$5" --age-version "$6" --age-os "$7" --age-arch "$8"' "$stage"
+age_transport_count=$(grep -Fc 'send_capture_file "$age_path" age' "$stage")
 [ "$age_transport_count" -eq 1 ]
 ! grep -Fq 'age-keygen' <<<"$capture_block"
 grep -Fq 'archive_size=10263766' "$root/scripts/install-beta-recovery-age.sh"
@@ -412,8 +482,8 @@ if grep -Fq "$unsupported_claim" "$root/scripts/authorize-beta-recovery.sh" ||
   echo "authorization still emits unsupported identity proof" >&2
   exit 1
 fi
-grep -Fq 'recipient_file="$RUNNER_TEMP/age-recipient"' "$workflow"
-grep -Fq 'recipient=$(<"$remote/age-recipient")' "$workflow"
+grep -Fq 'recipient_file="$RUNNER_TEMP/age-recipient"' "$stage"
+grep -Fq 'recipient=$(<"$remote/age-recipient")' "$stage"
 grep -Fq 'Remove selected artifact temporary files' "$workflow"
 grep -Fq 'RUNNER_TEMP/age-identity' "$workflow"
 grep -Fq 'Verify no isolated restore runner residue' "$workflow"
@@ -460,6 +530,18 @@ restore_line=$(grep -n 'id: restore' "$workflow" | cut -d: -f1)
 auth="$root/scripts/authorize-beta-recovery.sh"
 fixture_dir=$(mktemp -d)
 trap 'rm -r -- "$fixture_dir"' EXIT HUP INT TERM
+non_block_fixture=$fixture_dir/non-block-expression.yml
+non_block_padding=$(printf '%*s' 16384 '' | tr ' ' x)
+printf 'plain: ${{ %s }}\n' "$non_block_padding" >"$non_block_fixture"
+if recovery_scalar_budget "$non_block_fixture" >/dev/null 2>&1; then
+  echo "oversized plain expression scalar was accepted" >&2
+  exit 1
+fi
+printf 'quoted: '\''${{ %s }}'\''\n' "$non_block_padding" >"$non_block_fixture"
+if recovery_scalar_budget "$non_block_fixture" >/dev/null 2>&1; then
+  echo "oversized quoted expression scalar was accepted" >&2
+  exit 1
+fi
 valid_recovery_id=recovery-fixture
 valid_recipient=age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m
 invalid_short_recipient=age1x
@@ -517,7 +599,7 @@ run_safe_capture_preflight "$valid_recipient"
 [ "$ssh_calls" -eq 1 ]
 [ "$(wc -l <"$received_recipient" | tr -d '[:space:]')" -eq 1 ]
 [ "$(<"$received_recipient")" = "$valid_recipient" ]
-grep -Fq 'transferred ciphertext differs from quiesced capture result' "$workflow"
+grep -Fq 'transferred ciphertext differs from quiesced capture result' "$stage"
 for required in \
   'database_proof_actual_sha=$(sha256sum "$RUNNER_TEMP/database-proof.json" |' \
   'media_proof_actual_sha=$(sha256sum "$RUNNER_TEMP/media-proof.json" |' \
@@ -532,28 +614,28 @@ for required in \
   'database proof differs from quiesced capture result' \
   'media proof differs from quiesced capture result' \
   'remote staging cleanup failed'; do
-  grep -Fq -- "$required" "$workflow"
+  grep -Fq -- "$required" "$stage"
 done
-grep -Fq 'database_proof_expected_sha=$(jq -er' "$workflow"
-grep -Fq ".proofs.database.sha256 // empty" "$workflow"
-grep -Fq 'media_proof_expected_sha=$(jq -er' "$workflow"
-grep -Fq ".proofs.media.sha256 // empty" "$workflow"
-grep -Fq '2>/dev/null); then' "$workflow"
-! grep -Fq 'all(.proofs[]; (keys|sort)==["name","sha256"]' "$workflow"
-grep -Fq 'tooling_digest=$(for file in scripts/authorize-beta-recovery.sh' "$workflow"
-grep -Fq -- '--tooling-digest "$tooling_digest"' "$workflow"
+grep -Fq 'database_proof_expected_sha=$(jq -er' "$stage"
+grep -Fq ".proofs.database.sha256 // empty" "$stage"
+grep -Fq 'media_proof_expected_sha=$(jq -er' "$stage"
+grep -Fq ".proofs.media.sha256 // empty" "$stage"
+grep -Fq '2>/dev/null); then' "$stage"
+! grep -Fq 'all(.proofs[]; (keys|sort)==["name","sha256"]' "$stage"
+grep -Fq 'tooling_digest=$(for file in scripts/authorize-beta-recovery.sh' "$stage"
+grep -Fq -- '--tooling-digest "$tooling_digest"' "$stage"
 ! grep -Fq 'transferred proof differs from quiesced capture result' "$workflow"
-proof_gate_line=$(grep -n 'database_proof_actual_sha=' "$workflow" | head -1 | cut -d: -f1)
-proof_shape_line=$(grep -n 'database proof expected digest is missing or malformed' "$workflow" |
+proof_gate_line=$(grep -n 'database_proof_actual_sha=' "$stage" | head -1 | cut -d: -f1)
+proof_shape_line=$(grep -n 'database proof expected digest is missing or malformed' "$stage" |
   head -1 | cut -d: -f1)
-proof_compare_line=$(grep -n 'media proof differs from quiesced capture result' "$workflow" |
+proof_compare_line=$(grep -n 'media proof differs from quiesced capture result' "$stage" |
   head -1 | cut -d: -f1)
 [ "$proof_gate_line" -lt "$proof_shape_line" ] &&
   [ "$proof_shape_line" -lt "$proof_compare_line" ]
-aggregate_line=$(grep -n '\[ "$uploads_files"' "$workflow" | head -1 | cut -d: -f1)
-time_line=$(grep -n 'point_epoch=$(date -u' "$workflow" | head -1 | cut -d: -f1)
-cleanup_line=$(grep -n 'cleanup_remote ||' "$workflow" | head -1 | cut -d: -f1)
-evidence_line=$(grep -n 'scripts/build-beta-recovery-evidence.sh manifest' "$workflow" |
+aggregate_line=$(grep -n '\[ "$uploads_files"' "$stage" | head -1 | cut -d: -f1)
+time_line=$(grep -n 'point_epoch=$(date -u' "$stage" | head -1 | cut -d: -f1)
+cleanup_line=$(grep -n 'cleanup_remote ||' "$stage" | head -1 | cut -d: -f1)
+evidence_line=$(grep -n 'scripts/build-beta-recovery-evidence.sh manifest' "$stage" |
   head -1 | cut -d: -f1)
 [ "$proof_gate_line" -lt "$proof_compare_line" ] &&
   [ "$proof_compare_line" -lt "$aggregate_line" ] &&
@@ -562,8 +644,8 @@ evidence_line=$(grep -n 'scripts/build-beta-recovery-evidence.sh manifest' "$wor
   [ "$cleanup_line" -lt "$evidence_line" ]
 publish_block=$(awk '/^      - id: publish$/{flag=1} flag' "$workflow")
 ! grep -Fq 'if: always()' <<<"$publish_block"
-grep -Fq '.capturedAt==.recoveryPointTime' "$workflow"
-grep -Fq 'observed_age=$((observed_epoch - point_epoch))' "$workflow"
+grep -Fq '.capturedAt==.recoveryPointTime' "$stage"
+grep -Fq 'observed_age=$((observed_epoch - point_epoch))' "$stage"
 [ "$(grep -Fc 'retention-days: 30' "$workflow")" -eq 6 ]
 [ "$(grep -Fc 'scripts/validate-beta-recovery-artifact-retention.sh <<<"$artifact_json"' "$workflow")" -eq 2 ]
 ! grep -Eq 'created_epoch|expires_epoch|30 \* 24 \* 60 \* 60' "$workflow"
@@ -662,12 +744,13 @@ scripts/install-beta-recovery-age.sh
 scripts/materialize-beta-recovery-known-hosts.sh
 scripts/probe-test-vps-recovery-runtime.sh
 scripts/production-compose.sh
+scripts/run-beta-recovery-capture-stage.sh
 scripts/run-beta-recovery-capture.sh
 scripts/run-beta-recovery-remote-probe.sh
 scripts/run-beta-recovery-restore.sh
 scripts/validate-beta-recovery-artifact-retention.sh
 EOF
-extract_paths() { grep -oE 'scripts/[A-Za-z0-9._-]+' | sort -u; }
+extract_paths() { grep -oE 'scripts/[A-Za-z0-9._-]+' | LC_ALL=C sort -u; }
 workflow_inventory() {
   local wanted=$1
   awk -v wanted="$wanted" '
@@ -684,12 +767,16 @@ assert_inventory() {
   diff -u "$canonical_inventory" "$actual" ||
     { echo "$label tooling inventory differs" >&2; exit 1; }
 }
-[ "$(grep -Fc 'for file in scripts/authorize-beta-recovery.sh' "$workflow")" -eq 3 ]
-for index in 1 2 3; do
+[ "$(grep -Fc 'for file in scripts/authorize-beta-recovery.sh' "$workflow")" -eq 2 ]
+for index in 1 2; do
   actual=$retention_fixture/workflow-$index
   workflow_inventory "$index" >"$actual"
   assert_inventory "workflow inventory $index" "$actual"
 done
+actual=$retention_fixture/stage
+awk '/^tooling_digest=\$\(for file/{active=1} active {print} active && /; do/{exit}' \
+  "$stage" | extract_paths >"$actual"
+assert_inventory stage "$actual"
 actual=$retention_fixture/authorization
 awk '/^files=\(/{active=1} active {print} active && /^\)/{exit}' \
   "$root/scripts/authorize-beta-recovery.sh" | extract_paths >"$actual"
@@ -765,7 +852,7 @@ jq -e --arg db "$capture_db_sha" --arg media "$capture_media_sha" '
 point_epoch=$(date -u -d 2026-08-27T19:00:00Z +%s)
 observed_epoch=$((point_epoch + 120))
 [ "$((observed_epoch - point_epoch))" -eq 120 ]
-grep -Fq 'capture-database-proof.json' "$workflow"
+grep -Fq 'capture-database-proof.json' "$stage"
 if grep -Fq '${{ runner.temp }}/database-proof.json' "$workflow" ||
   grep -Fq '${{ runner.temp }}/media-proof.json' "$workflow"; then
   echo "capture proof files are incorrectly published as workflow artifacts" >&2
