@@ -22,6 +22,20 @@ frame_stdin() {
   printf -v prefix '%08x' "$header_length"
   printf '%s%s' "$prefix" "$header"
 }
+serialize_remote_command() {
+  local word quoted command=
+  (( $# >= 1 ))
+  for word in "$@"; do
+    [[ "$word" != *$'\r'* && "$word" != *$'\n'* ]]
+    LC_ALL=C printf -v quoted '%q' "$word"
+    if [ -n "$command" ]; then
+      command+=' '
+    fi
+    command+=$quoted
+  done
+  [ -n "$command" ]
+  printf '%s' "$command"
+}
 create_program=$(cat <<'REMOTE_CREATE_PROGRAM'
 set -euo pipefail
 LC_ALL=C
@@ -317,9 +331,13 @@ REMOTE_CLEANUP_PROGRAM
 create_program_b64=$(printf '%s' "$create_program" | base64 --wrap=0)
 receive_program_b64=$(printf '%s' "$receive_program" | base64 --wrap=0)
 cleanup_program_b64=$(printf '%s' "$cleanup_program" | base64 --wrap=0)
-create_remote_cmd=(sudo bash -c 'exec bash <(printf "%s" "$1" | base64 --decode)' -- "$create_program_b64")
-receive_remote_cmd=(sudo bash -c 'exec bash <(printf "%s" "$1" | base64 --decode)' -- "$receive_program_b64")
-cleanup_remote_cmd=(sudo bash -c 'exec bash <(printf "%s" "$1" | base64 --decode)' -- "$cleanup_program_b64")
+decoder_program='exec bash <(printf "%s" "$1" | base64 --decode)'
+create_remote_cmd=$(serialize_remote_command \
+  sudo bash -c "$decoder_program" -- "$create_program_b64")
+receive_remote_cmd=$(serialize_remote_command \
+  sudo bash -c "$decoder_program" -- "$receive_program_b64")
+cleanup_remote_cmd=$(serialize_remote_command \
+  sudo bash -c "$decoder_program" -- "$cleanup_program_b64")
 ssh_dir=
 recipient_file=
 remote_create_attempted=false
@@ -331,7 +349,7 @@ cleanup_remote() {
   printf -v cleanup_header 'meet-backend/beta-recovery-cleanup/v1|%s|%s\n' \
     "$remote" "$owner_token"
   frame_stdin "$cleanup_header" |
-    ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "${cleanup_remote_cmd[@]}"
+    ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "$cleanup_remote_cmd"
 }
 cleanup_capture() {
   local status=$1
@@ -372,7 +390,7 @@ create_header=
 printf -v create_header 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
   "$remote" "$owner_token"
 frame_stdin "$create_header" |
-  ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "${create_remote_cmd[@]}"
+  ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "$create_remote_cmd"
 remote_identity=$(ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" sudo bash -s -- \
   "$remote" <<'REMOTE_IDENTITY'
 set -euo pipefail
@@ -403,7 +421,7 @@ send_capture_file() {
   {
     frame_stdin "$receive_header"
     cat -- "$source"
-  } | ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "${receive_remote_cmd[@]}"
+  } | ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "$receive_remote_cmd"
 }
 send_capture_file scripts/run-beta-recovery-capture.sh run-beta-recovery-capture.sh
 send_capture_file scripts/backup-production.sh backup-production.sh

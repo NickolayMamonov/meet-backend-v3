@@ -254,6 +254,29 @@ assert_eof_probe_contract cleanup "$cleanup_program"
 grep -Fq 'rm -rf -- "$scratch" || status=1' <<<"$create_program" ||
   { echo "create cleanup trap does not remove parser scratch" >&2; exit 1; }
 assert_capture_count_at_least 'static control-program encoding' 3 'base64 --wrap=0'
+grep -Fq 'serialize_remote_command() {' <<<"$capture_block" ||
+  { echo "shared remote-command serializer is missing" >&2; exit 1; }
+grep -Fq "LC_ALL=C printf -v quoted '%q' \"\$word\"" <<<"$capture_block" ||
+  { echo "remote-command serializer does not use LC_ALL=C printf %q" >&2; exit 1; }
+grep -Fq 'command+=' <<<"$capture_block" ||
+  { echo "remote-command serializer does not build a scalar command" >&2; exit 1; }
+grep -Fq '[[ "$word" != *$'\''\r'\''* && "$word" != *$'\''\n'\''* ]]' \
+  <<<"$capture_block" ||
+  { echo "remote-command serializer does not reject CR/LF words" >&2; exit 1; }
+grep -Fq "decoder_program='exec bash <(printf \"%s\" \"\$1\" | base64 --decode)'" \
+  <<<"$capture_block" ||
+  { echo "fixed decoder program is missing" >&2; exit 1; }
+for launcher in create receive cleanup; do
+  grep -Fq "${launcher}_remote_cmd=\$(serialize_remote_command" <<<"$capture_block" ||
+    { echo "$launcher launcher is not serialized through the shared helper" >&2; exit 1; }
+  grep -Fq "ssh \"\${ssh_opts[@]}\" \"\$SSH_USER@\$HOST\" \"\$${launcher}_remote_cmd\"" \
+    <<<"$capture_block" ||
+    { echo "$launcher launcher is not one quoted post-destination argument" >&2; exit 1; }
+  ! grep -Fq "${launcher}_remote_cmd=(" <<<"$capture_block" ||
+    { echo "$launcher launcher remains an argv array" >&2; exit 1; }
+  ! grep -Fq "\${${launcher}_remote_cmd[@]}" <<<"$capture_block" ||
+    { echo "$launcher launcher expands as multiple SSH arguments" >&2; exit 1; }
+done
 assert_capture_count_at_least 'static decoder launch' 3 'sudo bash -c'
 assert_capture_count_at_least 'binary prefix validation' 3 'dd iflag=fullblock bs=1 count=8 status=none'
 assert_capture_count_at_least 'binary header inspection' 3 'od -An -v -tx1'
