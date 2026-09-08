@@ -1599,7 +1599,7 @@ extract_workflow_program REMOTE_RECEIVE_PROGRAM "$remote_program_dir/receive"
 extract_workflow_program REMOTE_CLEANUP_PROGRAM "$remote_program_dir/cleanup"
 
 serialize_fixture_remote_command() {
-  local serialized= word quoted
+  local serialized='' word quoted
   [ "$#" -ge 1 ] || fail "fixture remote serializer received no words"
   for word in "$@"; do
     [[ "$word" != *$'\r'* && "$word" != *$'\n'* ]] ||
