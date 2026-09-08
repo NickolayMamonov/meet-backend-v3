@@ -83,8 +83,12 @@ authenticated by a per-run 64-hex ownership token in a strict
 bounded, validated binary-safe stdin control frames; the identity query carries
 no credential. Each allowlisted capture input uses one exact-length-bounded raw
 stdin stream, while invariant remote programs are separate from dynamic input.
-No payload, owner token, or reversible encoding of either is carried in SSH
-argv, remote command source, or exported environment. If SSH reports failure
+The fixed decoder invocation and invariant program body are shell-serialized
+word by word into one command before OpenSSH, then parsed once by the remote
+login shell; framed stdin remains independent of that command. Base64 carries
+invariant code only, never a token or payload. No payload, owner token, or
+reversible encoding of either is carried in SSH argv, remote command source,
+or exported environment. If SSH reports failure
 after root and marker creation, cleanup still removes the root only when path,
 type, owner, modes, link count, and marker bytes authenticate this run; absent
 or mismatched-marker collisions are preserved byte-for-byte and

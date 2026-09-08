@@ -839,6 +839,11 @@ fixture_sudo_gid=$(id -g)
 export SUDO_UID="$fixture_sudo_uid"
 export SUDO_GID="$fixture_sudo_gid"
 
+write_wrapper "$consumer_bin/sudo" \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'exec "$@"'
+
 write_wrapper "$consumer_bin/ssh-keyscan" \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -1025,20 +1030,11 @@ write_wrapper "$consumer_bin/ssh" \
   'for ((i=0; i<${#args[@]}; i++)); do' \
   '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
   'done' \
-  'decoded_program_arg=-1' \
-  'for ((i=0; i<${#args[@]}; i++)); do' \
-  '  if [ "${args[i]:-}" = -c ] &&' \
-  '    [[ "${args[i+1]:-}" == *base64*--decode* ]] &&' \
-  '    [ "${args[i+2]:-}" = -- ] && [ -n "${args[i+3]:-}" ]; then' \
-  '    decoded_program_arg=$((i + 3)); break' \
-  '  fi' \
-  'done' \
+  'command_argc=0' \
+  'if [ "$command_start" -ge 0 ]; then command_argc=$((${#args[@]} - command_start)); fi' \
+  'printf "remote-command-argc=%s\n" "$command_argc" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   'frame_input=' \
-  'if [ "$decoded_program_arg" -ge 0 ]; then' \
-  '  frame_input=$(mktemp)' \
-  '  cat >"$frame_input"' \
-  '  exec <"$frame_input"' \
-  'fi' \
+  'invariant_command=false' \
   '"${BETA_RECOVERY_REAL_SSH:?}" -G "${effective_args[@]}" </dev/null >"$BETA_RECOVERY_EFFECTIVE_LOG" 2>"$BETA_RECOVERY_EFFECTIVE_ERR" || { printf "effective-config-failed ssh\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 43; }' \
   'grep -Fxq "user $SSH_USER" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-user\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
   'grep -Fxq "hostname $HOST" "$BETA_RECOVERY_EFFECTIVE_LOG" || { printf "effective-config-mismatch-host\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 44; }' \
@@ -1052,47 +1048,67 @@ write_wrapper "$consumer_bin/ssh" \
   'for ((i=0; i<${#args[@]}; i++)); do' \
   '  if [ "${args[i]}" = "$destination" ]; then command_start=$((i + 1)); break; fi' \
   'done' \
-  'if [ "$decoded_program_arg" -ge 0 ]; then' \
-  '  remote_state=${BETA_RECOVERY_REMOTE_STATE:-}' \
-  '  static_program="$remote_state.static.$BASHPID"' \
-  '  trap '\''status=$?; rm -f -- "$static_program" "$frame_input"; exit "$status"'\'' EXIT' \
-  '  base64 --decode <<<"${args[decoded_program_arg]}" >"$static_program"' \
-  '  if dd iflag=fullblock bs=1 skip=8 count=128 status=none if="$frame_input" |' \
-  '    grep -aFq "meet-backend/beta-recovery-create/v1" ; then' \
-  '    operation=create' \
-  '  elif dd iflag=fullblock bs=1 skip=8 count=128 status=none if="$frame_input" |' \
-  '    grep -aFq "meet-backend/beta-recovery-file/v1" ; then' \
-  '    operation=receive' \
-  '  elif dd iflag=fullblock bs=1 skip=8 count=128 status=none if="$frame_input" |' \
-  '    grep -aFq "meet-backend/beta-recovery-cleanup/v1" ; then' \
-  '    operation=cleanup' \
-  '  else' \
-  '    printf "argv-unclassified\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"; exit 49' \
+  'if [ "$command_start" -ge 0 ] && [ "$command_argc" -ge 1 ]; then' \
+  '  command_text=' \
+  '  for ((i=command_start; i<${#args[@]}; i++)); do' \
+  '    [ -n "$command_text" ] && command_text+=" "' \
+  '    command_text+="${args[i]}"' \
+  '  done' \
+  '  if { [ "$command_argc" -eq 1 ] &&' \
+  '      [[ "$command_text" == sudo\ bash\ -c\ *base64*--decode* ]]; } ||' \
+  '    { [ "$command_argc" -ge 5 ] &&' \
+  '      [ "${args[command_start]:-}" = sudo ] &&' \
+  '      [ "${args[command_start+1]:-}" = bash ] &&' \
+  '      [ "${args[command_start+2]:-}" = -c ] &&' \
+  '      [[ "${args[command_start+3]:-}" == *base64*--decode* ]] &&' \
+  '      [ "${args[command_start+4]:-}" = -- ]; }; then' \
+  '    invariant_command=true' \
   '  fi' \
-  '  printf "decoded-program-%s\n" "$operation" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  'fi' \
+  'if [ "$invariant_command" = true ]; then' \
+  '  frame_input=$(mktemp)' \
+  '  telemetry_program=$(mktemp)' \
+  '  trap '\''status=$?; rm -f -- "$telemetry_program" "$frame_input"; exit "$status"'\'' EXIT' \
+  '  cat >"$frame_input"' \
+  '  operation=' \
+  '  if [ "$command_argc" -eq 1 ]; then' \
+  '    program_b64=${command_text##* }' \
+  '    if base64 --decode <<<"$program_b64" >"$telemetry_program"; then' \
+  '      if grep -Fq "meet-backend/beta-recovery-create/v1" "$telemetry_program"; then' \
+  '        operation=create' \
+  '      elif grep -Fq "meet-backend/beta-recovery-file/v1" "$telemetry_program"; then' \
+  '        operation=receive' \
+  '      elif grep -Fq "meet-backend/beta-recovery-cleanup/v1" "$telemetry_program"; then' \
+  '        operation=cleanup' \
+  '      fi' \
+  '    fi' \
+  '  fi' \
   '  set +e' \
-  '  bash "$static_program" <"$frame_input"' \
+  '  bash -c "$command_text" <"$frame_input"' \
   '  status=$?' \
   '  set -e' \
-  '  if [ "$operation" = create ] &&' \
-  '    { [ "$status" -eq 0 ] || [ -n "${BETA_RECOVERY_CREATE_MODE:-}" ]; }; then' \
-  '    printf "remote-create\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '  if [ -n "$operation" ]; then' \
+  '    printf "decoded-program-%s\n" "$operation" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '    if [ "$operation" = create ] &&' \
+  '      { [ "$status" -eq 0 ] || [ -n "${BETA_RECOVERY_CREATE_MODE:-}" ]; }; then' \
+  '      printf "remote-create\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '    fi' \
+  '    if [ "$operation" = create ] && [ "$status" -eq 0 ] &&' \
+  '      [ "${BETA_RECOVERY_CREATE_MODE:-}" = ambiguous ]; then' \
+  '      printf "remote-create-ambiguous\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '      status=47' \
+  '    fi' \
+  '    if [ "$operation" = receive ] && [ "$status" -eq 0 ]; then' \
+  '      printf "remote-receive\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '      if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi' \
+  '    fi' \
+  '    if [ "$operation" = cleanup ] &&' \
+  '      { [ "$status" -eq 0 ] || [ "${BETA_RECOVERY_REMOTE_CLEANUP_FAIL:-0}" = 1 ] ||' \
+  '        [ -n "${BETA_RECOVERY_CREATE_MODE:-}" ]; }; then' \
+  '      printf "remote-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
+  '    fi' \
+  '    printf "decoded-program-status=%s\n" "$status" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '  fi' \
-  '  if [ "$operation" = create ] && [ "$status" -eq 0 ] &&' \
-  '    [ "${BETA_RECOVERY_CREATE_MODE:-}" = ambiguous ]; then' \
-  '    printf "remote-create-ambiguous\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  '    status=47' \
-  '  fi' \
-  '  if [ "$operation" = receive ] && [ "$status" -eq 0 ]; then' \
-  '    printf "remote-receive\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  '    if [ "${BETA_RECOVERY_SIGNAL_PHASE:-}" = ssh ]; then signal_parent "${BETA_RECOVERY_SIGNAL:?}"; fi' \
-  '  fi' \
-  '  if [ "$operation" = cleanup ] &&' \
-  '    { [ "$status" -eq 0 ] || [ "${BETA_RECOVERY_REMOTE_CLEANUP_FAIL:-0}" = 1 ] ||' \
-  '      [ -n "${BETA_RECOVERY_CREATE_MODE:-}" ]; }; then' \
-  '    printf "remote-cleanup\n" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
-  '  fi' \
-  '  printf "decoded-program-status=%s\n" "$status" >>"$BETA_RECOVERY_BOUNDARY_LOG"' \
   '  exit "$status"' \
   'fi' \
   'if [ "${BETA_RECOVERY_CAPTURE_FIXTURE:-0}" = 1 ] &&' \
@@ -1517,12 +1533,22 @@ run_consumer_case capture-collision-mismatched-marker "$capture_body" '' '' 0 co
 assert_framed_runtime_contract() {
   local workflow_file=$root/.github/workflows/prove-beta-backup-restore.yml
   local stage_file=$root/scripts/run-beta-recovery-capture-stage.sh
-  grep -Fq 'create_remote_cmd=(sudo bash -c' "$stage_file" ||
+  grep -Fq 'serialize_remote_command()' "$stage_file" ||
+    fail "static remote serializer contract is missing"
+  grep -Fq "decoder_program='exec bash <(printf" "$stage_file" ||
+    fail "static decoder source contract is missing"
+  grep -Fq 'create_remote_cmd=$(serialize_remote_command' "$stage_file" ||
     fail "static create launch contract is missing"
-  grep -Fq 'receive_remote_cmd=(sudo bash -c' "$stage_file" ||
+  grep -Fq 'receive_remote_cmd=$(serialize_remote_command' "$stage_file" ||
     fail "static receive launch contract is missing"
-  grep -Fq 'cleanup_remote_cmd=(sudo bash -c' "$stage_file" ||
+  grep -Fq 'cleanup_remote_cmd=$(serialize_remote_command' "$stage_file" ||
     fail "static cleanup launch contract is missing"
+  grep -Fq 'ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "$create_remote_cmd"' \
+    "$stage_file" || fail "scalar create SSH launch contract is missing"
+  grep -Fq 'ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "$receive_remote_cmd"' \
+    "$stage_file" || fail "scalar receive SSH launch contract is missing"
+  grep -Fq 'ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "$cleanup_remote_cmd"' \
+    "$stage_file" || fail "scalar cleanup SSH launch contract is missing"
   grep -Fq 'frame_stdin "$create_header"' "$stage_file" ||
     fail "framed create invocation is missing"
   grep -Fq 'frame_stdin "$receive_header"' "$stage_file" ||
@@ -1533,8 +1559,12 @@ assert_framed_runtime_contract() {
     fail "publication identity diagnostic contract is missing"
   grep -Fq 'scan_entry "$@"' "${BASH_SOURCE[0]}" ||
     fail "fake SSH entry scan contract is missing"
-  grep -Fq 'bash "$static_program" <"$frame_input"' "${BASH_SOURCE[0]}" ||
+  grep -Fq 'bash -c "$command_text" <"$frame_input"' "${BASH_SOURCE[0]}" ||
     fail "fake SSH boundary does not execute the decoded invariant program"
+  grep -Fq 'command_text+=" "' "${BASH_SOURCE[0]}" ||
+    fail "fake SSH boundary does not space-join remote argv"
+  grep -Fq 'exec "$@"' "${BASH_SOURCE[0]}" ||
+    fail "fixture sudo does not forward argv"
   grep -Fq 'set +e' "${BASH_SOURCE[0]}" ||
     fail "decoded-program return status is not captured explicitly"
 }
@@ -1567,6 +1597,78 @@ extract_workflow_program() {
 extract_workflow_program REMOTE_CREATE_PROGRAM "$remote_program_dir/create"
 extract_workflow_program REMOTE_RECEIVE_PROGRAM "$remote_program_dir/receive"
 extract_workflow_program REMOTE_CLEANUP_PROGRAM "$remote_program_dir/cleanup"
+
+serialize_fixture_remote_command() {
+  local serialized= word quoted
+  [ "$#" -ge 1 ] || fail "fixture remote serializer received no words"
+  for word in "$@"; do
+    [[ "$word" != *$'\r'* && "$word" != *$'\n'* ]] ||
+      fail "fixture remote serializer received a line break"
+    printf -v quoted '%q' "$word"
+    [ -n "$serialized" ] && serialized+=" "
+    serialized+=$quoted
+  done
+  printf '%s' "$serialized"
+}
+
+decoder_program='exec bash <(printf "%s" "$1" | base64 --decode)'
+
+run_old_multi_argument_launcher_case() {
+  local name=old-multi-argument-launcher
+  local case_dir=$consumer_root/cases/$name
+  local config=$case_dir/home/.ssh/config key=$case_dir/key
+  local remote=/tmp/beta-recovery-$name
+  local frame=$case_dir/frame prefix program_b64 status
+  rm -rf -- "$remote" "$case_dir"
+  mkdir -p "$case_dir/home/.ssh" "$case_dir/runner"
+  chmod 700 "$case_dir" "$case_dir/home" "$case_dir/home/.ssh" "$case_dir/runner"
+  printf '%s\n' \
+    'Host *' "  HostName $scan_host" '  Port 1' \
+    '  CanonicalizeHostname no' >"$config"
+  chmod 600 "$config"
+  : >"$key"
+  chmod 600 "$key"
+  printf 'meet-backend/beta-recovery-create/v1|%s|%s\n' \
+    "$remote" "$direct_token" >"$frame"
+  prefix=$(printf '%08x' "$(stat -c '%s' "$frame")")
+  program_b64=$(base64 --wrap=0 <"$remote_program_dir/create")
+  set +e
+  { printf '%s' "$prefix"; cat "$frame"; } | env \
+    PATH="$consumer_bin:$original_path" HOME="$case_dir/home" \
+    HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
+    SUDO_UID="$fixture_sudo_uid" SUDO_GID="$fixture_sudo_gid" \
+    BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+    BETA_RECOVERY_TOKEN_ORACLE="$token_oracle" \
+    BETA_RECOVERY_PAYLOAD_SENTINEL=fixture-payload-sentinel \
+    BETA_RECOVERY_PRIVATE_KEY_SENTINEL=fixture-private-key-sentinel \
+    BETA_RECOVERY_BOUNDARY_LOG="$case_dir/boundary.log" \
+    BETA_RECOVERY_EFFECTIVE_LOG="$case_dir/effective.log" \
+    BETA_RECOVERY_EFFECTIVE_ERR="$case_dir/effective.err" \
+    BETA_RECOVERY_REMOTE_STATE="$remote" \
+    ssh -F "$config" -i "$key" -p 2222 \
+    -o BatchMode=yes -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile="$case_dir/known_hosts" \
+    -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none \
+    fixture-user@"$scan_host" \
+    sudo bash -c "$decoder_program" -- "$program_b64" \
+    >"$case_dir/stdout" 2>"$case_dir/stderr"
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] ||
+    fail "old multi-argument launcher returned $status instead of false zero"
+  [ ! -s "$case_dir/stderr" ] ||
+    fail "old multi-argument launcher emitted stderr"
+  [ ! -e "$remote" ] && [ ! -L "$remote" ] ||
+    fail "old multi-argument launcher created a staging root"
+  [ ! -e "$remote/.meet-beta-recovery-owner" ] ||
+    fail "old multi-argument launcher created an owner marker"
+  assert_consumer_residue_absent "$case_dir"
+  ! grep -q '^decoded-program-' "$case_dir/boundary.log" ||
+    fail "old multi-argument launcher reported a decoded operation"
+  grep -Fxq 'remote-command-argc=6' "$case_dir/boundary.log" ||
+    fail "old multi-argument launcher did not preserve its argv shape"
+  rm -f -- "$frame"
+}
 
 direct_frame_case() {
   local name=$1 operation=$2 header=$3 suffix_hex=${4:-} payload_file=${5:-}
@@ -1605,6 +1707,9 @@ direct_frame_case() {
     : >"$suffix_file"
   fi
   base64 --wrap=0 <"$program_file" >"$case_dir/program.b64"
+  local remote_command
+  remote_command=$(serialize_fixture_remote_command sudo bash -c \
+    "$decoder_program" -- "$(<"$case_dir/program.b64")")
   frame_stdin() {
     cat "$case_dir/prefix"
     cat "$frame_file"
@@ -1632,14 +1737,15 @@ direct_frame_case() {
     -o UserKnownHostsFile="$case_dir/known_hosts" \
     -o GlobalKnownHostsFile=/dev/null -o KnownHostsCommand=none \
     fixture-user@"$scan_host" \
-    sudo bash -c 'exec bash <(printf "%s" "$1" | base64 --decode)' -- \
-    "$(<"$case_dir/program.b64")" >"$case_dir/stdout" 2>"$case_dir/stderr"
+    "$remote_command" >"$case_dir/stdout" 2>"$case_dir/stderr"
   direct_status=$?
   set -e
   rm -f -- "$frame_file" "$suffix_file" "$case_dir/prefix" "$case_dir/program.b64"
   assert_consumer_residue_absent "$case_dir"
   [ "$(grep -c '^ssh-call$' "$case_dir/boundary.log")" -eq 1 ] ||
     fail "direct frame $name did not make one SSH call"
+  grep -Fxq 'remote-command-argc=1' "$case_dir/boundary.log" ||
+    fail "direct frame $name did not send one serialized remote command"
   grep -Fxq "decoded-program-$operation" "$case_dir/boundary.log" ||
     fail "direct frame $name did not execute the decoded $operation program"
   grep -Fxq "decoded-program-status=$direct_status" "$case_dir/boundary.log" ||
@@ -1650,6 +1756,7 @@ direct_frame_case() {
 direct_token=$(<"$token_oracle")
 direct_remote=/tmp/beta-recovery-direct-frame
 rm -rf -- "$direct_remote"
+run_old_multi_argument_launcher_case
 assert_internal_lf_header() {
   local header=$1
   [ "$(printf '%s' "$header" | od -An -v -tx1 |
