@@ -1624,7 +1624,9 @@ run_old_multi_argument_launcher_case() {
   chmod 700 "$case_dir" "$case_dir/home" "$case_dir/home/.ssh" "$case_dir/runner"
   printf '%s\n' \
     'Host *' "  HostName $scan_host" '  Port 1' \
-    '  CanonicalizeHostname no' >"$config"
+    '  CanonicalizeHostname no' \
+    'Host hostile-preservation' \
+    '  HostName hostile.example.invalid' >"$config"
   chmod 600 "$config"
   : >"$key"
   chmod 600 "$key"
@@ -1638,6 +1640,7 @@ run_old_multi_argument_launcher_case() {
     HOST="$scan_host" PORT=2222 SSH_USER=fixture-user \
     SUDO_UID="$fixture_sudo_uid" SUDO_GID="$fixture_sudo_gid" \
     BETA_RECOVERY_REAL_SSH="$(command -v ssh)" \
+    BETA_RECOVERY_REAL_RM="$real_rm" \
     BETA_RECOVERY_TOKEN_ORACLE="$token_oracle" \
     BETA_RECOVERY_PAYLOAD_SENTINEL=fixture-payload-sentinel \
     BETA_RECOVERY_PRIVATE_KEY_SENTINEL=fixture-private-key-sentinel \
