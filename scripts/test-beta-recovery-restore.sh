@@ -86,7 +86,7 @@ expected_restore_vector=$fixture/expected-restore.args
 printf '%s\n' pg_restore --no-owner --no-privileges --exit-on-error -U restore_user \
   -d restore_db /tmp/postgres.dump >"$expected_restore_vector"
 
-if "$fake_docker" exec fixture-container pg_restore \
+if bash "$fake_docker" exec fixture-container pg_restore \
   --no-owner --no-privileges --exit-on-error -U restore_user -d restore_db \
   /tmp/postgres.dump >"$fixture/exact-restore.stdout" 2>"$fixture/exact-restore.stderr"; then
   :
@@ -99,7 +99,7 @@ cmp -- "$expected_restore_vector" "$fake_restore_log"
 expect_fake_restore_failure(){
   local name=$1
   shift
-  if "$fake_docker" exec fixture-container pg_restore "$@" \
+  if bash "$fake_docker" exec fixture-container pg_restore "$@" \
     >"$fixture/$name.stdout" 2>"$fixture/$name.stderr"; then
     echo "fake Docker accepted invalid restore role vector: $name" >&2
     exit 1
