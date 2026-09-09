@@ -74,6 +74,50 @@ printf 'community\n' >"$fixture/valid/communities/file"
 tar --create --gzip --file "$fixture/valid.tar.gz" --directory "$fixture/valid" .
 "$script" --validate-uploads-archive --archive "$fixture/valid.tar.gz" --work-dir "$fixture/work"
 
+fake_docker=$root/scripts/fixtures/beta-recovery/fake-docker.sh
+fake_state=$fixture/fake-docker-state
+fake_root=$fixture/fake-docker-root
+fake_restore_log=$fixture/fake-restore.args
+mkdir -p "$fake_state" "$fake_root"
+export FAKE_DOCKER_STATE="$fake_state"
+export FAKE_DOCKER_ROOT="$fake_root"
+export FAKE_DOCKER_RESTORE_ARG_LOG="$fake_restore_log"
+expected_restore_vector=$fixture/expected-restore.args
+printf '%s\n' pg_restore --no-owner --no-privileges --exit-on-error -U restore_user \
+  -d restore_db /tmp/postgres.dump >"$expected_restore_vector"
+
+if bash "$fake_docker" exec fixture-container pg_restore \
+  --no-owner --no-privileges --exit-on-error -U restore_user -d restore_db \
+  /tmp/postgres.dump >"$fixture/exact-restore.stdout" 2>"$fixture/exact-restore.stderr"; then
+  :
+else
+  echo "fake Docker rejected the exact restore vector" >&2
+  exit 1
+fi
+cmp -- "$expected_restore_vector" "$fake_restore_log"
+
+expect_fake_restore_failure(){
+  local name=$1
+  shift
+  if bash "$fake_docker" exec fixture-container pg_restore "$@" \
+    >"$fixture/$name.stdout" 2>"$fixture/$name.stderr"; then
+    echo "fake Docker accepted invalid restore role vector: $name" >&2
+    exit 1
+  fi
+}
+expect_fake_restore_failure missing-selector \
+  --no-owner --no-privileges --exit-on-error -d restore_db /tmp/postgres.dump
+expect_fake_restore_failure missing-value \
+  --no-owner --no-privileges --exit-on-error -U -d restore_db /tmp/postgres.dump
+expect_fake_restore_failure wrong-role \
+  --no-owner --no-privileges --exit-on-error --username root -d restore_db /tmp/postgres.dump
+expect_fake_restore_failure repeated-role \
+  --no-owner --no-privileges --exit-on-error -U restore_user --username restore_user \
+  -d restore_db /tmp/postgres.dump
+expect_fake_restore_failure conflicting-role \
+  --no-owner --no-privileges --exit-on-error -U restore_user --username other \
+  -d restore_db /tmp/postgres.dump
+
 mkdir -p "$fixture/traversal/avatars" "$fixture/traversal/meetings" "$fixture/traversal/communities" "$fixture/traversal-work"
 printf 'escape\n' >"$fixture/traversal/avatars/file"
 tar --create --gzip --file "$fixture/traversal.tar.gz" --directory "$fixture/traversal" \
