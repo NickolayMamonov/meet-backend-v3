@@ -212,6 +212,13 @@ case "${1:-}" in
             lowercase)
               printf '[]\n'
               printf 'Error response from daemon: get %s: no such volume\n' "${3:-}" >&2 ;;
+            status-two)
+              printf '[]\n'
+              printf 'Error response from daemon: get %s: no such volume\n' "${3:-}" >&2
+              exit 2 ;;
+            extra-stderr)
+              printf '[]\n'
+              printf 'Error response from daemon: get %s: no such volume\nextra diagnostic\n' "${3:-}" >&2 ;;
             legacy)
               echo 'No such volume' >&2 ;;
             malformed)

@@ -9,6 +9,8 @@ stage=$root/scripts/run-beta-recovery-capture-stage.sh
 [ -x "$stage" ] || exit 1
 command -v jq >/dev/null 2>&1
 grep -Fq 'test-beta-recovery-restore-docker.sh' "$backend_ci"
+grep -Fq 'BETA_RECOVERY_INJECT_COLLISION_FAILURE' "$root/scripts/test-beta-recovery-restore-docker.sh"
+grep -Fq 'cleanup_collision_resources' "$root/scripts/test-beta-recovery-restore-docker.sh"
 grep -Fq 'fake-docker.sh' "$backend_ci"
 grep -Fq 'bash -n "$script"' "$backend_ci"
 grep -Fq 'shellcheck --severity=warning "${shell_files[@]}"' "$backend_ci"

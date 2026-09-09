@@ -453,6 +453,8 @@ run_restore_fixture restore-interruption 137 valid interrupt
 run_restore_fixture restore-interruption-retry 0 valid survivor
 run_restore_fixture restore-lowercase-volume-absence 0 valid normal
 run_restore_fixture restore-legacy-volume-absence 0 valid normal
+run_restore_fixture restore-status-two-volume-absence 1 valid inspect-status-two
+run_restore_fixture restore-extra-stderr-volume-absence 1 valid inspect-extra-stderr
 run_restore_fixture restore-daemon-volume-inspection 1 valid inspect-daemon
 run_restore_fixture restore-authorization-volume-inspection 1 valid inspect-authorization
 run_restore_fixture restore-mixed-volume-inspection 1 valid inspect-mixed

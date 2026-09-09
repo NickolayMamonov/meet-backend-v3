@@ -34,6 +34,11 @@ container_created=false
 network_created=false
 collision_container_created=false
 collision_network_created=false
+collision_container=''
+collision_network=''
+collision_recovery_id=''
+collision_token=''
+collision_volume=''
 
 write_ownership_marker(){
   local container_attempted=$1 container_was_created=$2
@@ -68,6 +73,82 @@ assert_absent_before_create(){
   }
 }
 
+cleanup_collision_resources(){
+  local cleanup_status=0 inspect_status collision_container_authenticated=false
+  [ -n "$collision_container" ] && [ -n "$collision_network" ] || return 0
+  if [ "$collision_container_created" = true ]; then
+    if docker container inspect "$collision_container" >"$work/collision.cleanup.container.json" 2>"$work/collision.cleanup.container.stderr"; then
+      if jq -e --arg id "$collision_recovery_id" --arg token "$collision_token" '
+        .[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="collision-fixture" and
+        .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id and
+        .[0].Config.Labels["com.meet-backend.beta-recovery/owner-token"]==$token
+      ' "$work/collision.cleanup.container.json" >/dev/null; then
+        collision_container_authenticated=true
+        docker container rm --force --volumes "$collision_container" >/dev/null ||
+          cleanup_status=1
+      else
+        cleanup_status=1
+      fi
+    else
+      inspect_status=$?
+      if [ "$inspect_status" -eq 1 ]; then
+        collision_container_created=false
+      else
+        cleanup_status=1
+      fi
+    fi
+  fi
+  if [ "$collision_container_authenticated" = true ] && [ -n "$collision_volume" ]; then
+    if docker volume inspect "$collision_volume" >"$work/collision.cleanup.volume.json" 2>"$work/collision.cleanup.volume.stderr"; then
+      docker volume rm "$collision_volume" >/dev/null || cleanup_status=1
+    else
+      inspect_status=$?
+      [ "$inspect_status" -eq 1 ] || cleanup_status=1
+    fi
+  fi
+  if [ "$collision_network_created" = true ]; then
+    if docker network inspect "$collision_network" >"$work/collision.cleanup.network.json" 2>"$work/collision.cleanup.network.stderr"; then
+      if jq -e --arg id "$collision_recovery_id" --arg token "$collision_token" '
+        .[0].Labels["com.meet-backend.beta-recovery/owner"]=="collision-fixture" and
+        .[0].Labels["com.meet-backend.beta-recovery/recovery-id"]==$id and
+        .[0].Labels["com.meet-backend.beta-recovery/owner-token"]==$token
+      ' "$work/collision.cleanup.network.json" >/dev/null; then
+        docker network rm "$collision_network" >/dev/null || cleanup_status=1
+      else
+        cleanup_status=1
+      fi
+    else
+      inspect_status=$?
+      if [ "$inspect_status" -eq 1 ]; then
+        collision_network_created=false
+      else
+        cleanup_status=1
+      fi
+    fi
+  fi
+  if docker container inspect "$collision_container" >"$work/collision.residue.container.json" 2>/dev/null; then
+    cleanup_status=1
+  else
+    inspect_status=$?
+    [ "$inspect_status" -eq 1 ] || cleanup_status=1
+  fi
+  if docker network inspect "$collision_network" >"$work/collision.residue.network.json" 2>/dev/null; then
+    cleanup_status=1
+  else
+    inspect_status=$?
+    [ "$inspect_status" -eq 1 ] || cleanup_status=1
+  fi
+  if [ -n "$collision_volume" ]; then
+    if docker volume inspect "$collision_volume" >"$work/collision.residue.volume.json" 2>/dev/null; then
+      cleanup_status=1
+    else
+      inspect_status=$?
+      [ "$inspect_status" -eq 1 ] || cleanup_status=1
+    fi
+  fi
+  [ "$cleanup_status" -eq 0 ]
+}
+
 cleanup(){
   local status=$? cleanup_status=0
   trap - EXIT HUP INT TERM
@@ -88,10 +169,7 @@ cleanup(){
   if [ "$cleanup_status" -ne 0 ]; then
     echo "authenticated real-Docker cleanup failed" >&2
   fi
-  if [ "$collision_container_created" = true ] || [ "$collision_network_created" = true ]; then
-    echo "collision fixture cleanup was not completed" >&2
-    cleanup_status=1
-  fi
+  cleanup_collision_resources || cleanup_status=1
   rm -r -- "$work" >/dev/null 2>&1 || cleanup_status=1
   [ "$status" -eq 0 ] || cleanup_status=1
   exit "$cleanup_status"
@@ -237,6 +315,10 @@ docker network create --internal \
   --label com.meet-backend.beta-recovery/owner-token="$collision_token" \
   "$collision_network" >/dev/null
 collision_network_created=true
+if [ "${BETA_RECOVERY_INJECT_COLLISION_FAILURE:-0}" = 1 ]; then
+  echo "injected collision container creation failure" >&2
+  exit 42
+fi
 docker create --name "$collision_container" --network "$collision_network" \
   --label com.meet-backend.beta-recovery/owner=collision-fixture \
   --label com.meet-backend.beta-recovery/recovery-id="$collision_recovery_id" \

@@ -95,10 +95,9 @@ mul_small(){
 }
 capacity_ok(){ decimal_ge "$1" "$2" && decimal_ge "$(mul_small "$1" 4)" "$(mul_small "$2" 5)"; }
 inspect_resource(){
-  local kind=$1 name=$2 scratch status stdout_bytes stderr_bytes
+  local kind=$1 name=$2 scratch status stdout_bytes
   INSPECT_JSON=''
   INSPECT_STDOUT=''
-  INSPECT_STDERR=''
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/beta-recovery-inspect.XXXXXX") || return 2
   if docker "$kind" inspect "$name" >"$scratch/stdout" 2>"$scratch/stderr"; then
     status=0
@@ -106,33 +105,38 @@ inspect_resource(){
     status=$?
   fi
   INSPECT_STDOUT=$(<"$scratch/stdout")
-  INSPECT_STDERR=$(<"$scratch/stderr")
   stdout_bytes=$(wc -c <"$scratch/stdout" | tr -d '[:space:]')
-  stderr_bytes=$(wc -c <"$scratch/stderr" | tr -d '[:space:]')
-  rm -r -- "$scratch" || return 2
   if [ "$status" -eq 0 ]; then
     if [ "$stdout_bytes" -gt 0 ] && jq -e . <<<"$INSPECT_STDOUT" >/dev/null 2>&1; then
       INSPECT_JSON=$INSPECT_STDOUT
+      rm -r -- "$scratch" || return 2
       return 0
     fi
+    rm -r -- "$scratch" || return 2
     echo "Docker $kind inspection returned malformed JSON" >&2
     return 2
   fi
-  if [ "$kind" = volume ] &&
-    [ "$stdout_bytes" -eq 3 ] && [ "$INSPECT_STDOUT" = '[]' ] &&
-    [ "$stderr_bytes" -gt 0 ] &&
-    [[ "$INSPECT_STDERR" = "Error response from daemon: get $name: no such volume" ]]; then
+  if [ "$status" -eq 1 ] && [ "$kind" = volume ] &&
+    cmp -s "$scratch/stdout" <(printf '[]\n') &&
+    cmp -s "$scratch/stderr" <(printf 'Error response from daemon: get %s: no such volume\n' "$name"); then
+    rm -r -- "$scratch" || return 2
     return 1
   fi
-  if { [ "$stdout_bytes" -eq 0 ] ||
-       { [ "$stdout_bytes" -eq 3 ] && [ "$INSPECT_STDOUT" = '[]' ]; }; } &&
-    { [ "$INSPECT_STDERR" = "No such $kind" ] ||
-      [ "$INSPECT_STDERR" = "Error: No such $kind: $name" ] ||
-      [ "$INSPECT_STDERR" = "Error response from daemon: No such $kind: $name" ] ||
-      [ "$INSPECT_STDERR" = "Error response from daemon: $kind $name not found" ] ||
-      [ "$INSPECT_STDERR" = "$kind not found" ]; }; then
-    return 1
+  if [ "$status" -eq 1 ] &&
+    { [ "$stdout_bytes" -eq 0 ] || cmp -s "$scratch/stdout" <(printf '[]\n'); }; then
+    for absence_stderr in \
+      "No such $kind" \
+      "Error: No such $kind: $name" \
+      "Error response from daemon: No such $kind: $name" \
+      "Error response from daemon: $kind $name not found" \
+      "$kind not found"; do
+      if printf '%s\n' "$absence_stderr" | cmp -s - "$scratch/stderr"; then
+        rm -r -- "$scratch" || return 2
+        return 1
+      fi
+    done
   fi
+  rm -r -- "$scratch" || return 2
   echo "Docker $kind inspection failed" >&2
   return 2
 }
