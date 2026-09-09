@@ -39,6 +39,7 @@ collision_network=''
 collision_recovery_id=''
 collision_token=''
 collision_volume=''
+postgres_password=''
 
 write_ownership_marker(){
   local container_attempted=$1 container_was_created=$2
@@ -197,10 +198,13 @@ docker network create --internal \
   "$network" >/dev/null
 network_created=true
 write_ownership_marker false false true true
+postgres_password=$(od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]')
 docker create --name "$container" --network "$network" \
   --label com.meet-backend.beta-recovery/owner=restore \
   --label com.meet-backend.beta-recovery/recovery-id="$recovery_id" \
   --label com.meet-backend.beta-recovery/owner-token="$owner_token" \
+  -e POSTGRES_DB=restore_db -e POSTGRES_USER=restore_user \
+  -e POSTGRES_PASSWORD="$postgres_password" \
   "$image" >/dev/null
 container_created=true
 write_ownership_marker true true true true
@@ -266,6 +270,40 @@ jq -e --arg id "$recovery_id" --arg token "$owner_token" \
   .networkName==$network and .containerAttempted==true and .containerCreated==true and
   .networkAttempted==true and .networkCreated==true
 ' "$ownership_marker" >/dev/null
+
+docker start "$container" >/dev/null
+for _ in $(seq 1 60); do
+  docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&1 && break
+  sleep 1
+done
+docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&1
+docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -c \
+  'CREATE TABLE restore_role_probe (id integer PRIMARY KEY, payload text NOT NULL);
+   INSERT INTO restore_role_probe (id, payload) VALUES (1, '\''restore-role-proof'\'');'
+MSYS_NO_PATHCONV=1 docker exec "$container" pg_dump -U restore_user -d restore_db \
+  --format=custom --schema=public --table=public.restore_role_probe \
+  --file=/tmp/restore-role.dump
+docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -c \
+  'DROP TABLE restore_role_probe;'
+MSYS_NO_PATHCONV=1 docker exec "$container" pg_restore --list /tmp/restore-role.dump \
+  >"$work/restore-role.list"
+grep -Fq restore_role_probe "$work/restore-role.list"
+
+set +e
+MSYS_NO_PATHCONV=1 docker exec "$container" pg_restore --no-owner --no-privileges --exit-on-error \
+  -d restore_db /tmp/restore-role.dump >"$work/root-restore.stdout" \
+  2>"$work/root-restore.stderr"
+root_restore_status=$?
+set -e
+[ "$root_restore_status" -ne 0 ]
+grep -Fq 'role "root" does not exist' "$work/root-restore.stderr"
+
+MSYS_NO_PATHCONV=1 docker exec "$container" pg_restore --no-owner --no-privileges --exit-on-error \
+  -U restore_user -d restore_db /tmp/restore-role.dump \
+  >"$work/restore-user.stdout" 2>"$work/restore-user.stderr"
+docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -c \
+  'SELECT payload FROM restore_role_probe WHERE id=1;' >"$work/restored-row"
+grep -Fxq restore-role-proof "$work/restored-row"
 
 docker container inspect "$container" >"$work/container.before-cleanup.json"
 docker network inspect "$network" >"$work/network.before-cleanup.json"

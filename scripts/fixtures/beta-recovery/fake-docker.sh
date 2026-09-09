@@ -188,10 +188,49 @@ case "${1:-}" in
   start) log_event start ;;
   exec)
     log_event exec
-    if printf '%s\n' "$*" | grep -Fq pg_isready; then exit 0; fi
-    if printf '%s\n' "$*" | grep -Fq 'pg_restore --list'; then printf 'fixture archive list\n'; exit 0; fi
-    if [ "${FAKE_DOCKER_FAIL_RESTORE:-0}" = 1 ] &&
-      printf '%s\n' "$*" | grep -Fq 'pg_restore --no-owner'; then exit 1; fi
+    if [ "${3:-}" = pg_isready ]; then exit 0; fi
+    if [ "${3:-}" = pg_restore ] && [ "${4:-}" = --list ]; then
+      printf 'fixture archive list\n'
+      exit 0
+    fi
+    if [ "${3:-}" = pg_restore ]; then
+      restore_args=("${@:4}")
+      role_count=0
+      role=''
+      restore_index=0
+      while [ "$restore_index" -lt "${#restore_args[@]}" ]; do
+        restore_arg=${restore_args[$restore_index]}
+        case "$restore_arg" in
+          -U|--username)
+            next_index=$((restore_index + 1))
+            [ "$next_index" -lt "${#restore_args[@]}" ] || exit 1
+            restore_role=${restore_args[$next_index]}
+            [[ "$restore_role" != -* ]] || exit 1
+            role=$restore_role
+            role_count=$((role_count + 1))
+            restore_index=$((restore_index + 2))
+            ;;
+          -U?*)
+            role=${restore_arg#-U}
+            [ -n "$role" ] || exit 1
+            role_count=$((role_count + 1))
+            restore_index=$((restore_index + 1))
+            ;;
+          --username=?*)
+            role=${restore_arg#*=}
+            [ -n "$role" ] || exit 1
+            role_count=$((role_count + 1))
+            restore_index=$((restore_index + 1))
+            ;;
+          *) restore_index=$((restore_index + 1)) ;;
+        esac
+      done
+      [ "$role_count" -eq 1 ] && [ "$role" = restore_user ] || exit 1
+      if [ -n "${FAKE_DOCKER_RESTORE_ARG_LOG:-}" ]; then
+        printf '%s\n' pg_restore "${restore_args[@]}" >"$FAKE_DOCKER_RESTORE_ARG_LOG"
+      fi
+      [ "${FAKE_DOCKER_FAIL_RESTORE:-0}" = 1 ] && exit 1
+    fi
     if printf '%s\n' "$*" | grep -Fq 'psql'; then
       if printf '%s\n' "$*" | grep -Fq -- '-f /tmp/proof.sql'; then
         cat "$FAKE_DATABASE_PROOF"

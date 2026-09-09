@@ -763,7 +763,7 @@ docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&
 docker cp "$db_dump" "$container:/tmp/postgres.dump"
 docker exec "$container" pg_restore --list /tmp/postgres.dump >"$private/postgres.list" || fail "database archive listing failed"
 [ -s "$private/postgres.list" ] || fail "database archive listing is empty"
-docker exec "$container" pg_restore --no-owner --no-privileges --exit-on-error -d restore_db /tmp/postgres.dump >/dev/null || fail "database restore failed"
+docker exec "$container" pg_restore --no-owner --no-privileges --exit-on-error -U restore_user -d restore_db /tmp/postgres.dump >/dev/null || fail "database restore failed"
 docker cp "$sql" "$container:/tmp/proof.sql"
 docker exec "$container" psql -X -qAt -U restore_user -d restore_db -f /tmp/proof.sql >"$output/restored-database-proof.json"
 cmp -- "$expected_db" "$output/restored-database-proof.json" || fail "database proof differs byte-for-byte"
