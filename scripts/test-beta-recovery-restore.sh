@@ -94,6 +94,27 @@ if "$script" --validate-uploads-archive --archive "$fixture/fifo.tar.gz" \
   exit 1
 fi
 
+shape_fixture=$fixture/provenance-shape
+mkdir -- "$shape_fixture"
+provenance_fixture=$root/scripts/fixtures/beta-recovery/real-docker-volume-provenance.json
+volume_identity=$(jq -er '.volumeIdentity' "$provenance_fixture")
+jq '.container[0]' "$provenance_fixture" >"$shape_fixture/container.scalar.json"
+jq '.volume[0]' "$provenance_fixture" >"$shape_fixture/volume.scalar.json"
+jq '.container' "$provenance_fixture" >"$shape_fixture/container.array.json"
+jq '.volume' "$provenance_fixture" >"$shape_fixture/volume.array.json"
+scalar_container_report=$("$script" --evaluate-provenance \
+  --container-inspect "$shape_fixture/container.scalar.json" \
+  --volume-inspect "$shape_fixture/volume.array.json" \
+  --volume-identity "$volume_identity" --docker-root /var/lib/docker)
+jq -e '.accepted==false and (.failedClauses|index("shape")!=null)' \
+  <<<"$scalar_container_report" >/dev/null
+scalar_volume_report=$("$script" --evaluate-provenance \
+  --container-inspect "$shape_fixture/container.array.json" \
+  --volume-inspect "$shape_fixture/volume.scalar.json" \
+  --volume-identity "$volume_identity" --docker-root /var/lib/docker)
+jq -e '.accepted==false and (.failedClauses|index("shape")!=null)' \
+  <<<"$scalar_volume_report" >/dev/null
+
 run_restore_fixture() {
   local name=$1 expected_status=$2 mount_mode=${3:-valid} behavior=${4:-normal}
   local identity_kind=${5:-valid} identity_mode=${6:-600}

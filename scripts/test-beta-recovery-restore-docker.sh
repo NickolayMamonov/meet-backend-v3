@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export LC_ALL=C
+umask 077
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 runtime=$root/scripts/run-beta-recovery-restore.sh
@@ -9,6 +10,7 @@ image='postgres:16-alpine@sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c382
 command -v docker >/dev/null 2>&1
 command -v jq >/dev/null 2>&1
 command -v bash >/dev/null 2>&1
+command -v stat >/dev/null 2>&1
 [ -f "$fixture" ] && [ -x "$runtime" ]
 jq -e --arg image "$image" '
   .schema=="meet-backend/beta-recovery-real-docker-volume-provenance/v1" and
@@ -19,14 +21,80 @@ jq -e --arg image "$image" '
 ' "$fixture" >/dev/null
 
 suffix="$(date +%s)-$$-${RANDOM}"
-network="beta-recovery-evidence-${suffix}"
-container="beta-recovery-postgres-evidence-${suffix}"
+recovery_id="evidence-${suffix}"
+network="beta-recovery-${recovery_id}"
+container="beta-recovery-postgres-${recovery_id}"
+owner_token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 work=$(mktemp -d "${TMPDIR:-/tmp}/beta-recovery-docker.XXXXXX")
+ownership_marker=$work/restore-ownership.json
+volume_marker=$work/volume.identity
 volume=''
+docker_root=''
+container_created=false
+network_created=false
+collision_container_created=false
+collision_network_created=false
+
+write_ownership_marker(){
+  local container_attempted=$1 container_was_created=$2
+  local network_attempted=$3 network_was_created=$4 tmp
+  tmp=$ownership_marker.tmp
+  jq -cnS --arg id "$recovery_id" --arg token "$owner_token" \
+    --arg container "$container" --arg network "$network" \
+    --argjson container_attempted "$container_attempted" \
+    --argjson container_created "$container_was_created" \
+    --argjson network_attempted "$network_attempted" \
+    --argjson network_created "$network_was_created" '
+    {schema:"meet-backend/beta-recovery-ownership/v1",recoveryId:$id,
+     ownerToken:$token,containerName:$container,networkName:$network,
+     containerAttempted:$container_attempted,containerCreated:$container_created,
+     networkAttempted:$network_attempted,networkCreated:$network_created}
+  ' >"$tmp"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$ownership_marker"
+}
+
+assert_absent_before_create(){
+  local kind=$1 name=$2 status
+  if docker "$kind" inspect "$name" >/dev/null 2>&1; then
+    echo "real-Docker resource collision: $kind $name" >&2
+    return 1
+  else
+    status=$?
+  fi
+  [ "$status" -eq 1 ] || {
+    echo "real-Docker collision preflight could not inspect $kind $name" >&2
+    return 1
+  }
+}
+
 cleanup(){
-  docker container rm --force --volumes "$container" >/dev/null 2>&1 || :
-  docker network rm "$network" >/dev/null 2>&1 || :
-  rm -r -- "$work" >/dev/null 2>&1 || :
+  local status=$? cleanup_status=0
+  trap - EXIT HUP INT TERM
+  if [ "$container_created" = true ] || [ "$network_created" = true ] ||
+    [ -f "$ownership_marker" ]; then
+    [ -f "$ownership_marker" ] || cleanup_status=1
+    if bash "$runtime" --cleanup-survivors \
+      --container "$container" --network "$network" --volume "$volume" \
+      --volume-identity "$volume_marker" --ownership-marker "$ownership_marker" \
+      --owner-token "$owner_token" --recovery-id "$recovery_id" \
+      --docker-root "$docker_root" >"$work/cleanup.stdout" 2>"$work/cleanup.stderr"; then
+      container_created=false
+      network_created=false
+    else
+      cleanup_status=1
+    fi
+  fi
+  if [ "$cleanup_status" -ne 0 ]; then
+    echo "authenticated real-Docker cleanup failed" >&2
+  fi
+  if [ "$collision_container_created" = true ] || [ "$collision_network_created" = true ]; then
+    echo "collision fixture cleanup was not completed" >&2
+    cleanup_status=1
+  fi
+  rm -r -- "$work" >/dev/null 2>&1 || cleanup_status=1
+  [ "$status" -eq 0 ] || cleanup_status=1
+  exit "$cleanup_status"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -35,42 +103,60 @@ docker image inspect "$image" --format '{{json .RepoDigests}}' |
   jq -e --arg digest "${image##*@}" 'any(.[]; endswith($digest))' >/dev/null
 docker image inspect "$image" --format '{{json .Config.Volumes}}' |
   jq -e 'type=="object" and (keys|sort)==["/var/lib/postgresql/data"]' >/dev/null
-docker network create --internal "$network" >/dev/null
-docker create --name "$container" --network "$network" \
-  --label com.meet-backend.beta-recovery/owner=restore \
-  --label com.meet-backend.beta-recovery/recovery-id=evidence-fixture \
-  --label com.meet-backend.beta-recovery/owner-token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  "$image" >/dev/null
-
 docker_root=$(docker info --format '{{.DockerRootDir}}')
 [ "$docker_root" = /var/lib/docker ] || {
   echo "unexpected Docker root representation" >&2
   exit 1
 }
+
+assert_absent_before_create network "$network"
+assert_absent_before_create container "$container"
+write_ownership_marker false false false false
+docker network create --internal \
+  --label com.meet-backend.beta-recovery/owner=restore \
+  --label com.meet-backend.beta-recovery/recovery-id="$recovery_id" \
+  --label com.meet-backend.beta-recovery/owner-token="$owner_token" \
+  "$network" >/dev/null
+network_created=true
+write_ownership_marker false false true true
+docker create --name "$container" --network "$network" \
+  --label com.meet-backend.beta-recovery/owner=restore \
+  --label com.meet-backend.beta-recovery/recovery-id="$recovery_id" \
+  --label com.meet-backend.beta-recovery/owner-token="$owner_token" \
+  "$image" >/dev/null
+container_created=true
+write_ownership_marker true true true true
+
 docker container inspect "$container" >"$work/container.raw.json"
 volume=$(jq -er '.[0].Mounts | map(select(.Type=="volume" and .Destination=="/var/lib/postgresql/data")) |
-  if length==1 and (.[0].Name|test("^[0-9a-f]{64}$")) then .[0].Name else error end' "$work/container.raw.json")
+  if length==1 and (.[0].Name|test("^[0-9a-f]{64}$")) then .[0].Name else error end' \
+  "$work/container.raw.json")
 docker volume inspect "$volume" >"$work/volume.raw.json"
 fixture_volume=$(jq -er '.volumeIdentity' "$fixture")
 sanitized_container="$work/container.json"
 sanitized_volume="$work/volume.json"
 jq -cS --arg volume "$fixture_volume" '
-  .[0] | {
+  .[0] as $c |
+  [{
     HostConfig:{
-      Binds:.HostConfig.Binds,
-      Mounts:(if .HostConfig.Mounts == null then null else .HostConfig.Mounts | map({
-        Type,Name:$volume,Destination,RW,Source:("/var/lib/docker/volumes/"+$volume+"/_data"),Driver
-      }) end)
+      Binds:$c.HostConfig.Binds,
+      Mounts:(if $c.HostConfig.Mounts == null then null else
+        $c.HostConfig.Mounts | map({
+          Type,Name:$volume,Destination,RW,
+          Source:("/var/lib/docker/volumes/"+$volume+"/_data"),Driver
+        }) end)
     },
-    Mounts:(.Mounts | map({
-      Type,Name:$volume,Destination,RW,Source:("/var/lib/docker/volumes/"+$volume+"/_data")
+    Mounts:($c.Mounts | map({
+      Type,Name:$volume,Destination,RW,
+      Source:("/var/lib/docker/volumes/"+$volume+"/_data")
     }))
-  }
+  }]
 ' "$work/container.raw.json" >"$sanitized_container"
- jq -cS --arg volume "$fixture_volume" '
-  .[0] | {
-    Name:$volume,Driver,Mountpoint:("/var/lib/docker/volumes/"+$volume+"/_data"),Labels,Options
-  }
+jq -cS --arg volume "$fixture_volume" '
+  .[0] | [{
+    Name:$volume,Driver,Mountpoint:("/var/lib/docker/volumes/"+$volume+"/_data"),
+    Labels,Options
+  }]
 ' "$work/volume.raw.json" >"$sanitized_volume"
 jq -e --arg volume "$fixture_volume" '
   .dockerRootDir=="/var/lib/docker" and .volumeIdentity==$volume and
@@ -78,10 +164,6 @@ jq -e --arg volume "$fixture_volume" '
 ' --slurpfile volume_data "$sanitized_volume" --slurpfile container_data "$sanitized_container" \
   "$fixture" >/dev/null || {
   echo "sanitized real-Docker metadata differs from the reviewed fixture" >&2
-  jq -cS '{fixture_volume:.volume,fixture_container:.container}' "$fixture" >&2
-  jq -cS '{live_volume:$volume_data[0],live_container:$container_data[0]}' \
-    --slurpfile volume_data "$sanitized_volume" --slurpfile container_data "$sanitized_container" \
-    "$fixture" >&2
   exit 1
 }
 
@@ -94,8 +176,31 @@ baseline_report=$(bash "$runtime" --evaluate-provenance --baseline \
   --volume-identity "$fixture_volume" --docker-root /var/lib/docker)
 jq -e '.accepted==false and .failedClauses==["labels"]' <<<"$baseline_report" >/dev/null
 
-docker container rm --force --volumes "$container" >/dev/null
-docker network rm "$network" >/dev/null
+printf '%s\n' "$volume" >"$volume_marker.tmp"
+chmod 600 "$volume_marker.tmp"
+mv -f -- "$volume_marker.tmp" "$volume_marker"
+[ "$(stat -c '%a' "$ownership_marker")" = 600 ]
+[ "$(stat -c '%a' "$volume_marker")" = 600 ]
+jq -e --arg id "$recovery_id" --arg token "$owner_token" \
+  --arg container "$container" --arg network "$network" '
+  .schema=="meet-backend/beta-recovery-ownership/v1" and
+  .recoveryId==$id and .ownerToken==$token and .containerName==$container and
+  .networkName==$network and .containerAttempted==true and .containerCreated==true and
+  .networkAttempted==true and .networkCreated==true
+' "$ownership_marker" >/dev/null
+
+docker container inspect "$container" >"$work/container.before-cleanup.json"
+docker network inspect "$network" >"$work/network.before-cleanup.json"
+docker volume inspect "$volume" >"$work/volume.before-cleanup.json"
+bash "$runtime" --cleanup-survivors \
+  --container "$container" --network "$network" --volume "$volume" \
+  --volume-identity "$volume_marker" --ownership-marker "$ownership_marker" \
+  --owner-token "$owner_token" --recovery-id "$recovery_id" \
+  --docker-root "$docker_root"
+container_created=false
+network_created=false
+[ ! -e "$ownership_marker" ] && [ ! -e "$volume_marker" ]
+
 if docker volume inspect "$volume" >"$work/absence.stdout" 2>"$work/absence.stderr"; then
   status=0
 else
@@ -103,16 +208,12 @@ else
 fi
 jq -n --arg stdout "$( <"$work/absence.stdout")" --arg stderr "$( <"$work/absence.stderr")" \
   --arg actual "$volume" --argjson status "$status" '
-  {status:$status,stdout:($stdout+"\n"),stderr:(($stderr|gsub($actual;"<volume>"))+"\n")}
+  {status:$status,stdout:($stdout+"\n"),
+   stderr:(($stderr|gsub($actual;"<volume>"))+"\n")}
 ' >"$work/absence.json"
-jq -e --slurpfile expected "$fixture" '
-  . == $expected[0].absence
-' "$work/absence.json" >/dev/null || {
-  echo "post-removal volume absence tuple differs from the reviewed fixture" >&2
-  jq -cS --arg actual "$volume" '. | .stderr |= gsub($actual;"<volume>")' \
-    "$work/absence.json" >&2
-  exit 1
-}
+jq -e --slurpfile expected "$fixture" '. == $expected[0].absence' \
+  "$work/absence.json" >/dev/null
+
 for kind in container network volume; do
   case "$kind" in
     container) name=$container ;;
@@ -120,8 +221,77 @@ for kind in container network volume; do
     volume) name=$volume ;;
   esac
   if docker "$kind" inspect "$name" >"$work/$kind.stdout" 2>"$work/$kind.stderr"; then
-    echo "$kind residue remains after cleanup" >&2
+    echo "$kind residue remains after authenticated cleanup" >&2
     exit 1
   fi
 done
-echo "real Docker beta recovery volume provenance and cleanup passed"
+
+collision_suffix="${suffix}-collision"
+collision_network="beta-recovery-collision-${collision_suffix}"
+collision_container="beta-recovery-postgres-collision-${collision_suffix}"
+collision_recovery_id="collision-${collision_suffix}"
+collision_token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+docker network create --internal \
+  --label com.meet-backend.beta-recovery/owner=collision-fixture \
+  --label com.meet-backend.beta-recovery/recovery-id="$collision_recovery_id" \
+  --label com.meet-backend.beta-recovery/owner-token="$collision_token" \
+  "$collision_network" >/dev/null
+collision_network_created=true
+docker create --name "$collision_container" --network "$collision_network" \
+  --label com.meet-backend.beta-recovery/owner=collision-fixture \
+  --label com.meet-backend.beta-recovery/recovery-id="$collision_recovery_id" \
+  --label com.meet-backend.beta-recovery/owner-token="$collision_token" \
+  "$image" >/dev/null
+collision_container_created=true
+collision_volume=$(docker container inspect "$collision_container" |
+  jq -er '.[0].Mounts | map(select(.Type=="volume")) | if length==1 then .[0].Name else error end')
+docker container inspect "$collision_container" >"$work/collision.container.before.json"
+docker network inspect "$collision_network" >"$work/collision.network.before.json"
+docker volume inspect "$collision_volume" >"$work/collision.volume.before.json"
+if assert_absent_before_create container "$collision_container"; then
+  echo "container collision preflight unexpectedly accepted an existing resource" >&2
+  exit 1
+fi
+if assert_absent_before_create network "$collision_network"; then
+  echo "network collision preflight unexpectedly accepted an existing resource" >&2
+  exit 1
+fi
+docker container inspect "$collision_container" >"$work/collision.container.after.json"
+docker network inspect "$collision_network" >"$work/collision.network.after.json"
+docker volume inspect "$collision_volume" >"$work/collision.volume.after.json"
+cmp -- "$work/collision.container.before.json" "$work/collision.container.after.json"
+cmp -- "$work/collision.network.before.json" "$work/collision.network.after.json"
+cmp -- "$work/collision.volume.before.json" "$work/collision.volume.after.json"
+if [ "$collision_container_created" = true ]; then
+  docker container inspect "$collision_container" |
+    jq -e --arg id "$collision_recovery_id" --arg token "$collision_token" '
+    .[0].Config.Labels["com.meet-backend.beta-recovery/owner"]=="collision-fixture" and
+    .[0].Config.Labels["com.meet-backend.beta-recovery/recovery-id"]==$id and
+    .[0].Config.Labels["com.meet-backend.beta-recovery/owner-token"]==$token
+  ' >/dev/null
+  docker container rm --force --volumes "$collision_container" >/dev/null
+  collision_container_created=false
+fi
+if [ "$collision_network_created" = true ]; then
+  docker network inspect "$collision_network" |
+    jq -e --arg id "$collision_recovery_id" --arg token "$collision_token" '
+    .[0].Labels["com.meet-backend.beta-recovery/owner"]=="collision-fixture" and
+    .[0].Labels["com.meet-backend.beta-recovery/recovery-id"]==$id and
+    .[0].Labels["com.meet-backend.beta-recovery/owner-token"]==$token
+  ' >/dev/null
+  docker network rm "$collision_network" >/dev/null
+  collision_network_created=false
+fi
+for kind in container network volume; do
+  case "$kind" in
+    container) name=$collision_container ;;
+    network) name=$collision_network ;;
+    volume) name=$collision_volume ;;
+  esac
+  if docker "$kind" inspect "$name" >/dev/null 2>&1; then
+    echo "collision fixture residue remains: $kind" >&2
+    exit 1
+  fi
+done
+
+echo "real Docker beta recovery volume provenance and authenticated cleanup passed"

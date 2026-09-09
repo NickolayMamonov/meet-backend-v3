@@ -136,63 +136,91 @@ inspect_resource(){
   echo "Docker $kind inspection failed" >&2
   return 2
 }
+volume_provenance_clauses(){
+  local json=$1 volume=$2 root=$3 baseline=${4:-false} expected
+  expected=${root%/}/volumes/$volume/_data
+  jq -cn --argjson document "$json" --arg volume "$volume" --arg expected "$expected" \
+    --argjson baseline "$baseline" '
+    def docker_path:
+      if startswith("C:/Program Files/Git/") then ("/"+.[21:]) else . end;
+    [
+      (if (($document|type)=="array" and ($document|length)==1) then empty else "shape" end),
+      (if (($document|type)=="array" and ($document|length)==1 and $document[0].Name==$volume)
+       then empty else "name" end),
+      (if (($document|type)=="array" and ($document|length)==1 and $document[0].Driver=="local")
+       then empty else "driver" end),
+      (if (($document|type)=="array" and ($document|length)==1 and
+          ($document[0].Mountpoint|docker_path)==($expected|docker_path))
+       then empty else "mountpoint" end),
+      (if (($document|type)=="array" and ($document|length)==1 and
+          (if $baseline then
+             (($document[0].Labels==null) or
+              (($document[0].Labels|type)=="object" and ($document[0].Labels|length)==0))
+           else $document[0].Labels=={"com.docker.volume.anonymous":""}
+           end))
+       then empty else "labels" end),
+      (if (($document|type)=="array" and ($document|length)==1 and
+          (($document[0].Options==null) or
+           (($document[0].Options|type)=="object" and ($document[0].Options|length)==0)))
+       then empty else "options" end)
+    ] | sort | unique
+  '
+}
 volume_provenance(){
+  local failed
+  failed=$(volume_provenance_clauses "$1" "$2" "$3" false) || return 1
+  [ "$failed" = '[]' ]
+}
+container_mount_provenance_clauses(){
   local json=$1 volume=$2 root=$3 expected
   expected=${root%/}/volumes/$volume/_data
-  jq -e --arg volume "$volume" --arg expected "$expected" '
-    type=="array" and length==1 and .[0].Name==$volume and .[0].Driver=="local" and
-    .[0].Mountpoint==$expected and
-    .[0].Labels=={"com.docker.volume.anonymous":""} and
-    ((.[0].Options==null) or (.[0].Options|type=="object" and length==0))
-  ' <<<"$json" >/dev/null
+  jq -cn --argjson document "$json" --arg volume "$volume" --arg expected "$expected" '
+    def docker_path:
+      if startswith("C:/Program Files/Git/") then ("/"+.[21:]) else . end;
+    [
+      (if (($document|type)=="array" and ($document|length)==1) then empty else "shape" end),
+      (if (($document|type)=="array" and ($document|length)==1 and
+          (($document[0].HostConfig.Binds==null) or
+           (($document[0].HostConfig.Binds|type)=="array" and ($document[0].HostConfig.Binds|length)==0)))
+       then empty else "host-binds" end),
+      (if (($document|type)=="array" and ($document|length)==1 and
+          (($document[0].HostConfig.Mounts==null) or
+           (($document[0].HostConfig.Mounts|type)=="array" and ($document[0].HostConfig.Mounts|length)==0)))
+       then empty else "host-mounts" end),
+      (if (($document|type)=="array" and ($document|length)==1 and
+          ($document[0].Mounts|type)=="array" and ($document[0].Mounts|length)==1)
+       then empty else "mount-count" end),
+      (if (($document|type)=="array" and ($document|length)==1 and $document[0].Mounts[0].Type=="volume")
+       then empty else "mount-type" end),
+      (if (($document|type)=="array" and ($document|length)==1 and $document[0].Mounts[0].Name==$volume)
+       then empty else "mount-name" end),
+      (if (($document|type)=="array" and ($document|length)==1 and
+          $document[0].Mounts[0].Destination=="/var/lib/postgresql/data")
+       then empty else "destination" end),
+      (if (($document|type)=="array" and ($document|length)==1 and $document[0].Mounts[0].RW==true)
+       then empty else "read-write" end),
+      (if (($document|type)=="array" and ($document|length)==1 and
+          ($document[0].Mounts[0].Source|docker_path)==($expected|docker_path))
+       then empty else "source" end)
+    ] | sort | unique
+  '
 }
 container_mount_provenance(){
-  local json=$1 volume=$2 root=$3 expected
-  expected=${root%/}/volumes/$volume/_data
-  jq -e --arg volume "$volume" --arg expected "$expected" '
-    type=="array" and length==1 and
-    ((.[0].HostConfig.Binds==null) or (.[0].HostConfig.Binds|type=="array" and length==0)) and
-    ((.[0].HostConfig.Mounts==null) or (.[0].HostConfig.Mounts|type=="array" and length==0)) and
-    (.[0].Mounts|type=="array" and length==1 and .[0].Type=="volume" and
-      .[0].Name==$volume and .[0].Destination=="/var/lib/postgresql/data" and
-      .[0].RW==true and .[0].Source==$expected)
-  ' <<<"$json" >/dev/null
+  local failed
+  failed=$(container_mount_provenance_clauses "$1" "$2" "$3") || return 1
+  [ "$failed" = '[]' ]
 }
 provenance_report(){
   local container_file=$1 volume_file=$2 volume=$3 root=$4 baseline=${5:-false}
-  BETA_RECOVERY_EVALUATOR_DOCKER_ROOT=$root jq -n --slurpfile c "$container_file" --slurpfile v "$volume_file" \
-    --arg volume "$volume" \
-    --argjson baseline "$baseline" '
-    (env.BETA_RECOVERY_EVALUATOR_DOCKER_ROOT |
-      if startswith("C:/Program Files/Git/") then ("/"+.[21:]) else . end |
-      rtrimstr("/")) as $root |
-    ($root+"/volumes/"+$volume+"/_data") as $expected |
-    ($c[0] | if type=="array" then . else [.] end) as $c0 |
-    ($v[0] | if type=="array" then . else [.] end) as $v0 |
-    [
-      (if (($v0|type)=="array" and ($v0|length)==1 and
-          ($c0|type)=="array" and ($c0|length)==1) then empty else "shape" end),
-      (if (($v0|type)=="array" and ($v0|length)==1 and $v0[0].Name==$volume) then empty else "name" end),
-      (if (($v0|type)=="array" and ($v0|length)==1 and $v0[0].Driver=="local") then empty else "driver" end),
-      (if (($v0|type)=="array" and ($v0|length)==1 and $v0[0].Mountpoint==$expected) then empty else "mountpoint" end),
-      (if (($v0|type)=="array" and ($v0|length)==1 and
-          (if $baseline then (($v0[0].Labels==null) or ($v0[0].Labels|type=="object" and length==0))
-           else $v0[0].Labels=={"com.docker.volume.anonymous":""} end)) then empty else "labels" end),
-      (if (($v0|type)=="array" and ($v0|length)==1 and
-          (($v0[0].Options==null) or ($v0[0].Options|type=="object" and length==0))) then empty else "options" end),
-      (if (($c0|type)=="array" and ($c0|length)==1 and
-          (($c0[0].HostConfig.Binds==null) or ($c0[0].HostConfig.Binds|type=="array" and length==0))) then empty else "host-binds" end),
-      (if (($c0|type)=="array" and ($c0|length)==1 and
-          (($c0[0].HostConfig.Mounts==null) or
-            ($c0[0].HostConfig.Mounts|type=="array" and ($c0[0].HostConfig.Mounts|length)==0))) then empty else "host-mounts" end),
-      (if (($c0|type)=="array" and ($c0|length)==1 and ($c0[0].Mounts|type=="array" and ($c0[0].Mounts|length)==1)) then empty else "mount-count" end),
-      (if (($c0|type)=="array" and ($c0|length)==1 and $c0[0].Mounts[0].Type=="volume") then empty else "mount-type" end),
-      (if (($c0|type)=="array" and ($c0|length)==1 and $c0[0].Mounts[0].Name==$volume) then empty else "mount-name" end),
-      (if (($c0|type)=="array" and ($c0|length)==1 and $c0[0].Mounts[0].Destination=="/var/lib/postgresql/data") then empty else "destination" end),
-      (if (($c0|type)=="array" and ($c0|length)==1 and $c0[0].Mounts[0].RW==true) then empty else "read-write" end),
-      (if (($c0|type)=="array" and ($c0|length)==1 and $c0[0].Mounts[0].Source==$expected) then empty else "source" end)
-    ] | {accepted:(length==0),failedClauses:(sort|unique)}
-  ' || return 2
+  local container_json volume_json volume_failed container_failed
+  container_json=$(<"$container_file") || return 2
+  volume_json=$(<"$volume_file") || return 2
+  volume_failed=$(volume_provenance_clauses "$volume_json" "$volume" "$root" "$baseline") || return 2
+  container_failed=$(container_mount_provenance_clauses "$container_json" "$volume" "$root") || return 2
+  jq -cn --argjson volume "$volume_failed" --argjson container "$container_failed" '
+    ($volume + $container | sort | unique) as $failed |
+    {accepted:($failed|length==0),failedClauses:$failed}
+  '
 }
 if [ "${1:-}" = --evaluate-provenance ]; then
   shift
