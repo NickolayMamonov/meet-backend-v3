@@ -31,6 +31,8 @@ grep -Fq 'docker image inspect "$image"' "$script"
 grep -Fq 'HostConfig.Binds' "$script"
 grep -Fq 'HostConfig.Mounts' "$script"
 grep -Fq 'volume_provenance' "$script"
+grep -Fq -- '--evaluate-provenance' "$script"
+grep -Fq 'com.docker.volume.anonymous' "$script"
 grep -Fq 'marker=$temp/volume.identity' "$script"
 grep -Fq '^[0-9a-f]{64}$' "$script"
 
@@ -91,6 +93,27 @@ if "$script" --validate-uploads-archive --archive "$fixture/fifo.tar.gz" \
   echo "FIFO archive was accepted" >&2
   exit 1
 fi
+
+shape_fixture=$fixture/provenance-shape
+mkdir -- "$shape_fixture"
+provenance_fixture=$root/scripts/fixtures/beta-recovery/real-docker-volume-provenance.json
+volume_identity=$(jq -er '.volumeIdentity' "$provenance_fixture")
+jq '.container[0]' "$provenance_fixture" >"$shape_fixture/container.scalar.json"
+jq '.volume[0]' "$provenance_fixture" >"$shape_fixture/volume.scalar.json"
+jq '.container' "$provenance_fixture" >"$shape_fixture/container.array.json"
+jq '.volume' "$provenance_fixture" >"$shape_fixture/volume.array.json"
+scalar_container_report=$("$script" --evaluate-provenance \
+  --container-inspect "$shape_fixture/container.scalar.json" \
+  --volume-inspect "$shape_fixture/volume.array.json" \
+  --volume-identity "$volume_identity" --docker-root /var/lib/docker)
+jq -e '.accepted==false and (.failedClauses|index("shape")!=null)' \
+  <<<"$scalar_container_report" >/dev/null
+scalar_volume_report=$("$script" --evaluate-provenance \
+  --container-inspect "$shape_fixture/container.array.json" \
+  --volume-inspect "$shape_fixture/volume.scalar.json" \
+  --volume-identity "$volume_identity" --docker-root /var/lib/docker)
+jq -e '.accepted==false and (.failedClauses|index("shape")!=null)' \
+  <<<"$scalar_volume_report" >/dev/null
 
 run_restore_fixture() {
   local name=$1 expected_status=$2 mount_mode=${3:-valid} behavior=${4:-normal}
@@ -170,6 +193,7 @@ run_restore_fixture() {
   unset FAKE_DOCKER_FAIL_RESTORE FAKE_DOCKER_FAIL_CONTAINER_RM_ONCE
   unset FAKE_DOCKER_FAIL_VOLUME_RM_ONCE FAKE_DOCKER_FAIL_VOLUME_RM
   unset FAKE_DOCKER_PRESERVE_VOLUME FAKE_DOCKER_INTERRUPT_AFTER_CREATE
+  unset FAKE_DOCKER_VOLUME_ABSENCE_MODE
   unset FAKE_AGE_FAIL_UPLOADS AGE_IDENTITY
   if [ "$identity_kind" = environment ]; then export AGE_IDENTITY=unexpected; fi
   if [ "$behavior" = restore-failure ]; then export FAKE_DOCKER_FAIL_RESTORE=1; fi
@@ -188,6 +212,9 @@ run_restore_fixture() {
   fi
   if [ "$behavior" = interrupt ]; then export FAKE_DOCKER_INTERRUPT_AFTER_CREATE=1; fi
   if [ "$behavior" = second-decrypt-failure ]; then export FAKE_AGE_FAIL_UPLOADS=1; fi
+  if [[ "$behavior" = inspect-* ]]; then
+    export FAKE_DOCKER_VOLUME_ABSENCE_MODE=${behavior#inspect-}
+  fi
   export FAKE_DATABASE_PROOF="$case_dir/database-proof.json"
   export FAKE_DATABASE_DUMP="$case_dir/database.dump"
   export FAKE_UPLOADS_ARCHIVE="$case_dir/uploads.tar.gz"
@@ -380,6 +407,15 @@ run_restore_fixture() {
       { echo "persistent cleanup failure did not retain retry markers safely" >&2; exit 1; }
     return
   fi
+  if [[ "$behavior" = inspect-* ]]; then
+    [ ! -e "$case_dir/output/restore-summary" ] &&
+      [ -f "$case_dir/temp/volume.identity" ] &&
+      [ -f "$case_dir/temp/restore-ownership.json" ] &&
+      [ ! -e "$case_dir/docker-state/container" ] &&
+      [ ! -e "$case_dir/docker-state/network" ] ||
+      { echo "ambiguous volume inspection was accepted: $behavior" >&2; exit 1; }
+    return
+  fi
   [ ! -e "$case_dir/docker-state/container" ] && [ ! -e "$case_dir/docker-state/network" ] ||
     { echo "restore fixture $name left Docker resources" >&2; exit 1; }
   [ ! -e "$case_dir/docker-state/volume" ] ||
@@ -415,6 +451,15 @@ run_restore_fixture restore-collision 1 valid collision
 run_restore_fixture restore-zero-reference 1 valid zero-reference
 run_restore_fixture restore-interruption 137 valid interrupt
 run_restore_fixture restore-interruption-retry 0 valid survivor
+run_restore_fixture restore-lowercase-volume-absence 0 valid normal
+run_restore_fixture restore-legacy-volume-absence 0 valid normal
+run_restore_fixture restore-status-two-volume-absence 1 valid inspect-status-two
+run_restore_fixture restore-extra-stderr-volume-absence 1 valid inspect-extra-stderr
+run_restore_fixture restore-daemon-volume-inspection 1 valid inspect-daemon
+run_restore_fixture restore-authorization-volume-inspection 1 valid inspect-authorization
+run_restore_fixture restore-mixed-volume-inspection 1 valid inspect-mixed
+run_restore_fixture restore-malformed-volume-inspection 1 valid inspect-malformed
+run_restore_fixture restore-unknown-volume-inspection 1 valid inspect-unknown
 run_restore_fixture restore-missing-identity 1 valid normal missing
 run_restore_fixture restore-empty-identity 1 valid normal empty
 run_restore_fixture restore-newline-empty-identity 1 valid normal newline-empty

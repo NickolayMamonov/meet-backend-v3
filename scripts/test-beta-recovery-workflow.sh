@@ -2,10 +2,24 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 workflow=$root/.github/workflows/prove-beta-backup-restore.yml
+backend_ci=$root/.github/workflows/ci.yml
 stage=$root/scripts/run-beta-recovery-capture-stage.sh
 [ -f "$workflow" ] || exit 1
+[ -f "$backend_ci" ] || exit 1
 [ -x "$stage" ] || exit 1
 command -v jq >/dev/null 2>&1
+grep -Fq 'test-beta-recovery-restore-docker.sh' "$backend_ci"
+grep -Fq 'BETA_RECOVERY_INJECT_COLLISION_FAILURE' "$root/scripts/test-beta-recovery-restore-docker.sh"
+grep -Fq 'cleanup_collision_resources' "$root/scripts/test-beta-recovery-restore-docker.sh"
+grep -Fq 'fake-docker.sh' "$backend_ci"
+grep -Fq 'bash -n "$script"' "$backend_ci"
+grep -Fq 'shellcheck --severity=warning "${shell_files[@]}"' "$backend_ci"
+grep -Fq 'WORKFLOW=.github/workflows/ci.yml' "$backend_ci"
+grep -Fq 'WORKFLOW=.github/workflows/prove-beta-backup-restore.yml' "$backend_ci"
+postgres_image='postgres:16-alpine@sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2'
+grep -Fq "$postgres_image" "$root/scripts/run-beta-recovery-restore.sh"
+grep -Fq "$postgres_image" "$root/scripts/test-beta-recovery-restore-docker.sh"
+grep -Fq "$postgres_image" "$root/scripts/fixtures/beta-recovery/real-docker-volume-provenance.json"
 require_literals_file() {
   local file=$1 needles=$2
   shift 2
