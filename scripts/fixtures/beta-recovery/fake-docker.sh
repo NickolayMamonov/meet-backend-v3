@@ -233,6 +233,7 @@ case "${1:-}" in
     fi
     if printf '%s\n' "$*" | grep -Fq 'psql'; then
       if printf '%s\n' "$*" | grep -Fq -- '-f /tmp/proof.sql'; then
+        [ "${FAKE_DOCKER_FAIL_PROOF_PSQL:-0}" = 1 ] && exit 1
         cat "$FAKE_DATABASE_PROOF"
       elif printf '%s\n' "$*" | grep -Fq 'regexp_replace(image_url'; then
         [ -z "${FAKE_MEDIA_REFERENCE:-}" ] || printf '%s\n' "$FAKE_MEDIA_REFERENCE"

@@ -278,6 +278,27 @@ for _ in $(seq 1 60); do
 done
 docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&1
 docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -c \
+  "SELECT jsonb_build_object(
+     'rows', jsonb_build_object('users', 1),
+     'schema', 'meet-backend/closed-beta-database-proof/v1'
+   )::jsonb;" >"$work/postgres-jsonb.raw"
+jq -cnS '{schema:"meet-backend/closed-beta-database-proof/v1",rows:{users:1}}' \
+  >"$work/postgres-jsonb.expected"
+if cmp -- "$work/postgres-jsonb.raw" "$work/postgres-jsonb.expected"; then
+  echo "PostgreSQL JSONB text unexpectedly matched canonical bytes" >&2
+  exit 1
+fi
+jq -e -cS -s '
+  if length == 1 and
+     (.[0] | type) == "object" and
+     (.[0].schema | type) == "string" and
+     .[0].schema == "meet-backend/closed-beta-database-proof/v1"
+  then .[0]
+  else error("database proof must be one valid object")
+  end
+' "$work/postgres-jsonb.raw" >"$work/postgres-jsonb.canonical"
+cmp -- "$work/postgres-jsonb.expected" "$work/postgres-jsonb.canonical"
+docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -c \
   'CREATE TABLE restore_role_probe (id integer PRIMARY KEY, payload text NOT NULL);
    INSERT INTO restore_role_probe (id, payload) VALUES (1, '\''restore-role-proof'\'');'
 MSYS_NO_PATHCONV=1 docker exec "$container" pg_dump -U restore_user -d restore_db \
