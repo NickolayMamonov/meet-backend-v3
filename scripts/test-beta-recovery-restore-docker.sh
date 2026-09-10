@@ -272,11 +272,18 @@ jq -e --arg id "$recovery_id" --arg token "$owner_token" \
 ' "$ownership_marker" >/dev/null
 
 docker start "$container" >/dev/null
+postgres_ready=false
 for _ in $(seq 1 60); do
-  docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&1 && break
+  if docker exec "$container" pg_isready -h 127.0.0.1 -U restore_user -d restore_db >/dev/null 2>&1; then
+    postgres_ready=true
+    break
+  fi
   sleep 1
 done
-docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&1
+[ "$postgres_ready" = true ] || {
+  echo "PostgreSQL did not become ready on the final TCP listener" >&2
+  exit 1
+}
 docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -c \
   "SELECT jsonb_build_object(
      'rows', jsonb_build_object('users', 1),
