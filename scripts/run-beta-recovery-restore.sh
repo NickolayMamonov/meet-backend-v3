@@ -776,8 +776,15 @@ jq -cnS '{schema:"meet-backend/beta-recovery-mount/v1",type:"volume",
   >"$output/mount-contract.json"
 chmod 600 "$output/mount-contract.json"
 docker start "$container" >/dev/null
-for _ in $(seq 1 60); do docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&1 && break; sleep 1; done
-docker exec "$container" pg_isready -U restore_user -d restore_db >/dev/null 2>&1 || fail "postgres did not become ready"
+postgres_ready=false
+for _ in $(seq 1 60); do
+  if docker exec "$container" pg_isready -h 127.0.0.1 -U restore_user -d restore_db >/dev/null 2>&1; then
+    postgres_ready=true
+    break
+  fi
+  sleep 1
+done
+[ "$postgres_ready" = true ] || fail "postgres did not become ready"
 docker cp "$db_dump" "$container:/tmp/postgres.dump"
 docker exec "$container" pg_restore --list /tmp/postgres.dump >"$private/postgres.list" || fail "database archive listing failed"
 [ -s "$private/postgres.list" ] || fail "database archive listing is empty"

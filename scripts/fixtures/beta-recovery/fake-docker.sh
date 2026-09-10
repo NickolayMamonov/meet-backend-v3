@@ -31,6 +31,55 @@ network_owner_token() {
   [ -f "$state/network-owner-token" ] && cat "$state/network-owner-token" ||
     printf '%s' "${FAKE_DOCKER_OWNER_TOKEN:-}"
 }
+readiness_probe() {
+  local mode=${FAKE_DOCKER_READINESS_MODE:-final}
+  local attempts=0
+  if [ -f "$state/readiness-attempts" ]; then
+    attempts=$(<"$state/readiness-attempts")
+  fi
+  [[ "$attempts" =~ ^[0-9]+$ ]] || {
+    log_event readiness-malformed-state
+    exit 2
+  }
+  attempts=$((attempts + 1))
+  printf '%s\n' "$attempts" >"$state/readiness-attempts"
+  case "$mode" in
+    final|tcp-ready)
+      log_event readiness-final-tcp
+      ;;
+    bootstrap-restart-final)
+      case "$attempts" in
+        1) log_event readiness-bootstrap-socket-only; return 1 ;;
+        2) log_event readiness-restart-unavailable; return 1 ;;
+        *) log_event readiness-final-tcp ;;
+      esac
+      ;;
+    not-ready)
+      log_event readiness-not-ready
+      return 1
+      ;;
+    exited-container)
+      log_event readiness-exited-container
+      return 125
+      ;;
+    failed-exec)
+      log_event readiness-failed-exec
+      return 126
+      ;;
+    docker-command-failure)
+      log_event readiness-docker-command-failure
+      return 127
+      ;;
+    malformed)
+      log_event readiness-malformed-state
+      return 2
+      ;;
+    *)
+      log_event readiness-malformed-state
+      return 2
+      ;;
+  esac
+}
 
 json_container() {
   local mounts=${FAKE_DOCKER_MOUNT_MODE:-valid}
@@ -188,12 +237,24 @@ case "${1:-}" in
   start) log_event start ;;
   exec)
     log_event exec
-    if [ "${3:-}" = pg_isready ]; then exit 0; fi
+    if [ "${3:-}" = pg_isready ]; then
+      [ "$#" -eq 9 ] &&
+        [ "$4" = -h ] && [ "$5" = 127.0.0.1 ] &&
+        [ "$6" = -U ] && [ "$7" = restore_user ] &&
+        [ "$8" = -d ] && [ "$9" = restore_db ] || {
+        log_event readiness-malformed-vector
+        exit 2
+      }
+      readiness_probe
+      exit $?
+    fi
     if [ "${3:-}" = pg_restore ] && [ "${4:-}" = --list ]; then
+      log_event restore
       printf 'fixture archive list\n'
       exit 0
     fi
     if [ "${3:-}" = pg_restore ]; then
+      log_event restore
       restore_args=("${@:4}")
       role_count=0
       role=''
@@ -232,6 +293,7 @@ case "${1:-}" in
       [ "${FAKE_DOCKER_FAIL_RESTORE:-0}" = 1 ] && exit 1
     fi
     if printf '%s\n' "$*" | grep -Fq 'psql'; then
+      log_event proof
       if printf '%s\n' "$*" | grep -Fq -- '-f /tmp/proof.sql'; then
         [ "${FAKE_DOCKER_FAIL_PROOF_PSQL:-0}" = 1 ] && exit 1
         cat "$FAKE_DATABASE_PROOF"

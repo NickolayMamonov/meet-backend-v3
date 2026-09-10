@@ -6,6 +6,11 @@ script=$root/scripts/run-beta-recovery-restore.sh
 workflow=$root/.github/workflows/prove-beta-backup-restore.yml
 
 bash -n "$script"
+grep -Fq 'pg_isready -h 127.0.0.1 -U restore_user -d restore_db' "$script"
+if grep -Eq 'pg_isready[[:space:]]+-U' "$script"; then
+  echo "restore runtime contains a default-socket readiness probe" >&2
+  exit 1
+fi
 
 grep -Fq 'artifactFiles' "$script"
 grep -Fq 'source.ciphertexts' "$script"
@@ -161,7 +166,7 @@ jq -e '.accepted==false and (.failedClauses|index("shape")!=null)' \
 
 run_restore_fixture() {
   local name=$1 expected_status=$2 mount_mode=${3:-valid} behavior=${4:-normal}
-  local identity_kind=${5:-valid} identity_mode=${6:-600}
+  local identity_kind=${5:-valid} identity_mode=${6:-600} readiness_mode=${7:-final}
   local case_dir=$fixture/$name
   local hash tooling workflow_digest database_digest media_digest
   mkdir -p "$case_dir/artifact" "$case_dir/output" "$case_dir/docker-root" "$case_dir/docker-state" "$case_dir/temp"
@@ -231,10 +236,13 @@ run_restore_fixture() {
   ln -- "$root/scripts/fixtures/beta-recovery/fake-age.sh" "$case_dir/bin/age-keygen"
   ln -- "$root/scripts/fixtures/beta-recovery/fake-stat.sh" "$case_dir/bin/stat"
   chmod 700 "$case_dir/bin/docker" "$case_dir/bin/age" "$case_dir/bin/age-keygen" "$case_dir/bin/stat"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$case_dir/bin/sleep"
+  chmod 700 "$case_dir/bin/sleep"
   export FAKE_DOCKER_STATE="$case_dir/docker-state"
   export FAKE_DOCKER_ROOT="$case_dir/docker-root"
   export FAKE_RECOVERY_ID=recovery-fixture
   export FAKE_DOCKER_MOUNT_MODE="$mount_mode"
+  export FAKE_DOCKER_READINESS_MODE="$readiness_mode"
   export FAKE_RECOVERY_EVENT_LOG="$case_dir/events.log"
   export FAKE_IDENTITY_MODE="$identity_mode"
   export FAKE_MEDIA_REFERENCE=avatars/file
@@ -452,6 +460,56 @@ run_restore_fixture() {
     echo "restore fixture $name returned $actual_status, expected $expected_status" >&2
     exit 1
   }
+  if [[ "$behavior" = readiness-* ]]; then
+    readiness_events=$(grep '^docker-readiness-' "$case_dir/events.log" || :)
+    case "$behavior" in
+      readiness-bootstrap)
+        [ "$readiness_events" = $'docker-readiness-bootstrap-socket-only\ndocker-readiness-restart-unavailable\ndocker-readiness-final-tcp' ] || {
+          echo "bootstrap readiness transition differs" >&2
+          exit 1
+        }
+        final_line=$(grep -n '^docker-readiness-final-tcp$' "$case_dir/events.log" | head -n1 | cut -d: -f1)
+        work_line=$(grep -nE '^docker-(cp|restore|proof)$' "$case_dir/events.log" | head -n1 | cut -d: -f1)
+        [ -n "$final_line" ] && [ -n "$work_line" ] && [ "$work_line" -gt "$final_line" ] || {
+          echo "restore work started before final TCP readiness" >&2
+          exit 1
+        }
+        ;;
+      *)
+        [ "$(cat "$case_dir/docker-state/readiness-attempts")" = 60 ] || {
+          echo "readiness failure was not bounded at 60 attempts: $name" >&2
+          exit 1
+        }
+        expected_readiness_event=$(case "$behavior" in
+          readiness-timeout) printf '%s' docker-readiness-not-ready ;;
+          readiness-exited) printf '%s' docker-readiness-exited-container ;;
+          readiness-exec-failure) printf '%s' docker-readiness-failed-exec ;;
+          readiness-command-failure) printf '%s' docker-readiness-docker-command-failure ;;
+          readiness-malformed) printf '%s' docker-readiness-malformed-state ;;
+        esac)
+        [ "$(printf '%s\n' "$readiness_events" | sort -u)" = "$expected_readiness_event" ] || {
+          echo "readiness failure state differs: $name" >&2
+          exit 1
+        }
+        ! grep -Eq '^docker-(cp|restore|proof)$' "$case_dir/events.log" || {
+          echo "readiness failure reached restore or proof work: $name" >&2
+          exit 1
+        }
+        [ ! -e "$case_dir/output/restore-summary" ] &&
+          [ ! -e "$case_dir/output/restored-database-proof.json" ] &&
+          [ ! -e "$case_dir/output/restored-media-proof.json" ] &&
+          [ ! -e "$case_dir/temp" ] &&
+          [ ! -e "$case_dir/docker-state/container" ] &&
+          [ ! -e "$case_dir/docker-state/network" ] &&
+          [ ! -e "$case_dir/docker-state/volume" ] &&
+          [ ! -e "$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] || {
+          echo "readiness failure left residue or success evidence: $name" >&2
+          exit 1
+        }
+        return
+        ;;
+    esac
+  fi
   if [ "$identity_kind" != valid ] || [ "$behavior" = second-decrypt-failure ]; then
     ! grep -q '^docker-' "$case_dir/events.log" || {
       echo "identity/decrypt failure reached Docker: $name" >&2
@@ -548,6 +606,12 @@ run_restore_fixture() {
 }
 
 run_restore_fixture success 0 valid capacity
+run_restore_fixture restore-readiness-bootstrap 0 valid readiness-bootstrap valid 600 bootstrap-restart-final
+run_restore_fixture restore-readiness-timeout 1 valid readiness-timeout valid 600 not-ready
+run_restore_fixture restore-readiness-exited 1 valid readiness-exited valid 600 exited-container
+run_restore_fixture restore-readiness-exec-failure 1 valid readiness-exec-failure valid 600 failed-exec
+run_restore_fixture restore-readiness-command-failure 1 valid readiness-command-failure valid 600 docker-command-failure
+run_restore_fixture restore-readiness-malformed 1 valid readiness-malformed valid 600 malformed
 run_restore_fixture restore-failure 1 valid restore-failure
 run_restore_fixture restore-retry 0 valid retry
 run_restore_fixture restore-volume-retry 0 valid volume-retry
