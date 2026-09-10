@@ -179,6 +179,10 @@ run_restore_fixture() {
   printf encrypted >"$case_dir/artifact/uploads.tar.gz.age"
   jq -cnS '{schema:"meet-backend/closed-beta-database-proof/v1",rows:{users:1}}' \
     >"$case_dir/database-proof.json"
+  printf '%s\n' '{' \
+    '  "rows": { "users": 1 },' \
+    '  "schema": "meet-backend/closed-beta-database-proof/v1"' \
+    '}' >"$case_dir/database-proof.raw.json"
   printf 'avatars/file\n' >"$case_dir/reference-list"
   "$root/scripts/beta-recovery-media-proof.sh" --root "$fixture/valid" \
     --reference-list "$case_dir/reference-list" \
@@ -238,7 +242,7 @@ run_restore_fixture() {
   unset FAKE_DOCKER_FAIL_VOLUME_RM_ONCE FAKE_DOCKER_FAIL_VOLUME_RM
   unset FAKE_DOCKER_PRESERVE_VOLUME FAKE_DOCKER_INTERRUPT_AFTER_CREATE
   unset FAKE_DOCKER_VOLUME_ABSENCE_MODE
-  unset FAKE_AGE_FAIL_UPLOADS AGE_IDENTITY
+  unset FAKE_DOCKER_FAIL_PROOF_PSQL FAKE_AGE_FAIL_UPLOADS AGE_IDENTITY
   if [ "$identity_kind" = environment ]; then export AGE_IDENTITY=unexpected; fi
   if [ "$behavior" = restore-failure ]; then export FAKE_DOCKER_FAIL_RESTORE=1; fi
   if [ "$behavior" = zero-reference ]; then export FAKE_MEDIA_REFERENCE=meetings/unreferenced-zero; fi
@@ -256,13 +260,53 @@ run_restore_fixture() {
   fi
   if [ "$behavior" = interrupt ]; then export FAKE_DOCKER_INTERRUPT_AFTER_CREATE=1; fi
   if [ "$behavior" = second-decrypt-failure ]; then export FAKE_AGE_FAIL_UPLOADS=1; fi
+  case "$behavior" in
+    proof-empty) : >"$case_dir/database-proof.raw.json" ;;
+    proof-malformed) printf '{malformed\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-multiple)
+      printf '%s\n' \
+        '{"schema":"meet-backend/closed-beta-database-proof/v1","rows":{"users":1}}' \
+        '{"schema":"meet-backend/closed-beta-database-proof/v1","rows":{"users":1}}' \
+        >"$case_dir/database-proof.raw.json"
+      ;;
+    proof-scalar) printf 'null\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-array) printf '[{"schema":"meet-backend/closed-beta-database-proof/v1","rows":{"users":1}}]\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-missing-schema) printf '{"rows":{"users":1}}\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-non-string-schema) printf '{"schema":123,"rows":{"users":1}}\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-unexpected-schema) printf '{"schema":"unexpected","rows":{"users":1}}\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-semantic-mismatch) printf '{"schema":"meet-backend/closed-beta-database-proof/v1","rows":{"users":2}}\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-psql-failure) export FAKE_DOCKER_FAIL_PROOF_PSQL=1 ;;
+  esac
   if [[ "$behavior" = inspect-* ]]; then
     export FAKE_DOCKER_VOLUME_ABSENCE_MODE=${behavior#inspect-}
   fi
-  export FAKE_DATABASE_PROOF="$case_dir/database-proof.json"
+  export FAKE_DATABASE_PROOF="$case_dir/database-proof.raw.json"
   export FAKE_DATABASE_DUMP="$case_dir/database.dump"
   export FAKE_UPLOADS_ARCHIVE="$case_dir/uploads.tar.gz"
   export POSTGRES_IMAGE=repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  if [ "$behavior" = proof-cmp-failure ]; then
+    real_cmp=$(command -v cmp)
+    {
+      printf '%s\n' '#!/usr/bin/env bash'
+      printf '%s\n' 'for arg in "$@"; do'
+      printf '%s\n' '  case "$arg" in'
+      printf '%s\n' '    *restored-database-proof.json) exit 73 ;;'
+      printf '%s\n' '  esac'
+      printf '%s\n' 'done'
+      printf '%s\n' 'exec "$FAKE_REAL_CMP" "$@"'
+    } >"$case_dir/bin/cmp"
+    chmod 700 "$case_dir/bin/cmp"
+    export FAKE_REAL_CMP="$real_cmp"
+  fi
+  if [ "$behavior" = proof-publication-collision ]; then
+    printf 'pre-existing\n' >"$case_dir/output/restored-database-proof.json"
+  fi
+  if [ "$behavior" = capacity ]; then
+    if cmp -- "$case_dir/database-proof.json" "$case_dir/database-proof.raw.json"; then
+      echo "reordered proof fixture unexpectedly matched the canonical manifest proof" >&2
+      exit 1
+    fi
+  fi
   if [ "$behavior" = tooling-drift ]; then
     stale_tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture.sh \
       scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
@@ -466,6 +510,25 @@ run_restore_fixture() {
     { echo "restore fixture $name left anonymous volume state" >&2; exit 1; }
   [ ! -e "$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] ||
     { echo "restore fixture $name left anonymous volume data" >&2; exit 1; }
+  if [[ "$behavior" = proof-* ]]; then
+    [ ! -e "$case_dir/output/restore-summary" ] &&
+      [ ! -e "$case_dir/output/restored-media-proof.json" ] &&
+      [ ! -e "$case_dir/output/.restored-database-proof.json" ] &&
+      [ ! -e "$case_dir/temp" ] &&
+      [ ! -e "$case_dir/docker-state/container" ] &&
+      [ ! -e "$case_dir/docker-state/network" ] &&
+      [ ! -e "$case_dir/docker-state/volume" ] &&
+      [ ! -e "$case_dir/docker-root/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ] ||
+      { echo "proof-boundary failure left residue: $name" >&2; exit 1; }
+    if [ "$behavior" = proof-publication-collision ]; then
+      [ "$(cat "$case_dir/output/restored-database-proof.json")" = pre-existing ] ||
+        { echo "publication collision modified the existing proof" >&2; exit 1; }
+    else
+      [ ! -e "$case_dir/output/restored-database-proof.json" ] ||
+        { echo "proof-boundary failure left a published proof: $name" >&2; exit 1; }
+    fi
+    return
+  fi
   if [ "$behavior" = zero-reference ]; then
     jq -e '.referencesTotal==1 and .referencesResolved==false' \
       "$case_dir/output/restored-media-proof.json" >/dev/null ||
@@ -473,6 +536,10 @@ run_restore_fixture() {
   fi
   if [ "$expected_status" -eq 0 ]; then
     [ -s "$case_dir/output/restored-database-proof.json" ] &&
+      [ "$(wc -l <"$case_dir/output/restored-database-proof.json" | tr -d '[:space:]')" = 1 ] &&
+      jq -cS . "$case_dir/output/restored-database-proof.json" >"$case_dir/canonical-database-proof.json" &&
+      cmp -- "$case_dir/canonical-database-proof.json" "$case_dir/output/restored-database-proof.json" &&
+      [ "$(PATH="$case_dir/bin:$PATH" stat -c '%a' "$case_dir/output/restored-database-proof.json")" = 600 ] &&
       [ -s "$case_dir/output/restored-media-proof.json" ] &&
       grep -Fxq cleanup_complete=true "$case_dir/output/restore-summary" &&
       jq -e 'keys|sort == ["anonymous","destination","readWrite","schema","type"]' \
@@ -512,5 +579,17 @@ run_restore_fixture restore-wrong-mode-identity 1 valid normal valid 644
 run_restore_fixture restore-wrong-identity 1 valid normal wrong
 run_restore_fixture restore-environment-identity 1 valid normal environment
 run_restore_fixture restore-second-decrypt-failure 1 valid second-decrypt-failure
+run_restore_fixture restore-proof-empty 1 valid proof-empty
+run_restore_fixture restore-proof-malformed 1 valid proof-malformed
+run_restore_fixture restore-proof-multiple 1 valid proof-multiple
+run_restore_fixture restore-proof-scalar 1 valid proof-scalar
+run_restore_fixture restore-proof-array 1 valid proof-array
+run_restore_fixture restore-proof-missing-schema 1 valid proof-missing-schema
+run_restore_fixture restore-proof-non-string-schema 1 valid proof-non-string-schema
+run_restore_fixture restore-proof-unexpected-schema 1 valid proof-unexpected-schema
+run_restore_fixture restore-proof-semantic-mismatch 1 valid proof-semantic-mismatch
+run_restore_fixture restore-proof-psql-failure 1 valid proof-psql-failure
+run_restore_fixture restore-proof-publication-collision 1 valid proof-publication-collision
+run_restore_fixture restore-proof-cmp-failure 1 valid proof-cmp-failure
 
 echo "beta recovery restore contract and archive fixtures passed"

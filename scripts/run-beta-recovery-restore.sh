@@ -42,6 +42,10 @@ identity=''
 private=''
 db_dump=''
 uploads_archive=''
+db_proof_raw=''
+db_proof_canonical=''
+proof_publication_tmp=''
+database_proof_published=0
 preflight_cleanup(){
   local status=$?
   trap - EXIT HUP INT TERM
@@ -53,6 +57,9 @@ preflight_cleanup(){
   if [ "${temp_owned:-0}" -eq 1 ]; then
     remove_path "$db_expected" || status=1
     remove_path "$media_expected" || status=1
+    remove_path "$db_proof_raw" || status=1
+    remove_path "$db_proof_canonical" || status=1
+    remove_path "$proof_publication_tmp" || status=1
     if [ -d "$temp" ] && [ ! -L "$temp" ] &&
       [ -z "$(find "$temp" -mindepth 1 -print -quit)" ]; then
       rmdir -- "$temp" || status=1
@@ -576,6 +583,8 @@ private=$temp/private-$id
 mkdir -- "$private"; chmod 700 "$private"
 db_dump=$private/postgres.dump
 uploads_archive=$private/uploads.tar.gz
+db_proof_raw=$private/database-proof.raw.json
+db_proof_canonical=$private/database-proof.canonical.json
 age -d -i "$identity" -o "$db_dump" "$artifact/postgres.dump.age" ||
   fail "database ciphertext decryption failed"
 age -d -i "$identity" -o "$uploads_archive" "$artifact/uploads.tar.gz.age" ||
@@ -631,6 +640,9 @@ cleanup(){
   remove_path "$private/reference-list" || local_cleanup_status=1
   remove_path "$db_expected" || local_cleanup_status=1
   remove_path "$media_expected" || local_cleanup_status=1
+  remove_path "$db_proof_raw" || local_cleanup_status=1
+  remove_path "$db_proof_canonical" || local_cleanup_status=1
+  remove_path "$proof_publication_tmp" || local_cleanup_status=1
   if inspect_resource container "$container"; then c=0; else c=$?; fi
   if [ "$c" -eq 0 ]; then
     if [ "$ownership_valid" -eq 1 ] && [ "$container_attempted" = true ] &&
@@ -729,6 +741,12 @@ cleanup(){
   else
     rm -f -- "$output/restore-summary" || local_cleanup_status=1
   fi
+  if [ "$database_proof_published" -eq 1 ] &&
+    { [ "$status" -ne 0 ] || [ "$local_cleanup_status" -ne 0 ] ||
+      [ "$resource_cleanup_status" -ne 0 ] || [ "$cleanup_confirmed" -ne 1 ] ||
+      [ "$temp_owned" -ne 1 ]; }; then
+    remove_path "$output/restored-database-proof.json" || local_cleanup_status=1
+  fi
   [ "$local_cleanup_status" -eq 0 ] && [ "$resource_cleanup_status" -eq 0 ] || status=1
   [ "$status" -eq 0 ] || exit "$status"; exit "$status"
 }
@@ -765,7 +783,34 @@ docker exec "$container" pg_restore --list /tmp/postgres.dump >"$private/postgre
 [ -s "$private/postgres.list" ] || fail "database archive listing is empty"
 docker exec "$container" pg_restore --no-owner --no-privileges --exit-on-error -U restore_user -d restore_db /tmp/postgres.dump >/dev/null || fail "database restore failed"
 docker cp "$sql" "$container:/tmp/proof.sql"
-docker exec "$container" psql -X -qAt -U restore_user -d restore_db -f /tmp/proof.sql >"$output/restored-database-proof.json"
+docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -f /tmp/proof.sql >"$db_proof_raw" ||
+  fail "database proof query failed"
+jq -e -cS -s '
+  if length == 1 and
+     (.[0] | type) == "object" and
+     (.[0].schema | type) == "string" and
+     .[0].schema == "meet-backend/closed-beta-database-proof/v1"
+  then .[0]
+  else error("database proof must be one valid object")
+  end
+' "$db_proof_raw" >"$db_proof_canonical" || fail "database proof serialization is invalid"
+regular "$db_proof_canonical" || fail "database proof serialization is empty"
+cmp -- "$expected_db" "$db_proof_canonical" || fail "database proof differs byte-for-byte"
+[ ! -e "$output/restored-database-proof.json" ] && [ ! -L "$output/restored-database-proof.json" ] ||
+  fail "restored database proof destination already exists"
+proof_publication_tmp=$(mktemp "$output/.restored-database-proof.json.XXXXXX") ||
+  fail "restored database proof staging could not be created"
+cp -- "$db_proof_canonical" "$proof_publication_tmp" ||
+  fail "restored database proof staging could not be written"
+chmod 600 "$proof_publication_tmp" || fail "restored database proof staging mode could not be set"
+mv -n -- "$proof_publication_tmp" "$output/restored-database-proof.json" ||
+  fail "restored database proof publication failed"
+[ ! -e "$proof_publication_tmp" ] && [ ! -L "$proof_publication_tmp" ] ||
+  fail "restored database proof publication left staging residue"
+database_proof_published=1
+regular "$output/restored-database-proof.json" || fail "restored database proof publication is invalid"
+[ "$(stat -c '%a' "$output/restored-database-proof.json")" = 600 ] ||
+  fail "restored database proof publication mode differs"
 cmp -- "$expected_db" "$output/restored-database-proof.json" || fail "database proof differs byte-for-byte"
 docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -c \
   "SELECT regexp_replace(image_url, '^https://api[.]whysoezzy[.]online/demo-assets/v1/', '')
