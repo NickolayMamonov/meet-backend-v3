@@ -1,6 +1,7 @@
 package dev.whysoezzy.meet.service
 
-import dev.whysoezzy.meet.domain.entity.AdBlock
+import dev.whysoezzy.meet.api.dto.AdBlockResponseDto
+import dev.whysoezzy.meet.api.dto.toDto
 import dev.whysoezzy.meet.domain.repository.AdBlockRepository
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
@@ -11,11 +12,11 @@ class AdBlockService(
     private val adBlockRepository: AdBlockRepository
 ) {
 
-    fun getAllActiveAdBlocks(): List<AdBlock> {
-        return adBlockRepository.findByIsActiveTrue()
+    fun getAllActiveAdBlocks(): List<AdBlockResponseDto> {
+        return adBlockRepository.findByIsActiveTrue().map { it.toDto() }
     }
 
-    fun getAdBlockById(id: Long): AdBlock? {
-        return adBlockRepository.findById(id).orElse(null)
+    fun getAdBlockById(id: Long): AdBlockResponseDto? {
+        return adBlockRepository.findById(id).orElse(null)?.toDto()
     }
 }

@@ -71,6 +71,3 @@ fun AdBlock.toDto(): AdBlockResponseDto {
     }
 }
 
-fun List<AdBlock>.toDtoList(): List<AdBlockResponseDto> = map { it.toDto() }
-
-

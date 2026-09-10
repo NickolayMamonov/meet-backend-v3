@@ -2,8 +2,6 @@ package dev.whysoezzy.meet.api.controller
 
 
 import dev.whysoezzy.meet.api.dto.AdBlockResponseDto
-import dev.whysoezzy.meet.api.dto.toDto
-import dev.whysoezzy.meet.api.dto.toDtoList
 import dev.whysoezzy.meet.service.AdBlockService
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.GetMapping
@@ -19,13 +17,12 @@ class AdBlockController(
 
     @GetMapping
     fun getAllActiveAdBlocks(): ResponseEntity<List<AdBlockResponseDto>> {
-        val adBlocks = adBlockService.getAllActiveAdBlocks()
-        return ResponseEntity.ok(adBlocks.toDtoList())
+        return ResponseEntity.ok(adBlockService.getAllActiveAdBlocks())
     }
 
     @GetMapping("/{id}")
     fun getAdBlockById(@PathVariable id: Long): ResponseEntity<AdBlockResponseDto> {
         val adBlock = adBlockService.getAdBlockById(id)
-        return adBlock?.let { ResponseEntity.ok(it.toDto()) } ?: ResponseEntity.ok().build()
+        return adBlock?.let { ResponseEntity.ok(it) } ?: ResponseEntity.ok().build()
     }
 }
