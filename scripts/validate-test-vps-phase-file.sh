@@ -62,12 +62,25 @@ size=$(stat -c '%s' "$output") || fail "phase size cannot be read"
 [ "$size" -le 65536 ] || fail "phase file is too large"
 canonical=$(realpath -e -- "$output") || fail "phase path cannot be canonicalized"
 case "$canonical" in "$state_dir/$phase.json") ;; *) fail "phase path escaped state directory" ;; esac
-jq -e --arg phase "$phase" \
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+contract="$script_dir/test-vps-admission-contract.json"
+[ -f "$contract" ] && [ ! -L "$contract" ] && [ -r "$contract" ] ||
+  fail "admission contract is unavailable"
+jq -e '
+  type == "object" and (keys | sort) == ["populated","schema","stateModes"] and
+  .schema == "meet-backend/test-vps-admission-contract/v1" and
+  (.stateModes | sort) == ["closed-beta-demo","empty-closed"]
+' "$contract" >/dev/null || fail "admission contract is invalid"
+jq -e --slurpfile contract "$contract" --arg phase "$phase" \
   --arg expected_image "$expected_image" \
   --arg expected_image_id "$expected_image_id" \
   --arg expected_revision "$expected_revision" \
   --arg expected_version "$expected_version" \
   --arg state_mode "$state_mode" '
+  def valid_route($routes;$key):
+    ($routes[$key] | type == "object" and .status == 200 and
+      .schemaValid == true and .equal == true and
+      (.projectionSha256 | type == "string" and test("^[0-9a-f]{64}$")));
   type == "object" and
   (keys | sort) == [
     "adminAuthenticatedDisabled404","adminBlankDisabled403","adminKeyConfigured",
@@ -106,12 +119,30 @@ jq -e --arg phase "$phase" \
     .runtime.smtpIdleSamples == [0,0] and
     .http.meetingsStatus == 200 and .http.meetingsJson == true and
     (if $state_mode == "empty-closed"
-     then .database.totalRows == 0 and .http.meetingsCount == 0
-     else (.admission.stateSha256 | type == "string" and test("^[0-9a-f]{64}$")) and
-       .admission.routes.meetings.equal == true and
-       .admission.routes.recommendedCommunities.equal == true and
-       .admission.routes.tags.equal == true and
-       .admission.routes.ads.equal == true
+     then (.admission | type == "object" and
+       (keys | sort) == ["mode","stateSha256"] and
+       .mode == $state_mode and .stateSha256 == null) and
+       .database.totalRows == 0 and .http.meetingsCount == 0
+     else (.admission | type == "object" and
+       (keys | sort) == [
+         "catalogName","manifestVersion","mode","publicProjectionSha256",
+         "recoveryProofSha256","routes","stableProofSha256","stateSha256"
+       ] and .mode == $state_mode and
+       .catalogName == $contract[0].populated.catalogName and
+       .manifestVersion == $contract[0].populated.manifestVersion and
+       .recoveryProofSha256 == $contract[0].populated.recoveryProof.sha256 and
+       .stableProofSha256 == $contract[0].populated.stableProof.sha256 and
+       (.stateSha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+       (.publicProjectionSha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+       (.routes | type == "object" and
+         (keys | sort) == ["ads","meetings","recommendedCommunities","tags"] and
+         valid_route(.;"meetings") and valid_route(.;"recommendedCommunities") and
+         valid_route(.;"tags") and valid_route(.;"ads")) and
+       .routes.meetings.count == $contract[0].populated.roots.meetings and
+       .routes.recommendedCommunities.count == $contract[0].populated.roots.communities and
+       .routes.tags.count == $contract[0].populated.roots.tags and
+       .routes.ads.count == $contract[0].populated.roots.adBlocks) and
+       .http.meetingsCount == $contract[0].populated.roots.meetings
      end)) and
   (.assetsCount | type == "number" and floor == . and . >= 0) and
   (.assetsVerified | type == "boolean") and

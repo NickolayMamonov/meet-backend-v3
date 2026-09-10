@@ -493,13 +493,14 @@ jobs:
           )
           download_phase() {
             local state_dir=$1 phase=$2 expected_image=$3 expected_id=$4
-            local expected_revision=$5 expected_version=$6 local_file remote_file
-            remote_file="$state_dir/$phase.json"
+            local expected_revision=$5 expected_version=$6 state_mode=$7
             local_file="$RUNNER_TEMP/$phase.json"
+            remote_file="$state_dir/$phase.json"
             ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/validate-test-vps-phase-file.sh" \
               --root "$PATH_ON_HOST" --state-dir "$state_dir" --phase "$phase" \
               --expected-image "$expected_image" --expected-image-id "$expected_id" \
               --expected-revision "$expected_revision" --expected-version "$expected_version" \
+              --state-mode "$state_mode" \
               --output "$remote_file"
             remote_sha=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote_file" <<'REMOTE'
           set -euo pipefail
@@ -512,14 +513,15 @@ jobs:
             [ "$local_sha" = "$remote_sha" ]
             jq -e --arg phase "$phase" --arg image "$expected_image" \
               --arg imageId "$expected_id" --arg revision "$expected_revision" \
-              --arg version "$expected_version" '
+              --arg version "$expected_version" --arg stateMode "$state_mode" '
               type == "object" and
               .schema == "meet-backend/test-vps-closed-beta-state/v2" and
               .phase == $phase and .image == $image and .imageId == $imageId and
-              .revision == $revision and .version == $version and
+              .revision == $revision and .version == $version and .stateMode == $stateMode and
               .containerHealthy == true and .environmentMatched == true and
               (.zeroStateProbe | type == "object" and
                 .schema == "meet-backend/test-vps-zero-state-probe/v2" and
+                .admission.mode == $stateMode and
                 .zeroStateObserved == true and .zeroState == "closed" and
                 .runtime.containerHealthy == true and
                 .runtime.topologyVerified == true and
@@ -528,21 +530,30 @@ jobs:
                 .runtime.postgresWritablePrimary == true and
                 .runtime.nonIdleApplicationTransactions == 0 and
                 .runtime.smtpIdleSamples == [0,0] and
-                .database.totalRows == 0 and
+                (if $stateMode == "empty-closed"
+                 then .database.totalRows == 0 and
+                   .http.meetingsCount == 0
+                 else ((.admission.stateSha256 | type == "string" and
+                   test("^[0-9a-f]{64}$")) and
+                   .admission.routes.meetings.equal == true and
+                   .admission.routes.recommendedCommunities.equal == true and
+                   .admission.routes.tags.equal == true and
+                   .admission.routes.ads.equal == true)
+                 end) and
                 .http.meetingsStatus == 200 and
-                .http.meetingsJson == true and .http.meetingsCount == 0)
+                .http.meetingsJson == true)
             ' "$local_file" >/dev/null
           }
           download_phase "$final_state_dir" predecessor "$previous_reference" \
-            "$previous_id" "$previous_revision" "$previous_version"
+            "$previous_id" "$previous_revision" "$previous_version" "$STATE_MODE"
           download_phase "$final_state_dir" candidate "$IMAGE@$IMAGE_DIGEST" \
-            "$target_id" "$SOURCE_SHA" "$VERSION"
+            "$target_id" "$SOURCE_SHA" "$VERSION" "$STATE_MODE"
           if [ "$previous_id" != "$target_id" ]; then
             download_phase "$rollback_state_dir" rollback "$previous_reference" \
-              "$previous_id" "$previous_revision" "$previous_version"
+              "$previous_id" "$previous_revision" "$previous_version" "$STATE_MODE"
           fi
           download_phase "$final_state_dir" final "$IMAGE@$IMAGE_DIGEST" \
-            "$target_id" "$SOURCE_SHA" "$VERSION"
+            "$target_id" "$SOURCE_SHA" "$VERSION" "$STATE_MODE"
           for phase in predecessor candidate final; do
             test -s "$RUNNER_TEMP/$phase.json"
           done
@@ -562,11 +573,19 @@ jobs:
             --phase predecessor \
             --output "$RUNNER_TEMP/bootstrap-predecessor.json" \
             "${predecessor_introduction_args[@]}"
+          rollback_required=false
+          [ "$previous_id" = "$target_id" ] || rollback_required=true
+          if [ "$rollback_required" = true ]; then
+            scripts/build-bootstrap-default-proof.sh \
+              --source-checkout "$proof_checkout" \
+              --source-sha "$proof_sha" \
+              --image-ref "$proof_image" \
+              --phase rollback \
+              --output "$RUNNER_TEMP/bootstrap-rollback.json" \
+              "${predecessor_introduction_args[@]}"
+            jq -e '.phase == "rollback"' "$RUNNER_TEMP/bootstrap-rollback.json" >/dev/null
+          fi
           git worktree remove "$proof_checkout"
-          cp -- "$RUNNER_TEMP/bootstrap-predecessor.json" \
-            "$RUNNER_TEMP/bootstrap-rollback.json"
-          cmp -- "$RUNNER_TEMP/bootstrap-predecessor.json" \
-            "$RUNNER_TEMP/bootstrap-rollback.json"
           scripts/build-bootstrap-default-proof.sh \
             --source-checkout "$GITHUB_WORKSPACE" \
             --source-sha "$SOURCE_SHA" \
@@ -576,17 +595,24 @@ jobs:
           pre_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-predecessor.json" | awk '{print $1}')
           cand_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-candidate.json" | awk '{print $1}')
           final_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-final.json" | awk '{print $1}')
-          rollback_proof="$pre_proof"
-          rollback_required=false
-          [ "$previous_id" = "$target_id" ] || rollback_required=true
+          rollback_proof=
+          rollback_args=(--argjson rollback null)
+          rollback_bootstrap_args=(--argjson rollbackBootstrap null)
+          if [ "$rollback_required" = true ]; then
+            rollback_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-rollback.json" | awk '{print $1}')
+            rollback_args=(--slurpfile rollback "$RUNNER_TEMP/rollback.json")
+            rollback_bootstrap_args=(--slurpfile rollbackBootstrap "$RUNNER_TEMP/bootstrap-rollback.json")
+          fi
           rollback_verified=${rollback_verified:-false}
           jq -n \
             --slurpfile predecessor "$RUNNER_TEMP/predecessor.json" \
             --slurpfile candidate "$RUNNER_TEMP/candidate.json" \
+            "${rollback_args[@]}" \
             --slurpfile final "$RUNNER_TEMP/final.json" \
             --slurpfile predecessorBootstrap "$RUNNER_TEMP/bootstrap-predecessor.json" \
             --slurpfile candidateBootstrap "$RUNNER_TEMP/bootstrap-candidate.json" \
             --slurpfile finalBootstrap "$RUNNER_TEMP/bootstrap-final.json" \
+            "${rollback_bootstrap_args[@]}" \
             --slurpfile authority "$RUNNER_TEMP/dev-promotion-source-deploy.json" \
             --arg source "$SOURCE_SHA" --arg tree "${{ needs.authorize.outputs.tree_id }}" \
             --arg version "$VERSION" --arg image "$IMAGE" --arg alias "test-sha-$SOURCE_SHA" \
@@ -687,7 +713,7 @@ jobs:
                     then identity($predecessor;$predecessorBootstrap;$predecessorProof)
                     else null end),
                   restored:(if $rollbackRequired
-                    then identity($rollback;$predecessorBootstrap;$rollbackProof)
+                    then identity($rollback;$rollbackBootstrap;$rollbackProof)
                     else null end),
                   sameImageRedeploy:(if $rollbackRequired then false else true end),
                   verified:$rollbackVerified
