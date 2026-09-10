@@ -213,8 +213,6 @@ admission_state_sha256=
 admission_database_proof_sha256=
 admission_stable_proof_sha256=
 admission_public_proof_sha256=
-admission_snapshot_a=
-admission_snapshot_b=
 admission_route_summaries='{}'
 admission_bundle_a=
 admission_bundle_b=
@@ -266,7 +264,6 @@ if [ "$state_mode" = closed-beta-demo ]; then
     fail "stable proof fixture digest differs"
   capture_admission_bundle() {
     local destination=$1
-    local bundle
     admission_bundle_tmp=$(mktemp)
     chmod 600 "$admission_bundle_tmp"
     {
@@ -312,7 +309,6 @@ if [ "$state_mode" = closed-beta-demo ]; then
       "$public" >/dev/null || fail "public database projection is invalid"
   }
   admission_bundle_a=$(mktemp)
-  admission_snapshot_a=$(mktemp)
   admission_recovery_a=$(mktemp)
   admission_stable_a=$(mktemp)
   admission_public_a=$(mktemp)
@@ -467,7 +463,6 @@ if [ "$state_mode" = closed-beta-demo ]; then
      ads:{status:200,schemaValid:true,count:($ads|length),projectionSha256:$hash,equal:true}}
   ')
   admission_bundle_b=$(mktemp)
-  admission_snapshot_b=$(mktemp)
   admission_recovery_b=$(mktemp)
   admission_stable_b=$(mktemp)
   admission_public_b=$(mktemp)

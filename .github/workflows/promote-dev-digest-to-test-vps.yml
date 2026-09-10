@@ -480,6 +480,8 @@ jobs:
           )
           [[ "$previous_revision" =~ ^[0-9a-f]{40}$ ]]
           [[ "$previous_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          rollback_required=false
+          [ "$previous_id" = "$target_id" ] || rollback_required=true
           git fetch --no-tags origin "$previous_revision" \
             "$PUBLIC_V1_2_0_BOOTSTRAP_INTRODUCTION_SHA"
           if [ "$previous_version" = 1.2.0 ]; then
@@ -494,8 +496,9 @@ jobs:
           download_phase() {
             local state_dir=$1 phase=$2 expected_image=$3 expected_id=$4
             local expected_revision=$5 expected_version=$6 state_mode=$7
-            local_file="$RUNNER_TEMP/$phase.json"
-            remote_file="$state_dir/$phase.json"
+            local local_name=${8:-$phase}
+            local local_file="$RUNNER_TEMP/$local_name.json"
+            local remote_file="$state_dir/$phase.json"
             ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/validate-test-vps-phase-file.sh" \
               --root "$PATH_ON_HOST" --state-dir "$state_dir" --phase "$phase" \
               --expected-image "$expected_image" --expected-image-id "$expected_id" \
@@ -545,19 +548,56 @@ jobs:
             ' "$local_file" >/dev/null
           }
           download_phase "$final_state_dir" predecessor "$previous_reference" \
-            "$previous_id" "$previous_revision" "$previous_version" "$STATE_MODE"
+            "$previous_id" "$previous_revision" "$previous_version" "$STATE_MODE" predecessor
           download_phase "$final_state_dir" candidate "$IMAGE@$IMAGE_DIGEST" \
-            "$target_id" "$SOURCE_SHA" "$VERSION" "$STATE_MODE"
-          if [ "$previous_id" != "$target_id" ]; then
+            "$target_id" "$SOURCE_SHA" "$VERSION" "$STATE_MODE" candidate
+          if [ "$rollback_required" = true ]; then
+            rollback_previous_reference=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+              "$rollback_state_dir/previous-image" <<'REMOTE'
+          set -euo pipefail
+          [ -f "$1" ] && [ ! -L "$1" ]
+          cat "$1"
+          REMOTE
+            )
+            rollback_previous_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+              "$rollback_state_dir/previous-image-id" <<'REMOTE'
+          set -euo pipefail
+          [ -f "$1" ] && [ ! -L "$1" ]
+          cat "$1"
+          REMOTE
+            )
+            rollback_previous_revision=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+              "$rollback_state_dir/previous-revision" <<'REMOTE'
+          set -euo pipefail
+          [ -f "$1" ] && [ ! -L "$1" ]
+          cat "$1"
+          REMOTE
+            )
+            rollback_previous_version=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+              "$rollback_state_dir/previous-version" <<'REMOTE'
+          set -euo pipefail
+          [ -f "$1" ] && [ ! -L "$1" ]
+          cat "$1"
+          REMOTE
+            )
+            [ "$rollback_previous_reference" = "$previous_reference" ]
+            [ "$rollback_previous_id" = "$previous_id" ]
+            [[ "$rollback_previous_revision" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$rollback_previous_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            download_phase "$rollback_state_dir" predecessor \
+              "$rollback_previous_reference" "$rollback_previous_id" \
+              "$rollback_previous_revision" "$rollback_previous_version" \
+              "$STATE_MODE" rollback-predecessor
             download_phase "$rollback_state_dir" rollback "$previous_reference" \
-              "$previous_id" "$previous_revision" "$previous_version" "$STATE_MODE"
+              "$previous_id" "$previous_revision" "$previous_version" "$STATE_MODE" rollback
           fi
           download_phase "$final_state_dir" final "$IMAGE@$IMAGE_DIGEST" \
-            "$target_id" "$SOURCE_SHA" "$VERSION" "$STATE_MODE"
+            "$target_id" "$SOURCE_SHA" "$VERSION" "$STATE_MODE" final
           for phase in predecessor candidate final; do
             test -s "$RUNNER_TEMP/$phase.json"
           done
-          if [ "$previous_id" != "$target_id" ]; then
+          if [ "$rollback_required" = true ]; then
+            test -s "$RUNNER_TEMP/rollback-predecessor.json"
             test -s "$RUNNER_TEMP/rollback.json"
           fi
           proof_sha=$(jq -r '.revision' "$RUNNER_TEMP/predecessor.json")
@@ -573,17 +613,29 @@ jobs:
             --phase predecessor \
             --output "$RUNNER_TEMP/bootstrap-predecessor.json" \
             "${predecessor_introduction_args[@]}"
-          rollback_required=false
-          [ "$previous_id" = "$target_id" ] || rollback_required=true
           if [ "$rollback_required" = true ]; then
+            rollback_proof_sha=$(jq -r '.revision' "$RUNNER_TEMP/rollback-predecessor.json")
+            rollback_proof_image=$(jq -r '.image' "$RUNNER_TEMP/rollback-predecessor.json")
+            rollback_proof_checkout="$RUNNER_TEMP/bootstrap-source-rollback-predecessor"
+            git fetch --no-tags origin "$rollback_proof_sha"
+            git worktree add --detach "$rollback_proof_checkout" "$rollback_proof_sha" >/dev/null
+            docker pull "$rollback_proof_image" >/dev/null
             scripts/build-bootstrap-default-proof.sh \
-              --source-checkout "$proof_checkout" \
-              --source-sha "$proof_sha" \
-              --image-ref "$proof_image" \
+              --source-checkout "$rollback_proof_checkout" \
+              --source-sha "$rollback_proof_sha" \
+              --image-ref "$rollback_proof_image" \
+              --phase predecessor \
+              --output "$RUNNER_TEMP/bootstrap-rollback-predecessor.json" \
+              "${predecessor_introduction_args[@]}"
+            scripts/build-bootstrap-default-proof.sh \
+              --source-checkout "$rollback_proof_checkout" \
+              --source-sha "$rollback_proof_sha" \
+              --image-ref "$rollback_proof_image" \
               --phase rollback \
               --output "$RUNNER_TEMP/bootstrap-rollback.json" \
               "${predecessor_introduction_args[@]}"
             jq -e '.phase == "rollback"' "$RUNNER_TEMP/bootstrap-rollback.json" >/dev/null
+            git worktree remove "$rollback_proof_checkout"
           fi
           git worktree remove "$proof_checkout"
           scripts/build-bootstrap-default-proof.sh \
@@ -596,21 +648,30 @@ jobs:
           cand_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-candidate.json" | awk '{print $1}')
           final_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-final.json" | awk '{print $1}')
           rollback_proof=
+          rollback_pre_proof=
           rollback_args=(--argjson rollback null)
+          rollback_predecessor_args=(--slurpfile rollbackPredecessor "$RUNNER_TEMP/rollback-predecessor.json")
+          rollback_predecessor_bootstrap_args=(--slurpfile rollbackPredecessorBootstrap "$RUNNER_TEMP/bootstrap-rollback-predecessor.json")
           rollback_bootstrap_args=(--argjson rollbackBootstrap null)
           if [ "$rollback_required" = true ]; then
+            rollback_pre_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-rollback-predecessor.json" | awk '{print $1}')
             rollback_proof=$(sha256sum "$RUNNER_TEMP/bootstrap-rollback.json" | awk '{print $1}')
             rollback_args=(--slurpfile rollback "$RUNNER_TEMP/rollback.json")
             rollback_bootstrap_args=(--slurpfile rollbackBootstrap "$RUNNER_TEMP/bootstrap-rollback.json")
+          else
+            rollback_predecessor_args=(--argjson rollbackPredecessor null)
+            rollback_predecessor_bootstrap_args=(--argjson rollbackPredecessorBootstrap null)
           fi
           rollback_verified=${rollback_verified:-false}
           jq -n \
             --slurpfile predecessor "$RUNNER_TEMP/predecessor.json" \
             --slurpfile candidate "$RUNNER_TEMP/candidate.json" \
+            "${rollback_predecessor_args[@]}" \
             "${rollback_args[@]}" \
             --slurpfile final "$RUNNER_TEMP/final.json" \
             --slurpfile predecessorBootstrap "$RUNNER_TEMP/bootstrap-predecessor.json" \
             --slurpfile candidateBootstrap "$RUNNER_TEMP/bootstrap-candidate.json" \
+            "${rollback_predecessor_bootstrap_args[@]}" \
             --slurpfile finalBootstrap "$RUNNER_TEMP/bootstrap-final.json" \
             "${rollback_bootstrap_args[@]}" \
             --slurpfile authority "$RUNNER_TEMP/dev-promotion-source-deploy.json" \
@@ -619,13 +680,14 @@ jobs:
             --arg admissionMode "${{ needs.admit-image.outputs.admission_mode }}" \
             --arg root "$IMAGE_DIGEST" --arg platform "${{ needs.admit-image.outputs.platform_digest }}" \
             --arg predecessorProof "$pre_proof" --arg candidateProof "$cand_proof" \
+            --arg rollbackPredecessorProof "$rollback_pre_proof" \
             --arg rollbackProof "$rollback_proof" --arg finalProof "$final_proof" \
             --arg previousId "$previous_id" \
             --argjson rollbackRequired "$rollback_required" \
             --argjson rollbackAttempted "$rollback_attempted" \
             --argjson rollbackVerified "$rollback_verified" '
             def exact_keys($keys): (keys | sort) == ($keys | sort);
-            def proof($doc):
+            def proof($doc;$expectedPhase):
               ($doc[0]) as $proof |
               if ($proof | type == "object" and exact_keys([
                     "bootstrapControlPresent","bootstrapMode","effectiveDefault",
@@ -645,10 +707,11 @@ jobs:
                    .bootstrapMode == "legacy-not-applicable") and
                   (.bootstrapControlPresent | type == "boolean") and
                   (.effectiveDefault == false) and
-                  (.strictAncestor | type == "boolean"))
+                  (.strictAncestor | type == "boolean") and
+                  .phase == $expectedPhase)
               then $proof else error("bootstrap proof is invalid") end;
-            def phase($p;$b;$proofSha):
-              ($p[0]) as $x | proof($b) as $bootstrap |
+            def phase($p;$b;$proofSha;$expectedPhase):
+              ($p[0]) as $x | proof($b;$expectedPhase) as $bootstrap |
               ($x.zeroStateProbe) as $probe |
               if (($x.image | split("@")[1]) != $bootstrap.imageDigest or
                   $x.imageId != $bootstrap.imageId or
@@ -672,8 +735,9 @@ jobs:
                   zeroStateProbe:$probe
                 }
               end;
-            def identity($p;$bootstrap;$proofSha):
+            def identity($p;$bootstrap;$proofSha;$expectedPhase):
               ($p[0]) as $x |
+              proof($bootstrap;$expectedPhase) as $verifiedBootstrap |
               ($x.zeroStateProbe.admission) as $admission |
               {
                 stateMode:$admission.mode,
@@ -684,9 +748,9 @@ jobs:
                 version:$x.version,
                 runtimeConfigHash:$x.runtimeConfigHash,
                 bootstrapProofSha256:$proofSha,
-                bootstrapMode:$bootstrap[0].bootstrapMode,
-                bootstrapControlPresent:$bootstrap[0].bootstrapControlPresent,
-                bootstrapDisabled:(if $bootstrap[0].bootstrapControlPresent then true else null end)
+                bootstrapMode:$verifiedBootstrap.bootstrapMode,
+                bootstrapControlPresent:$verifiedBootstrap.bootstrapControlPresent,
+                bootstrapDisabled:(if $verifiedBootstrap.bootstrapControlPresent then true else null end)
               };
             {
               schema:"meet-backend/test-promotion-evidence-input/v2",
@@ -705,20 +769,21 @@ jobs:
                 referrerClosure:true,protectedStateEqual:true
               },
               deployment:{
-                predecessor:phase($predecessor;$predecessorBootstrap;$predecessorProof),
-                candidate:phase($candidate;$candidateBootstrap;$candidateProof),
+                predecessor:phase($predecessor;$predecessorBootstrap;$predecessorProof;"predecessor"),
+                candidate:phase($candidate;$candidateBootstrap;$candidateProof;"candidate"),
                 rollback:{
                   attempted:$rollbackAttempted,required:$rollbackRequired,
                   predecessor:(if $rollbackRequired
-                    then identity($predecessor;$predecessorBootstrap;$predecessorProof)
+                    then identity($rollbackPredecessor;$rollbackPredecessorBootstrap;
+                      $rollbackPredecessorProof;"predecessor")
                     else null end),
                   restored:(if $rollbackRequired
-                    then identity($rollback;$rollbackBootstrap;$rollbackProof)
+                    then identity($rollback;$rollbackBootstrap;$rollbackProof;"rollback")
                     else null end),
                   sameImageRedeploy:(if $rollbackRequired then false else true end),
                   verified:$rollbackVerified
                 },
-                final:phase($final;$finalBootstrap;$finalProof),
+                final:phase($final;$finalBootstrap;$finalProof;"final"),
                 runtime:{
                   topologyVerified:$final[0].zeroStateProbe.runtime.topologyVerified,
                   hardeningVerified:$final[0].zeroStateProbe.runtime.hardeningVerified,
@@ -770,11 +835,13 @@ jobs:
           retention-days: 14
           path: |
             ${{ runner.temp }}/predecessor.json
+            ${{ runner.temp }}/rollback-predecessor.json
             ${{ runner.temp }}/candidate.json
             ${{ runner.temp }}/rollback.json
             ${{ runner.temp }}/final.json
             ${{ runner.temp }}/bootstrap-candidate.json
             ${{ runner.temp }}/bootstrap-predecessor.json
+            ${{ runner.temp }}/bootstrap-rollback-predecessor.json
             ${{ runner.temp }}/bootstrap-rollback.json
             ${{ runner.temp }}/bootstrap-final.json
             ${{ runner.temp }}/layout-proof.json

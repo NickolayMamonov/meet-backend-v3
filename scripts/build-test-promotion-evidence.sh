@@ -139,12 +139,11 @@ validate_success_input() {
       (.bootstrapMode == "declared-false" or .bootstrapMode == "legacy-not-applicable") and
       (.bootstrapControlPresent | type == "boolean") and
       (.bootstrapDisabled == null or (.bootstrapDisabled | type == "boolean"));
-    def phase_identity($phase):
-      {stateMode:$phase.admissionMode,stateSha256:$phase.admissionStateSha256,
-       imageReference:$phase.imageDigest,imageId:$phase.imageId,
-       revision:$phase.sourceSha,version:$phase.version,
-       runtimeConfigHash:$phase.runtimeDigest,
-       bootstrapProofSha256:$phase.bootstrapProofSha256,
+    def rollback_identity($phase):
+      {stateMode:$phase.stateMode,stateSha256:$phase.stateSha256,
+       imageReference:$phase.imageReference,imageId:$phase.imageId,
+       revision:$phase.revision,version:$phase.version,
+       runtimeConfigHash:$phase.runtimeConfigHash,
        bootstrapMode:$phase.bootstrapMode,
        bootstrapControlPresent:$phase.bootstrapControlPresent,
        bootstrapDisabled:$phase.bootstrapDisabled};
@@ -367,9 +366,8 @@ validate_success_input() {
      then $rollback.attempted and $rollback.verified and
        ($rollback.sameImageRedeploy | not) and
        ($rollback.predecessor | identity) and ($rollback.restored | identity) and
-       $rollback.predecessor == phase_identity($deployment.predecessor) and
-       $rollback.restored == phase_identity($deployment.predecessor) and
-       $rollback.predecessor == $rollback.restored
+       rollback_identity($rollback.predecessor) ==
+         rollback_identity($rollback.restored)
      else ($rollback.attempted | not) and ($rollback.verified | not) and
        $rollback.sameImageRedeploy and $rollback.predecessor == null and
        $rollback.restored == null

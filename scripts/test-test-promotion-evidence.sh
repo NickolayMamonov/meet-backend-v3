@@ -14,6 +14,7 @@ PREDECESSOR_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccc
 PREDECESSOR_ID=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 CANDIDATE_ID=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 PROOF=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+ROLLBACK_PROOF=abababababababababababababababababababababababababababababababab
 CONFIG=1111111111111111111111111111111111111111111111111111111111111111
 RUNTIME=2222222222222222222222222222222222222222222222222222222222222222
 CONTRACT=$ROOT_DIR/scripts/test-vps-admission-contract.json
@@ -48,6 +49,7 @@ jq -n \
   --arg predecessorId "$PREDECESSOR_ID" \
   --arg candidateId "$CANDIDATE_ID" \
   --arg proof "$PROOF" \
+  --arg rollbackProof "$ROLLBACK_PROOF" \
   --arg config "$CONFIG" \
   --arg runtime "$RUNTIME" '
   def probe($digest;$id;$sourceSha;$phase;$runtimeHash):
@@ -127,7 +129,7 @@ jq -n \
           stateMode:"empty-closed",stateSha256:null,imageReference:$predecessor,
           imageId:$predecessorId,revision:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           version:"1.2.0",runtimeConfigHash:$runtime,
-          bootstrapProofSha256:$proof,bootstrapMode:"legacy-not-applicable",
+          bootstrapProofSha256:$rollbackProof,bootstrapMode:"legacy-not-applicable",
           bootstrapControlPresent:false,bootstrapDisabled:null
         },
         restored:{
@@ -326,20 +328,9 @@ expect_failure unproven-rollback \
   bash "$BUILDER" success --input "$TMP/unproven-rollback.json" \
   --output "$TMP/rejected.json"
 
-jq '
-  .deployment.predecessor.bootstrapMode = "declared-false" |
-  .deployment.predecessor.bootstrapControlPresent = true |
-  .deployment.predecessor.bootstrapDisabled = true |
-  .deployment.predecessor.bootstrapProofSha256 =
-    "0000000000000000000000000000000000000000000000000000000000000000"
-' "$TMP/input.json" >"$TMP/declared-false-predecessor-mismatch.json"
-expect_failure declared-false-predecessor-mismatch \
-  bash "$BUILDER" success --input "$TMP/declared-false-predecessor-mismatch.json" \
-  --output "$TMP/rejected.json"
-
 for rollback_side in predecessor restored; do
   for rollback_field in stateMode stateSha256 imageReference imageId revision \
-    version runtimeConfigHash bootstrapProofSha256 bootstrapMode \
+    version runtimeConfigHash bootstrapMode \
     bootstrapControlPresent bootstrapDisabled; do
     rollback_marker="rollback-${rollback_side}-${rollback_field}"
     jq --arg side "$rollback_side" --arg field "$rollback_field" '
@@ -350,6 +341,12 @@ for rollback_side in predecessor restored; do
       --output "$TMP/rejected.json"
   done
 done
+
+jq '.deployment.rollback.restored.bootstrapProofSha256 = "not-a-digest"' \
+  "$TMP/input.json" >"$TMP/malformed-rollback-proof.json"
+expect_failure malformed-rollback-proof \
+  bash "$BUILDER" success --input "$TMP/malformed-rollback-proof.json" \
+  --output "$TMP/rejected.json"
 
 jq --arg proof "$PROOF" '
   .deployment.rollback = {

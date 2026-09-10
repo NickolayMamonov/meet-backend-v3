@@ -6,11 +6,14 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import tools.jackson.databind.ObjectMapper
+import java.sql.Connection
+import javax.sql.DataSource
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Instant
 import java.time.LocalDate
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -20,6 +23,9 @@ class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
 
     @Autowired
     private lateinit var bootstrapService: DemoCatalogBootstrapService
+
+    @Autowired
+    private lateinit var dataSource: DataSource
 
     @BeforeEach
     fun clearDatabase() {
@@ -158,13 +164,13 @@ class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
 
     @Test
     fun `public proof rejects established scalar and nested relationship drift`() {
-        bootstrap()
-
         val mutations = listOf(
             "UPDATE meetings SET title = '[ДЕМО] изменено' WHERE demo_catalog_key = 'closed-beta-demo/meeting/welcome'",
             "UPDATE meetings SET address = 'Изменённый адрес' WHERE demo_catalog_key = 'closed-beta-demo/meeting/welcome'",
             "UPDATE meetings SET source = 'TIMEPAD' WHERE demo_catalog_key = 'closed-beta-demo/meeting/welcome'",
             "UPDATE meetings SET is_online = true WHERE demo_catalog_key = 'closed-beta-demo/meeting/welcome'",
+            "UPDATE communities SET name = '[ДЕМО] изменено' WHERE demo_catalog_key = 'closed-beta-demo/community/moscow-meets'",
+            "UPDATE tags SET text = '[ДЕМО] изменено' WHERE demo_catalog_key = 'closed-beta-demo/tag/networking'",
             "UPDATE ad_blocks SET action_url = '/unexpected' WHERE demo_catalog_key = 'closed-beta-demo/ad/interests'",
             """
             DELETE FROM meeting_participants
@@ -173,10 +179,33 @@ class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
             """.trimIndent(),
         )
         mutations.forEach { mutation ->
+            resetDatabase()
+            jdbcTemplate.execute("SELECT setval('users_id_seq', 1, true)")
+            bootstrap()
             jdbcTemplate.update(mutation)
             assertNull(publicProof(), "public proof accepted drift from: $mutation")
-            bootstrap()
         }
+    }
+
+    @Test
+    fun `snapshot B rejects a committed write after the public probe`() {
+        bootstrap()
+
+        val snapshotA = repeatableReadStableProof()
+        val publicA = requireNotNull(publicProof())
+
+        jdbcTemplate.update(
+            "UPDATE meetings SET date = '29.09.2026' " +
+                "WHERE demo_catalog_key = 'closed-beta-demo/meeting/board-games'",
+        )
+
+        val snapshotB = repeatableReadStableProof()
+        val publicB = publicProof()
+        assertNotNull(snapshotA)
+        assertNotEquals(snapshotA, snapshotB)
+        assertNotEquals(publicA, publicB)
+        assertNull(snapshotB)
+        assertNull(publicB)
     }
 
     private fun bootstrap() {
@@ -199,4 +228,23 @@ class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
             Files.readString(Path.of("scripts", "test-vps-beta-demo-public-proof.sql")),
             String::class.java,
         )
+
+    private fun repeatableReadStableProof(): String? =
+        dataSource.connection.use { connection ->
+            connection.autoCommit = false
+            connection.transactionIsolation = Connection.TRANSACTION_REPEATABLE_READ
+            connection.isReadOnly = true
+            try {
+                connection.prepareStatement(
+                    Files.readString(Path.of("scripts", "test-vps-beta-demo-stable-proof.sql")),
+                ).use { statement ->
+                    statement.executeQuery().use { resultSet ->
+                        if (resultSet.next()) resultSet.getString(1) else null
+                    }
+                }.also { connection.commit() }
+            } catch (error: Throwable) {
+                connection.rollback()
+                throw error
+            }
+        }
 }
