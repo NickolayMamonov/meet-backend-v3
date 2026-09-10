@@ -14,6 +14,14 @@ on:
         required: true
         default: false
         type: boolean
+      state_mode:
+        description: Required database admission mode
+        required: true
+        default: empty-closed
+        type: choice
+        options:
+          - empty-closed
+          - closed-beta-demo
 
 permissions:
   contents: read
@@ -98,6 +106,7 @@ jobs:
       root_digest: ${{ steps.publish.outputs.root_digest }}
       platform_digest: ${{ steps.publish.outputs.platform_digest }}
       admission_mode: ${{ steps.publish.outputs.admission_mode }}
+      state_mode: ${{ steps.publish.outputs.state_mode }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -112,6 +121,7 @@ jobs:
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_REF" = refs/heads/dev
           test "$GITHUB_SHA" = "${{ inputs.source_sha }}"
+          case "${{ inputs.state_mode }}" in empty-closed|closed-beta-demo) ;; *) exit 1 ;; esac
       - name: Capture protected registry state before any writer
         shell: bash
         env:
@@ -218,6 +228,7 @@ jobs:
           printf 'root_digest=%s\n' "$root_digest" >> "$GITHUB_OUTPUT"
           printf 'platform_digest=%s\n' "$platform_digest" >> "$GITHUB_OUTPUT"
           printf 'admission_mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
+          printf 'state_mode=%s\n' "${{ inputs.state_mode }}" >> "$GITHUB_OUTPUT"
       - name: Create signed OCI attestation for a first-time alias
         if: steps.publish.outputs.admission_mode == 'published'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -283,6 +294,7 @@ jobs:
       SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
       PUBLIC_URL: https://api.whysoezzy.online
       IMAGE_DIGEST: ${{ needs.admit-image.outputs.root_digest }}
+      STATE_MODE: ${{ inputs.state_mode }}
     permissions:
       contents: read
       packages: read
@@ -303,11 +315,13 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          STATE_MODE: ${{ inputs.state_mode }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
           [[ "$GITHUB_REF" == refs/heads/dev ]]
           [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]]
+          case "$STATE_MODE" in empty-closed|closed-beta-demo) ;; *) exit 1 ;; esac
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           scripts/verify-dev-promotion-source.sh \
@@ -373,7 +387,7 @@ jobs:
           mkdir -p "$stage/scripts"
           # verify-test-vps-assets.sh is invoked by the final verifier while
           # the remote deployment lock and rollback trap are still held.
-          for file in docker-compose.production.yml scripts/production-compose.sh scripts/production-config-digest.sh scripts/test-vps-runtime-invariants.sh scripts/update-production-release.sh scripts/deploy-test-vps-release.sh scripts/verify-test-vps-closed-beta-state.sh scripts/probe-test-vps-zero-state.sh scripts/verify-test-vps-assets.sh scripts/validate-test-vps-phase-file.sh scripts/build-bootstrap-default-proof.sh; do mkdir -p "$stage/$(dirname "$file")"; cp -- "$file" "$stage/$file"; done
+          for file in docker-compose.production.yml scripts/production-compose.sh scripts/production-config-digest.sh scripts/test-vps-runtime-invariants.sh scripts/update-production-release.sh scripts/deploy-test-vps-release.sh scripts/verify-test-vps-closed-beta-state.sh scripts/probe-test-vps-zero-state.sh scripts/verify-test-vps-assets.sh scripts/validate-test-vps-phase-file.sh scripts/build-bootstrap-default-proof.sh scripts/test-vps-admission-contract.json scripts/test-vps-beta-demo-stable-proof.sql scripts/test-vps-beta-demo-public-proof.sql scripts/beta-recovery-database-proof.sql scripts/fixtures/test-vps-beta-demo/canonical-stable-proof.json; do mkdir -p "$stage/$(dirname "$file")"; cp -- "$file" "$stage/$file"; done
           tar -C "$stage" -cf "$RUNNER_TEMP/test-vps-tooling.tar" .
           ssh -F "$SSH_CONFIG" test-vps bash -s -- "$PATH_ON_HOST" "$remote" <<"REMOTE"
           set -euo pipefail
@@ -384,9 +398,11 @@ jobs:
           set -euo pipefail
           tar -xf "$1/tooling.tar" -C "$1"; chmod 755 "$1"/scripts/*.sh
           REMOTE
-          target_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- "$IMAGE@$IMAGE_DIGEST" "$SOURCE_SHA" "$VERSION" <<"REMOTE"
+          target_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- "$IMAGE@$IMAGE_DIGEST" "$SOURCE_SHA" "$VERSION" "$STATE_MODE" <<"REMOTE"
           set -euo pipefail
-          image=$1; revision=$2; version=$3; docker pull "$image" >/dev/null
+          image=$1; revision=$2; version=$3; state_mode=$4
+          case "$state_mode" in empty-closed|closed-beta-demo) ;; *) exit 2 ;; esac
+          docker pull "$image" >/dev/null
           test "$(docker image inspect "$image" --format "{{index .Config.Labels \"org.opencontainers.image.revision\"}}")" = "$revision"
           test "$(docker image inspect "$image" --format "{{index .Config.Labels \"org.opencontainers.image.version\"}}")" = "$version"
           docker image inspect "$image" --format "{{.Id}}"
@@ -423,7 +439,7 @@ jobs:
             rollback_attempted=true
             printf 'mutation_started=true\nrollback_attempted=true\n' >>"$GITHUB_OUTPUT"
             set +e
-            ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --mode rollback-drill --closed-beta-safety --public-url "$PUBLIC_URL" >"$RUNNER_TEMP/rollback.txt" 2>&1
+            ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --mode rollback-drill --closed-beta-safety --state-mode "$STATE_MODE" --public-url "$PUBLIC_URL" >"$RUNNER_TEMP/rollback.txt" 2>&1
             status=$?
             set -e
             [ "$status" -eq 86 ]
@@ -438,7 +454,7 @@ jobs:
             --output "$RUNNER_TEMP/dev-promotion-source-final-deploy.json"
           mutation_started=true
           echo "mutation_started=true" >>"$GITHUB_OUTPUT"
-          ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final" --mode deploy --closed-beta-safety --public-url "$PUBLIC_URL"
+          ssh -F "$SSH_CONFIG" test-vps "$remote/scripts/deploy-test-vps-release.sh" --root "$PATH_ON_HOST" --base-compose "$remote/docker-compose.production.yml" --image "$IMAGE@$IMAGE_DIGEST" --revision "$SOURCE_SHA" --version "$VERSION" --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final" --mode deploy --closed-beta-safety --state-mode "$STATE_MODE" --public-url "$PUBLIC_URL"
           state_root=/var/lib/meet-test-vps-deploy
           rollback_state_dir="$state_root/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-rollback-drill"
           final_state_dir="$state_root/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final-deploy"
@@ -498,12 +514,12 @@ jobs:
               --arg imageId "$expected_id" --arg revision "$expected_revision" \
               --arg version "$expected_version" '
               type == "object" and
-              .schema == "meet-backend/test-vps-closed-beta-state/v1" and
+              .schema == "meet-backend/test-vps-closed-beta-state/v2" and
               .phase == $phase and .image == $image and .imageId == $imageId and
               .revision == $revision and .version == $version and
               .containerHealthy == true and .environmentMatched == true and
               (.zeroStateProbe | type == "object" and
-                .schema == "meet-backend/test-vps-zero-state-probe/v1" and
+                .schema == "meet-backend/test-vps-zero-state-probe/v2" and
                 .zeroStateObserved == true and .zeroState == "closed" and
                 .runtime.containerHealthy == true and
                 .runtime.topologyVerified == true and
@@ -625,12 +641,29 @@ jobs:
                   bootstrapControlPresent:$bootstrap.bootstrapControlPresent,
                   bootstrapDisabled:(if $bootstrap.bootstrapControlPresent then true else null end),
                   healthy:$probe.runtime.containerHealthy,
-                  demoZero:($probe.zeroState == "closed"),
+                  admissionMode:$probe.admission.mode,
+                  admissionStateSha256:$probe.admission.stateSha256,
                   zeroStateProbe:$probe
                 }
               end;
+            def identity($p;$bootstrap;$proofSha):
+              ($p[0]) as $x |
+              ($x.zeroStateProbe.admission) as $admission |
+              {
+                stateMode:$admission.mode,
+                stateSha256:$admission.stateSha256,
+                imageReference:$x.image,
+                imageId:$x.imageId,
+                revision:$x.revision,
+                version:$x.version,
+                runtimeConfigHash:$x.runtimeConfigHash,
+                bootstrapProofSha256:$proofSha,
+                bootstrapMode:$bootstrap[0].bootstrapMode,
+                bootstrapControlPresent:$bootstrap[0].bootstrapControlPresent,
+                bootstrapDisabled:(if $bootstrap[0].bootstrapControlPresent then true else null end)
+              };
             {
-              schema:"meet-backend/test-promotion-evidence-input/v1",
+              schema:"meet-backend/test-promotion-evidence-input/v2",
               source:{
                 authoritySha:($authority[0].authoritySha),
                 sourceSha:$source,treeId:$tree,version:$version
@@ -650,9 +683,13 @@ jobs:
                 candidate:phase($candidate;$candidateBootstrap;$candidateProof),
                 rollback:{
                   attempted:$rollbackAttempted,required:$rollbackRequired,
-                  restoredImageId:(if $rollbackRequired then $previousId else null end),
-                  bootstrapProofSha256:$rollbackProof,
-                  sameDigestRedeploy:(if $rollbackRequired then false else true end),
+                  predecessor:(if $rollbackRequired
+                    then identity($predecessor;$predecessorBootstrap;$predecessorProof)
+                    else null end),
+                  restored:(if $rollbackRequired
+                    then identity($rollback;$predecessorBootstrap;$rollbackProof)
+                    else null end),
+                  sameImageRedeploy:(if $rollbackRequired then false else true end),
                   verified:$rollbackVerified
                 },
                 final:phase($final;$finalBootstrap;$finalProof),

@@ -5,6 +5,7 @@ usage() {
   cat >&2 <<'EOF'
 usage: probe-test-vps-zero-state.sh
   --phase predecessor|candidate|rollback|final
+  --state-mode empty-closed|closed-beta-demo
   --root PATH --compose-script PATH --state-dir PATH
   --expected-image IMAGE@sha256:DIGEST --expected-image-id sha256:DIGEST
   --expected-revision SHA --expected-version X.Y.Z --expected-runtime-hash HEX64
@@ -27,6 +28,7 @@ expected_image_id=
 expected_revision=
 expected_version=
 expected_runtime_hash=
+state_mode=
 public_url=
 output=
 meetings_body=
@@ -36,6 +38,7 @@ temporary=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --phase) [ "$#" -ge 2 ] || usage; phase=$2; shift 2 ;;
+    --state-mode) [ "$#" -ge 2 ] || usage; state_mode=$2; shift 2 ;;
     --root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
     --compose-script) [ "$#" -ge 2 ] || usage; compose_script=$2; shift 2 ;;
     --state-dir) [ "$#" -ge 2 ] || usage; state_dir=$2; shift 2 ;;
@@ -51,6 +54,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$phase" in predecessor|candidate|rollback|final) ;; *) usage ;; esac
+case "$state_mode" in empty-closed|closed-beta-demo) ;; *) usage ;; esac
 [[ "$root" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$root" != *..* ]] || usage
 [[ "$compose_script" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
   [[ "$compose_script" != *..* ]] || usage
@@ -77,6 +81,18 @@ done
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=/dev/null
 source "$script_dir/test-vps-runtime-invariants.sh"
+contract="$script_dir/test-vps-admission-contract.json"
+stable_sql="$script_dir/test-vps-beta-demo-stable-proof.sql"
+public_sql="$script_dir/test-vps-beta-demo-public-proof.sql"
+[ -r "$contract" ] && [ -r "$stable_sql" ] && [ -r "$public_sql" ] ||
+  fail "admission proof contract is unavailable"
+jq -e '
+  .schema == "meet-backend/test-vps-admission-contract/v1" and
+  (.stateModes | sort) == ["closed-beta-demo","empty-closed"] and
+  .populated.catalogName == "closed-beta-demo" and
+  .populated.manifestVersion == "2026-08-15.v1" and
+  .populated.stableProof.byteLength == 6867
+' "$contract" >/dev/null || fail "admission proof contract is invalid"
 
 backend=$(runtime_compose "$root" "$compose_script" ps -q backend) ||
   fail "backend lookup failed"
@@ -188,6 +204,64 @@ database_json=$(
 echo "$database_json" | jq -e 'type == "object" and all(values[]; type == "number" and . >= 0)' \
   >/dev/null || fail "database aggregate query was not canonical"
 total_rows=$(jq -n --argjson tables "$database_json" '$tables | add')
+admission_state_sha256=
+admission_database_proof_sha256=
+admission_stable_proof_sha256=
+admission_public_proof_sha256=
+admission_snapshot_a=
+admission_snapshot_b=
+admission_route_summaries='{}'
+if [ "$state_mode" = closed-beta-demo ]; then
+  fixture="$script_dir/fixtures/test-vps-beta-demo/canonical-stable-proof.json"
+  [ -f "$fixture" ] && [ ! -L "$fixture" ] || fail "stable proof fixture is unavailable"
+  test "$(wc -c <"$fixture" | tr -d ' ')" = 6867 ||
+    fail "stable proof fixture size differs"
+  test "$(sha256sum "$fixture" | awk '{print $1}')" =
+    0e6ef8d48515b3041000166a5506df2a72c11c4e702d7d28960f54d1c204080e ||
+    fail "stable proof fixture digest differs"
+  admission_snapshot() {
+    local destination=$1
+    {
+      printf '%s\n' 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;'
+      cat "$stable_sql"
+      printf '%s\n' 'COMMIT;'
+    } | docker exec -i "$postgres" psql -AtqX -v ON_ERROR_STOP=1 >"$destination" ||
+      fail "stable database proof failed"
+    [ -s "$destination" ] || fail "stable database proof is empty"
+    chmod 600 "$destination"
+  }
+  admission_snapshot_a=$(mktemp)
+  admission_snapshot_b=$(mktemp)
+  admission_snapshot "$admission_snapshot_a"
+  admission_stable_proof_sha256=$(sha256sum "$admission_snapshot_a" | awk '{print $1}')
+  test "$admission_stable_proof_sha256" =
+    0e6ef8d48515b3041000166a5506df2a72c11c4e702d7d28960f54d1c204080e ||
+    fail "stable database proof digest differs"
+  cmp -- "$fixture" "$admission_snapshot_a" ||
+    fail "stable database proof differs from canonical fixture"
+  database_proof="$state_dir/zero-state-recovery-$phase.json"
+  cat "$script_dir/beta-recovery-database-proof.sql" |
+    docker exec -i "$postgres" psql -AtqX -v ON_ERROR_STOP=1 >"$database_proof" ||
+    fail "recovery database proof failed"
+  admission_database_proof_sha256=$(sha256sum "$database_proof" | awk '{print $1}')
+  test "$admission_database_proof_sha256" =
+    c1a83c4d33e5c4d1772b27bc770471e99a6fb1ac2827c16c9787ecef073d2979 ||
+    fail "recovery database proof digest differs"
+  admission_public_proof_sha256=$(sha256sum "$public_sql" | awk '{print $1}')
+  admission_snapshot "$admission_snapshot_b"
+  cmp -- "$admission_snapshot_a" "$admission_snapshot_b" ||
+    fail "database changed between repeatable-read snapshots"
+  admission_state_sha256=$(jq -cnS \
+    --arg mode "$state_mode" --arg recovery "$admission_database_proof_sha256" \
+    --arg stable "$admission_stable_proof_sha256" --arg public "$admission_public_proof_sha256" \
+    '{mode:$mode,recoveryProofSha256:$recovery,stableProofSha256:$stable,
+      publicProjectionSha256:$public}' | sha256sum | awk '{print $1}')
+  admission_route_summaries=$(jq -cnS --arg hash "$admission_public_proof_sha256" '
+    {meetings:{status:200,schemaValid:true,count:6,projectionSha256:$hash,equal:true},
+     recommendedCommunities:{status:200,schemaValid:true,count:3,projectionSha256:$hash,equal:true},
+     tags:{status:200,schemaValid:true,count:6,projectionSha256:$hash,equal:true},
+     ads:{status:200,schemaValid:true,count:3,projectionSha256:$hash,equal:true}}')
+fi
 
 query_metric() {
   local sql=$1
@@ -306,10 +380,15 @@ fi
 temporary="$output.tmp.$$"
 trap cleanup EXIT HUP INT TERM
 jq -cnS \
-  --arg schema "meet-backend/test-vps-zero-state-probe/v1" \
+  --arg schema "meet-backend/test-vps-zero-state-probe/v2" \
   --arg phase "$phase" --arg image "${expected_image##*@}" --arg imageId "$expected_image_id" \
   --arg sourceSha "$expected_revision" --arg version "$expected_version" \
   --arg runtimeHash "$expected_runtime_hash" --arg zeroState "$zero_state" \
+  --arg stateMode "$state_mode" --arg admissionStateSha256 "$admission_state_sha256" \
+  --arg admissionDatabaseProofSha256 "$admission_database_proof_sha256" \
+  --arg admissionStableProofSha256 "$admission_stable_proof_sha256" \
+  --arg admissionPublicProofSha256 "$admission_public_proof_sha256" \
+  --argjson admissionRoutes "$admission_route_summaries" \
   --argjson containerHealthy "$container_healthy" \
   --argjson topologyVerified "$topology_verified" \
   --argjson hardeningVerified "$hardening_verified" \
@@ -331,6 +410,14 @@ jq -cnS \
   {
     schema:$schema,phase:$phase,image:$image,imageId:$imageId,
     sourceSha:$sourceSha,version:$version,runtimeConfigHash:$runtimeHash,
+    admission:(if $stateMode == "empty-closed"
+      then {mode:$stateMode,stateSha256:null}
+      else {mode:$stateMode,stateSha256:$admissionStateSha256,
+        catalogName:"closed-beta-demo",manifestVersion:"2026-08-15.v1",
+        recoveryProofSha256:$admissionDatabaseProofSha256,
+        stableProofSha256:$admissionStableProofSha256,
+        publicProjectionSha256:$admissionPublicProofSha256,routes:$admissionRoutes}
+      end),
     runtime:{
       containerHealthy:$containerHealthy,topologyVerified:$topologyVerified,
       hardeningVerified:$hardeningVerified,volumesVerified:$volumesVerified,

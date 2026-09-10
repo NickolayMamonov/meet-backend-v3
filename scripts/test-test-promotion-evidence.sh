@@ -43,9 +43,10 @@ jq -n \
   --arg runtime "$RUNTIME" '
   def probe($digest;$id;$sourceSha;$phase;$runtimeHash):
     {
-      schema:"meet-backend/test-vps-zero-state-probe/v1",
+      schema:"meet-backend/test-vps-zero-state-probe/v2",
       phase:$phase,image:$digest,imageId:$id,sourceSha:$sourceSha,
       version:"1.2.0",runtimeConfigHash:$runtimeHash,
+      admission:{mode:"empty-closed",stateSha256:null},
       runtime:{
         containerHealthy:true,hardeningVerified:true,topologyVerified:true,
         volumesVerified:true,postgresWritablePrimary:true,
@@ -81,11 +82,12 @@ jq -n \
       configDigest:$config,runtimeDigest:$runtime,bootstrapMode:$mode,
       bootstrapControlPresent:$present,bootstrapDisabled:$disabled,
       healthy:$observed.runtime.containerHealthy,
-      demoZero:($observed.zeroState == "closed"),
+      admissionMode:$observed.admission.mode,
+      admissionStateSha256:$observed.admission.stateSha256,
       zeroStateProbe:$observed
     };
   {
-    schema:"meet-backend/test-promotion-evidence-input/v1",
+    schema:"meet-backend/test-promotion-evidence-input/v2",
     source:{
       sourceSha:$source,authoritySha:$source,treeId:$tree,version:"1.2.0"
     },
@@ -111,9 +113,21 @@ jq -n \
         $root;$candidateId;$source;$tree;"declared-false";true;true;"candidate"
       ),
       rollback:{
-        bootstrapProofSha256:$proof,
-        required:true,attempted:true,verified:true,sameDigestRedeploy:false,
-        restoredImageId:$predecessorId
+        required:true,attempted:true,verified:true,sameImageRedeploy:false,
+        predecessor:{
+          stateMode:"empty-closed",stateSha256:null,imageReference:$predecessor,
+          imageId:$predecessorId,revision:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          version:"1.2.0",runtimeConfigHash:$runtime,
+          bootstrapProofSha256:$proof,bootstrapMode:"legacy-not-applicable",
+          bootstrapControlPresent:false,bootstrapDisabled:null
+        },
+        restored:{
+          stateMode:"empty-closed",stateSha256:null,imageReference:$predecessor,
+          imageId:$predecessorId,revision:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          version:"1.2.0",runtimeConfigHash:$runtime,
+          bootstrapProofSha256:$proof,bootstrapMode:"legacy-not-applicable",
+          bootstrapControlPresent:false,bootstrapDisabled:null
+        }
       },
       final:phase(
         $root;$candidateId;$source;$tree;"declared-false";true;true;"final"
@@ -142,7 +156,7 @@ bash "$BUILDER" success --input "$TMP/input.json" \
 cmp "$TMP/evidence.json" "$TMP/evidence-repeat.json"
 [ "$(wc -l <"$TMP/evidence.json" | tr -d ' ')" -eq 1 ]
 jq -e '
-  .schema == "meet-backend/test-promotion-evidence/v1" and
+  .schema == "meet-backend/test-promotion-evidence/v2" and
   .kind == "success" and .evidenceSanitized == true and
   .artifactUploaded == false and .retentionAuthorized == false and
   .deployment.rollback.required == true and
@@ -154,7 +168,7 @@ bash "$BUILDER" authorize-retention \
   --artifact-uploaded true \
   --output "$TMP/retention.json"
 jq -e '
-  .schema == "meet-backend/test-promotion-retention/v1" and
+  .schema == "meet-backend/test-promotion-retention/v2" and
   .artifactUploaded == true and .evidenceSanitized == true and
   .finalVerified == true and .rollbackPolicySatisfied == true and
   .retentionAuthorized == true and
@@ -225,16 +239,15 @@ expect_failure declared-false-predecessor-mismatch \
 
 jq --arg proof "$PROOF" '
   .deployment.rollback = {
-    bootstrapProofSha256:$proof,
-    required:false,attempted:false,verified:false,sameDigestRedeploy:true,
-    restoredImageId:null
+    required:false,attempted:false,verified:false,sameImageRedeploy:true,
+    predecessor:null,restored:null
   } |
   .image.admissionMode = "reused"
 ' "$TMP/input.json" >"$TMP/same-digest.json"
 bash "$BUILDER" success --input "$TMP/same-digest.json" \
   --output "$TMP/same-digest-evidence.json"
 jq -e '
-  .deployment.rollback.sameDigestRedeploy == true and
+  .deployment.rollback.sameImageRedeploy == true and
   .deployment.rollback.required == false and
   .deployment.rollback.verified == false
 ' "$TMP/same-digest-evidence.json" >/dev/null

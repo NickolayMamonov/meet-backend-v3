@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --root PATH --state-dir PATH --phase predecessor|candidate|rollback|final --output PATH" >&2
+  echo "usage: $0 --root PATH --state-dir PATH --phase predecessor|candidate|rollback|final --state-mode empty-closed|closed-beta-demo --output PATH" >&2
   exit 2
 }
 
@@ -19,11 +19,13 @@ expected_image=
 expected_image_id=
 expected_revision=
 expected_version=
+state_mode=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
     --state-dir) [ "$#" -ge 2 ] || usage; state_dir=$2; shift 2 ;;
     --phase) [ "$#" -ge 2 ] || usage; phase=$2; shift 2 ;;
+    --state-mode) [ "$#" -ge 2 ] || usage; state_mode=$2; shift 2 ;;
     --output) [ "$#" -ge 2 ] || usage; output=$2; shift 2 ;;
     --expected-image) [ "$#" -ge 2 ] || usage; expected_image=$2; shift 2 ;;
     --expected-image-id) [ "$#" -ge 2 ] || usage; expected_image_id=$2; shift 2 ;;
@@ -35,6 +37,7 @@ done
 [[ "$root" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$root" != *..* ]] || usage
 [[ "$state_dir" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$state_dir" != *..* ]] || usage
 case "$phase" in predecessor|candidate|rollback|final) ;; *) usage ;; esac
+case "$state_mode" in empty-closed|closed-beta-demo) ;; *) usage ;; esac
 if [ -n "$expected_image" ]; then
   [[ "$expected_image" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] || usage
 fi
@@ -63,16 +66,18 @@ jq -e --arg phase "$phase" \
   --arg expected_image "$expected_image" \
   --arg expected_image_id "$expected_image_id" \
   --arg expected_revision "$expected_revision" \
-  --arg expected_version "$expected_version" '
+  --arg expected_version "$expected_version" \
+  --arg state_mode "$state_mode" '
   type == "object" and
   (keys | sort) == [
     "adminAuthenticatedDisabled404","adminBlankDisabled403","adminKeyConfigured",
     "assetsCount","assetsVerified","containerHealthy","environmentMatched",
     "image","imageId","phase","revision","runtimeConfigHash","schema",
-    "version","zeroStateProbe"
+    "stateMode","version","zeroStateProbe"
   ] and
-  .schema == "meet-backend/test-vps-closed-beta-state/v1" and
+  .schema == "meet-backend/test-vps-closed-beta-state/v2" and
   .phase == $phase and
+  .stateMode == $state_mode and
   (if $expected_image == "" then true else .image == $expected_image end) and
   (if $expected_image_id == "" then true else .imageId == $expected_image_id end) and
   (if $expected_revision == "" then true else .revision == $expected_revision end) and
@@ -85,7 +90,7 @@ jq -e --arg phase "$phase" \
   .containerHealthy == true and
   .environmentMatched == true and
   (.zeroStateProbe | type == "object" and
-    .schema == "meet-backend/test-vps-zero-state-probe/v1" and
+    .schema == "meet-backend/test-vps-zero-state-probe/v2" and
     .phase == $phase and
     (if $expected_image == "" then true
      else .image == ($expected_image | split("@")[1]) end) and
@@ -99,9 +104,15 @@ jq -e --arg phase "$phase" \
     .runtime.postgresWritablePrimary == true and
     .runtime.nonIdleApplicationTransactions == 0 and
     .runtime.smtpIdleSamples == [0,0] and
-    .database.totalRows == 0 and
     .http.meetingsStatus == 200 and .http.meetingsJson == true and
-    .http.meetingsCount == 0) and
+    (if $state_mode == "empty-closed"
+     then .database.totalRows == 0 and .http.meetingsCount == 0
+     else (.admission.stateSha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+       .admission.routes.meetings.equal == true and
+       .admission.routes.recommendedCommunities.equal == true and
+       .admission.routes.tags.equal == true and
+       .admission.routes.ads.equal == true
+     end)) and
   (.assetsCount | type == "number" and floor == . and . >= 0) and
   (.assetsVerified | type == "boolean") and
   (.adminKeyConfigured | type == "boolean") and
