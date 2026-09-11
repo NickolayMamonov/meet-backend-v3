@@ -37,9 +37,11 @@ class AdminPushController(
         if (request.reminderOffsetMinutes != 60 && request.reminderOffsetMinutes != 1_440) {
             throw BadRequestException("Invalid reminder offset")
         }
-        if (request.installationId.toString() != request.installationId.toString().lowercase()) {
+        if (!CANONICAL_UUID.matches(request.installationId)) {
             throw BadRequestException("Invalid installation id")
         }
+        val installationId = runCatching { UUID.fromString(request.installationId) }
+            .getOrElse { throw BadRequestException("Invalid installation id") }
         val mode = when (request.mode.name) {
             "SINGLE" -> PushDiagnosticMode.SINGLE
             "DEDUP_PAIR" -> PushDiagnosticMode.DEDUP_PAIR
@@ -48,7 +50,7 @@ class AdminPushController(
 
         val command = PushDiagnosticCommand(
             userId = request.userId,
-            installationId = request.installationId,
+            installationId = installationId,
             meetingId = request.meetingId,
             reminderOffsetMinutes = request.reminderOffsetMinutes,
             mode = mode,
@@ -76,4 +78,8 @@ class AdminPushController(
             dev.whysoezzy.meet.service.push.DiagnosticCallResult.ProviderUnavailable -> "PROVIDER_UNAVAILABLE"
             dev.whysoezzy.meet.service.push.DiagnosticCallResult.NotAttempted -> "NOT_ATTEMPTED"
         }
+
+    private companion object {
+        val CANONICAL_UUID = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+    }
 }

@@ -1,7 +1,5 @@
 package dev.whysoezzy.meet.api.dto
 
-import java.util.UUID
-
 enum class PushDiagnosticMode {
     SINGLE,
     DEDUP_PAIR,
@@ -9,7 +7,7 @@ enum class PushDiagnosticMode {
 
 data class PushDiagnosticRequest(
     val userId: Long,
-    val installationId: UUID,
+    val installationId: String,
     val meetingId: Long,
     val reminderOffsetMinutes: Int,
     val mode: PushDiagnosticMode,

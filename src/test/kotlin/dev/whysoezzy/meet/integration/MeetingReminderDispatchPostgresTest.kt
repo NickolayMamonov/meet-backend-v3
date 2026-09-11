@@ -9,6 +9,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import java.time.Instant
+import java.time.temporal.ChronoUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 
@@ -22,14 +23,13 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
     @Autowired
     private lateinit var dispatch: JdbcReminderDispatchStore
 
-    private val now = Instant.parse("2026-09-11T20:00:00Z")
-
     @BeforeEach
     fun clearDatabase() = resetDatabase()
 
     @Test
     fun `leased accepted target becomes sent and closes its claim`() {
-        val fixture = seedReminder()
+        val now = databaseNow()
+        val fixture = seedReminder(now)
         val lease = dispatch.leaseNext()
         assertNotNull(lease)
         val prepared = dispatch.prepareSend(lease, now)
@@ -57,7 +57,8 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
 
     @Test
     fun `invalid provider registration terminally invalidates only the exact installation`() {
-        val fixture = seedReminder()
+        val now = databaseNow()
+        val fixture = seedReminder(now)
         val lease = requireNotNull(dispatch.leaseNext())
         val prepared = requireNotNull(dispatch.prepareSend(lease, now))
 
@@ -86,7 +87,7 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
         ))
     }
 
-    private fun seedReminder(): ApiFixture {
+    private fun seedReminder(now: Instant): ApiFixture {
         val fixture = fixture()
         jdbcTemplate.update(
             "UPDATE meetings SET time = ? WHERE id = ?",
@@ -96,6 +97,15 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
         installations.register(requireNotNull(fixture.bob.id), parseFid("fid-bob"))
         val candidate = reminders.findCandidates(now).single()
         requireNotNull(reminders.discover(candidate, now))
+        jdbcTemplate.update(
+            "UPDATE meeting_reminder_targets SET next_attempt_at = clock_timestamp() - INTERVAL '1 second'",
+        )
         return fixture
     }
+
+    private fun databaseNow(): Instant =
+        jdbcTemplate.queryForObject(
+            "SELECT clock_timestamp()",
+            java.sql.Timestamp::class.java,
+        )!!.toInstant().truncatedTo(ChronoUnit.MILLIS)
 }

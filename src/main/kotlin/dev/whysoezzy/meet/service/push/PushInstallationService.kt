@@ -33,7 +33,9 @@ class PushInstallationService(
             store.setLockTimeout()
             val owners = (store.ownerIdsForFid(fid) + userId).distinct().sorted()
             owners.forEach(store::lockUser)
-            val holder = store.findByFid(fid, forUpdate = true)
+            recheckOwners(fid, userId, owners)
+            store.lockInstallations(store.installationIdsForFid(fid))
+            val holder = store.findByFid(fid)
             if (holder?.userId == userId) {
                 val current = requireNotNull(store.heartbeat(holder.id, userId, now))
                 PushInstallationMutation(current)
@@ -49,7 +51,8 @@ class PushInstallationService(
             store.setLockTimeout()
             val ownerIds = (store.ownerIdsForFid(fid) + userId).distinct().sorted()
             ownerIds.forEach(store::lockUser)
-            val current = store.findById(installationId, forUpdate = true)
+            recheckOwners(fid, userId, ownerIds)
+            val current = store.findById(installationId)
                 ?: throw NotFoundException("Push installation not found")
             if (
                 current.userId != userId ||
@@ -62,7 +65,21 @@ class PushInstallationService(
             ) {
                 throw NotFoundException("Push installation not found")
             }
-            val holder = store.findByFid(fid, forUpdate = true)
+            store.lockInstallations((store.installationIdsForFid(fid) + installationId).distinct().sorted())
+            val lockedCurrent = store.findById(installationId, forUpdate = true)
+                ?: throw NotFoundException("Push installation not found")
+            if (
+                lockedCurrent.userId != userId ||
+                lockedCurrent.status !in setOf(
+                    InstallationStatus.ACTIVE,
+                    InstallationStatus.UNREGISTERED,
+                    InstallationStatus.INVALID,
+                    InstallationStatus.EXPIRED,
+                )
+            ) {
+                throw NotFoundException("Push installation not found")
+            }
+            val holder = store.findByFid(fid)
             if (holder != null && holder.id != installationId) store.transfer(holder.id, now)
             PushInstallationMutation(
                 requireNotNull(store.activate(installationId, userId, fid, now)),
@@ -99,11 +116,20 @@ class PushInstallationService(
                 return requireNotNull(transaction.execute { block() })
             } catch (exception: Throwable) {
                 if (exception is NotFoundException || exception is ConflictException) throw exception
+                if (exception is OwnerSetChanged) {
+                    last = exception
+                    return@repeat
+                }
                 if (!isRetryable(exception)) throw exception
                 last = exception
             }
         }
         throw PushUnavailableException()
+    }
+
+    private fun recheckOwners(fid: Fid, userId: Long, expected: List<Long>) {
+        val actual = (store.ownerIdsForFid(fid) + userId).distinct().sorted()
+        if (actual != expected) throw OwnerSetChanged()
     }
 
     private fun isRetryable(exception: Throwable): Boolean {
@@ -121,4 +147,6 @@ class PushInstallationService(
     private companion object {
         val RETRYABLE_STATES = setOf("23505", "40001", "40P01")
     }
+
+    private class OwnerSetChanged : RuntimeException()
 }

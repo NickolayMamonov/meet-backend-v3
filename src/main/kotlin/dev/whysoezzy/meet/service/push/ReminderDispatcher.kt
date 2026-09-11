@@ -35,6 +35,8 @@ class PushFid internal constructor(private val raw: String) {
         get() = raw
     internal fun rawValue(): String = raw
     override fun toString(): String = "PushFid(redacted)"
+    override fun equals(other: Any?): Boolean = other is PushFid && raw == other.raw
+    override fun hashCode(): Int = raw.hashCode()
 
     companion object {
         internal fun of(raw: String): PushFid = PushFid(raw)
@@ -388,47 +390,62 @@ class JdbcReminderDispatchStore(
         val expiredInstallations = expireStaleInstallations(limit, now)
         val candidates = jdbc.query(
             """
-            SELECT id, claim_id, user_id FROM meeting_reminder_targets
+            SELECT id, claim_id, user_id, installation_id, lease_token, attempts, lease_until,
+                   (SELECT meeting_id FROM meeting_reminder_claims WHERE id = claim_id) AS meeting_id
+            FROM meeting_reminder_targets
             WHERE status = 'LEASED' AND attempts >= ? AND lease_until <= clock_timestamp()
             ORDER BY lease_until, id LIMIT ?
             """.trimIndent(),
             { rs, _ ->
-                Triple(
-                    rs.getObject("id", UUID::class.java),
-                    rs.getObject("claim_id", UUID::class.java),
-                    rs.getLong("user_id"),
+                ReminderLease(
+                    targetId = rs.getObject("id", UUID::class.java),
+                    claimId = rs.getObject("claim_id", UUID::class.java),
+                    userId = rs.getLong("user_id"),
+                    meetingId = rs.getLong("meeting_id"),
+                    installationId = rs.getObject("installation_id", UUID::class.java),
+                    leaseToken = rs.getObject("lease_token", UUID::class.java),
+                    attempt = rs.getInt("attempts"),
+                    leaseUntil = rs.getTimestamp("lease_until").toInstant(),
                 )
             },
             PushRuntimeSettings.MAX_ATTEMPTS,
             limit,
         )
         var recovered = 0
-        candidates.forEach { (targetId, claimId, userId) ->
-            jdbc.queryForList("SELECT id FROM users WHERE id = ? FOR UPDATE", Long::class.java, userId)
-            jdbc.queryForList("SELECT id FROM meeting_reminder_claims WHERE id = ? FOR UPDATE", UUID::class.java, claimId)
-            jdbc.queryForList("SELECT id FROM meeting_reminder_targets WHERE id = ? FOR UPDATE", UUID::class.java, targetId)
+        candidates.forEach { lease ->
+            jdbc.queryForList("SELECT id FROM users WHERE id = ? FOR UPDATE", Long::class.java, lease.userId)
+            jdbc.queryForList("SELECT id FROM meeting_reminder_claims WHERE id = ? FOR UPDATE", UUID::class.java, lease.claimId)
+            jdbc.queryForList("SELECT id FROM meeting_reminder_targets WHERE id = ? FOR UPDATE", UUID::class.java, lease.targetId)
+            val row = load(lease, requireLiveLease = false)
+            val skipReason = row?.let { eligibility(it, now) }
+            val status = if (skipReason == null) "FAILED" else "SKIPPED"
+            val reason = skipReason?.name ?: "ATTEMPTS_EXHAUSTED"
             if (
+                row != null &&
                 jdbc.update(
                     """
                     UPDATE meeting_reminder_targets
-                    SET status = 'FAILED', reason = 'ATTEMPTS_EXHAUSTED',
+                    SET status = ?, reason = ?,
                         lease_token = NULL, lease_until = NULL, completed_at = ?
-                    WHERE id = ? AND status = 'LEASED' AND attempts >= ?
+                    WHERE id = ? AND lease_token = ? AND status = 'LEASED' AND attempts >= ?
                       AND lease_until <= clock_timestamp()
                     """.trimIndent(),
+                    status,
+                    reason,
                     timestamp(now),
-                    targetId,
+                    lease.targetId,
+                    lease.leaseToken,
                     PushRuntimeSettings.MAX_ATTEMPTS,
                 ) > 0
             ) {
                 recovered++
-                reduceClaim(claimId, now)
+                reduceClaim(lease.claimId, now)
             }
         }
         return recovered + expiredInstallations
     }
 
-    private fun load(lease: ReminderLease): DispatchRow? =
+    private fun load(lease: ReminderLease, requireLiveLease: Boolean = true): DispatchRow? =
         jdbc.query(
             """
             SELECT t.id, t.claim_id, t.user_id, t.installation_id, t.lease_token,
@@ -450,7 +467,7 @@ class JdbcReminderDispatchStore(
             JOIN meetings m ON m.id = c.meeting_id
             JOIN push_installations i ON i.id = t.installation_id
             WHERE t.id = ? AND t.lease_token = ? AND t.status = 'LEASED'
-              AND t.lease_until > clock_timestamp()
+              ${if (requireLiveLease) "AND t.lease_until > clock_timestamp()" else ""}
             """.trimIndent(),
             ::mapRow,
             lease.targetId,

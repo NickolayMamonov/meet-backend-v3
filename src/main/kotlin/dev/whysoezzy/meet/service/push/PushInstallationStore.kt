@@ -70,6 +70,23 @@ class PushInstallationStore(
             fid.value,
         )
 
+    fun installationIdsForFid(fid: Fid): List<UUID> =
+        jdbc.queryForList(
+            "SELECT id FROM push_installations WHERE fid = ? AND status = 'ACTIVE' ORDER BY id",
+            UUID::class.java,
+            fid.value,
+        )
+
+    fun lockInstallations(ids: Collection<UUID>) {
+        if (ids.isEmpty()) return
+        val placeholders = ids.joinToString(",") { "?" }
+        jdbc.queryForList(
+            "SELECT id FROM push_installations WHERE id IN ($placeholders) ORDER BY id FOR UPDATE",
+            UUID::class.java,
+            *ids.toTypedArray(),
+        )
+    }
+
     fun lockUser(userId: Long) {
         jdbc.queryForList("SELECT id FROM users WHERE id = ? FOR UPDATE", Long::class.java, userId)
     }

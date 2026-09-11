@@ -2,6 +2,7 @@ package dev.whysoezzy.meet.service.push
 
 import dev.whysoezzy.meet.config.PushProperties
 import mu.KotlinLogging
+import org.springframework.context.annotation.Conditional
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import org.springframework.transaction.PlatformTransactionManager
@@ -11,6 +12,7 @@ import java.time.Clock
 private val logger = KotlinLogging.logger {}
 
 @Component
+@Conditional(DiscoveryPushCondition::class)
 class MeetingReminderScheduler(
     private val properties: PushProperties,
     private val reminders: MeetingReminderStore,
@@ -41,4 +43,13 @@ class MeetingReminderScheduler(
             logger.warn { "Push reminder discovery unavailable" }
         }
     }
+}
+
+class DiscoveryPushCondition : org.springframework.context.annotation.Condition {
+    override fun matches(
+        context: org.springframework.context.annotation.ConditionContext,
+        metadata: org.springframework.core.type.AnnotatedTypeMetadata,
+    ): Boolean =
+        context.environment.getProperty("app.push.provider-enabled", Boolean::class.java, false) &&
+            context.environment.getProperty("app.push.discovery-enabled", Boolean::class.java, false)
 }

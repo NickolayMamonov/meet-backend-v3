@@ -140,34 +140,60 @@ class MeetingReminderStore(
             timestamp(issuedAt),
         ).firstOrNull() ?: return null
 
-        val installations = jdbc.query(
-            """
-            SELECT id, user_id
-            FROM push_installations
-            WHERE user_id = ? AND status = 'ACTIVE' AND fid IS NOT NULL
-              AND last_seen_at > ?::timestamptz - INTERVAL '35 days'
-            ORDER BY id
-            """.trimIndent(),
-            { rs, _ -> rs.getObject("id", UUID::class.java) to rs.getLong("user_id") },
-            candidate.userId,
-            timestamp(now),
-        )
-        installations.forEach { (installationId, userId) ->
-            jdbc.update(
-                """
-                INSERT INTO meeting_reminder_targets
-                    (id, claim_id, user_id, installation_id, status, attempts, next_attempt_at,
-                     lease_token, lease_until, reason, completed_at)
-                VALUES (?, ?, ?, ?, 'PENDING', 0, ?, NULL, NULL, NULL, NULL)
-                """.trimIndent(),
-                UUID.randomUUID(),
-                inserted,
-                userId,
-                installationId,
-                timestamp(now),
-            )
+        var snapshotCount = 0
+        var lastInstallationId: UUID? = null
+        while (true) {
+            val installations = if (lastInstallationId == null) {
+                jdbc.query(
+                    """
+                    SELECT id, user_id
+                    FROM push_installations
+                    WHERE user_id = ? AND status = 'ACTIVE' AND fid IS NOT NULL
+                      AND last_seen_at > ?::timestamptz - INTERVAL '35 days'
+                    ORDER BY id
+                    LIMIT 128
+                    """.trimIndent(),
+                    { rs, _ -> rs.getObject("id", UUID::class.java) to rs.getLong("user_id") },
+                    candidate.userId,
+                    timestamp(now),
+                )
+            } else {
+                jdbc.query(
+                    """
+                    SELECT id, user_id
+                    FROM push_installations
+                    WHERE user_id = ? AND status = 'ACTIVE' AND fid IS NOT NULL
+                      AND last_seen_at > ?::timestamptz - INTERVAL '35 days'
+                      AND id > ?
+                    ORDER BY id
+                    LIMIT 128
+                    """.trimIndent(),
+                    { rs, _ -> rs.getObject("id", UUID::class.java) to rs.getLong("user_id") },
+                    candidate.userId,
+                    timestamp(now),
+                    lastInstallationId,
+                )
+            }
+            if (installations.isEmpty()) break
+            installations.forEach { (installationId, userId) ->
+                jdbc.update(
+                    """
+                    INSERT INTO meeting_reminder_targets
+                        (id, claim_id, user_id, installation_id, status, attempts, next_attempt_at,
+                         lease_token, lease_until, reason, completed_at)
+                    VALUES (?, ?, ?, ?, 'PENDING', 0, ?, NULL, NULL, NULL, NULL)
+                    """.trimIndent(),
+                    UUID.randomUUID(),
+                    inserted,
+                    userId,
+                    installationId,
+                    timestamp(now),
+                )
+                snapshotCount++
+            }
+            lastInstallationId = installations.last().first
         }
-        if (installations.isEmpty()) {
+        if (snapshotCount == 0) {
             jdbc.update(
                 """
                 UPDATE meeting_reminder_claims
@@ -188,7 +214,7 @@ class MeetingReminderStore(
             dueAt = due,
             deadlineAt = deadline,
             issuedAt = issuedAt,
-            status = if (installations.isEmpty()) ReminderClaimStatus.NO_TARGET else ReminderClaimStatus.PENDING,
+            status = if (snapshotCount == 0) ReminderClaimStatus.NO_TARGET else ReminderClaimStatus.PENDING,
         )
     }
 

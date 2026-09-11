@@ -53,6 +53,8 @@ interface PushDiagnosticStore {
 
     fun recheckEligible(selection: DiagnosticSelection, now: Instant): DiagnosticSelection?
 
+    fun lockOwner(userId: Long) = Unit
+
     fun invalidateExact(
         selection: DiagnosticSelection,
         expectedFid: PushFid,
@@ -226,6 +228,7 @@ class PushDiagnosticService(
     ): InvalidationOutcome {
         return try {
             when (transaction.execute {
+                store.lockOwner(selection.userId)
                 store.invalidateExact(
                     selection = selection,
                     expectedFid = sentFid,
@@ -287,6 +290,10 @@ class JdbcPushDiagnosticStore(
         now: Instant,
     ): DiagnosticSelection? =
         query(selection.userId, selection.installationId, selection.meetingId, now)
+
+    override fun lockOwner(userId: Long) {
+        jdbc.queryForList("SELECT id FROM users WHERE id = ? FOR UPDATE", Long::class.java, userId)
+    }
 
     override fun invalidateExact(
         selection: DiagnosticSelection,
