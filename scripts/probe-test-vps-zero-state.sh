@@ -98,6 +98,9 @@ jq -e '
   .populated.manifestVersion == "2026-08-15.v1" and
   .populated.stableProof.byteLength == 6867
 ' "$contract" >/dev/null || fail "admission proof contract is invalid"
+populated_meetings=$(jq -er \
+  '.populated.roots.meetings | select(type == "number" and floor == .)' \
+  "$contract") || fail "populated meeting count is invalid"
 
 backend=$(runtime_compose "$root" "$compose_script" ps -q backend) ||
   fail "backend lookup failed"
@@ -625,7 +628,7 @@ elif [ "$state_mode" = closed-beta-demo ] &&
   [ "$volumes_verified" = true ] &&
   [ "$non_idle_transactions" = 0 ] &&
   [ "$smtp_sample_one" = 0 ] && [ "$smtp_sample_two" = 0 ] &&
-  [ "$meetings_status" = 200 ] && [ "$meetings_count" -eq 6 ] &&
+  [ "$meetings_status" = 200 ] && [ "$meetings_count" -eq "$populated_meetings" ] &&
   [ "$actuator_status" = 404 ] && [ "$http_redirect_https" = true ] &&
   [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ] &&
   [ "$postgres_writable_primary" = 1 ] &&

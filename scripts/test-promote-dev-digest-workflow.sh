@@ -5,6 +5,8 @@ WORKFLOW=$ROOT_DIR/.github/workflows/promote-dev-digest-to-test-vps.yml
 CI=$ROOT_DIR/.github/workflows/ci.yml
 FIXTURES=$ROOT_DIR/scripts/fixtures/promote-dev-digest-workflow
 AUTHORIZER=$ROOT_DIR/scripts/authorize-dev-promotion.sh
+PROBE=$ROOT_DIR/scripts/probe-test-vps-zero-state.sh
+CONTRACT=$ROOT_DIR/scripts/test-vps-admission-contract.json
 [ -f "$WORKFLOW" ] && [ -f "$FIXTURES/authorized-run.json" ] || exit 1
 grep -Fq "workflow_dispatch:" "$WORKFLOW"
 grep -Fq 'scripts/authorize-dev-promotion.sh' "$WORKFLOW"
@@ -54,6 +56,13 @@ grep -Fq 'def rollback_identity' "$ROOT_DIR/scripts/build-test-promotion-evidenc
 grep -Fq '.phase == $expectedPhase' "$WORKFLOW"
 grep -Fq 'actionlint_version=1.7.7' "$CI"
 grep -Fq 'promote-dev-digest-to-test-vps.yml' "$CI"
+grep -Fq 'populated_meetings=$(jq -er' "$PROBE"
+grep -Fq '[ "$meetings_count" -eq "$populated_meetings" ]' "$PROBE"
+! grep -Fq '[ "$meetings_count" -eq 6 ]' "$PROBE"
+mutated_contract=$(mktemp)
+trap 'rm -f -- "$mutated_contract"' EXIT HUP INT TERM
+jq '.populated.roots.meetings = 7' "$CONTRACT" >"$mutated_contract"
+[ "$(jq -er '.populated.roots.meetings' "$mutated_contract")" = 7 ]
 ! grep -Fq 'find /var/lib/meet-test-vps-deploy' "$WORKFLOW"
 grep -Fq 'deployment-branch-policies?per_page=100' "$AUTHORIZER"
 ! grep -Fq '/deployment-branch-policy"' "$WORKFLOW"
