@@ -127,7 +127,7 @@ jq -e '
     "mutationStarted","retentionAuthorized","rollbackAttempted",
     "rollbackVerified","schema","stage"
   ] and
-  .schema == "meet-backend/test-promotion-incident/v1" and
+  .schema == "meet-backend/test-promotion-incident/v2" and
   .kind == "incident" and
   .stage == "authorization" and
   .failureClass == "internalFailure" and

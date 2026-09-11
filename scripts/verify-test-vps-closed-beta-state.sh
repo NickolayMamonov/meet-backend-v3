@@ -4,6 +4,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 usage: verify-test-vps-closed-beta-state.sh --phase predecessor|candidate|rollback|final
+  --state-mode empty-closed|closed-beta-demo
   --root PATH --compose-script PATH --state-dir PATH
   --expected-image IMAGE@sha256:DIGEST --expected-image-id sha256:DIGEST
   --expected-revision SHA --expected-version X.Y.Z --expected-runtime-hash HEX64
@@ -16,9 +17,11 @@ fail() { echo "closed-beta host-state verification failed: $*" >&2; exit 1; }
 phase='' root='' compose_script='' state_dir='' expected_image='' expected_image_id=''
 expected_revision='' expected_version='' expected_runtime_hash='' output=''
 public_url=''
+state_mode=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --phase) [ "$#" -ge 2 ] || usage; phase=$2; shift 2 ;;
+    --state-mode) [ "$#" -ge 2 ] || usage; state_mode=$2; shift 2 ;;
     --root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
     --compose-script) [ "$#" -ge 2 ] || usage; compose_script=$2; shift 2 ;;
     --state-dir) [ "$#" -ge 2 ] || usage; state_dir=$2; shift 2 ;;
@@ -33,6 +36,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$phase" in predecessor|candidate|rollback|final) ;; *) usage ;; esac
+case "$state_mode" in empty-closed|closed-beta-demo) ;; *) usage ;; esac
 [[ "$root" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$root" != *..* ]] || usage
 [[ "$compose_script" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$compose_script" != *..* ]] || usage
 [[ "$state_dir" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$state_dir" != *..* ]] || usage
@@ -93,6 +97,7 @@ if [ -n "$public_url" ]; then
     --state-dir "$state_dir" --expected-image "$expected_image" \
     --expected-image-id "$expected_image_id" --expected-revision "$expected_revision" \
     --expected-version "$expected_version" --expected-runtime-hash "$expected_runtime_hash" \
+    --state-mode "$state_mode" \
     --public-url "$public_url" --output "$zero_state_probe" ||
     fail "zero-state probe did not close the phase"
 fi
@@ -117,7 +122,8 @@ if [ -n "$zero_state_probe" ]; then
   admin_authenticated_disabled_404=$(jq -er '.http.adminAuthenticatedDisabled404' "$zero_state_probe")
   admin_blank_disabled_403=$(jq -er '.http.adminBlankDisabled403' "$zero_state_probe")
 fi
-jq -cnS --arg phase "$phase" --arg image "$expected_image" --arg imageId "$expected_image_id" \
+jq -cnS --arg phase "$phase" --arg stateMode "$state_mode" \
+  --arg image "$expected_image" --arg imageId "$expected_image_id" \
   --arg revision "$expected_revision" --arg version "$expected_version" --arg runtimeHash "$expected_runtime_hash" \
   --argjson containerHealthy "$container_healthy" \
   --argjson environmentMatched "$environment_matched" \
@@ -127,7 +133,7 @@ jq -cnS --arg phase "$phase" --arg image "$expected_image" --arg imageId "$expec
   --argjson adminKeyConfigured "$admin_key_configured" \
   --argjson adminAuthenticatedDisabled404 "$admin_authenticated_disabled_404" \
   --argjson adminBlankDisabled403 "$admin_blank_disabled_403" \
-  '{schema:"meet-backend/test-vps-closed-beta-state/v1",phase:$phase,image:$image,imageId:$imageId,
+  '{schema:"meet-backend/test-vps-closed-beta-state/v2",phase:$phase,stateMode:$stateMode,image:$image,imageId:$imageId,
     revision:$revision,version:$version,runtimeConfigHash:$runtimeHash,
     containerHealthy:$containerHealthy,environmentMatched:$environmentMatched,
     zeroStateProbe:$zeroStateProbe,assetsCount:$assetsCount,

@@ -70,7 +70,7 @@ reject_sensitive_content() {
 
 validate_success_input() {
   local input=$1
-  jq -e '
+  jq -e --slurpfile contract "$admission_contract" '
     def sha: type == "string" and test("^[0-9a-f]{40}$");
     def digest: type == "string" and test("^sha256:[0-9a-f]{64}$");
     def hex_digest: type == "string" and test("^[0-9a-f]{64}$");
@@ -84,24 +84,111 @@ validate_success_input() {
       "demo_catalog_state","meeting_participants","meeting_tags",
       "meetings","tags","user_interests","user_social_media","users"
     ];
-    def probe:
+    def route($routes;$name;$count;$projection):
+      ($routes[$name] | type == "object" and exact_keys([
+        "count","equal","projectionSha256","schemaValid","status"
+      ]) and .status == 200 and .schemaValid == true and
+        .count == $count and .projectionSha256 == $projection and
+        .equal == true);
+    def admission($contract):
+      if type != "object" then false
+      elif .mode == "empty-closed" then
+        exact_keys(["mode","stateSha256"]) and .stateSha256 == null
+      elif .mode == "closed-beta-demo" then
+        . as $admission |
+        exact_keys([
+          "catalogName","manifestVersion","mode","publicProjectionSha256",
+          "recoveryProofSha256","routes","stableProofSha256","stateSha256"
+        ]) and
+        .catalogName == $contract.populated.catalogName and
+        .manifestVersion == $contract.populated.manifestVersion and
+        (.stateSha256 | hex_digest) and
+        .recoveryProofSha256 == $contract.populated.recoveryProof.sha256 and
+        .stableProofSha256 == $contract.populated.stableProof.sha256 and
+        (.publicProjectionSha256 | hex_digest) and
+        ($admission.routes | type == "object" and exact_keys([
+          "ads","meetings","recommendedCommunities","tags"
+        ])) and
+        route($admission.routes;"meetings";
+          $contract.populated.roots.meetings;
+          $admission.publicProjectionSha256) and
+        route($admission.routes;"recommendedCommunities";
+          $contract.populated.roots.communities;
+          $admission.publicProjectionSha256) and
+        route($admission.routes;"tags";$contract.populated.roots.tags;
+          $admission.publicProjectionSha256) and
+        route($admission.routes;"ads";$contract.populated.roots.adBlocks;
+          $admission.publicProjectionSha256)
+      else false
+      end;
+    def identity:
       type == "object" and exact_keys([
-        "database","http","image","imageId","phase","runtime",
+        "bootstrapControlPresent","bootstrapDisabled","bootstrapMode",
+        "bootstrapProofSha256","imageId","imageReference","revision",
+        "runtimeConfigHash","stateMode","stateSha256","version"
+      ]) and
+      (.stateMode == "empty-closed" or .stateMode == "closed-beta-demo") and
+      (if .stateMode == "empty-closed"
+       then .stateSha256 == null
+       else (.stateSha256 | hex_digest)
+       end) and
+      (.imageReference | digest) and (.imageId | digest) and
+      (.revision | sha) and (.version | semver) and
+      (.runtimeConfigHash | hex_digest) and
+      (.bootstrapProofSha256 | hex_digest) and
+      (.bootstrapMode == "declared-false" or .bootstrapMode == "legacy-not-applicable") and
+      (.bootstrapControlPresent | type == "boolean") and
+      (.bootstrapDisabled == null or (.bootstrapDisabled | type == "boolean"));
+    def rollback_identity($phase):
+      {stateMode:$phase.stateMode,stateSha256:$phase.stateSha256,
+       imageReference:$phase.imageReference,imageId:$phase.imageId,
+       revision:$phase.revision,version:$phase.version,
+       runtimeConfigHash:$phase.runtimeConfigHash,
+       bootstrapMode:$phase.bootstrapMode,
+       bootstrapControlPresent:$phase.bootstrapControlPresent,
+       bootstrapDisabled:$phase.bootstrapDisabled};
+    def probe($contract):
+      . as $probe |
+      type == "object" and exact_keys([
+        "admission","database","http","image","imageId","phase","runtime",
         "runtimeConfigHash","schema","sourceSha","version",
         "zeroState","zeroStateObserved"
       ]) and
-      .schema == "meet-backend/test-vps-zero-state-probe/v1" and
+      .schema == "meet-backend/test-vps-zero-state-probe/v2" and
       (.phase == "predecessor" or .phase == "candidate" or
        .phase == "rollback" or .phase == "final") and
       (.image | digest) and (.imageId | digest) and (.sourceSha | sha) and
       (.version | semver) and (.runtimeConfigHash | hex_digest) and
-      .zeroState == "closed" and .zeroStateObserved == true and
-      (.database | type == "object" and exact_keys(["tables","totalRows"]) and
+      ($probe.admission | admission($contract)) and
+      $probe.zeroState == "closed" and $probe.zeroStateObserved == true and
+      ($probe.database | type == "object" and exact_keys(["tables","totalRows"]) and
         (.tables | type == "object" and (keys | sort) == (table_names | sort) and
           all(values[]; type == "number" and . >= 0)) and
         (.totalRows | type == "number") and
-        (.totalRows == ([.tables[]] | add)) and
-        .totalRows == 0) and
+        (.totalRows == ([.tables[]] | add))) and
+      (if $probe.admission.mode == "empty-closed"
+       then $probe.database.totalRows == 0 and $probe.http.meetingsCount == 0
+       else $probe.database.tables.tags == $contract.populated.roots.tags and
+         $probe.database.tables.users == $contract.populated.roots.users and
+         $probe.database.tables.communities == $contract.populated.roots.communities and
+         $probe.database.tables.meetings == $contract.populated.roots.meetings and
+         $probe.database.tables.ad_blocks == $contract.populated.roots.adBlocks and
+         $probe.database.tables.user_interests ==
+           $contract.populated.relationships.userInterests and
+         $probe.database.tables.community_tags ==
+           $contract.populated.relationships.communityTags and
+         $probe.database.tables.community_subscribers ==
+           $contract.populated.relationships.communitySubscribers and
+         $probe.database.tables.meeting_tags ==
+           $contract.populated.relationships.meetingTags and
+         $probe.database.tables.meeting_participants ==
+           $contract.populated.relationships.meetingParticipants and
+         $probe.database.tables.ad_block_communities ==
+           $contract.populated.relationships.adBlockCommunities and
+         $probe.database.tables.ad_block_users ==
+           $contract.populated.relationships.adBlockUsers and
+         $probe.http.meetingsCount == $contract.populated.roots.meetings
+       end) and
       (.runtime | type == "object" and exact_keys([
         "containerHealthy","hardeningVerified","networks",
         "nonIdleApplicationTransactions","postgresVolumes",
@@ -120,7 +207,7 @@ validate_success_input() {
         "assetsCount","assetsVerified","httpRedirectHttps","meetingsCount",
         "meetingsJson","meetingsStatus"
       ]) and
-        .meetingsStatus == 200 and .meetingsJson == true and .meetingsCount == 0 and
+        .meetingsStatus == 200 and .meetingsJson == true and
         .actuatorStatus == 404 and .httpRedirectHttps == true and
         .adminMissingStatus == 403 and .adminWrongStatus == 403 and
         (.adminKeyConfigured | type == "boolean") and
@@ -129,12 +216,16 @@ validate_success_input() {
         (if .adminKeyConfigured
          then .adminAuthenticatedDisabled404 == true and .adminBlankDisabled403 == false
          else .adminAuthenticatedDisabled404 == false and .adminBlankDisabled403 == true
+         end) and
+        (if $probe.admission.mode == "empty-closed"
+         then .meetingsCount == 0
+         else .meetingsCount == $contract.populated.roots.meetings
          end) and .assetsCount == 13 and .assetsVerified == true);
-    def phase($expectedPhase):
+    def phase($expectedPhase;$contract):
       . as $phaseDoc |
       type == "object" and exact_keys([
         "bootstrapControlPresent","bootstrapDisabled","bootstrapMode",
-        "bootstrapProofSha256","configDigest","demoZero","healthy",
+        "admissionMode","admissionStateSha256","bootstrapProofSha256","configDigest","healthy",
         "imageDigest","imageId","runtimeDigest","sourceSha","treeId",
         "version","zeroStateProbe"
       ]) and
@@ -146,8 +237,10 @@ validate_success_input() {
        .bootstrapMode == "legacy-not-applicable") and
       (.bootstrapControlPresent | type == "boolean") and
       (.bootstrapDisabled == null or (.bootstrapDisabled | type == "boolean")) and
-      (.healthy | type == "boolean") and (.demoZero | type == "boolean") and
-      ($phaseDoc.zeroStateProbe | probe) and
+      (.healthy | type == "boolean") and
+      (.admissionMode == "empty-closed" or .admissionMode == "closed-beta-demo") and
+      (.admissionStateSha256 == null or (.admissionStateSha256 | hex_digest)) and
+      ($phaseDoc.zeroStateProbe | probe($contract)) and
       $phaseDoc.zeroStateProbe.phase == $expectedPhase and
       $phaseDoc.zeroStateProbe.image == $phaseDoc.imageDigest and
       $phaseDoc.zeroStateProbe.imageId == $phaseDoc.imageId and
@@ -155,11 +248,13 @@ validate_success_input() {
       $phaseDoc.zeroStateProbe.version == $phaseDoc.version and
       $phaseDoc.zeroStateProbe.runtimeConfigHash == $phaseDoc.runtimeDigest and
       $phaseDoc.healthy == $phaseDoc.zeroStateProbe.runtime.containerHealthy and
-      $phaseDoc.demoZero == ($phaseDoc.zeroStateProbe.zeroState == "closed") and
+      $phaseDoc.admissionMode == $phaseDoc.zeroStateProbe.admission.mode and
+      $phaseDoc.admissionStateSha256 == $phaseDoc.zeroStateProbe.admission.stateSha256 and
       (if .bootstrapMode == "declared-false"
        then .bootstrapControlPresent == true and .bootstrapDisabled == true
        else .bootstrapControlPresent == false and .bootstrapDisabled == null
        end);
+    ($contract[0]) as $contractDoc |
     . as $root |
     ($root.deployment.final.zeroStateProbe) as $finalProbe |
     ($root.deployment) as $deployment |
@@ -169,7 +264,7 @@ validate_success_input() {
     type == "object" and (keys | length) == 5 and exact_keys([
       "control","deployment","image","schema","source"
     ]) and
-    .schema == "meet-backend/test-promotion-evidence-input/v1" and
+    .schema == "meet-backend/test-promotion-evidence-input/v2" and
     (.source | type == "object" and exact_keys([
       "authoritySha","sourceSha","treeId","version"
     ]) and
@@ -180,7 +275,7 @@ validate_success_input() {
       "platform","platformDigest","protectedStateEqual","provenance",
       "referrerClosure","rootDigest","sbom"
     ]) and
-      .image == "ghcr.io/nickolaymamonov/meet-backend-v3" and
+      $root.image.image == "ghcr.io/nickolaymamonov/meet-backend-v3" and
       (.alias | type == "string") and
       .alias == ("test-sha-" + $root.source.sourceSha) and
       (.admissionMode == "published" or .admissionMode == "reused") and
@@ -196,9 +291,9 @@ validate_success_input() {
     (($deployment | keys | sort) == ([
       "candidate","final","predecessor","probes","rollback","runtime"
     ] | sort)) and
-    ($deployment.predecessor | phase("predecessor")) and
-    ($deployment.candidate | phase("candidate")) and
-    ($deployment.final | phase("final")) and
+    ($deployment.predecessor | phase("predecessor";$contractDoc)) and
+    ($deployment.candidate | phase("candidate";$contractDoc)) and
+    ($deployment.final | phase("final";$contractDoc)) and
     $deployment.candidate.bootstrapMode == "declared-false" and
     $deployment.candidate.bootstrapControlPresent == true and
     $deployment.candidate.bootstrapDisabled == true and
@@ -215,6 +310,11 @@ validate_success_input() {
     $deployment.final.sourceSha == $root.source.sourceSha and
     $deployment.final.treeId == $root.source.treeId and
     $deployment.final.version == $root.source.version and
+    $deployment.predecessor.admissionMode == $deployment.candidate.admissionMode and
+    $deployment.predecessor.admissionStateSha256 ==
+      $deployment.candidate.admissionStateSha256 and
+    $deployment.candidate.admissionMode == $deployment.final.admissionMode and
+    $deployment.candidate.admissionStateSha256 == $deployment.final.admissionStateSha256 and
     ($runtime | type == "object") and
     (($runtime | keys | sort) == ([
       "hardeningVerified","nonIdleApplicationTransactions",
@@ -246,29 +346,31 @@ validate_success_input() {
     $probes.httpRedirectHttps == $finalProbe.http.httpRedirectHttps and
     $probes.meetings200Json == ($finalProbe.http.meetingsStatus == 200 and
       $finalProbe.http.meetingsJson == true and
-      $finalProbe.http.meetingsCount == 0) and
+      (if $finalProbe.admission.mode == "empty-closed"
+       then $finalProbe.http.meetingsCount == 0
+       else $finalProbe.http.meetingsCount == $contractDoc.populated.roots.meetings
+       end)) and
     ($probes.assets == {
       count:$finalProbe.http.assetsCount,
       verified:$finalProbe.http.assetsVerified
     }) and
     ($rollback | type == "object") and
     (($rollback | keys | sort) == ([
-      "attempted","bootstrapProofSha256","required","restoredImageId",
-      "sameDigestRedeploy","verified"
+      "attempted","predecessor","required","restored","sameImageRedeploy","verified"
     ] | sort)) and
-    ($rollback.bootstrapProofSha256 | hex_digest) and
     ($rollback.required | type == "boolean") and
     ($rollback.attempted | type == "boolean") and
     ($rollback.verified | type == "boolean") and
-    ($rollback.sameDigestRedeploy | type == "boolean") and
-    ($rollback.restoredImageId == null or ($rollback.restoredImageId | digest)) and
-    ($rollback.bootstrapProofSha256 == $deployment.predecessor.bootstrapProofSha256) and
+    ($rollback.sameImageRedeploy | type == "boolean") and
     (if $rollback.required
      then $rollback.attempted and $rollback.verified and
-       ($rollback.sameDigestRedeploy | not) and
-       $rollback.restoredImageId == $deployment.predecessor.imageId
+       ($rollback.sameImageRedeploy | not) and
+       ($rollback.predecessor | identity) and ($rollback.restored | identity) and
+       rollback_identity($rollback.predecessor) ==
+         rollback_identity($rollback.restored)
      else ($rollback.attempted | not) and ($rollback.verified | not) and
-       $rollback.sameDigestRedeploy and $rollback.restoredImageId == null
+       $rollback.sameImageRedeploy and $rollback.predecessor == null and
+       $rollback.restored == null
      end) and
     (.control | type == "object" and exact_keys([
       "finalVerified","rollbackPolicySatisfied"
@@ -281,7 +383,7 @@ validate_success_evidence() {
   local evidence=$1 reconstructed
   jq -e '
     type == "object" and
-    .schema == "meet-backend/test-promotion-evidence/v1" and
+    .schema == "meet-backend/test-promotion-evidence/v2" and
     .kind == "success" and .evidenceSanitized == true and
     .artifactUploaded == false and .retentionAuthorized == false and
     (.source | type == "object") and (.image | type == "object") and
@@ -296,13 +398,31 @@ validate_success_evidence() {
     fail "retention evidence is not an eligible success document"
   reconstructed=$(mktemp)
   jq -cS '
+    def input_phase:
+      {
+        bootstrapControlPresent:.bootstrapControlPresent,
+        bootstrapDisabled:.bootstrapDisabled,
+        bootstrapMode:.bootstrapMode,
+        admissionMode:.admissionMode,
+        admissionStateSha256:.admissionStateSha256,
+        bootstrapProofSha256:.bootstrapProofSha256,
+        configDigest:.configDigest,
+        healthy:.healthy,
+        imageDigest:.imageDigest,
+        imageId:.imageId,
+        runtimeDigest:.runtimeDigest,
+        sourceSha:.sourceSha,
+        treeId:.treeId,
+        version:.version,
+        zeroStateProbe:.zeroStateProbe
+      };
     {
-      schema:"meet-backend/test-promotion-evidence-input/v1",
+      schema:"meet-backend/test-promotion-evidence-input/v2",
       source:.source,image:.image,
       deployment:{
-        predecessor:.deployment.predecessor,
-        candidate:.deployment.candidate,
-        final:.deployment.final,
+        predecessor:(.deployment.predecessor | input_phase),
+        candidate:(.deployment.candidate | input_phase),
+        final:(.deployment.final | input_phase),
         runtime:.deployment.runtime,
         probes:.deployment.probes,
         rollback:.deployment.rollback
@@ -317,6 +437,24 @@ validate_success_evidence() {
 
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+admission_contract="$script_dir/test-vps-admission-contract.json"
+[ -f "$admission_contract" ] && [ ! -L "$admission_contract" ] &&
+  [ -r "$admission_contract" ] || fail "admission contract is unavailable"
+jq -e '
+  type == "object" and
+  (keys | sort) == ["populated","schema","stateModes"] and
+  .schema == "meet-backend/test-vps-admission-contract/v1" and
+  (.stateModes | sort) == ["closed-beta-demo","empty-closed"] and
+  (.populated | type == "object" and
+    .catalogName == "closed-beta-demo" and
+    .manifestVersion == "2026-08-15.v1" and
+    (.recoveryProof | type == "object" and
+      (keys | sort) == ["schema","sha256"]) and
+    (.stableProof | type == "object" and
+      (keys | sort) == ["byteLength","fixture","schema","serialization","sha256"]))
+' "$admission_contract" >/dev/null ||
+  fail "admission contract is invalid"
 [ "$#" -ge 1 ] || usage
 operation=$1
 shift
@@ -338,16 +476,18 @@ case "$operation" in
     reject_sensitive_content "$input"
     candidate=$(mktemp)
     trap 'rm -f -- "$candidate"' EXIT HUP INT TERM
-    jq -cS '
+    jq -cS --slurpfile contract "$admission_contract" '
+      ($contract[0]) as $contractDoc |
       .deployment.final.zeroStateProbe as $probe |
       def phase($x):
         ($x.zeroStateProbe) as $observed |
         $x + {
           healthy:$observed.runtime.containerHealthy,
-          demoZero:($observed.zeroState == "closed")
+          admissionMode:$observed.admission.mode,
+          admissionStateSha256:$observed.admission.stateSha256
         };
       {
-        schema:"meet-backend/test-promotion-evidence/v1",
+        schema:"meet-backend/test-promotion-evidence/v2",
         kind:"success",
         source:.source,
         image:.image,
@@ -376,7 +516,12 @@ case "$operation" in
             assets:{count:$probe.http.assetsCount,verified:$probe.http.assetsVerified},
             httpRedirectHttps:$probe.http.httpRedirectHttps,
             meetings200Json:($probe.http.meetingsStatus == 200 and
-              $probe.http.meetingsJson == true and $probe.http.meetingsCount == 0)
+              $probe.http.meetingsJson == true and
+              $probe.http.meetingsCount ==
+                (if $probe.admission.mode == "empty-closed"
+                 then 0
+                 else $contractDoc.populated.roots.meetings
+                 end))
           }
         },
         control:.control,
@@ -419,7 +564,7 @@ case "$operation" in
       fail "rollback cannot precede mutation"
     candidate=$(mktemp)
     trap 'rm -f -- "$candidate"' EXIT HUP INT TERM
-    jq -cnS --arg schema "meet-backend/test-promotion-incident/v1" \
+    jq -cnS --arg schema "meet-backend/test-promotion-incident/v2" \
       --arg stage "$stage" --arg failureClass "$failure_class" \
       --argjson mutationStarted "$mutation_started" \
       --argjson rollbackAttempted "$rollback_attempted" \
@@ -457,7 +602,7 @@ case "$operation" in
     [[ "$evidence_sha" =~ ^[0-9a-f]{64}$ ]] || fail "evidence digest calculation failed"
     candidate=$(mktemp)
     trap 'rm -f -- "$candidate"' EXIT HUP INT TERM
-    jq -cnS --arg schema "meet-backend/test-promotion-retention/v1" \
+    jq -cnS --arg schema "meet-backend/test-promotion-retention/v2" \
       --arg evidenceSha256 "$evidence_sha" '
       {schema:$schema,evidenceSha256:$evidenceSha256,artifactUploaded:true,
        evidenceSanitized:true,finalVerified:true,rollbackPolicySatisfied:true,

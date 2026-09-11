@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --root PATH --base-compose PATH --image IMAGE@sha256:DIGEST --revision SHA --version VERSION --run-key KEY --mode deploy|rollback-drill [--closed-beta-safety] [--public-url https://HOST]" >&2
+  echo "usage: $0 --root PATH --base-compose PATH --image IMAGE@sha256:DIGEST --revision SHA --version VERSION --run-key KEY --mode deploy|rollback-drill [--closed-beta-safety --state-mode empty-closed|closed-beta-demo] [--public-url https://HOST]" >&2
   exit 2
 }
 
@@ -20,6 +20,7 @@ run_key=
 mode=
 closed_beta_safety=false
 public_url=
+state_mode=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --root) [ "$#" -ge 2 ] && [ -z "$root" ] || usage; root=$2; shift 2 ;;
@@ -33,6 +34,11 @@ while [ "$#" -gt 0 ]; do
       [ "$closed_beta_safety" = false ] || usage
       closed_beta_safety=true
       shift
+      ;;
+    --state-mode)
+      [ "$#" -ge 2 ] && [ -z "$state_mode" ] || usage
+      state_mode=$2
+      shift 2
       ;;
     --public-url)
       [ "$#" -ge 2 ] && [ -z "$public_url" ] || usage
@@ -55,6 +61,11 @@ done
 case "$mode" in deploy|rollback-drill) ;; *) usage ;; esac
 if [ -n "$public_url" ]; then
   [[ "$public_url" =~ ^https://[^/]+$ ]] || usage
+fi
+if [ "$closed_beta_safety" = true ]; then
+  case "$state_mode" in empty-closed|closed-beta-demo) ;; *) usage ;; esac
+elif [ -n "$state_mode" ]; then
+  usage
 fi
 
 for command_name in docker curl jq flock; do
@@ -159,6 +170,7 @@ run_safety_hook() {
     --expected-revision "$expected_revision"
     --expected-version "$expected_version"
     --expected-runtime-hash "$expected_runtime_hash"
+    --state-mode "$state_mode"
   )
   if [ -n "$public_url" ]; then
     safety_args+=(--public-url "$public_url")

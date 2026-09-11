@@ -35,8 +35,11 @@ class PostgresTestDatabase(
     val jdbcUrl: String
         get() = externalUrl?.let {
             val separator = if ('?' in it) "&" else "?"
-            "$it${separator}currentSchema=$schema"
-        } ?: container.jdbcUrl
+            "$it${separator}currentSchema=$schema&prepareThreshold=0"
+        } ?: run {
+            val separator = if ('?' in container.jdbcUrl) "&" else "?"
+            "${container.jdbcUrl}${separator}prepareThreshold=0"
+        }
 
     val username: String
         get() = externalUrl?.let { externalCredentials.first } ?: container.username

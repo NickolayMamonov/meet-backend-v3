@@ -1,0 +1,44 @@
+{
+  "schema": "meet-backend/test-vps-admission-contract/v1",
+  "stateModes": [
+    "empty-closed",
+    "closed-beta-demo"
+  ],
+  "populated": {
+    "catalogName": "closed-beta-demo",
+    "manifestVersion": "2026-08-15.v1",
+    "recoveryProof": {
+      "schema": "meet-backend/closed-beta-database-proof/v1",
+      "sha256": "c1a83c4d33e5c4d1772b27bc770471e99a6fb1ac2827c16c9787ecef073d2979"
+    },
+    "stableProof": {
+      "schema": "meet-backend/closed-beta-demo-stable-proof/v1",
+      "serialization": "psql-jsonb-text-with-trailing-lf",
+      "fixture": "scripts/fixtures/test-vps-beta-demo/canonical-stable-proof.json",
+      "byteLength": 6867,
+      "sha256": "0e6ef8d48515b3041000166a5506df2a72c11c4e702d7d28960f54d1c204080e"
+    },
+    "schedule": {
+      "anchorDate": "2026-09-14",
+      "validThrough": "2026-09-14T00:00:00+00:00"
+    },
+    "roots": {
+      "tags": 6,
+      "users": 6,
+      "communities": 3,
+      "meetings": 6,
+      "adBlocks": 3
+    },
+    "relationships": {
+      "userInterests": 12,
+      "communityTags": 7,
+      "communitySubscribers": 9,
+      "meetingTags": 12,
+      "meetingParticipants": 18,
+      "adBlockCommunities": 3,
+      "adBlockUsers": 4,
+      "meetingPersonHosts": 6,
+      "meetingCommunityHosts": 6
+    }
+  }
+}

@@ -278,6 +278,8 @@ jobs:
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
           WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
+          WORKFLOW=.github/workflows/promote-dev-digest-to-test-vps.yml \
+            "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
       - name: Verify Release Please state
         env:
           RELEASE_REF: ${{ inputs.source_sha == '' && inputs.ref || '' }}

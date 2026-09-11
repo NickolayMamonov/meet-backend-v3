@@ -2,8 +2,11 @@
 set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 WORKFLOW=$ROOT_DIR/.github/workflows/promote-dev-digest-to-test-vps.yml
+CI=$ROOT_DIR/.github/workflows/ci.yml
 FIXTURES=$ROOT_DIR/scripts/fixtures/promote-dev-digest-workflow
 AUTHORIZER=$ROOT_DIR/scripts/authorize-dev-promotion.sh
+PROBE=$ROOT_DIR/scripts/probe-test-vps-zero-state.sh
+PROBE_FIXTURE=$FIXTURES/probe-contract.sh
 [ -f "$WORKFLOW" ] && [ -f "$FIXTURES/authorized-run.json" ] || exit 1
 grep -Fq "workflow_dispatch:" "$WORKFLOW"
 grep -Fq 'scripts/authorize-dev-promotion.sh' "$WORKFLOW"
@@ -42,7 +45,26 @@ grep -Fq 'PUBLIC_V1_2_0_BOOTSTRAP_INTRODUCTION_SHA: a8aa869dafc7b23178c6c505ef07
 grep -Fq 'git merge-base --is-ancestor "$previous_revision"' "$WORKFLOW"
 grep -Fq 'sha256sum -- "$1"' "$WORKFLOW"
 grep -Fq 'local_sha=$(sha256sum "$local_file"' "$WORKFLOW"
-grep -Fq 'cmp -- "$RUNNER_TEMP/bootstrap-predecessor.json"' "$WORKFLOW"
+grep -Fq 'rollback-predecessor.json' "$WORKFLOW"
+grep -Fq 'download_phase "$rollback_state_dir" predecessor' "$WORKFLOW"
+grep -Fq '"$rollback_state_dir" "$final_state_dir" "$rollback_required"' "$WORKFLOW"
+grep -Fq 'if [ "$rollback_required" = true ]; then' "$WORKFLOW"
+grep -Fq 'then $final[0].zeroStateProbe.http.meetingsCount == 0' "$WORKFLOW"
+grep -Fq '$admissionContract[0].populated.roots.meetings' "$WORKFLOW"
+grep -Fq 'identity($rollbackPredecessor' "$WORKFLOW"
+grep -Fq 'def rollback_identity' "$ROOT_DIR/scripts/build-test-promotion-evidence.sh"
+grep -Fq '.phase == $expectedPhase' "$WORKFLOW"
+grep -Fq 'actionlint_version=1.7.7' "$CI"
+grep -Fq 'promote-dev-digest-to-test-vps.yml' "$CI"
+grep -Fq 'populated_meetings=$(jq -er' "$PROBE"
+grep -Fq '[ "$meetings_count" -eq "$populated_meetings" ]' "$PROBE"
+! grep -Fq '[ "$meetings_count" -eq 6 ]' "$PROBE"
+[ -x "$PROBE_FIXTURE" ]
+grep -Fq -- '--test-admission-contract "$contract"' "$PROBE_FIXTURE"
+grep -Fq 'TEST_VPS_PROBE_FIXTURE=true' "$PROBE_FIXTURE"
+grep -Fq '.populated.roots.meetings = 7' "$PROBE_FIXTURE"
+grep -Fq '.zeroState == "unknown"' "$PROBE_FIXTURE"
+"$PROBE_FIXTURE"
 ! grep -Fq 'find /var/lib/meet-test-vps-deploy' "$WORKFLOW"
 grep -Fq 'deployment-branch-policies?per_page=100' "$AUTHORIZER"
 ! grep -Fq '/deployment-branch-policy"' "$WORKFLOW"
