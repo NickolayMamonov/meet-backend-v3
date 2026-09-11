@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 BUILDER=$ROOT_DIR/scripts/build-test-promotion-evidence.sh
 TMP=$(mktemp -d)
+# Do not leak the fixture directory through Windows' exported TMP variable to
+# child scripts, which use mktemp for their own private evidence files.
+export -n TMP
 trap 'rm -r -- "$TMP"' EXIT HUP INT TERM
 
 SOURCE=0123456789abcdef0123456789abcdef01234567
@@ -360,7 +363,9 @@ bash "$BUILDER" success --input "$TMP/same-digest.json" \
 jq -e '
   .deployment.rollback.sameImageRedeploy == true and
   .deployment.rollback.required == false and
-  .deployment.rollback.verified == false
+  .deployment.rollback.verified == false and
+  .deployment.rollback.predecessor == null and
+  .deployment.rollback.restored == null
 ' "$TMP/same-digest-evidence.json" >/dev/null
 
 bash "$BUILDER" incident \

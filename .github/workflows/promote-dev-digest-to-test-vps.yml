@@ -458,12 +458,6 @@ jobs:
           state_root=/var/lib/meet-test-vps-deploy
           rollback_state_dir="$state_root/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-rollback-drill"
           final_state_dir="$state_root/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final-deploy"
-          ssh -F "$SSH_CONFIG" test-vps bash -s -- \
-            "$rollback_state_dir" "$final_state_dir" <<'REMOTE'
-          set -euo pipefail
-          [ -d "$1" ] && [ ! -L "$1" ]
-          [ -d "$2" ] && [ ! -L "$2" ]
-          REMOTE
           previous_revision=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$final_state_dir/previous-revision" <<'REMOTE'
           set -euo pipefail
@@ -482,6 +476,15 @@ jobs:
           [[ "$previous_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           rollback_required=false
           [ "$previous_id" = "$target_id" ] || rollback_required=true
+          ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+            "$rollback_state_dir" "$final_state_dir" "$rollback_required" <<'REMOTE'
+          set -euo pipefail
+          rollback_required=$3
+          [ -d "$2" ] && [ ! -L "$2" ]
+          if [ "$rollback_required" = true ]; then
+            [ -d "$1" ] && [ ! -L "$1" ]
+          fi
+          REMOTE
           git fetch --no-tags origin "$previous_revision" \
             "$PUBLIC_V1_2_0_BOOTSTRAP_INTRODUCTION_SHA"
           if [ "$previous_version" = 1.2.0 ]; then
@@ -682,7 +685,8 @@ jobs:
             --arg predecessorProof "$pre_proof" --arg candidateProof "$cand_proof" \
             --arg rollbackPredecessorProof "$rollback_pre_proof" \
             --arg rollbackProof "$rollback_proof" --arg finalProof "$final_proof" \
-            --arg previousId "$previous_id" \
+            --arg stateMode "$STATE_MODE" \
+            --slurpfile admissionContract scripts/test-vps-admission-contract.json \
             --argjson rollbackRequired "$rollback_required" \
             --argjson rollbackAttempted "$rollback_attempted" \
             --argjson rollbackVerified "$rollback_verified" '
@@ -800,7 +804,11 @@ jobs:
                 probes:{
                   meetings200Json:($final[0].zeroStateProbe.http.meetingsStatus == 200 and
                     $final[0].zeroStateProbe.http.meetingsJson == true and
-                    $final[0].zeroStateProbe.http.meetingsCount == 0),
+                    (if $stateMode == "empty-closed"
+                     then $final[0].zeroStateProbe.http.meetingsCount == 0
+                     else $final[0].zeroStateProbe.http.meetingsCount ==
+                       $admissionContract[0].populated.roots.meetings
+                     end)),
                   actuator404:($final[0].zeroStateProbe.http.actuatorStatus == 404),
                   httpRedirectHttps:$final[0].zeroStateProbe.http.httpRedirectHttps,
                   adminMissing403:

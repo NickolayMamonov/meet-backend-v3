@@ -149,9 +149,7 @@ jq -e --slurpfile contract "$contract" --arg phase "$phase" \
   (.adminKeyConfigured | type == "boolean") and
   (.adminAuthenticatedDisabled404 | type == "boolean") and
   (.adminBlankDisabled403 | type == "boolean") and
-  (if .phase != "final"
-   then .adminAuthenticatedDisabled404 == false and .adminBlankDisabled403 == false
-   elif .adminKeyConfigured
+  (if .adminKeyConfigured
    then .adminAuthenticatedDisabled404 == true and .adminBlankDisabled403 == false
    else .adminAuthenticatedDisabled404 == false and .adminBlankDisabled403 == true
    end)
