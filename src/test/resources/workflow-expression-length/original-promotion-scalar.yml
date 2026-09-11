@@ -1,0 +1,10 @@
+# Baseline provenance: cb730ea062454a0453010ff4eddeb5f6ccf51171.
+# The original deploy run scalar measured 22382 decoded UTF-16 units,
+# 22540 generated-expression units, and four embedded expressions.
+name: inert promotion scalar regression
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo '${{ x }}'
