@@ -85,6 +85,9 @@ class Meeting(
     @Column(name = "ends_at")
     var endsAt: Long? = null,
 
+    @Column(name = "push_start_version", nullable = false)
+    var pushStartVersion: Long = 0,
+
     @Column(name = "demo_catalog_key", length = 160, updatable = false)
     var demoCatalogKey: String? = null,
     

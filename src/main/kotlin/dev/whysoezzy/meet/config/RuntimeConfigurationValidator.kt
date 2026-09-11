@@ -10,6 +10,7 @@ object RuntimeConfigurationValidator {
         otpHash: OtpHashProperties,
         clientIp: ClientIpProperties,
         sms: SmsProperties,
+        push: PushProperties = PushProperties(),
     ) {
         val profiles = environment.activeProfiles.toSet()
         val mode = when (profiles) {
@@ -58,6 +59,9 @@ object RuntimeConfigurationValidator {
         if (email.provider == EmailProvider.SMTP) {
             SmtpRuntimeSettings.from(email, environment)
         }
+
+        ProtectedLoggingPolicy.validate(environment)
+        PushRuntimeSettings.from(push)
     }
 
     const val NON_PRODUCTION_DEV_KEY_ID = "dev-current"
