@@ -6,7 +6,7 @@ CI=$ROOT_DIR/.github/workflows/ci.yml
 FIXTURES=$ROOT_DIR/scripts/fixtures/promote-dev-digest-workflow
 AUTHORIZER=$ROOT_DIR/scripts/authorize-dev-promotion.sh
 PROBE=$ROOT_DIR/scripts/probe-test-vps-zero-state.sh
-CONTRACT=$ROOT_DIR/scripts/test-vps-admission-contract.json
+PROBE_FIXTURE=$FIXTURES/probe-contract.sh
 [ -f "$WORKFLOW" ] && [ -f "$FIXTURES/authorized-run.json" ] || exit 1
 grep -Fq "workflow_dispatch:" "$WORKFLOW"
 grep -Fq 'scripts/authorize-dev-promotion.sh' "$WORKFLOW"
@@ -59,10 +59,12 @@ grep -Fq 'promote-dev-digest-to-test-vps.yml' "$CI"
 grep -Fq 'populated_meetings=$(jq -er' "$PROBE"
 grep -Fq '[ "$meetings_count" -eq "$populated_meetings" ]' "$PROBE"
 ! grep -Fq '[ "$meetings_count" -eq 6 ]' "$PROBE"
-mutated_contract=$(mktemp)
-trap 'rm -f -- "$mutated_contract"' EXIT HUP INT TERM
-jq '.populated.roots.meetings = 7' "$CONTRACT" >"$mutated_contract"
-[ "$(jq -er '.populated.roots.meetings' "$mutated_contract")" = 7 ]
+[ -x "$PROBE_FIXTURE" ]
+grep -Fq -- '--test-admission-contract "$contract"' "$PROBE_FIXTURE"
+grep -Fq 'TEST_VPS_PROBE_FIXTURE=true' "$PROBE_FIXTURE"
+grep -Fq '.populated.roots.meetings = 7' "$PROBE_FIXTURE"
+grep -Fq '.zeroState == "unknown"' "$PROBE_FIXTURE"
+"$PROBE_FIXTURE"
 ! grep -Fq 'find /var/lib/meet-test-vps-deploy' "$WORKFLOW"
 grep -Fq 'deployment-branch-policies?per_page=100' "$AUTHORIZER"
 ! grep -Fq '/deployment-branch-policy"' "$WORKFLOW"

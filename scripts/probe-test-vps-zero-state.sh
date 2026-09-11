@@ -10,6 +10,7 @@ usage: probe-test-vps-zero-state.sh
   --expected-image IMAGE@sha256:DIGEST --expected-image-id sha256:DIGEST
   --expected-revision SHA --expected-version X.Y.Z --expected-runtime-hash HEX64
   --public-url https://HOST --output PATH
+  [test fixture] --test-admission-contract PATH --test-observed-meetings COUNT
 EOF
   exit 2
 }
@@ -31,6 +32,8 @@ expected_runtime_hash=
 state_mode=
 public_url=
 output=
+test_admission_contract=
+test_observed_meetings=
 meetings_body=
 headers=
 admin_config=
@@ -54,9 +57,48 @@ while [ "$#" -gt 0 ]; do
     --expected-runtime-hash) [ "$#" -ge 2 ] || usage; expected_runtime_hash=$2; shift 2 ;;
     --public-url) [ "$#" -ge 2 ] || usage; public_url=$2; shift 2 ;;
     --output) [ "$#" -ge 2 ] || usage; output=$2; shift 2 ;;
+    --test-admission-contract) [ "$#" -ge 2 ] || usage; test_admission_contract=$2; shift 2 ;;
+    --test-observed-meetings) [ "$#" -ge 2 ] || usage; test_observed_meetings=$2; shift 2 ;;
     *) usage ;;
   esac
 done
+
+if [ -n "$test_admission_contract" ] || [ -n "$test_observed_meetings" ]; then
+  [ "${TEST_VPS_PROBE_FIXTURE:-false}" = true ] || usage
+  [ -z "$phase$root$compose_script$state_dir$expected_image$expected_image_id" ] &&
+    [ -z "$expected_revision$expected_version$expected_runtime_hash$state_mode$public_url" ] ||
+    usage
+  [[ "$test_admission_contract" =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+    [[ "$test_admission_contract" != *..* ]] || usage
+  [[ "$test_observed_meetings" =~ ^[0-9]+$ ]] || usage
+  [ -f "$test_admission_contract" ] && [ ! -L "$test_admission_contract" ] || usage
+  [ -n "$output" ] || usage
+  [[ "$output" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$output" != *..* ]] || usage
+  [ -d "$(dirname -- "$output")" ] || usage
+  command -v jq >/dev/null 2>&1 || fail "jq is required"
+  jq -e '
+    type == "object" and
+    (keys | sort) == ["populated","schema","stateModes"] and
+    .schema == "meet-backend/test-vps-admission-contract/v1" and
+    (.stateModes | sort) == ["closed-beta-demo","empty-closed"] and
+    (.populated | type == "object") and
+    (.populated.roots.meetings | type == "number" and floor == .)
+  ' "$test_admission_contract" >/dev/null ||
+    fail "test admission contract is invalid"
+  expected_test_meetings=$(jq -er \
+    '.populated.roots.meetings | select(type == "number" and floor == .)' \
+    "$test_admission_contract") || fail "test meeting count is invalid"
+  test_zero_state=unknown
+  [ "$test_observed_meetings" -eq "$expected_test_meetings" ] &&
+    test_zero_state=closed
+  jq -cnS --argjson observed "$test_observed_meetings" \
+    --argjson expected "$expected_test_meetings" --arg zeroState "$test_zero_state" \
+    '{schema:"meet-backend/test-vps-zero-state-probe-fixture/v1",
+      observedMeetings:$observed,contractMeetings:$expected,zeroState:$zeroState}' \
+    >"$output" || fail "test admission evidence construction failed"
+  [ "$test_zero_state" = closed ]
+  exit
+fi
 
 case "$phase" in predecessor|candidate|rollback|final) ;; *) usage ;; esac
 case "$state_mode" in empty-closed|closed-beta-demo) ;; *) usage ;; esac
