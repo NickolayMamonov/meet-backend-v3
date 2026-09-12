@@ -10,6 +10,7 @@ import java.time.Instant
 import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -73,6 +74,84 @@ class PushDiagnosticServiceTest {
             )
         }
         assertEquals(503, exception.status.value())
+    }
+
+    @Test
+    fun `unexpected provider failure is sanitized for single diagnostic`() {
+        val selection = selection()
+        val service = PushDiagnosticService(
+            store = FakeDiagnosticStore(selection),
+            provider = object : PushProvider {
+                override fun send(fid: PushFid, message: PushReminderMessage): PushDeliveryResult =
+                    error("provider failure")
+            },
+            transactionManager = ImmediateTransactionManager(),
+            clock = Clock.fixed(Instant.parse("2026-09-11T20:00:00Z"), ZoneOffset.UTC),
+        )
+
+        val exception = assertFailsWith<dev.whysoezzy.meet.api.error.ApiException> {
+            service.send(
+                PushDiagnosticCommand(1, selection.installationId, 2, 60, PushDiagnosticMode.SINGLE),
+            )
+        }
+        assertEquals(503, exception.status.value())
+        assertEquals("PUSH_UNAVAILABLE", exception.code)
+    }
+
+    @Test
+    fun `unexpected first provider failure stops pair without a second call`() {
+        val selection = selection()
+        var calls = 0
+        val service = PushDiagnosticService(
+            store = FakeDiagnosticStore(selection),
+            provider = object : PushProvider {
+                override fun send(fid: PushFid, message: PushReminderMessage): PushDeliveryResult {
+                    calls += 1
+                    error("provider failure")
+                }
+            },
+            transactionManager = ImmediateTransactionManager(),
+            clock = Clock.fixed(Instant.parse("2026-09-11T20:00:00Z"), ZoneOffset.UTC),
+        )
+
+        val response = service.send(
+            PushDiagnosticCommand(1, selection.installationId, 2, 60, PushDiagnosticMode.DEDUP_PAIR),
+        ) as PushDiagnosticResponse.Pair
+
+        assertEquals(DiagnosticAggregateResult.INCONCLUSIVE, response.result)
+        assertEquals(DiagnosticCallResult.ProviderUnavailable, response.first)
+        assertEquals(DiagnosticCallResult.NotAttempted, response.second)
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun `typed provider unavailability still permits the second pair call`() {
+        val selection = selection()
+        var calls = 0
+        val service = PushDiagnosticService(
+            store = FakeDiagnosticStore(selection),
+            provider = object : PushProvider {
+                override fun send(fid: PushFid, message: PushReminderMessage): PushDeliveryResult {
+                    calls += 1
+                    return if (calls == 1) {
+                        PushDeliveryResult.Unavailable
+                    } else {
+                        PushDeliveryResult.Accepted
+                    }
+                }
+            },
+            transactionManager = ImmediateTransactionManager(),
+            clock = Clock.fixed(Instant.parse("2026-09-11T20:00:00Z"), ZoneOffset.UTC),
+        )
+
+        val response = service.send(
+            PushDiagnosticCommand(1, selection.installationId, 2, 60, PushDiagnosticMode.DEDUP_PAIR),
+        ) as PushDiagnosticResponse.Pair
+
+        assertEquals(DiagnosticAggregateResult.INCONCLUSIVE, response.result)
+        assertEquals(DiagnosticCallResult.ProviderUnavailable, response.first)
+        assertEquals(DiagnosticCallResult.Accepted, response.second)
+        assertEquals(2, calls)
     }
 
     private fun selection() = DiagnosticSelection(

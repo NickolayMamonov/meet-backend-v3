@@ -5,11 +5,15 @@ import dev.whysoezzy.meet.api.error.ApiErrorResponseWriter
 import dev.whysoezzy.meet.api.error.ApiExceptionHandler
 import dev.whysoezzy.meet.config.PushWebConfiguration
 import dev.whysoezzy.meet.config.StorageProperties
+import dev.whysoezzy.meet.config.AdminProperties
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.security.ApiAccessDeniedHandler
 import dev.whysoezzy.meet.security.ApiAuthenticationEntryPoint
+import dev.whysoezzy.meet.security.AdminKeyAuthFilter
 import dev.whysoezzy.meet.security.AuthUtils
+import dev.whysoezzy.meet.security.JwtAuthFilter
 import dev.whysoezzy.meet.security.JwtService
+import dev.whysoezzy.meet.security.SecurityConfig
 import dev.whysoezzy.meet.service.push.InstallationStatus
 import dev.whysoezzy.meet.service.push.PushFid
 import dev.whysoezzy.meet.service.push.PushInstallationMutation
@@ -35,7 +39,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 
 @WebMvcTest(controllers = [PushInstallationController::class])
-@org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc(addFilters = false)
 @org.springframework.context.annotation.Import(
     ApiExceptionHandler::class,
     ApiErrorResponseWriter::class,
@@ -43,6 +46,9 @@ import kotlin.test.assertEquals
     StorageProperties::class,
     ApiAuthenticationEntryPoint::class,
     ApiAccessDeniedHandler::class,
+    AdminKeyAuthFilter::class,
+    JwtAuthFilter::class,
+    SecurityConfig::class,
 )
 class PushInstallationControllerMvcTest @Autowired constructor(
     private val mockMvc: MockMvc,
@@ -58,6 +64,9 @@ class PushInstallationControllerMvcTest @Autowired constructor(
 
     @MockitoBean
     private lateinit var userRepository: UserRepository
+
+    @MockitoBean
+    private lateinit var adminProperties: AdminProperties
 
     private val installationId = UUID.fromString("123e4567-e89b-12d3-a456-426614174000")
     private val seenAt = Instant.parse("2026-09-11T20:00:00Z")

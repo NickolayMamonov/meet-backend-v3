@@ -3,6 +3,7 @@ package dev.whysoezzy.meet.service.push
 import dev.whysoezzy.meet.api.error.ApiException
 import dev.whysoezzy.meet.api.error.BadRequestException
 import dev.whysoezzy.meet.api.error.NotFoundException
+import dev.whysoezzy.meet.api.error.PushUnavailableException
 import org.springframework.context.annotation.Conditional
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.stereotype.Component
@@ -126,6 +127,9 @@ class PushDiagnosticService(
             )
 
             val first = call(selected, message)
+            if (first.localFailure && command.mode == PushDiagnosticMode.SINGLE) {
+                throw unavailable()
+            }
             val firstInvalidation = if (first.result == DiagnosticCallResult.InvalidTarget) {
                 invalidate(selected, first.sentFid)
             } else {
@@ -134,6 +138,14 @@ class PushDiagnosticService(
             if (command.mode == PushDiagnosticMode.SINGLE) {
                 if (firstInvalidation == InvalidationOutcome.FAILED) throw unavailable()
                 return PushDiagnosticResponse.Single(first.result)
+            }
+
+            if (first.localFailure) {
+                return PushDiagnosticResponse.Pair(
+                    result = DiagnosticAggregateResult.INCONCLUSIVE,
+                    first = first.result,
+                    second = DiagnosticCallResult.NotAttempted,
+                )
             }
 
             if (firstInvalidation != InvalidationOutcome.CONTINUE) {
@@ -218,6 +230,7 @@ class PushDiagnosticService(
                 DiagnosticCallResult.ProviderUnavailable,
                 selection.fid,
                 selection.registrationVersion,
+                localFailure = true,
             )
         }
     }
@@ -255,8 +268,7 @@ class PushDiagnosticService(
         }
     }
 
-    private fun unavailable() =
-        ApiException(HttpStatus.SERVICE_UNAVAILABLE, "PUSH_UNAVAILABLE", "Push delivery is unavailable")
+    private fun unavailable() = PushUnavailableException()
 
     private enum class InvalidationOutcome {
         CONTINUE,
@@ -268,6 +280,7 @@ class PushDiagnosticService(
         val result: DiagnosticCallResult,
         val sentFid: PushFid,
         val registrationVersion: Long,
+        val localFailure: Boolean = false,
     )
 
     private companion object {

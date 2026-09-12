@@ -128,8 +128,24 @@ CREATE TABLE meeting_reminder_targets (
         (status = 'PENDING' AND attempts = 0)
         OR (status = 'LEASED' AND attempts BETWEEN 1 AND 5)
         OR (status = 'RETRY_WAIT' AND attempts BETWEEN 1 AND 4)
-        OR (status IN ('SENT', 'INVALID', 'FAILED') AND attempts BETWEEN 1 AND 5)
-        OR (status = 'SKIPPED' AND attempts BETWEEN 0 AND 5)
+        OR (status = 'SENT' AND attempts BETWEEN 1 AND 5 AND reason = 'ACCEPTED')
+        OR (status = 'INVALID' AND attempts BETWEEN 1 AND 5 AND reason = 'UNREGISTERED')
+        OR (status = 'FAILED' AND attempts = 5 AND reason = 'ATTEMPTS_EXHAUSTED')
+        OR (
+            status = 'SKIPPED'
+            AND attempts BETWEEN 0 AND 5
+            AND reason IN (
+                'USER_UNAVAILABLE',
+                'OPTED_OUT',
+                'LEFT_MEETING',
+                'MEETING_UNAVAILABLE',
+                'START_CHANGED',
+                'STARTED',
+                'INSTALLATION_UNAVAILABLE',
+                'INSTALLATION_STALE',
+                'DEADLINE_PASSED'
+            )
+        )
     )
 );
 

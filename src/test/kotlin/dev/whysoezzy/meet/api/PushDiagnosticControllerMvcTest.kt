@@ -6,10 +6,14 @@ import dev.whysoezzy.meet.api.error.ApiExceptionHandler
 import dev.whysoezzy.meet.config.PushWebConfiguration
 import dev.whysoezzy.meet.config.StorageProperties
 import dev.whysoezzy.meet.config.AdminProperties
+import dev.whysoezzy.meet.api.error.PushUnavailableException
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import dev.whysoezzy.meet.security.ApiAccessDeniedHandler
 import dev.whysoezzy.meet.security.ApiAuthenticationEntryPoint
+import dev.whysoezzy.meet.security.AdminKeyAuthFilter
+import dev.whysoezzy.meet.security.JwtAuthFilter
 import dev.whysoezzy.meet.security.JwtService
+import dev.whysoezzy.meet.security.SecurityConfig
 import dev.whysoezzy.meet.service.push.DiagnosticAggregateResult
 import dev.whysoezzy.meet.service.push.DiagnosticCallResult
 import dev.whysoezzy.meet.service.push.PushDiagnosticCommand
@@ -32,7 +36,6 @@ import java.util.UUID
 import kotlin.test.assertEquals
 
 @WebMvcTest(controllers = [AdminPushController::class])
-@org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc(addFilters = false)
 @TestPropertySource(
     properties = [
         "app.push.provider-enabled=true",
@@ -46,6 +49,9 @@ import kotlin.test.assertEquals
     StorageProperties::class,
     ApiAuthenticationEntryPoint::class,
     ApiAccessDeniedHandler::class,
+    AdminKeyAuthFilter::class,
+    JwtAuthFilter::class,
+    SecurityConfig::class,
 )
 class PushDiagnosticControllerMvcTest @Autowired constructor(
     private val mockMvc: MockMvc,
@@ -157,5 +163,50 @@ class PushDiagnosticControllerMvcTest @Autowired constructor(
         )
             .andExpect(status().isUnsupportedMediaType)
         Mockito.verifyNoInteractions(service)
+    }
+
+    @Test
+    fun `diagnostic requires the existing admin key boundary`() {
+        Mockito.`when`(adminProperties.apiKey).thenReturn("test-admin-key")
+        val valid = """{"userId":7,"installationId":"$installationId","meetingId":42,"reminderOffsetMinutes":60,"mode":"SINGLE"}"""
+
+        mockMvc.perform(
+            post("/admin/push/diagnostic")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(valid),
+        )
+            .andExpect(status().isForbidden)
+
+        mockMvc.perform(
+            post("/admin/push/diagnostic")
+                .header("X-Admin-Key", "wrong-key")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(valid),
+        )
+            .andExpect(status().isForbidden)
+    }
+
+    @Test
+    fun `provider infrastructure failure is returned as sanitized 503`() {
+        Mockito.`when`(adminProperties.apiKey).thenReturn("test-admin-key")
+        val command = PushDiagnosticCommand(
+            7,
+            UUID.fromString(installationId),
+            42,
+            60,
+            PushDiagnosticMode.SINGLE,
+        )
+        Mockito.`when`(service.send(command)).thenThrow(PushUnavailableException())
+
+        mockMvc.perform(
+            post("/admin/push/diagnostic")
+                .header("X-Admin-Key", "test-admin-key")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(
+                    """{"userId":7,"installationId":"$installationId","meetingId":42,"reminderOffsetMinutes":60,"mode":"SINGLE"}""",
+                ),
+        )
+            .andExpect(status().isServiceUnavailable)
+            .andExpect(jsonPath("$.code").value("PUSH_UNAVAILABLE"))
     }
 }
