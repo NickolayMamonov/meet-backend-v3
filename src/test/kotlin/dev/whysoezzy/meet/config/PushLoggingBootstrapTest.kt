@@ -160,6 +160,8 @@ class PushLoggingBootstrapTest {
         assertEquals(0, profileOnly.credentialTouches)
         assertEquals(0, profileOnly.firebaseAppTouches)
         assertEquals(0, profileOnly.providerTouches)
+        assertEquals(0, profileOnly.downstreamEvents)
+        assertEquals(0, profileOnly.initializerEntries)
         assertSafeBootstrapOutput(profileOnly)
 
         val cliWins = runApplication(
