@@ -11,8 +11,9 @@ object ReminderRetryPolicy {
     private val BASE_DELAYS = longArrayOf(30, 60, 120, 240)
 
     /**
-     * [attempt] is the attempt that just completed (1..4). A null result is
-     * terminal: there is no legal fifth retry slot or no time left.
+     * [attempt] is the attempt that just completed (1..4). At the inclusive
+     * deadline/start boundary, a zero-delay retry keeps the fifth attempt
+     * durable without scheduling before now or at/after the meeting start.
      */
     fun nextAttemptAt(
         targetId: UUID,
@@ -31,7 +32,11 @@ object ReminderRetryPolicy {
             meetingStart.toEpochMilli() - 1,
         )
         val candidate = min(requested.toEpochMilli(), latest)
-        return if (candidate > now.toEpochMilli()) Instant.ofEpochMilli(candidate) else null
+        return when {
+            candidate > now.toEpochMilli() -> Instant.ofEpochMilli(candidate)
+            !now.isAfter(deadline) && now.isBefore(meetingStart) -> now
+            else -> null
+        }
     }
 
     private fun deterministicJitter(targetId: UUID, attempt: Int, bound: Long): Long {

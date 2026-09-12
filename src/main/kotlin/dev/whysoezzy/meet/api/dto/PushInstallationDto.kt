@@ -9,7 +9,9 @@ data class PushInstallationRequest(
     @field:NotBlank(message = "FID is required")
     @field:Size(max = 1024, message = "FID is too long")
     val fid: String,
-)
+) {
+    override fun toString(): String = "PushInstallationRequest(redacted)"
+}
 
 data class PushInstallationDto(
     val installationId: UUID,

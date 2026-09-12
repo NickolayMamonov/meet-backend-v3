@@ -41,5 +41,15 @@ class ReminderRetryPolicyTest {
                 now,
             ),
         )
+        assertEquals(
+            now,
+            ReminderRetryPolicy.nextAttemptAt(
+                id,
+                1,
+                now,
+                now,
+                now.plusSeconds(60),
+            ),
+        )
     }
 }

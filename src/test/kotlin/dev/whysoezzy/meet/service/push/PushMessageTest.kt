@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.service.push
 
+import dev.whysoezzy.meet.api.dto.PushInstallationRequest
 import org.junit.jupiter.api.Test
 import java.time.Instant
 import java.util.UUID
@@ -36,6 +37,7 @@ class PushMessageTest {
     @Test
     fun `fid is opaque and bounded by utf8 bytes`() {
         assertFalse(parseFid("opaque").toString().contains("opaque"))
+        assertFalse(PushInstallationRequest("opaque").toString().contains("opaque"))
         assertFailsWith<IllegalArgumentException> { parseFid("") }
         assertFailsWith<IllegalArgumentException> { parseFid("\u0000") }
         assertFailsWith<IllegalArgumentException> { parseFid("é".repeat(513)) }

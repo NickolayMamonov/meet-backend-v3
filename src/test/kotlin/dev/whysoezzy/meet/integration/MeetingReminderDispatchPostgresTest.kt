@@ -232,6 +232,48 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
         ))
     }
 
+    @Test
+    fun `transient failure at the inclusive deadline remains retryable until attempt five`() {
+        val issuedAt = databaseNow()
+        seedReminder(issuedAt)
+        val lease = requireNotNull(dispatch.leaseNext())
+        val prepared = requireNotNull(dispatch.prepareSend(lease, issuedAt))
+        val deadline = jdbcTemplate.queryForObject(
+            "SELECT deadline_at FROM meeting_reminder_claims WHERE id = ?",
+            java.sql.Timestamp::class.java,
+            lease.claimId,
+        )!!.toInstant()
+
+        assertEquals(
+            true,
+            dispatch.finalize(lease, prepared, ReminderFinalization.TransientFailure, deadline),
+        )
+        assertEquals(
+            "RETRY_WAIT",
+            jdbcTemplate.queryForObject(
+                "SELECT status FROM meeting_reminder_targets WHERE id = ?",
+                String::class.java,
+                lease.targetId,
+            ),
+        )
+        assertEquals(
+            1,
+            jdbcTemplate.queryForObject(
+                "SELECT attempts FROM meeting_reminder_targets WHERE id = ?",
+                Int::class.java,
+                lease.targetId,
+            ),
+        )
+        assertEquals(
+            deadline,
+            jdbcTemplate.queryForObject(
+                "SELECT next_attempt_at FROM meeting_reminder_targets WHERE id = ?",
+                java.sql.Timestamp::class.java,
+                lease.targetId,
+            )!!.toInstant(),
+        )
+    }
+
     private fun seedReminder(now: Instant): ApiFixture {
         val fixture = fixture()
         jdbcTemplate.update(
