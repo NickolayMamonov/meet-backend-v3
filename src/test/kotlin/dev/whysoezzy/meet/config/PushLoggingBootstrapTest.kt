@@ -105,6 +105,8 @@ class PushLoggingBootstrapTest {
 
         assertNotNull(result.failure)
         assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, rootMessage(result.failure!!))
+        assertEquals(0, result.credentialTouches)
+        assertEquals(0, result.firebaseAppTouches)
         assertEquals(0, result.providerTouches)
         assertEquals(0, result.downstreamEvents)
         assertEquals(0, result.initializerEntries)
@@ -128,6 +130,8 @@ class PushLoggingBootstrapTest {
 
         assertNotNull(result.failure)
         assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, rootMessage(result.failure!!))
+        assertEquals(0, result.credentialTouches)
+        assertEquals(0, result.firebaseAppTouches)
         assertEquals(0, result.providerTouches)
         assertEquals(0, downstreamEvents.get())
         assertEquals(0, initializerEntries.get())
@@ -153,6 +157,9 @@ class PushLoggingBootstrapTest {
         )
         assertNotNull(profileOnly.failure)
         assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, rootMessage(profileOnly.failure!!))
+        assertEquals(0, profileOnly.credentialTouches)
+        assertEquals(0, profileOnly.firebaseAppTouches)
+        assertEquals(0, profileOnly.providerTouches)
         assertSafeBootstrapOutput(profileOnly)
 
         val cliWins = runApplication(
@@ -166,6 +173,8 @@ class PushLoggingBootstrapTest {
         assertTrue(cliWins.failure == null)
         assertTrue(cliWins.downstreamEvents > 0)
         assertTrue(cliWins.initializerEntries > 0)
+        assertEquals(0, cliWins.credentialTouches)
+        assertEquals(0, cliWins.firebaseAppTouches)
         assertEquals(0, cliWins.providerTouches)
     }
 
