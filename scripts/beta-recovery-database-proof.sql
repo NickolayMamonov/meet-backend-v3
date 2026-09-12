@@ -153,12 +153,7 @@ schema_checks AS (
          FROM information_schema.tables
          WHERE table_schema = current_schema()
            AND table_type = 'BASE TABLE'
-           AND table_name <> 'flyway_schema_history'
-           AND table_name NOT IN (
-               'push_installations',
-               'meeting_reminder_claims',
-               'meeting_reminder_targets'
-           )) = 19 AS exact_required_table_count,
+           AND table_name <> 'flyway_schema_history') = 19 AS exact_required_table_count,
         (SELECT count(*)
          FROM expected_indexes expected
          JOIN pg_class index_class
@@ -215,15 +210,13 @@ schema_checks AS (
 ),
 flyway_check AS (
     SELECT COALESCE((
-        count(*) FILTER (WHERE success AND version::int <= 9) = 9
-        AND count(*) FILTER (WHERE NOT success AND version::int <= 9) = 0
+        count(*) FILTER (WHERE success) = 9
+        AND count(*) FILTER (WHERE NOT success) = 0
         AND array_agg(version ORDER BY installed_rank)
-            FILTER (WHERE success AND version::int <= 9) =
-                ARRAY['1', '2', '3', '4', '5', '6', '7', '8', '9']::varchar[]
+            FILTER (WHERE success) = ARRAY['1', '2', '3', '4', '5', '6', '7', '8', '9']::varchar[]
         AND array_agg(installed_rank ORDER BY installed_rank)
-            FILTER (WHERE success AND version::int <= 9) =
-                ARRAY[1, 2, 3, 4, 5, 6, 7, 8, 9]::integer[]
-        AND count(*) FILTER (WHERE success AND version::int <= 9 AND type = 'SQL') = 9
+            FILTER (WHERE success) = ARRAY[1, 2, 3, 4, 5, 6, 7, 8, 9]::integer[]
+        AND count(*) FILTER (WHERE success AND type = 'SQL') = 9
     ), false) AS valid
     FROM flyway_schema_history
 ),

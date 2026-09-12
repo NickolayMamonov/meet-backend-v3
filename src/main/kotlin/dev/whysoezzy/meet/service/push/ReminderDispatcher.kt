@@ -426,11 +426,12 @@ class JdbcReminderDispatchStore(
             jdbc.queryForList("SELECT id FROM users WHERE id = ? FOR UPDATE", Long::class.java, userId)
             jdbc.queryForList("SELECT id FROM meeting_reminder_claims WHERE id = ? FOR UPDATE", UUID::class.java, claimId)
             jdbc.queryForList("SELECT id FROM meeting_reminder_targets WHERE id = ? FOR UPDATE", UUID::class.java, targetId)
+            val reason = recoveryReason(targetId) ?: return@forEach
             if (
                 jdbc.update(
                     """
                     UPDATE meeting_reminder_targets
-                    SET status = 'SKIPPED', reason = 'DEADLINE_PASSED',
+                    SET status = 'SKIPPED', reason = ?,
                         lease_token = NULL, lease_until = NULL, completed_at = ?
                     WHERE id = ? AND status IN ('PENDING', 'RETRY_WAIT')
                       AND lease_token IS NULL
@@ -439,6 +440,7 @@ class JdbcReminderDispatchStore(
                           WHERE c.id = claim_id AND c.deadline_at <= clock_timestamp()
                       )
                     """.trimIndent(),
+                    reason,
                     timestamp(now),
                     targetId,
                 ) > 0
@@ -733,6 +735,36 @@ class JdbcReminderDispatchStore(
         }
         return expired
     }
+
+    private fun recoveryReason(targetId: UUID): String? =
+        jdbc.query(
+            """
+            SELECT CASE
+                WHEN u.deleted_at IS NOT NULL THEN 'USER_UNAVAILABLE'
+                WHEN NOT u.notifications_enabled THEN 'OPTED_OUT'
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM meeting_participants mp
+                    WHERE mp.user_id = t.user_id AND mp.meeting_id = c.meeting_id
+                ) THEN 'LEFT_MEETING'
+                WHEN m.status <> 'ACTIVE' THEN 'MEETING_UNAVAILABLE'
+                WHEN m.time <> c.meeting_start_ms
+                     OR m.push_start_version <> c.start_version THEN 'START_CHANGED'
+                WHEN m.time <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint THEN 'STARTED'
+                WHEN i.status <> 'ACTIVE' OR i.fid IS NULL THEN 'INSTALLATION_UNAVAILABLE'
+                WHEN i.last_seen_at <= clock_timestamp() - INTERVAL '35 days' THEN 'INSTALLATION_STALE'
+                ELSE 'DEADLINE_PASSED'
+            END AS reason
+            FROM meeting_reminder_targets t
+            JOIN meeting_reminder_claims c ON c.id = t.claim_id
+            JOIN users u ON u.id = t.user_id
+            JOIN meetings m ON m.id = c.meeting_id
+            JOIN push_installations i ON i.id = t.installation_id
+            WHERE t.id = ? AND t.status IN ('PENDING', 'RETRY_WAIT')
+              AND t.lease_token IS NULL
+            """.trimIndent(),
+            { rs, _ -> rs.getString("reason") },
+            targetId,
+        ).firstOrNull()
 
     private fun lockCompletionRows(lease: ReminderLease) {
         jdbc.queryForList("SELECT id FROM users WHERE id = ? FOR UPDATE", Long::class.java, lease.userId)

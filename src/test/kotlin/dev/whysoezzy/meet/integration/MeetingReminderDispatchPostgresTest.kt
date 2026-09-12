@@ -218,7 +218,7 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
             ),
         )
         assertEquals(
-            "DEADLINE_PASSED",
+            "STARTED",
             jdbcTemplate.queryForObject(
                 "SELECT reason FROM meeting_reminder_targets WHERE id = ?",
                 String::class.java,
