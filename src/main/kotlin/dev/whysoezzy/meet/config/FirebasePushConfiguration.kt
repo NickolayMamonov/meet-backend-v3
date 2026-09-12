@@ -48,7 +48,7 @@ class FirebasePushConfiguration {
             val credentials = Files.newInputStream(credentialsPath).use { input ->
                 ServiceAccountCredentials.fromStream(input)
             }
-            require(credentials.projectId == settings.projectId) {
+            require(credentials.projectId == PushRuntimeSettings.EXPECTED_PROJECT_ID) {
                 throw invalidConfiguration()
             }
             val scopedCredentials = credentials
@@ -56,7 +56,7 @@ class FirebasePushConfiguration {
                 .createWithCustomRetryStrategy(false)
             val options = FirebaseOptions.builder()
                 .setCredentials(scopedCredentials)
-                .setProjectId(settings.projectId)
+                .setProjectId(PushRuntimeSettings.EXPECTED_PROJECT_ID)
                 .setConnectTimeout(PushRuntimeSettings.FCM_CONNECT_TIMEOUT_MS)
                 .setReadTimeout(PushRuntimeSettings.FCM_READ_TIMEOUT_MS)
                 .setWriteTimeout(PushRuntimeSettings.FCM_WRITE_TIMEOUT_MS)

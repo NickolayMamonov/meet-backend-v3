@@ -19,6 +19,7 @@ class PushRuntimeSettings private constructor(
         get() = maintenanceEnabled || discoveryEnabled || dispatchEnabled
 
     companion object {
+        const val EXPECTED_PROJECT_ID = "meeting-1d258"
         const val DISCOVERY_INTERVAL_SECONDS = 60L
         const val MAINTENANCE_INTERVAL_SECONDS = 60L
         const val IDLE_DISPATCH_DELAY_SECONDS = 1L
@@ -35,7 +36,7 @@ class PushRuntimeSettings private constructor(
 
         fun from(properties: PushProperties): PushRuntimeSettings {
             val projectId = properties.projectId
-            require(projectId.isNotEmpty() && PROJECT_ID.matches(projectId)) {
+            require(projectId == EXPECTED_PROJECT_ID) {
                 INVALID_CONFIGURATION
             }
             val credentialsFile = properties.credentialsFile
@@ -58,7 +59,6 @@ class PushRuntimeSettings private constructor(
             )
         }
 
-        private val PROJECT_ID = Regex("^[a-z][a-z0-9-]{4,127}$")
         const val INVALID_CONFIGURATION = "PUSH_CONFIG_INVALID"
     }
 

@@ -9,7 +9,7 @@ class PushProperties(
     val dispatchEnabled: Boolean = false,
     val diagnosticEnabled: Boolean = false,
     val maintenanceEnabled: Boolean = false,
-    val projectId: String = "meeting-1d258",
+    val projectId: String = PushRuntimeSettings.EXPECTED_PROJECT_ID,
     val credentialsFile: String = "",
 ) {
     override fun toString(): String = "PushProperties(redacted)"

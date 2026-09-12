@@ -16,7 +16,7 @@ class PushPropertiesTest {
         assertFalse(properties.dispatchEnabled)
         assertFalse(properties.diagnosticEnabled)
         assertFalse(properties.maintenanceEnabled)
-        assertEquals("meeting-1d258", properties.projectId)
+        assertEquals(PushRuntimeSettings.EXPECTED_PROJECT_ID, properties.projectId)
         assertEquals("", properties.credentialsFile)
         assertEquals("PushProperties(redacted)", properties.toString())
     }
@@ -54,5 +54,19 @@ class PushPropertiesTest {
         assertFailsWith<IllegalArgumentException> {
             PushRuntimeSettings.from(PushProperties(dispatchEnabled = true))
         }
+    }
+
+    @Test
+    fun `runtime settings accept only the dedicated Firebase project`() {
+        val failure = assertFailsWith<IllegalArgumentException> {
+            PushRuntimeSettings.from(
+                PushProperties(
+                    projectId = "another-valid-project",
+                    credentialsFile = "/run/secrets/firebase.json",
+                ),
+            )
+        }
+
+        assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, failure.message)
     }
 }

@@ -210,6 +210,54 @@ class FirebasePushConfigurationTest {
         }
     }
 
+    @Test
+    fun `alternate valid project is rejected before credential or Firebase app touch`() {
+        val alternateProject = "another-valid-project"
+        val credentialPath = kotlin.io.path.createTempFile("alternate-project-secret", ".json")
+        val credentialTouches = AtomicInteger()
+        val appTouches = AtomicInteger()
+        val credentialStatic = mockStatic(ServiceAccountCredentials::class.java)
+        val appStatic = mockStatic(FirebaseApp::class.java)
+        try {
+            Files.writeString(credentialPath, syntheticServiceAccountJson(project = alternateProject))
+            credentialStatic.`when`<ServiceAccountCredentials> {
+                ServiceAccountCredentials.fromStream(any(InputStream::class.java))
+            }.thenAnswer {
+                credentialTouches.incrementAndGet()
+                mock(ServiceAccountCredentials::class.java)
+            }
+            appStatic.`when`<FirebaseApp> {
+                FirebaseApp.initializeApp(any(FirebaseOptions::class.java), anyString())
+            }.thenAnswer {
+                appTouches.incrementAndGet()
+                mock(FirebaseApp::class.java)
+            }
+
+            val failure = withSafeLoggingState {
+                assertFailsWith<IllegalStateException> {
+                    FirebasePushConfiguration().firebasePushProvider(
+                        PushProperties(
+                            providerEnabled = true,
+                            projectId = alternateProject,
+                            credentialsFile = credentialPath.toString(),
+                        ),
+                        MockEnvironment(),
+                    )
+                }
+            }
+
+            assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, failure.message)
+            assertEquals(0, credentialTouches.get())
+            assertEquals(0, appTouches.get())
+            assertFalse(failure.stackTraceToString().contains(alternateProject))
+            assertFalse(failure.stackTraceToString().contains(credentialPath.toString()))
+        } finally {
+            appStatic.close()
+            credentialStatic.close()
+            Files.deleteIfExists(credentialPath)
+        }
+    }
+
     private fun <T> withSafeLoggingState(action: () -> T): T {
         val context = LoggerFactory.getILoggerFactory() as LoggerContext
         val loggers = context.loggerList
@@ -273,7 +321,7 @@ class FirebasePushConfigurationTest {
         """.trimIndent()
 
     private companion object {
-        const val SYNTHETIC_PROJECT = "meeting-1d258"
+        const val SYNTHETIC_PROJECT = PushRuntimeSettings.EXPECTED_PROJECT_ID
         val protectedJulNames = listOf(
             "com.google.auth",
             "com.google.api.client",

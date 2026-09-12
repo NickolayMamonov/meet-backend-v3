@@ -268,6 +268,33 @@ class PushLoggingBootstrapTest {
         assertTrue(result.providerTouches > 0)
     }
 
+    @Test
+    fun `real bootstrap rejects an alternate valid Firebase project before any provider touch`(
+        @TempDir directory: Path,
+    ) {
+        val alternateProject = "another-valid-project"
+        val credentialPath = directory.resolve("alternate-project-secret.json")
+        Files.writeString(credentialPath, "{}")
+
+        val result = runApplication(
+            arguments = arrayOf(
+                "--spring.main.banner-mode=off",
+                "--app.push.provider-enabled=true",
+                "--app.push.credentials-file=$credentialPath",
+                "--app.push.project-id=$alternateProject",
+            ),
+        )
+
+        assertNotNull(result.failure)
+        assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, rootMessage(result.failure!!))
+        assertEquals(0, result.credentialTouches)
+        assertEquals(0, result.firebaseAppTouches)
+        assertEquals(0, result.providerTouches)
+        assertTrue(result.downstreamEvents > 0)
+        assertTrue(result.initializerEntries > 0)
+        assertSafeBootstrapOutput(result, alternateProject, credentialPath.toString())
+    }
+
     private fun runApplication(
         emitSafeControl: Boolean = false,
         downstreamEvents: AtomicInteger = AtomicInteger(),
@@ -504,7 +531,10 @@ class PushLoggingBootstrapTest {
                 dispatchEnabled = environment.getProperty("app.push.dispatch-enabled", Boolean::class.java, false),
                 diagnosticEnabled = environment.getProperty("app.push.diagnostic-enabled", Boolean::class.java, false),
                 maintenanceEnabled = environment.getProperty("app.push.maintenance-enabled", Boolean::class.java, false),
-                projectId = environment.getProperty("app.push.project-id", "meeting-1d258"),
+                projectId = environment.getProperty(
+                    "app.push.project-id",
+                    PushRuntimeSettings.EXPECTED_PROJECT_ID,
+                ),
                 credentialsFile = environment.getProperty("app.push.credentials-file", ""),
             )
 
