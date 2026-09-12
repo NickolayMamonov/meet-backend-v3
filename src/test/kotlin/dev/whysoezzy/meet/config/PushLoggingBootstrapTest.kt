@@ -202,6 +202,11 @@ class PushLoggingBootstrapTest {
             )
             assertNotNull(result.failure)
             assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, rootMessage(result.failure!!))
+            assertEquals(0, result.credentialTouches)
+            assertEquals(0, result.firebaseAppTouches)
+            assertEquals(0, result.providerTouches)
+            assertEquals(0, result.downstreamEvents)
+            assertEquals(0, result.initializerEntries)
             assertSafeBootstrapOutput(result)
         } finally {
             Files.walk(directory).sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) }
