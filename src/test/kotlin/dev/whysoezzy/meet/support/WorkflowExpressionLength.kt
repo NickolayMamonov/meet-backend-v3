@@ -319,8 +319,8 @@ object WorkflowExpressionLength {
         val trimmed: String,
     ) {
         fun covers(value: String): Boolean =
-            trimDotNetWhitespace(value.substring(0, start)).isEmpty() &&
-                trimDotNetWhitespace(value.substring(end)).isEmpty()
+            start == 0 &&
+                end == value.length
     }
 
     private fun findExpressions(value: String): List<Expression> {
@@ -409,7 +409,9 @@ object WorkflowExpressionLength {
                 val identifier = value.substring(start, index)
                 var next = index
                 while (next < value.length && isDotNetWhitespace(value[next].code)) next++
-                val isMemberAccess = start > 0 && value[start - 1] == '.'
+                var previous = start - 1
+                while (previous >= 0 && isDotNetWhitespace(value[previous].code)) previous--
+                val isMemberAccess = previous >= 0 && value[previous] == '.'
                 if (!isMemberAccess &&
                     next < value.length &&
                     value[next] == '(' &&

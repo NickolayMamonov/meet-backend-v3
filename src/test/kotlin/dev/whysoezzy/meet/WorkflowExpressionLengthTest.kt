@@ -131,6 +131,12 @@ class WorkflowExpressionLengthTest {
                 WorkflowExpressionLength.accountCondition(statusCall + body + "x")
             }
         }
+        for (separator in listOf(" ", "\u0085", "\u00A0", "\u202F")) {
+            assertEquals(
+                "success() && (github.${separator}success())".length,
+                WorkflowExpressionLength.accountCondition("github.${separator}success()").generatedLength,
+            )
+        }
         assertEquals(
             "success() && ('success()')".length,
             WorkflowExpressionLength.accountCondition("'success()'").generatedLength,
@@ -147,6 +153,54 @@ class WorkflowExpressionLengthTest {
             "success() && (failure-marker())".length,
             WorkflowExpressionLength.accountCondition("failure-marker()").generatedLength,
         )
+    }
+
+    @Test
+    fun `surrounding dotnet whitespace remains in runner-shaped expression accounting`() {
+        fun scalarValue(body: String) = "  \${{ $body }}  "
+        fun scalarGenerated(body: String) = "format('  {0}  ', $body)"
+
+        val scalarBody = "x".repeat(
+            WorkflowExpressionLength.LIMIT - scalarGenerated("").length,
+        )
+        assertEquals(
+            WorkflowExpressionLength.LIMIT,
+            WorkflowExpressionLength.accountScalar(scalarValue(scalarBody)).generatedLength,
+        )
+        assertEquals(
+            WorkflowExpressionLength.LIMIT + 1,
+            WorkflowExpressionLength.accountScalar(scalarValue("${scalarBody}x")).generatedLength,
+        )
+
+        fun nonStatusConditionValue(body: String) = scalarValue(body)
+        fun nonStatusConditionGenerated(body: String) =
+            "success() && (${scalarGenerated(body)})"
+
+        val nonStatusBody = "x".repeat(
+            WorkflowExpressionLength.LIMIT - nonStatusConditionGenerated("").length,
+        )
+        assertEquals(
+            WorkflowExpressionLength.LIMIT,
+            WorkflowExpressionLength.accountCondition(nonStatusConditionValue(nonStatusBody)).generatedLength,
+        )
+        assertThrows<WorkflowExpressionLength.Violation> {
+            WorkflowExpressionLength.accountCondition(nonStatusConditionValue("${nonStatusBody}x"))
+        }
+
+        fun statusConditionValue(body: String) = "  \${{ success() + $body }}  "
+        fun statusConditionGenerated(body: String) =
+            "format('  {0}  ', success() + $body)"
+
+        val statusBody = "x".repeat(
+            WorkflowExpressionLength.LIMIT - statusConditionGenerated("").length,
+        )
+        assertEquals(
+            WorkflowExpressionLength.LIMIT,
+            WorkflowExpressionLength.accountCondition(statusConditionValue(statusBody)).generatedLength,
+        )
+        assertThrows<WorkflowExpressionLength.Violation> {
+            WorkflowExpressionLength.accountCondition(statusConditionValue("${statusBody}x"))
+        }
     }
 
     @Test
