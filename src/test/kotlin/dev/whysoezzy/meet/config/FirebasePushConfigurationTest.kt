@@ -124,22 +124,36 @@ class FirebasePushConfigurationTest {
                 appTouches.incrementAndGet()
                 mock(FirebaseApp::class.java)
             }
-            val environment = MockEnvironment()
-                .withProperty("logging.level.org.apache.hc.client5.http2.frame.payload", "DEBUG")
-            val failure = withSafeLoggingState {
-                assertFailsWith<IllegalStateException> {
-                    FirebasePushConfiguration().firebasePushProvider(
-                        PushProperties(
-                            providerEnabled = true,
-                            projectId = SYNTHETIC_PROJECT,
-                            credentialsFile = credentials.toString(),
-                        ),
-                        environment,
-                    )
+            val transportNamespaces = listOf(
+                "org.apache.hc",
+                "org.apache.hc.client5",
+                "org.apache.hc.client5.http.headers",
+                "org.apache.hc.client5.http.wire",
+                "org.apache.hc.client5.http2.frame",
+                "org.apache.hc.client5.http2.frame.payload",
+                "org.apache.hc.client5.http2.flow",
+                "org.apache.hc.client5.synthetic.secret",
+                "org.apache.hc.core5",
+                "org.apache.hc.core5.synthetic.secret",
+            )
+            transportNamespaces.forEach { namespace ->
+                val environment = MockEnvironment()
+                    .withProperty("logging.level.$namespace", "DEBUG")
+                val failure = withSafeLoggingState {
+                    assertFailsWith<IllegalStateException> {
+                        FirebasePushConfiguration().firebasePushProvider(
+                            PushProperties(
+                                providerEnabled = true,
+                                projectId = SYNTHETIC_PROJECT,
+                                credentialsFile = credentials.toString(),
+                            ),
+                            environment,
+                        )
+                    }
                 }
+                assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, failure.message, namespace)
+                assertFalse(failure.stackTraceToString().contains(marker), namespace)
             }
-            assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, failure.message)
-            assertFalse(failure.stackTraceToString().contains(marker))
             assertEquals(0, credentialTouches.get())
             assertEquals(0, appTouches.get())
         } finally {

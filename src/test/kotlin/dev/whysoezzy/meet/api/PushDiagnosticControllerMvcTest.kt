@@ -187,6 +187,7 @@ class PushDiagnosticControllerMvcTest @Autowired constructor(private val mockMvc
         listOf(
             body(userId = 0), body(userId = -1), body(meetingId = 0), body(meetingId = -1),
             body(installationId = INSTALLATION_ID.uppercase()), body(installationId = "not-a-uuid"),
+            body(installationId = "123e4567-e89b-12d3-a456-42661417400"),
             body(offset = 59), body(offset = 1441), body(mode = "single"), body(mode = "BROADCAST"),
         ).forEach { mockMvc.perform(request(it, ADMIN_KEY)).andExpect(status().isBadRequest) }
         listOf("?topic=all", "?token=secret", "?userId=8", "?mode=SINGLE&mode=DEDUP_PAIR", "?empty=").forEach {
@@ -200,6 +201,19 @@ class PushDiagnosticControllerMvcTest @Autowired constructor(private val mockMvc
             post("/admin/push/diagnostic/unknown").header("X-Admin-Key", ADMIN_KEY)
                 .contentType(MediaType.APPLICATION_JSON).content(body()),
         ).andExpect(status().isNotFound)
+        Mockito.verifyNoInteractions(service)
+    }
+
+    @Test
+    fun `encoded noncanonical UUID is rejected before service interaction`() {
+        mockMvc.perform(
+            request(
+                body(installationId = "123e4567-e89b-12d3-a456-426614174%30%30%30"),
+                ADMIN_KEY,
+            ),
+        ).andExpect(status().isBadRequest)
+            .andExpect(jsonPath("$.code").value("BAD_REQUEST"))
+
         Mockito.verifyNoInteractions(service)
     }
 

@@ -233,6 +233,7 @@ class GoogleSdkLogGuardTest {
             "org.apache.hc.client5.http2.frame",
             "org.apache.hc.client5.http2.frame.payload",
             "org.apache.hc.client5.http2.flow",
+            "org.apache.hc.client5.synthetic.secret",
             "org.apache.hc.core5.synthetic.secret",
         )
     }

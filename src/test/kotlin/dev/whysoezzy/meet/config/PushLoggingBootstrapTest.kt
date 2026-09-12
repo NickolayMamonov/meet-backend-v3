@@ -3,7 +3,10 @@ package dev.whysoezzy.meet.config
 import ch.qos.logback.classic.spi.ILoggingEvent
 import ch.qos.logback.core.read.ListAppender
 import ch.qos.logback.classic.LoggerContext
-import dev.whysoezzy.meet.service.push.PushProvider
+import com.google.auth.oauth2.ServiceAccountCredentials
+import com.google.firebase.FirebaseApp
+import com.google.firebase.messaging.FirebaseMessaging
+import com.google.firebase.FirebaseOptions
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import org.junit.jupiter.api.parallel.ResourceLock
@@ -11,9 +14,12 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.Arguments
 import org.junit.jupiter.params.provider.MethodSource
 import org.mockito.Mockito.mock
+import org.mockito.Mockito.mockStatic
+import org.mockito.Mockito.any
+import org.mockito.Mockito.anyString
+import org.mockito.Mockito.doReturn
 import org.slf4j.LoggerFactory
 import org.springframework.boot.WebApplicationType
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.boot.context.event.ApplicationEnvironmentPreparedEvent
 import org.springframework.boot.context.logging.LoggingApplicationListener
 import org.springframework.boot.support.EnvironmentPostProcessorApplicationListener
@@ -28,6 +34,7 @@ import org.springframework.core.Ordered
 import org.springframework.core.env.ConfigurableEnvironment
 import org.springframework.mock.env.MockEnvironment
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.io.PrintStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -42,6 +49,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @ResourceLock("global-logging-state")
@@ -221,12 +229,37 @@ class PushLoggingBootstrapTest {
         }
     }
 
+    @Test
+    fun `provider enabled bootstrap reaches the real factory with synthetic local credentials`(
+        @TempDir directory: Path,
+    ) {
+        val credentials = directory.resolve("synthetic-credentials.json")
+        Files.writeString(credentials, "{}")
+
+        val result = runApplication(
+            arguments = arrayOf(
+                "--spring.main.banner-mode=off",
+                "--app.push.provider-enabled=true",
+                "--app.push.credentials-file=$credentials",
+                "--app.push.project-id=meeting-1d258",
+            ),
+        )
+
+        assertNull(result.failure)
+        assertTrue(result.contextActive)
+        assertTrue(result.credentialTouches > 0)
+        assertTrue(result.firebaseAppTouches > 0)
+        assertTrue(result.providerTouches > 0)
+    }
+
     private fun runApplication(
         emitSafeControl: Boolean = false,
         downstreamEvents: AtomicInteger = AtomicInteger(),
         initializerEntries: AtomicInteger = AtomicInteger(),
         arguments: Array<String>,
     ): BootstrapResult {
+        credentialTouchCounter.set(0)
+        firebaseAppTouchCounter.set(0)
         providerTouchCounter.set(0)
         val downstream = object : ApplicationListener<ApplicationEnvironmentPreparedEvent>, Ordered {
             override fun onApplicationEvent(event: ApplicationEnvironmentPreparedEvent) {
@@ -276,6 +309,33 @@ class PushLoggingBootstrapTest {
         julLoggers.forEach { it.addHandler(julHandler) }
         var context: ConfigurableApplicationContext? = null
         var failure: Throwable? = null
+        val credentials = mock(ServiceAccountCredentials::class.java)
+        doReturn("meeting-1d258").`when`(credentials).projectId
+        doReturn(credentials).`when`(credentials).createScoped(any<Collection<String>>())
+        doReturn(credentials).`when`(credentials).createWithCustomRetryStrategy(false)
+        val credentialStatic = mockStatic(ServiceAccountCredentials::class.java)
+        val appStatic = mockStatic(FirebaseApp::class.java)
+        val messagingStatic = mockStatic(FirebaseMessaging::class.java)
+        val app = mock(FirebaseApp::class.java)
+        val messaging = mock(FirebaseMessaging::class.java)
+        credentialStatic.`when`<ServiceAccountCredentials> {
+            ServiceAccountCredentials.fromStream(any(InputStream::class.java))
+        }.thenAnswer {
+            credentialTouchCounter.incrementAndGet()
+            credentials
+        }
+        appStatic.`when`<FirebaseApp> {
+            FirebaseApp.initializeApp(any(FirebaseOptions::class.java), anyString())
+        }.thenAnswer {
+            firebaseAppTouchCounter.incrementAndGet()
+            app
+        }
+        messagingStatic.`when`<FirebaseMessaging> {
+            FirebaseMessaging.getInstance(any(FirebaseApp::class.java))
+        }.thenAnswer {
+            providerTouchCounter.incrementAndGet()
+            messaging
+        }
         try {
             System.setOut(PrintStream(stdout, true, StandardCharsets.UTF_8))
             System.setErr(PrintStream(stderr, true, StandardCharsets.UTF_8))
@@ -304,11 +364,16 @@ class PushLoggingBootstrapTest {
                 },
                 contextActive = context?.isActive == true,
                 providerTouches = providerTouchCounter.get(),
+                credentialTouches = credentialTouchCounter.get(),
+                firebaseAppTouches = firebaseAppTouchCounter.get(),
                 downstreamEvents = downstreamEvents.get(),
                 initializerEntries = initializerEntries.get(),
             )
         } finally {
             context?.close()
+            messagingStatic.close()
+            appStatic.close()
+            credentialStatic.close()
             julLoggers.forEach { it.removeHandler(julHandler) }
             applicationLogger.detachAppender(applicationEvents)
             safeControlLogger.detachAppender(applicationEvents)
@@ -406,6 +471,8 @@ class PushLoggingBootstrapTest {
         val effectiveLevels: Map<String, String>,
         val contextActive: Boolean,
         val providerTouches: Int,
+        val credentialTouches: Int,
+        val firebaseAppTouches: Int,
         val downstreamEvents: Int,
         val initializerEntries: Int,
     )
@@ -425,12 +492,6 @@ class PushLoggingBootstrapTest {
                 credentialsFile = environment.getProperty("app.push.credentials-file", ""),
             )
 
-        @Bean
-        @ConditionalOnProperty(prefix = "app.push", name = ["provider-enabled"], havingValue = "true")
-        fun failOnProviderTouch(): PushProvider {
-            providerTouchCounter.incrementAndGet()
-            return mock(PushProvider::class.java)
-        }
     }
 
     private class RecordingHandler(
@@ -446,6 +507,8 @@ class PushLoggingBootstrapTest {
     }
 
     private companion object {
+        val credentialTouchCounter = AtomicInteger()
+        val firebaseAppTouchCounter = AtomicInteger()
         val providerTouchCounter = AtomicInteger()
         val protectedJulNames = listOf(
             "com.google.auth",
@@ -468,6 +531,7 @@ class PushLoggingBootstrapTest {
                 "org.apache.hc.client5.http2.frame",
                 "org.apache.hc.client5.http2.frame.payload",
                 "org.apache.hc.client5.http2.flow",
+                "org.apache.hc.client5.synthetic.secret",
                 "org.apache.hc.core5.synthetic.secret",
             )
             val restrictedSqlNames = listOf(
