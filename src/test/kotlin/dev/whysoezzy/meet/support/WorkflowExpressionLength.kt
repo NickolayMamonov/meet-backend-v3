@@ -408,7 +408,7 @@ object WorkflowExpressionLength {
                 while (index < value.length && isIdentifierPart(value[index])) index++
                 val identifier = value.substring(start, index)
                 var next = index
-                while (next < value.length && value[next].isWhitespace()) next++
+                while (next < value.length && isDotNetWhitespace(value[next].code)) next++
                 val isMemberAccess = start > 0 && value[start - 1] == '.'
                 if (!isMemberAccess &&
                     next < value.length &&

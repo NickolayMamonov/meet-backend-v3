@@ -120,6 +120,17 @@ class WorkflowExpressionLengthTest {
             "success ( )".length,
             WorkflowExpressionLength.accountCondition("success ( )").generatedLength,
         )
+        for (separator in listOf("\u0085", "\u00A0")) {
+            val statusCall = "success${separator}()"
+            val body = "x".repeat(WorkflowExpressionLength.LIMIT - statusCall.length)
+            assertEquals(
+                WorkflowExpressionLength.LIMIT,
+                WorkflowExpressionLength.accountCondition(statusCall + body).generatedLength,
+            )
+            assertThrows<WorkflowExpressionLength.Violation> {
+                WorkflowExpressionLength.accountCondition(statusCall + body + "x")
+            }
+        }
         assertEquals(
             "success() && ('success()')".length,
             WorkflowExpressionLength.accountCondition("'success()'").generatedLength,

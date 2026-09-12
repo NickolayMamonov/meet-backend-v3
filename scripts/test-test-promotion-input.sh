@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-FILTER=$ROOT_DIR/scripts/build-test-promotion-input.jq
+FILTER=${PROMOTION_INPUT_FILTER:-$ROOT_DIR/scripts/build-test-promotion-input.jq}
 BUILDER=$ROOT_DIR/scripts/build-test-promotion-evidence.sh
 CONTRACT=$ROOT_DIR/scripts/test-vps-admission-contract.json
 FIXTURES=$ROOT_DIR/scripts/fixtures/test-promotion-input
@@ -238,13 +238,7 @@ assert_assembler_rejects_raw() {
   branch=$(jq -er '.imageBranch' "$metadata")
   if extract_raw_inputs "$raw" "$inputs" "$branch" false >"$stderr" 2>&1; then
     if run_assembler "$metadata" "$inputs" "$output" >"$stderr" 2>&1; then
-      if validate_bootstrap_fixtures "$raw" >/dev/null 2>&1; then
-        status=0
-      else
-        rm -f -- "$output"
-        echo "jq: bootstrap proof is invalid" >"$stderr"
-        status=1
-      fi
+      status=0
     else
       status=$?
     fi
@@ -253,6 +247,25 @@ assert_assembler_rejects_raw() {
     echo "promotion input fixture rejected by raw schema validation" >>"$stderr"
   fi
   [ "$status" -ne 0 ] && [ ! -s "$output" ] && [ -s "$stderr" ]
+}
+
+assert_weakened_filter_rejected() {
+  local metadata=$1 raw=$2 name=$3
+  local mutation_dir=$TMP/mutation-$name
+  local weakened_filter=$mutation_dir/weakened.jq
+  local mutated_raw=$mutation_dir/raw.json
+  local original_filter=$FILTER
+  mkdir -p "$mutation_dir"
+  sed 's/then $proof else error("bootstrap proof is invalid") end/then $proof else $proof end/' \
+    "$FILTER" >"$weakened_filter"
+  jq '.candidateBootstrap[0].extra = true' "$raw" >"$mutated_raw"
+  FILTER=$weakened_filter
+  if assert_assembler_rejects_raw "$metadata" "$mutated_raw" "$name"; then
+    FILTER=$original_filter
+    echo "weakened filter accepted malformed bootstrap input" >&2
+    return 1
+  fi
+  FILTER=$original_filter
 }
 
 assert_field_mutation_rejected() {
@@ -325,6 +338,9 @@ assert_assembler_rejects "$control_metadata" "$control_raw" \
   bootstrap-missing 'del(.candidateBootstrap[0].phase)'
 assert_assembler_rejects "$control_metadata" "$control_raw" \
   bootstrap-wrong-phase '.candidateBootstrap[0].phase = "final"'
+
+assert_weakened_filter_rejected "$control_metadata" "$control_raw" \
+  weakened-bootstrap-filter
 
 for phase in predecessor candidate final; do
   assert_field_mutation_rejected "$control_metadata" "$control_raw" \

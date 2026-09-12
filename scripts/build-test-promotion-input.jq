@@ -1,7 +1,9 @@
-def exact_keys($keys): (keys | sort) == ($keys | sort);
+def exact_keys($value;$expected):
+  (($value | keys | sort) == ($expected | sort));
 def proof($doc;$expectedPhase):
   ($doc[0]) as $proof |
-  if ($proof | type == "object" and exact_keys([
+  if (($proof | type) == "object" and
+      exact_keys($proof;[
         "bootstrapControlPresent","bootstrapMode","effectiveDefault",
         "imageDigest","imageId","introductionSha",
         "jarProductionSha256","jarPropertiesSha256","phase",
@@ -9,18 +11,18 @@ def proof($doc;$expectedPhase):
         "sourcePropertiesSha256","sourceSha","strictAncestor",
         "treeId","version"
       ]) and
-      .schema == "meet-backend/test-promotion-bootstrap-proof/v1" and
-      (.imageDigest | test("^sha256:[0-9a-f]{64}$")) and
-      (.imageId | test("^sha256:[0-9a-f]{64}$")) and
-      (.sourceSha | test("^[0-9a-f]{40}$")) and
-      (.treeId | test("^[0-9a-f]{40}$")) and
-      (.version | test("^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$")) and
-      (.bootstrapMode == "declared-false" or
-       .bootstrapMode == "legacy-not-applicable") and
-      (.bootstrapControlPresent | type == "boolean") and
-      (.effectiveDefault == false) and
-      (.strictAncestor | type == "boolean") and
-      .phase == $expectedPhase)
+      $proof.schema == "meet-backend/test-promotion-bootstrap-proof/v1" and
+      ($proof.imageDigest | test("^sha256:[0-9a-f]{64}$")) and
+      ($proof.imageId | test("^sha256:[0-9a-f]{64}$")) and
+      ($proof.sourceSha | test("^[0-9a-f]{40}$")) and
+      ($proof.treeId | test("^[0-9a-f]{40}$")) and
+      ($proof.version | test("^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$")) and
+      ($proof.bootstrapMode == "declared-false" or
+       $proof.bootstrapMode == "legacy-not-applicable") and
+      (($proof.bootstrapControlPresent | type) == "boolean") and
+      $proof.effectiveDefault == false and
+      (($proof.strictAncestor | type) == "boolean") and
+      $proof.phase == $expectedPhase)
   then $proof else error("bootstrap proof is invalid") end;
 def phase($p;$b;$proofSha;$expectedPhase):
   ($p[0]) as $x | proof($b;$expectedPhase) as $bootstrap |
