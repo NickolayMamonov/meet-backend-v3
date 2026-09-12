@@ -5,6 +5,10 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.yaml.snakeyaml.LoaderOptions
 import org.yaml.snakeyaml.Yaml
+import org.yaml.snakeyaml.nodes.MappingNode
+import org.yaml.snakeyaml.nodes.Node
+import org.yaml.snakeyaml.nodes.ScalarNode
+import org.yaml.snakeyaml.nodes.SequenceNode
 import java.io.StringReader
 import java.nio.file.Files
 import java.nio.file.Path
@@ -69,6 +73,72 @@ class WorkflowExpressionLengthTest {
     }
 
     @Test
+    fun `conditions decode whole string literals before status conversion`() {
+        assertEquals(
+            "always()".length,
+            WorkflowExpressionLength.accountCondition("\${{ 'always()' }}").generatedLength,
+        )
+        assertEquals(
+            "success() && (a'b)".length,
+            WorkflowExpressionLength.accountCondition("\${{ 'a''b' }}").generatedLength,
+        )
+    }
+
+    @Test
+    fun `conditions use the declared dotnet whitespace set`() {
+        assertEquals(
+            "success()".length,
+            WorkflowExpressionLength.accountCondition("\u0085").generatedLength,
+        )
+        assertEquals(
+            "success()".length,
+            WorkflowExpressionLength.accountCondition("\u00A0").generatedLength,
+        )
+        assertEquals(
+            "success() && (\uFEFF)".length,
+            WorkflowExpressionLength.accountCondition("\uFEFF").generatedLength,
+        )
+
+        val prefix = "success() && ("
+        val body = "x".repeat(WorkflowExpressionLength.LIMIT - prefix.length - 1)
+        assertEquals(
+            WorkflowExpressionLength.LIMIT,
+            WorkflowExpressionLength.accountCondition(body).generatedLength,
+        )
+        assertThrows<WorkflowExpressionLength.Violation> {
+            WorkflowExpressionLength.accountCondition("$body-x")
+        }
+    }
+
+    @Test
+    fun `status recognition is token aware and case insensitive`() {
+        assertEquals(
+            "SUCCESS()".length,
+            WorkflowExpressionLength.accountCondition("SUCCESS()").generatedLength,
+        )
+        assertEquals(
+            "success ( )".length,
+            WorkflowExpressionLength.accountCondition("success ( )").generatedLength,
+        )
+        assertEquals(
+            "success() && ('success()')".length,
+            WorkflowExpressionLength.accountCondition("'success()'").generatedLength,
+        )
+        assertEquals(
+            "success() && (github.success())".length,
+            WorkflowExpressionLength.accountCondition("github.success()").generatedLength,
+        )
+        assertEquals(
+            "success() && (success)".length,
+            WorkflowExpressionLength.accountCondition("success").generatedLength,
+        )
+        assertEquals(
+            "success() && (failure-marker())".length,
+            WorkflowExpressionLength.accountCondition("failure-marker()").generatedLength,
+        )
+    }
+
+    @Test
     fun `yaml decoding and utf16 accounting happen before the limit check`() {
         val yaml = """
             jobs:
@@ -82,6 +152,55 @@ class WorkflowExpressionLengthTest {
         assertTrue(node != null)
         assertEquals(3, "é𝄞".length)
         assertEquals(1, WorkflowExpressionLength.accountScalar("\${{ 'quoted }} text' }}").expressionCount)
+    }
+
+    @Test
+    fun `structural workflow recognition distinguishes jobs and steps`() {
+        val long = "x".repeat(WorkflowExpressionLength.LIMIT + 1)
+        val yaml = """
+            name: structural fixture
+            jobs:
+              build:
+                if: github.ref == 'refs/heads/dev'
+                env:
+                  run: "$long"
+                steps:
+                  - if: always()
+                    with:
+                      if: "$long"
+                    run: echo ok
+        """.trimIndent()
+        val root = Files.createTempDirectory("workflow-expression-structure-")
+        try {
+            Files.createDirectories(root.resolve(".github/workflows"))
+            Files.writeString(root.resolve(".github/workflows/fixture.yml"), yaml)
+            val measurements = WorkflowExpressionLength.assertWithinLimits(root)
+            assertTrue(
+                measurements.any {
+                    it.kind == WorkflowExpressionLength.ScalarKind.RUN &&
+                        it.location.structuralPath == "root.jobs.job[0].steps[0].run"
+                },
+            )
+            assertTrue(
+                measurements.count {
+                    it.kind == WorkflowExpressionLength.ScalarKind.CONDITION_WRAPPER
+                } == 2,
+            )
+            assertFalse(
+                measurements.any {
+                    it.kind == WorkflowExpressionLength.ScalarKind.RUN &&
+                        it.location.structuralPath.endsWith(".env.run")
+                },
+            )
+            assertFalse(
+                measurements.any {
+                    it.kind == WorkflowExpressionLength.ScalarKind.CONDITION_WRAPPER &&
+                        it.location.structuralPath.endsWith(".with.if")
+                },
+            )
+        } finally {
+            Files.walk(root).sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
+        }
     }
 
     @Test
@@ -113,8 +232,14 @@ class WorkflowExpressionLengthTest {
 
     @Test
     fun `original promotion scalar regression keeps its measured baseline`() {
-        val scalar = "'".repeat(156) + "a".repeat(22_194) +
-            List(4) { "\${{ x }}" }.joinToString("")
+        val resource = Path.of("src/test/resources/workflow-expression-length/original-promotion-scalar.yml")
+        val document = Files.newBufferedReader(resource).use { Yaml(LoaderOptions()).compose(it) }
+        assertTrue(document != null)
+        val jobs = mappingValue(document!!, "jobs") as MappingNode
+        val fixture = mappingValue(jobs, "fixture") as MappingNode
+        val steps = mappingValue(fixture, "steps") as SequenceNode
+        val run = mappingValue(steps.value.single() as MappingNode, "run") as ScalarNode
+        val scalar = run.value
         val accounting = WorkflowExpressionLength.accountScalar(scalar)
 
         assertEquals(22_382, accounting.decodedLength)
@@ -122,4 +247,9 @@ class WorkflowExpressionLengthTest {
         assertEquals(4, accounting.expressionCount)
         assertTrue(accounting.generatedLength!! > WorkflowExpressionLength.LIMIT)
     }
+
+    private fun mappingValue(mapping: Node, key: String): Node =
+        (mapping as MappingNode).value
+            .first { (it.keyNode as ScalarNode).value == key }
+            .valueNode
 }

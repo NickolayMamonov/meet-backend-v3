@@ -119,14 +119,15 @@ object WorkflowExpressionLength {
         val expressions = findExpressions(value)
         accountScalar(value)
         val condition = if (expressions.size == 1 && expressions.single().covers(value)) {
-            expressions.single().trimmed
+            decodeSingleStringLiteral(expressions.single().trimmed)
+                ?: expressions.single().trimmed
         } else if (expressions.isNotEmpty()) {
             generatedExpression(value, expressions)
         } else {
             value
         }
         val converted = when {
-            condition.isBlank() -> "success()"
+            trimDotNetWhitespace(condition).isEmpty() -> "success()"
             hasStatusFunction(condition) -> condition
             else -> "success() && ($condition)"
         }
@@ -159,6 +160,7 @@ object WorkflowExpressionLength {
             workflow = workflow,
             node = documents.single(),
             path = "root",
+            context = SchemaContext.ROOT,
             active = active,
             measurements = measurements,
             nodeCount = IntArray(1),
@@ -171,6 +173,7 @@ object WorkflowExpressionLength {
         workflow: Path,
         node: Node?,
         path: String,
+        context: SchemaContext,
         active: MutableSet<Node>,
         measurements: MutableList<Measurement>,
         nodeCount: IntArray,
@@ -192,26 +195,55 @@ object WorkflowExpressionLength {
                 is MappingNode -> {
                     realNode.value.forEachIndexed { index, tuple ->
                         val key = (tuple.keyNode as? ScalarNode)?.value
-                        val field = key?.takeIf { it.matches(STRUCTURAL_KEY) } ?: "field"
+                        val field = structuralField(context, key, index)
                         val childPath = "$path.$field"
                         if (tuple.keyNode is ScalarNode) {
                             recordScalar(root, workflow, tuple.keyNode as ScalarNode, childPath, false, false, measurements)
                         } else {
-                            walk(root, workflow, tuple.keyNode, "$childPath.key$index", active, measurements, nodeCount)
+                            walk(
+                                root,
+                                workflow,
+                                tuple.keyNode,
+                                "$childPath.key$index",
+                                SchemaContext.OTHER,
+                                active,
+                                measurements,
+                                nodeCount,
+                            )
                         }
-                        val isRun = key == "run"
-                        val isCondition = key == "if"
                         val child = tuple.valueNode
-                        if (child is ScalarNode) {
-                            recordScalar(root, workflow, child, childPath, isRun, isCondition, measurements)
+                        val realChild = unwrap(child)
+                        val isRun = context == SchemaContext.STEP && key == "run"
+                        val isCondition =
+                            (context == SchemaContext.JOB || context == SchemaContext.STEP) && key == "if"
+                        if (realChild is ScalarNode) {
+                            recordScalar(root, workflow, realChild, childPath, isRun, isCondition, measurements)
                         } else {
-                            walk(root, workflow, child, childPath, active, measurements, nodeCount)
+                            walk(
+                                root,
+                                workflow,
+                                child,
+                                childPath,
+                                childContext(context, key, realChild),
+                                active,
+                                measurements,
+                                nodeCount,
+                            )
                         }
                     }
                 }
                 is SequenceNode -> {
                     realNode.value.forEachIndexed { index, child ->
-                        walk(root, workflow, child, "$path[$index]", active, measurements, nodeCount)
+                        walk(
+                            root,
+                            workflow,
+                            child,
+                            "$path[$index]",
+                            if (context == SchemaContext.STEPS) SchemaContext.STEP else SchemaContext.OTHER,
+                            active,
+                            measurements,
+                            nodeCount,
+                        )
                     }
                 }
             }
@@ -219,6 +251,33 @@ object WorkflowExpressionLength {
             active.remove(realNode)
         }
     }
+
+    private enum class SchemaContext {
+        ROOT,
+        JOBS,
+        JOB,
+        STEPS,
+        STEP,
+        OTHER,
+    }
+
+    private fun childContext(context: SchemaContext, key: String?, child: Node): SchemaContext =
+        when {
+            context == SchemaContext.ROOT && key == "jobs" && child is MappingNode -> SchemaContext.JOBS
+            context == SchemaContext.JOBS && child is MappingNode -> SchemaContext.JOB
+            context == SchemaContext.JOB && key == "steps" && child is SequenceNode -> SchemaContext.STEPS
+            else -> SchemaContext.OTHER
+        }
+
+    private fun unwrap(node: Node): Node =
+        if (node is AnchorNode) node.realNode else node
+
+    private fun structuralField(context: SchemaContext, key: String?, index: Int): String =
+        if (context == SchemaContext.JOBS) {
+            "job[$index]"
+        } else {
+            key?.takeIf { it in SAFE_STRUCTURAL_FIELDS } ?: "field"
+        }
 
     private fun recordScalar(
         root: Path,
@@ -317,36 +376,75 @@ object WorkflowExpressionLength {
         return builder.toString()
     }
 
+    private fun decodeSingleStringLiteral(expression: String): String? {
+        val literal = trimDotNetWhitespace(expression)
+        if (literal.length < 2 || literal.first() != '\'' || literal.last() != '\'') return null
+        val result = StringBuilder(literal.length - 2)
+        var index = 1
+        while (index < literal.length - 1) {
+            if (literal[index] != '\'') {
+                result.append(literal[index])
+                index++
+            } else if (index + 1 < literal.length - 1 && literal[index + 1] == '\'') {
+                result.append('\'')
+                index += 2
+            } else {
+                return null
+            }
+        }
+        return result.toString()
+    }
+
     private fun hasStatusFunction(value: String): Boolean {
-        var quoted = false
         var index = 0
         while (index < value.length) {
             if (value[index] == '\'') {
-                if (quoted && index + 1 < value.length && value[index + 1] == '\'') {
-                    index += 2
-                    continue
-                }
-                quoted = !quoted
-                index++
+                index = skipExpressionString(value, index)
                 continue
             }
-            if (!quoted && (index == 0 ||
-                    (!value[index - 1].isLetterOrDigit() &&
-                        value[index - 1] != '_' &&
-                        value[index - 1] != '.'))
-            ) {
-                STATUS_FUNCTIONS.forEach { function ->
-                    if (value.startsWith(function, index) &&
-                        value.substring(index + function.length).trimStart().startsWith("(")
-                    ) {
-                        return true
-                    }
+            if (isIdentifierStart(value[index])) {
+                val start = index
+                index++
+                while (index < value.length && isIdentifierPart(value[index])) index++
+                val identifier = value.substring(start, index)
+                var next = index
+                while (next < value.length && value[next].isWhitespace()) next++
+                val isMemberAccess = start > 0 && value[start - 1] == '.'
+                if (!isMemberAccess &&
+                    next < value.length &&
+                    value[next] == '(' &&
+                    STATUS_FUNCTIONS.any { it.equals(identifier, ignoreCase = true) }
+                ) {
+                    return true
                 }
+                continue
             }
             index++
         }
         return false
     }
+
+    private fun skipExpressionString(value: String, start: Int): Int {
+        var index = start + 1
+        while (index < value.length) {
+            if (value[index] == '\'') {
+                if (index + 1 < value.length && value[index + 1] == '\'') {
+                    index += 2
+                } else {
+                    return index + 1
+                }
+            } else {
+                index++
+            }
+        }
+        return value.length
+    }
+
+    private fun isIdentifierStart(value: Char): Boolean =
+        value == '_' || value.isLetter()
+
+    private fun isIdentifierPart(value: Char): Boolean =
+        value == '_' || value.isLetterOrDigit()
 
     private fun trimDotNetWhitespace(value: String): String {
         var start = 0
@@ -357,7 +455,8 @@ object WorkflowExpressionLength {
     }
 
     private fun isDotNetWhitespace(codePoint: Int): Boolean =
-        Character.isWhitespace(codePoint) ||
+        codePoint in 0x0009..0x000D ||
+            codePoint == 0x0020 ||
             codePoint == 0x0085 ||
             codePoint == 0x00A0 ||
             codePoint == 0x1680 ||
@@ -371,6 +470,23 @@ object WorkflowExpressionLength {
     private fun formatLocation(location: Location): String =
         "${location.workflow}:${location.line}:${location.column}:${location.structuralPath}"
 
-    private val STRUCTURAL_KEY = Regex("[A-Za-z][A-Za-z0-9_-]*")
+    private val SAFE_STRUCTURAL_FIELDS = setOf(
+        "jobs",
+        "steps",
+        "run",
+        "if",
+        "env",
+        "with",
+        "name",
+        "on",
+        "permissions",
+        "concurrency",
+        "defaults",
+        "strategy",
+        "matrix",
+        "uses",
+        "shell",
+        "working-directory",
+    )
     private val STATUS_FUNCTIONS = listOf("success", "always", "failure", "cancelled")
 }
