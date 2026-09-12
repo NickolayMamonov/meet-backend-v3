@@ -380,6 +380,19 @@ class JdbcReminderDispatchStore(
             lease.targetId,
             lease.leaseToken,
         ) > 0
+        if (changed && decision.invalidateInstallation) {
+            jdbc.update(
+                """
+                UPDATE push_installations
+                SET fid = NULL, status = 'UNREGISTERED', registration_version = registration_version + 1,
+                    updated_at = ?, terminal_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'ACTIVE'
+                  AND registration_version = ? AND fid = ?
+                """.trimIndent(),
+                timestamp(now), timestamp(now), lease.installationId, lease.userId,
+                send.registrationVersion, send.fid.value,
+            )
+        }
         if (changed) reduceClaim(lease.claimId, now)
         return changed
     }
@@ -504,18 +517,7 @@ class JdbcReminderDispatchStore(
             return TargetDecision("SKIPPED", ineligible.name, null)
         }
         if (outcome == ReminderFinalization.InvalidRegistration) {
-            jdbc.update(
-                """
-                UPDATE push_installations
-                SET fid = NULL, status = 'UNREGISTERED', registration_version = registration_version + 1,
-                    updated_at = ?, terminal_at = ?
-                WHERE id = ? AND user_id = ? AND status = 'ACTIVE'
-                  AND registration_version = ? AND fid = ?
-                """.trimIndent(),
-                timestamp(now), timestamp(now), lease.installationId, lease.userId,
-                send.registrationVersion, send.fid.value,
-            )
-            return TargetDecision("INVALID", "UNREGISTERED", null)
+            return TargetDecision("INVALID", "UNREGISTERED", null, invalidateInstallation = true)
         }
         return when (outcome) {
             ReminderFinalization.Accepted -> TargetDecision("SENT", "ACCEPTED", null)
@@ -635,6 +637,7 @@ class JdbcReminderDispatchStore(
         val status: String,
         val reason: String,
         val nextAttemptAt: Instant?,
+        val invalidateInstallation: Boolean = false,
     )
 
     private companion object {

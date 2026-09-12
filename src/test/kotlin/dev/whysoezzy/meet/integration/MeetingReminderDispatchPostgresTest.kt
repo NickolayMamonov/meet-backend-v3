@@ -165,9 +165,12 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
         val fixture = seedReminder(now)
         val lease = requireNotNull(dispatch.leaseNext())
         val prepared = requireNotNull(dispatch.prepareSend(lease, now))
-        val stale = lease.copy(leaseToken = UUID.randomUUID())
+        jdbcTemplate.update(
+            "UPDATE meeting_reminder_targets SET lease_until = clock_timestamp() - INTERVAL '1 second' WHERE id = ?",
+            lease.targetId,
+        )
 
-        assertEquals(false, dispatch.finalize(stale, prepared, ReminderFinalization.InvalidRegistration, now))
+        assertEquals(false, dispatch.finalize(lease, prepared, ReminderFinalization.InvalidRegistration, now))
         assertEquals(
             "LEASED",
             jdbcTemplate.queryForObject(
