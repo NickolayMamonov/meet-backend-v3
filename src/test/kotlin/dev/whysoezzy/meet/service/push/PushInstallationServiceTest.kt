@@ -73,6 +73,36 @@ class PushInstallationServiceTest {
         assertEquals(" fid ", parseFid(" fid ").value)
     }
 
+    @Test
+    fun `register retries the whole transaction when the locked owner set changes`() {
+        val oldId = UUID.fromString("123e4567-e89b-12d3-a456-426614174000")
+        val newId = UUID.fromString("123e4567-e89b-12d3-a456-426614174001")
+        val old = record(oldId, 7, "fid-race", now)
+        val created = record(newId, 9, "fid-race", now)
+        val store = Mockito.mock(PushInstallationStore::class.java)
+        Mockito.`when`(store.ownerIdsForFid(parseFid("fid-race")))
+            .thenReturn(listOf(7L), listOf(7L, 8L), listOf(7L, 8L))
+        Mockito.`when`(store.installationIdsForFid(parseFid("fid-race")))
+            .thenReturn(listOf(oldId))
+        Mockito.`when`(store.findByFid(parseFid("fid-race")))
+            .thenReturn(old)
+        Mockito.`when`(
+            store.insert(
+                Mockito.any(UUID::class.java) ?: newId,
+                Mockito.anyLong(),
+                Mockito.any(PushFid::class.java) ?: parseFid("matcher"),
+                Mockito.any(Instant::class.java) ?: now,
+            ),
+        ).thenReturn(created)
+
+        val result = service(store).register(9, parseFid("fid-race"))
+
+        assertEquals(newId, result.installation.id)
+        Mockito.verify(store, Mockito.atLeast(3)).ownerIdsForFid(parseFid("fid-race"))
+        Mockito.verify(store, Mockito.atLeastOnce()).lockUser(8L)
+        Mockito.verify(store, Mockito.atLeastOnce()).lockUser(9L)
+    }
+
     private fun service(store: PushInstallationStore) =
         PushInstallationService(store, ImmediateTransactionManager(), clock)
 

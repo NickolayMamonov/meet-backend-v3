@@ -131,6 +131,61 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
         )
     }
 
+    @Test
+    fun `transient retries consume exactly five attempts and never lease a sixth`() {
+        val now = databaseNow()
+        seedReminder(now)
+
+        repeat(4) {
+            val lease = requireNotNull(dispatch.leaseNext())
+            val prepared = requireNotNull(dispatch.prepareSend(lease, now))
+            assertEquals(true, dispatch.finalize(lease, prepared, ReminderFinalization.TransientFailure, now))
+            jdbcTemplate.update(
+                "UPDATE meeting_reminder_targets SET next_attempt_at = clock_timestamp() - INTERVAL '1 second'",
+            )
+        }
+        val fifth = requireNotNull(dispatch.leaseNext())
+        val prepared = requireNotNull(dispatch.prepareSend(fifth, now))
+        assertEquals(true, dispatch.finalize(fifth, prepared, ReminderFinalization.TransientFailure, now))
+
+        assertEquals(
+            "FAILED",
+            jdbcTemplate.queryForObject(
+                "SELECT status FROM meeting_reminder_targets WHERE id = ?",
+                String::class.java,
+                fifth.targetId,
+            ),
+        )
+        assertEquals(null, dispatch.leaseNext())
+    }
+
+    @Test
+    fun `stale lease completion has no state or invalidation side effects`() {
+        val now = databaseNow()
+        val fixture = seedReminder(now)
+        val lease = requireNotNull(dispatch.leaseNext())
+        val prepared = requireNotNull(dispatch.prepareSend(lease, now))
+        val stale = lease.copy(leaseToken = UUID.randomUUID())
+
+        assertEquals(false, dispatch.finalize(stale, prepared, ReminderFinalization.InvalidRegistration, now))
+        assertEquals(
+            "LEASED",
+            jdbcTemplate.queryForObject(
+                "SELECT status FROM meeting_reminder_targets WHERE id = ?",
+                String::class.java,
+                lease.targetId,
+            ),
+        )
+        assertEquals(
+            "ACTIVE",
+            jdbcTemplate.queryForObject(
+                "SELECT status FROM push_installations WHERE user_id = ?",
+                String::class.java,
+                fixture.bob.id,
+            ),
+        )
+    }
+
     private fun seedReminder(now: Instant): ApiFixture {
         val fixture = fixture()
         jdbcTemplate.update(
