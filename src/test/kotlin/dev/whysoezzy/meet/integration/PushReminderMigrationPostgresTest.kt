@@ -7,6 +7,10 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.dao.DataIntegrityViolationException
+import dev.whysoezzy.meet.domain.entity.EventSource
+import dev.whysoezzy.meet.ingestion.MeetingUpsertService
+import dev.whysoezzy.meet.ingestion.RawEvent
+import dev.whysoezzy.meet.ingestion.UpsertResult
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.UUID
@@ -19,6 +23,9 @@ class PushReminderMigrationPostgresTest : IntegrationTestSupport() {
 
     @Autowired
     private lateinit var installations: PushInstallationService
+
+    @Autowired
+    private lateinit var upsertService: MeetingUpsertService
 
     @BeforeEach
     fun clearDatabase() = resetDatabase()
@@ -119,6 +126,140 @@ class PushReminderMigrationPostgresTest : IntegrationTestSupport() {
                 targetId,
             ),
         )
+    }
+
+    @Test
+    fun `start version increments for raw SQL and TIMEPAD upsert away and back`() {
+        val fixture = fixture()
+        val original = fixture.meeting.time
+        val originalVersion = jdbcTemplate.queryForObject(
+            "SELECT push_start_version FROM meetings WHERE id = ?",
+            Long::class.java,
+            fixture.meeting.id,
+        )
+
+        jdbcTemplate.update("UPDATE meetings SET time = ? WHERE id = ?", original + 1_000, fixture.meeting.id)
+        jdbcTemplate.update("UPDATE meetings SET time = ? WHERE id = ?", original, fixture.meeting.id)
+        assertEquals(
+            originalVersion!! + 2,
+            jdbcTemplate.queryForObject(
+                "SELECT push_start_version FROM meetings WHERE id = ?",
+                Long::class.java,
+                fixture.meeting.id,
+            ),
+        )
+
+        val raw = RawEvent(
+            sourceExternalId = "version-away-back",
+            title = "Kotlin version trigger",
+            description = "PostgreSQL trigger proof",
+            imageUrl = "",
+            startsAtEpochMs = 1_790_000_000_000,
+            address = "Online",
+            latitude = 0.0,
+            longitude = 0.0,
+            externalUrl = null,
+            isOnline = true,
+            topicKeywords = setOf("ИТ и интернет"),
+        )
+        assertEquals(UpsertResult.CREATED, upsertService.upsert(EventSource.TIMEPAD, raw))
+        val upserted = meetings.findAll().single { it.sourceExternalId == raw.sourceExternalId }
+        val baseVersion = jdbcTemplate.queryForObject(
+            "SELECT push_start_version FROM meetings WHERE id = ?",
+            Long::class.java,
+            upserted.id,
+        )
+        val changed = raw.copy(startsAtEpochMs = raw.startsAtEpochMs + 1_000)
+        assertEquals(UpsertResult.UPDATED, upsertService.upsert(EventSource.TIMEPAD, changed))
+        assertEquals(UpsertResult.UPDATED, upsertService.upsert(EventSource.TIMEPAD, raw))
+        assertEquals(
+            baseVersion!! + 2,
+            jdbcTemplate.queryForObject(
+                "SELECT push_start_version FROM meetings WHERE id = ?",
+                Long::class.java,
+                upserted.id,
+            ),
+        )
+    }
+
+    @Test
+    fun `V10 rejects invalid lifecycle, timing, lease and attempt rows`() {
+        val fixture = fixture()
+        val now = Instant.parse("2026-09-11T20:00:00Z")
+        val timestamp = java.sql.Timestamp.from(now)
+        val userId = requireNotNull(fixture.bob.id)
+        val installationId = UUID.randomUUID()
+        assertFailsWith<DataIntegrityViolationException> {
+            jdbcTemplate.update(
+                """
+                INSERT INTO push_installations
+                    (id, user_id, fid, status, registration_version, created_at, updated_at, last_seen_at, terminal_at)
+                VALUES (?, ?, ?, 'ACTIVE', 1, ?, ?, ?, ?)
+                """.trimIndent(),
+                installationId, userId, "bad-terminal", timestamp, timestamp, timestamp, timestamp,
+            )
+        }
+        jdbcTemplate.update(
+            """
+            INSERT INTO push_installations
+                (id, user_id, fid, status, registration_version, created_at, updated_at, last_seen_at, terminal_at)
+            VALUES (?, ?, ?, 'ACTIVE', 1, ?, ?, ?, NULL)
+            """.trimIndent(),
+            installationId, userId, "fid-migration-constraints", timestamp, timestamp, timestamp,
+        )
+        val meetingStart = now.plusSeconds(3_600)
+        assertFailsWith<DataIntegrityViolationException> {
+            jdbcTemplate.update(
+                """
+                INSERT INTO meeting_reminder_claims
+                    (id, user_id, meeting_id, reminder_offset_minutes, meeting_start_ms,
+                     start_version, due_at, deadline_at, issued_at, status, completed_at)
+                VALUES (?, ?, ?, 60, ?, 0, ?, ?, ?, 'PENDING', NULL)
+                """.trimIndent(),
+                UUID.randomUUID(),
+                userId,
+                fixture.meeting.id,
+                meetingStart.toEpochMilli(),
+                java.sql.Timestamp.from(now.plusSeconds(1)),
+                java.sql.Timestamp.from(now.plusSeconds(16 * 60)),
+                timestamp,
+            )
+        }
+        val claimId = UUID.randomUUID()
+        jdbcTemplate.update(
+            """
+            INSERT INTO meeting_reminder_claims
+                (id, user_id, meeting_id, reminder_offset_minutes, meeting_start_ms,
+                 start_version, due_at, deadline_at, issued_at, status, completed_at)
+            VALUES (?, ?, ?, 60, ?, 0, ?, ?, ?, 'PENDING', NULL)
+            """.trimIndent(),
+            claimId, userId, fixture.meeting.id, meetingStart.toEpochMilli(),
+            timestamp, java.sql.Timestamp.from(now.plusSeconds(15 * 60)),
+            timestamp,
+        )
+        val targetId = UUID.randomUUID()
+        assertFailsWith<DataIntegrityViolationException> {
+            jdbcTemplate.update(
+                """
+                INSERT INTO meeting_reminder_targets
+                    (id, claim_id, user_id, installation_id, status, attempts, next_attempt_at,
+                     lease_token, lease_until, reason, completed_at)
+                VALUES (?, ?, ?, ?, 'LEASED', 0, ?, NULL, NULL, NULL, NULL)
+                """.trimIndent(),
+                targetId, claimId, userId, installationId, java.sql.Timestamp.from(now),
+            )
+        }
+        assertFailsWith<DataIntegrityViolationException> {
+            jdbcTemplate.update(
+                """
+                INSERT INTO meeting_reminder_targets
+                    (id, claim_id, user_id, installation_id, status, attempts, next_attempt_at,
+                     lease_token, lease_until, reason, completed_at)
+                VALUES (?, ?, ?, ?, 'PENDING', 6, ?, NULL, NULL, NULL, NULL)
+                """.trimIndent(),
+                targetId, claimId, userId, installationId, java.sql.Timestamp.from(now),
+            )
+        }
     }
 
     private fun seedReminder(now: Instant) {

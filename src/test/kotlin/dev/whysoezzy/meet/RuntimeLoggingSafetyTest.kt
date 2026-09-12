@@ -13,10 +13,14 @@ import dev.whysoezzy.meet.api.error.ApiExceptionHandler
 import dev.whysoezzy.meet.config.EmailProperties
 import dev.whysoezzy.meet.config.EmailProvider
 import dev.whysoezzy.meet.config.GeocoderProperties
+import dev.whysoezzy.meet.config.GoogleSdkLogGuard
 import dev.whysoezzy.meet.config.JwtProperties
 import dev.whysoezzy.meet.config.OtpProperties
 import dev.whysoezzy.meet.config.OtpRateLimitProperties
 import dev.whysoezzy.meet.config.OtpVerificationProperties
+import dev.whysoezzy.meet.config.ProtectedLoggingPolicy
+import dev.whysoezzy.meet.config.PushLoggingEnvironmentListener
+import dev.whysoezzy.meet.config.PushRuntimeSettings
 import dev.whysoezzy.meet.config.RuntimeConfigurationInitializer
 import dev.whysoezzy.meet.config.SmtpRuntimeSettings
 import dev.whysoezzy.meet.config.StorageProperties
@@ -39,6 +43,7 @@ import dev.whysoezzy.meet.service.email.SmtpEmailOtpSender
 import jakarta.mail.internet.MimeMessage
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import org.junit.jupiter.api.parallel.ResourceLock
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import org.mockito.ArgumentMatchers.any
@@ -51,6 +56,7 @@ import org.mockito.Mockito.mock
 import org.mockito.Mockito.`when`
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.ObjectProvider
+import org.springframework.boot.context.event.ApplicationEnvironmentPreparedEvent
 import org.springframework.context.support.GenericApplicationContext
 import org.springframework.core.env.MapPropertySource
 import org.springframework.mock.web.MockHttpServletRequest
@@ -63,15 +69,137 @@ import org.springframework.transaction.support.SimpleTransactionStatus
 import org.springframework.web.client.RestClient
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
+import java.io.ByteArrayOutputStream
+import java.io.PrintStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Base64
+import java.util.logging.LogManager
+import java.util.logging.Logger as JulLogger
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
+@ResourceLock("global-logging-state")
 class RuntimeLoggingSafetyTest {
+
+    @Test
+    fun `protected SDK HTTP HTTP2 JDBC and driver logger subtrees suppress markers`() {
+        withProtectedLoggingState {
+            val rootLogger = LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME) as Logger
+            val applicationLogger = LoggerFactory.getLogger("dev.whysoezzy") as Logger
+            rootLogger.level = Level.DEBUG
+            applicationLogger.level = Level.DEBUG
+            protectedLoggerNames.forEach { name ->
+                (LoggerFactory.getLogger(name) as Logger).level = null
+                (LoggerFactory.getLogger("$name.synthetic.descendant") as Logger).level = null
+            }
+            listOf(
+                "org.springframework.jdbc.core.StatementCreatorUtils",
+                "org.hibernate.orm.jdbc.bind",
+                "org.postgresql.jdbc",
+            ).forEach { name ->
+                (LoggerFactory.getLogger(name) as Logger).level = Level.OFF
+                (LoggerFactory.getLogger("$name.synthetic.descendant") as Logger).level = null
+            }
+            (LoggerFactory.getLogger("org.postgresql") as Logger).level = Level.WARN
+            (LoggerFactory.getLogger("org.postgresql.jdbc") as Logger).level = Level.WARN
+            GoogleSdkLogGuard.install(MockEnvironment())
+
+            val appender = ListAppender<ILoggingEvent>().apply { start() }
+            rootLogger.addAppender(appender)
+            val stdout = ByteArrayOutputStream()
+            val stderr = ByteArrayOutputStream()
+            val oldOut = System.out
+            val oldErr = System.err
+            val marker = "sdk-credential-fid-payload-response-marker"
+            try {
+                System.setOut(PrintStream(stdout, true, Charsets.UTF_8))
+                System.setErr(PrintStream(stderr, true, Charsets.UTF_8))
+                protectedLoggerNames.forEach { name ->
+                    val logger = LoggerFactory.getLogger("$name.synthetic.descendant")
+                    logger.debug("Authorization=Bearer $marker FID=$marker data=$marker")
+                    logger.trace("HTTP/2 frame payload=$marker", IllegalStateException(marker))
+                    logger.error("provider response message-id=$marker", IllegalStateException(marker))
+                }
+                listOf(
+                    "org.springframework.jdbc.core.StatementCreatorUtils",
+                    "org.hibernate.orm.jdbc.bind",
+                    "org.postgresql",
+                    "org.postgresql.jdbc",
+                ).forEach { name ->
+                    val logger = LoggerFactory.getLogger("$name.synthetic.descendant")
+                    logger.debug("SQL bind=$marker")
+                    logger.trace("driver detail=$marker")
+                }
+                LoggerFactory.getLogger("org.postgresql.jdbc.synthetic.descendant")
+                    .error("driver-safe-control-event")
+                applicationLogger.info("safe-control-event-visible")
+            } finally {
+                rootLogger.detachAppender(appender)
+                appender.stop()
+                System.setOut(oldOut)
+                System.setErr(oldErr)
+            }
+
+            val output = buildString {
+                append(stdout.toString(Charsets.UTF_8))
+                append(stderr.toString(Charsets.UTF_8))
+                appender.list.forEach { event ->
+                    append(event.formattedMessage).append('\n')
+                    append(event.throwableProxy?.let(ThrowableProxyUtil::asString).orEmpty())
+                }
+            }
+            assertFalse(output.contains(marker), output)
+            assertTrue(output.contains("safe-control-event-visible"))
+            assertTrue(output.contains("driver-safe-control-event"))
+            assertEquals(Level.OFF, (LoggerFactory.getLogger(
+                "org.springframework.jdbc.core.StatementCreatorUtils",
+            ) as Logger).effectiveLevel)
+            assertEquals(Level.WARN, (LoggerFactory.getLogger("org.postgresql") as Logger).effectiveLevel)
+        }
+    }
+
+    @Test
+    fun `unsafe startup diagnostics are static across causes and suppressed exceptions`() {
+        val marker = "runtime-startup-secret-marker"
+        val event = ApplicationEnvironmentPreparedEvent(
+            mock(org.springframework.boot.bootstrap.ConfigurableBootstrapContext::class.java),
+            org.springframework.boot.SpringApplication(),
+            emptyArray<String>(),
+            MockEnvironment().withProperty("logging.level.org.apache.hc.core5.synthetic", marker),
+        )
+        val stdout = ByteArrayOutputStream()
+        val stderr = ByteArrayOutputStream()
+        val oldOut = System.out
+        val oldErr = System.err
+        try {
+            System.setOut(PrintStream(stdout, true, Charsets.UTF_8))
+            System.setErr(PrintStream(stderr, true, Charsets.UTF_8))
+            val failure = assertFailsWith<IllegalStateException> {
+                PushLoggingEnvironmentListener().onApplicationEvent(event)
+            }
+            val graph = exceptionGraph(failure)
+            assertEquals(PushRuntimeSettings.INVALID_CONFIGURATION, failure.message)
+            assertFalse(graph.contains(marker))
+            assertFalse(stdout.toString(Charsets.UTF_8).contains(marker))
+            assertFalse(stderr.toString(Charsets.UTF_8).contains(marker))
+        } finally {
+            System.setOut(oldOut)
+            System.setErr(oldErr)
+        }
+    }
+
+    @Test
+    fun `safe SQL policy retains ordinary application and SQL logging controls`() {
+        val environment = MockEnvironment()
+            .withProperty("logging.level.org.springframework.jdbc.core.StatementCreatorUtils", "WARN")
+            .withProperty("logging.level.org.hibernate.orm.jdbc.bind", "INFO")
+            .withProperty("logging.level.org.postgresql.jdbc", "WARN")
+            .withProperty("logging.level.dev.whysoezzy.meet", "DEBUG")
+        ProtectedLoggingPolicy.validate(environment)
+    }
 
     @ParameterizedTest(name = "{0} profile")
     @ValueSource(strings = ["default", "dev"])
@@ -388,6 +516,73 @@ class RuntimeLoggingSafetyTest {
         }
     }
 
+    private fun withProtectedLoggingState(action: () -> Unit) {
+        val names = buildSet {
+            add(Logger.ROOT_LOGGER_NAME)
+            add("dev.whysoezzy")
+            addAll(protectedLoggerNames)
+            addAll(protectedLoggerNames.map { "$it.synthetic.descendant" })
+            addAll(
+                listOf(
+                    "org.springframework.jdbc.core.StatementCreatorUtils",
+                    "org.springframework.jdbc.core.StatementCreatorUtils.synthetic.descendant",
+                    "org.hibernate.orm.jdbc.bind",
+                    "org.hibernate.orm.jdbc.bind.synthetic.descendant",
+                    "org.postgresql.jdbc",
+                    "org.postgresql.jdbc.synthetic.descendant",
+                ),
+            )
+        }
+        val loggers = names.associateWith {
+            LoggerFactory.getLogger(it) as Logger
+        }
+        val levels = loggers.mapValues { it.value.level }
+        val julLoggers = LogManager.getLogManager().loggerNames.asSequence()
+            .map(JulLogger::getLogger)
+            .filter { logger ->
+                listOf(
+                    "com.google.auth",
+                    "com.google.api.client",
+                    "com.google.firebase",
+                    "com.google.auth.http.HttpCredentialsAdapter",
+                ).any { logger.name == it || logger.name.startsWith("$it.") }
+            }
+            .toList()
+        val julLevels = julLoggers.associateWith { it.level }
+        try {
+            loggers.values.forEach { logger ->
+                when {
+                    ProtectedLoggingPolicy.isSdkNamespace(logger.name) -> logger.level = null
+                    ProtectedLoggingPolicy.isBindingNamespace(logger.name) ||
+                        ProtectedLoggingPolicy.isDriverNamespace(logger.name) -> logger.level = Level.OFF
+                }
+            }
+            julLoggers.forEach { it.level = java.util.logging.Level.OFF }
+            action()
+        } finally {
+            loggers.forEach { (name, logger) -> logger.level = levels[name] }
+            julLoggers.forEach { it.level = julLevels[it] }
+            LogManager.getLogManager().loggerNames.asSequence()
+                .map(JulLogger::getLogger)
+                .filter { logger ->
+                    protectedJulNames.any { logger.name == it || logger.name.startsWith("$it.") }
+                }
+                .filter { it !in julLevels }
+                .forEach { it.level = null }
+        }
+    }
+
+    private fun exceptionGraph(throwable: Throwable): String =
+        buildString {
+            fun appendThrowable(current: Throwable?) {
+                if (current == null) return
+                append(current::class.java.name).append(':').append(current.message).append('\n')
+                current.suppressed.forEach(::appendThrowable)
+                appendThrowable(current.cause)
+            }
+            appendThrowable(throwable)
+        }
+
     private fun applicationLogLevel(profile: String): String =
         Files.newBufferedReader(
             Path.of("src/main/resources", if (profile == "dev") "application-dev.yml" else "application.yml"),
@@ -407,5 +602,28 @@ class RuntimeLoggingSafetyTest {
         private val failure: RuntimeException,
     ) : JavaMailSenderImpl() {
         override fun send(mimeMessage: MimeMessage): Nothing = throw failure
+    }
+
+    private companion object {
+        val protectedJulNames = listOf(
+            "com.google.auth",
+            "com.google.api.client",
+            "com.google.firebase",
+            "com.google.auth.http.HttpCredentialsAdapter",
+        )
+        val protectedLoggerNames = listOf(
+            "com.google.auth",
+            "com.google.api.client",
+            "com.google.firebase",
+            "com.google.auth.http.HttpCredentialsAdapter",
+            "org.apache.http",
+            "org.apache.hc",
+            "org.apache.hc.client5.http.headers",
+            "org.apache.hc.client5.http.wire",
+            "org.apache.hc.client5.http2.frame",
+            "org.apache.hc.client5.http2.frame.payload",
+            "org.apache.hc.client5.http2.flow",
+            "org.apache.hc.core5.synthetic.secret",
+        )
     }
 }
