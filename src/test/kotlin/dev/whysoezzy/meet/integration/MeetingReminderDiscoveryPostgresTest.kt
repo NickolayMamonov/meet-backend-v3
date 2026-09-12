@@ -70,4 +70,25 @@ class MeetingReminderDiscoveryPostgresTest : IntegrationTestSupport() {
             ),
         )
     }
+
+    @Test
+    fun `discovery rechecks membership after the candidate snapshot`() {
+        val fixture = fixture()
+        val meetingTime = now.plusSeconds(3_600).toEpochMilli()
+        jdbcTemplate.update("UPDATE meetings SET time = ? WHERE id = ?", meetingTime, fixture.meeting.id)
+        installations.register(requireNotNull(fixture.bob.id), parseFid("fid-bob"))
+        val candidate = reminders.findCandidates(now).single()
+
+        jdbcTemplate.update(
+            "DELETE FROM meeting_participants WHERE user_id = ? AND meeting_id = ?",
+            fixture.bob.id,
+            fixture.meeting.id,
+        )
+
+        assertNull(reminders.discover(candidate, now))
+        assertEquals(
+            0L,
+            jdbcTemplate.queryForObject("SELECT COUNT(*) FROM meeting_reminder_claims", Long::class.java),
+        )
+    }
 }

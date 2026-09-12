@@ -31,4 +31,18 @@ class GoogleSdkLogGuardTest {
             logger.level = original
         }
     }
+
+    @Test
+    fun `transport and synthetic descendants are protected as namespace subtrees`() {
+        listOf(
+            "org.apache.hc.client5.http.headers",
+            "org.apache.hc.client5.http.wire",
+            "org.apache.hc.client5.http2.frame",
+            "org.apache.hc.client5.http2.frame.payload",
+            "org.apache.hc.client5.http2.flow",
+            "org.apache.hc.core5.synthetic.secret",
+        ).forEach { name ->
+            assertTrue(ProtectedLoggingPolicy.isSdkNamespace(name), name)
+        }
+    }
 }

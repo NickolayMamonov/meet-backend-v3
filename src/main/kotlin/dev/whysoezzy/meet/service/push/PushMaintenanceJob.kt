@@ -15,7 +15,6 @@ private val maintenanceLogger = KotlinLogging.logger {}
 @Conditional(MaintenancePushCondition::class)
 class PushMaintenanceJob(
     private val store: ReminderDispatchStore,
-    private val installations: PushInstallationStore,
     transactionManager: PlatformTransactionManager,
     private val clock: Clock,
 ) {
@@ -27,7 +26,6 @@ class PushMaintenanceJob(
     fun run() {
         try {
             transaction.execute {
-                installations.expireStale(clock.instant(), PushRuntimeSettings.PASS_LIMIT)
                 store.recoverAndExpire(PushRuntimeSettings.PASS_LIMIT, clock.instant())
             }
         } catch (exception: Exception) {

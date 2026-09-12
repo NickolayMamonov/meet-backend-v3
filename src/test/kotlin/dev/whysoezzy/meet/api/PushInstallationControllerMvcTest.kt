@@ -139,6 +139,18 @@ class PushInstallationControllerMvcTest @Autowired constructor(
             .andExpect(jsonPath("$.code").value("BAD_REQUEST"))
     }
 
+    @Test
+    fun `vendor JSON media types cannot bypass the strict push request converter`() {
+        mockMvc.perform(
+            post("/profile/push-installations")
+                .with(user("7").roles("USER"))
+                .contentType("application/vnd.example+json")
+                .content("""{"fid":"fid-1","unknown":"rejected"}"""),
+        )
+            .andExpect(status().isUnsupportedMediaType)
+        Mockito.verifyNoInteractions(service)
+    }
+
     private fun record(id: UUID, userId: Long) = PushInstallationRecord(
         id = id,
         userId = userId,

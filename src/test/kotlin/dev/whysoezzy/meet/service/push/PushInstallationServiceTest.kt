@@ -14,6 +14,7 @@ import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 
 class PushInstallationServiceTest {
     private val now = Instant.parse("2026-09-11T20:00:00Z")
@@ -64,6 +65,12 @@ class PushInstallationServiceTest {
         assertEquals(newId, result.installation.id)
         Mockito.verify(store).transfer(oldId, now)
         assertEquals(created, result.installation)
+    }
+
+    @Test
+    fun `FID parser rejects whitespace-only credentials without trimming valid values`() {
+        assertFailsWith<IllegalArgumentException> { parseFid(" \t\r\n") }
+        assertEquals(" fid ", parseFid(" fid ").value)
     }
 
     private fun service(store: PushInstallationStore) =

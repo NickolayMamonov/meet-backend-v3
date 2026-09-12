@@ -13,6 +13,7 @@ import io.swagger.v3.oas.annotations.security.SecurityRequirement
 import io.swagger.v3.oas.annotations.tags.Tag
 import jakarta.validation.Valid
 import org.springframework.http.HttpStatus
+import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.DeleteMapping
 import org.springframework.web.bind.annotation.PathVariable
@@ -30,7 +31,7 @@ class PushInstallationController(
     private val service: PushInstallationService,
     private val authUtils: AuthUtils,
 ) {
-    @PostMapping
+    @PostMapping(consumes = [MediaType.APPLICATION_JSON_VALUE])
     @Operation(summary = "Register a push installation", security = [SecurityRequirement(name = "bearerAuth")])
     fun register(@Valid @RequestBody request: PushInstallationRequest): ResponseEntity<PushInstallationDto> {
         val result = service.register(authUtils.getCurrentUserId(), parseFid(request.fid))
@@ -38,7 +39,7 @@ class PushInstallationController(
         return ResponseEntity.status(if (result.created) HttpStatus.CREATED else HttpStatus.OK).body(body)
     }
 
-    @PutMapping("/{installationId}")
+    @PutMapping("/{installationId}", consumes = [MediaType.APPLICATION_JSON_VALUE])
     @Operation(summary = "Rotate a push installation", security = [SecurityRequirement(name = "bearerAuth")])
     fun rotate(
         @PathVariable installationId: String,

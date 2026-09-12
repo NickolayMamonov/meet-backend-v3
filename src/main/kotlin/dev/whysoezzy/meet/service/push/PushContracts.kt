@@ -15,7 +15,7 @@ typealias PushSendResult = PushDeliveryResult
 const val MAX_FID_BYTES = 1_024
 
 fun parseFid(value: String): Fid {
-    require(value.isNotEmpty()) { "FID is required" }
+    require(value.isNotBlank()) { "FID is required" }
     require('\u0000' !in value) { "FID contains an invalid character" }
     val byteCount = try {
         val encoder = StandardCharsets.UTF_8.newEncoder()

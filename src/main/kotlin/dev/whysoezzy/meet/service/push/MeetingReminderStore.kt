@@ -95,6 +95,19 @@ class MeetingReminderStore(
             candidate.userId,
         ).firstOrNull() ?: return null
         if (!user.first || user.second != null) return null
+        val isParticipant = jdbc.queryForObject(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM meeting_participants
+                WHERE user_id = ? AND meeting_id = ?
+            )
+            """.trimIndent(),
+            Boolean::class.java,
+            candidate.userId,
+            candidate.meetingId,
+        ) == true
+        if (!isParticipant) return null
 
         val meeting = jdbc.query(
             """

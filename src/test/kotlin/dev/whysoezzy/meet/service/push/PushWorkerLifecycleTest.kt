@@ -7,12 +7,32 @@ import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import org.springframework.mock.env.MockEnvironment
+import org.mockito.Mockito
 import org.springframework.transaction.PlatformTransactionManager
 import org.springframework.transaction.TransactionDefinition
 import org.springframework.transaction.TransactionStatus
 import org.springframework.transaction.support.SimpleTransactionStatus
 
 class PushWorkerLifecycleTest {
+    @Test
+    fun `discovery condition requires provider and discovery flags`() {
+        val condition = DiscoveryPushCondition()
+        val metadata = org.springframework.core.type.AnnotationMetadata.introspect(PushWorkerLifecycle::class.java)
+        fun matches(provider: Boolean, discovery: Boolean): Boolean {
+            val environment = MockEnvironment()
+                .withProperty("app.push.provider-enabled", provider.toString())
+                .withProperty("app.push.discovery-enabled", discovery.toString())
+            val context = Mockito.mock(org.springframework.context.annotation.ConditionContext::class.java)
+            Mockito.`when`(context.environment).thenReturn(environment)
+            return condition.matches(context, metadata)
+        }
+        assertFalse(matches(false, false))
+        assertFalse(matches(true, false))
+        assertFalse(matches(false, true))
+        assertTrue(matches(true, true))
+    }
+
     @Test
     fun `lifecycle is auto-starting and can stop admission`() {
         val dispatcher = ReminderDispatcher(

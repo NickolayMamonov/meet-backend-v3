@@ -9,6 +9,7 @@ import dev.whysoezzy.meet.service.push.PushDiagnosticService
 import dev.whysoezzy.meet.service.push.DiagnosticPushCondition
 import jakarta.servlet.http.HttpServletRequest
 import org.springframework.context.annotation.Conditional
+import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.PostMapping
 import org.springframework.web.bind.annotation.RequestBody
@@ -22,7 +23,7 @@ import java.util.UUID
 class AdminPushController(
     private val diagnosticService: PushDiagnosticService,
 ) {
-    @PostMapping("/diagnostic")
+    @PostMapping("/diagnostic", consumes = [MediaType.APPLICATION_JSON_VALUE])
     fun diagnostic(
         @RequestBody request: PushDiagnosticRequest,
         servletRequest: HttpServletRequest,

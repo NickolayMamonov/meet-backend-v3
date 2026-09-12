@@ -144,4 +144,18 @@ class PushDiagnosticControllerMvcTest @Autowired constructor(
         }
         assertEquals(0, Mockito.mockingDetails(service).invocations.count { it.method.name == "send" })
     }
+
+    @Test
+    fun `vendor JSON media types cannot bypass strict diagnostic parsing`() {
+        Mockito.`when`(adminProperties.apiKey).thenReturn("test-admin-key")
+        mockMvc.perform(
+            post("/admin/push/diagnostic")
+                .with(user("admin").roles("ADMIN"))
+                .header("X-Admin-Key", "test-admin-key")
+                .contentType("application/vnd.example+json")
+                .content("""{"userId":7,"installationId":"$installationId","meetingId":42,"reminderOffsetMinutes":60,"mode":"SINGLE","extra":true}"""),
+        )
+            .andExpect(status().isUnsupportedMediaType)
+        Mockito.verifyNoInteractions(service)
+    }
 }

@@ -10,8 +10,10 @@ import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 
 class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
     @Autowired
@@ -85,6 +87,48 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
             String::class.java,
             fixture.bob.id,
         ))
+    }
+
+    @Test
+    fun `expired fifth lease applies eligibility precedence before attempts exhausted`() {
+        val now = databaseNow()
+        val fixture = seedReminder(now)
+        val lease = requireNotNull(dispatch.leaseNext())
+        jdbcTemplate.update(
+            """
+            UPDATE meeting_reminder_targets
+            SET attempts = 5, status = 'LEASED',
+                lease_until = clock_timestamp() - INTERVAL '1 second'
+            WHERE id = ?
+            """.trimIndent(),
+            lease.targetId,
+        )
+        jdbcTemplate.update("UPDATE users SET notifications_enabled = false WHERE id = ?", fixture.bob.id)
+
+        assertEquals(1, dispatch.recoverAndExpire(100, now))
+        assertEquals(
+            "SKIPPED",
+            jdbcTemplate.queryForObject(
+                "SELECT status FROM meeting_reminder_targets WHERE id = ?",
+                String::class.java,
+                lease.targetId,
+            ),
+        )
+        assertEquals(
+            "OPTED_OUT",
+            jdbcTemplate.queryForObject(
+                "SELECT reason FROM meeting_reminder_targets WHERE id = ?",
+                String::class.java,
+                lease.targetId,
+            ),
+        )
+        assertNull(
+            jdbcTemplate.queryForObject(
+                "SELECT lease_token FROM meeting_reminder_targets WHERE id = ?",
+                UUID::class.java,
+                lease.targetId,
+            ),
+        )
     }
 
     private fun seedReminder(now: Instant): ApiFixture {
