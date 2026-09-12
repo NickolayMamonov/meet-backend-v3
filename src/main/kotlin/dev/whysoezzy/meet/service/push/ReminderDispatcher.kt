@@ -401,6 +401,53 @@ class JdbcReminderDispatchStore(
         require(limit > 0)
         setLockTimeout()
         val expiredInstallations = expireStaleInstallations(limit, now)
+        val overdue = jdbc.query(
+            """
+            SELECT t.id, t.claim_id, t.user_id
+            FROM meeting_reminder_targets t
+            JOIN meeting_reminder_claims c ON c.id = t.claim_id
+            WHERE t.status IN ('PENDING', 'RETRY_WAIT')
+              AND t.lease_token IS NULL
+              AND c.deadline_at <= clock_timestamp()
+            ORDER BY c.deadline_at, t.id
+            LIMIT ?
+            """.trimIndent(),
+            { rs, _ ->
+                Triple(
+                    rs.getObject("id", UUID::class.java),
+                    rs.getObject("claim_id", UUID::class.java),
+                    rs.getLong("user_id"),
+                )
+            },
+            limit,
+        )
+        var recovered = 0
+        overdue.forEach { (targetId, claimId, userId) ->
+            jdbc.queryForList("SELECT id FROM users WHERE id = ? FOR UPDATE", Long::class.java, userId)
+            jdbc.queryForList("SELECT id FROM meeting_reminder_claims WHERE id = ? FOR UPDATE", UUID::class.java, claimId)
+            jdbc.queryForList("SELECT id FROM meeting_reminder_targets WHERE id = ? FOR UPDATE", UUID::class.java, targetId)
+            if (
+                jdbc.update(
+                    """
+                    UPDATE meeting_reminder_targets
+                    SET status = 'SKIPPED', reason = 'DEADLINE_PASSED',
+                        lease_token = NULL, lease_until = NULL, completed_at = ?
+                    WHERE id = ? AND status IN ('PENDING', 'RETRY_WAIT')
+                      AND lease_token IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM meeting_reminder_claims c
+                          WHERE c.id = claim_id AND c.deadline_at <= clock_timestamp()
+                      )
+                    """.trimIndent(),
+                    timestamp(now),
+                    targetId,
+                ) > 0
+            ) {
+                recovered++
+                reduceClaim(claimId, now)
+            }
+        }
+        val remaining = (limit - recovered).coerceAtLeast(0)
         val candidates = jdbc.query(
             """
             SELECT id, claim_id, user_id, installation_id, lease_token, attempts, lease_until,
@@ -422,9 +469,8 @@ class JdbcReminderDispatchStore(
                 )
             },
             PushRuntimeSettings.MAX_ATTEMPTS,
-            limit,
+            remaining,
         )
-        var recovered = 0
         candidates.forEach { lease ->
             jdbc.queryForList("SELECT id FROM users WHERE id = ? FOR UPDATE", Long::class.java, lease.userId)
             jdbc.queryForList("SELECT id FROM meeting_reminder_claims WHERE id = ? FOR UPDATE", UUID::class.java, lease.claimId)

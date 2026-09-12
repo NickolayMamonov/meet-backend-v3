@@ -189,6 +189,49 @@ class MeetingReminderDispatchPostgresTest : IntegrationTestSupport() {
         )
     }
 
+    @Test
+    fun `maintenance terminalizes overdue unleased retry work without leasing it`() {
+        val now = databaseNow()
+        val fixture = seedReminder(now.minusSeconds(3_600))
+        val targetId = jdbcTemplate.queryForObject(
+            "SELECT id FROM meeting_reminder_targets LIMIT 1",
+            UUID::class.java,
+        )
+        jdbcTemplate.update(
+            """
+            UPDATE meeting_reminder_targets
+            SET status = 'RETRY_WAIT', attempts = 1, reason = 'TRANSIENT',
+                next_attempt_at = CURRENT_TIMESTAMP - INTERVAL '10 minutes',
+                lease_token = NULL, lease_until = NULL
+            WHERE id = ?
+            """.trimIndent(),
+            targetId,
+        )
+
+        assertEquals(1, dispatch.recoverAndExpire(100, now))
+        assertEquals(
+            "SKIPPED",
+            jdbcTemplate.queryForObject(
+                "SELECT status FROM meeting_reminder_targets WHERE id = ?",
+                String::class.java,
+                targetId,
+            ),
+        )
+        assertEquals(
+            "DEADLINE_PASSED",
+            jdbcTemplate.queryForObject(
+                "SELECT reason FROM meeting_reminder_targets WHERE id = ?",
+                String::class.java,
+                targetId,
+            ),
+        )
+        assertEquals(fixture.bob.id, jdbcTemplate.queryForObject(
+            "SELECT user_id FROM meeting_reminder_targets WHERE id = ?",
+            Long::class.java,
+            targetId,
+        ))
+    }
+
     private fun seedReminder(now: Instant): ApiFixture {
         val fixture = fixture()
         jdbcTemplate.update(
