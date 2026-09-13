@@ -1,0 +1,14 @@
+{
+  "baselineCommit": "cb730ea062454a0453010ff4eddeb5f6ccf51171",
+  "workflowPath": ".github/workflows/promote-dev-digest-to-test-vps.yml",
+  "filterSourceLines": [693, 831],
+  "baselineFilterSha256": "8cf493135a2c60a14a866e9e2ee69a62cbb522e6f6c189139b24dc0ab75a1bee",
+  "scalarPath": "jobs.deploy.steps[].run",
+  "generationCommand": "jq -n with the complete promotion arguments and baseline inline filter | jq -S .",
+  "cases": [
+    "empty-closed-same",
+    "closed-beta-demo-same",
+    "empty-closed-changed",
+    "closed-beta-demo-changed"
+  ]
+}

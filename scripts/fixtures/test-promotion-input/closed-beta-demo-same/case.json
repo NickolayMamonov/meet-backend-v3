@@ -1,0 +1,22 @@
+{
+  "stateMode": "closed-beta-demo",
+  "imageBranch": "same",
+  "rollbackRequired": false,
+  "rollbackAttempted": false,
+  "rollbackVerified": false,
+  "sourceSha": "0123456789abcdef0123456789abcdef01234567",
+  "treeId": "89abcdef0123456789abcdef0123456789abcdef",
+  "version": "1.2.0",
+  "image": "ghcr.io/nickolaymamonov/meet-backend-v3",
+  "alias": "test-sha-0123456789abcdef0123456789abcdef01234567",
+  "admissionMode": "reused",
+  "rootDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "platformDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "proofs": {
+    "predecessor": "9999999999999999999999999999999999999999999999999999999999999999",
+    "candidate": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "rollbackPredecessor": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "rollback": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "final": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  }
+}

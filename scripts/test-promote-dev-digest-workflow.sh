@@ -7,7 +7,10 @@ FIXTURES=$ROOT_DIR/scripts/fixtures/promote-dev-digest-workflow
 AUTHORIZER=$ROOT_DIR/scripts/authorize-dev-promotion.sh
 PROBE=$ROOT_DIR/scripts/probe-test-vps-zero-state.sh
 PROBE_FIXTURE=$FIXTURES/probe-contract.sh
+FILTER=$ROOT_DIR/scripts/build-test-promotion-input.jq
 [ -f "$WORKFLOW" ] && [ -f "$FIXTURES/authorized-run.json" ] || exit 1
+[ -f "$FILTER" ]
+grep -Fq -- '-f scripts/build-test-promotion-input.jq' "$WORKFLOW"
 grep -Fq "workflow_dispatch:" "$WORKFLOW"
 grep -Fq 'scripts/authorize-dev-promotion.sh' "$WORKFLOW"
 ! grep -Fq 'version.json' "$WORKFLOW"
@@ -49,11 +52,11 @@ grep -Fq 'rollback-predecessor.json' "$WORKFLOW"
 grep -Fq 'download_phase "$rollback_state_dir" predecessor' "$WORKFLOW"
 grep -Fq '"$rollback_state_dir" "$final_state_dir" "$rollback_required"' "$WORKFLOW"
 grep -Fq 'if [ "$rollback_required" = true ]; then' "$WORKFLOW"
-grep -Fq 'then $final[0].zeroStateProbe.http.meetingsCount == 0' "$WORKFLOW"
-grep -Fq '$admissionContract[0].populated.roots.meetings' "$WORKFLOW"
-grep -Fq 'identity($rollbackPredecessor' "$WORKFLOW"
+grep -Fq 'then $final[0].zeroStateProbe.http.meetingsCount == 0' "$FILTER"
+grep -Fq '$admissionContract[0].populated.roots.meetings' "$FILTER"
+grep -Fq 'identity($rollbackPredecessor' "$FILTER"
 grep -Fq 'def rollback_identity' "$ROOT_DIR/scripts/build-test-promotion-evidence.sh"
-grep -Fq '.phase == $expectedPhase' "$WORKFLOW"
+grep -Fq '.phase == $expectedPhase' "$FILTER"
 grep -Fq 'actionlint_version=1.7.7' "$CI"
 grep -Fq 'promote-dev-digest-to-test-vps.yml' "$CI"
 grep -Fq 'populated_meetings=$(jq -er' "$PROBE"
@@ -77,7 +80,7 @@ grep -Fq 'mutation_started' "$WORKFLOW"
 grep -Fq 'printf '\''root_digest=%s\n'\'' "$root_digest" >> "$GITHUB_OUTPUT"' "$WORKFLOW"
 grep -Fq 'printf '\''platform_digest=%s\n'\'' "$platform_digest" >> "$GITHUB_OUTPUT"' "$WORKFLOW"
 grep -Fq 'printf '\''admission_mode=%s\n'\'' "$mode" >> "$GITHUB_OUTPUT"' "$WORKFLOW"
-! grep -Eiq 'gh[[:space:]]+release|docker[[:space:]]+push|git[[:space:]]+push|refs/tags|--method[[:space:]]+DELETE' "$WORKFLOW"
+! grep -Eiq 'gh[[:space:]]+release|docker[[:space:]]+push|git[[:space:]]+push|refs/tags|--method[[:space:]]+DELETE' "$WORKFLOW" "$FILTER"
 command -v jq >/dev/null
 jq -e '(.event_name == "workflow_dispatch") and (.ref == "refs/heads/dev") and (.head_sha | test("^[0-9a-f]{40}$")) and (.authorized == true)' \
   "$FIXTURES/authorized-run.json" >/dev/null
@@ -85,4 +88,5 @@ jq -e '(.head_sha | test("^[0-9a-f]{40}$")) and (.conclusion == "success") and (
   "$FIXTURES/authorized-ci-runs.json" >/dev/null
 jq -e '(.closed_beta_promotion_branches == ["dev"]) and (.test_vps_branches == ["dev"])' \
   "$FIXTURES/dev-only-environment.json" >/dev/null
+bash "$ROOT_DIR/scripts/test-test-promotion-input.sh"
 echo "dev promotion workflow fixture passed"
