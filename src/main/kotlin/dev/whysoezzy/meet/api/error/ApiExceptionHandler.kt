@@ -5,6 +5,7 @@ import jakarta.validation.ConstraintViolationException
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.http.converter.HttpMessageNotReadableException
+import org.springframework.web.HttpMediaTypeNotSupportedException
 import org.springframework.validation.FieldError
 import org.springframework.web.bind.MethodArgumentNotValidException
 import org.springframework.web.bind.ServletRequestBindingException
@@ -46,6 +47,13 @@ class ApiExceptionHandler(
             ?: "Invalid request"
         return response(HttpStatus.BAD_REQUEST, message, request, "BAD_REQUEST")
     }
+
+    @ExceptionHandler(HttpMediaTypeNotSupportedException::class)
+    fun unsupportedMediaType(
+        exception: HttpMediaTypeNotSupportedException,
+        request: HttpServletRequest,
+    ): ResponseEntity<ApiError> =
+        response(HttpStatus.UNSUPPORTED_MEDIA_TYPE, "Unsupported media type", request, "UNSUPPORTED_MEDIA_TYPE")
 
     @ExceptionHandler(
         NoResourceFoundException::class,

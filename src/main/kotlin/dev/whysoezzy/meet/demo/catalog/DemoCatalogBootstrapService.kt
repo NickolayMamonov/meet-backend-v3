@@ -152,6 +152,7 @@ class DemoCatalogBootstrapService(
                     user.deletedAt != null ||
                     user.authVersion != 0L ||
                     user.socialMedia.isNotEmpty() ||
+                    count("SELECT count(*) FROM push_installations WHERE user_id = ?", user.id) > 0 ||
                     count("SELECT count(*) FROM auth_identities WHERE user_id = ?", user.id) > 0 ||
                     count("SELECT count(*) FROM refresh_tokens WHERE user_id = ?", user.id) > 0 ||
                     emailIdentifiers.any {

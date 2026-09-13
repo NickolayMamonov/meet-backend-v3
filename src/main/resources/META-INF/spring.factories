@@ -1,0 +1,2 @@
+org.springframework.context.ApplicationListener=\
+dev.whysoezzy.meet.config.PushLoggingEnvironmentListener

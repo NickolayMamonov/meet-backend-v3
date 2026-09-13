@@ -18,9 +18,13 @@ open class ApiException(
 ) : RuntimeException(message)
 
 class BadRequestException(message: String) : ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message)
+class PayloadTooLargeException :
+    ApiException(HttpStatus.PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE", "Request payload is too large")
 class ValidationException(message: String) : ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message)
 class NotFoundException(message: String) : ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message)
 class ConflictException(message: String) : ApiException(HttpStatus.CONFLICT, "CONFLICT", message)
+class PushConflictException(message: String = "Push operation is blocked") :
+    ApiException(HttpStatus.CONFLICT, "CONFLICT_BLOCKED", message)
 class UnauthorizedException(message: String = "Authentication is required") :
     ApiException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", message)
 class ForbiddenException(message: String = "Access is denied") : ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message)
@@ -28,6 +32,8 @@ class RateLimitException(message: String = "Too many requests. Please try again 
     ApiException(HttpStatus.TOO_MANY_REQUESTS, "RATE_LIMITED", message)
 class ServiceUnavailableException(message: String) :
     ApiException(HttpStatus.SERVICE_UNAVAILABLE, "SMS_UNAVAILABLE", message)
+class PushUnavailableException(message: String = "Push service is temporarily unavailable") :
+    ApiException(HttpStatus.SERVICE_UNAVAILABLE, "PUSH_UNAVAILABLE", message)
 class EmailOtpRateLimitedException :
     ApiException(
         HttpStatus.TOO_MANY_REQUESTS,

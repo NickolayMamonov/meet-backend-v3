@@ -35,7 +35,7 @@ class MeetingServiceTest {
         val fullMeeting = meeting(capacity = 1, participants = mutableSetOf(existingParticipant))
 
         `when`(meetingRepository.findById(99L)).thenReturn(Optional.of(fullMeeting))
-        `when`(userRepository.findById(42L)).thenReturn(Optional.of(joiningUser))
+        `when`(userRepository.findWithLockById(42L)).thenReturn(joiningUser)
         `when`(meetingRepository.isUserParticipant(99L, 42L)).thenReturn(false)
 
         val exception = assertThrows<ConflictException> {

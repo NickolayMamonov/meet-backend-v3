@@ -5,6 +5,7 @@ import dev.whysoezzy.meet.domain.repository.CommunityRepository
 import dev.whysoezzy.meet.domain.repository.RefreshTokenRepository
 import dev.whysoezzy.meet.domain.repository.TagRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
+import dev.whysoezzy.meet.service.push.PushInstallationStore
 import org.junit.jupiter.api.Test
 import org.mockito.Mockito.mock
 import org.mockito.Mockito.verify
@@ -16,11 +17,13 @@ class UserServiceTest {
     private val userRepository = mock(UserRepository::class.java)
     private val tagRepository = mock(TagRepository::class.java)
     private val refreshTokenRepository = mock(RefreshTokenRepository::class.java)
+    private val pushInstallationStore = mock(PushInstallationStore::class.java)
     private val userService = UserService(
         userRepository,
         tagRepository,
         refreshTokenRepository,
         UserProfileMapper(),
+        pushInstallationStore,
     )
 
     @Test
@@ -37,5 +40,9 @@ class UserServiceTest {
         assertNotNull(user.deletedAt)
         verify(userRepository).save(user)
         verify(refreshTokenRepository).deleteAllByUserId(1L)
+        verify(pushInstallationStore).markAccountDeleted(
+            1L,
+            user.deletedAt!!.toInstant(java.time.ZoneOffset.UTC),
+        )
     }
 }

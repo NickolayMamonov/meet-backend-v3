@@ -9,6 +9,7 @@ import dev.whysoezzy.meet.domain.repository.CommunityRepository
 import dev.whysoezzy.meet.domain.repository.TagRepository
 import dev.whysoezzy.meet.domain.repository.RefreshTokenRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
+import dev.whysoezzy.meet.service.push.PushInstallationStore
 import mu.KotlinLogging
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
@@ -22,6 +23,7 @@ class UserService(
     private val tagRepository: TagRepository,
     private val refreshTokenRepository: RefreshTokenRepository,
     private val profileMapper: UserProfileMapper,
+    private val pushInstallationStore: PushInstallationStore,
 ) {
 
     @Transactional(readOnly = true)
@@ -106,6 +108,10 @@ class UserService(
             ?: throw NotFoundException("User not found")
         user.deletedAt = LocalDateTime.now()
         user.authVersion += 1
+        pushInstallationStore.markAccountDeleted(
+            userId,
+            user.deletedAt!!.toInstant(java.time.ZoneOffset.UTC),
+        )
         userRepository.save(user)
         refreshTokenRepository.deleteAllByUserId(userId)
     }
