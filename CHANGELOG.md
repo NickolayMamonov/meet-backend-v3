@@ -1,5 +1,58 @@
 # Changelog
 
+## [1.4.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.3.0...v1.4.0) (2026-09-13)
+
+
+### Features
+
+* **promotion:** admit populated beta state ([cb730ea](https://github.com/NickolayMamonov/meet-backend-v3/commit/cb730ea062454a0453010ff4eddeb5f6ccf51171))
+* **promotion:** admit populated beta state ([1353a4d](https://github.com/NickolayMamonov/meet-backend-v3/commit/1353a4df4f3ab2d790b7de1e87c82e6eae268274))
+* prove beta backup restore ([47ab2ef](https://github.com/NickolayMamonov/meet-backend-v3/commit/47ab2efbe26dfb2e77040e2b7ff605a174219a4d))
+* prove beta backup restore ([66f2882](https://github.com/NickolayMamonov/meet-backend-v3/commit/66f2882fbaf076a9ad9d1fdc854b5bff6c772eb0))
+* **push:** implement beta push reminders ([ad1dbf4](https://github.com/NickolayMamonov/meet-backend-v3/commit/ad1dbf470c40db7bb7f8b477560a7aa647dcd737))
+* **push:** implement beta reminders ([d5a3680](https://github.com/NickolayMamonov/meet-backend-v3/commit/d5a368045fca28ad8c24b79705e462a5589163b1))
+
+
+### Fixes
+
+* bind restore capacity and authority contracts ([1df09d0](https://github.com/NickolayMamonov/meet-backend-v3/commit/1df09d0e8787bf68d29b29595c704fdac7925a03))
+* close beta recovery rework blockers ([f7dd646](https://github.com/NickolayMamonov/meet-backend-v3/commit/f7dd646f0b2813ad1cd2a7a67fa4519d3c0abb3d))
+* close beta recovery rework blockers ([b763d01](https://github.com/NickolayMamonov/meet-backend-v3/commit/b763d01dc13044bb33e145f7b27797de986a9b25))
+* close beta recovery rework gaps ([64dbbd1](https://github.com/NickolayMamonov/meet-backend-v3/commit/64dbbd16995a89f2baf245f8b567b955d656a855))
+* close beta recovery rework gaps ([589190d](https://github.com/NickolayMamonov/meet-backend-v3/commit/589190d44be03fd81e2a5ecb4d7fa598523dbe99))
+* close beta recovery security gaps ([950a35b](https://github.com/NickolayMamonov/meet-backend-v3/commit/950a35b30d3fe1c61f59c900acdacd853f7af380))
+* close recovery journal and residue gaps ([a40f26a](https://github.com/NickolayMamonov/meet-backend-v3/commit/a40f26a8eb13743847bc7c83299f477edc1c9264))
+* close release publication races ([65b4f4f](https://github.com/NickolayMamonov/meet-backend-v3/commit/65b4f4f31623cf126544663e9800fa8fb7a57ac0))
+* gate recovery evidence on final cleanup ([17e7cf1](https://github.com/NickolayMamonov/meet-backend-v3/commit/17e7cf1921a84557fb10e6a31c8f4451472268d3))
+* harden beta backup restore proof ([8fd02e3](https://github.com/NickolayMamonov/meet-backend-v3/commit/8fd02e399ba1762f4b148551d39d83c63fc8074e))
+* harden v1.3.0 release recovery ([af499d1](https://github.com/NickolayMamonov/meet-backend-v3/commit/af499d160718dcd285c9e419e21da6066ea0afc6))
+* preserve promotion expression whitespace accounting ([bbf2e90](https://github.com/NickolayMamonov/meet-backend-v3/commit/bbf2e90c1f05a8f90a5a7686247e194031067236))
+* **promotion:** bind populated meeting admission ([bc4e312](https://github.com/NickolayMamonov/meet-backend-v3/commit/bc4e3123ae0268a08dcca9b0d37da94d9bcafd0d))
+* **promotion:** close rework admission contracts ([6955903](https://github.com/NickolayMamonov/meet-backend-v3/commit/69559037e0b53e7ad4211e402b3a8f6beca678c9))
+* **promotion:** complete populated admission proof ([4425b72](https://github.com/NickolayMamonov/meet-backend-v3/commit/4425b726000425091ca2908eb9cd2945815120fa))
+* **promotion:** preserve probe fixture executable bit ([a717129](https://github.com/NickolayMamonov/meet-backend-v3/commit/a7171291988ea1ed4c8a67a4b9de50d3502dc784))
+* **promotion:** repair rollback admission evidence ([37ebf5e](https://github.com/NickolayMamonov/meet-backend-v3/commit/37ebf5e62da610dbbe68f256f84f13a2de7486ed))
+* **push:** apply recovery precedence and state constraints ([fd0ab82](https://github.com/NickolayMamonov/meet-backend-v3/commit/fd0ab82721923ca3c8cf0b3c8689362c25b7b7f5))
+* **push:** close exact-head review gaps ([3fd279a](https://github.com/NickolayMamonov/meet-backend-v3/commit/3fd279a7761fc9d51b2579b4f9393c9122f335ba))
+* **push:** close review blockers ([a604cef](https://github.com/NickolayMamonov/meet-backend-v3/commit/a604ceffa6be8c0e79b3b59cb0580bf48108b5e1))
+* **push:** discover within reminder grace window ([241b3fe](https://github.com/NickolayMamonov/meet-backend-v3/commit/241b3fe0dfe48c9cdfd99e803d4d45acb90d8492))
+* **push:** enforce dedicated Firebase project ([3717119](https://github.com/NickolayMamonov/meet-backend-v3/commit/371711972da6cf46e5c5383b0f53ff9111a34522))
+* **push:** enforce diagnostic and target state contracts ([500a6c6](https://github.com/NickolayMamonov/meet-backend-v3/commit/500a6c65dd4fdbc443c8cdb27337e60006a53614))
+* **push:** fence invalidation behind lease CAS ([22cae51](https://github.com/NickolayMamonov/meet-backend-v3/commit/22cae519f9011db27cfc34ab248ba1af075d499e))
+* **push:** index installation owners across lifecycle ([26466e8](https://github.com/NickolayMamonov/meet-backend-v3/commit/26466e8edd4942d34a10ccd0ad210b7eacb7b3dd))
+* **push:** index installation owners in V10 ([cbcad3b](https://github.com/NickolayMamonov/meet-backend-v3/commit/cbcad3b32531f00f8ffad902673168918401ccaf))
+* **push:** keep reminder schema in authorized V10 ([25bdeac](https://github.com/NickolayMamonov/meet-backend-v3/commit/25bdeac5f029986f634e9afeaf42c31abc393e1e))
+* **push:** preserve retry state at delivery boundary ([d24d1ab](https://github.com/NickolayMamonov/meet-backend-v3/commit/d24d1abcc960a3f309d97e649ff1186882a7e00a))
+* **push:** recover overdue and fence stale leases ([96dce98](https://github.com/NickolayMamonov/meet-backend-v3/commit/96dce98633da5619591bef9bef30567ad3831a4b))
+* **push:** serialize membership mutations ([055cfc9](https://github.com/NickolayMamonov/meet-backend-v3/commit/055cfc93a1b9b3863639cb52b34d68521221da30))
+* recover exact v1.3.0 release draft ([79263bf](https://github.com/NickolayMamonov/meet-backend-v3/commit/79263bfed6427dc1a45900e338805c52dbd5f59d))
+* recover exact v1.3.0 release draft ([25adf8f](https://github.com/NickolayMamonov/meet-backend-v3/commit/25adf8f0d481ede59fa30d1a03f67168a4c8f9cb))
+* **recovery:** close cleanup admission race ([7185e3b](https://github.com/NickolayMamonov/meet-backend-v3/commit/7185e3bf74f17a0ebbdbc8fd63317389e28c8b85))
+* rework beta recovery proof gates ([c5fa114](https://github.com/NickolayMamonov/meet-backend-v3/commit/c5fa1140dd8cc14dc2e03b06a0422c25e3017e7d))
+* satisfy shellcheck for recovery authorization ([8a3e17d](https://github.com/NickolayMamonov/meet-backend-v3/commit/8a3e17d0ecfd4d901cc1e276a8b94028495a252b))
+* tolerate artifact retention rounding ([bbaec8b](https://github.com/NickolayMamonov/meet-backend-v3/commit/bbaec8b7ae60794cf1e0ebfa2ec2a5f1db3f5dbc))
+* tolerate artifact retention rounding ([f29ceec](https://github.com/NickolayMamonov/meet-backend-v3/commit/f29ceec9a7e17539c80169ebe185d501dd246146))
+
 ## [1.3.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.2.0...v1.3.0) (2026-08-23)
 
 
