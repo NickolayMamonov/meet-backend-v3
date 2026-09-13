@@ -1,0 +1,358 @@
+{
+  "control": {
+    "finalVerified": true,
+    "rollbackPolicySatisfied": true
+  },
+  "deployment": {
+    "candidate": {
+      "admissionMode": "empty-closed",
+      "admissionStateSha256": null,
+      "bootstrapControlPresent": true,
+      "bootstrapDisabled": true,
+      "bootstrapMode": "declared-false",
+      "bootstrapProofSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "configDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "healthy": true,
+      "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "imageId": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "runtimeDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sourceSha": "0123456789abcdef0123456789abcdef01234567",
+      "treeId": "89abcdef0123456789abcdef0123456789abcdef",
+      "version": "1.2.0",
+      "zeroStateProbe": {
+        "admission": {
+          "mode": "empty-closed",
+          "stateSha256": null
+        },
+        "database": {
+          "tables": {
+            "ad_block_communities": 0,
+            "ad_block_users": 0,
+            "ad_blocks": 0,
+            "communities": 0,
+            "community_subscribers": 0,
+            "community_tags": 0,
+            "demo_catalog_state": 0,
+            "meeting_participants": 0,
+            "meeting_tags": 0,
+            "meetings": 0,
+            "tags": 0,
+            "user_interests": 0,
+            "user_social_media": 0,
+            "users": 0
+          },
+          "totalRows": 0
+        },
+        "http": {
+          "actuatorStatus": 404,
+          "adminAuthenticatedDisabled404": true,
+          "adminBlankDisabled403": false,
+          "adminKeyConfigured": true,
+          "adminMissingStatus": 403,
+          "adminWrongStatus": 403,
+          "assetsCount": 13,
+          "assetsVerified": true,
+          "httpRedirectHttps": true,
+          "meetingsCount": 0,
+          "meetingsJson": true,
+          "meetingsStatus": 200
+        },
+        "image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "imageId": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "phase": "candidate",
+        "runtime": {
+          "containerHealthy": true,
+          "hardeningVerified": true,
+          "networks": [],
+          "nonIdleApplicationTransactions": 0,
+          "ports": [],
+          "postgresVolumes": [
+            {
+              "destination": "/var/lib/postgresql/data",
+              "propagation": "",
+              "read_only": false,
+              "source": "meet-production_postgres_data",
+              "type": "volume"
+            }
+          ],
+          "postgresWritablePrimary": true,
+          "smtpIdleSamples": [
+            0,
+            0
+          ],
+          "topologyVerified": true,
+          "volumes": [
+            {
+              "destination": "/data/uploads",
+              "propagation": "",
+              "read_only": false,
+              "source": "meet-production_uploads_data",
+              "type": "volume"
+            }
+          ],
+          "volumesVerified": true
+        },
+        "runtimeConfigHash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "schema": "meet-backend/test-vps-zero-state-probe/v2",
+        "sourceSha": "0123456789abcdef0123456789abcdef01234567",
+        "version": "1.2.0",
+        "zeroState": "closed",
+        "zeroStateObserved": true
+      }
+    },
+    "final": {
+      "admissionMode": "empty-closed",
+      "admissionStateSha256": null,
+      "bootstrapControlPresent": true,
+      "bootstrapDisabled": true,
+      "bootstrapMode": "declared-false",
+      "bootstrapProofSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "configDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "healthy": true,
+      "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "imageId": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "runtimeDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sourceSha": "0123456789abcdef0123456789abcdef01234567",
+      "treeId": "89abcdef0123456789abcdef0123456789abcdef",
+      "version": "1.2.0",
+      "zeroStateProbe": {
+        "admission": {
+          "mode": "empty-closed",
+          "stateSha256": null
+        },
+        "database": {
+          "tables": {
+            "ad_block_communities": 0,
+            "ad_block_users": 0,
+            "ad_blocks": 0,
+            "communities": 0,
+            "community_subscribers": 0,
+            "community_tags": 0,
+            "demo_catalog_state": 0,
+            "meeting_participants": 0,
+            "meeting_tags": 0,
+            "meetings": 0,
+            "tags": 0,
+            "user_interests": 0,
+            "user_social_media": 0,
+            "users": 0
+          },
+          "totalRows": 0
+        },
+        "http": {
+          "actuatorStatus": 404,
+          "adminAuthenticatedDisabled404": true,
+          "adminBlankDisabled403": false,
+          "adminKeyConfigured": true,
+          "adminMissingStatus": 403,
+          "adminWrongStatus": 403,
+          "assetsCount": 13,
+          "assetsVerified": true,
+          "httpRedirectHttps": true,
+          "meetingsCount": 0,
+          "meetingsJson": true,
+          "meetingsStatus": 200
+        },
+        "image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "imageId": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "phase": "final",
+        "runtime": {
+          "containerHealthy": true,
+          "hardeningVerified": true,
+          "networks": [],
+          "nonIdleApplicationTransactions": 0,
+          "ports": [],
+          "postgresVolumes": [
+            {
+              "destination": "/var/lib/postgresql/data",
+              "propagation": "",
+              "read_only": false,
+              "source": "meet-production_postgres_data",
+              "type": "volume"
+            }
+          ],
+          "postgresWritablePrimary": true,
+          "smtpIdleSamples": [
+            0,
+            0
+          ],
+          "topologyVerified": true,
+          "volumes": [
+            {
+              "destination": "/data/uploads",
+              "propagation": "",
+              "read_only": false,
+              "source": "meet-production_uploads_data",
+              "type": "volume"
+            }
+          ],
+          "volumesVerified": true
+        },
+        "runtimeConfigHash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "schema": "meet-backend/test-vps-zero-state-probe/v2",
+        "sourceSha": "0123456789abcdef0123456789abcdef01234567",
+        "version": "1.2.0",
+        "zeroState": "closed",
+        "zeroStateObserved": true
+      }
+    },
+    "predecessor": {
+      "admissionMode": "empty-closed",
+      "admissionStateSha256": null,
+      "bootstrapControlPresent": false,
+      "bootstrapDisabled": null,
+      "bootstrapMode": "legacy-not-applicable",
+      "bootstrapProofSha256": "9999999999999999999999999999999999999999999999999999999999999999",
+      "configDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "healthy": true,
+      "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "imageId": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "runtimeDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sourceSha": "0123456789abcdef0123456789abcdef01234567",
+      "treeId": "89abcdef0123456789abcdef0123456789abcdef",
+      "version": "1.2.0",
+      "zeroStateProbe": {
+        "admission": {
+          "mode": "empty-closed",
+          "stateSha256": null
+        },
+        "database": {
+          "tables": {
+            "ad_block_communities": 0,
+            "ad_block_users": 0,
+            "ad_blocks": 0,
+            "communities": 0,
+            "community_subscribers": 0,
+            "community_tags": 0,
+            "demo_catalog_state": 0,
+            "meeting_participants": 0,
+            "meeting_tags": 0,
+            "meetings": 0,
+            "tags": 0,
+            "user_interests": 0,
+            "user_social_media": 0,
+            "users": 0
+          },
+          "totalRows": 0
+        },
+        "http": {
+          "actuatorStatus": 404,
+          "adminAuthenticatedDisabled404": true,
+          "adminBlankDisabled403": false,
+          "adminKeyConfigured": true,
+          "adminMissingStatus": 403,
+          "adminWrongStatus": 403,
+          "assetsCount": 13,
+          "assetsVerified": true,
+          "httpRedirectHttps": true,
+          "meetingsCount": 0,
+          "meetingsJson": true,
+          "meetingsStatus": 200
+        },
+        "image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "imageId": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "phase": "predecessor",
+        "runtime": {
+          "containerHealthy": true,
+          "hardeningVerified": true,
+          "networks": [],
+          "nonIdleApplicationTransactions": 0,
+          "ports": [],
+          "postgresVolumes": [
+            {
+              "destination": "/var/lib/postgresql/data",
+              "propagation": "",
+              "read_only": false,
+              "source": "meet-production_postgres_data",
+              "type": "volume"
+            }
+          ],
+          "postgresWritablePrimary": true,
+          "smtpIdleSamples": [
+            0,
+            0
+          ],
+          "topologyVerified": true,
+          "volumes": [
+            {
+              "destination": "/data/uploads",
+              "propagation": "",
+              "read_only": false,
+              "source": "meet-production_uploads_data",
+              "type": "volume"
+            }
+          ],
+          "volumesVerified": true
+        },
+        "runtimeConfigHash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "schema": "meet-backend/test-vps-zero-state-probe/v2",
+        "sourceSha": "0123456789abcdef0123456789abcdef01234567",
+        "version": "1.2.0",
+        "zeroState": "closed",
+        "zeroStateObserved": true
+      }
+    },
+    "probes": {
+      "actuator404": true,
+      "adminAuthenticatedDisabled404": true,
+      "adminBlankDisabled403": false,
+      "adminKeyConfigured": true,
+      "adminMissing403": true,
+      "adminWrong403": true,
+      "assets": {
+        "count": 13,
+        "verified": true
+      },
+      "httpRedirectHttps": true,
+      "meetings200Json": true
+    },
+    "rollback": {
+      "attempted": false,
+      "predecessor": null,
+      "required": false,
+      "restored": null,
+      "sameImageRedeploy": true,
+      "verified": false
+    },
+    "runtime": {
+      "hardeningVerified": true,
+      "nonIdleApplicationTransactions": 0,
+      "postgresWritablePrimary": true,
+      "smtpIdleSamples": [
+        0,
+        0
+      ],
+      "topologyVerified": true,
+      "volumes": [
+        "meet-production_postgres_data",
+        "meet-production_uploads_data"
+      ],
+      "volumesVerified": true
+    }
+  },
+  "image": {
+    "admissionMode": "reused",
+    "alias": "test-sha-0123456789abcdef0123456789abcdef01234567",
+    "githubAttestation": true,
+    "image": "ghcr.io/nickolaymamonov/meet-backend-v3",
+    "labels": {
+      "revision": "0123456789abcdef0123456789abcdef01234567",
+      "source": "https://github.com/NickolayMamonov/meet-backend-v3",
+      "version": "1.2.0"
+    },
+    "platform": "linux/amd64",
+    "platformDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "protectedStateEqual": true,
+    "provenance": true,
+    "referrerClosure": true,
+    "rootDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sbom": true
+  },
+  "schema": "meet-backend/test-promotion-evidence-input/v2",
+  "source": {
+    "authoritySha": "0123456789abcdef0123456789abcdef01234567",
+    "sourceSha": "0123456789abcdef0123456789abcdef01234567",
+    "treeId": "89abcdef0123456789abcdef0123456789abcdef",
+    "version": "1.2.0"
+  }
+}
