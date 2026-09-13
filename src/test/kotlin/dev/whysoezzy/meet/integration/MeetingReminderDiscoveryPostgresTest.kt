@@ -141,15 +141,15 @@ class MeetingReminderDiscoveryPostgresTest : IntegrationTestSupport() {
             ).forEach { (_, elapsedMs) ->
                 resetDatabase()
                 val fixture = fixture()
-                val due = now.plusMillis(elapsedMs)
+                val due = now
                 val meetingTime = due.plusSeconds(offsetMinutes.toLong() * 60).toEpochMilli()
                 jdbcTemplate.update("UPDATE meetings SET time = ? WHERE id = ?", meetingTime, fixture.meeting.id)
                 installations.register(requireNotNull(fixture.bob.id), parseFid("fid-$offsetMinutes-$elapsedMs"))
 
-                val candidates = reminders.findCandidates(due)
+                val candidates = reminders.findCandidates(due.plusMillis(elapsedMs))
                 assertEquals(1, candidates.size)
                 assertEquals(offsetMinutes, candidates.single().offset.minutes)
-                assertNotNull(reminders.discover(candidates.single(), due))
+                assertNotNull(reminders.discover(candidates.single(), due.plusMillis(elapsedMs)))
             }
         }
     }
@@ -160,7 +160,7 @@ class MeetingReminderDiscoveryPostgresTest : IntegrationTestSupport() {
         val beforeDueFixture = fixture()
         jdbcTemplate.update(
             "UPDATE meetings SET time = ? WHERE id = ?",
-            now.plusSeconds(60 * 60).minusMillis(1).toEpochMilli(),
+            now.plusSeconds(60 * 60).plusMillis(1).toEpochMilli(),
             beforeDueFixture.meeting.id,
         )
         installations.register(requireNotNull(beforeDueFixture.bob.id), parseFid("fid-before-due"))

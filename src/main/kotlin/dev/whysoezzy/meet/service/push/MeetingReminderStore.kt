@@ -57,7 +57,7 @@ class MeetingReminderStore(
                   AND m.status = 'ACTIVE'
                   AND m.time > EXTRACT(EPOCH FROM ?::timestamptz) * 1000
                   AND to_timestamp((m.time - o.minutes * 60000)::double precision / 1000)
-                      BETWEEN ?::timestamptz AND ?::timestamptz + INTERVAL '15 minutes'
+                      BETWEEN ?::timestamptz - INTERVAL '15 minutes' AND ?::timestamptz
                   AND NOT EXISTS (
                       SELECT 1 FROM meeting_reminder_claims c
                       WHERE c.user_id = p.user_id
