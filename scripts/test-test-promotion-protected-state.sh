@@ -10,7 +10,7 @@ trap 'rm -r -- "$TMP"' EXIT HUP INT TERM
 fail() { echo "test-promotion protected-state fixture failed: $*" >&2; exit 1; }
 run_capture() {
   bash "$CAPTURE" --input "$1" --output "$2" \
-    --candidate-alias test-sha-1111111111111111111111111111111111111111
+    --candidate-alias test-sha-9b6d2b06c0336ab8d153564dcf6328e81c4d7b36
 }
 expect_failure() {
   local name=$1
@@ -45,15 +45,18 @@ cmp --silent "$TMP/canonical.json" "$TMP/repeat.json" ||
 [ "$(wc -l <"$TMP/canonical.json" | tr -d ' ')" -eq 1 ] ||
   fail "canonical output is not compact JSON"
 jq -e '
-  .schema == "meet-backend/test-promotion-protected-state/v1" and
+  .schema == "meet-backend/test-promotion-protected-state/v2" and
   .publicRelease.id == 371012814 and .publicRelease.tag == "v1.2.0" and
   .protected.releaseIds == [367640510,371012814] and
-  (any(.protected.aliases[]; .alias == "test-sha-1111111111111111111111111111111111111111")) and
+  (any(.protected.aliases[]; .alias == "test-sha-9b6d2b06c0336ab8d153564dcf6328e81c4d7b36")) and
   (any(.protected.aliases[]; .alias == "v1.2.0" and (.digests | length) == 2)) and
-  (any(.protected.versions[]; .digest == "sha256:9999999999999999999999999999999999999999999999999999999999999999")) and
+  (any(.protected.versions[]; .digest == "sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda")) and
   (all(.protected.versions[]; .digest != "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")) and
   (any(.protected.referrerClosure[]; .digest == "sha256:7777777777777777777777777777777777777777777777777777777777777777")) and
-  (all(.protected.githubAttestations[]; .subjectDigest != "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")) and
+  (all(.protected.attestationEvidence[]; .rootDigest != "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")) and
+  (any(.protected.authorities[]; .releaseId == 367640510 and .evidenceStorage.kind == "oci-registry-bundle")) and
+  (any(.protected.authorities[]; .releaseId == 371012814 and .evidenceStorage.kind == "github-api-workflow-artifact" and .releaseSourceDigest == "9b6d2b06c0336ab8d153564dcf6328e81c4d7b36" and .certificateSourceDigest == "9af0723444f918594101999a4338b418607cbd01")) and
+  (any(.protected.attestationEvidence[]; .rootDigest == "sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda" and .evidenceStorage.bundleDigest == "sha256:cf1f5d905c0bb97ca2013b3dd8aa415fb331a63dfec860e0382e5690339e5958")) and
   .proof.sha256 == "db5659e40c0b882e17d5e4f8e0218232e500134a86ecf49e6de714808de5c529"
 ' "$TMP/canonical.json" >/dev/null || fail "protected closure projection is wrong"
 
@@ -62,7 +65,7 @@ jq '
   .tagRefs |= reverse | .registry.versions |= reverse |
   .registry.versions[].tags |= reverse | .registry.subjects |= reverse |
   .registry.subjects[].aliases |= reverse | .registry.manifests |= reverse |
-  .registry.manifests[].children |= reverse | .registry.attestations |= reverse
+  .registry.manifests[].children |= reverse | .registry.authorities |= reverse | .registry.evidence |= reverse
 ' "$FIXTURE" >"$TMP/reordered.json"
 run_capture "$TMP/reordered.json" "$TMP/reordered-output.json"
 cmp --silent "$TMP/canonical.json" "$TMP/reordered-output.json" ||
@@ -91,10 +94,46 @@ jq '.registry.versions[0].digest = "not-a-digest"' "$FIXTURE" >"$TMP/malformed.j
 expect_failure malformed run_capture "$TMP/malformed.json" "$TMP/rejected.json"
 jq '.releases += [.releases[1]]' "$FIXTURE" >"$TMP/ambiguous.json"
 expect_failure ambiguous run_capture "$TMP/ambiguous.json" "$TMP/rejected.json"
-jq '.registry.attestations[0].signerWorkflow = "https://evil.invalid/workflow"' \
+jq '.registry.evidence[0].signerWorkflow = "https://evil.invalid/workflow"' \
   "$FIXTURE" >"$TMP/malformed-attestation.json"
 expect_failure malformed-attestation \
   run_capture "$TMP/malformed-attestation.json" "$TMP/rejected.json"
+jq '.registry.authorities[0].extra = "fixture-secret-must-not-appear"' "$FIXTURE" >"$TMP/extra-authority.json"
+expect_failure extra-authority run_capture "$TMP/extra-authority.json" "$TMP/rejected.json"
+jq '.registry.evidence[0].extra = "fixture-secret-must-not-appear"' "$FIXTURE" >"$TMP/extra-evidence.json"
+expect_failure extra-evidence run_capture "$TMP/extra-evidence.json" "$TMP/rejected.json"
+jq '.registry.authorities[0].subject.extra = "fixture-secret-must-not-appear"' "$FIXTURE" >"$TMP/extra-authority-subject.json"
+expect_failure extra-authority-subject run_capture "$TMP/extra-authority-subject.json" "$TMP/rejected.json"
+jq '.registry.evidence[0].subject.extra = "fixture-secret-must-not-appear"' "$FIXTURE" >"$TMP/extra-evidence-subject.json"
+expect_failure extra-evidence-subject run_capture "$TMP/extra-evidence-subject.json" "$TMP/rejected.json"
+jq '.registry.authorities[1].evidenceStorage.asset.extra = "fixture-secret-must-not-appear"' "$FIXTURE" >"$TMP/extra-api-asset.json"
+expect_failure extra-api-asset run_capture "$TMP/extra-api-asset.json" "$TMP/rejected.json"
+jq '.registry.authorities[1].evidenceStorage.assets[0].extra = "fixture-secret-must-not-appear"' "$FIXTURE" >"$TMP/extra-api-assets-entry.json"
+expect_failure extra-api-assets-entry run_capture "$TMP/extra-api-assets-entry.json" "$TMP/rejected.json"
+jq '.registry.evidence[0].evidenceStorage.closure.extra = "fixture-secret-must-not-appear"' "$FIXTURE" >"$TMP/extra-oci-closure.json"
+expect_failure extra-oci-closure run_capture "$TMP/extra-oci-closure.json" "$TMP/rejected.json"
+for mutation in authority-releaseId authority-root authority-platform authority-source authority-signer authority-storage; do
+  case "$mutation" in
+    authority-releaseId) filter='.registry.authorities[0].releaseId = 371012814' ;;
+    authority-root) filter='.registry.authorities[0].rootDigest = "sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda" | .registry.authorities[0].subject.digest = "sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda"' ;;
+    authority-platform) filter='.registry.authorities[0].platformDigest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"' ;;
+    authority-source) filter='.registry.authorities[0].releaseSourceDigest = "9b6d2b06c0336ab8d153564dcf6328e81c4d7b36"' ;;
+    authority-signer) filter='.registry.authorities[0].signerDigest = "9af0723444f918594101999a4338b418607cbd01"' ;;
+    authority-storage) filter='.registry.authorities[0].evidenceStorage.kind = "github-api-workflow-artifact"' ;;
+  esac
+  jq "$filter" "$FIXTURE" >"$TMP/$mutation.json"
+  expect_failure "$mutation" run_capture "$TMP/$mutation.json" "$TMP/rejected.json"
+done
+jq '.registry.evidence[0].certificateIdentity = "https://evil.invalid/workflow@refs/heads/dev"' "$FIXTURE" >"$TMP/evidence-identity.json"
+expect_failure evidence-identity run_capture "$TMP/evidence-identity.json" "$TMP/rejected.json"
+jq '.registry.evidence[0].evidenceStorage.kind = "github-api-workflow-artifact"' "$FIXTURE" >"$TMP/evidence-storage.json"
+expect_failure evidence-storage run_capture "$TMP/evidence-storage.json" "$TMP/rejected.json"
+jq '.registry.authorities += [.registry.authorities[0] | .rootDigest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" | .subject.digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]' "$FIXTURE" >"$TMP/unbound-authority.json"
+expect_failure unbound-authority run_capture "$TMP/unbound-authority.json" "$TMP/rejected.json"
+jq '.registry.evidence += [.registry.evidence[0] | .rootDigest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" | .subject.digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]' "$FIXTURE" >"$TMP/unbound-evidence.json"
+expect_failure unbound-evidence run_capture "$TMP/unbound-evidence.json" "$TMP/rejected.json"
+jq '.schema = "meet-backend/test-promotion-protected-state-input/v1"' "$FIXTURE" >"$TMP/v1-input.json"
+expect_failure v1-input run_capture "$TMP/v1-input.json" "$TMP/rejected.json"
 jq '.proof.sha256 = "fixture-secret-must-not-appear"' "$FIXTURE" >"$TMP/secret.json"
 expect_failure secret-proof run_capture "$TMP/secret.json" "$TMP/rejected.json"
 printf '{not-json\n' >"$TMP/not-json"
@@ -108,17 +147,30 @@ expect_byte_change protected-alias \
   '.registry.versions[0].tags += ["protected-drift"]'
 expect_byte_change protected-manifest \
   '.registry.manifests[4].size = 301'
-expect_byte_change protected-attestation \
-  '.registry.attestations[0].sourceDigest = "4444444444444444444444444444444444444444"'
-
+jq '.registry.evidence[0].releaseSourceDigest = "4444444444444444444444444444444444444444"' "$FIXTURE" >"$TMP/wrong-source.json"
+expect_failure wrong-source run_capture "$TMP/wrong-source.json" "$TMP/rejected.json"
 jq '.tagRefs[1].peeledCommitSha = "3333333333333333333333333333333333333333"' \
   "$FIXTURE" >"$TMP/tag-ref-drift.json"
 expect_failure tag-ref-drift \
   run_capture "$TMP/tag-ref-drift.json" "$TMP/rejected.json"
-jq '.registry.subjects[0].platformDigest = "sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
+jq '.registry.subjects[0].platformDigest = "sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda"' \
   "$FIXTURE" >"$TMP/platform-drift.json"
 expect_failure platform-drift \
   run_capture "$TMP/platform-drift.json" "$TMP/rejected.json"
+
+jq '
+  ([.registry.subjects[] | select(.kind == "platform" and .releaseId == 371012814)] |
+    if length == 1 then .[0].digest else error("v1.2.0 platform is ambiguous") end) as $sharedPlatform |
+  ([.registry.subjects[] | select(.kind == "root" and .releaseId == 367640510)] |
+    if length == 1 then .[0].digest else error("v1.0.1 root is ambiguous") end) as $v101Root |
+  .registry.subjects |= map(if .kind == "root" and .releaseId == 367640510
+    then .platformDigest = $sharedPlatform else . end) |
+  .registry.authorities |= map(if .releaseId == 367640510
+    then .platformDigest = $sharedPlatform else . end) |
+  .registry.evidence |= map(if .rootDigest == $v101Root
+    then .platformDigest = $sharedPlatform else . end)
+' "$FIXTURE" >"$TMP/cross-root-platform.json"
+expect_failure cross-root-platform run_capture "$TMP/cross-root-platform.json" "$TMP/rejected.json"
 
 cp "$TMP/canonical.json" "$TMP/stable-output.json"
 jq '.proof.sha256 = "fixture-secret-must-not-appear"' "$FIXTURE" >"$TMP/rejected-input.json"
