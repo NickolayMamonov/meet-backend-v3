@@ -290,9 +290,21 @@ run_builder() {
   else
     status=$?
   fi
-  if [ "$expected" = same ]; then
+  if [ "$expected" = same ] || [ "$expected" = changed ]; then
     [ "$status" -eq 0 ] && [ ! -s "$stdout" ] && [ -s "$output" ]
     assert_sanitized_success "$output"
+    if [ "$expected" = changed ]; then
+      local expected_predecessor expected_restored
+      expected_predecessor=$(jq -er \
+        '.deployment.rollback.predecessor.imageReference' "$input")
+      expected_restored=$(jq -er \
+        '.deployment.rollback.restored.imageReference' "$input")
+      jq -e --arg expectedPredecessor "$expected_predecessor" \
+        --arg expectedRestored "$expected_restored" '
+        .deployment.rollback.predecessor.imageReference == $expectedPredecessor and
+        .deployment.rollback.restored.imageReference == $expectedRestored
+      ' "$output" >/dev/null
+    fi
   else
     [ "$status" -ne 0 ] && [ ! -s "$stdout" ] && [ -s "$stderr" ] && [ ! -e "$output" ]
     grep -Fxq "$expected_stderr" "$stderr"

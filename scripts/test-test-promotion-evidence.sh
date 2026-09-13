@@ -20,6 +20,15 @@ PROOF=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 ROLLBACK_PROOF=abababababababababababababababababababababababababababababababab
 CONFIG=1111111111111111111111111111111111111111111111111111111111111111
 RUNTIME=2222222222222222222222222222222222222222222222222222222222222222
+ROLLBACK_IMAGE_PREFIX=ghcr.io/nickolaymamonov/meet-backend-v3@
+FULL_PREDECESSOR_REFERENCE=$ROLLBACK_IMAGE_PREFIX$PREDECESSOR_DIGEST
+FULL_OTHER_REFERENCE=$ROLLBACK_IMAGE_PREFIX$ROOT_DIGEST
+VALID_BARE_REFERENCE=$PREDECESSOR_DIGEST
+VALID_OTHER_BARE_REFERENCE=$ROOT_DIGEST
+VALID_HEX=$(printf 'a%.0s' {1..64})
+SHORT_HEX=$(printf 'a%.0s' {1..63})
+LONG_HEX=$(printf 'a%.0s' {1..65})
+NONHEX="${VALID_HEX%?}g"
 CONTRACT=$ROOT_DIR/scripts/test-vps-admission-contract.json
 RECOVERY_PROOF=$(jq -r '.populated.recoveryProof.sha256' "$CONTRACT")
 STABLE_PROOF=$(jq -r '.populated.stableProof.sha256' "$CONTRACT")
@@ -41,6 +50,69 @@ expect_failure() {
     { echo "evidence rejection emitted stdout: $marker" >&2; exit 1; }
   [ -s "$TMP/$marker.stderr" ] ||
     { echo "evidence rejection omitted safe stderr: $marker" >&2; exit 1; }
+}
+
+expect_invalid_rollback_value() {
+  local marker=$1 value=$2
+  local input=$TMP/invalid-$marker.json
+  local output=$TMP/invalid-$marker.output.json
+  jq --arg value "$value" '
+    .deployment.rollback.predecessor.imageReference = $value |
+    .deployment.rollback.restored.imageReference = $value
+  ' "$TMP/input.json" >"$input"
+  expect_failure "$marker" \
+    bash "$BUILDER" success --input "$input" --output "$output"
+  [ ! -e "$output" ]
+}
+
+expect_invalid_rollback_mutation() {
+  local marker=$1 mutation=$2
+  local input=$TMP/invalid-$marker.json
+  local output=$TMP/invalid-$marker.output.json
+  jq "$mutation" "$TMP/input.json" >"$input"
+  expect_failure "$marker" \
+    bash "$BUILDER" success --input "$input" --output "$output"
+  [ ! -e "$output" ]
+}
+
+expect_rollback_pair_failure() {
+  local marker=$1 predecessor=$2 restored=$3
+  local input=$TMP/invalid-$marker.json
+  local output=$TMP/invalid-$marker.output.json
+  jq --arg predecessor "$predecessor" --arg restored "$restored" '
+    .deployment.rollback.predecessor.imageReference = $predecessor |
+    .deployment.rollback.restored.imageReference = $restored
+  ' "$TMP/input.json" >"$input"
+  expect_failure "$marker" \
+    bash "$BUILDER" success --input "$input" --output "$output"
+  [ ! -e "$output" ]
+}
+
+assert_full_reference_success() {
+  local input=$1 marker=$2 expected_predecessor=$3 expected_restored=$4
+  local output=$TMP/$marker.json
+  local repeat=$TMP/$marker-repeat.json
+  local retention=$TMP/$marker-retention.json
+  local evidence_sha
+  bash "$BUILDER" success --input "$input" --output "$output"
+  bash "$BUILDER" success --input "$input" --output "$repeat"
+  cmp "$output" "$repeat"
+  [ "$(wc -l <"$output" | tr -d ' ')" -eq 1 ]
+  jq -e --arg expectedPredecessor "$expected_predecessor" \
+    --arg expectedRestored "$expected_restored" '
+    .schema == "meet-backend/test-promotion-evidence/v2" and
+    .kind == "success" and
+    .deployment.rollback.predecessor.imageReference == $expectedPredecessor and
+    .deployment.rollback.restored.imageReference == $expectedRestored
+  ' "$output" >/dev/null
+  evidence_sha=$(sha256sum "$output" | awk '{print $1}')
+  bash "$BUILDER" authorize-retention \
+    --evidence "$output" \
+    --artifact-uploaded true \
+    --output "$retention"
+  jq -e --arg evidenceSha "$evidence_sha" '
+    .retentionAuthorized == true and .evidenceSha256 == $evidenceSha
+  ' "$retention" >/dev/null
 }
 
 jq -n \
@@ -253,6 +325,103 @@ bash "$BUILDER" authorize-retention \
   --artifact-uploaded true \
   --output "$TMP/populated-retention.json"
 jq -e '.retentionAuthorized == true' "$TMP/populated-retention.json" >/dev/null
+
+jq --arg reference "$FULL_PREDECESSOR_REFERENCE" '
+  .deployment.rollback.predecessor.imageReference = $reference |
+  .deployment.rollback.restored.imageReference = $reference
+' "$TMP/input.json" >"$TMP/full-reference-input.json"
+assert_full_reference_success \
+  "$TMP/full-reference-input.json" \
+  full-reference-empty \
+  "$FULL_PREDECESSOR_REFERENCE" \
+  "$FULL_PREDECESSOR_REFERENCE"
+
+jq --arg reference "$FULL_PREDECESSOR_REFERENCE" '
+  .deployment.rollback.predecessor.imageReference = $reference |
+  .deployment.rollback.restored.imageReference = $reference
+' "$TMP/populated-input.json" >"$TMP/full-reference-populated-input.json"
+assert_full_reference_success \
+  "$TMP/full-reference-populated-input.json" \
+  full-reference-populated \
+  "$FULL_PREDECESSOR_REFERENCE" \
+  "$FULL_PREDECESSOR_REFERENCE"
+
+expect_invalid_rollback_value wrong-registry \
+  "docker.io/nickolaymamonov/meet-backend-v3@sha256:$VALID_HEX"
+expect_invalid_rollback_value wrong-repository \
+  "ghcr.io/other/meet-backend-v3@sha256:$VALID_HEX"
+expect_invalid_rollback_value registry-dot-lookalike \
+  "ghcrXio/nickolaymamonov/meet-backend-v3@sha256:$VALID_HEX"
+expect_invalid_rollback_value tag-only \
+  "ghcr.io/nickolaymamonov/meet-backend-v3:latest"
+expect_invalid_rollback_value tag-at-digest \
+  "ghcr.io/nickolaymamonov/meet-backend-v3:latest@$VALID_BARE_REFERENCE"
+expect_invalid_rollback_value uppercase-prefix "SHA256:$VALID_HEX"
+expect_invalid_rollback_value uppercase-hex "sha256:${VALID_HEX^^}"
+expect_invalid_rollback_value short-digest "sha256:$SHORT_HEX"
+expect_invalid_rollback_value long-digest "sha256:$LONG_HEX"
+expect_invalid_rollback_value nonhex-digest "sha256:$NONHEX"
+expect_invalid_rollback_value extra-prefix "prefix$VALID_BARE_REFERENCE"
+expect_invalid_rollback_value extra-suffix "$VALID_BARE_REFERENCE-suffix"
+expect_invalid_rollback_value multiple-references \
+  "$VALID_BARE_REFERENCE@$VALID_BARE_REFERENCE"
+expect_invalid_rollback_value multiple-full-references \
+  "$FULL_PREDECESSOR_REFERENCE@$FULL_PREDECESSOR_REFERENCE"
+expect_invalid_rollback_value leading-space " $VALID_BARE_REFERENCE"
+expect_invalid_rollback_value trailing-space "$VALID_BARE_REFERENCE "
+expect_invalid_rollback_value internal-space \
+  "${VALID_BARE_REFERENCE:0:10} ${VALID_BARE_REFERENCE:10}"
+expect_invalid_rollback_value leading-lf $'\n'"$VALID_BARE_REFERENCE"
+expect_invalid_rollback_value trailing-lf "$VALID_BARE_REFERENCE"$'\n'
+expect_invalid_rollback_value leading-cr $'\r'"$VALID_BARE_REFERENCE"
+expect_invalid_rollback_value trailing-cr "$VALID_BARE_REFERENCE"$'\r'
+expect_invalid_rollback_value leading-tab $'\t'"$VALID_BARE_REFERENCE"
+expect_invalid_rollback_value trailing-tab "$VALID_BARE_REFERENCE"$'\t'
+expect_invalid_rollback_mutation empty-reference '
+  .deployment.rollback.predecessor.imageReference = "" |
+  .deployment.rollback.restored.imageReference = ""
+'
+expect_invalid_rollback_mutation null-reference '
+  .deployment.rollback.predecessor.imageReference = null |
+  .deployment.rollback.restored.imageReference = null
+'
+expect_invalid_rollback_mutation nonstring-reference '
+  .deployment.rollback.predecessor.imageReference = 123 |
+  .deployment.rollback.restored.imageReference = 123
+'
+
+expect_rollback_pair_failure mixed-bare-full \
+  "$VALID_BARE_REFERENCE" "$FULL_PREDECESSOR_REFERENCE"
+expect_rollback_pair_failure mixed-full-bare \
+  "$FULL_PREDECESSOR_REFERENCE" "$VALID_BARE_REFERENCE"
+expect_rollback_pair_failure unequal-valid-full \
+  "$FULL_PREDECESSOR_REFERENCE" "$FULL_OTHER_REFERENCE"
+expect_rollback_pair_failure unequal-valid-bare \
+  "$VALID_BARE_REFERENCE" "$VALID_OTHER_BARE_REFERENCE"
+
+expect_full_reference_rejected() {
+  local marker=$1 mutation=$2
+  local input=$TMP/invalid-$marker.json
+  local output=$TMP/invalid-$marker.output.json
+  jq --arg value "$FULL_PREDECESSOR_REFERENCE" "$mutation" \
+    "$TMP/input.json" >"$input"
+  expect_failure "$marker" \
+    bash "$BUILDER" success --input "$input" --output "$output"
+  [ ! -e "$output" ]
+}
+
+expect_full_reference_rejected rollback-image-id '
+  .deployment.rollback.predecessor.imageId = $value |
+  .deployment.rollback.restored.imageId = $value
+'
+expect_full_reference_rejected root-digest '.image.rootDigest = $value'
+expect_full_reference_rejected platform-digest '.image.platformDigest = $value'
+for phase in predecessor candidate final; do
+  expect_full_reference_rejected "$phase-image-digest" \
+    ".deployment.$phase.imageDigest = \$value"
+  expect_full_reference_rejected "$phase-probe-image" \
+    ".deployment.$phase.zeroStateProbe.image = \$value"
+done
 
 jq '
   .deployment.predecessor.zeroStateProbe.admission = {

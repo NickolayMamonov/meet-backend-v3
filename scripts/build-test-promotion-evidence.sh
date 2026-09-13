@@ -73,6 +73,9 @@ validate_success_input() {
   jq -e --slurpfile contract "$admission_contract" '
     def sha: type == "string" and test("^[0-9a-f]{40}$");
     def digest: type == "string" and test("^sha256:[0-9a-f]{64}$");
+    def rollback_image_reference:
+      type == "string" and
+      test("\\A(?:ghcr[.]io/nickolaymamonov/meet-backend-v3@)?sha256:[0-9a-f]{64}\\z");
     def hex_digest: type == "string" and test("^[0-9a-f]{64}$");
     def semver:
       type == "string" and
@@ -132,7 +135,7 @@ validate_success_input() {
        then .stateSha256 == null
        else (.stateSha256 | hex_digest)
        end) and
-      (.imageReference | digest) and (.imageId | digest) and
+      (.imageReference | rollback_image_reference) and (.imageId | digest) and
       (.revision | sha) and (.version | semver) and
       (.runtimeConfigHash | hex_digest) and
       (.bootstrapProofSha256 | hex_digest) and
