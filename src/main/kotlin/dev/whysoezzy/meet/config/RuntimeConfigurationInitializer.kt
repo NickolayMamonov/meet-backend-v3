@@ -24,9 +24,14 @@ class RuntimeConfigurationInitializer : ApplicationContextInitializer<Configurab
         val clientIp = binder.bind("app.http.client-ip", Bindable.of(ClientIpProperties::class.java))
             .orElseGet(::ClientIpProperties)
         val sms = binder.bind("app.sms", Bindable.of(SmsProperties::class.java)).orElseGet(::SmsProperties)
+        val push = try {
+            binder.bind("app.push", Bindable.of(PushProperties::class.java)).orElseGet(::PushProperties)
+        } catch (_: Throwable) {
+            throw IllegalStateException(PushRuntimeSettings.INVALID_CONFIGURATION)
+        }
 
         requireDatasource(environment)
-        RuntimeConfigurationValidator.validate(environment, email, otpHash, clientIp, sms)
+        RuntimeConfigurationValidator.validate(environment, email, otpHash, clientIp, sms, push)
     }
 
     private fun requireDatasource(environment: ConfigurableEnvironment) {

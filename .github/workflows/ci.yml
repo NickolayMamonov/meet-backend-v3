@@ -77,7 +77,7 @@ jobs:
         if: inputs.source_sha == ''
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Checkout reviewed CI tooling
         if: inputs.source_sha != ''
@@ -93,6 +93,25 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           path: source
+      - name: Record reviewed source identity
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          EXPLICIT_REF: ${{ inputs.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          echo "reviewed source SHA: $actual_sha"
+          if [ -n "$SOURCE_SHA" ]; then
+            test "$actual_sha" = "$SOURCE_SHA"
+          elif [ -n "$EXPLICIT_REF" ]; then
+            echo "reviewed source ref: $EXPLICIT_REF"
+          else
+            expected_sha="${PR_HEAD_SHA:-$WORKFLOW_SHA}"
+            test "$actual_sha" = "$expected_sha"
+          fi
       - name: Set up Java
         uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00
         with:
@@ -134,7 +153,7 @@ jobs:
         if: inputs.source_sha == ''
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Checkout reviewed CI tooling
         if: inputs.source_sha != ''
@@ -150,6 +169,25 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           path: source
+      - name: Record reviewed source identity
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          EXPLICIT_REF: ${{ inputs.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          echo "reviewed source SHA: $actual_sha"
+          if [ -n "$SOURCE_SHA" ]; then
+            test "$actual_sha" = "$SOURCE_SHA"
+          elif [ -n "$EXPLICIT_REF" ]; then
+            echo "reviewed source ref: $EXPLICIT_REF"
+          else
+            expected_sha="${PR_HEAD_SHA:-$WORKFLOW_SHA}"
+            test "$actual_sha" = "$expected_sha"
+          fi
       - name: Set up Java
         uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00
         with:
@@ -172,7 +210,7 @@ jobs:
         if: inputs.source_sha == ''
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Checkout reviewed CI tooling
         if: inputs.source_sha != ''
@@ -188,6 +226,25 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           path: source
+      - name: Record reviewed source identity
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          EXPLICIT_REF: ${{ inputs.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          echo "reviewed source SHA: $actual_sha"
+          if [ -n "$SOURCE_SHA" ]; then
+            test "$actual_sha" = "$SOURCE_SHA"
+          elif [ -n "$EXPLICIT_REF" ]; then
+            echo "reviewed source ref: $EXPLICIT_REF"
+          else
+            expected_sha="${PR_HEAD_SHA:-$WORKFLOW_SHA}"
+            test "$actual_sha" = "$expected_sha"
+          fi
       - name: Provision and canary pinned age toolchain
         working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
@@ -227,6 +284,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-dev-promotion-source.sh"
           bash "$TOOLING_SCRIPTS/test-dev-promotion-authorization.sh"
           bash "$TOOLING_SCRIPTS/test-promote-dev-digest-workflow.sh"
+          bash "$TOOLING_SCRIPTS/test-ci-source-checkout.sh"
           bash "$TOOLING_SCRIPTS/test-test-promotion-environment-policy.sh"
           bash "$TOOLING_SCRIPTS/test-script-execution-contract.sh"
           bash "$TOOLING_SCRIPTS/test-test-promotion-layout.sh"
@@ -334,7 +392,7 @@ jobs:
         if: inputs.source_sha == ''
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Checkout reviewed CI tooling
         if: inputs.source_sha != ''
@@ -350,6 +408,25 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           path: source
+      - name: Record reviewed source identity
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          EXPLICIT_REF: ${{ inputs.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          echo "reviewed source SHA: $actual_sha"
+          if [ -n "$SOURCE_SHA" ]; then
+            test "$actual_sha" = "$SOURCE_SHA"
+          elif [ -n "$EXPLICIT_REF" ]; then
+            echo "reviewed source ref: $EXPLICIT_REF"
+          else
+            expected_sha="${PR_HEAD_SHA:-$WORKFLOW_SHA}"
+            test "$actual_sha" = "$expected_sha"
+          fi
       - name: Set up Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       - name: Build image

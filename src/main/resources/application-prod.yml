@@ -19,6 +19,14 @@ app:
     enabled: ${INGESTION_ENABLED:false}
   timepad:
     enabled: ${TIMEPAD_ENABLED:false}
+  push:
+    provider-enabled: ${APP_PUSH_PROVIDER_ENABLED:false}
+    discovery-enabled: ${APP_PUSH_DISCOVERY_ENABLED:false}
+    dispatch-enabled: ${APP_PUSH_DISPATCH_ENABLED:false}
+    diagnostic-enabled: ${APP_PUSH_DIAGNOSTIC_ENABLED:false}
+    maintenance-enabled: ${APP_PUSH_MAINTENANCE_ENABLED:false}
+    project-id: ${APP_PUSH_PROJECT_ID:meeting-1d258}
+    credentials-file: ${APP_PUSH_CREDENTIALS_FILE:}
   storage:
     upload-dir: ${APP_STORAGE_UPLOAD_DIR:/data/uploads}
     base-url: ${APP_STORAGE_BASE_URL}

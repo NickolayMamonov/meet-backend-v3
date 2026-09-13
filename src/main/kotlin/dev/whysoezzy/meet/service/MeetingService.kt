@@ -108,10 +108,10 @@ class MeetingService(
     fun joinMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId joining meeting: $meetingId" }
 
+        val user = userRepository.findWithLockById(userId)
+            ?: throw NotFoundException("User not found")
         val meeting = meetingRepository.findById(meetingId)
             .orElseThrow { NotFoundException("Meeting not found") }
-        val user = userRepository.findById(userId)
-            .orElseThrow { NotFoundException("User not found") }
 
         if (!meeting.isActive()) throw ConflictException("Meeting is not active")
         if (meetingRepository.isUserParticipant(meetingId, userId))
@@ -129,10 +129,10 @@ class MeetingService(
     fun leaveMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId leaving meeting: $meetingId" }
 
+        val user = userRepository.findWithLockById(userId)
+            ?: throw NotFoundException("User not found")
         val meeting = meetingRepository.findById(meetingId)
             .orElseThrow { NotFoundException("Meeting not found") }
-        val user = userRepository.findById(userId)
-            .orElseThrow { NotFoundException("User not found") }
 
         if (!meetingRepository.isUserParticipant(meetingId, userId))
             throw ConflictException("User is not a participant")

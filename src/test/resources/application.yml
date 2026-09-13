@@ -21,6 +21,12 @@ app:
     enabled: false
   timepad:
     enabled: false
+  push:
+    provider-enabled: false
+    discovery-enabled: false
+    dispatch-enabled: false
+    diagnostic-enabled: false
+    maintenance-enabled: false
 
 spring:
   profiles:
