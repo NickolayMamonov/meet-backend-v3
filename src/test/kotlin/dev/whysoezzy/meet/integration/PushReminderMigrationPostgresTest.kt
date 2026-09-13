@@ -16,6 +16,7 @@ import java.time.temporal.ChronoUnit
 import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class PushReminderMigrationPostgresTest : IntegrationTestSupport() {
     @Autowired
@@ -75,6 +76,90 @@ class PushReminderMigrationPostgresTest : IntegrationTestSupport() {
         assertEquals(0L, before)
         assertEquals(1L, afterChange)
         assertEquals(2L, afterReturn)
+    }
+
+    @Test
+    fun `V10 creates all-row owner index for lookup and user deletion cascade`() {
+        val fixture = fixture()
+        val userId = requireNotNull(fixture.bob.id)
+        val now = java.sql.Timestamp.from(databaseNow())
+        repeat(32) {
+            jdbcTemplate.update(
+                """
+                INSERT INTO push_installations
+                    (id, user_id, fid, status, registration_version, created_at, updated_at, last_seen_at, terminal_at)
+                VALUES (?, ?, NULL, 'ACCOUNT_DELETED', 1, ?, ?, ?, ?)
+                """.trimIndent(),
+                UUID.randomUUID(),
+                userId,
+                now,
+                now,
+                now,
+                now,
+            )
+        }
+
+        assertEquals(
+            true,
+            jdbcTemplate.queryForObject(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND tablename = 'push_installations'
+                      AND indexname = 'idx_push_installations_owner'
+                )
+                """.trimIndent(),
+                Boolean::class.java,
+            ),
+        )
+        assertEquals(
+            "c",
+            jdbcTemplate.queryForObject(
+                """
+                SELECT confdeltype
+                FROM pg_constraint
+                WHERE conrelid = 'push_installations'::regclass
+                  AND conname = 'push_installations_user_id_fkey'
+                """.trimIndent(),
+                String::class.java,
+            ),
+        )
+        val indexDefinition = requireNotNull(jdbcTemplate.queryForObject(
+            """
+            SELECT indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND indexname = 'idx_push_installations_owner'
+            """.trimIndent(),
+            String::class.java,
+        ))
+        assertTrue(indexDefinition.contains("(user_id)"))
+
+        jdbcTemplate.execute("SET enable_seqscan = off")
+        try {
+            val lookupPlan = jdbcTemplate.query(
+                "EXPLAIN (COSTS OFF) SELECT id FROM push_installations WHERE user_id = ?",
+                { rs, _ -> rs.getString(1) },
+                userId,
+            )
+            val cascadePlan = jdbcTemplate.query(
+                "EXPLAIN (COSTS OFF) DELETE FROM push_installations WHERE user_id = ?",
+                { rs, _ -> rs.getString(1) },
+                userId,
+            )
+            assertTrue(
+                lookupPlan.any { it.contains("idx_push_installations_owner") },
+                lookupPlan.joinToString("\n"),
+            )
+            assertTrue(
+                cascadePlan.any { it.contains("idx_push_installations_owner") },
+                cascadePlan.joinToString("\n"),
+            )
+        } finally {
+            jdbcTemplate.execute("RESET enable_seqscan")
+        }
     }
 
     @Test

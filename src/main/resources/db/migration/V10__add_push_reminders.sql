@@ -51,6 +51,8 @@ CREATE UNIQUE INDEX uq_push_installations_active_fid
 CREATE INDEX idx_push_installations_owner_fresh
     ON push_installations (user_id, last_seen_at, id)
     WHERE status = 'ACTIVE';
+CREATE INDEX idx_push_installations_owner
+    ON push_installations (user_id);
 
 CREATE TABLE meeting_reminder_claims (
     id UUID PRIMARY KEY,
