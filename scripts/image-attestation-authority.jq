@@ -207,16 +207,135 @@ def normalize_verified_result($verified; $bundleDigest; $storage):
      evidenceStorage:({kind:$storage,bundleDigest:$bundleDigest})}
   end;
 
-def assert_authority:
-  . as $a |
-  ($a|type == "object") and
-  ($a.schema == "meet-backend/image-attestation-authority/v1") and
-  ($a.repository == repository) and ($a.image == image) and
-  ($a.sourceRef == source_ref) and ($a.oidcIssuer == issuer) and
-  ($a.predicateType == predicate) and
-  ($a.certificateSourceDigest|sha40) and ($a.signerDigest|sha40) and
-  ($a.rootDigest|digest) and ($a.platformDigest|digest) and
-  ($a.subject|type == "object") and ($a.subject.digest == $a.rootDigest) and
-  ($a.evidenceStorage|type == "object") and
-  ($a.evidenceStorage.kind == "oci-registry-bundle" or
-   $a.evidenceStorage.kind == "github-api-workflow-artifact");
+def expected_assets($releaseId):
+  if $releaseId == 371012814 then
+    [
+      {id:515612606,name:"release-manifest.json",size:695,
+       apiDigest:"sha256:428e33c13d31040682f6b5d660e902860dd9a69ba26339be76762a4efbcf42eb",
+       downloadSha256:"428e33c13d31040682f6b5d660e902860dd9a69ba26339be76762a4efbcf42eb"},
+      {id:515612616,name:"image-index.json",size:857,
+       apiDigest:"sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda",
+       downloadSha256:"e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda"},
+      {id:515612629,name:"image-inspect.txt",size:849,
+       apiDigest:"sha256:614e14fd979195c798e67eec8a7e1e6edbf1da73caaaaa182225753440b11ea3",
+       downloadSha256:"614e14fd979195c798e67eec8a7e1e6edbf1da73caaaaa182225753440b11ea3"},
+      {id:515612640,name:"SHA256SUMS",size:249,
+       apiDigest:"sha256:6c6295333cb0406b44946438e4d949b410dda3d82ead63239e33739a8f4c9271",
+       downloadSha256:"6c6295333cb0406b44946438e4d949b410dda3d82ead63239e33739a8f4c9271"}
+    ]
+  elif $releaseId == 377201468 then
+    [
+      {id:532339115,name:"SHA256SUMS",size:255,
+       apiDigest:"sha256:ac70335a2301856b09a912400b977cb4d67653c9d7a370ad5834ae5f591dd476",
+       downloadSha256:"ac70335a2301856b09a912400b977cb4d67653c9d7a370ad5834ae5f591dd476"},
+      {id:532339069,name:"image-index.json",size:857,
+       apiDigest:"sha256:88b697872331ed2786f2d9009c769a87c32470086702faacf9874576fe094e9e",
+       downloadSha256:"88b697872331ed2786f2d9009c769a87c32470086702faacf9874576fe094e9e"},
+      {id:532339092,name:"image-inspect.txt",size:849,
+       apiDigest:"sha256:5f0836e04868ca8e036d44a8c5517d84dfc51bbf1282a87a589d3acd2443addf",
+       downloadSha256:"5f0836e04868ca8e036d44a8c5517d84dfc51bbf1282a87a589d3acd2443addf"},
+      {id:532339036,name:"release-manifest.json",size:695,
+       apiDigest:"sha256:cd34df22ab90a6d5f5b3624bed03d7c2527a842e278136b383bcebe985f1ca6e",
+       downloadSha256:"cd34df22ab90a6d5f5b3624bed03d7c2527a842e278136b383bcebe985f1ca6e"}
+    ]
+  else []
+  end;
+
+def assert_authority($a; $e; $release; $root; $platform; $rootManifest; $platformManifest):
+  [historical_catalog[] |
+    select(.release.id == $a.releaseId and
+      .release.tag == $a.tag and
+      .release.version == $a.version and
+      .release.source == $a.releaseSourceDigest and
+      .productImage.rootDigest == $a.rootDigest)] as $matches |
+  if ($matches | length) != 1 then false
+  else
+    ($matches[0]) as $catalog |
+    ($a | exact_keys([
+      "certificateIdentity","certificateSourceDigest","evidenceStorage","image",
+      "oidcIssuer","platformDigest","predicateType","releaseId",
+      "releaseSourceDigest","repository","rootDigest","schema","scope",
+      "signerDigest","signerWorkflow","sourceRef","sourceRepository",
+      "subject","tag","version"
+    ])) and
+    ($a.schema == "meet-backend/image-attestation-authority/v1") and
+    ($a.scope == "protected-release") and
+    ($a.repository == repository) and ($a.image == image) and
+    ($a.sourceRepository == source_repository) and ($a.sourceRef == source_ref) and
+    ($a.oidcIssuer == issuer) and ($a.predicateType == predicate) and
+    ($a.releaseId == $catalog.release.id) and
+    ($a.tag == $catalog.release.tag) and ($a.version == $catalog.release.version) and
+    ($a.releaseSourceDigest == $catalog.release.source) and
+    ($a.certificateSourceDigest == $catalog.attestation.certificateSourceDigest) and
+    ($a.signerDigest == $catalog.attestation.signerDigest) and
+    ($a.signerWorkflow == $catalog.attestation.signerWorkflow) and
+    ($a.certificateIdentity == $catalog.attestation.certificateIdentity) and
+    ($a.rootDigest == $catalog.productImage.rootDigest) and
+    ($a.platformDigest | digest) and
+    ($a.subject.digest == $a.rootDigest) and
+    ($a.subject.name | type == "string") and
+    ($a.subject.name == $catalog.attestation.subject.name or
+      ($a.subject.name | ascii_downcase) == image) and
+    ($release | type == "object" and
+      .id == $catalog.release.id and .tag_name == $catalog.release.tag and
+      .target_commitish == $catalog.release.source and
+      .draft == $catalog.release.draft and
+      .prerelease == $catalog.release.prerelease) and
+    ($root | type == "object" and
+      .kind == "root" and .releaseId == $catalog.release.id and
+      .digest == $a.rootDigest and .platformDigest == $a.platformDigest) and
+    ($platform | type == "object" and
+      .kind == "platform" and .releaseId == $catalog.release.id and
+      .rootDigest == $a.rootDigest and .digest == $a.platformDigest) and
+    ($rootManifest | type == "object" and
+      .digest == $a.rootDigest and
+      .mediaType == $catalog.productImage.rootMediaType) and
+    ($platformManifest | type == "object" and
+      .digest == $a.platformDigest and
+      .mediaType == $catalog.productImage.platform.mediaType) and
+    ($e | type == "object" and
+      exact_keys([
+        "certificateIdentity","certificateSourceDigest","evidenceStorage",
+        "oidcIssuer","platformDigest","predicateType","releaseSourceDigest",
+        "rootDigest","schema","signerDigest","signerWorkflow","sourceRef",
+        "sourceRepository","subject"
+      ]) and
+      .schema == "meet-backend/image-attestation-evidence/v2" and
+      .sourceRepository == $a.sourceRepository and
+      .releaseSourceDigest == $a.releaseSourceDigest and
+      .certificateSourceDigest == $a.certificateSourceDigest and
+      .signerDigest == $a.signerDigest and .sourceRef == $a.sourceRef and
+      .signerWorkflow == $a.signerWorkflow and
+      .certificateIdentity == $a.certificateIdentity and
+      .oidcIssuer == $a.oidcIssuer and .predicateType == $a.predicateType and
+      .rootDigest == $a.rootDigest and .platformDigest == $a.platformDigest and
+      .subject == $a.subject and
+      (.evidenceStorage | type == "object" and
+        .kind == $a.evidenceStorage.kind and
+        if .kind == "oci-registry-bundle" then
+          exact_keys([
+            "bundleDigest","bundleLayerDigest","bundleLayerMediaType",
+            "bundleLayerSize","kind","signatureManifestDigest"
+          ]) and
+          (.bundleDigest | digest) and (.bundleLayerDigest | digest) and
+          (.signatureManifestDigest | digest) and
+          .bundleLayerMediaType == "application/vnd.dev.sigstore.bundle.v0.3+json" and
+          (.bundleLayerSize | type == "number" and floor == . and . > 0)
+        elif .kind == "github-api-workflow-artifact" then
+          exact_keys(["asset","assets","bundleDigest","kind"]) and
+          (.bundleDigest | digest) and
+          (.assets == (expected_assets($a.releaseId) | sort_by(.id))) and
+          (.asset == (expected_assets($a.releaseId)[] |
+            select(.name == "image-index.json")))
+        else false end)) and
+    ($a.evidenceStorage | type == "object" and
+      if .kind == "oci-registry-bundle" then
+        exact_keys(["kind"])
+      elif .kind == "github-api-workflow-artifact" then
+        exact_keys(["asset","assets","bundleDigest","kind"]) and
+        .bundleDigest == $catalog.evidenceStorage.bundleDigest and
+        (.assets == (expected_assets($a.releaseId) | sort_by(.id))) and
+        (.asset == (expected_assets($a.releaseId)[] |
+          select(.name == "image-index.json")))
+      else false end)
+  end;

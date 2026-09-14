@@ -32,6 +32,26 @@ expect_byte_change() {
     fail "protected drift did not change canonical bytes: $name"
   fi
 }
+expect_rejection_preserves_output() {
+  local name=$1
+  local filter=$2
+  jq "$filter" "$FIXTURE" >"$TMP/$name.json"
+  cp "$TMP/canonical.json" "$TMP/$name-sentinel.json"
+  cp "$TMP/$name-sentinel.json" "$TMP/$name-output.json"
+  if run_capture "$TMP/$name.json" "$TMP/$name-output.json" \
+      >"$TMP/$name.stdout" 2>"$TMP/$name.stderr"; then
+    fail "expected authority mutation rejection was accepted: $name"
+  fi
+  cmp --silent "$TMP/$name-sentinel.json" "$TMP/$name-output.json" ||
+    fail "authority mutation changed existing output: $name"
+  if find "$TMP" -maxdepth 1 -name "$name-output.json.tmp.*" -print -quit | grep -q .; then
+    fail "authority mutation left a temporary output: $name"
+  fi
+  [ ! -s "$TMP/$name.stdout" ] || fail "rejection emitted stdout: $name"
+  [ -s "$TMP/$name.stderr" ] || fail "rejection omitted stderr: $name"
+  ! grep -Fq 'fixture-secret-must-not-appear' "$TMP/$name.stderr" ||
+    fail "rejection printed a secret: $name"
+}
 
 [ -r "$CAPTURE" ] || fail "capture script is unavailable"
 [ -f "$FIXTURE" ] || fail "fixture is missing"
@@ -113,8 +133,16 @@ expect_byte_change protected-alias \
   '.registry.versions[0].tags += ["protected-drift"]'
 expect_byte_change protected-manifest \
   '.registry.manifests[4].size = 301'
-expect_byte_change protected-attestation \
+expect_rejection_preserves_output protected-attestation \
   '.registry.evidence[0].releaseSourceDigest = "4444444444444444444444444444444444444444"'
+expect_rejection_preserves_output authority-certificate-source \
+  '.registry.authorities[0].certificateSourceDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+expect_rejection_preserves_output authority-signer \
+  '.registry.authorities[0].signerDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+expect_rejection_preserves_output evidence-certificate-source \
+  '.registry.evidence[0].certificateSourceDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+expect_rejection_preserves_output evidence-signer \
+  '.registry.evidence[0].signerDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
 
 jq '.tagRefs[1].peeledCommitSha = "3333333333333333333333333333333333333333"' \
   "$FIXTURE" >"$TMP/tag-ref-drift.json"

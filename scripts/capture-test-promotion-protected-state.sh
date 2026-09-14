@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 usage() { echo "usage: $0 --input PATH --output PATH [--candidate-alias ALIAS]" >&2; exit 2; }
 fail() { echo "test-promotion protected-state capture failed: $*" >&2; exit 1; }
 
@@ -33,49 +35,16 @@ trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
 
 # The complete API/registry capture is an explicit input shim.  This command
 # intentionally has no network client, registry client, or mutation command.
-if ! jq -cS \
+if ! jq -cS -L "$SCRIPT_DIR" \
   --arg proofSha db5659e40c0b882e17d5e4f8e0218232e500134a86ecf49e6de714808de5c529 \
   --arg checksum 'db5659e40c0b882e17d5e4f8e0218232e500134a86ecf49e6de714808de5c529 *docs/evidence/MEE2-48-protected-history-v1.json' \
   --arg candidateAlias "$candidate_alias" '
+  include "image-attestation-authority";
   def sha40: type == "string" and test("^[0-9a-f]{40}$");
   def digest: type == "string" and test("^sha256:[0-9a-f]{64}$");
   def semver: type == "string" and test("^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$");
   def keys_are($keys): type == "object" and (keys | sort) == ($keys | sort);
   def member($array;$value): ($array | index($value)) != null;
-  def valid_authority:
-    . as $a |
-    ($a.schema == "meet-backend/image-attestation-authority/v1") and
-    ($a.scope == "protected-release") and
-    ($a.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
-    ($a.image | type == "string" and test("^ghcr[.]io/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
-    ($a.releaseId | type == "number" and floor == . and . > 0) and
-    ($a.tag | type == "string" and test("^v[0-9]+[.][0-9]+[.][0-9]+$")) and
-    ($a.version | type == "string" and semver and . == ($a.tag | sub("^v"; ""))) and
-    ($a.sourceRepository | type == "string" and test("^https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
-    ($a.releaseSourceDigest | sha40) and ($a.certificateSourceDigest | sha40) and ($a.signerDigest | sha40) and
-    ($a.sourceRef == "refs/heads/dev") and
-    ($a.signerWorkflow | type == "string" and startswith(".github/workflows/")) and
-    ($a.certificateIdentity == ($a.sourceRepository + "/" + $a.signerWorkflow + "@" + $a.sourceRef)) and
-    ($a.oidcIssuer == "https://token.actions.githubusercontent.com") and
-    ($a.predicateType == "https://slsa.dev/provenance/v1") and
-    ($a.rootDigest | digest) and ($a.platformDigest | digest) and
-    ($a.subject | type == "object" and (.name | type == "string" and length > 0) and (.digest | digest) and .digest == $a.rootDigest) and
-    ($a.evidenceStorage | type == "object" and (.kind == "oci-registry-bundle" or .kind == "github-api-workflow-artifact"));
-
-  def valid_evidence:
-    . as $e |
-    ($e.schema == "meet-backend/image-attestation-evidence/v2") and
-    ($e.sourceRepository | type == "string" and test("^https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
-    ($e.releaseSourceDigest | sha40) and ($e.certificateSourceDigest | sha40) and ($e.signerDigest | sha40) and
-    ($e.sourceRef == "refs/heads/dev") and
-    ($e.signerWorkflow | type == "string" and startswith(".github/workflows/")) and
-    ($e.certificateIdentity == ($e.sourceRepository + "/" + $e.signerWorkflow + "@" + $e.sourceRef)) and
-    ($e.oidcIssuer == "https://token.actions.githubusercontent.com") and
-    ($e.predicateType == "https://slsa.dev/provenance/v1") and
-    ($e.rootDigest | digest) and ($e.platformDigest | digest) and
-    ($e.subject | type == "object" and (.name | type == "string" and length > 0) and (.digest | digest) and .digest == $e.rootDigest) and
-    ($e.evidenceStorage | type == "object" and (.kind == "oci-registry-bundle" or .kind == "github-api-workflow-artifact"));
-
   . as $raw |
   (
     type == "object" and
@@ -134,11 +103,11 @@ if ! jq -cS \
       (map(.size | type == "number" and floor == . and . >= 0) | all) and
       (map(.predicateTypes | type == "array" and all(.[]?; type == "string" and length > 0)) | all)) and
     (.registry.authorities | type == "array" and
-      (map(valid_authority) | all) and
+      (map(type == "object") | all) and
       ((map(.releaseId) | unique | length) == length) and
       ((map(.rootDigest) | unique | length) == length)) and
     (.registry.evidence | type == "array" and
-      (map(valid_evidence) | all) and
+      (map(type == "object") | all) and
       ((map(.rootDigest) | unique | length) == length)) and
     (.proof | keys_are(["checksum","path","sha256"]) and
       .path == "docs/evidence/MEE2-48-protected-history-v1.json" and
@@ -177,6 +146,30 @@ if ! jq -cS \
     . as $platform |
     any($roots[]?; .digest == $platform.rootDigest and .platformDigest == $platform.digest)
   ] | all) then . else error("protected platform subject is not bound to its root") end) |
+  (.registry.manifests) as $manifestTable |
+  ([
+    $roots[] as $root |
+    ([ $protectedReleases[] | select(.id == $root.releaseId) ] |
+      if length == 1 then .[0] else error("protected release authority is ambiguous") end) as $release |
+    ([ $platforms[] | select(.digest == $root.platformDigest and .rootDigest == $root.digest) ] |
+      if length == 1 then .[0] else error("protected platform authority is ambiguous") end) as $platform |
+    ([ $manifestTable[]? | select(.digest == $root.digest) ] |
+      if length == 1 then .[0] else error("protected root manifest is ambiguous") end) as $rootManifest |
+    ([ $manifestTable[]? | select(.digest == $platform.digest) ] |
+      if length == 1 then .[0] else error("protected platform manifest is ambiguous") end) as $platformManifest |
+    ([ .registry.authorities[] | select(.rootDigest == $root.digest) ] |
+      if length == 1 then .[0] else error("protected authority is ambiguous") end) as $authority |
+    ([ .registry.evidence[] | select(.rootDigest == $root.digest) ] |
+      if length == 1 then .[0] else error("protected evidence is ambiguous") end) as $evidence |
+    if assert_authority(
+      $authority; $evidence; $release; $root; $platform; $rootManifest; $platformManifest
+    ) then $authority else error("protected authority is not catalog-backed") end
+  ]) as $validatedAuthorities |
+  ([
+    $roots[] as $root |
+    ([ .registry.evidence[] | select(.rootDigest == $root.digest) ] |
+      if length == 1 then .[0] else error("protected evidence is ambiguous") end)
+  ]) as $validatedEvidence |
   ([ $protectedReleases[]? | .tag_name, (.tag_name | sub("^v"; "")), ("sha-" + .target_commitish) ] | unique) as $identityAliases |
   (if ([
     $roots[] |
@@ -195,7 +188,6 @@ if ! jq -cS \
   )]) as $touchedVersions |
   ([ $touchedVersions[]?.digest ] | unique) as $touchedDigests |
   ([ $baseDigests[]?, $touchedDigests[]? ] | unique) as $seeds |
-  (.registry.manifests) as $manifestTable |
   (reduce range(0; 32) as $round ($seeds;
     . as $known |
     ([ $manifestTable[] | select(member($known;.digest) or (.subjectDigest != null and member($known;.subjectDigest))) |
@@ -246,12 +238,8 @@ if ! jq -cS \
         select(member($closure;.digest) and (.subjectDigest != null or (.children | length) > 0)) |
         {digest,mediaType,size,subjectDigest,artifactType,predicateTypes:(.predicateTypes | unique | sort),children:(.children | unique | sort)}
       ] | sort_by(.digest)),
-      authorities:([
-        $raw.registry.authorities[] | select(. as $a | any($roots[]?; .digest == $a.rootDigest)) | .
-      ] | sort_by(.releaseId,.rootDigest)),
-      attestationEvidence:([
-        $raw.registry.evidence[] | select(. as $a | any($roots[]?; .digest == $a.rootDigest)) | .
-      ] | sort_by(.rootDigest,.evidenceStorage.kind)),
+      authorities:($validatedAuthorities | sort_by(.releaseId,.rootDigest)),
+      attestationEvidence:($validatedEvidence | sort_by(.rootDigest,.evidenceStorage.kind)),
       storageKinds:([
         $raw.registry.authorities[] | select(. as $a | any($roots[]?; .digest == $a.rootDigest)) | .evidenceStorage.kind
       ] | unique | sort)
