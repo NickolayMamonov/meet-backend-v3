@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 usage() {
   echo "usage: $0 --repository OWNER/REPO --image ghcr.io/OWNER/IMAGE --output PATH [--candidate-alias ALIAS]" >&2
   exit 2
@@ -134,6 +136,7 @@ jq -e 'all(.[]; .digest | test("^sha256:[0-9a-f]{64}$"))' "$tmp/versions.json" >
 : >"$tmp/subjects.jsonl"
 : >"$tmp/manifests.jsonl"
 : >"$tmp/attestations.jsonl"
+: >"$tmp/authorities.jsonl"
 : >"$tmp/versions.jsonl"
 
 validate_digest() {
@@ -174,59 +177,138 @@ read_raw_manifest() {
 }
 
 collect_verified_attestations() {
-  local digest=$1 source_digest=$2 record bundle_sha
-  local verified_file="$tmp/github-${digest#sha256:}.json"
-  if [ ! -f "$verified_file" ]; then
-    gh attestation verify "oci://$image@$digest" \
-      --repo "$repository" --source-digest "$source_digest" --format json \
-      >"$verified_file" ||
-      fail "GitHub attestation verification failed for $digest"
-  fi
-  jq -e --arg subject "${digest#sha256:}" \
-    --arg repository "https://github.com/$repository" \
-    --arg source "$source_digest" '
-    type == "array" and length > 0 and
-    all(.[];
-      (.attestation.bundle | type == "object") and
-      (.verificationResult | type == "object") and
-      (.verificationResult.statement.predicateType |
-        type == "string" and length > 0) and
-      ([.verificationResult.statement.subject[]? |
-        select(.digest.sha256? == $subject)] | length) == 1 and
-      (.verificationResult.signature.certificate as $certificate |
-        $certificate.sourceRepositoryURI == $repository and
-        $certificate.sourceRepositoryDigest == $source and
-        ($certificate.sourceRepositoryRef |
-          type == "string" and startswith("refs/")) and
-        ($certificate.buildSignerURI |
-          type == "string" and
-          startswith($repository + "/.github/workflows/") and
-          endswith("@" + $certificate.sourceRepositoryRef)) and
-        $certificate.subjectAlternativeName == $certificate.buildSignerURI)
-    )
-  ' "$verified_file" >/dev/null ||
-    fail "verified GitHub attestation evidence is malformed for $digest"
-  while IFS= read -r record; do
-    bundle_sha=$(
-      jq -cS '.attestation.bundle' <<<"$record" |
-        sha256sum | awk '{print $1}'
-    ) || fail "verified GitHub attestation bundle hashing failed for $digest"
-    jq -cS --arg subjectDigest "$digest" \
-      --arg bundleDigest "sha256:$bundle_sha" '
-      .verificationResult as $result |
-      $result.signature.certificate as $certificate |
-      {
-        subjectDigest:$subjectDigest,
-        predicateType:$result.statement.predicateType,
-        sourceRepository:$certificate.sourceRepositoryURI,
-        sourceDigest:$certificate.sourceRepositoryDigest,
-        workflowRef:$certificate.sourceRepositoryRef,
-        signerWorkflow:$certificate.buildSignerURI,
-        bundleDigest:$bundleDigest
-      }
-    ' <<<"$record" >>"$tmp/attestations.jsonl" ||
-      fail "verified GitHub attestation normalization failed for $digest"
-  done < <(jq -c '.[]' "$verified_file")
+  local digest=$1 source_digest=$2 release_id=$3 platform_digest=$4
+  local release_tag release_version
+  local authority="$tmp/authority-${digest#sha256:}.json"
+  local evidence="$tmp/evidence-${digest#sha256:}.json"
+  local closure="$tmp/closure-${digest#sha256:}.json"
+  local bundle="$tmp/bundle-${digest#sha256:}.json"
+  local raw="$tmp/raw-${digest#sha256:}.json"
+  local inventory="$tmp/inventory-${digest#sha256:}.json"
+  local -a closure_args=()
+  local image_index_hash
+
+  release_tag=$(jq -r --argjson id "$release_id" \
+    '.[] | select(.id == $id) | .tag_name' "$tmp/releases-normalized.json")
+  release_version=${release_tag#v}
+  [ -n "$release_tag" ] || fail "release tag is missing for $release_id"
+
+  "$SCRIPT_DIR/resolve-image-attestation-authority.sh" \
+    protected-release \
+    --release-id "$release_id" \
+    --tag "$release_tag" \
+    --version "$release_version" \
+    --source "$source_digest" \
+    --root "$digest" \
+    --platform "$platform_digest" \
+    >"$authority" ||
+    fail "attestation authority resolution failed for $digest"
+
+  case "$(jq -r '.evidenceStorage.kind' "$authority")" in
+    oci-registry-bundle)
+      "$SCRIPT_DIR/normalize-ghcr-package-inventory.sh" \
+        --package-versions-file "$tmp/packages.json" \
+        --digest "$digest" \
+        --output "$inventory" ||
+        fail "package inventory normalization failed for $digest"
+      [ -z "${IMAGE_ATTESTATION_FIXTURE_DIR:-}" ] ||
+        closure_args=(--fixture-dir "$IMAGE_ATTESTATION_FIXTURE_DIR")
+      "$SCRIPT_DIR/verify-oci-referrer-closure.sh" \
+        --image "$image" \
+        --index-file "$raw" \
+        --inventory-file "$inventory" \
+        --subject-digest "$digest" \
+        --platform-subject "$platform_digest" \
+        "${closure_args[@]}" \
+        --require-bundle \
+        --bundle-output "$bundle" \
+        --output "$closure" >/dev/null ||
+        fail "closure-derived registry bundle verification failed for $digest"
+      "$SCRIPT_DIR/verify-image-attestation-authority.sh" \
+        --authority "$authority" \
+        --subject-file "$raw" \
+        --bundle "$bundle" \
+        --closure "$closure" \
+        --output "$evidence" ||
+        fail "shared image attestation verification failed for $digest"
+      ;;
+    github-api-workflow-artifact)
+      assets_dir="$tmp/release-assets-${release_id}"
+      mkdir -- "$assets_dir" || fail "release asset workspace creation failed"
+      jq -e '
+        (.evidenceStorage.assets | type == "array" and length == 4) and
+        ([.evidenceStorage.assets[].name] | sort) ==
+          ["SHA256SUMS","image-index.json","image-inspect.txt","release-manifest.json"]
+      ' "$authority" >/dev/null ||
+        fail "immutable release asset authority is incomplete"
+      while IFS=$'\t' read -r asset_id asset_name asset_size asset_api_digest asset_sha; do
+        jq -e --argjson id "$asset_id" --arg name "$asset_name" \
+          --arg api "$asset_api_digest" --argjson size "$asset_size" '
+          [.[] | .assets[] | select(.id == $id and .name == $name)] as $assets |
+          ($assets | length == 1) and
+          ($assets[0].size == $size) and
+          ("sha256:" + $assets[0].sha256) == $api
+        ' "$tmp/releases-normalized.json" >/dev/null ||
+          fail "release asset API tuple disagrees with authority"
+        asset_path="$assets_dir/$asset_name"
+        gh api --method GET -H 'Accept: application/octet-stream' \
+          "repos/$repository/releases/assets/$asset_id" >"$asset_path" ||
+          fail "immutable release asset download failed"
+        [ "$(wc -c <"$asset_path" | tr -d ' ')" -eq "$asset_size" ] ||
+          fail "immutable release asset size disagrees with authority"
+        [ "$(sha256sum "$asset_path" | awk '{print $1}')" = "$asset_sha" ] ||
+          fail "immutable release asset bytes disagree with authority"
+      done < <(jq -r '
+        .evidenceStorage.assets[] |
+        [.id,.name,.size,.apiDigest,.downloadSha256] | @tsv
+      ' "$authority")
+      image_index_hash=$(sha256sum "$assets_dir/image-index.json" | awk '{print $1}')
+      [ "$image_index_hash" = "${digest#sha256:}" ] ||
+        fail "immutable release index bytes do not match the registry root"
+      [ "$(wc -c <"$assets_dir/image-index.json" | tr -d ' ')" -eq 857 ] ||
+        fail "immutable release index size is not pinned"
+      "$SCRIPT_DIR/verify-immutable-release-proof.sh" \
+        --repository "$repository" \
+        --tag "$release_tag" \
+        --release-id "$release_id" \
+        --source-sha "$source_digest" \
+        --assets-dir "$assets_dir" \
+        >"$tmp/immutable-proof-${release_id}.json" ||
+        fail "immutable release proof verification failed"
+      "$SCRIPT_DIR/normalize-ghcr-package-inventory.sh" \
+        --package-versions-file "$tmp/packages.json" \
+        --digest "$digest" \
+        --output "$inventory" ||
+        fail "package inventory normalization failed for API release"
+      [ -z "${IMAGE_ATTESTATION_FIXTURE_DIR:-}" ] ||
+        closure_args=(--fixture-dir "$IMAGE_ATTESTATION_FIXTURE_DIR")
+      "$SCRIPT_DIR/verify-oci-referrer-closure.sh" \
+        --image "$image" \
+        --index-file "$raw" \
+        --inventory-file "$inventory" \
+        --subject-digest "$digest" \
+        --platform-subject "$platform_digest" \
+        "${closure_args[@]}" \
+        --output "$closure" >/dev/null ||
+        fail "independent registry closure verification failed for API release"
+      cmp -s "$assets_dir/image-index.json" "$raw" ||
+        fail "immutable release index is not byte-identical to registry bytes"
+      "$SCRIPT_DIR/verify-image-attestation-authority.sh" \
+        --authority "$authority" \
+        --subject-file "$assets_dir/image-index.json" \
+        --immutable-proof "$tmp/immutable-proof-${release_id}.json" \
+        --output "$evidence" ||
+        fail "shared API workflow-artifact verification failed for $digest"
+      ;;
+    *)
+      fail "unsupported attestation evidence storage for $digest"
+      ;;
+  esac
+
+  jq -cS . "$authority" >>"$tmp/authorities.jsonl" ||
+    fail "authority normalization failed for $digest"
+  jq -cS . "$evidence" >>"$tmp/attestations.jsonl" ||
+    fail "evidence normalization failed for $digest"
 }
 
 while IFS=$'\t' read -r version_id digest tags_json; do
@@ -273,7 +355,7 @@ while IFS=$'\t' read -r version_id digest tags_json; do
       release_source=$(jq -r --argjson id "$release_id" \
         '.[] | select(.id == $id) | .target_commitish' \
         "$tmp/releases-normalized.json")
-      collect_verified_attestations "$digest" "$release_source"
+      collect_verified_attestations "$digest" "$release_source" "$release_id" "$platform_digest"
     fi
     jq -cnS --arg digest "$digest" --arg mediaType "$media_type" \
       --argjson size "$manifest_size" \
@@ -389,10 +471,10 @@ jq -e --slurpfile manifests "$tmp/manifests.json" '
 ' "$tmp/versions.json" >/dev/null ||
   fail "package inventory contains an unbound manifest"
 jq -sS '
-  group_by(.bundleDigest) |
-  map(if (unique | length) == 1 then .[0]
+  group_by(.rootDigest) |
+  map(if length == 1 then .[0]
       else error("conflicting verified GitHub attestation records") end) |
-  sort_by(.subjectDigest,.predicateType,.bundleDigest)
+  sort_by(.rootDigest,.predicateType,.evidenceStorage.bundleDigest)
 ' "$tmp/attestations.jsonl" >"$tmp/attestations.json" ||
   fail "verified GitHub attestation records conflict"
 
@@ -405,10 +487,11 @@ jq -cnS \
   --slurpfile versions "$tmp/versions.json" \
   --slurpfile subjects "$tmp/subjects.json" \
   --slurpfile manifests "$tmp/manifests.json" \
+  --slurpfile authorities "$tmp/authorities.jsonl" \
   --slurpfile attestations "$tmp/attestations.json" \
   --arg candidateAlias "$candidate_alias" '
   {
-    schema:"meet-backend/test-promotion-protected-state-input/v1",
+    schema:"meet-backend/test-promotion-protected-state-input/v2",
     repository:$repository,image:$image,
     releases:($releases[0] // []),
     tagRefs:($tagRefs[0] // []),
@@ -416,7 +499,8 @@ jq -cnS \
       versions:($versions[0] // []),
       subjects:($subjects[0] // []),
       manifests:($manifests[0] // []),
-      attestations:($attestations[0] // [])
+      authorities:($authorities // []),
+      evidence:($attestations[0] // []),
     },
     proof:{
       path:"docs/evidence/MEE2-48-protected-history-v1.json",

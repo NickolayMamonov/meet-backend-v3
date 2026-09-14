@@ -42,24 +42,45 @@ if ! jq -cS \
   def semver: type == "string" and test("^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$");
   def keys_are($keys): type == "object" and (keys | sort) == ($keys | sort);
   def member($array;$value): ($array | index($value)) != null;
-  def valid_attestation:
+  def valid_authority:
     . as $a |
-    keys_are(["bundleDigest","predicateType","signerWorkflow","sourceDigest","sourceRepository","subjectDigest","workflowRef"]) and
-    ($a.bundleDigest | digest) and
-    ($a.predicateType | type == "string" and length > 0) and
-    ($a.sourceDigest | sha40) and
-    ($a.subjectDigest | digest) and
+    ($a.schema == "meet-backend/image-attestation-authority/v1") and
+    ($a.scope == "protected-release") and
+    ($a.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+    ($a.image | type == "string" and test("^ghcr[.]io/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+    ($a.releaseId | type == "number" and floor == . and . > 0) and
+    ($a.tag | type == "string" and test("^v[0-9]+[.][0-9]+[.][0-9]+$")) and
+    ($a.version | type == "string" and semver and . == ($a.tag | sub("^v"; ""))) and
     ($a.sourceRepository | type == "string" and test("^https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
-    ($a.workflowRef | type == "string" and startswith("refs/")) and
-    ($a.signerWorkflow | type == "string" and
-      startswith($a.sourceRepository + "/.github/workflows/") and
-      endswith("@" + $a.workflowRef));
+    ($a.releaseSourceDigest | sha40) and ($a.certificateSourceDigest | sha40) and ($a.signerDigest | sha40) and
+    ($a.sourceRef == "refs/heads/dev") and
+    ($a.signerWorkflow | type == "string" and startswith(".github/workflows/")) and
+    ($a.certificateIdentity == ($a.sourceRepository + "/" + $a.signerWorkflow + "@" + $a.sourceRef)) and
+    ($a.oidcIssuer == "https://token.actions.githubusercontent.com") and
+    ($a.predicateType == "https://slsa.dev/provenance/v1") and
+    ($a.rootDigest | digest) and ($a.platformDigest | digest) and
+    ($a.subject | type == "object" and (.name | type == "string" and length > 0) and (.digest | digest) and .digest == $a.rootDigest) and
+    ($a.evidenceStorage | type == "object" and (.kind == "oci-registry-bundle" or .kind == "github-api-workflow-artifact"));
+
+  def valid_evidence:
+    . as $e |
+    ($e.schema == "meet-backend/image-attestation-evidence/v2") and
+    ($e.sourceRepository | type == "string" and test("^https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+    ($e.releaseSourceDigest | sha40) and ($e.certificateSourceDigest | sha40) and ($e.signerDigest | sha40) and
+    ($e.sourceRef == "refs/heads/dev") and
+    ($e.signerWorkflow | type == "string" and startswith(".github/workflows/")) and
+    ($e.certificateIdentity == ($e.sourceRepository + "/" + $e.signerWorkflow + "@" + $e.sourceRef)) and
+    ($e.oidcIssuer == "https://token.actions.githubusercontent.com") and
+    ($e.predicateType == "https://slsa.dev/provenance/v1") and
+    ($e.rootDigest | digest) and ($e.platformDigest | digest) and
+    ($e.subject | type == "object" and (.name | type == "string" and length > 0) and (.digest | digest) and .digest == $e.rootDigest) and
+    ($e.evidenceStorage | type == "object" and (.kind == "oci-registry-bundle" or .kind == "github-api-workflow-artifact"));
 
   . as $raw |
   (
     type == "object" and
     keys_are(["image","proof","releases","registry","repository","schema","tagRefs"]) and
-    .schema == "meet-backend/test-promotion-protected-state-input/v1" and
+    .schema == "meet-backend/test-promotion-protected-state-input/v2" and
     (.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") and . == ascii_downcase) and
     (.image | type == "string" and test("^ghcr[.]io/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") and . == ascii_downcase) and
     (.releases | type == "array" and length > 0) and
@@ -89,7 +110,7 @@ if ! jq -cS \
         (.objectType == "commit" or .objectType == "tag") and
         (.objectSha | sha40) and (.peeledCommitSha | sha40)
       else false end) | all)) and
-    (.registry | keys_are(["attestations","manifests","subjects","versions"])) and
+    (.registry | keys_are(["authorities","evidence","manifests","subjects","versions"])) and
     (.registry.versions | type == "array" and
       (map((keys | sort) == ["digest","id","tags"]) | all) and
       (map(.digest | digest) | all) and
@@ -112,11 +133,13 @@ if ! jq -cS \
       (map(.mediaType | type == "string" and length > 0) | all) and
       (map(.size | type == "number" and floor == . and . >= 0) | all) and
       (map(.predicateTypes | type == "array" and all(.[]?; type == "string" and length > 0)) | all)) and
-    (.registry.attestations | type == "array" and
-      (map((keys | sort) == ["bundleDigest","predicateType","signerWorkflow","sourceDigest","sourceRepository","subjectDigest","workflowRef"]) | all) and
-      (map(valid_attestation) | all) and
-      ((map(.bundleDigest) | unique | length) == length)) and
-    (.registry.attestations | (map(.bundleDigest | digest) | all)) and
+    (.registry.authorities | type == "array" and
+      (map(valid_authority) | all) and
+      ((map(.releaseId) | unique | length) == length) and
+      ((map(.rootDigest) | unique | length) == length)) and
+    (.registry.evidence | type == "array" and
+      (map(valid_evidence) | all) and
+      ((map(.rootDigest) | unique | length) == length)) and
     (.proof | keys_are(["checksum","path","sha256"]) and
       .path == "docs/evidence/MEE2-48-protected-history-v1.json" and
       .sha256 == $proofSha and .checksum == $checksum)
@@ -196,7 +219,7 @@ if ! jq -cS \
      {alias:$alias,digests:([.registry.versions[] | select(any(.tags[]?; . == $alias)) | .digest] | unique | sort)}
    ] | sort_by(.alias)) as $aliasBindings |
   {
-    schema:"meet-backend/test-promotion-protected-state/v1",
+    schema:"meet-backend/test-promotion-protected-state/v2",
     repository:$raw.repository,
     image:$raw.image,
     publicRelease:{id:$public.id,tag:$public.tag_name,version:($public.tag_name | sub("^v"; "")),sourceSha:$public.target_commitish},
@@ -223,10 +246,15 @@ if ! jq -cS \
         select(member($closure;.digest) and (.subjectDigest != null or (.children | length) > 0)) |
         {digest,mediaType,size,subjectDigest,artifactType,predicateTypes:(.predicateTypes | unique | sort),children:(.children | unique | sort)}
       ] | sort_by(.digest)),
-      githubAttestations:([
-        $raw.registry.attestations[] | select(member($closure;.subjectDigest)) |
-        {subjectDigest,predicateType,sourceRepository,sourceDigest,workflowRef,signerWorkflow,bundleDigest}
-      ] | sort_by(.subjectDigest,.predicateType,.bundleDigest))
+      authorities:([
+        $raw.registry.authorities[] | select(. as $a | any($roots[]?; .digest == $a.rootDigest)) | .
+      ] | sort_by(.releaseId,.rootDigest)),
+      attestationEvidence:([
+        $raw.registry.evidence[] | select(. as $a | any($roots[]?; .digest == $a.rootDigest)) | .
+      ] | sort_by(.rootDigest,.evidenceStorage.kind)),
+      storageKinds:([
+        $raw.registry.authorities[] | select(. as $a | any($roots[]?; .digest == $a.rootDigest)) | .evidenceStorage.kind
+      ] | unique | sort)
     },
     proof:{path:$raw.proof.path,sha256:$raw.proof.sha256,checksum:$raw.proof.checksum}
   }

@@ -1,0 +1,49 @@
+[
+  {
+    "name": "protected-v1.0.1",
+    "mode": "protected-release",
+    "releaseId": 367640510,
+    "tag": "v1.0.1",
+    "version": "1.0.1",
+    "source": "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc",
+    "root": "sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6",
+    "platform": "sha256:2e2f41478f341da8df7e573c48c59ee1734ee7d29e9a7be614f3660adac64554"
+  },
+  {
+    "name": "protected-v1.1.0-draft",
+    "mode": "protected-release",
+    "releaseId": 368531227,
+    "tag": "v1.1.0",
+    "version": "1.1.0",
+    "source": "36ffd11ea4d35147f1df9c1cafa6a330300c1339",
+    "root": "sha256:c156a8a1436b008eea2980711b233b6f800cf60a36cdbe08faf480a2c97e6570",
+    "platform": "sha256:a04f84d5325cbe67b536b3000353da765ae4412ab0b0b9acabce1ecbba61c3ee"
+  },
+  {
+    "name": "protected-v1.2.0",
+    "mode": "protected-release",
+    "releaseId": 371012814,
+    "tag": "v1.2.0",
+    "version": "1.2.0",
+    "source": "9b6d2b06c0336ab8d153564dcf6328e81c4d7b36",
+    "root": "sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda",
+    "platform": "sha256:3d2741adeb501f103b1fdc2b79c9e2cdb30f30ab257805d2fe67e57bc6d222b6"
+  },
+  {
+    "name": "protected-v1.3.0",
+    "mode": "protected-release",
+    "releaseId": 377201468,
+    "tag": "v1.3.0",
+    "version": "1.3.0",
+    "source": "a7abfe04f6852f479291a4710ebdee23e9ae8a34",
+    "root": "sha256:88b697872331ed2786f2d9009c769a87c32470086702faacf9874576fe094e9e",
+    "platform": "sha256:b98ef109b9f0aeed909a15d44908087093b9177313813040ddbeb2d415c51961"
+  },
+  {
+    "name": "test-candidate",
+    "mode": "test-candidate",
+    "source": "fedcba9876543210fedcba9876543210fedcba98",
+    "root": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "platform": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+  }
+]
