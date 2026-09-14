@@ -161,6 +161,11 @@ policy_fail() {
 
 historical_rows=$(historical_authority_rows) ||
   policy_fail "historical authority rows could not be collected"
+jq -e 'type == "array" and length == 4' <<<"$historical_rows" >/dev/null ||
+  policy_fail "historical authority rows are not a four-row array"
+# Keep the exact production policy bytes for every matrix case without paying
+# for repeated JSON construction on the Windows runner.
+historical_authority_rows() { printf '%s\n' "$historical_rows"; }
 jq -e '
   type == "array" and
   length == 4 and
@@ -295,16 +300,142 @@ while IFS= read -r entry; do
     '.package.tags |= .[0:2]'
 done <"$TMP/historical-policy-contexts.jsonl"
 
-policy_uri="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev"
+observed_signer_workflow="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev"
 synthetic_subject="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 synthetic_invocation="https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/99999999999/attempts/1"
 synthetic_bundle=$(jq -cnS '{synthetic:"accepted-shape"}')
-synthetic_response=$(jq -cnS --argjson bundle "$synthetic_bundle" --arg subject "${synthetic_subject#sha256:}" --arg signer "4bff2902511e8e739d7604bf120b121429e60aeb" --arg invocation "$synthetic_invocation" --arg subjectName "ghcr.io/nickolaymamonov/meet-backend-v3" --arg policy "$policy_uri" '[{attestation:{bundle:$bundle},verificationResult:{statement:{predicateType:"https://slsa.dev/provenance/v1",subject:[{digest:{sha256:$subject},name:$subjectName}]},signature:{certificate:{sourceRepositoryURI:"https://github.com/NickolayMamonov/meet-backend-v3",sourceRepositoryDigest:$signer,sourceRepositoryRef:"refs/heads/dev",buildSignerURI:$policy,buildSignerDigest:$signer,subjectAlternativeName:$policy,issuer:"https://token.actions.githubusercontent.com",runInvocationURI:$invocation}}}}]')
+synthetic_response=$(jq -cnS --argjson bundle "$synthetic_bundle" --arg subject "${synthetic_subject#sha256:}" --arg signer "4bff2902511e8e739d7604bf120b121429e60aeb" --arg invocation "$synthetic_invocation" --arg subjectName "ghcr.io/nickolaymamonov/meet-backend-v3" --arg signerWorkflow "$observed_signer_workflow" --arg certificateIdentity "$observed_signer_workflow" '[{attestation:{bundle:$bundle},verificationResult:{statement:{predicateType:"https://slsa.dev/provenance/v1",subject:[{digest:{sha256:$subject},name:$subjectName}]},signature:{certificate:{sourceRepositoryURI:"https://github.com/NickolayMamonov/meet-backend-v3",sourceRepositoryDigest:$signer,sourceRepositoryRef:"refs/heads/dev",buildSignerURI:$signerWorkflow,buildSignerDigest:$signer,subjectAlternativeName:$certificateIdentity,issuer:"https://token.actions.githubusercontent.com",runInvocationURI:$invocation}}}}]')
 synthetic_hash=$(jq -cS '.[0].attestation.bundle' <<<"$synthetic_response" | sha256sum | awk '{print $1}')
 synthetic_selection=$(jq -cnS --arg signer "4bff2902511e8e739d7604bf120b121429e60aeb" --arg invocation "$synthetic_invocation" --arg subject "ghcr.io/nickolaymamonov/meet-backend-v3" --arg bundle "sha256:$synthetic_hash" \
   '{row:{signer:$signer,invocation:$invocation,subject:$subject,bundle:$bundle}}')
 synthetic_output=$(validate_historical_attestation "$synthetic_response" "$synthetic_selection" "$synthetic_subject") || policy_fail "accepted synthetic attestation shape was rejected"
-jq -e --arg expected "$policy_uri" '.signerWorkflow == $expected' <<<"$synthetic_output" >/dev/null || policy_fail "normalized signer workflow was not the parsed observed value"
+jq -e --arg expected "$observed_signer_workflow" '.signerWorkflow == $expected' <<<"$synthetic_output" >/dev/null || policy_fail "normalized signer workflow was not the parsed observed value"
+
+policy_expect_attestation_rejection() {
+  local name=$1
+  local filter=$2
+  local mutated
+  mutated=$(jq -cS "$filter" <<<"$synthetic_response") ||
+    policy_fail "could not construct mutated attestation: $name"
+  if validate_historical_attestation "$mutated" "$synthetic_selection" "$synthetic_subject" \
+      >"$TMP/attestation-$name.stdout" 2>"$TMP/attestation-$name.stderr"; then
+    policy_fail "attestation mutation was accepted: $name"
+  fi
+  [ ! -s "$TMP/attestation-$name.stdout" ] ||
+    policy_fail "rejected attestation emitted normalized output: $name"
+}
+
+policy_expect_attestation_rejection source-repository \
+  '.[0].verificationResult.signature.certificate.sourceRepositoryURI = "https://evil.invalid/repository"'
+policy_expect_attestation_rejection source-digest \
+  '.[0].verificationResult.signature.certificate.sourceRepositoryDigest = "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc"'
+policy_expect_attestation_rejection source-ref \
+  '.[0].verificationResult.signature.certificate.sourceRepositoryRef = "refs/heads/main"'
+policy_expect_attestation_rejection signer-workflow \
+  '.[0].verificationResult.signature.certificate.buildSignerURI = "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/other.yml@refs/heads/dev"'
+policy_expect_attestation_rejection signer-digest \
+  '.[0].verificationResult.signature.certificate.buildSignerDigest = "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc"'
+policy_expect_attestation_rejection certificate-identity \
+  '.[0].verificationResult.signature.certificate.subjectAlternativeName = "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/other.yml@refs/heads/dev"'
+policy_expect_attestation_rejection issuer \
+  '.[0].verificationResult.signature.certificate.issuer = "https://evil.invalid/issuer"'
+policy_expect_attestation_rejection invocation \
+  '.[0].verificationResult.signature.certificate.runInvocationURI = "https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/1/attempts/1"'
+policy_expect_attestation_rejection predicate \
+  '.[0].verificationResult.statement.predicateType = "https://example.invalid/predicate"'
+policy_expect_attestation_rejection subject-name \
+  '.[0].verificationResult.statement.subject[0].name = "evil.invalid/image"'
+policy_expect_attestation_rejection subject-digest \
+  '.[0].verificationResult.statement.subject[0].digest.sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
+policy_expect_attestation_rejection product-as-signer \
+  '.[0].verificationResult.signature.certificate.sourceRepositoryDigest = "d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc"'
+policy_expect_attestation_rejection bundle \
+  '.[0].attestation.bundle = {synthetic:"changed"}'
+policy_expect_attestation_rejection duplicate-result \
+  '. += .'
+policy_expect_attestation_rejection duplicate-subject \
+  '.[0].verificationResult.statement.subject |= . + [.[0]]'
+
+# shellcheck disable=SC2034
+transport_case() {
+  local name=$1 release_id=$2 storage=$3 subject_name=$4
+  local transport_tmp="$TMP/transport-$name"
+  local artifact_content="workflow-artifact-$name"
+  local artifact_digest bundle bundle_hash invocation signer subject selection
+  local args_file
+  mkdir "$transport_tmp"
+  artifact_digest=$(printf '%s' "$artifact_content" | sha256sum | awk '{print $1}')
+  subject="sha256:$artifact_digest"
+  signer="1111111111111111111111111111111111111111"
+  invocation="https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/99999999999/attempts/1"
+  bundle=$(jq -cnS --arg storage "$storage" '{transport:$storage}')
+  bundle_hash=$(jq -cS <<<"$bundle" | sha256sum | awk '{print $1}')
+  selection=$(jq -cnS --argjson id "$release_id" --arg signer "$signer" \
+    --arg invocation "$invocation" --arg subject "$subject_name" \
+    --arg storage "$storage" --arg bundle "sha256:$bundle_hash" \
+    '{status:"historical",row:{id:$id,signer:$signer,invocation:$invocation,
+      subject:$subject,storage:$storage,bundle:$bundle}}')
+  jq -cnS --argjson id "$release_id" --arg digest "$artifact_digest" \
+    --argjson size "${#artifact_content}" \
+    '[{id:$id,assets:[{id:123,name:"image-index.json",sha256:$digest,size:$size}]}]' \
+    >"$transport_tmp/releases-normalized.json"
+  : >"$transport_tmp/attestations.jsonl"
+  TRANSPORT_LOG="$transport_tmp/gh-args.log"
+  TRANSPORT_ARTIFACT="$artifact_content"
+  TRANSPORT_RESPONSE=$(jq -cnS --argjson bundle "$bundle" --arg subject "${subject#sha256:}" \
+    --arg signer "$signer" --arg invocation "$invocation" --arg subjectName "$subject_name" \
+    --arg signerWorkflow "$observed_signer_workflow" \
+    '[{attestation:{bundle:$bundle},verificationResult:{statement:{
+      predicateType:"https://slsa.dev/provenance/v1",
+      subject:[{digest:{sha256:$subject},name:$subjectName}]},signature:{certificate:{
+      sourceRepositoryURI:"https://github.com/NickolayMamonov/meet-backend-v3",
+      sourceRepositoryDigest:$signer,sourceRepositoryRef:"refs/heads/dev",
+      buildSignerURI:$signerWorkflow,buildSignerDigest:$signer,
+      subjectAlternativeName:$signerWorkflow,
+      issuer:"https://token.actions.githubusercontent.com",
+      runInvocationURI:$invocation}}}}]')
+  gh() {
+    printf '%s\0' "$@" >>"$TRANSPORT_LOG"
+    case "$1" in
+      api) printf '%s' "$TRANSPORT_ARTIFACT" ;;
+      attestation) printf '%s' "$TRANSPORT_RESPONSE" ;;
+      *) return 1 ;;
+    esac
+  }
+  tmp="$transport_tmp"
+  repository="NickolayMamonov/meet-backend-v3"
+  image="ghcr.io/nickolaymamonov/meet-backend-v3"
+  collect_verified_attestations "$subject" "0000000000000000000000000000000000000000" "$selection" ||
+    policy_fail "transport adapter rejected its valid $name response"
+  unset -f gh
+  args_file="$transport_tmp/gh-args.txt"
+  tr '\0' '\n' <"$TRANSPORT_LOG" >"$args_file"
+  if [ "$storage" = github-api-workflow-artifact ]; then
+    grep -Fxq "repos/NickolayMamonov/meet-backend-v3/releases/assets/123" "$args_file" ||
+      policy_fail "API workflow-artifact transport did not read the release asset: $name"
+    grep -Fxq "$transport_tmp/workflow-artifact-${subject#sha256:}.json" "$args_file" ||
+      policy_fail "API workflow-artifact transport did not verify the downloaded artifact: $name"
+    ! grep -Fxq -- "--bundle-from-oci" "$args_file" ||
+      policy_fail "API workflow-artifact transport fell back to OCI: $name"
+  else
+    grep -Fxq "oci://ghcr.io/nickolaymamonov/meet-backend-v3@$subject" "$args_file" ||
+      policy_fail "OCI transport did not verify the OCI subject: $name"
+    grep -Fxq -- "--bundle-from-oci" "$args_file" ||
+      policy_fail "OCI transport omitted its explicit bundle transport: $name"
+    ! grep -Fxq "repos/NickolayMamonov/meet-backend-v3/releases/assets/123" "$args_file" ||
+      policy_fail "OCI transport unexpectedly read a GitHub release asset: $name"
+  fi
+}
+
+jq -e '
+  map(select(.id == 371012814 or .id == 377201468))
+  | length == 2 and all(.[]; .storage == "github-api-workflow-artifact")
+' <<<"$historical_rows" >/dev/null ||
+  policy_fail "v1.2.0 and v1.3.0 do not select the API workflow-artifact transport"
+transport_case api-v1.2 371012814 github-api-workflow-artifact image-index.json
+transport_case api-v1.3 377201468 github-api-workflow-artifact image-index.json
+transport_case oci-v1.0 367640510 oci-registry-bundle ghcr.io/nickolaymamonov/meet-backend-v3
+
 expected_policy_selections=$(jq -cS '
   [.records[] |
     {

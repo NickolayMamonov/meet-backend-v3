@@ -7,6 +7,178 @@ historical_authority_rows() { jq -cnS '[{id:367640510,tag:"v1.0.1",version:"1.0.
 select_historical_authority() { local p=$1; historical_authority_rows | jq -cS --argjson p "$p" 'def a($p;$r):($p.package.tags|type=="array" and length==3 and length==(unique|length) and sort==(["sha-"+$r.source,$r.version,$r.tag]|sort)); def d($p;$r):$p.release.id==$r.id or $p.release.tag==$r.tag or $p.release.version==$r.version or $p.release.source==$r.source or $p.package.id==$r.packageId or $p.rootDigest==$r.root or $p.platform.digest==$r.platform or any($p.package.tags[]?; .==("sha-"+$r.source) or .==$r.version or .==$r.tag); [.[]|select(d($p;.))] as $m | if ($m|length)==0 then {status:"unrelated"} elif ($m|length)!=1 then error("ambiguous historical authority") else $m[0] as $r | if $p.repository=="NickolayMamonov/meet-backend-v3" and $p.image=="ghcr.io/nickolaymamonov/meet-backend-v3" and $p.release=={id:$r.id,tag:$r.tag,version:$r.version,source:$r.source,draft:$r.draft,prerelease:$r.prerelease,immutable:$r.immutable} and $p.package.id==$r.packageId and $p.package.digest==$r.root and a($p;$r) and $p.rootDigest==$r.root and $p.platform.digest==$r.platform and $p.platform.mediaType=="application/vnd.oci.image.manifest.v1+json" and $p.platform.size==1815 and $p.platform.platform=={architecture:"amd64",os:"linux"} then {status:"historical",row:$r} else error("historical product tuple mismatch") end end'; }
 validate_historical_attestation() { local response=$1 selection=$2 subject=$3 row obs hash record; row=$(jq -c '.row' <<<"$selection") || return 1; record=$(jq -c '.[0]' <<<"$response") || return 1; obs=$(jq -cS --arg subject "${subject#sha256:}" 'if type!="array" or length!=1 then error("result cardinality") else .[0] end | .attestation.bundle as $b | .verificationResult as $r | $r.signature.certificate as $c | $r.statement.subject as $s | if ($b|type)!="object" or ($s|type)!="array" or ($s|length)!=1 or $s[0].digest.sha256!=$subject then error("observed evidence malformed") else {bundle:$b,predicateType:$r.statement.predicateType,sourceRepository:$c.sourceRepositoryURI,sourceDigest:$c.sourceRepositoryDigest,workflowRef:$c.sourceRepositoryRef,signerWorkflow:$c.buildSignerURI,signerDigest:$c.buildSignerDigest,certificateIdentity:$c.subjectAlternativeName,issuer:$c.issuer,invocationURI:$c.runInvocationURI,subjectName:$s[0].name} end' <<<"$response") || return 1; hash=$(jq -cS '.attestation.bundle' <<<"$record" | sha256sum|awk '{print $1}') || return 1; jq -e -n --argjson a "$obs" --argjson r "$row" '$a.sourceRepository=="https://github.com/NickolayMamonov/meet-backend-v3" and $a.sourceDigest==$r.signer and $a.workflowRef=="refs/heads/dev" and $a.signerWorkflow=="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev" and $a.signerDigest==$r.signer and $a.certificateIdentity=="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev" and $a.issuer=="https://token.actions.githubusercontent.com" and $a.invocationURI==$r.invocation and $a.predicateType=="https://slsa.dev/provenance/v1" and $a.subjectName==$r.subject' >/dev/null || return 1; [ "sha256:$hash" = "$(jq -r '.row.bundle' <<<"$selection")" ] || return 1; jq -cnS --arg subject "$subject" --arg source "$(jq -r '.row.signer' <<<"$selection")" --arg bundle "sha256:$hash" --arg signerWorkflow "$(jq -r '.signerWorkflow' <<<"$obs")" '{subjectDigest:$subject,predicateType:"https://slsa.dev/provenance/v1",sourceRepository:"https://github.com/NickolayMamonov/meet-backend-v3",sourceDigest:$source,workflowRef:"refs/heads/dev",signerWorkflow:$signerWorkflow,bundleDigest:$bundle}'; }
 
+validate_historical_attestation() {
+  local response=$1 selection=$2 subject=$3 normalized hash expected_bundle
+  normalized=$(jq -cS --arg subject "${subject#sha256:}" --argjson selection "$selection" '
+    if type != "array" or length != 1 then
+      error("result cardinality")
+    else
+      .[0] as $record |
+      $record.attestation.bundle as $bundle |
+      $record.verificationResult as $result |
+      $result.signature.certificate as $certificate |
+      $result.statement.subject as $subjects |
+      if ($bundle | type) != "object" or
+         ($subjects | type) != "array" or
+         ($subjects | length) != 1 or
+         $subjects[0].digest.sha256 != $subject or
+         $certificate.sourceRepositoryURI != "https://github.com/NickolayMamonov/meet-backend-v3" or
+         $certificate.sourceRepositoryDigest != $selection.row.signer or
+         $certificate.sourceRepositoryRef != "refs/heads/dev" or
+         $certificate.buildSignerURI != "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev" or
+         $certificate.buildSignerDigest != $selection.row.signer or
+         $certificate.subjectAlternativeName != "https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev" or
+         $certificate.issuer != "https://token.actions.githubusercontent.com" or
+         $certificate.runInvocationURI != $selection.row.invocation or
+         $result.statement.predicateType != "https://slsa.dev/provenance/v1" or
+         $subjects[0].name != $selection.row.subject
+      then
+        error("observed evidence mismatch")
+      else
+        {
+          bundle:$bundle,
+          output:{
+            subjectDigest:("sha256:" + $subject),
+            predicateType:$result.statement.predicateType,
+            sourceRepository:$certificate.sourceRepositoryURI,
+            sourceDigest:$certificate.sourceRepositoryDigest,
+            workflowRef:$certificate.sourceRepositoryRef,
+            signerWorkflow:$certificate.buildSignerURI,
+            bundleDigest:null
+          }
+        }
+      end
+    end
+  ' <<<"$response") || return 1
+  hash=$(jq -cS '.bundle' <<<"$normalized" | sha256sum | awk '{print $1}') ||
+    return 1
+  expected_bundle=$(jq -r '.row.bundle' <<<"$selection") || return 1
+  [ "sha256:$hash" = "$expected_bundle" ] || return 1
+  jq -cnS --argjson normalized "$normalized" --arg bundle "sha256:$hash" \
+    '$normalized.output | .bundleDigest = $bundle'
+}
+
+download_workflow_artifact() {
+  local release_id=$1 expected_digest=$2 destination=$3
+  local asset asset_id asset_digest asset_size actual_digest actual_size
+  asset=$(jq -c --argjson releaseId "$release_id" '
+    [.[] | select(.id == $releaseId) | .assets[] |
+      select(.name == "image-index.json")] |
+    if length == 1 then .[0] else empty end
+  ' "$tmp/releases-normalized.json") ||
+    fail "workflow artifact inventory lookup failed for release $release_id"
+  [ -n "$asset" ] || fail "release $release_id does not have exactly one image-index.json asset"
+  asset_id=$(jq -r '.id // empty' <<<"$asset")
+  asset_digest=$(jq -r '.sha256 // empty' <<<"$asset")
+  asset_size=$(jq -r '.size // empty' <<<"$asset")
+  [ "$asset_id" != "" ] && [ "$asset_id" != null ] ||
+    fail "workflow artifact ID is missing for release $release_id"
+  [ "$asset_digest" = "${expected_digest#sha256:}" ] ||
+    fail "workflow artifact digest disagrees with image root for release $release_id"
+  [[ "$asset_size" =~ ^[0-9]+$ ]] || fail "workflow artifact size is malformed for release $release_id"
+  gh api --header 'Accept: application/octet-stream' \
+    "repos/$repository/releases/assets/$asset_id" >"$destination" ||
+    fail "workflow artifact read failed for release $release_id"
+  actual_digest=$(sha256sum "$destination" | awk '{print $1}')
+  [ "$actual_digest" = "$asset_digest" ] ||
+    fail "workflow artifact bytes do not match release asset digest for $release_id"
+  actual_size=$(wc -c <"$destination" | tr -d ' ')
+  [ "$actual_size" -eq "$asset_size" ] ||
+    fail "workflow artifact bytes do not match release asset size for $release_id"
+}
+
+collect_verified_attestations() {
+  local digest=$1 source_digest=$2 record bundle_sha
+  local selection=${3:-}
+  local selection_status=
+  if [ -n "$selection" ]; then
+    selection_status=$(jq -r '.status // empty' <<<"$selection")
+  fi
+  if [ "$selection_status" = historical ]; then
+    local signer storage release_id artifact
+    local -a common_args=() args=()
+    signer=$(jq -r '.row.signer' <<<"$selection")
+    storage=$(jq -r '.row.storage' <<<"$selection")
+    release_id=$(jq -r '.row.id' <<<"$selection")
+    common_args=(--repo "$repository" --source-digest "$signer"
+      --source-ref refs/heads/dev
+      --signer-workflow github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml
+      --signer-digest "$signer"
+      --cert-oidc-issuer https://token.actions.githubusercontent.com
+      --predicate-type https://slsa.dev/provenance/v1 --format json)
+    case "$storage" in
+      github-api-workflow-artifact)
+        artifact="$tmp/workflow-artifact-${digest#sha256:}.json"
+        download_workflow_artifact "$release_id" "$digest" "$artifact"
+        args=("$artifact" "${common_args[@]}")
+        ;;
+      oci-registry-bundle)
+        args=("oci://$image@$digest" --bundle-from-oci "${common_args[@]}")
+        ;;
+      *)
+        fail "historical authority has unsupported verification transport: $storage"
+        ;;
+    esac
+    local historical_file="$tmp/github-${digest#sha256:}.json"
+    gh attestation verify "${args[@]}" >"$historical_file" || fail "GitHub attestation verification failed for $digest"
+    validate_historical_attestation "$(<"$historical_file")" "$selection" "$digest" >"$tmp/historical-${digest#sha256:}.json" || fail "historical GitHub attestation evidence is malformed for $digest"
+    cat "$tmp/historical-${digest#sha256:}.json" >>"$tmp/attestations.jsonl"
+    return
+  fi
+  local verified_file="$tmp/github-${digest#sha256:}.json"
+  if [ ! -f "$verified_file" ]; then
+    gh attestation verify "oci://$image@$digest" \
+      --repo "$repository" --source-digest "$source_digest" --format json \
+      >"$verified_file" ||
+      fail "GitHub attestation verification failed for $digest"
+  fi
+  jq -e --arg subject "${digest#sha256:}" \
+    --arg repository "https://github.com/$repository" \
+    --arg source "$source_digest" '
+    type == "array" and length > 0 and
+    all(.[];
+      (.attestation.bundle | type == "object") and
+      (.verificationResult | type == "object") and
+      (.verificationResult.statement.predicateType |
+        type == "string" and length > 0) and
+      ([.verificationResult.statement.subject[]? |
+        select(.digest.sha256? == $subject)] | length) == 1 and
+      (.verificationResult.signature.certificate as $certificate |
+        $certificate.sourceRepositoryURI == $repository and
+        $certificate.sourceRepositoryDigest == $source and
+        ($certificate.sourceRepositoryRef |
+          type == "string" and startswith("refs/")) and
+        ($certificate.buildSignerURI |
+          type == "string" and
+          startswith($repository + "/.github/workflows/") and
+          endswith("@" + $certificate.sourceRepositoryRef)) and
+        $certificate.subjectAlternativeName == $certificate.buildSignerURI)
+    )
+  ' "$verified_file" >/dev/null ||
+    fail "verified GitHub attestation evidence is malformed for $digest"
+  while IFS= read -r record; do
+    bundle_sha=$(
+      jq -cS '.attestation.bundle' <<<"$record" |
+        sha256sum | awk '{print $1}'
+    ) || fail "verified GitHub attestation bundle hashing failed for $digest"
+    jq -cS --arg subjectDigest "$digest" \
+      --arg bundleDigest "sha256:$bundle_sha" '
+      .verificationResult as $result |
+      $result.signature.certificate as $certificate |
+      {
+        subjectDigest:$subjectDigest,
+        predicateType:$result.statement.predicateType,
+        sourceRepository:$certificate.sourceRepositoryURI,
+        sourceDigest:$certificate.sourceRepositoryDigest,
+        workflowRef:$certificate.sourceRepositoryRef,
+        signerWorkflow:$certificate.buildSignerURI,
+        bundleDigest:$bundleDigest
+      }
+    ' <<<"$record" >>"$tmp/attestations.jsonl" ||
+      fail "verified GitHub attestation normalization failed for $digest"
+  done < <(jq -c '.[]' "$verified_file")
+}
+
 usage() {
   echo "usage: $0 --repository OWNER/REPO --image ghcr.io/OWNER/IMAGE --output PATH [--candidate-alias ALIAS]" >&2
   exit 2
@@ -185,79 +357,6 @@ read_raw_manifest() {
     fail "registry descriptor media type disagrees with manifest for $digest"
   [ -z "$expected_size" ] || [ "$actual_size" -eq "$expected_size" ] ||
     fail "registry descriptor size disagrees with manifest for $digest"
-}
-
-collect_verified_attestations() {
-  local digest=$1 source_digest=$2 record bundle_sha
-  local selection=${3:-}
-  local selection_status=
-  if [ -n "$selection" ]; then
-    selection_status=$(jq -r '.status // empty' <<<"$selection")
-  fi
-  if [ "$selection_status" = historical ]; then
-    local -a args=()
-    args=("oci://$image@$digest" --repo "$repository" --source-digest "$(jq -r '.row.signer' <<<"$selection")" --source-ref refs/heads/dev --signer-workflow github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml --signer-digest "$(jq -r '.row.signer' <<<"$selection")" --cert-oidc-issuer https://token.actions.githubusercontent.com --predicate-type https://slsa.dev/provenance/v1 --format json)
-    if [ "$(jq -r '.row.storage' <<<"$selection")" = oci-registry-bundle ]; then
-      args=("oci://$image@$digest" --bundle-from-oci "${args[@]:1}")
-    fi
-    local historical_file="$tmp/github-${digest#sha256:}.json"
-    gh attestation verify "${args[@]}" >"$historical_file" || fail "GitHub attestation verification failed for $digest"
-    validate_historical_attestation "$(<"$historical_file")" "$selection" "$digest" >"$tmp/historical-${digest#sha256:}.json" || fail "historical GitHub attestation evidence is malformed for $digest"
-    cat "$tmp/historical-${digest#sha256:}.json" >>"$tmp/attestations.jsonl"
-    return
-  fi
-  local verified_file="$tmp/github-${digest#sha256:}.json"
-  if [ ! -f "$verified_file" ]; then
-    gh attestation verify "oci://$image@$digest" \
-      --repo "$repository" --source-digest "$source_digest" --format json \
-      >"$verified_file" ||
-      fail "GitHub attestation verification failed for $digest"
-  fi
-  jq -e --arg subject "${digest#sha256:}" \
-    --arg repository "https://github.com/$repository" \
-    --arg source "$source_digest" '
-    type == "array" and length > 0 and
-    all(.[];
-      (.attestation.bundle | type == "object") and
-      (.verificationResult | type == "object") and
-      (.verificationResult.statement.predicateType |
-        type == "string" and length > 0) and
-      ([.verificationResult.statement.subject[]? |
-        select(.digest.sha256? == $subject)] | length) == 1 and
-      (.verificationResult.signature.certificate as $certificate |
-        $certificate.sourceRepositoryURI == $repository and
-        $certificate.sourceRepositoryDigest == $source and
-        ($certificate.sourceRepositoryRef |
-          type == "string" and startswith("refs/")) and
-        ($certificate.buildSignerURI |
-          type == "string" and
-          startswith($repository + "/.github/workflows/") and
-          endswith("@" + $certificate.sourceRepositoryRef)) and
-        $certificate.subjectAlternativeName == $certificate.buildSignerURI)
-    )
-  ' "$verified_file" >/dev/null ||
-    fail "verified GitHub attestation evidence is malformed for $digest"
-  while IFS= read -r record; do
-    bundle_sha=$(
-      jq -cS '.attestation.bundle' <<<"$record" |
-        sha256sum | awk '{print $1}'
-    ) || fail "verified GitHub attestation bundle hashing failed for $digest"
-    jq -cS --arg subjectDigest "$digest" \
-      --arg bundleDigest "sha256:$bundle_sha" '
-      .verificationResult as $result |
-      $result.signature.certificate as $certificate |
-      {
-        subjectDigest:$subjectDigest,
-        predicateType:$result.statement.predicateType,
-        sourceRepository:$certificate.sourceRepositoryURI,
-        sourceDigest:$certificate.sourceRepositoryDigest,
-        workflowRef:$certificate.sourceRepositoryRef,
-        signerWorkflow:$certificate.buildSignerURI,
-        bundleDigest:$bundleDigest
-      }
-    ' <<<"$record" >>"$tmp/attestations.jsonl" ||
-      fail "verified GitHub attestation normalization failed for $digest"
-  done < <(jq -c '.[]' "$verified_file")
 }
 
 while IFS=$'\t' read -r version_id digest tags_json; do
