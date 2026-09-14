@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-set -euo pipefail
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -euo pipefail
+fi
+
+historical_authority_rows() { jq -cnS '[{id:367640510,tag:"v1.0.1",version:"1.0.1",source:"d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc",signer:"4bff2902511e8e739d7604bf120b121429e60aeb",packageId:1115681835,root:"sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6",platform:"sha256:2e2f41478f341da8df7e573c48c59ee1734ee7d29e9a7be614f3660adac64554",draft:false,prerelease:false,immutable:false,invocation:"https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/31368625251/attempts/1",subject:"ghcr.io/nickolaymamonov/meet-backend-v3",storage:"oci-registry-bundle",bundle:"sha256:d238057705a334533fa3962ef0a7d96e8999696392b438199fbdbe37488e5950"},{id:368531227,tag:"v1.1.0",version:"1.1.0",source:"36ffd11ea4d35147f1df9c1cafa6a330300c1339",signer:"8598a31e60d0bae784bebf43404f3b1e91d603e1",packageId:1123238824,root:"sha256:c156a8a1436b008eea2980711b233b6f800cf60a36cdbe08faf480a2c97e6570",platform:"sha256:a04f84d5325cbe67b536b3000353da765ae4412ab0b0b9acabce1ecbba61c3ee",draft:true,prerelease:false,immutable:false,invocation:"https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/31551286770/attempts/1",subject:"ghcr.io/nickolaymamonov/meet-backend-v3",storage:"oci-registry-bundle",bundle:"sha256:02268aa7d49ca85c979f4437c1046cca7bce19379eca2eaac28b786acc7daa1f"},{id:371012814,tag:"v1.2.0",version:"1.2.0",source:"9b6d2b06c0336ab8d153564dcf6328e81c4d7b36",signer:"9af0723444f918594101999a4338b418607cbd01",packageId:1135861098,root:"sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda",platform:"sha256:3d2741adeb501f103b1fdc2b79c9e2cdb30f30ab257805d2fe67e57bc6d222b6",draft:false,prerelease:false,immutable:true,invocation:"https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/31880582935/attempts/1",subject:"image-index.json",storage:"github-api-workflow-artifact",bundle:"sha256:cf1f5d905c0bb97ca2013b3dd8aa415fb331a63dfec860e0382e5690339e5958"},{id:377201468,tag:"v1.3.0",version:"1.3.0",source:"a7abfe04f6852f479291a4710ebdee23e9ae8a34",signer:"79263bfed6427dc1a45900e338805c52dbd5f59d",packageId:1178492365,root:"sha256:88b697872331ed2786f2d9009c769a87c32470086702faacf9874576fe094e9e",platform:"sha256:b98ef109b9f0aeed909a15d44908087093b9177313813040ddbeb2d415c51961",draft:false,prerelease:false,immutable:true,invocation:"https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/33075760603/attempts/1",subject:"image-index.json",storage:"github-api-workflow-artifact",bundle:"sha256:cb48b0ad1cf2a02733057e337bbba3ea4dc493c311f95117afb3381f894e19a8"}]'; }
+select_historical_authority() { local p=$1; historical_authority_rows | jq -cS --argjson p "$p" 'def a($p;$r):($p.package.tags|type=="array" and length==3 and length==(unique|length) and sort==(["sha-"+$r.source,$r.version,$r.tag]|sort)); def d($p;$r):$p.release.id==$r.id or $p.release.tag==$r.tag or $p.release.version==$r.version or $p.release.source==$r.source or $p.package.id==$r.packageId or $p.rootDigest==$r.root or $p.platform.digest==$r.platform or any($p.package.tags[]?; .==("sha-"+$r.source) or .==$r.version or .==$r.tag); [.[]|select(d($p;.))] as $m | if ($m|length)==0 then {status:"unrelated"} elif ($m|length)!=1 then error("ambiguous historical authority") else $m[0] as $r | if $p.repository=="NickolayMamonov/meet-backend-v3" and $p.image=="ghcr.io/nickolaymamonov/meet-backend-v3" and $p.release=={id:$r.id,tag:$r.tag,version:$r.version,source:$r.source,draft:$r.draft,prerelease:$r.prerelease,immutable:$r.immutable} and $p.package.id==$r.packageId and $p.package.digest==$r.root and a($p;$r) and $p.rootDigest==$r.root and $p.platform.digest==$r.platform and $p.platform.mediaType=="application/vnd.oci.image.manifest.v1+json" and $p.platform.size==1815 and $p.platform.platform=={architecture:"amd64",os:"linux"} then {status:"historical",row:$r} else error("historical product tuple mismatch") end end'; }
+validate_historical_attestation() { local response=$1 selection=$2 subject=$3 row obs hash record; row=$(jq -c '.row' <<<"$selection") || return 1; record=$(jq -c '.[0]' <<<"$response") || return 1; obs=$(jq -cS --arg subject "${subject#sha256:}" 'if type!="array" or length!=1 then error("result cardinality") else .[0] end | .attestation.bundle as $b | .verificationResult as $r | $r.signature.certificate as $c | $r.statement.subject as $s | if ($b|type)!="object" or ($s|type)!="array" or ($s|length)!=1 or $s[0].digest.sha256!=$subject then error("observed evidence malformed") else {bundle:$b,predicateType:$r.statement.predicateType,sourceRepository:$c.sourceRepositoryURI,sourceDigest:$c.sourceRepositoryDigest,workflowRef:$c.sourceRepositoryRef,signerWorkflow:$c.buildSignerURI,signerDigest:$c.buildSignerDigest,certificateIdentity:$c.subjectAlternativeName,issuer:$c.issuer,invocationURI:$c.runInvocationURI,subjectName:$s[0].name} end' <<<"$response") || return 1; hash=$(jq -cS '.attestation.bundle' <<<"$record" | sha256sum|awk '{print $1}') || return 1; jq -e -n --argjson a "$obs" --argjson r "$row" '$a.sourceRepository=="https://github.com/NickolayMamonov/meet-backend-v3" and $a.sourceDigest==$r.signer and $a.workflowRef=="refs/heads/dev" and $a.signerWorkflow=="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev" and $a.signerDigest==$r.signer and $a.certificateIdentity=="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev" and $a.issuer=="https://token.actions.githubusercontent.com" and $a.invocationURI==$r.invocation and $a.predicateType=="https://slsa.dev/provenance/v1" and $a.subjectName==$r.subject' >/dev/null || return 1; [ "sha256:$hash" = "$(jq -r '.row.bundle' <<<"$selection")" ] || return 1; jq -cnS --arg subject "$subject" --arg source "$(jq -r '.row.signer' <<<"$selection")" --arg bundle "sha256:$hash" '{subjectDigest:$subject,predicateType:"https://slsa.dev/provenance/v1",sourceRepository:"https://github.com/NickolayMamonov/meet-backend-v3",sourceDigest:$source,workflowRef:"refs/heads/dev",signerWorkflow:"https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev",bundleDigest:$bundle}'; }
 
 usage() {
   echo "usage: $0 --repository OWNER/REPO --image ghcr.io/OWNER/IMAGE --output PATH [--candidate-alias ALIAS]" >&2
@@ -8,6 +14,7 @@ usage() {
 
 fail() { echo "test-promotion protected-state collection failed: $*" >&2; exit 1; }
 
+main() {
 repository=
 image=
 output=
@@ -99,6 +106,13 @@ tag_refs=$(
     [ -n "$tag" ] || continue
     target=$(jq -r --arg tag "$tag" '.[] | select(.tag_name == $tag) | .target_commitish' \
       "$tmp/releases-normalized.json")
+is_draft=$(jq -r --arg tag "$tag" '.[]|select(.tag_name==$tag)|.draft' "$tmp/releases-normalized.json")
+    if [ "$tag" = v1.1.0 ] && [ "$is_draft" = true ]; then
+      matching_refs=$(gh api "repos/$repository/git/matching-refs/tags/v1.1.0") || fail "draft tag absence read failed"
+      jq -e 'type=="array" and all(.[]; type=="object" and (.ref|type=="string")) and ([.[]|select(.ref=="refs/tags/v1.1.0")]|length)==0' <<<"$matching_refs" >/dev/null || fail "draft v1.1.0 exact tag is present or malformed"
+      jq -cnS --arg tag "$tag" '{tag:$tag,state:"absent"}'
+      continue
+    fi
     ref_json=$(gh api "repos/$repository/git/ref/tags/$tag" 2>/dev/null) ||
       fail "tag ref read failed for $tag"
     object_type=$(jq -r '.object.type // empty' <<<"$ref_json")
@@ -175,6 +189,23 @@ read_raw_manifest() {
 
 collect_verified_attestations() {
   local digest=$1 source_digest=$2 record bundle_sha
+  local selection=${3:-}
+  local selection_status=
+  if [ -n "$selection" ]; then
+    selection_status=$(jq -r '.status // empty' <<<"$selection")
+  fi
+  if [ "$selection_status" = historical ]; then
+    local -a args=()
+    args=("oci://$image@$digest" --repo "$repository" --source-digest "$(jq -r '.row.signer' <<<"$selection")" --source-ref refs/heads/dev --signer-workflow github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml --signer-digest "$(jq -r '.row.signer' <<<"$selection")" --cert-oidc-issuer https://token.actions.githubusercontent.com --predicate-type https://slsa.dev/provenance/v1 --format json)
+    if [ "$(jq -r '.row.storage' <<<"$selection")" = oci-registry-bundle ]; then
+      args=("oci://$image@$digest" --bundle-from-oci "${args[@]:1}")
+    fi
+    local historical_file="$tmp/github-${digest#sha256:}.json"
+    gh attestation verify "${args[@]}" >"$historical_file" || fail "GitHub attestation verification failed for $digest"
+    validate_historical_attestation "$(<"$historical_file")" "$selection" "$digest" >"$tmp/historical-${digest#sha256:}.json" || fail "historical GitHub attestation evidence is malformed for $digest"
+    cat "$tmp/historical-${digest#sha256:}.json" >>"$tmp/attestations.jsonl"
+    return
+  fi
   local verified_file="$tmp/github-${digest#sha256:}.json"
   if [ ! -f "$verified_file" ]; then
     gh attestation verify "oci://$image@$digest" \
@@ -266,6 +297,9 @@ while IFS=$'\t' read -r version_id digest tags_json; do
         fail "release image index has no unique linux/amd64 subject"
     fi
     if [ "$release_id" -gt 0 ]; then
+release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:.tag_name,version:(.tag_name|sub("^v";"")),source:.target_commitish,draft,prerelease,immutable}' "$tmp/releases-normalized.json")
+      product_context=$(jq -cnS --arg repository "$repository" --arg image "$image" --argjson release "$release_record" --argjson packageId "$version_id" --arg digest "$digest" --argjson tags "$tags_json" --argjson platform "$platform_descriptor" '{repository:$repository,image:$image,release:$release,package:{id:$packageId,digest:$digest,tags:$tags},rootDigest:$digest,platform:$platform}')
+      selection=$(select_historical_authority "$product_context") || fail "historical product authority selection failed for $digest"
       jq -cnS --arg digest "$digest" --argjson releaseId "$release_id" \
         --arg platformDigest "$platform_digest" --argjson aliases "$tags_json" \
         '{digest:$digest,kind:"root",releaseId:$releaseId,rootDigest:null,
@@ -273,7 +307,7 @@ while IFS=$'\t' read -r version_id digest tags_json; do
       release_source=$(jq -r --argjson id "$release_id" \
         '.[] | select(.id == $id) | .target_commitish' \
         "$tmp/releases-normalized.json")
-      collect_verified_attestations "$digest" "$release_source"
+      collect_verified_attestations "$digest" "$release_source" "$selection"
     fi
     jq -cnS --arg digest "$digest" --arg mediaType "$media_type" \
       --argjson size "$manifest_size" \
@@ -429,3 +463,8 @@ chmod 600 "$temporary" 2>/dev/null || true
 mv -f -- "$temporary" "$output" || fail "protected-state input publication failed"
 rm -r -- "$tmp"
 trap - EXIT HUP INT TERM
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

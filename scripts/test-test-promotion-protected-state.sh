@@ -146,5 +146,206 @@ PATH="$TMP/forbidden-bin:$PATH" \
   run_capture "$FIXTURE" "$TMP/shim-output.json"
 cmp --silent "$TMP/canonical.json" "$TMP/shim-output.json" ||
   fail "explicit command shims changed the projection"
+COLLECTOR=$ROOT_DIR/scripts/collect-test-promotion-protected-state.sh
+HISTORICAL_FIXTURE=$ROOT_DIR/scripts/fixtures/test-promotion-protected-state/historical-authority.json
+[ -r "$COLLECTOR" ] || fail "collector is unavailable for policy tests"
+[ -r "$HISTORICAL_FIXTURE" ] || fail "historical authority fixture is missing"
+
+# shellcheck source=collect-test-promotion-protected-state.sh
+source "$COLLECTOR"
+
+policy_fail() {
+  echo "test-promotion protected-state collector policy failed: $*" >&2
+  exit 1
+}
+
+historical_rows=$(historical_authority_rows) ||
+  policy_fail "historical authority rows could not be collected"
+jq -e '
+  type == "array" and
+  length == 4 and
+  length == (unique | length) and
+  ([.[] | [.id, .source, .root]] | length) ==
+    ([.[] | [.id, .source, .root]] | unique | length)
+' <<<"$historical_rows" >/dev/null ||
+  policy_fail "historical authority rows are not four unique rows"
+
+jq -e '
+  type == "object" and
+  (.records | type == "array" and length == 4) and
+  all(.records[];
+    (.release.id | type == "number") and
+    (.release.source | type == "string") and
+    (.image.rootDigest | type == "string") and
+    (.image.package | type == "object") and
+    (.attestation.signerDigest | type == "string")
+  )
+' "$HISTORICAL_FIXTURE" >/dev/null ||
+  policy_fail "historical authority fixture is malformed"
+
+jq -cS '
+  .records
+  | map({
+      triple: [.release.id, .release.source, .image.rootDigest],
+      expectedId: .release.id,
+      expectedSigner: .attestation.signerDigest,
+      context: {
+        repository: "NickolayMamonov/meet-backend-v3",
+        image: "ghcr.io/nickolaymamonov/meet-backend-v3",
+        release: {
+          id: .release.id,
+          tag: .release.tag,
+          version: .release.version,
+          source: .release.source,
+          draft: .release.draft,
+          prerelease: .release.prerelease,
+          immutable: .release.immutable
+        },
+        package: .image.package,
+        rootDigest: .image.rootDigest,
+        platform: .image.platform
+      }
+    })
+  | sort_by(.triple)
+  | .[]
+' "$HISTORICAL_FIXTURE" >"$TMP/historical-policy-contexts.jsonl" ||
+  policy_fail "historical authority contexts could not be mapped"
+
+policy_expect_rejection() {
+  local name=$1
+  local context=$2
+  if select_historical_authority "$context" \
+      >"$TMP/policy-$name.stdout" 2>"$TMP/policy-$name.stderr"; then
+    policy_fail "selector accepted mutated context: $name"
+  fi
+  [ ! -s "$TMP/policy-$name.stdout" ] ||
+    policy_fail "selector emitted stdout for rejected context: $name"
+  [ -s "$TMP/policy-$name.stderr" ] ||
+    policy_fail "selector omitted stderr for rejected context: $name"
+}
+
+policy_expect_mutation_rejection() {
+  local name=$1
+  local context=$2
+  local filter=$3
+  local mutated
+  mutated=$(jq -cS "$filter" <<<"$context") ||
+    policy_fail "could not construct mutated context: $name"
+  policy_expect_rejection "$name" "$mutated"
+}
+
+: >"$TMP/historical-policy-selections.jsonl"
+while IFS= read -r entry; do
+  triple=$(jq -c '.triple' <<<"$entry") ||
+    policy_fail "historical context triple could not be read"
+  expected_id=$(jq -r '.expectedId' <<<"$entry") ||
+    policy_fail "historical context ID could not be read"
+  expected_signer=$(jq -r '.expectedSigner' <<<"$entry") ||
+    policy_fail "historical context signer could not be read"
+  context=$(jq -c '.context' <<<"$entry") ||
+    policy_fail "historical product context could not be read"
+
+  selection=$(select_historical_authority "$context") ||
+    policy_fail "historical product context was rejected: $expected_id"
+  jq -e --argjson expectedId "$expected_id" --arg expectedSigner "$expected_signer" '
+    .status == "historical" and
+    .row.id == $expectedId and
+    .row.signer == $expectedSigner
+  ' <<<"$selection" >/dev/null ||
+    policy_fail "historical selection has the wrong ID or signer: $expected_id"
+  jq -cnS --argjson triple "$triple" --argjson selection "$selection" '
+    {
+      triple: $triple,
+      status: $selection.status,
+      rowId: $selection.row.id,
+      signer: $selection.row.signer
+    }
+  ' >>"$TMP/historical-policy-selections.jsonl" ||
+    policy_fail "historical selection could not be recorded: $expected_id"
+
+  reordered_context=$(jq -cS '.package.tags |= reverse' <<<"$context") ||
+    policy_fail "historical aliases could not be reordered: $expected_id"
+  reordered_selection=$(select_historical_authority "$reordered_context") ||
+    policy_fail "reordered historical aliases were rejected: $expected_id"
+  printf '%s\n' "$selection" >"$TMP/policy-$expected_id.selection"
+  printf '%s\n' "$reordered_selection" >"$TMP/policy-$expected_id.reordered-selection"
+  cmp --silent "$TMP/policy-$expected_id.selection" \
+    "$TMP/policy-$expected_id.reordered-selection" ||
+    policy_fail "alias order changed historical selection: $expected_id"
+
+  policy_expect_mutation_rejection "$expected_id-repository" "$context" \
+    '.repository = "other-owner/other-repository"'
+  policy_expect_mutation_rejection "$expected_id-source" "$context" \
+    '.release.source = "0000000000000000000000000000000000000000"'
+  policy_expect_mutation_rejection "$expected_id-package-id" "$context" \
+    '.package.id = 0'
+  policy_expect_mutation_rejection "$expected_id-root" "$context" \
+    '.rootDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"'
+  policy_expect_mutation_rejection "$expected_id-platform" "$context" \
+    '.platform.digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"'
+  policy_expect_mutation_rejection "$expected_id-draft" "$context" \
+    '.release.draft |= not'
+  policy_expect_mutation_rejection "$expected_id-prerelease" "$context" \
+    '.release.prerelease |= not'
+  policy_expect_mutation_rejection "$expected_id-immutable" "$context" \
+    '.release.immutable |= not'
+  policy_expect_mutation_rejection "$expected_id-alias-content" "$context" \
+    '.package.tags |= ["alias-mismatch"] + .[1:]'
+  policy_expect_mutation_rejection "$expected_id-alias-cardinality" "$context" \
+    '.package.tags |= .[0:2]'
+done <"$TMP/historical-policy-contexts.jsonl"
+
+expected_policy_selections=$(jq -cS '
+  [.records[] |
+    {
+      triple: [.release.id, .release.source, .image.rootDigest],
+      status: "historical",
+      rowId: .release.id,
+      signer: .attestation.signerDigest
+    }
+  ] | sort_by(.triple)
+' "$HISTORICAL_FIXTURE") ||
+  policy_fail "expected historical selections could not be built"
+jq -s -e --argjson expected "$expected_policy_selections" '
+  length == 4 and
+  (map(.triple) | unique | length) == 4 and
+  (sort_by(.triple) == $expected)
+' "$TMP/historical-policy-selections.jsonl" >/dev/null ||
+  policy_fail "historical authority selections are not bijective"
+
+unrelated_context=$(jq -cnS '{
+  repository: "unrelated-owner/unrelated-repository",
+  image: "ghcr.io/unrelated-owner/unrelated-image",
+  release: {
+    id: 999999999,
+    tag: "v9.9.9",
+    version: "9.9.9",
+    source: "ffffffffffffffffffffffffffffffffffffffff",
+    draft: false,
+    prerelease: false,
+    immutable: true
+  },
+  package: {
+    id: 9999999999,
+    digest: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    tags: [
+      "sha-ffffffffffffffffffffffffffffffffffffffff",
+      "9.9.9",
+      "v9.9.9"
+    ]
+  },
+  rootDigest: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  platform: {
+    digest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    mediaType: "application/vnd.oci.image.manifest.v1+json",
+    size: 1815,
+    platform: {architecture: "amd64", os: "linux"}
+  }
+}') || policy_fail "unrelated context could not be built"
+unrelated_selection=$(select_historical_authority "$unrelated_context") ||
+  policy_fail "unrelated product context was rejected"
+jq -e '. == {status: "unrelated"}' <<<"$unrelated_selection" >/dev/null ||
+  policy_fail "unrelated product context was not classified as unrelated"
+
 
 echo "test-promotion protected-state fixtures passed: canonical order, drift matrix, candidate exclusion, collision inclusion, malformed input, and no writers/network"

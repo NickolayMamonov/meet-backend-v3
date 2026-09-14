@@ -60,7 +60,7 @@ if ! jq -cS \
     type == "object" and
     keys_are(["image","proof","releases","registry","repository","schema","tagRefs"]) and
     .schema == "meet-backend/test-promotion-protected-state-input/v1" and
-    (.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") and . == ascii_downcase) and
+    (.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
     (.image | type == "string" and test("^ghcr[.]io/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") and . == ascii_downcase) and
     (.releases | type == "array" and length > 0) and
     (.releases | (map((keys | sort) == ["assets","draft","id","immutable","prerelease","protected","published_at","tag_name","target_commitish"]) | all)) and
