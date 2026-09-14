@@ -295,6 +295,16 @@ while IFS= read -r entry; do
     '.package.tags |= .[0:2]'
 done <"$TMP/historical-policy-contexts.jsonl"
 
+policy_uri="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev"
+synthetic_subject="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+synthetic_invocation="https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/99999999999/attempts/1"
+synthetic_bundle=$(jq -cnS '{synthetic:"accepted-shape"}')
+synthetic_response=$(jq -cnS --argjson bundle "$synthetic_bundle" --arg subject "${synthetic_subject#sha256:}" --arg signer "4bff2902511e8e739d7604bf120b121429e60aeb" --arg invocation "$synthetic_invocation" --arg subjectName "ghcr.io/nickolaymamonov/meet-backend-v3" --arg policy "$policy_uri" '[{attestation:{bundle:$bundle},verificationResult:{statement:{predicateType:"https://slsa.dev/provenance/v1",subject:[{digest:{sha256:$subject},name:$subjectName}]},signature:{certificate:{sourceRepositoryURI:"https://github.com/NickolayMamonov/meet-backend-v3",sourceRepositoryDigest:$signer,sourceRepositoryRef:"refs/heads/dev",buildSignerURI:$policy,buildSignerDigest:$signer,subjectAlternativeName:$policy,issuer:"https://token.actions.githubusercontent.com",runInvocationURI:$invocation}}}}]')
+synthetic_hash=$(jq -cS '.[0].attestation.bundle' <<<"$synthetic_response" | sha256sum | awk '{print $1}')
+synthetic_selection=$(jq -cnS --arg signer "4bff2902511e8e739d7604bf120b121429e60aeb" --arg invocation "$synthetic_invocation" --arg subject "ghcr.io/nickolaymamonov/meet-backend-v3" --arg bundle "sha256:$synthetic_hash" \
+  '{row:{signer:$signer,invocation:$invocation,subject:$subject,bundle:$bundle}}')
+synthetic_output=$(validate_historical_attestation "$synthetic_response" "$synthetic_selection" "$synthetic_subject") || policy_fail "accepted synthetic attestation shape was rejected"
+jq -e --arg expected "$policy_uri" '.signerWorkflow == $expected' <<<"$synthetic_output" >/dev/null || policy_fail "normalized signer workflow was not the parsed observed value"
 expected_policy_selections=$(jq -cS '
   [.records[] |
     {
