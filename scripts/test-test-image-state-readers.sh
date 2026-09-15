@@ -216,7 +216,7 @@ REAL_ROOT=$(digest_of "$DATA/real-root.json")
 
 jq -cS -n --arg source "$SOURCE" '
   [[{
-    id:371012814,
+    id:987654321,
     tag_name:"v1.2.3",
     target_commitish:$source,
     draft:false,immutable:true,protected:true,prerelease:false,
