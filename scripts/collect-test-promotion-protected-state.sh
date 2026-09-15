@@ -200,19 +200,20 @@ usage() {
 fail() { echo "test-promotion protected-state collection failed: $*" >&2; exit 1; }
 
 normalize_artifact_predicate_types() {
-  local manifest=$1 release_id=$2 subject_digest=$3 root_digest=$4 selection=$5
+  local manifest=$1 subject_digest=$3
   local artifact_type predicate_type layer_count layer_media generic_count
-  local selection_status storage selected_root
+  local authority_row
   artifact_type=$(jq -r '.artifactType // empty' "$manifest") || return 1
   if [ "$artifact_type" = application/vnd.dev.sigstore.bundle.v0.3+json ]; then
-    selection_status=$(jq -r '.status // empty' <<<"$selection") || return 1
-    storage=$(jq -r '.row.storage // empty' <<<"$selection") || return 1
-    selected_root=$(jq -r '.row.root // empty' <<<"$selection") || return 1
-    [ "$release_id" -gt 0 ] || return 1
-    [ "$selection_status" = historical ] || return 1
-    [ "$storage" = oci-registry-bundle ] || return 1
-    [ "$selected_root" = "$root_digest" ] || return 1
-    [ "$subject_digest" = "$root_digest" ] || return 1
+    authority_row=$(historical_authority_rows | jq -ceS \
+      --arg subjectDigest "$subject_digest" '
+      [.[] | select(
+        .root == $subjectDigest and
+        .storage == "oci-registry-bundle"
+      )] |
+      if length == 1 then .[0] else empty end
+    ') || return 1
+    [ -n "$authority_row" ] || return 1
     predicate_type=$(jq -r \
       '.annotations["dev.sigstore.bundle.predicateType"] // empty' \
       "$manifest") || return 1

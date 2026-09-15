@@ -167,7 +167,10 @@ jq -e 'type == "array" and length == 4' <<<"$historical_rows" >/dev/null ||
   policy_fail "historical authority rows are not a four-row array"
 # Keep the exact production policy bytes for every matrix case without paying
 # for repeated JSON construction on the Windows runner.
-historical_authority_rows() { printf '%s\n' "$historical_rows"; }
+sigstore_authority_rows_override=
+historical_authority_rows() {
+  printf '%s\n' "${sigstore_authority_rows_override:-$historical_rows}"
+}
 jq -e '
   type == "array" and
   length == 4 and
@@ -425,11 +428,6 @@ sigstore_manifest() {
   ' >"$destination"
 }
 
-sigstore_selection() {
-  local root=$1
-  jq -cnS --arg root "$root" \
-    '{status:"historical",row:{root:$root,storage:"oci-registry-bundle"}}'
-}
 
 sigstore_expect_rejection() {
   local name=$1 manifest=$2 release_id=$3 subject=$4 root=$5 selection=$6
@@ -443,67 +441,123 @@ sigstore_expect_rejection() {
 }
 
 while IFS=$'\t' read -r sigstore_id sigstore_root; do
-  sigstore_selection_json=$(sigstore_selection "$sigstore_root")
+  sigstore_root=${sigstore_root%$'\r'}
+  sigstore_current_digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  [ "$sigstore_current_digest" != "$sigstore_root" ] ||
+    policy_fail "Sigstore artifact digest equals retained root: $sigstore_id"
   sigstore_manifest "$TMP/sigstore-$sigstore_id.json" "$sigstore_root" 1 \
     "$sigstore_artifact_type" "$sigstore_predicate_type" "__missing__"
   sigstore_predicates=$(normalize_artifact_predicate_types \
-    "$TMP/sigstore-$sigstore_id.json" "$sigstore_id" "$sigstore_root" \
-    "$sigstore_root" "$sigstore_selection_json") ||
+    "$TMP/sigstore-$sigstore_id.json" 0 "$sigstore_root" \
+    "$sigstore_current_digest" '{}') ||
     policy_fail "valid Sigstore predicate was rejected: $sigstore_id"
   jq -e --argjson expected '["https://slsa.dev/provenance/v1"]' \
     '. == $expected' <<<"$sigstore_predicates" >/dev/null ||
     policy_fail "valid Sigstore predicate did not normalize to one type: $sigstore_id"
 
+  sigstore_alternate_predicates=$(normalize_artifact_predicate_types \
+    "$TMP/sigstore-$sigstore_id.json" 999999999 "$sigstore_root" \
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+    '{}') ||
+    policy_fail "artifact digest or release ID controlled Sigstore acceptance: $sigstore_id"
+  [ "$sigstore_alternate_predicates" = "$sigstore_predicates" ] ||
+    policy_fail "artifact digest or release ID changed Sigstore normalization: $sigstore_id"
+
+  sigstore_cross_row_root=$(jq -r --arg root "$sigstore_root" '
+    .[] | select(.storage == "oci-registry-bundle" and .root != $root) | .root
+  ' <<<"$historical_rows" | head -n 1)
+  [ -n "$sigstore_cross_row_root" ] ||
+    policy_fail "cross-row Sigstore fixture is missing: $sigstore_id"
+  sigstore_stale_selection=$(jq -cnS --arg root "$sigstore_cross_row_root" '
+    {status:"historical",row:{root:$root,storage:"oci-registry-bundle"}}
+  ')
+  sigstore_stale_predicates=$(normalize_artifact_predicate_types \
+    "$TMP/sigstore-$sigstore_id.json" 0 "$sigstore_root" \
+    "$sigstore_current_digest" "$sigstore_stale_selection") ||
+    policy_fail "stale/cross-row selection controlled Sigstore acceptance: $sigstore_id"
+  [ "$sigstore_stale_predicates" = "$sigstore_predicates" ] ||
+    policy_fail "stale/cross-row selection changed Sigstore normalization: $sigstore_id"
+
   jq 'del(.annotations["dev.sigstore.bundle.predicateType"])' \
     "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-missing.json"
   sigstore_expect_rejection missing-predicate \
-    "$TMP/sigstore-$sigstore_id-missing.json" "$sigstore_id" \
-    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+    "$TMP/sigstore-$sigstore_id-missing.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
   jq '.annotations["dev.sigstore.bundle.predicateType"] = "https://evil.invalid/predicate"' \
     "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-wrong.json"
   sigstore_expect_rejection wrong-predicate \
-    "$TMP/sigstore-$sigstore_id-wrong.json" "$sigstore_id" \
-    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+    "$TMP/sigstore-$sigstore_id-wrong.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
+  jq '.annotations["dev.sigstore.bundle.predicateType"] = ""' \
+    "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-empty.json"
+  sigstore_expect_rejection empty-predicate \
+    "$TMP/sigstore-$sigstore_id-empty.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
   jq '.annotations["dev.sigstore.bundle.predicateType"] = ["https://slsa.dev/provenance/v1","https://evil.invalid/predicate"]' \
     "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-conflicting.json"
   sigstore_expect_rejection conflicting-predicate \
-    "$TMP/sigstore-$sigstore_id-conflicting.json" "$sigstore_id" \
-    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+    "$TMP/sigstore-$sigstore_id-conflicting.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
+  jq '.annotations["dev.sigstore.bundle.predicateType"] = ["https://slsa.dev/provenance/v1","https://slsa.dev/provenance/v1"]' \
+    "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-duplicate.json"
+  sigstore_expect_rejection duplicate-predicate \
+    "$TMP/sigstore-$sigstore_id-duplicate.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
   jq '.layers = []' "$TMP/sigstore-$sigstore_id.json" \
     >"$TMP/sigstore-$sigstore_id-no-layer.json"
   sigstore_expect_rejection no-layer \
-    "$TMP/sigstore-$sigstore_id-no-layer.json" "$sigstore_id" \
-    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+    "$TMP/sigstore-$sigstore_id-no-layer.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
   jq '.layers |= . + .' "$TMP/sigstore-$sigstore_id.json" \
     >"$TMP/sigstore-$sigstore_id-two-layers.json"
   sigstore_expect_rejection two-layers \
-    "$TMP/sigstore-$sigstore_id-two-layers.json" "$sigstore_id" \
-    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+    "$TMP/sigstore-$sigstore_id-two-layers.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
   jq '.layers[0].mediaType = "application/octet-stream"' \
     "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-wrong-media.json"
   sigstore_expect_rejection wrong-media \
-    "$TMP/sigstore-$sigstore_id-wrong-media.json" "$sigstore_id" \
-    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+    "$TMP/sigstore-$sigstore_id-wrong-media.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
   jq '.layers[0].annotations["in-toto.io/predicate-type"] = "https://slsa.dev/provenance/v1"' \
     "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-generic-layer.json"
   sigstore_expect_rejection generic-layer \
-    "$TMP/sigstore-$sigstore_id-generic-layer.json" "$sigstore_id" \
-    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+    "$TMP/sigstore-$sigstore_id-generic-layer.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
   sigstore_expect_rejection foreign-subject \
-    "$TMP/sigstore-$sigstore_id.json" "$sigstore_id" \
+    "$TMP/sigstore-$sigstore_id.json" 0 \
     "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
-    "$sigstore_root" "$sigstore_selection_json"
-  sigstore_expect_rejection foreign-row \
-    "$TMP/sigstore-$sigstore_id.json" "$sigstore_id" \
-    "$sigstore_root" \
-    "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
-    "$sigstore_selection_json"
+    "$sigstore_current_digest" '{}'
+
   jq 'del(.layers, .annotations)' "$TMP/sigstore-$sigstore_id.json" \
     >"$TMP/sigstore-$sigstore_id-partial.json"
   sigstore_expect_rejection partial \
-    "$TMP/sigstore-$sigstore_id-partial.json" "$sigstore_id" \
-    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+    "$TMP/sigstore-$sigstore_id-partial.json" 0 \
+    "$sigstore_root" "$sigstore_current_digest" '{}'
 done < <(jq -r '.[] | select(.storage == "oci-registry-bundle") | [.id,.root] | @tsv' <<<"$historical_rows")
+
+sigstore_authority_root=$(jq -r '
+  [.[] | select(.storage == "oci-registry-bundle")][0].root
+' <<<"$historical_rows")
+sigstore_manifest "$TMP/sigstore-authority-row.json" "$sigstore_authority_root" 1 \
+  "$sigstore_artifact_type" "$sigstore_predicate_type" "__missing__"
+sigstore_authority_rows_override=$(jq -cS --arg root "$sigstore_authority_root" '
+  . as $rows |
+  $rows + [($rows[] |
+    select(.root == $root and .storage == "oci-registry-bundle"))]
+' <<<"$historical_rows")
+sigstore_expect_rejection duplicate-authority \
+  "$TMP/sigstore-authority-row.json" 0 "$sigstore_authority_root" \
+  "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" '{}'
+sigstore_authority_rows_override=$(jq -cS --arg root "$sigstore_authority_root" '
+  map(if .root == $root
+      then .storage = "github-api-workflow-artifact"
+      else .
+      end)
+' <<<"$historical_rows")
+sigstore_expect_rejection non-oci-authority \
+  "$TMP/sigstore-authority-row.json" 0 "$sigstore_authority_root" \
+  "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" '{}'
+sigstore_authority_rows_override=
 
 generic_manifest="$TMP/generic-predicate.json"
 jq -cnS '{
