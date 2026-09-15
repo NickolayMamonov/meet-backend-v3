@@ -190,6 +190,27 @@ jq -e '
 ' "$HISTORICAL_FIXTURE" >/dev/null ||
   policy_fail "historical authority fixture is malformed"
 
+jq -e --argjson rows "$historical_rows" '
+  .records
+  | map({id: .release.id, capture: .attestation.canonicalBundleDigest})
+  | sort_by(.id) as $capture
+  | ($rows | map({id: .id, production: .bundle}) | sort_by(.id)) as $production
+  | ($capture | map(.capture)) == [
+      "sha256:d238057705a334533fa3962ef0a7d96e8999696392b438199fbdbe37488e5950",
+      "sha256:02268aa7d49ca85c979f4437c1046cca7bce19379eca2eaac28b786acc7daa1f",
+      "sha256:cf1f5d905c0bb97ca2013b3dd8aa415fb331a63dfec860e0382e5690339e5958",
+      "sha256:cb48b0ad1cf2a02733057e337bbba3ea4dc493c311f95117afb3381f894e19a8"
+    ]
+  and ($production | map(.production)) == [
+      "sha256:8b1037a95682b343c47b7db24e8576a6a97d8b59de3ae80e7fe76341a6168f2a",
+      "sha256:9e41130252d1edf5ff4a82e9c6b24b4f50b67b4c05430be26e8f474a354739c8",
+      "sha256:6fc87b8c7167fdc24de74853264ed3dde855896913fd609f41680267c265f414",
+      "sha256:7675da813f32cba607a12305dbeeaef475a85b204d83709642316ddb14887084"
+    ]
+  and all(range(0; 4); $capture[.].capture != $production[.].production)
+' "$HISTORICAL_FIXTURE" >/dev/null ||
+  policy_fail "capture CRLF and production LF bundle digests are not distinct and complete"
+
 jq -cS '
   .records
   | map({
@@ -305,12 +326,24 @@ done <"$TMP/historical-policy-contexts.jsonl"
 observed_signer_workflow="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev"
 synthetic_subject="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 synthetic_invocation="https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/99999999999/attempts/1"
-synthetic_bundle=$(jq -cnS '{synthetic:"accepted-shape"}')
+synthetic_bundle=$(jq -cnS '{synthetic:"accepted-shape",escapedCarriageReturn:"line\rvalue"}')
 synthetic_response=$(jq -cnS --argjson bundle "$synthetic_bundle" --arg subject "${synthetic_subject#sha256:}" --arg signer "4bff2902511e8e739d7604bf120b121429e60aeb" --arg invocation "$synthetic_invocation" --arg subjectName "ghcr.io/nickolaymamonov/meet-backend-v3" --arg signerWorkflow "$observed_signer_workflow" --arg certificateIdentity "$observed_signer_workflow" '[{attestation:{bundle:$bundle},verificationResult:{statement:{predicateType:"https://slsa.dev/provenance/v1",subject:[{digest:{sha256:$subject},name:$subjectName}]},signature:{certificate:{sourceRepositoryURI:"https://github.com/NickolayMamonov/meet-backend-v3",sourceRepositoryDigest:$signer,sourceRepositoryRef:"refs/heads/dev",buildSignerURI:$signerWorkflow,buildSignerDigest:$signer,subjectAlternativeName:$certificateIdentity,issuer:"https://token.actions.githubusercontent.com",runInvocationURI:$invocation}}}}]')
-synthetic_hash=$(jq -cS '.[0].attestation.bundle' <<<"$synthetic_response" | sha256sum | awk '{print $1}')
+synthetic_compact_bundle=$(jq -cS '.[0].attestation.bundle' <<<"$synthetic_response")
+synthetic_compact_bundle=${synthetic_compact_bundle%$'\r'}
+jq -e '.escapedCarriageReturn == "line\rvalue"' <<<"$synthetic_compact_bundle" >/dev/null ||
+  policy_fail "escaped carriage return was not preserved inside the bundle JSON string"
+synthetic_hash=$(printf '%s\n' "$synthetic_compact_bundle" | sha256sum | awk '{print $1}')
+synthetic_crlf_hash=$(printf '%s\r\n' "$synthetic_compact_bundle" | sha256sum | awk '{print $1}')
+[ "$synthetic_hash" != "$synthetic_crlf_hash" ] ||
+  policy_fail "synthetic LF and CRLF bundle bytes unexpectedly share a raw digest"
 synthetic_selection=$(jq -cnS --arg signer "4bff2902511e8e739d7604bf120b121429e60aeb" --arg invocation "$synthetic_invocation" --arg subject "ghcr.io/nickolaymamonov/meet-backend-v3" --arg bundle "sha256:$synthetic_hash" \
   '{row:{signer:$signer,invocation:$invocation,subject:$subject,bundle:$bundle}}')
 synthetic_output=$(validate_historical_attestation "$synthetic_response" "$synthetic_selection" "$synthetic_subject") || policy_fail "accepted synthetic attestation shape was rejected"
+synthetic_response_crlf=$(printf '%s\r\n' "${synthetic_response%$'\r'}")
+synthetic_output_crlf=$(validate_historical_attestation "$synthetic_response_crlf" "$synthetic_selection" "$synthetic_subject") ||
+  policy_fail "CRLF-terminated synthetic verifier response was rejected"
+cmp --silent <(printf '%s\n' "$synthetic_output") <(printf '%s\n' "$synthetic_output_crlf") ||
+  policy_fail "LF and CRLF verifier responses produced different policy output"
 jq -e --arg expected "$observed_signer_workflow" '.signerWorkflow == $expected' <<<"$synthetic_output" >/dev/null || policy_fail "normalized signer workflow was not the parsed observed value"
 
 policy_expect_attestation_rejection() {
@@ -363,7 +396,7 @@ transport_case() {
   local name=$1 release_id=$2 storage=$3 subject_name=$4
   local transport_tmp="$TMP/transport-$name"
   local artifact_content="workflow-artifact-$name"
-  local artifact_digest bundle bundle_hash invocation signer subject selection
+  local artifact_digest bundle bundle_compact bundle_hash invocation signer subject selection
   local args_file
   mkdir "$transport_tmp"
   artifact_digest=$(printf '%s' "$artifact_content" | sha256sum | awk '{print $1}')
@@ -371,7 +404,9 @@ transport_case() {
   signer="1111111111111111111111111111111111111111"
   invocation="https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/99999999999/attempts/1"
   bundle=$(jq -cnS --arg storage "$storage" '{transport:$storage}')
-  bundle_hash=$(jq -cS <<<"$bundle" | sha256sum | awk '{print $1}')
+  bundle_compact=$(jq -cS <<<"$bundle")
+  bundle_compact=${bundle_compact%$'\r'}
+  bundle_hash=$(printf '%s\n' "$bundle_compact" | sha256sum | awk '{print $1}')
   selection=$(jq -cnS --argjson id "$release_id" --arg signer "$signer" \
     --arg invocation "$invocation" --arg subject "$subject_name" \
     --arg storage "$storage" --arg bundle "sha256:$bundle_hash" \
