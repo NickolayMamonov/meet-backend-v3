@@ -199,6 +199,46 @@ usage() {
 
 fail() { echo "test-promotion protected-state collection failed: $*" >&2; exit 1; }
 
+normalize_artifact_predicate_types() {
+  local manifest=$1 release_id=$2 subject_digest=$3 root_digest=$4 selection=$5
+  local artifact_type predicate_type layer_count layer_media generic_count
+  local selection_status storage selected_root
+  artifact_type=$(jq -r '.artifactType // empty' "$manifest") || return 1
+  if [ "$artifact_type" = application/vnd.dev.sigstore.bundle.v0.3+json ]; then
+    selection_status=$(jq -r '.status // empty' <<<"$selection") || return 1
+    storage=$(jq -r '.row.storage // empty' <<<"$selection") || return 1
+    selected_root=$(jq -r '.row.root // empty' <<<"$selection") || return 1
+    [ "$release_id" -gt 0 ] || return 1
+    [ "$selection_status" = historical ] || return 1
+    [ "$storage" = oci-registry-bundle ] || return 1
+    [ "$selected_root" = "$root_digest" ] || return 1
+    [ "$subject_digest" = "$root_digest" ] || return 1
+    predicate_type=$(jq -r \
+      '.annotations["dev.sigstore.bundle.predicateType"] // empty' \
+      "$manifest") || return 1
+    [ "$predicate_type" = https://slsa.dev/provenance/v1 ] || return 1
+    layer_count=$(jq -r '.layers | if type == "array" then length else -1 end' "$manifest") ||
+      return 1
+    [ "$layer_count" -eq 1 ] || return 1
+    layer_media=$(jq -r '.layers[0].mediaType // empty' "$manifest") || return 1
+    [ "$layer_media" = application/vnd.dev.sigstore.bundle.v0.3+json ] || return 1
+    generic_count=$(jq -r '
+      [.layers[0].annotations?["in-toto.io/predicate-type"]?]
+      | map(select(. != null))
+      | length
+    ' "$manifest") || return 1
+    [ "$generic_count" -eq 0 ] || return 1
+    jq -cnS '["https://slsa.dev/provenance/v1"]'
+    return
+  fi
+  jq -c '
+    [.layers[]?.annotations["in-toto.io/predicate-type"]?]
+    | map(select(type == "string" and length > 0))
+    | unique
+    | sort
+  ' "$manifest"
+}
+
 main() {
 repository=
 image=
@@ -454,10 +494,9 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
           '.annotations["vnd.docker.reference.digest"] // empty' <<<"$descriptor")
         actual_subject=$(jq -r '.subject.digest // empty' "$child_raw")
         artifact_type=$(jq -r '.artifactType // empty' "$child_raw")
-        predicate_types=$(jq -c '
-          [.layers[]?.annotations["in-toto.io/predicate-type"]?] |
-          map(select(type == "string" and length > 0)) | unique | sort
-        ' "$child_raw")
+        predicate_types=$(normalize_artifact_predicate_types \
+          "$child_raw" "$release_id" "$descriptor_subject" "$digest" "$selection") ||
+          fail "attestation predicate binding is malformed for $child_digest"
         validate_digest "$descriptor_subject"
         [ -z "$actual_subject" ] ||
           [ "$descriptor_subject" = "$actual_subject" ] ||
@@ -487,10 +526,9 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
   else
     subject_digest=$(jq -r '.subject.digest // empty' "$raw")
     artifact_type=$(jq -r '.artifactType // empty' "$raw")
-    predicate_types=$(jq -c '
-      [.layers[]?.annotations["in-toto.io/predicate-type"]?] |
-      map(select(type == "string" and length > 0)) | unique | sort
-    ' "$raw")
+    predicate_types=$(normalize_artifact_predicate_types \
+      "$raw" "$release_id" "$subject_digest" "$digest" "${selection:-}") ||
+      fail "artifact predicate binding is malformed for $digest"
     if [ -n "$subject_digest" ] || [ -n "$artifact_type" ] ||
        [ "$(jq length <<<"$predicate_types")" -gt 0 ]; then
       [ -n "$artifact_type" ] ||

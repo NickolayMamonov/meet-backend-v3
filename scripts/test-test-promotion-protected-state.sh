@@ -391,6 +391,146 @@ policy_expect_attestation_rejection duplicate-result \
 policy_expect_attestation_rejection duplicate-subject \
   '.[0].verificationResult.statement.subject |= . + [.[0]]'
 
+sigstore_artifact_type=application/vnd.dev.sigstore.bundle.v0.3+json
+sigstore_predicate_type=https://slsa.dev/provenance/v1
+sigstore_manifest() {
+  local destination=$1 subject=$2 layer_count=$3 layer_media=$4 top_level=$5 generic=$6
+  jq -cnS \
+    --arg subject "$subject" \
+    --arg layerMedia "$layer_media" \
+    --arg topLevel "$top_level" \
+    --arg generic "$generic" \
+    --argjson layerCount "$layer_count" '
+    {
+      schemaVersion:2,
+      mediaType:"application/vnd.oci.image.manifest.v1+json",
+      artifactType:"application/vnd.dev.sigstore.bundle.v0.3+json",
+      subject:{
+        mediaType:"application/vnd.oci.image.manifest.v1+json",
+        digest:$subject,size:1
+      },
+      annotations:(if $topLevel == "__missing__" then {} else
+        {"dev.sigstore.bundle.predicateType":$topLevel} end),
+      layers:[
+        range(0; $layerCount) as $index |
+        {
+          mediaType:$layerMedia,
+          digest:("sha256:" + (($index + 1) | tostring | . * 64)),
+          size:1,
+          annotations:(if $generic == "__missing__" then {} else
+            {"in-toto.io/predicate-type":$generic} end)
+        }
+      ]
+    }
+  ' >"$destination"
+}
+
+sigstore_selection() {
+  local root=$1
+  jq -cnS --arg root "$root" \
+    '{status:"historical",row:{root:$root,storage:"oci-registry-bundle"}}'
+}
+
+sigstore_expect_rejection() {
+  local name=$1 manifest=$2 release_id=$3 subject=$4 root=$5 selection=$6
+  if normalize_artifact_predicate_types "$manifest" "$release_id" "$subject" \
+      "$root" "$selection" >"$TMP/sigstore-$name.stdout" \
+      2>"$TMP/sigstore-$name.stderr"; then
+    policy_fail "Sigstore mutation was accepted: $name"
+  fi
+  [ ! -s "$TMP/sigstore-$name.stdout" ] ||
+    policy_fail "Sigstore rejection emitted predicate output: $name"
+}
+
+while IFS=$'\t' read -r sigstore_id sigstore_root; do
+  sigstore_selection_json=$(sigstore_selection "$sigstore_root")
+  sigstore_manifest "$TMP/sigstore-$sigstore_id.json" "$sigstore_root" 1 \
+    "$sigstore_artifact_type" "$sigstore_predicate_type" "__missing__"
+  sigstore_predicates=$(normalize_artifact_predicate_types \
+    "$TMP/sigstore-$sigstore_id.json" "$sigstore_id" "$sigstore_root" \
+    "$sigstore_root" "$sigstore_selection_json") ||
+    policy_fail "valid Sigstore predicate was rejected: $sigstore_id"
+  jq -e --argjson expected '["https://slsa.dev/provenance/v1"]' \
+    '. == $expected' <<<"$sigstore_predicates" >/dev/null ||
+    policy_fail "valid Sigstore predicate did not normalize to one type: $sigstore_id"
+
+  jq 'del(.annotations["dev.sigstore.bundle.predicateType"])' \
+    "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-missing.json"
+  sigstore_expect_rejection missing-predicate \
+    "$TMP/sigstore-$sigstore_id-missing.json" "$sigstore_id" \
+    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+  jq '.annotations["dev.sigstore.bundle.predicateType"] = "https://evil.invalid/predicate"' \
+    "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-wrong.json"
+  sigstore_expect_rejection wrong-predicate \
+    "$TMP/sigstore-$sigstore_id-wrong.json" "$sigstore_id" \
+    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+  jq '.annotations["dev.sigstore.bundle.predicateType"] = ["https://slsa.dev/provenance/v1","https://evil.invalid/predicate"]' \
+    "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-conflicting.json"
+  sigstore_expect_rejection conflicting-predicate \
+    "$TMP/sigstore-$sigstore_id-conflicting.json" "$sigstore_id" \
+    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+  jq '.layers = []' "$TMP/sigstore-$sigstore_id.json" \
+    >"$TMP/sigstore-$sigstore_id-no-layer.json"
+  sigstore_expect_rejection no-layer \
+    "$TMP/sigstore-$sigstore_id-no-layer.json" "$sigstore_id" \
+    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+  jq '.layers |= . + .' "$TMP/sigstore-$sigstore_id.json" \
+    >"$TMP/sigstore-$sigstore_id-two-layers.json"
+  sigstore_expect_rejection two-layers \
+    "$TMP/sigstore-$sigstore_id-two-layers.json" "$sigstore_id" \
+    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+  jq '.layers[0].mediaType = "application/octet-stream"' \
+    "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-wrong-media.json"
+  sigstore_expect_rejection wrong-media \
+    "$TMP/sigstore-$sigstore_id-wrong-media.json" "$sigstore_id" \
+    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+  jq '.layers[0].annotations["in-toto.io/predicate-type"] = "https://slsa.dev/provenance/v1"' \
+    "$TMP/sigstore-$sigstore_id.json" >"$TMP/sigstore-$sigstore_id-generic-layer.json"
+  sigstore_expect_rejection generic-layer \
+    "$TMP/sigstore-$sigstore_id-generic-layer.json" "$sigstore_id" \
+    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+  sigstore_expect_rejection foreign-subject \
+    "$TMP/sigstore-$sigstore_id.json" "$sigstore_id" \
+    "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
+    "$sigstore_root" "$sigstore_selection_json"
+  sigstore_expect_rejection foreign-row \
+    "$TMP/sigstore-$sigstore_id.json" "$sigstore_id" \
+    "$sigstore_root" \
+    "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
+    "$sigstore_selection_json"
+  jq 'del(.layers, .annotations)' "$TMP/sigstore-$sigstore_id.json" \
+    >"$TMP/sigstore-$sigstore_id-partial.json"
+  sigstore_expect_rejection partial \
+    "$TMP/sigstore-$sigstore_id-partial.json" "$sigstore_id" \
+    "$sigstore_root" "$sigstore_root" "$sigstore_selection_json"
+done < <(jq -r '.[] | select(.storage == "oci-registry-bundle") | [.id,.root] | @tsv' <<<"$historical_rows")
+
+generic_manifest="$TMP/generic-predicate.json"
+jq -cnS '{
+  schemaVersion:2,
+  mediaType:"application/vnd.oci.image.manifest.v1+json",
+  artifactType:"application/vnd.in-toto+json",
+  layers:[{
+    mediaType:"application/vnd.in-toto+json",
+    digest:"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    size:1,
+    annotations:{"in-toto.io/predicate-type":"https://slsa.dev/provenance/v1"}
+  }]
+}' >"$generic_manifest"
+generic_predicates=$(normalize_artifact_predicate_types \
+  "$generic_manifest" 0 "" "" '{}') ||
+  policy_fail "generic layer predicate behavior changed"
+jq -e --argjson expected '["https://slsa.dev/provenance/v1"]' \
+  '. == $expected' <<<"$generic_predicates" >/dev/null ||
+  policy_fail "generic layer predicate was not preserved"
+jq '.layers[0].annotations = {} | .annotations = {"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}' \
+  "$generic_manifest" >"$TMP/generic-top-level-only.json"
+generic_top_level_predicates=$(normalize_artifact_predicate_types \
+  "$TMP/generic-top-level-only.json" 0 "" "" '{}') ||
+  generic_top_level_predicates='[]'
+[ "$(jq length <<<"$generic_top_level_predicates")" -eq 0 ] ||
+  policy_fail "generic artifact accepted a top-level-only predicate"
+
 # shellcheck disable=SC2034
 transport_case() {
   local name=$1 release_id=$2 storage=$3 subject_name=$4
