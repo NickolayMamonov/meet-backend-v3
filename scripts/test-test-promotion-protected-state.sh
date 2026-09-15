@@ -84,6 +84,8 @@ jq '.registry.versions |= map(if .id == 2005 then .tags = ["v1.2.0"] else . end)
 run_capture "$TMP/collision.json" "$TMP/collision-output.json"
 cmp --silent "$TMP/canonical.json" "$TMP/collision-output.json" &&
   fail "protected collision was discarded"
+[ -s "$TMP/collision-output.json" ] ||
+  fail "protected collision produced an empty canonical projection"
 jq -e 'any(.protected.subjectDigests[]; . == "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")' \
   "$TMP/collision-output.json" >/dev/null || fail "collision digest was not represented"
 
@@ -435,6 +437,43 @@ jq -e '
 transport_case api-v1.2 371012814 github-api-workflow-artifact image-index.json
 transport_case api-v1.3 377201468 github-api-workflow-artifact image-index.json
 transport_case oci-v1.0 367640510 oci-registry-bundle ghcr.io/nickolaymamonov/meet-backend-v3
+
+transport_rejection() {
+  local name=$1 invalid_id=$2
+  local rejection_tmp="$TMP/transport-rejection-$name"
+  local digest destination
+  mkdir "$rejection_tmp"
+  digest=$(printf '%s' "$name" | sha256sum | awk '{print $1}')
+  destination="$rejection_tmp/artifact.json"
+  jq -cnS --arg invalidId "$invalid_id" --arg digest "$digest" '
+    [{id:371012814,assets:[{
+      id:$invalidId,name:"image-index.json",sha256:$digest,size:0
+    }]}]
+  ' >"$rejection_tmp/releases-normalized.json"
+  : >"$rejection_tmp/gh-args.log"
+  TRANSPORT_LOG="$rejection_tmp/gh-args.log"
+  gh() {
+    printf '%s\0' "$@" >>"$TRANSPORT_LOG"
+    return 1
+  }
+  # shellcheck disable=SC2034
+  tmp="$rejection_tmp"
+  # shellcheck disable=SC2034
+  repository="NickolayMamonov/meet-backend-v3"
+  if (download_workflow_artifact 371012814 "sha256:$digest" "$destination"); then
+    policy_fail "malformed asset ID was accepted: $name"
+  fi
+  [ ! -s "$TRANSPORT_LOG" ] ||
+    policy_fail "GitHub API was invoked for malformed asset ID: $name"
+  [ ! -e "$destination" ] ||
+    policy_fail "malformed asset ID created an artifact: $name"
+  unset -f gh
+}
+
+transport_rejection nonnumeric abc
+transport_rejection traversal ../issues
+transport_rejection zero 0
+transport_rejection decimal 1.5
 
 expected_policy_selections=$(jq -cS '
   [.records[] |

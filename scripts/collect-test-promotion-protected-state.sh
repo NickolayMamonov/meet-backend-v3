@@ -71,8 +71,10 @@ download_workflow_artifact() {
   asset_id=$(jq -r '.id // empty' <<<"$asset")
   asset_digest=$(jq -r '.sha256 // empty' <<<"$asset")
   asset_size=$(jq -r '.size // empty' <<<"$asset")
-  [ "$asset_id" != "" ] && [ "$asset_id" != null ] ||
-    fail "workflow artifact ID is missing for release $release_id"
+  jq -e '.id | type == "number" and floor == . and . > 0' <<<"$asset" >/dev/null ||
+    fail "workflow artifact ID is malformed for release $release_id"
+  [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] ||
+    fail "workflow artifact ID is malformed for release $release_id"
   [ "$asset_digest" = "${expected_digest#sha256:}" ] ||
     fail "workflow artifact digest disagrees with image root for release $release_id"
   [[ "$asset_size" =~ ^[0-9]+$ ]] || fail "workflow artifact size is malformed for release $release_id"
@@ -267,7 +269,10 @@ jq -e '
     (.id | type == "number") and
     (.tag_name | type == "string" and test("^v[0-9]+[.][0-9]+[.][0-9]+$")) and
     (.target_commitish | type == "string" and test("^[0-9a-f]{40}$")) and
-    all(.assets[]; .sha256 | test("^[0-9a-f]{64}$"))
+    all(.assets[];
+      (.id | type == "number" and floor == . and . > 0) and
+      (.sha256 | test("^[0-9a-f]{64}$"))
+    )
   )
 ' "$tmp/releases-normalized.json" >/dev/null ||
   fail "release inventory contains an unsupported or undigested asset"
