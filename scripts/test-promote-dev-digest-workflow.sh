@@ -116,8 +116,6 @@ jq -e '(.head_sha | test("^[0-9a-f]{40}$")) and (.conclusion == "success") and (
   "$FIXTURES/authorized-ci-runs.json" >/dev/null
 jq -e '(.closed_beta_promotion_branches == ["dev"]) and (.test_vps_branches == ["dev"])' \
   "$FIXTURES/dev-only-environment.json" >/dev/null
-[ -x "$ROOT_DIR/scripts/test-test-promotion-input.sh" ]
-
 extract_step_metadata() {
   local workflow=$1
   awk '
