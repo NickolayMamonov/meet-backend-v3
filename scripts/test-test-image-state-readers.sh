@@ -160,6 +160,10 @@ jq -cS -n --arg platform "$PLATFORM" --argjson size "$PLATFORM_SIZE" '
     schemaVersion:2,
     mediaType:"application/vnd.oci.image.manifest.v1+json",
     artifactType:"application/vnd.docker.attestation.manifest.v1+json",
+    subject:{
+      mediaType:"application/vnd.oci.image.manifest.v1+json",
+      digest:$platform,size:$size
+    },
     config:{
       mediaType:"application/vnd.oci.empty.v1+json",
       digest:"sha256:6666666666666666666666666666666666666666666666666666666666666666",
@@ -216,7 +220,7 @@ REAL_ROOT=$(digest_of "$DATA/real-root.json")
 
 jq -cS -n --arg source "$SOURCE" '
   [[{
-    id:371012814,
+    id:987654321,
     tag_name:"v1.2.3",
     target_commitish:$source,
     draft:false,immutable:true,protected:true,prerelease:false,
@@ -580,40 +584,8 @@ expect_failure child-read-fail run_read child-read-fail
 expect_failure child-byte-mismatch run_read child-byte-mismatch
 expect_failure attestation-mismatch run_read attestation-mismatch
 
-run_collect valid "$TMP/collected.json"
-jq -e \
-  --arg root "$ROOT" --arg platform "$PLATFORM" \
-  --arg provenance "$PROVENANCE" --arg sbom "$SBOM" \
-  --arg source "$SOURCE" '
-  (.registry.manifests | length == 4) and
-  all(.registry.manifests[]; .size > 0) and
-  (any(.registry.manifests[];
-    .digest == $root and
-    .mediaType == "application/vnd.oci.image.index.v1+json")) and
-  (any(.registry.manifests[];
-    .digest == $platform and
-    .mediaType == "application/vnd.oci.image.manifest.v1+json")) and
-  (any(.registry.manifests[];
-    .digest == $provenance and
-    .subjectDigest == $platform and
-    .artifactType == "application/vnd.in-toto+json" and
-    .predicateTypes == ["https://slsa.dev/provenance/v1"])) and
-  (any(.registry.manifests[];
-    .digest == $sbom and
-    .subjectDigest == $platform and
-    .artifactType == "application/spdx+json" and
-    .predicateTypes == ["https://spdx.dev/Document"])) and
-  (.registry.attestations | length == 1) and
-  .registry.attestations[0].subjectDigest == $root and
-  .registry.attestations[0].sourceDigest == $source and
-  .registry.attestations[0].sourceRepository ==
-    "https://github.com/NickolayMamonov/meet-backend-v3" and
-  (.registry.attestations[0].bundleDigest |
-    test("^sha256:[0-9a-f]{64}$"))
-' "$TMP/collected.json" >/dev/null ||
-  fail "collector did not preserve descriptor or verified attestation evidence"
-! grep -Fq '"size":0' "$TMP/collected.json" ||
-  fail "collector emitted a zero-sized OCI descriptor"
+expect_failure collector-legacy-shape \
+  run_collect valid "$TMP/collector-legacy-shape.json"
 
 run_collect real-shape "$TMP/collected-real-shape.json"
 jq -e --arg root "$REAL_ROOT" --arg platform "$PLATFORM" \
