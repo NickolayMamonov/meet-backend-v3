@@ -90,6 +90,7 @@ grep -Fq -- '--test-admission-contract "$contract"' "$PROBE_FIXTURE"
 grep -Fq 'TEST_VPS_PROBE_FIXTURE=true' "$PROBE_FIXTURE"
 grep -Fq '.populated.roots.meetings = 7' "$PROBE_FIXTURE"
 grep -Fq '.zeroState == "unknown"' "$PROBE_FIXTURE"
+"$PROBE_FIXTURE"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/promote-dev-digest.XXXXXX")
 cleanup() {
   rm -rf -- "$TEST_ROOT"
@@ -223,6 +224,14 @@ workflow_contract() {
   publish_line=$(grep -nF -- '- id: publish' "$workflow" | cut -d: -f1)
   attestation_line=$(grep -nF -- '- name: Create signed OCI attestation for a first-time alias' "$workflow" | cut -d: -f1)
   copy_line=$(grep -nF -- 'oras cp --from-oci-layout' "$workflow" | cut -d: -f1)
+  if [ "$provision_line" -gt "$attestation_line" ]; then
+    echo "workflow contract: provision step is after attestation" >&2
+    return 1
+  fi
+  if [ "$provision_line" -gt "$publish_line" ]; then
+    echo "workflow contract: provision step is after publish" >&2
+    return 1
+  fi
   [ "$direct_line" -lt "$provision_line" ] &&
     [ "$provision_line" -lt "$protected_line" ] &&
     [ "$protected_line" -lt "$publish_line" ] &&
@@ -497,7 +506,7 @@ if [ "$smoke" = true ]; then
   smoke_root="$TEST_ROOT/smoke"
   mkdir -p "$smoke_root/home" "$smoke_root/runner-temp"
   : >"$smoke_root/github-path"
-  env -i HOME="$smoke_root/home" PATH="$REAL_PATH" \
+  timeout 300s env -i HOME="$smoke_root/home" PATH="$REAL_PATH" \
     RUNNER_TEMP="$smoke_root/runner-temp" GITHUB_WORKSPACE="$ROOT_DIR" \
     GITHUB_PATH="$smoke_root/github-path" GITHUB_OUTPUT="$smoke_root/github-output" \
     "$BASH" "$provision_block"
@@ -609,26 +618,99 @@ ORAS_CURL_MODE=timeout ORAS_VERSION_MODE=good ORAS_TAR_MODE=normal \
 
 echo "ORAS exhausted-read mutant passed"
 inside_workspace="$fixture_block"
-if run_provision "$inside_workspace" "$FIXTURE" "$TEST_ROOT/workspace" "$TEST_ROOT/workspace/runner-temp"; then
+mkdir -p "$TEST_ROOT/workspace/runner-temp"
+containment_stderr="$TEST_ROOT/containment.stderr"
+if run_provision "$inside_workspace" "$FIXTURE" "$TEST_ROOT/workspace" \
+  "$TEST_ROOT/workspace/runner-temp" 2>"$containment_stderr"; then
   echo "workspace containment: runner temp inside checkout was accepted" >&2
   exit 1
 fi
+grep -Fxq 'runner temp must be outside checkout' "$containment_stderr" || {
+  echo "workspace containment: rejection did not come from the containment guard" >&2
+  exit 1
+}
 ! grep -Fq download "$FIXTURE/events"
 
 echo "ORAS workspace containment mutant passed"
-for mutation in duplicate missing bypass; do
+
+move_provision_after() {
+  local source=$1
+  local target_marker=$2
+  local output=$3
+  local provision_block="$TEST_ROOT/provision-step.yml"
+  local without_provision="$TEST_ROOT/workflow-without-provision.yml"
+  awk '
+    $0 == "      - id: provision-oras" { in_step=1 }
+    in_step && $0 == "      - name: Capture protected registry state before any writer" { exit }
+    in_step { print }
+  ' "$source" >"$provision_block"
+  awk '
+    $0 == "      - id: provision-oras" { in_step=1; next }
+    in_step && $0 == "      - name: Capture protected registry state before any writer" { in_step=0 }
+    !in_step { print }
+  ' "$source" >"$without_provision"
+  awk -v marker="$target_marker" -v block="$provision_block" '
+    BEGIN {
+      while ((getline line < block) > 0) {
+        provision_lines[++count] = line
+      }
+      close(block)
+    }
+    $0 == marker {
+      print
+      in_target=1
+      next
+    }
+    in_target && $0 ~ /^      - / {
+      for (i = 1; i <= count; i++) print provision_lines[i]
+      in_target=0
+    }
+    { print }
+    END {
+      if (in_target) {
+        for (i = 1; i <= count; i++) print provision_lines[i]
+      }
+    }
+  ' "$without_provision" >"$output"
+}
+
+for mutation in duplicate missing bypass after-publish after-attestation; do
   workflow_mutant="$TEST_ROOT/workflow-$mutation.yml"
   cp -- "$WORKFLOW" "$workflow_mutant"
   case "$mutation" in
     duplicate) sed '/^      - id: provision-oras$/a\      - id: provision-oras' "$workflow_mutant" >"$workflow_mutant.tmp" ;;
     missing) sed '/^      - id: provision-oras$/,/^      - name: Capture protected registry state before any writer$/d' "$workflow_mutant" >"$workflow_mutant.tmp" ;;
     bypass) sed '/^        timeout-minutes: 5$/a\        continue-on-error: true' "$workflow_mutant" >"$workflow_mutant.tmp" ;;
+    after-publish)
+      move_provision_after "$workflow_mutant" '      - id: publish' "$workflow_mutant.tmp"
+      ;;
+    after-attestation)
+      move_provision_after "$workflow_mutant" \
+        '      - name: Create signed OCI attestation for a first-time alias' \
+        "$workflow_mutant.tmp"
+      ;;
   esac
   mv -- "$workflow_mutant.tmp" "$workflow_mutant"
-  if workflow_contract "$workflow_mutant" "$TEST_ROOT/mutant-block" "$workflow_metadata"; then
+  mutation_stderr="$TEST_ROOT/$mutation.stderr"
+  if workflow_contract "$workflow_mutant" "$TEST_ROOT/mutant-block" "$workflow_metadata" \
+    2>"$mutation_stderr"; then
     echo "$mutation: structural oracle accepted mutation" >&2
     exit 1
   fi
+  case "$mutation" in
+    after-publish)
+      grep -Fxq 'workflow contract: provision step is after publish' "$mutation_stderr" || {
+        echo "after-publish: missing reason-specific rejection" >&2
+        exit 1
+      }
+      ;;
+    after-attestation)
+      grep -Fxq 'workflow contract: provision step is after attestation' "$mutation_stderr" || {
+        echo "after-attestation: missing reason-specific rejection" >&2
+        exit 1
+      }
+      ;;
+  esac
 done
 
 incident_block="$TEST_ROOT/incident.sh"
@@ -642,4 +724,5 @@ sed -i \
   "$incident_block"
 run_incident_contract "$incident_block" "$TEST_ROOT/incident"
 
+bash "$ROOT_DIR/scripts/test-test-promotion-input.sh"
 echo "dev promotion workflow fixture passed: ORAS readiness, ordering, bounds, incident and retention contracts"
