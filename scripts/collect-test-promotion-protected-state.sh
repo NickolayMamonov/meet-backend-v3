@@ -3,18 +3,149 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   set -euo pipefail
 fi
 
-historical_authority_rows() {
+supported_authority_rows() {
   jq -cnS '[
-    {id:367640510,tag:"v1.0.1",version:"1.0.1",source:"d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc",signer:"4bff2902511e8e739d7604bf120b121429e60aeb",packageId:1115681835,root:"sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6",platform:"sha256:2e2f41478f341da8df7e573c48c59ee1734ee7d29e9a7be614f3660adac64554",draft:false,prerelease:false,immutable:false,invocation:"https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/31368625251/attempts/1",subject:"ghcr.io/nickolaymamonov/meet-backend-v3",storage:"oci-registry-bundle",bundle:"sha256:8b1037a95682b343c47b7db24e8576a6a97d8b59de3ae80e7fe76341a6168f2a"},
-    {id:368531227,tag:"v1.1.0",version:"1.1.0",source:"36ffd11ea4d35147f1df9c1cafa6a330300c1339",signer:"8598a31e60d0bae784bebf43404f3b1e91d603e1",packageId:1123238824,root:"sha256:c156a8a1436b008eea2980711b233b6f800cf60a36cdbe08faf480a2c97e6570",platform:"sha256:a04f84d5325cbe67b536b3000353da765ae4412ab0b0b9acabce1ecbba61c3ee",draft:true,prerelease:false,immutable:false,invocation:"https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/31551286770/attempts/1",subject:"ghcr.io/nickolaymamonov/meet-backend-v3",storage:"oci-registry-bundle",bundle:"sha256:9e41130252d1edf5ff4a82e9c6b24b4f50b67b4c05430be26e8f474a354739c8"},
     {id:371012814,tag:"v1.2.0",version:"1.2.0",source:"9b6d2b06c0336ab8d153564dcf6328e81c4d7b36",signer:"9af0723444f918594101999a4338b418607cbd01",packageId:1135861098,root:"sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda",platform:"sha256:3d2741adeb501f103b1fdc2b79c9e2cdb30f30ab257805d2fe67e57bc6d222b6",draft:false,prerelease:false,immutable:true,invocation:"https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/31880582935/attempts/1",subject:"image-index.json",storage:"github-api-workflow-artifact",bundle:"sha256:6fc87b8c7167fdc24de74853264ed3dde855896913fd609f41680267c265f414"},
     {id:377201468,tag:"v1.3.0",version:"1.3.0",source:"a7abfe04f6852f479291a4710ebdee23e9ae8a34",signer:"79263bfed6427dc1a45900e338805c52dbd5f59d",packageId:1178492365,root:"sha256:88b697872331ed2786f2d9009c769a87c32470086702faacf9874576fe094e9e",platform:"sha256:b98ef109b9f0aeed909a15d44908087093b9177313813040ddbeb2d415c51961",draft:false,prerelease:false,immutable:true,invocation:"https://github.com/NickolayMamonov/meet-backend-v3/actions/runs/33075760603/attempts/1",subject:"image-index.json",storage:"github-api-workflow-artifact",bundle:"sha256:7675da813f32cba607a12305dbeeaef475a85b204d83709642316ddb14887084"}
   ]'
 }
-select_historical_authority() { local p=$1; historical_authority_rows | jq -cS --argjson p "$p" 'def a($p;$r):($p.package.tags|type=="array" and length==3 and length==(unique|length) and sort==(["sha-"+$r.source,$r.version,$r.tag]|sort)); def d($p;$r):$p.release.id==$r.id or $p.release.tag==$r.tag or $p.release.version==$r.version or $p.release.source==$r.source or $p.package.id==$r.packageId or $p.rootDigest==$r.root or $p.platform.digest==$r.platform or any($p.package.tags[]?; .==("sha-"+$r.source) or .==$r.version or .==$r.tag); [.[]|select(d($p;.))] as $m | if ($m|length)==0 then {status:"unrelated"} elif ($m|length)!=1 then error("ambiguous historical authority") else $m[0] as $r | if $p.repository=="NickolayMamonov/meet-backend-v3" and $p.image=="ghcr.io/nickolaymamonov/meet-backend-v3" and $p.release=={id:$r.id,tag:$r.tag,version:$r.version,source:$r.source,draft:$r.draft,prerelease:$r.prerelease,immutable:$r.immutable} and $p.package.id==$r.packageId and $p.package.digest==$r.root and a($p;$r) and $p.rootDigest==$r.root and $p.platform.digest==$r.platform and $p.platform.mediaType=="application/vnd.oci.image.manifest.v1+json" and $p.platform.size==1815 and $p.platform.platform=={architecture:"amd64",os:"linux"} then {status:"historical",row:$r} else error("historical product tuple mismatch") end end'; }
-validate_historical_attestation() { local response=$1 selection=$2 subject=$3 row obs hash record; row=$(jq -c '.row' <<<"$selection") || return 1; record=$(jq -c '.[0]' <<<"$response") || return 1; obs=$(jq -cS --arg subject "${subject#sha256:}" 'if type!="array" or length!=1 then error("result cardinality") else .[0] end | .attestation.bundle as $b | .verificationResult as $r | $r.signature.certificate as $c | $r.statement.subject as $s | if ($b|type)!="object" or ($s|type)!="array" or ($s|length)!=1 or $s[0].digest.sha256!=$subject then error("observed evidence malformed") else {bundle:$b,predicateType:$r.statement.predicateType,sourceRepository:$c.sourceRepositoryURI,sourceDigest:$c.sourceRepositoryDigest,workflowRef:$c.sourceRepositoryRef,signerWorkflow:$c.buildSignerURI,signerDigest:$c.buildSignerDigest,certificateIdentity:$c.subjectAlternativeName,issuer:$c.issuer,invocationURI:$c.runInvocationURI,subjectName:$s[0].name} end' <<<"$response") || return 1; hash=$(jq -cS '.attestation.bundle' <<<"$record" | sha256sum|awk '{print $1}') || return 1; jq -e -n --argjson a "$obs" --argjson r "$row" '$a.sourceRepository=="https://github.com/NickolayMamonov/meet-backend-v3" and $a.sourceDigest==$r.signer and $a.workflowRef=="refs/heads/dev" and $a.signerWorkflow=="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev" and $a.signerDigest==$r.signer and $a.certificateIdentity=="https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/release-please.yml@refs/heads/dev" and $a.issuer=="https://token.actions.githubusercontent.com" and $a.invocationURI==$r.invocation and $a.predicateType=="https://slsa.dev/provenance/v1" and $a.subjectName==$r.subject' >/dev/null || return 1; [ "sha256:$hash" = "$(jq -r '.row.bundle' <<<"$selection")" ] || return 1; jq -cnS --arg subject "$subject" --arg source "$(jq -r '.row.signer' <<<"$selection")" --arg bundle "sha256:$hash" --arg signerWorkflow "$(jq -r '.signerWorkflow' <<<"$obs")" '{subjectDigest:$subject,predicateType:"https://slsa.dev/provenance/v1",sourceRepository:"https://github.com/NickolayMamonov/meet-backend-v3",sourceDigest:$source,workflowRef:"refs/heads/dev",signerWorkflow:$signerWorkflow,bundleDigest:$bundle}'; }
+retired_product_rows() {
+  jq -cnS '[
+    {
+      id:367640510,tag:"v1.0.1",version:"1.0.1",
+      source:"d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc",
+      closure:[
+        {kind:"root",id:1115681835,digest:"sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6",tags:["sha-d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc","1.0.1","v1.0.1"]},
+        {kind:"platform",id:1115681794,digest:"sha256:2e2f41478f341da8df7e573c48c59ee1734ee7d29e9a7be614f3660adac64554",tags:[]},
+        {kind:"legacy",id:1115681816,digest:"sha256:9f7ba89024aa1242b835230a2d158d0c87cc93ecf5a1a7138d493f3ac741a875",tags:[]},
+        {kind:"sigstore",id:1115891804,digest:"sha256:deae4981eb0593d6d4dbaaca4ac36486e9174727c1c0dc1d407ad37608133f6d",tags:[]},
+        {kind:"marker",id:1115891833,digest:"sha256:4a25f1ec46c8a897a7b7b4696abffdd3e913570f59ed7041cee4d1a5f76ca038",tags:["sha256-41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6"]}
+      ]
+    },
+    {
+      id:368531227,tag:"v1.1.0",version:"1.1.0",
+      source:"36ffd11ea4d35147f1df9c1cafa6a330300c1339",
+      closure:[
+        {kind:"root",id:1123238824,digest:"sha256:c156a8a1436b008eea2980711b233b6f800cf60a36cdbe08faf480a2c97e6570",tags:["sha-36ffd11ea4d35147f1df9c1cafa6a330300c1339","1.1.0","v1.1.0"]},
+        {kind:"platform",id:null,digest:"sha256:a04f84d5325cbe67b536b3000353da765ae4412ab0b0b9acabce1ecbba61c3ee",tags:[]},
+        {kind:"legacy",id:null,digest:"sha256:6b9341ece696b0de761b703ef29047cf0182b3a55fb513f662eae494e2cf667f",tags:[]},
+        {kind:"sigstore",id:1123240857,digest:"sha256:6f8c8a92a39bdfbf47c1f95ff7ba01b55f5f767126dd77751ea67bae17b0f29a",tags:[]},
+        {kind:"marker",id:null,digest:"sha256:7f4c29b519fb2ce28696557e1592f544adebb5b5ffa4d13e4262a64295d593a4",tags:["sha256-c156a8a1436b008eea2980711b233b6f800cf60a36cdbe08faf480a2c97e6570"]}
+      ]
+    }
+  ]'
+}
 
-validate_historical_attestation() {
+backend_version_at_least_floor() {
+  local version=$1 major minor _patch
+  [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    return 1
+  IFS=. read -r major minor _patch <<<"$version"
+  (( major > 1 || (major == 1 && minor >= 2) ))
+}
+
+select_supported_authority() {
+  local product=$1
+  supported_authority_rows | jq -cS --argjson product "$product" '
+    def aliases_match($p;$r):
+      ($p.package.tags | type == "array") and
+      ($p.package.tags | length) == 3 and
+      ($p.package.tags | unique | length) == 3 and
+      ($p.package.tags | sort) ==
+        (["sha-" + $r.source,$r.version,$r.tag] | sort);
+    def discriminates($p;$r):
+      $p.release.id == $r.id or $p.release.tag == $r.tag or
+      $p.release.version == $r.version or $p.release.source == $r.source or
+      $p.package.id == $r.packageId or $p.rootDigest == $r.root or
+      $p.platform.digest == $r.platform or
+      any($p.package.tags[]?;
+        . == ("sha-" + $r.source) or . == $r.version or . == $r.tag);
+    [.[] | select(discriminates($product;.))] as $matches |
+    if ($matches | length) == 0 then
+      {status:"unrelated"}
+    elif ($matches | length) != 1 then
+      error("ambiguous supported authority")
+    else
+      $matches[0] as $row |
+      if $product.repository == "NickolayMamonov/meet-backend-v3" and
+         $product.image == "ghcr.io/nickolaymamonov/meet-backend-v3" and
+         $product.release == {
+           id:$row.id,tag:$row.tag,version:$row.version,source:$row.source,
+           draft:$row.draft,prerelease:$row.prerelease,immutable:$row.immutable
+         } and
+         $product.package.id == $row.packageId and
+         $product.package.digest == $row.root and
+         aliases_match($product;$row) and
+         $product.rootDigest == $row.root and
+         $product.platform.digest == $row.platform and
+         $product.platform.mediaType == "application/vnd.oci.image.manifest.v1+json" and
+         $product.platform.size == 1815 and
+         $product.platform.platform == {architecture:"amd64",os:"linux"}
+      then {status:"supported-authority",row:$row}
+      else error("supported product tuple mismatch")
+      end
+    end
+  '
+}
+
+filter_active_package_versions() {
+  local versions=$1 retired
+  retired=$(retired_product_rows) || return 1
+  jq -cS --argjson retired "$retired" '
+    def tags_equal($left;$right):
+      ($left | type == "array") and
+      ($left | length) == ($left | unique | length) and
+      ($left | sort) == ($right | sort);
+    if type != "array" or
+       any(.[];
+         (.id | type != "number") or (.id | floor != .) or .id <= 0 or
+         (.digest | type != "string") or
+         (.digest | test("^sha256:[0-9a-f]{64}$") | not) or
+         (.tags | type != "array") or
+         any(.tags[]?; type != "string" or length == 0)) or
+       ((map(.id) | unique | length) != length) or
+       ((map(.digest) | unique | length) != length)
+    then error("package inventory is malformed or ambiguous")
+    else
+      reduce .[] as $version
+        ({active:[]};
+          ([$retired[] |
+            select(
+              any(.closure[]; .digest == $version.digest or
+                (.id != null and .id == $version.id)) or
+              any(.closure[].tags[]?;
+                . as $tag | ($version.tags | index($tag)) != null)
+            )]) as $rows |
+          if ($rows | length) == 0 then
+            .active += [$version]
+          elif ($rows | length) != 1 then
+            error("package version crosses retired rows")
+          else
+            $rows[0] as $row |
+            ([$row.closure[] | select(.digest == $version.digest)]) as $items |
+            if ($items | length) != 1 then
+              error("retired discriminator points to a foreign digest")
+            else
+              $items[0] as $item |
+              if ($item.id != null and $item.id != $version.id) or
+                 (tags_equal($version.tags;$item.tags) | not)
+              then error("retired package tuple is malformed")
+              else .
+              end
+            end
+          end) |
+      .active
+    end
+  ' <<<"$versions"
+}
+
+is_retired_digest() {
+  local digest=$1
+  retired_product_rows | jq -e --arg digest "$digest" \
+    'any(.[].closure[]; .digest == $digest)' >/dev/null
+}
+
+validate_supported_attestation() {
   local response=$1 selection=$2 subject=$3 normalized compact_bundle hash expected_bundle
   record=$(jq -c '.[0]' <<<"$response") || return 1
   normalized=$(jq -cS --arg subject "${subject#sha256:}" --argjson selection "$selection" '
@@ -106,7 +237,7 @@ collect_verified_attestations() {
   if [ -n "$selection" ]; then
     selection_status=$(jq -r '.status // empty' <<<"$selection")
   fi
-  if [ "$selection_status" = historical ]; then
+  if [ "$selection_status" = supported-authority ]; then
     local signer storage release_id artifact
     local -a common_args=() args=()
     signer=$(jq -r '.row.signer' <<<"$selection")
@@ -124,17 +255,17 @@ collect_verified_attestations() {
         download_workflow_artifact "$release_id" "$digest" "$artifact"
         args=("$artifact" "${common_args[@]}")
         ;;
-      oci-registry-bundle)
-        args=("oci://$image@$digest" --bundle-from-oci "${common_args[@]}")
-        ;;
       *)
-        fail "historical authority has unsupported verification transport: $storage"
+        fail "supported authority has unsupported verification transport: $storage"
         ;;
     esac
-    local historical_file="$tmp/github-${digest#sha256:}.json"
-    gh attestation verify "${args[@]}" >"$historical_file" || fail "GitHub attestation verification failed for $digest"
-    validate_historical_attestation "$(<"$historical_file")" "$selection" "$digest" >"$tmp/historical-${digest#sha256:}.json" || fail "historical GitHub attestation evidence is malformed for $digest"
-    cat "$tmp/historical-${digest#sha256:}.json" >>"$tmp/attestations.jsonl"
+    local supported_file="$tmp/github-${digest#sha256:}.json"
+    gh attestation verify "${args[@]}" >"$supported_file" ||
+      fail "GitHub attestation verification failed for $digest"
+    validate_supported_attestation "$(<"$supported_file")" "$selection" "$digest" \
+      >"$tmp/supported-${digest#sha256:}.json" ||
+      fail "supported GitHub attestation evidence is malformed for $digest"
+    cat "$tmp/supported-${digest#sha256:}.json" >>"$tmp/attestations.jsonl"
     return
   fi
   local verified_file="$tmp/github-${digest#sha256:}.json"
@@ -200,43 +331,50 @@ usage() {
 fail() { echo "test-promotion protected-state collection failed: $*" >&2; exit 1; }
 
 normalize_artifact_predicate_types() {
-  local manifest=$1 subject_digest=$3
-  local artifact_type predicate_type layer_count layer_media generic_count
-  local authority_row
-  artifact_type=$(jq -r '.artifactType // empty' "$manifest") || return 1
-  if [ "$artifact_type" = application/vnd.dev.sigstore.bundle.v0.3+json ]; then
-    authority_row=$(historical_authority_rows | jq -ceS \
-      --arg subjectDigest "$subject_digest" '
-      [.[] | select(
-        .root == $subjectDigest and
-        .storage == "oci-registry-bundle"
-      )] |
-      if length == 1 then .[0] else empty end
-    ') || return 1
-    [ -n "$authority_row" ] || return 1
-    predicate_type=$(jq -r \
-      '.annotations["dev.sigstore.bundle.predicateType"] // empty' \
-      "$manifest") || return 1
-    [ "$predicate_type" = https://slsa.dev/provenance/v1 ] || return 1
-    layer_count=$(jq -r '.layers | if type == "array" then length else -1 end' "$manifest") ||
-      return 1
-    [ "$layer_count" -eq 1 ] || return 1
-    layer_media=$(jq -r '.layers[0].mediaType // empty' "$manifest") || return 1
-    [ "$layer_media" = application/vnd.dev.sigstore.bundle.v0.3+json ] || return 1
-    generic_count=$(jq -r '
-      [.layers[0].annotations?["in-toto.io/predicate-type"]?]
-      | map(select(. != null))
-      | length
-    ' "$manifest") || return 1
-    [ "$generic_count" -eq 0 ] || return 1
-    jq -cnS '["https://slsa.dev/provenance/v1"]'
-    return
-  fi
+  local manifest=$1
   jq -c '
     [.layers[]?.annotations["in-toto.io/predicate-type"]?]
     | map(select(type == "string" and length > 0))
     | unique
     | sort
+  ' "$manifest"
+}
+
+normalize_modern_attestation_predicates() {
+  local manifest=$1 subject_digest=$2 selection=${3:-} selection_json
+  selection_json=${selection:-'{}'}
+  jq -cS --arg subject "$subject_digest" \
+    --argjson selection "$selection_json" '
+    if .artifactType !=
+         "application/vnd.docker.attestation.manifest.v1+json" or
+       (.subject | type) != "object" or
+       .subject.digest != $subject or
+       (.subject.mediaType | type) != "string" or
+       (.subject.mediaType | length) == 0 or
+       (.subject.size | type) != "number" or .subject.size <= 0 or
+       (.layers | type) != "array" or (.layers | length) == 0 or
+       any(.layers[];
+         .mediaType != "application/vnd.in-toto+json" or
+         (.digest | type) != "string" or
+         (.digest | test("^sha256:[0-9a-f]{64}$") | not) or
+         (.size | type) != "number" or .size < 0 or
+         (.annotations["in-toto.io/predicate-type"] | type) != "string" or
+         (.annotations["in-toto.io/predicate-type"] | length) == 0)
+    then error("modern attestation shape is malformed")
+    else
+      [.layers[].annotations["in-toto.io/predicate-type"]] as $predicates |
+      ($predicates | unique | sort) as $normalized |
+      if ($predicates | length) != ($normalized | length) or
+         ($normalized | index("https://slsa.dev/provenance/v1")) == null or
+         ($selection.status == "supported-authority" and
+          $normalized != [
+            "https://slsa.dev/provenance/v1",
+            "https://spdx.dev/Document"
+          ])
+      then error("modern attestation predicates are malformed")
+      else $normalized
+      end
+    end
   ' "$manifest"
 }
 
@@ -299,7 +437,17 @@ jq -cS --arg repository "$repository" '
       target_commitish:(.target_commitish // ""),
       draft:(.draft // false),
       immutable:(if (.immutable | type) == "boolean" then .immutable else error("release immutable field is missing or not boolean") end),
-      protected:(.protected // ((.draft // false) | not) and ((.prerelease // false) | not)),
+      protected:(
+        (.tag_name | capture(
+          "^v(?<major>0|[1-9][0-9]*)[.](?<minor>0|[1-9][0-9]*)[.](?<patch>0|[1-9][0-9]*)$"
+        )) as $version |
+        ((.protected //
+          (((.draft // false) | not) and
+           ((.prerelease // false) | not))) and
+         (($version.major | tonumber) > 1 or
+          (($version.major | tonumber) == 1 and
+           ($version.minor | tonumber) >= 2)))
+      ),
       prerelease:(.prerelease // false),
       published_at,
       assets:(
@@ -329,19 +477,13 @@ jq -e '
 ' "$tmp/releases-normalized.json" >/dev/null ||
   fail "release inventory contains an unsupported or undigested asset"
 
-release_tags=$(jq -r '.[].tag_name' "$tmp/releases-normalized.json")
+release_tags=$(jq -r '.[] | select(.protected) | .tag_name' \
+  "$tmp/releases-normalized.json")
 tag_refs=$(
   while IFS= read -r tag; do
     [ -n "$tag" ] || continue
     target=$(jq -r --arg tag "$tag" '.[] | select(.tag_name == $tag) | .target_commitish' \
       "$tmp/releases-normalized.json")
-is_draft=$(jq -r --arg tag "$tag" '.[]|select(.tag_name==$tag)|.draft' "$tmp/releases-normalized.json")
-    if [ "$tag" = v1.1.0 ] && [ "$is_draft" = true ]; then
-      matching_refs=$(gh api "repos/$repository/git/matching-refs/tags/v1.1.0") || fail "draft tag absence read failed"
-      jq -e 'type=="array" and all(.[]; type=="object" and (.ref|type=="string")) and ([.[]|select(.ref=="refs/tags/v1.1.0")]|length)==0' <<<"$matching_refs" >/dev/null || fail "draft v1.1.0 exact tag is present or malformed"
-      jq -cnS --arg tag "$tag" '{tag:$tag,state:"absent"}'
-      continue
-    fi
     ref_json=$(gh api "repos/$repository/git/ref/tags/$tag" 2>/dev/null) ||
       fail "tag ref read failed for $tag"
     object_type=$(jq -r '.object.type // empty' <<<"$ref_json")
@@ -371,8 +513,28 @@ jq -cS '
     }]
 ' "$tmp/packages.json" >"$tmp/versions.json" ||
   fail "package inventory normalization failed"
-jq -e 'all(.[]; .digest | test("^sha256:[0-9a-f]{64}$"))' "$tmp/versions.json" >/dev/null ||
-  fail "package inventory contains a malformed digest"
+filter_active_package_versions "$(<"$tmp/versions.json")" \
+  >"$tmp/versions-active.json" ||
+  fail "package inventory conflicts with retired history"
+mv "$tmp/versions-active.json" "$tmp/versions.json"
+jq -e --slurpfile releases "$tmp/releases-normalized.json" '
+  def below_floor:
+    (.tag_name | capture(
+      "^v(?<major>0|[1-9][0-9]*)[.](?<minor>0|[1-9][0-9]*)[.](?<patch>0|[1-9][0-9]*)$"
+    )) as $version |
+    (($version.major | tonumber) < 1 or
+     (($version.major | tonumber) == 1 and
+      ($version.minor | tonumber) < 2));
+  all(.[];
+    . as $package |
+    all($releases[0][] | select(below_floor);
+      (.tag_name as $tag |
+       ($tag | sub("^v";"")) as $version |
+       ("sha-" + .target_commitish) as $source |
+       all($package.tags[]?;
+         . != $tag and . != $version and . != $source))))
+' "$tmp/versions.json" >/dev/null ||
+  fail "pre-floor aliases remain in active package inventory"
 
 : >"$tmp/subjects.jsonl"
 : >"$tmp/manifests.jsonl"
@@ -417,13 +579,14 @@ read_raw_manifest() {
 }
 
 while IFS=$'\t' read -r version_id digest tags_json; do
+  selection=
   raw="$tmp/raw-${digest#sha256:}.json"
   read_raw_manifest "$digest" "$raw"
   media_type=$(jq -r '.mediaType // empty' "$raw")
   manifest_size=$(wc -c <"$raw" | tr -d ' ')
   release_id=$(jq -r --argjson tags "$tags_json" '
     [.[] as $release |
-      select(any($tags[]?; . == $release.tag_name or
+      select($release.protected and any($tags[]?; . == $release.tag_name or
         . == ($release.tag_name | sub("^v";"")) or
         . == ("sha-" + $release.target_commitish))) |
       $release.id] | first // 0
@@ -455,7 +618,8 @@ while IFS=$'\t' read -r version_id digest tags_json; do
     if [ "$release_id" -gt 0 ]; then
 release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:.tag_name,version:(.tag_name|sub("^v";"")),source:.target_commitish,draft,prerelease,immutable}' "$tmp/releases-normalized.json")
       product_context=$(jq -cnS --arg repository "$repository" --arg image "$image" --argjson release "$release_record" --argjson packageId "$version_id" --arg digest "$digest" --argjson tags "$tags_json" --argjson platform "$platform_descriptor" '{repository:$repository,image:$image,release:$release,package:{id:$packageId,digest:$digest,tags:$tags},rootDigest:$digest,platform:$platform}')
-      selection=$(select_historical_authority "$product_context") || fail "historical product authority selection failed for $digest"
+      selection=$(select_supported_authority "$product_context") ||
+        fail "supported product authority selection failed for $digest"
       jq -cnS --arg digest "$digest" --argjson releaseId "$release_id" \
         --arg platformDigest "$platform_digest" --argjson aliases "$tags_json" \
         '{digest:$digest,kind:"root",releaseId:$releaseId,rootDigest:null,
@@ -472,6 +636,8 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
         artifactType:null,predicateTypes:[],children:$children}' >>"$tmp/manifests.jsonl"
     while IFS= read -r descriptor; do
       child_digest=$(jq -r '.digest' <<<"$descriptor")
+      ! is_retired_digest "$child_digest" ||
+        fail "active manifest references a retired digest: $child_digest"
       child_media=$(jq -r '.mediaType' <<<"$descriptor")
       child_size=$(jq -r '.size' <<<"$descriptor")
       child_raw="$tmp/raw-${child_digest#sha256:}.json"
@@ -495,16 +661,20 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
           '.annotations["vnd.docker.reference.digest"] // empty' <<<"$descriptor")
         actual_subject=$(jq -r '.subject.digest // empty' "$child_raw")
         artifact_type=$(jq -r '.artifactType // empty' "$child_raw")
-        predicate_types=$(normalize_artifact_predicate_types \
-          "$child_raw" "$release_id" "$descriptor_subject" "$digest" "$selection") ||
-          fail "attestation predicate binding is malformed for $child_digest"
         validate_digest "$descriptor_subject"
-        [ -z "$actual_subject" ] ||
-          [ "$descriptor_subject" = "$actual_subject" ] ||
+        [ "$descriptor_subject" = "$actual_subject" ] ||
           fail "attestation subject binding disagrees for $child_digest"
         [ "$descriptor_subject" = "$digest" ] ||
           [ "$descriptor_subject" = "$platform_digest" ] ||
           fail "attestation is bound to a foreign subject for $child_digest"
+        if [ "$release_id" -gt 0 ]; then
+          predicate_types=$(normalize_modern_attestation_predicates \
+            "$child_raw" "$descriptor_subject" "$selection") ||
+            fail "supported attestation shape is malformed for $child_digest"
+        else
+          predicate_types=$(normalize_artifact_predicate_types "$child_raw") ||
+            fail "attestation predicate binding is malformed for $child_digest"
+        fi
         [ -n "$artifact_type" ] ||
           fail "attestation artifact type is missing for $child_digest"
         [ "$(jq length <<<"$predicate_types")" -gt 0 ] ||
@@ -526,9 +696,11 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
     done < <(jq -c '.manifests[]' "$raw")
   else
     subject_digest=$(jq -r '.subject.digest // empty' "$raw")
+    if [ -n "$subject_digest" ] && is_retired_digest "$subject_digest"; then
+      fail "active artifact is bound to a retired subject: $digest"
+    fi
     artifact_type=$(jq -r '.artifactType // empty' "$raw")
-    predicate_types=$(normalize_artifact_predicate_types \
-      "$raw" "$release_id" "$subject_digest" "$digest" "${selection:-}") ||
+    predicate_types=$(normalize_artifact_predicate_types "$raw") ||
       fail "artifact predicate binding is malformed for $digest"
     if [ -n "$subject_digest" ] || [ -n "$artifact_type" ] ||
        [ "$(jq length <<<"$predicate_types")" -gt 0 ]; then

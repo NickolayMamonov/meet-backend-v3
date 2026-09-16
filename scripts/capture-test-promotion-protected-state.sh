@@ -40,6 +40,10 @@ if ! jq -cS \
   def sha40: type == "string" and test("^[0-9a-f]{40}$");
   def digest: type == "string" and test("^sha256:[0-9a-f]{64}$");
   def semver: type == "string" and test("^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$");
+  def supported_tag:
+    capture("^v(?<major>0|[1-9][0-9]*)[.](?<minor>0|[1-9][0-9]*)[.](?<patch>0|[1-9][0-9]*)$") as $v |
+    (($v.major | tonumber) > 1 or
+     (($v.major | tonumber) == 1 and ($v.minor | tonumber) >= 2));
   def keys_are($keys): type == "object" and (keys | sort) == ($keys | sort);
   def member($array;$value): ($array | index($value)) != null;
   def valid_attestation:
@@ -71,6 +75,8 @@ if ! jq -cS \
     (.releases | (map(.draft | type == "boolean") | all)) and
     (.releases | (map(.immutable | type == "boolean") | all)) and
     (.releases | (map(.protected | type == "boolean") | all)) and
+    (.releases | (map(if (.tag_name | supported_tag) then true
+      else (.protected | not) end) | all)) and
     (.releases | (map(.prerelease | type == "boolean") | all)) and
     (.releases | (map(.assets |
       map((.id | type == "number" and floor == . and . > 0) and
@@ -126,11 +132,17 @@ if ! jq -cS \
     if length == 1 then .[0] else error("public release identity is ambiguous") end) as $public |
   if ($public.tag_name == "v1.2.0" and
       ($public.draft | not) and ($public.prerelease | not) and
-      $public.immutable and $public.published_at != null)
+      $public.immutable and $public.protected and $public.published_at != null)
   then .
   else error("public v1.2.0 release identity is invalid")
   end |
-  ([.releases[] | select(.protected or .id == 371012814)] | map(.id) | unique) as $protectedIds |
+  ([.releases[] | select(.protected and (.tag_name | supported_tag))] |
+    map(.id) | unique) as $protectedIds |
+  ([.releases[] | select((.tag_name | supported_tag) | not)] |
+    map(.id) | unique) as $retiredIds |
+  ([.releases[] | select(member($retiredIds;.id)) |
+    .tag_name, (.tag_name | sub("^v"; "")), ("sha-" + .target_commitish)] |
+    unique) as $retiredAliases |
   ([.releases[] | select(member($protectedIds;.id))]) as $protectedReleases |
   (if ([
     $protectedReleases[] |
@@ -164,6 +176,23 @@ if ! jq -cS \
       any(.tags[]?; . == $alias))
   ] | all) then . else error("protected subject aliases disagree with registry tags") end) |
   ([ $roots[]?.digest, $platforms[]?.digest ] | unique) as $baseDigests |
+  ([ $retiredIds[]? as $id |
+     .registry.subjects[] |
+     select(.releaseId == $id) |
+     .digest, .rootDigest, .platformDigest
+   ] | map(select(digest)) | unique) as $retiredSeeds |
+  ([
+    "sha256:41be6a4e725898bf41823a66abc78dc19f11f31282a3ad574298729095ba59c6",
+    "sha256:2e2f41478f341da8df7e573c48c59ee1734ee7d29e9a7be614f3660adac64554",
+    "sha256:9f7ba89024aa1242b835230a2d158d0c87cc93ecf5a1a7138d493f3ac741a875",
+    "sha256:deae4981eb0593d6d4dbaaca4ac36486e9174727c1c0dc1d407ad37608133f6d",
+    "sha256:4a25f1ec46c8a897a7b7b4696abffdd3e913570f59ed7041cee4d1a5f76ca038",
+    "sha256:c156a8a1436b008eea2980711b233b6f800cf60a36cdbe08faf480a2c97e6570",
+    "sha256:a04f84d5325cbe67b536b3000353da765ae4412ab0b0b9acabce1ecbba61c3ee",
+    "sha256:6b9341ece696b0de761b703ef29047cf0182b3a55fb513f662eae494e2cf667f",
+    "sha256:6f8c8a92a39bdfbf47c1f95ff7ba01b55f5f767126dd77751ea67bae17b0f29a",
+    "sha256:7f4c29b519fb2ce28696557e1592f544adebb5b5ffa4d13e4262a64295d593a4"
+  ] + $retiredSeeds | unique) as $retiredKnown |
   ([.registry.versions[] | select(
     member($baseDigests;.digest) or
     any(.tags[]?; member($identityAliases;.)) or
@@ -179,6 +208,24 @@ if ! jq -cS \
        (.digest, .children[]?) ] | unique) as $next |
     ($known + $next | unique)
   )) as $closure |
+  (reduce range(0; 32) as $round ($retiredKnown;
+    . as $known |
+    ([ $manifestTable[] |
+       select(member($known;.digest) or
+         (.subjectDigest != null and member($known;.subjectDigest))) |
+       (.digest, .children[]?) ] | unique) as $next |
+    ($known + $next | unique)
+  )) as $retiredClosure |
+  (if ([ $closure[] | select(member($retiredClosure;.)) ] | length) == 0
+   then . else error("retired identity entered protected closure") end) |
+  (if ([
+    .registry.versions[] |
+    . as $version |
+    .tags[]? |
+    select(member($retiredAliases;.)) |
+    select(member($retiredClosure;$version.digest) | not)
+  ] | length) == 0
+   then . else error("retired alias is bound to an active or candidate digest") end) |
   (if ([
     $closure[] |
     . as $closedDigest |

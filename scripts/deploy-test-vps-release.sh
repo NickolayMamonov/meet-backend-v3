@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
-set -euo pipefail
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -euo pipefail
+fi
+
+is_supported_test_vps_version() {
+  local version=${1:-}
+  local major minor patch
+  [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    return 1
+  IFS=. read -r major minor patch <<<"$version"
+  (( major > 1 ||
+    (major == 1 && (minor > 2 || (minor == 2 && patch >= 0))) ))
+}
 
 usage() {
   echo "usage: $0 --root PATH --base-compose PATH --image IMAGE@sha256:DIGEST --revision SHA --version VERSION --run-key KEY --mode deploy|rollback-drill [--closed-beta-safety --state-mode empty-closed|closed-beta-demo] [--public-url https://HOST]" >&2
@@ -11,6 +23,7 @@ fail() {
   exit 1
 }
 
+main() {
 root=
 base_compose=
 image=
@@ -57,6 +70,8 @@ done
 [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
   usage
+is_supported_test_vps_version "$version" ||
+  fail "target version must be at least v1.2.0"
 [[ "$run_key" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || usage
 case "$mode" in deploy|rollback-drill) ;; *) usage ;; esac
 if [ -n "$public_url" ]; then
@@ -123,6 +138,8 @@ previous_revision=$(runtime_release_field "$root" BACKEND_REVISION)
   fail "running revision is malformed"
 [[ "$previous_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
   fail "running version is malformed"
+is_supported_test_vps_version "$previous_version" ||
+  fail "predecessor version must be at least v1.2.0"
 previous_id=$(runtime_image_id "$root" "$compose_script")
 [ "$(docker image inspect "$previous_image" --format '{{.Id}}')" = "$previous_id" ]
 previous_runtime_hash=$(docker inspect "$(compose ps -q backend)" \
@@ -307,3 +324,9 @@ run_safety_hook final "$image" "$target_id" \
   "$revision" "$version" "$target_hash"
 mutation_started=false
 echo "deployment=completed image_id=$target_id version=$version revision=$revision"
+
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
