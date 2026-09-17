@@ -122,6 +122,54 @@ jobs:
           test "$GITHUB_REF" = refs/heads/dev
           test "$GITHUB_SHA" = "${{ inputs.source_sha }}"
           case "${{ inputs.state_mode }}" in empty-closed|closed-beta-demo) ;; *) exit 1 ;; esac
+      - id: provision-oras
+        name: Provision verified ORAS
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          oras_version=1.3.4
+          oras_sha256=f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
+          oras_url="https://github.com/oras-project/oras/releases/download/v${oras_version}/oras_${oras_version}_linux_amd64.tar.gz"
+          test -n "${RUNNER_TEMP:-}"
+          test -n "${GITHUB_WORKSPACE:-}"
+          test -d "$RUNNER_TEMP"
+          test -d "$GITHUB_WORKSPACE"
+          runner_temp_real=$(cd -- "$RUNNER_TEMP" && pwd -P)
+          workspace_real=$(cd -- "$GITHUB_WORKSPACE" && pwd -P)
+          case "$runner_temp_real/" in
+            "$workspace_real/"*|"$workspace_real") echo "runner temp must be outside checkout" >&2; exit 1 ;;
+          esac
+          oras_root=$(mktemp -d "$runner_temp_real/oras.XXXXXX")
+          bin="$oras_root/bin"
+          archive="$oras_root/oras.tar.gz"
+          mkdir "$bin"
+          curl \
+            --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 60 \
+            --retry 2 --retry-delay 2 --retry-max-time 180 \
+            --output "$archive" "$oras_url"
+          printf '%s  %s\n' "$oras_sha256" "$archive" |
+            sha256sum --check --strict
+          tar -xzf "$archive" -C "$bin" --no-same-owner oras
+          test -f "$bin/oras"
+          test -x "$bin/oras"
+          test ! -L "$bin/oras"
+          version_output=$("$bin/oras" version)
+          version=$(printf '%s\n' "$version_output" | awk '
+            $1 == "Version:" {
+              count++
+              if (NF != 2) exit 2
+              value=$2
+            }
+            END {
+              if (count != 1 || value != "1.3.4") exit 3
+              print value
+            }
+          ')
+          test "$version" = "$oras_version"
+          printf '%s\n' "$bin" >>"$GITHUB_PATH"
       - name: Capture protected registry state before any writer
         shell: bash
         env:
