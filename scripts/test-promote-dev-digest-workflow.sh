@@ -517,7 +517,19 @@ if [ "$smoke" = true ]; then
   [ -x "$selected" ]
   selected_command=$(PATH="$selected_bin:$REAL_PATH" command -v oras)
   [ "$selected_command" = "$selected" ]
-  "$selected" version | grep -Fxq 'Version: 1.3.4'
+  version_output=$("$selected" version)
+  version=$(printf '%s\n' "$version_output" | awk '
+    $1 == "Version:" {
+      count++
+      if (NF != 2) exit 2
+      value=$2
+    }
+    END {
+      if (count != 1 || value != "1.3.4") exit 3
+      print value
+    }
+  ')
+  [ "$version" = "1.3.4" ]
   echo "ORAS runtime smoke passed: pinned 1.3.4 private executable selected"
   exit 0
 fi
