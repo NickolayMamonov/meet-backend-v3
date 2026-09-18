@@ -250,7 +250,9 @@ jobs:
               --layout "$layout" \
               --protected-state "$RUNNER_TEMP/protected-before.json" \
               --output "$RUNNER_TEMP/layout-proof.json"
-            oras cp --from-oci-layout "$layout" "$ref"
+            # ORAS requires a source selector; this digest names the admitted
+            # index and its platform/attestation children.
+            oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"
           fi
           root_digest=$(docker buildx imagetools inspect "$ref" --format "{{.Manifest.Digest}}")
           raw="$RUNNER_TEMP/test-image-index.json"

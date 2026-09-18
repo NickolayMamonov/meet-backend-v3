@@ -53,7 +53,10 @@ grep -Fq 'capture-test-promotion-protected-state.sh' "$WORKFLOW"
 grep -Fq 'collect-test-promotion-protected-state.sh' "$WORKFLOW"
 grep -Fq 'verify-oci-referrer-closure.sh' "$WORKFLOW"
 grep -Fq 'published OCI subject differs from admitted OCI layout' "$WORKFLOW"
-grep -Fq 'oras cp --from-oci-layout' "$WORKFLOW"
+grep -Fq 'oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"' "$WORKFLOW"
+grep -Fq 'Run pinned ORAS local layout smoke' "$CI"
+grep -Fq 'timeout-minutes: 10' "$CI"
+grep -Fq 'timeout 600s bash "$TOOLING_SCRIPTS/test-promote-dev-digest-workflow.sh" --oras-runtime-smoke' "$CI"
 grep -Fq 'same-image redeploy requires explicit allow_same_digest_redeploy=true' "$WORKFLOW"
 grep -Fq 'if: always()' "$WORKFLOW"
 grep -Fq 'build-test-promotion-evidence.sh incident' "$WORKFLOW"
@@ -198,6 +201,7 @@ workflow_contract() {
   local workflow=$1
   local block=$2
   local metadata=$3
+  local publish_block="$metadata.publish"
   extract_step_metadata "$workflow" >"$metadata"
   [ "$(awk -F '\t' '$1 == "provision-oras" { count++ } END { print count + 0 }' "$metadata")" -eq 1 ] ||
     { echo "workflow contract: expected exactly one provision-oras step" >&2; return 1; }
@@ -214,6 +218,51 @@ workflow_contract() {
     extract_run_block "$workflow" '      - id: provision-oras' "$block" ||
       { echo "workflow contract: provision run block is missing or ambiguous" >&2; return 1; }
   fi
+  extract_run_block "$workflow" '      - id: publish' "$publish_block" ||
+    { echo "workflow contract: publish run block is missing or ambiguous" >&2; return 1; }
+
+  local copy_count copy_command root_selection platform_selection source_verify layout_verify copy
+  local root_guard platform_guard
+  copy_count=$(grep -Fc 'oras cp --from-oci-layout' "$publish_block")
+  [ "$copy_count" -eq 1 ] ||
+    { echo "workflow contract: expected exactly one OCI copy command" >&2; return 1; }
+  grep -Fxq 'alias="test-sha-$SOURCE_SHA"' "$publish_block" ||
+    { echo "workflow contract: source-derived alias changed" >&2; return 1; }
+  grep -Fxq 'ref="$IMAGE:$alias"' "$publish_block" ||
+    { echo "workflow contract: source-derived alias changed" >&2; return 1; }
+  copy_command=$(grep -F 'oras cp --from-oci-layout' "$publish_block" | sed 's/^[[:space:]]*//')
+  [ "$copy_command" = 'oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"' ] ||
+    { echo "workflow contract: copy source must select admitted root digest" >&2; return 1; }
+  root_selection=$(grep -nF 'local_root_digest=$(jq -er' "$publish_block" | cut -d: -f1)
+  platform_selection=$(grep -nF 'local_platform_digest=$(jq -er' "$publish_block" | cut -d: -f1)
+  source_verify=$(grep -nF 'scripts/verify-dev-promotion-source.sh' "$publish_block" | cut -d: -f1)
+  layout_verify=$(grep -nF 'scripts/verify-test-promotion-layout.sh' "$publish_block" | cut -d: -f1)
+  copy=$(grep -nF 'oras cp --from-oci-layout' "$publish_block" | cut -d: -f1)
+  root_guard=$(grep -nF 'test "$local_root_digest" = "$root_digest"' "$publish_block" | cut -d: -f1)
+  platform_guard=$(grep -nF 'test "$local_platform_digest" = "$platform_digest"' "$publish_block" | cut -d: -f1)
+  [ "$(grep -Fc 'local_root_digest=$(jq -er' "$publish_block")" -eq 1 ] &&
+    [ "$(grep -Fc 'local_platform_digest=$(jq -er' "$publish_block")" -eq 1 ] &&
+    [ -n "$root_selection" ] && [ -n "$platform_selection" ] &&
+    [ -n "$source_verify" ] && [ -n "$layout_verify" ] &&
+    [ -n "$copy" ] && [ -n "$root_guard" ] && [ -n "$platform_guard" ] ||
+    { echo "workflow contract: root/platform admission or equality guard missing" >&2; return 1; }
+  [ "$root_selection" -lt "$source_verify" ] &&
+    [ "$platform_selection" -lt "$source_verify" ] &&
+    [ "$source_verify" -lt "$layout_verify" ] &&
+    [ "$layout_verify" -lt "$copy" ] &&
+    [ "$copy" -lt "$root_guard" ] &&
+    [ "$root_guard" -lt "$platform_guard" ] || {
+      if [ "$copy" -lt "$layout_verify" ]; then
+        echo "workflow contract: copy precedes layout verification" >&2
+      else
+        echo "workflow contract: admission or equality ordering changed" >&2
+      fi
+      return 1
+    }
+  grep -Fq 'if length == 1 then .[0] else error("OCI layout root is not unique") end' "$publish_block" ||
+    { echo "workflow contract: root uniqueness guard changed" >&2; return 1; }
+  grep -Fq 'if length == 1 then .[0] else error("OCI layout platform is not unique") end' "$publish_block" ||
+    { echo "workflow contract: platform uniqueness guard changed" >&2; return 1; }
 
   local direct_line provision_line protected_line publish_line attestation_line copy_line
   direct_line=$(grep -nF -- '- name: Recheck direct writer guards' "$workflow" | cut -d: -f1)
@@ -530,6 +579,7 @@ if [ "$smoke" = true ]; then
     }
   ')
   [ "$version" = "1.3.4" ]
+  bash "$ROOT_DIR/scripts/test-test-promotion-layout.sh" --oras-bin "$selected"
   echo "ORAS runtime smoke passed: pinned 1.3.4 private executable selected"
   exit 0
 fi
@@ -722,6 +772,73 @@ for mutation in duplicate missing bypass after-publish after-attestation; do
       ;;
   esac
 done
+
+for mutation in bare empty wrong platform guessed-tag extra-source; do
+  workflow_mutant="$TEST_ROOT/workflow-selector-$mutation.yml"
+  cp -- "$WORKFLOW" "$workflow_mutant"
+  case "$mutation" in
+    bare)
+      sed 's#oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"#oras cp --from-oci-layout "$layout" "$ref"#' \
+        "$workflow_mutant" >"$workflow_mutant.tmp"
+      ;;
+    empty)
+      sed 's#oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"#oras cp --from-oci-layout "$layout@" "$ref"#' \
+        "$workflow_mutant" >"$workflow_mutant.tmp"
+      ;;
+    wrong)
+      sed 's#oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"#oras cp --from-oci-layout "$layout@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$ref"#' \
+        "$workflow_mutant" >"$workflow_mutant.tmp"
+      ;;
+    platform)
+      sed 's#oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"#oras cp --from-oci-layout "$layout@$local_platform_digest" "$ref"#' \
+        "$workflow_mutant" >"$workflow_mutant.tmp"
+      ;;
+    guessed-tag)
+      sed 's#oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"#oras cp --from-oci-layout "$layout:test" "$ref"#' \
+        "$workflow_mutant" >"$workflow_mutant.tmp"
+      ;;
+    extra-source)
+      sed 's#oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"#oras cp --from-oci-layout "$layout@$local_root_digest" "$ref" "$ref"#' \
+        "$workflow_mutant" >"$workflow_mutant.tmp"
+      ;;
+  esac
+  mv -- "$workflow_mutant.tmp" "$workflow_mutant"
+  mutation_stderr="$TEST_ROOT/selector-$mutation.stderr"
+  if workflow_contract "$workflow_mutant" "$TEST_ROOT/mutant-block" "$workflow_metadata" \
+    2>"$mutation_stderr"; then
+    echo "$mutation: selector structural oracle accepted mutation" >&2
+    exit 1
+  fi
+  grep -Fxq 'workflow contract: copy source must select admitted root digest' "$mutation_stderr" || {
+    echo "$mutation: missing reason-specific selector rejection" >&2
+    exit 1
+  }
+done
+
+alias_mutant="$TEST_ROOT/workflow-selector-alias.yml"
+sed 's#ref="$IMAGE:$alias"#ref="$IMAGE:guessed-tag"#' "$WORKFLOW" >"$alias_mutant"
+if workflow_contract "$alias_mutant" "$TEST_ROOT/mutant-block" "$workflow_metadata" \
+  >"$TEST_ROOT/alias.stdout" 2>"$TEST_ROOT/alias.stderr"; then
+  echo "changed-alias: structural oracle accepted mutation" >&2
+  exit 1
+fi
+grep -Fxq 'workflow contract: source-derived alias changed' "$TEST_ROOT/alias.stderr"
+
+copy_before_layout="$TEST_ROOT/workflow-selector-copy-before-layout.yml"
+awk '
+  /^            oras cp --from-oci-layout "\$layout@\$local_root_digest" "\$ref"$/ { next }
+  /^            scripts\/verify-test-promotion-layout\.sh/ {
+    print "            oras cp --from-oci-layout \"$layout@$local_root_digest\" \"$ref\""
+  }
+  { print }
+' "$WORKFLOW" >"$copy_before_layout"
+if workflow_contract "$copy_before_layout" "$TEST_ROOT/mutant-block" "$workflow_metadata" \
+  >"$TEST_ROOT/copy-before-layout.stdout" 2>"$TEST_ROOT/copy-before-layout.stderr"; then
+  echo "copy-before-layout: structural oracle accepted mutation" >&2
+  exit 1
+fi
+grep -Fxq 'workflow contract: copy precedes layout verification' "$TEST_ROOT/copy-before-layout.stderr"
+echo "selector mutants passed: bare empty wrong platform guessed-tag extra-source; alias and copy-order rejection preserved"
 
 incident_block="$TEST_ROOT/incident.sh"
 extract_run_block "$WORKFLOW" '      - name: Build sanitized incident document' "$incident_block"
