@@ -267,9 +267,9 @@ workflow_contract() {
   local direct_line provision_line protected_line publish_line attestation_line copy_line
   direct_line=$(grep -nF -- '- name: Recheck direct writer guards' "$workflow" | cut -d: -f1)
   provision_line=$(grep -nF -- '- id: provision-oras' "$workflow" | cut -d: -f1)
-  protected_line=$(grep -nF -- '- name: Capture protected registry state before any writer' "$workflow" | cut -d: -f1)
+  protected_line=$(grep -nF -- 'name: Capture protected registry state before any writer' "$workflow" | cut -d: -f1)
   publish_line=$(grep -nF -- '- id: publish' "$workflow" | cut -d: -f1)
-  attestation_line=$(grep -nF -- '- name: Create signed OCI attestation for a first-time alias' "$workflow" | cut -d: -f1)
+  attestation_line=$(grep -nF -- 'name: Create signed OCI attestation for a first-time alias' "$workflow" | cut -d: -f1)
   copy_line=$(grep -nF -- 'oras cp --from-oci-layout' "$workflow" | cut -d: -f1)
   if [ "$provision_line" -gt "$attestation_line" ]; then
     echo "workflow contract: provision step is after attestation" >&2
@@ -517,10 +517,14 @@ run_incident_contract() {
       "$BASH" "$block"
   )
   jq -e '
-    .schema == "meet-backend/test-promotion-incident/v2" and
+    .schema == "meet-backend/test-promotion-incident/v3" and
     .kind == "incident" and .stage == "admission" and
     .failureClass == "internalFailure" and
-    .mutationStarted == false and .rollbackAttempted == false and
+    .mutationStarted == false and .deploymentMutationStarted == false and
+    .registryPublication == "unknown" and
+    .attestationWrite == "unknown" and
+    .initialAliasState == "unknown" and
+    .rollbackAttempted == false and
     .rollbackVerified == false and .evidenceSanitized == true and
     .retentionAuthorized == false
   ' "$temp/promotion-incident.json" >/dev/null
@@ -845,6 +849,9 @@ extract_run_block "$WORKFLOW" '      - name: Build sanitized incident document' 
 sed -i \
   -e 's/\${{ needs\.authorize\.result }}/success/g' \
   -e 's/\${{ needs\.admit-image\.result }}/failure/g' \
+  -e 's/\${{ needs\.admit-image\.outputs\.registry_publication }}/unknown/g' \
+  -e 's/\${{ needs\.admit-image\.outputs\.attestation_write }}/unknown/g' \
+  -e 's/\${{ needs\.admit-image\.outputs\.initial_alias_state }}/unknown/g' \
   -e 's/\${{ needs\.deploy\.outputs\.mutation_started }}/false/g' \
   -e 's/\${{ needs\.deploy\.outputs\.rollback_attempted }}/false/g' \
   -e 's/\${{ needs\.deploy\.outputs\.rollback_verified }}/false/g' \

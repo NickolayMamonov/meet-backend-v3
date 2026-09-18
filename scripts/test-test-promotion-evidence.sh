@@ -540,19 +540,24 @@ jq -e '
 bash "$BUILDER" incident \
   --stage rollback \
   --failure-class rollbackFailed \
-  --mutation-started true \
+  --registry-publication startedUnconfirmed \
+  --attestation-write startedUnconfirmed \
+  --initial-alias-state absent \
+  --deployment-mutation-started true \
   --rollback-attempted true \
   --rollback-verified false \
   --output "$TMP/incident.json"
 jq -e '
   keys == [
-    "artifactUploaded","evidenceSanitized","failureClass","kind",
-    "mutationStarted","retentionAuthorized","rollbackAttempted",
-    "rollbackVerified","schema","stage"
+    "artifactUploaded","attestationWrite","deploymentMutationStarted",
+    "evidenceSanitized","failureClass","initialAliasState","kind",
+    "mutationStarted","registryPublication","retentionAuthorized",
+    "rollbackAttempted","rollbackVerified","schema","stage"
   ] and
-  .schema == "meet-backend/test-promotion-incident/v2" and
+  .schema == "meet-backend/test-promotion-incident/v3" and
   .kind == "incident" and .stage == "rollback" and
   .failureClass == "rollbackFailed" and .mutationStarted == true and
+  .deploymentMutationStarted == true and
   .rollbackAttempted == true and .rollbackVerified == false and
   .evidenceSanitized == true and .artifactUploaded == false and
   .retentionAuthorized == false
@@ -567,7 +572,10 @@ else
   bash "$BUILDER" incident \
     --stage evidence \
     --failure-class sanitizationFailed \
-    --mutation-started true \
+    --registry-publication unknown \
+    --attestation-write unknown \
+    --initial-alias-state unknown \
+    --deployment-mutation-started true \
     --rollback-attempted true \
     --rollback-verified true \
     --output "$TMP/selected.json"
@@ -575,7 +583,10 @@ fi
 bash "$BUILDER" incident \
   --stage evidence \
   --failure-class sanitizationFailed \
-  --mutation-started true \
+  --registry-publication unknown \
+  --attestation-write unknown \
+  --initial-alias-state unknown \
+  --deployment-mutation-started true \
   --rollback-attempted true \
   --rollback-verified true \
   --output "$TMP/selected-repeat.json"
@@ -588,7 +599,10 @@ expect_failure impossible-rollback \
   bash "$BUILDER" incident \
   --stage rollback \
   --failure-class rollbackFailed \
-  --mutation-started false \
+  --registry-publication notStarted \
+  --attestation-write notStarted \
+  --initial-alias-state absent \
+  --deployment-mutation-started false \
   --rollback-attempted true \
   --rollback-verified false \
   --output "$TMP/rejected.json"

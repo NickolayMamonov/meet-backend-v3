@@ -96,6 +96,7 @@ jobs:
     needs: authorize
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev' && github.sha == inputs.source_sha && needs.authorize.outputs.authorized == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     environment: closed-beta-promotion
     permissions:
       contents: read
@@ -107,6 +108,9 @@ jobs:
       platform_digest: ${{ steps.publish.outputs.platform_digest }}
       admission_mode: ${{ steps.publish.outputs.admission_mode }}
       state_mode: ${{ steps.publish.outputs.state_mode }}
+      initial_alias_state: ${{ steps.registry-export.outputs.initial_alias_state }}
+      registry_publication: ${{ steps.registry-export.outputs.registry_publication }}
+      attestation_write: ${{ steps.registry-export.outputs.attestation_write }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -170,7 +174,9 @@ jobs:
           ')
           test "$version" = "$oras_version"
           printf '%s\n' "$bin" >>"$GITHUB_PATH"
-      - name: Capture protected registry state before any writer
+      - id: protected-before
+        name: Capture protected registry state before any writer
+        timeout-minutes: 10
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -178,6 +184,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          registry_state="$RUNNER_TEMP/test-promotion-registry-state.json"
+          bash scripts/record-test-promotion-registry-state.sh init \
+            --file "$registry_state" --source "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          printf 'REGISTRY_STATE=%s\n' "$registry_state" >>"$GITHUB_ENV"
           gh api --paginate --slurp \
             "users/${GITHUB_REPOSITORY%%/*}/packages/container/${GITHUB_REPOSITORY##*/}/versions?per_page=100" \
             >"$RUNNER_TEMP/protected-package-versions.json"
@@ -189,10 +200,13 @@ jobs:
             --input "$RUNNER_TEMP/protected-state-input.json" \
             --candidate-alias "test-sha-$SOURCE_SHA" \
             --output "$RUNNER_TEMP/protected-before.json"
+          chmod a-w "$RUNNER_TEMP/protected-package-versions.json" \
+            "$RUNNER_TEMP/protected-before.json"
           sha256sum "$RUNNER_TEMP/protected-before.json" |
             awk '{print "protected_before_sha256="$1}' >>"$GITHUB_OUTPUT"
       - id: publish
         name: Publish or safely reuse only the source-bound test alias
+        timeout-minutes: 30
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -208,10 +222,29 @@ jobs:
             --output "$RUNNER_TEMP/admission-state.json"
           state=$(jq -r .state "$RUNNER_TEMP/admission-state.json")
           case "$state" in
-            absent) mode=published ;;
-            reusable) mode=reused ;;
+            absent)
+              mode=published
+              bash scripts/record-test-promotion-registry-state.sh classify \
+                --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
+                --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+                --initial-state absent
+              ;;
+            reusable)
+              mode=reused
+              bash scripts/record-test-promotion-registry-state.sh classify \
+                --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
+                --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+                --initial-state reusable
+              ;;
+            partial|rejected) mode=quarantined ;;
             *) echo "candidate alias is not safely reusable" >&2; exit 1 ;;
           esac
+          [ "$mode" != quarantined ] || {
+            echo "candidate alias is quarantined; no writer is permitted" >&2
+            exit 1
+          }
+          publication_proof=
+          publication_proof_sha=
           if [ "$mode" = published ]; then
             printf "%s" "$GH_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
             layout="$RUNNER_TEMP/test-image-layout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
@@ -250,9 +283,32 @@ jobs:
               --layout "$layout" \
               --protected-state "$RUNNER_TEMP/protected-before.json" \
               --output "$RUNNER_TEMP/layout-proof.json"
+            publication_proof="$RUNNER_TEMP/test-promotion-publication-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json"
+            scripts/verify-test-promotion-publication.sh create \
+              --image "$IMAGE" \
+              --source-sha "$SOURCE_SHA" \
+              --tree-id "${{ needs.authorize.outputs.tree_id }}" \
+              --version "$VERSION" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --layout "$layout" \
+              --layout-proof "$RUNNER_TEMP/layout-proof.json" \
+              --source-proof "$RUNNER_TEMP/dev-promotion-source-publish.json" \
+              --before-inventory "$RUNNER_TEMP/protected-package-versions.json" \
+              --protected-state "$RUNNER_TEMP/protected-before.json" \
+              --output "$publication_proof"
+            publication_proof_sha=$(sha256sum "$publication_proof" | awk '{print $1}')
+            bash scripts/record-test-promotion-registry-state.sh begin \
+              --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
+              --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --operation publication
             # ORAS requires a source selector; this digest names the admitted
             # index and its platform/attestation children.
             oras cp --from-oci-layout "$layout@$local_root_digest" "$ref"
+            bash scripts/record-test-promotion-registry-state.sh confirm \
+              --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
+              --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --operation publication
           fi
           root_digest=$(docker buildx imagetools inspect "$ref" --format "{{.Manifest.Digest}}")
           raw="$RUNNER_TEMP/test-image-index.json"
@@ -266,30 +322,193 @@ jobs:
             test "$local_platform_digest" = "$platform_digest" ||
               { echo "published OCI platform subject differs from admitted OCI layout" >&2; exit 1; }
           fi
-          scripts/normalize-ghcr-package-inventory.sh \
-            --package-versions-file "$RUNNER_TEMP/protected-package-versions.json" \
-            --digest "$root_digest" \
-            --output "$RUNNER_TEMP/registry-inventory.json"
           scripts/verify-oci-evidence.sh "$IMAGE" "$root_digest" "$raw" >/dev/null
-          scripts/verify-oci-referrer-closure.sh \
-            --image "$IMAGE" --index-file "$raw" \
-            --inventory-file "$RUNNER_TEMP/registry-inventory.json" \
-            --subject-digest "$root_digest" --platform-subject "$platform_digest" >/dev/null
           printf 'root_digest=%s\n' "$root_digest" >> "$GITHUB_OUTPUT"
           printf 'platform_digest=%s\n' "$platform_digest" >> "$GITHUB_OUTPUT"
           printf 'admission_mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
           printf 'state_mode=%s\n' "${{ inputs.state_mode }}" >> "$GITHUB_OUTPUT"
-      - name: Create signed OCI attestation for a first-time alias
+          if [ "$mode" = published ]; then
+            printf 'publication_proof=%s\n' "$publication_proof" >> "$GITHUB_OUTPUT"
+            printf 'publication_proof_sha=%s\n' "$publication_proof_sha" >> "$GITHUB_OUTPUT"
+          fi
+      - id: fresh-inventory
+        name: Collect fresh post-publication inventory
+        timeout-minutes: 5
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          require_signature=false
+          if [ "${{ steps.publish.outputs.admission_mode }}" = reused ]; then
+            require_signature=true
+          fi
+          fresh_info=$(scripts/read-test-promotion-inventory.sh \
+            --image "$IMAGE" \
+            --alias "test-sha-$SOURCE_SHA" \
+            --subject-digest "${{ steps.publish.outputs.root_digest }}" \
+            --platform-subject "${{ steps.publish.outputs.platform_digest }}" \
+            --index-file "$RUNNER_TEMP/test-image-index.json" \
+            --before-inventory "$RUNNER_TEMP/protected-package-versions.json" \
+            --protected-state "$RUNNER_TEMP/protected-before.json" \
+            --require-signature "$require_signature" \
+            --output-dir "$RUNNER_TEMP")
+          while IFS= read -r line; do
+            case "$line" in
+              phase_dir=*|package_versions_file=*|registry_inventory_file=*)
+                printf '%s\n' "$line" >>"$GITHUB_OUTPUT"
+                ;;
+              *) echo "unexpected inventory output" >&2; exit 1 ;;
+            esac
+          done <<<"$fresh_info"
+          scripts/verify-oci-referrer-closure.sh \
+            --image "$IMAGE" \
+            --index-file "$RUNNER_TEMP/test-image-index.json" \
+            --inventory-file "$(awk -F= '$1 == "package_versions_file" {print substr($0, index($0, "=") + 1)}' <<<"$fresh_info")" \
+            --subject-digest "${{ steps.publish.outputs.root_digest }}" \
+            --platform-subject "${{ steps.publish.outputs.platform_digest }}" \
+            --promotion-baseline-file "$RUNNER_TEMP/protected-package-versions.json" \
+            --protected-state-file "$RUNNER_TEMP/protected-before.json" \
+            --candidate-alias "test-sha-$SOURCE_SHA" >/dev/null
+      - id: observed
+        name: Capture observed source-bound image admission
+        timeout-minutes: 5
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/admit-test-image.sh inspect \
+            --source "$SOURCE_SHA" --version "$VERSION" \
+            --alias "test-sha-$SOURCE_SHA" \
+            --expected-root-digest "${{ steps.publish.outputs.root_digest }}" \
+            --expected-platform-digest "${{ steps.publish.outputs.platform_digest }}" \
+            --input-command scripts/read-test-image-state.sh \
+            --output "$RUNNER_TEMP/observed-reader-before-signature.json"
+      - id: publication-proof
+        name: Verify same-run publication proof
+        if: success() && steps.publish.outputs.admission_mode == 'published'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          bash scripts/verify-test-promotion-publication.sh verify \
+            --proof "${{ steps.publish.outputs.publication_proof }}" \
+            --expected-proof-sha256 "${{ steps.publish.outputs.publication_proof_sha }}" \
+            --index-file "$RUNNER_TEMP/test-image-index.json" \
+            --candidate-inventory "${{ steps.fresh-inventory.outputs.registry_inventory_file }}" \
+            --observed-reader "$RUNNER_TEMP/observed-reader-before-signature.json" \
+            --registry-journal "$REGISTRY_STATE" \
+            --before-inventory "$RUNNER_TEMP/protected-package-versions.json" \
+            --protected-state "$RUNNER_TEMP/protected-before.json" \
+            --layout-proof "$RUNNER_TEMP/layout-proof.json" \
+            --image "$IMAGE" \
+            --source-sha "$SOURCE_SHA" \
+            --tree-id "${{ needs.authorize.outputs.tree_id }}" \
+            --version "${{ needs.authorize.outputs.version }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Mark signer intent for a first-time alias
         if: steps.publish.outputs.admission_mode == 'published'
+        timeout-minutes: 1
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          bash scripts/record-test-promotion-registry-state.sh begin \
+            --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --operation attestation
+      - id: signer
+        name: Create signed OCI attestation for a first-time alias
+        if: steps.publish.outputs.admission_mode == 'published'
+        timeout-minutes: 5
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.publish.outputs.root_digest }}
           push-to-registry: true
-      - name: Verify signed OCI attestation identity
+      - name: Confirm signer completion
+        if: always() && steps.signer.outcome == 'success'
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.publish.outputs.admission_mode }}" = published ]; then
+            bash scripts/record-test-promotion-registry-state.sh confirm \
+              --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
+              --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --operation attestation
+          fi
+      - id: final-inventory
+        name: Collect fresh signed inventory after publication
+        if: success() && steps.publish.outputs.admission_mode == 'published'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fresh_info=$(scripts/read-test-promotion-inventory.sh \
+            --image "$IMAGE" \
+            --alias "test-sha-$SOURCE_SHA" \
+            --subject-digest "${{ steps.publish.outputs.root_digest }}" \
+            --platform-subject "${{ steps.publish.outputs.platform_digest }}" \
+            --index-file "$RUNNER_TEMP/test-image-index.json" \
+            --before-inventory "$RUNNER_TEMP/protected-package-versions.json" \
+            --protected-state "$RUNNER_TEMP/protected-before.json" \
+            --require-signature true \
+            --output-dir "$RUNNER_TEMP")
+          while IFS= read -r line; do
+            case "$line" in
+              phase_dir=*|package_versions_file=*|registry_inventory_file=*)
+                printf '%s\n' "$line" >>"$GITHUB_OUTPUT"
+                ;;
+              *) echo "unexpected signed inventory output" >&2; exit 1 ;;
+            esac
+          done <<<"$fresh_info"
+          scripts/verify-oci-referrer-closure.sh \
+            --image "$IMAGE" \
+            --index-file "$RUNNER_TEMP/test-image-index.json" \
+            --inventory-file "$(awk -F= '$1 == "package_versions_file" {print substr($0, index($0, "=") + 1)}' <<<"$fresh_info")" \
+            --subject-digest "${{ steps.publish.outputs.root_digest }}" \
+            --platform-subject "${{ steps.publish.outputs.platform_digest }}" \
+            --promotion-baseline-file "$RUNNER_TEMP/protected-package-versions.json" \
+            --protected-state-file "$RUNNER_TEMP/protected-before.json" \
+            --candidate-alias "test-sha-$SOURCE_SHA" >/dev/null
+      - id: final-observed
+        name: Capture final signed image admission
+        if: success() && steps.publish.outputs.admission_mode == 'published'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/admit-test-image.sh inspect \
+            --source "$SOURCE_SHA" --version "$VERSION" \
+            --alias "test-sha-$SOURCE_SHA" \
+            --expected-root-digest "${{ steps.publish.outputs.root_digest }}" \
+            --expected-platform-digest "${{ steps.publish.outputs.platform_digest }}" \
+            --input-command scripts/read-test-image-state.sh \
+            --output "$RUNNER_TEMP/observed-reader-after-signature.json"
+      - name: Verify signed OCI attestation identity
+        id: signed-identity
+        timeout-minutes: 5
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh attestation verify \
@@ -297,6 +516,8 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --source-digest "$SOURCE_SHA" >/dev/null
       - name: Read-only image admission
+        id: final-admission
+        timeout-minutes: 5
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -308,10 +529,15 @@ jobs:
           [[ "$GITHUB_REF" == refs/heads/dev ]]
           [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]]
           bash scripts/admit-test-image.sh verify \
-            --source "$SOURCE_SHA" --version "$VERSION" --alias "test-sha-$SOURCE_SHA" --input-command scripts/read-test-image-state.sh
+            --source "$SOURCE_SHA" --version "$VERSION" --alias "test-sha-$SOURCE_SHA" \
+            --expected-root-digest "${{ steps.publish.outputs.root_digest }}" \
+            --expected-platform-digest "${{ steps.publish.outputs.platform_digest }}" \
+            --input-command scripts/read-test-image-state.sh
           test ! -e release.json
           test ! -e protected-state-write.marker
       - name: Capture protected registry state after admission
+        id: protected-after
+        timeout-minutes: 10
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -329,6 +555,20 @@ jobs:
           cmp --silent "$RUNNER_TEMP/protected-before.json" \
             "$RUNNER_TEMP/protected-after.json" ||
             { echo "protected release/package/subject/referrer state drifted" >&2; exit 1; }
+      - id: registry-export
+        name: Export registry and attestation facts
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          registry_state="${REGISTRY_STATE:-$RUNNER_TEMP/test-promotion-registry-state.json}"
+          bash scripts/record-test-promotion-registry-state.sh export \
+            --file "$registry_state" --source "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --github-output "$GITHUB_OUTPUT"
   deploy:
     name: Locked exact-digest test VPS deployment
     needs: [authorize, admit-image]
@@ -785,20 +1025,49 @@ jobs:
         run: |
           set -euo pipefail
           stage=authorization
-          mutation=false
+          registry_publication='${{ needs.admit-image.outputs.registry_publication }}'
+          attestation_write='${{ needs.admit-image.outputs.attestation_write }}'
+          initial_alias_state='${{ needs.admit-image.outputs.initial_alias_state }}'
+          deployment_mutation_started=unknown
           rollback=false
           rollback_verified=false
           if [ "${{ needs.authorize.result }}" = success ]; then stage=admission; fi
           if [ "${{ needs.admit-image.result }}" = success ]; then stage=predecessor; fi
-          mutation='${{ needs.deploy.outputs.mutation_started }}'
           rollback='${{ needs.deploy.outputs.rollback_attempted }}'
           rollback_verified='${{ needs.deploy.outputs.rollback_verified }}'
-          [ "$mutation" = true ] || mutation=false
           [ "$rollback" = true ] || rollback=false
           [ "$rollback_verified" = true ] || rollback_verified=false
+          if [ "${{ needs.deploy.result }}" = skipped ]; then
+            deployment_mutation_started=false
+          elif [ '${{ needs.deploy.outputs.mutation_started }}' = true ] ||
+               [ '${{ needs.deploy.outputs.mutation_started }}' = false ]; then
+            deployment_mutation_started='${{ needs.deploy.outputs.mutation_started }}'
+          fi
+          if [ "${{ needs.authorize.result }}" != success ] &&
+             [ "${{ needs.admit-image.result }}" = skipped ]; then
+            registry_publication=notStarted
+            attestation_write=notStarted
+            initial_alias_state=unknown
+          else
+            case "$registry_publication" in
+              notStarted|startedUnconfirmed|confirmed|unknown) ;;
+              *) registry_publication=unknown ;;
+            esac
+            case "$attestation_write" in
+              notStarted|startedUnconfirmed|confirmed|unknown) ;;
+              *) attestation_write=unknown ;;
+            esac
+            case "$initial_alias_state" in
+              unknown|absent|partial|reusable|rejected) ;;
+              *) initial_alias_state=unknown ;;
+            esac
+          fi
           scripts/build-test-promotion-evidence.sh incident \
             --stage "$stage" --failure-class internalFailure \
-            --mutation-started "$mutation" \
+            --registry-publication "$registry_publication" \
+            --attestation-write "$attestation_write" \
+            --initial-alias-state "$initial_alias_state" \
+            --deployment-mutation-started "$deployment_mutation_started" \
             --rollback-attempted "$rollback" --rollback-verified "$rollback_verified" \
             --output "$RUNNER_TEMP/promotion-incident.json"
       - name: Upload sanitized incident evidence

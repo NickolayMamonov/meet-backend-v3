@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --image IMAGE --index-file PATH --inventory-file PATH --subject-digest sha256:... --platform-subject sha256:... [--fixture-dir PATH] [--output PATH]" >&2
+  echo "usage: $0 --image IMAGE --index-file PATH --inventory-file PATH --subject-digest sha256:... --platform-subject sha256:... [--promotion-baseline-file PATH --protected-state-file PATH --candidate-alias ALIAS] [--fixture-dir PATH] [--output PATH]" >&2
   exit 2
 }
 
@@ -18,6 +18,9 @@ SUBJECT_DIGEST=
 PLATFORM_SUBJECT=
 FIXTURE_DIR=
 OUTPUT=
+PROMOTION_BASELINE=
+PROMOTION_PROTECTED=
+CANDIDATE_ALIAS=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --image) [ "$#" -ge 2 ] || usage; IMAGE=$2; shift 2 ;;
@@ -27,6 +30,9 @@ while [ "$#" -gt 0 ]; do
     --platform-subject) [ "$#" -ge 2 ] || usage; PLATFORM_SUBJECT=$2; shift 2 ;;
     --fixture-dir) [ "$#" -ge 2 ] || usage; FIXTURE_DIR=$2; shift 2 ;;
     --output) [ "$#" -ge 2 ] || usage; OUTPUT=$2; shift 2 ;;
+    --promotion-baseline-file) [ "$#" -ge 2 ] || usage; PROMOTION_BASELINE=$2; shift 2 ;;
+    --protected-state-file) [ "$#" -ge 2 ] || usage; PROMOTION_PROTECTED=$2; shift 2 ;;
+    --candidate-alias) [ "$#" -ge 2 ] || usage; CANDIDATE_ALIAS=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -38,6 +44,14 @@ command -v jq >/dev/null 2>&1 || fail "jq is required"
 [[ "$PLATFORM_SUBJECT" =~ ^sha256:[0-9a-f]{64}$ ]] || usage
 [ -n "$FIXTURE_DIR" ] || command -v docker >/dev/null 2>&1 ||
   fail "docker is required for live OCI manifest reads"
+[ -z "$PROMOTION_BASELINE" ] && [ -z "$PROMOTION_PROTECTED" ] &&
+  [ -z "$CANDIDATE_ALIAS" ] || {
+  [ -f "$PROMOTION_BASELINE" ] && [ -f "$PROMOTION_PROTECTED" ] &&
+    [[ "$CANDIDATE_ALIAS" =~ ^test-sha-[0-9a-f]{40}$ ]] ||
+    usage
+}
+PROMOTION=false
+[ -z "$PROMOTION_BASELINE" ] || PROMOTION=true
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -r -- "$WORK_DIR"' EXIT HUP INT TERM
@@ -45,6 +59,42 @@ REFERRERS=$WORK_DIR/referrers
 INVENTORY_DIGESTS=$WORK_DIR/inventory-digests
 ATTRIBUTIONS=$WORK_DIR/attributions.jsonl
 : >"$ATTRIBUTIONS"
+
+if [ "$PROMOTION" = true ]; then
+  jq -e '
+    type == "array" and length > 0 and all(.[]; type == "array") and
+    all(.[][];
+      type == "object" and
+      (.id | type == "number" and floor == . and . > 0) and
+      (.name | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.metadata.container.tags | type == "array" and
+        all(.[]; type == "string" and length > 0))
+    ) and
+    ([.[][] | .id] | unique | length) == ([.[][]] | length) and
+    ([.[][] | .name] | unique | length) == ([.[][]] | length) and
+    ([.[][] | .metadata.container.tags[]] | unique | length) ==
+      ([.[][] | .metadata.container.tags[]] | length)
+  ' "$PROMOTION_BASELINE" >/dev/null ||
+    fail "promotion baseline snapshot is malformed"
+  jq -e '
+    type == "array" and length > 0 and all(.[]; type == "array") and
+    all(.[][]; type == "object" and
+      (.id | type == "number" and floor == . and . > 0) and
+      (.name | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.metadata.container.tags | type == "array" and
+        all(.[]; type == "string" and length > 0)))
+  ' "$INVENTORY_FILE" >/dev/null ||
+    fail "promotion fresh snapshot is malformed"
+  jq -c --arg subject "$SUBJECT_DIGEST" --arg alias "$CANDIDATE_ALIAS" '
+    [.[][]] as $rows |
+    {digest:$subject,aliases:{($alias):$subject},latest:null,
+     versions:[$rows[] | {
+       id,digest:.name,tags:.metadata.container.tags
+     }]}
+  ' "$INVENTORY_FILE" >"$WORK_DIR/promotion-inventory.json" ||
+    fail "promotion inventory normalization failed"
+  INVENTORY_FILE=$WORK_DIR/promotion-inventory.json
+fi
 
 validate_digest() {
   [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]] ||
@@ -114,11 +164,26 @@ jq -r \
   ' "$INDEX_FILE" | tr -d '\r' | sort -u >"$REFERRERS"
 [ -s "$REFERRERS" ] || fail "subject-bound OCI referrer descriptors are missing"
 
-jq -r --arg subject "$SUBJECT_DIGEST" '
-  .versions[] | select(.digest != $subject) | .digest
-' "$INVENTORY_FILE" | tr -d '\r' | sort -u >"$INVENTORY_DIGESTS"
+if [ "$PROMOTION" = true ]; then
+  jq -r --arg platform "$PLATFORM_SUBJECT" \
+    '[$platform, (.manifests[] | .digest)] | unique[]' \
+    "$INDEX_FILE" |
+    tr -d '\r' | sort -u >"$INVENTORY_DIGESTS" ||
+    fail "package inventory digest projection failed"
+else
+  jq -r --arg subject "$SUBJECT_DIGEST" \
+    '.versions[] | select(.digest != $subject) | .digest' \
+    "$INVENTORY_FILE" |
+    tr -d '\r' | sort -u >"$INVENTORY_DIGESTS" ||
+    fail "package inventory digest projection failed"
+fi
 [ -s "$INVENTORY_DIGESTS" ] || fail "package inventory has no child or referrer versions"
 while IFS= read -r digest; do validate_digest "$digest"; done <"$INVENTORY_DIGESTS"
+while IFS= read -r digest; do
+  jq -e --arg digest "$digest" 'any(.versions[]; .digest == $digest)' \
+    "$INVENTORY_FILE" >/dev/null ||
+    fail "candidate package version is absent from package inventory"
+done <"$INVENTORY_DIGESTS"
 while IFS= read -r digest; do
   grep -Fqx "$digest" "$INVENTORY_DIGESTS" ||
     fail "top-level subject-bound referrer is absent from package inventory"
@@ -196,6 +261,15 @@ jq -r --arg marker "$MARKER" '
   fail "subject marker identifies multiple package versions"
 MARKER_ROOT=$(head -1 "$MARKER_DIGESTS" || true)
 
+if [ "$PROMOTION" = true ]; then
+  jq -e --arg alias "$CANDIDATE_ALIAS" --arg subject "$SUBJECT_DIGEST" '
+    ([.versions[] | select(.digest == $subject)] | length) == 1 and
+    ([.versions[] | select(.digest == $subject)][0].tags == [$alias])
+  ' "$INVENTORY_FILE" >/dev/null ||
+    fail "promotion candidate alias is not bound exactly to the subject"
+fi
+
+mark_reachable "$SUBJECT_DIGEST"
 mark_reachable "$PLATFORM_SUBJECT"
 collect_reachable "$PLATFORM_SUBJECT" 0
 while IFS= read -r digest; do
@@ -215,6 +289,45 @@ while IFS= read -r digest; do
   grep -Fqx "$digest" "$REACHABLE" ||
     fail "package inventory version is absent from the referrer graph"
 done <"$INVENTORY_DIGESTS"
+
+if [ "$PROMOTION" = true ]; then
+  reachable_json=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$REACHABLE")
+  baseline_non_candidate=$(jq -cS --argjson reachable "$reachable_json" '
+    [.[][] | {id,digest:.name,tags:.metadata.container.tags} as $row |
+      select(($reachable | index($row.digest)) == null)] | sort_by(.id,.digest)
+  ' "$PROMOTION_BASELINE")
+  current_non_candidate=$(jq -cS --argjson reachable "$reachable_json" '
+    [.versions[] as $row | select(($reachable | index($row.digest)) == null)] |
+    sort_by(.id,.digest)
+  ' "$INVENTORY_FILE")
+  [ "$baseline_non_candidate" = "$current_non_candidate" ] ||
+    fail "noncandidate package inventory changed during promotion"
+  protected_digests=$(jq -c '
+    [
+      (.protected.rootDigests[]?),
+      (.protected.platformDigests[]?),
+      (.protected.subjectDigests[]?),
+      (.protected.versions[]?.digest?),
+      (.protected.subjects[]?.digest?),
+      (.protected.manifests[]?.digest?),
+      (.registry.versions[]?.digest?),
+      (.registry.subjects[]?.digest?),
+      (.registry.manifests[]?.digest?)
+    ] | map(select(type == "string")) | unique
+  ' "$PROMOTION_PROTECTED") || fail "promotion protected state is malformed"
+  jq -e --argjson reachable "$reachable_json" --argjson protected "$protected_digests" '
+    any($reachable[]; . as $digest | any($protected[]; . == $digest))
+  ' <<<null >/dev/null &&
+    fail "promotion candidate intersects protected state"
+  jq -e --arg subject "$SUBJECT_DIGEST" --arg marker "$MARKER" \
+    --arg alias "$CANDIDATE_ALIAS" --argjson reachable "$reachable_json" '
+    all(.versions[] as $row | select(($reachable | index($row.digest)) != null);
+      if $row.digest == $subject then $row.tags == [$alias]
+      else all($row.tags[]; . == $marker)
+      end)
+  ' "$INVENTORY_FILE" >/dev/null ||
+    fail "promotion candidate has an unexpected alias or marker"
+fi
 
 NODE_PROVENANCE=0
 NODE_SBOM=0
@@ -385,10 +498,13 @@ done <"$INVENTORY_DIGESTS"
 
 jq \
   --slurpfile attrs "$ATTRIBUTIONS" \
-  --arg subject "$SUBJECT_DIGEST" '
+  --arg subject "$SUBJECT_DIGEST" \
+  --argjson reachable "$(jq -Rsc 'split("\n") | map(select(length > 0))' "$REACHABLE")" \
+  --argjson promotion "$PROMOTION" '
     .versions |= map(
       . as $version |
-      if .digest == $subject then .
+      if $promotion and (($reachable | index($version.digest)) == null) then empty
+      elif $version.digest == $subject then .
       else
         ($attrs | map(select(.digest == $version.digest))[0]) as $match |
         if $match == null then error("missing referrer attribution")
