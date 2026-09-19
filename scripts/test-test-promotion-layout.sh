@@ -393,6 +393,13 @@ run_publish_fragment() {
       >"$sandbox/stdout" 2>"$sandbox/stderr"
   )
   status=$?
+  if [ "$status" -eq 0 ]; then
+    bash "$sandbox/scripts/record-test-promotion-registry-state.sh" confirm \
+      --file "$registry_state" --source "$SOURCE_SHA" \
+      --run-id 35354750679 --run-attempt 2 \
+      --operation publication
+    status=$?
+  fi
   printf '%s\n' "$status" >"$sandbox/status"
   printf '%s\n' "$proof" >"$sandbox/proof-path"
   return "$status"
