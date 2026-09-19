@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.4.0...v1.4.1) (2026-09-19)
+
+
+### Fixes
+
+* select admitted ORAS layout root ([bf44261](https://github.com/NickolayMamonov/meet-backend-v3/commit/bf44261ba7237a0a7c218e7effca1bd3d8bdb07f))
+
 ## [1.4.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.3.0...v1.4.0) (2026-09-17)
 
 
