@@ -485,20 +485,16 @@ manifest_observation_from_descriptor() {
         mediaType,
         size,
         facts:{
-          subjectDigest:
-            if (.subjectDigest? // null) == null then unknown
-            else positive_scalar(.subjectDigest) end,
-          artifactType:
-            if (.artifactType? // null) == null then unknown
-            else positive_scalar(.artifactType) end,
-          predicateTypes:
-            if (.predicateTypes? // null) == null or
-               (.predicateTypes | length) == 0 then unknown
-            else partial_set(.predicateTypes) end,
-          children:
-            if (.children? // null) == null or
-               (.children | length) == 0 then unknown
-            else partial_set(.children) end
+          subjectDigest:(if (.subjectDigest? // null) == null then unknown
+                        else positive_scalar(.subjectDigest) end),
+          artifactType:(if (.artifactType? // null) == null then unknown
+                       else positive_scalar(.artifactType) end),
+          predicateTypes:(if (.predicateTypes? // null) == null or
+                              (.predicateTypes | length) == 0 then unknown
+                         else partial_set(.predicateTypes) end),
+          children:(if (.children? // null) == null or
+                         (.children | length) == 0 then unknown
+                   else partial_set(.children) end)
         }
       }
     end
