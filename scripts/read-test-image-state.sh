@@ -288,15 +288,47 @@ normalize_verified_attestations() {
       --arg repository "https://github.com/$GITHUB_REPOSITORY" \
       --arg source "$source" \
       --arg ref "refs/heads/dev" \
+      --arg root "${root#sha256:}" \
+      --arg platform "${platform#sha256:}" \
       --argjson claim "$normalized" \
       --argjson index "$index" '
       .[$index] |
       .verificationResult.statement as $statement |
       .verificationResult.signature.certificate as $certificate |
-      ($statement.subject | type == "array" and length == 1) and
-      ($statement.predicateType == $claim.predicateType) and
-      ($statement.subject[0].digest.sha256 ==
-        ($claim.subject | sub("^sha256:";""))) and
+      ($statement |
+        type == "object" and
+        ._type == "https://in-toto.io/Statement/v1" and
+        (.predicateType | type == "string" and length > 0) and
+        (.subject | type == "array" and length == 1) and
+        (.subject[0].name | type == "string" and length > 0) and
+        (.subject[0].digest | type == "object" and
+          (keys | sort) == ["sha256"] and
+          (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+          (.sha256 == $root or .sha256 == $platform)) and
+        (.predicate.buildDefinition.externalParameters.workflow.repository == $repository) and
+        (.predicate.buildDefinition.externalParameters.workflow.ref == $ref) and
+        ([
+          .predicate.buildDefinition.resolvedDependencies[]? |
+          select(.uri? == ("git+" + $repository + "@" + $ref)) |
+          select(.digest.gitCommit? == $source)
+        ] | length == 1) and
+        (.predicate.runDetails.builder.id |
+          type == "string" and
+          startswith($repository + "/.github/workflows/") and
+          endswith("@" + $ref))) and
+      ({
+        subject:("sha256:" + $statement.subject[0].digest.sha256),
+        predicateType:$statement.predicateType,
+        sourceRepository:$repository,
+        sourceDigest:$source,
+        workflow:$statement.predicate.runDetails.builder.id
+      } == {
+        subject:$claim.subject,
+        predicateType:$claim.predicateType,
+        sourceRepository:$claim.sourceRepository,
+        sourceDigest:$claim.sourceDigest,
+        workflow:$claim.workflow
+      }) and
       $certificate.sourceRepositoryURI == $repository and
       $certificate.sourceRepositoryDigest == $source and
       $certificate.sourceRepositoryRef == $ref and

@@ -417,9 +417,35 @@ evaluate_snapshot() {
   local reachability_output closure_output closure_status closure_budget_ms
   local closure_output_file
   local root_count root_tags alias_count alias_digest marker_count digest count
-  local current_count
+  local baseline_rows
 
   validate_snapshot "$current" "fresh"
+
+  baseline_rows=$(jq -c '
+    [.[][] |
+      .name as $digest |
+      .metadata.container.tags as $tags |
+      {id, digest:$digest, tags:([$tags[]] | sort)} |
+      select(any($candidate[]; . == $digest) | not)] |
+    sort_by(.id,.digest)
+  ' --argjson candidate "$INDEX_DIGESTS" "$BEFORE_INVENTORY" | tr -d '\r') ||
+    fail "before-inventory projection failed"
+  current_non_candidate=$(jq -c --argjson candidate "$INDEX_DIGESTS" '
+    [.[][] |
+      .name as $digest |
+      .metadata.container.tags as $tags |
+      {id, digest:$digest, tags:([$tags[]] | sort)} |
+      select(any($candidate[]; . == $digest) | not)] |
+      sort_by(.id,.digest)
+  ' "$current" | tr -d '\r') ||
+    fail "fresh inventory projection failed"
+  jq -n -e \
+    --argjson baseline "$baseline_rows" \
+    --argjson current "$current_non_candidate" '
+    all($baseline[]; . as $expected |
+      any($current[]; . == $expected))
+  ' >/dev/null ||
+    fail "protected or historical package inventory changed during observation"
 
   reachability_output="$PHASE_DIR/.reachable-digests.json"
   closure_output_file="$PHASE_DIR/.reachability-closure.log"
@@ -461,7 +487,7 @@ evaluate_snapshot() {
     [.[][] |
       .name as $digest |
       .metadata.container.tags as $tags |
-      {id, digest:$digest, tags:$tags} |
+      {id, digest:$digest, tags:([$tags[]] | sort)} |
       select(any($candidate[]; . == $digest) | not)] |
     sort_by(.id,.digest)
   ' --argjson candidate "$INDEX_DIGESTS" "$BEFORE_INVENTORY" | tr -d '\r') ||
@@ -474,16 +500,13 @@ evaluate_snapshot() {
     [.[][] |
       .name as $digest |
       .metadata.container.tags as $tags |
-      {id, digest:$digest, tags:$tags} |
+      {id, digest:$digest, tags:([$tags[]] | sort)} |
       select(any($candidate[]; . == $digest) | not)] |
       sort_by(.id,.digest)
   ' "$current" | tr -d '\r') ||
     fail "fresh inventory projection failed"
-  current_count=$(jq -r '[.[][]] | length' "$current" | tr -d '\r') ||
-    fail "fresh inventory cardinality failed"
-  if [ "$current_count" -gt 0 ] && [ "$current_non_candidate" != "$baseline_rows" ]; then
+  [ "$current_non_candidate" = "$baseline_rows" ] ||
     fail "protected or historical package inventory changed during observation"
-  fi
 
   alias_count=$(jq -r --arg alias "$ALIAS" '
     [.[][] | select(any(.metadata.container.tags[]; . == $alias))] | length

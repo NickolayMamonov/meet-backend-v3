@@ -103,9 +103,21 @@ jq -cS -n --arg source "$SOURCE" --arg version "$VERSION" '
 
 jq -cS -n --arg root "$ROOT" --arg source "$SOURCE" '
   [{verificationResult:{
-    statement:{predicateType:"https://slsa.dev/provenance/v1",
+    statement:{_type:"https://in-toto.io/Statement/v1",
+      predicateType:"https://slsa.dev/provenance/v1",
       subject:[{name:"image-index.json",
-        digest:{sha256:($root|sub("^sha256:";""))}}]},
+        digest:{sha256:($root|sub("^sha256:";""))}}],
+      predicate:{buildDefinition:{
+        externalParameters:{workflow:{
+          repository:"https://github.com/NickolayMamonov/meet-backend-v3",
+          ref:"refs/heads/dev"}},
+        resolvedDependencies:[{
+          uri:"git+https://github.com/NickolayMamonov/meet-backend-v3@refs/heads/dev",
+          digest:{gitCommit:$source}
+        }]
+      },runDetails:{builder:{
+        id:"https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/build.yml@refs/heads/dev"
+      }}}},
     signature:{certificate:{
       sourceRepositoryURI:"https://github.com/NickolayMamonov/meet-backend-v3",
       sourceRepositoryDigest:$source,sourceRepositoryRef:"refs/heads/dev",
@@ -310,6 +322,19 @@ if [ "$1" = attestation ] && [ "$2" = verify ]; then
       jq --argjson bundle "$bundle" \
         '.[0].attestation={bundle:($bundle | .dsseEnvelope.signatures[0].sig="different")}' \
         "$FIXTURE_DATA/verified.json" ;;
+    verify-statement-repository-mismatch)
+      jq '. [0].verificationResult.statement.predicate.buildDefinition.externalParameters.workflow.repository =
+        "https://github.com/foreign/repository"' "$FIXTURE_DATA/verified.json" ;;
+    verify-statement-ref-mismatch)
+      jq '. [0].verificationResult.statement.predicate.buildDefinition.externalParameters.workflow.ref =
+        "refs/heads/main"' "$FIXTURE_DATA/verified.json" ;;
+    verify-statement-source-mismatch)
+      jq '. [0].verificationResult.statement.predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit =
+        "ffffffffffffffffffffffffffffffffffffffffffff"' "$FIXTURE_DATA/verified.json" ;;
+    verify-statement-builder-mismatch)
+      jq '. [0].verificationResult.statement.predicate.runDetails.builder.id =
+        "https://github.com/foreign/repository/.github/workflows/build.yml@refs/heads/dev"' \
+        "$FIXTURE_DATA/verified.json" ;;
     *) bundle=$(jq -cS . "$FIXTURE_DATA/bundle.json")
       jq --argjson bundle "$bundle" \
       '.[0].attestation={bundle:$bundle}' "$FIXTURE_DATA/verified.json" ;;
@@ -366,6 +391,10 @@ expect_failure duplicate-attestation run_read duplicate-attestation
 expect_failure valid-plus-foreign run_read valid-plus-foreign
 expect_failure verify-fail run_read verify-fail
 expect_failure verify-bundle-mismatch run_read verify-bundle-mismatch
+expect_failure verify-statement-repository-mismatch run_read verify-statement-repository-mismatch
+expect_failure verify-statement-ref-mismatch run_read verify-statement-ref-mismatch
+expect_failure verify-statement-source-mismatch run_read verify-statement-source-mismatch
+expect_failure verify-statement-builder-mismatch run_read verify-statement-builder-mismatch
 expect_failure child-error run_read child-error
 expect_failure child-mismatch run_read child-mismatch
 

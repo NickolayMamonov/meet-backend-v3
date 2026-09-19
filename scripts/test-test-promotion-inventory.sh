@@ -154,6 +154,27 @@ jq -e --arg root "$ROOT_DIGEST" --arg alias "$ALIAS" '
 ' "$PHASE/registry-inventory.json" >/dev/null
 [ ! -s "$TMP/sleeps" ]
 
+# Provider tag ordering is not mutation. Noncandidate accounting compares a
+# canonical tag set rather than the raw response order.
+TAG_ORDER_BEFORE=$TMP/tag-order-before.json
+TAG_ORDER_RESPONSE=$TMP/tag-order-response.json
+jq '.[0][0].metadata.container.tags = ["latest","v1.0.0"]' \
+  "$BEFORE" >"$TAG_ORDER_BEFORE"
+jq '.[0][0].metadata.container.tags = ["v1.0.0","latest"]' \
+  "$RESPONSE" >"$TAG_ORDER_RESPONSE"
+TAG_ORDER_OUTPUT=$TMP/tag-order-output
+mkdir -p "$TAG_ORDER_OUTPUT"
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_RESPONSE=$TAG_ORDER_RESPONSE \
+  SLEEP_LOG=$TMP/sleeps \
+  "$READER" --image "$IMAGE" --alias "$ALIAS" \
+  --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
+  --index-file "$INDEX_WORK" --before-inventory "$TAG_ORDER_BEFORE" \
+  --protected-state "$PROTECTED" --require-signature false \
+  --output-dir "$TAG_ORDER_OUTPUT" >/dev/null
+TAG_ORDER_PHASE=$(find "$TAG_ORDER_OUTPUT" -mindepth 1 -maxdepth 1 \
+  -type d -name 'test-promotion-inventory.*' | head -1)
+[ -n "$TAG_ORDER_PHASE" ] && [ -s "$TAG_ORDER_PHASE/package-versions.json" ]
+
 # A marker-root index may expose a nested signature manifest that has no
 # package tag of its own. The nested row is still part of the candidate
 # closure and must converge inside the same bounded inventory operation.
@@ -308,10 +329,11 @@ PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_SEQUENCE_DIR=$MARKER_SEQUENCE \
 [ "$(tr -d '[:space:]' <"$TMP/marker-count")" -eq 5 ]
 [ "$(wc -l <"$TMP/sleeps" | tr -d '[:space:]')" -eq 4 ]
 
-# A complete empty snapshot is valid, but missing candidate visibility is the
-# sole retryable result.
+# A complete snapshot containing only the unchanged baseline is valid, but
+# missing candidate visibility is the sole retryable result.
 EMPTY=$TMP/empty.json
-jq -n '[[]]' >"$EMPTY"
+jq --arg protected "$PROTECTED_DIGEST" \
+  '[[.[][] | select(.name == $protected)]]' "$BEFORE" >"$EMPTY"
 
 # The fifth complete read is allowed to converge, with exactly four bounded
 # delays and no page mixing across attempts.
@@ -350,6 +372,29 @@ set -e
 [ "$STATUS" -eq 75 ]
 [ "$(wc -l <"$TMP/sleeps" | tr -d '[:space:]')" -eq 4 ]
 [ "$(find "$TMP" -mindepth 1 -maxdepth 1 -type d -name 'test-promotion-inventory.*' | wc -l | tr -d '[:space:]')" -eq 1 ]
+
+# A complete empty snapshot that deletes an immutable baseline row is
+# terminal, not candidate visibility lag, and must consume exactly one read.
+DELETED_EMPTY=$TMP/empty-with-baseline-deletion.json
+jq -n '[[]]' >"$DELETED_EMPTY"
+DELETED_SEQUENCE=$TMP/empty-deletion-sequence
+mkdir -p "$DELETED_SEQUENCE"
+cp -- "$DELETED_EMPTY" "$DELETED_SEQUENCE/1.json"
+printf '0\n' >"$TMP/deleted-count"
+rm -f "$TMP/sleeps"
+set +e
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_SEQUENCE_DIR=$DELETED_SEQUENCE \
+  GH_COUNT_FILE=$TMP/deleted-count SLEEP_LOG=$TMP/sleeps \
+  "$READER" --image "$IMAGE" --alias "$ALIAS" \
+  --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
+  --index-file "$INDEX_WORK" --before-inventory "$BEFORE" \
+  --protected-state "$PROTECTED" --require-signature false \
+  --output-dir "$TMP" >/dev/null 2>&1
+DELETED_STATUS=$?
+set -e
+[ "$DELETED_STATUS" -eq 1 ]
+[ "$(tr -d '[:space:]' <"$TMP/deleted-count")" -eq 1 ]
+[ ! -e "$TMP/sleeps" ]
 
 # An API error and malformed page stream are terminal and must not consume a
 # retry or sleep.
