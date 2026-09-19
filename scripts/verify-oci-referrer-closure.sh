@@ -419,6 +419,7 @@ validate_node() {
   local digest=$1 inherited_subject=$2 depth=$3 allow_inherited=$4
   local expected_size=${5:-} expected_media=${6:-}
   local file media descriptor child child_media child_size declared_subject subject_descriptor
+  declared_subject=
   [ "$depth" -le 8 ] || fail "OCI referrer graph exceeds the verification bound"
   file=$WORK_DIR/node-${digest#sha256:}.json
   fetch_raw "$digest" "$file" "$expected_size" "$expected_media"
