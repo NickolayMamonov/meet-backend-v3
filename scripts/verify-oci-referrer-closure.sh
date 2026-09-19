@@ -21,6 +21,7 @@ OUTPUT=
 PROMOTION_BASELINE=
 PROMOTION_PROTECTED=
 CANDIDATE_ALIAS=
+REQUIRE_SIGNATURE=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --image) [ "$#" -ge 2 ] || usage; IMAGE=$2; shift 2 ;;
@@ -33,6 +34,7 @@ while [ "$#" -gt 0 ]; do
     --promotion-baseline-file) [ "$#" -ge 2 ] || usage; PROMOTION_BASELINE=$2; shift 2 ;;
     --protected-state-file) [ "$#" -ge 2 ] || usage; PROMOTION_PROTECTED=$2; shift 2 ;;
     --candidate-alias) [ "$#" -ge 2 ] || usage; CANDIDATE_ALIAS=$2; shift 2 ;;
+    --require-signature) [ "$#" -ge 2 ] || usage; REQUIRE_SIGNATURE=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -50,6 +52,9 @@ command -v jq >/dev/null 2>&1 || fail "jq is required"
     [[ "$CANDIDATE_ALIAS" =~ ^test-sha-[0-9a-f]{40}$ ]] ||
     usage
 }
+[ "$REQUIRE_SIGNATURE" = true ] || [ "$REQUIRE_SIGNATURE" = false ] || usage
+[ "sha256:$(sha256sum -- "$INDEX_FILE" | awk '{print $1}')" = "$SUBJECT_DIGEST" ] ||
+  fail "selected OCI index bytes do not match the subject digest"
 PROMOTION=false
 [ -z "$PROMOTION_BASELINE" ] || PROMOTION=true
 
@@ -108,7 +113,7 @@ validate_descriptor() {
     (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
     ($expected == "" or .digest == $expected) and
     (.mediaType | type == "string" and length > 0) and
-    (.size | type == "number" and floor == . and . >= 0)
+    (.size | type == "number" and floor == . and . > 0)
   ' <<<"$descriptor" >/dev/null ||
     fail "OCI descriptor is malformed"
 }
@@ -190,18 +195,26 @@ while IFS= read -r digest; do
 done <"$REFERRERS"
 
 fetch_raw() {
-  local digest=$1 destination=$2
+  local digest=$1 destination=$2 expected_size=${3:-} expected_media=${4:-}
   if [ -n "$FIXTURE_DIR" ]; then
     local fixture="$FIXTURE_DIR/${digest#sha256:}.json"
     [ -f "$fixture" ] || fail "OCI child manifest is missing"
-    jq -c . "$fixture" >"$destination" ||
-      fail "OCI child manifest is malformed"
+    cp -- "$fixture" "$destination" ||
+      fail "OCI child manifest could not be copied"
   else
     docker buildx imagetools inspect --raw "$IMAGE@$digest" >"$destination" ||
       fail "OCI child manifest lookup failed"
   fi
   jq -e 'type == "object"' "$destination" >/dev/null ||
     fail "OCI child response is not a JSON object"
+  [ "sha256:$(sha256sum -- "$destination" | awk '{print $1}')" = "$digest" ] ||
+    fail "OCI child bytes do not match its descriptor digest"
+  actual_size=$(wc -c <"$destination" | tr -d '[:space:]')
+  [ -z "$expected_size" ] || [ "$actual_size" -eq "$expected_size" ] ||
+    fail "OCI child bytes do not match its descriptor size"
+  actual_media=$(jq -r '.mediaType // empty' "$destination")
+  [ -z "$expected_media" ] || [ "$actual_media" = "$expected_media" ] ||
+    fail "OCI child media type does not match its descriptor"
 }
 
 REACHABLE=$WORK_DIR/reachable
@@ -215,7 +228,8 @@ mark_reachable() {
 }
 
 collect_reachable() {
-  local digest=$1 depth=$2 file media descriptor child child_media
+  local digest=$1 depth=$2 expected_size=${3:-} expected_media=${4:-}
+  local file media descriptor child child_media child_size
   [ "$depth" -le 8 ] || fail "OCI referrer graph exceeds the verification bound"
   validate_digest "$digest"
   mark_reachable "$digest"
@@ -224,7 +238,7 @@ collect_reachable() {
   fi
   printf '%s\n' "$digest" >>"$VISITED"
   file=$WORK_DIR/node-${digest#sha256:}.json
-  fetch_raw "$digest" "$file"
+  fetch_raw "$digest" "$file" "$expected_size" "$expected_media"
   media=$(jq -r '.mediaType // empty' "$file")
   case "$media" in
     application/vnd.oci.image.index.v1+json)
@@ -236,12 +250,13 @@ collect_reachable() {
         validate_descriptor "$descriptor"
         child=$(jq -r '.digest' <<<"$descriptor")
         child_media=$(jq -r '.mediaType' <<<"$descriptor")
+        child_size=$(jq -r '.size' <<<"$descriptor")
         case "$child_media" in
           application/vnd.oci.image.manifest.v1+json|\
           application/vnd.oci.image.index.v1+json) ;;
           *) fail "reachable OCI child media type is foreign" ;;
         esac
-        collect_reachable "$child" "$((depth + 1))"
+        collect_reachable "$child" "$((depth + 1))" "$child_size" "$child_media"
       done < <(jq -c '.manifests[]' "$file")
       ;;
     application/vnd.oci.image.manifest.v1+json)
@@ -271,10 +286,18 @@ fi
 
 mark_reachable "$SUBJECT_DIGEST"
 mark_reachable "$PLATFORM_SUBJECT"
-collect_reachable "$PLATFORM_SUBJECT" 0
+platform_descriptor=$(jq -c --arg digest "$PLATFORM_SUBJECT" \
+  '.manifests[] | select(.digest == $digest)' "$INDEX_FILE")
+collect_reachable "$PLATFORM_SUBJECT" 0 \
+  "$(jq -r '.size' <<<"$platform_descriptor")" \
+  "$(jq -r '.mediaType' <<<"$platform_descriptor")"
 while IFS= read -r digest; do
   mark_reachable "$digest"
-  collect_reachable "$digest" 0
+  referrer_descriptor=$(jq -c --arg digest "$digest" \
+    '.manifests[] | select(.digest == $digest)' "$INDEX_FILE")
+  collect_reachable "$digest" 0 \
+    "$(jq -r '.size' <<<"$referrer_descriptor")" \
+    "$(jq -r '.mediaType' <<<"$referrer_descriptor")"
 done <"$REFERRERS"
 if [ -n "$MARKER_ROOT" ] &&
    ! grep -Fqx "$MARKER_ROOT" "$REACHABLE"; then
@@ -357,10 +380,11 @@ validate_image_manifest() {
 
 validate_node() {
   local digest=$1 inherited_subject=$2 depth=$3 allow_inherited=$4
-  local file media descriptor child child_media declared_subject
+  local expected_size=${5:-} expected_media=${6:-}
+  local file media descriptor child child_media child_size declared_subject
   [ "$depth" -le 8 ] || fail "OCI referrer graph exceeds the verification bound"
   file=$WORK_DIR/node-${digest#sha256:}.json
-  fetch_raw "$digest" "$file"
+  fetch_raw "$digest" "$file" "$expected_size" "$expected_media"
   media=$(jq -r '.mediaType // empty' "$file")
   case "$media" in
     application/vnd.oci.image.index.v1+json)
@@ -380,13 +404,14 @@ validate_node() {
         validate_descriptor "$descriptor"
         child=$(jq -r '.digest' <<<"$descriptor")
         child_media=$(jq -r '.mediaType' <<<"$descriptor")
+        child_size=$(jq -r '.size' <<<"$descriptor")
         case "$child_media" in
           application/vnd.oci.image.manifest.v1+json|\
           application/vnd.oci.image.index.v1+json) ;;
           *) fail "nested OCI child media type is foreign" ;;
         esac
         validate_node "$child" "$inherited_subject" "$((depth + 1))" \
-          "$allow_inherited"
+          "$allow_inherited" "$child_size" "$child_media"
       done < <(jq -c '.manifests[]' "$file")
       ;;
     application/vnd.oci.image.manifest.v1+json)
@@ -431,7 +456,12 @@ validate_node() {
           *) fail "OCI referrer predicate is not provenance or SBOM" ;;
         esac
         if [ "$child_media" = "application/vnd.dev.sigstore.bundle.v0.3+json" ]; then
+          [ "$(jq -r '.artifactType // empty' "$file")" = \
+            "application/vnd.dev.sigstore.bundle.v0.3+json" ] ||
+            fail "OCI signature node artifact type is missing"
+          [ -n "$declared_subject" ] || fail "OCI signature node has no subject"
           NODE_SIGNATURE=1
+          SIGNATURE_FOUND=1
         fi
       done < <(jq -c '.layers[]' "$file")
       ;;
@@ -443,6 +473,7 @@ NODE_BOUND=0
 NODE_PROVENANCE=0
 NODE_SBOM=0
 NODE_SIGNATURE=0
+SIGNATURE_FOUND=0
 
 while IFS= read -r digest; do
   NODE_PROVENANCE=0
@@ -453,17 +484,25 @@ while IFS= read -r digest; do
   kind=
   if [ "$digest" = "$PLATFORM_SUBJECT" ]; then
     platform_file=$WORK_DIR/platform-${digest#sha256:}.json
-    fetch_raw "$digest" "$platform_file"
+    platform_size=$(jq -er --arg digest "$digest" \
+      '.manifests[] | select(.digest == $digest) | .size' "$INDEX_FILE")
+    platform_media=$(jq -er --arg digest "$digest" \
+      '.manifests[] | select(.digest == $digest) | .mediaType' "$INDEX_FILE")
+    fetch_raw "$digest" "$platform_file" "$platform_size" "$platform_media"
     validate_image_manifest "$platform_file"
     NODE_BOUND=1
     kind=subject
     subject=$SUBJECT_DIGEST
   elif grep -Fqx "$digest" "$REFERRERS"; then
+    referrer_size=$(jq -er --arg digest "$digest" \
+      '.manifests[] | select(.digest == $digest) | .size' "$INDEX_FILE")
+    referrer_media=$(jq -er --arg digest "$digest" \
+      '.manifests[] | select(.digest == $digest) | .mediaType' "$INDEX_FILE")
     subject=$(jq -r --arg digest "$digest" '
       .manifests[] | select(.digest == $digest) |
       .annotations["vnd.docker.reference.digest"]
     ' "$INDEX_FILE")
-    validate_node "$digest" "$subject" 0 1
+    validate_node "$digest" "$subject" 0 1 "$referrer_size" "$referrer_media"
   elif [ "$digest" = "$MARKER_ROOT" ]; then
     validate_node "$digest" "$SUBJECT_DIGEST" 0 0
   else
@@ -495,6 +534,10 @@ while IFS= read -r digest; do
       verified:true,subject:$subject,platformSubject:$platform,kind:$kind
     }}' >>"$ATTRIBUTIONS"
 done <"$INVENTORY_DIGESTS"
+
+if [ "$REQUIRE_SIGNATURE" = true ] && [ "$SIGNATURE_FOUND" -ne 1 ]; then
+  fail "required subject-bound OCI signature node is missing"
+fi
 
 jq \
   --slurpfile attrs "$ATTRIBUTIONS" \

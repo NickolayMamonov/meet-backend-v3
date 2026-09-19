@@ -197,6 +197,204 @@ extract_run_block() {
   [ -s "$output" ]
 }
 
+assert_step_token_binding() {
+  local workflow=$1 marker=$2 expected=$3
+  local binding
+  binding=$(awk -v marker="$marker" '
+    $0 == marker {
+      in_step=1
+      next
+    }
+    in_step && /^      - / {
+      exit
+    }
+    in_step && /^          GH_TOKEN: / {
+      print
+      found++
+    }
+    END {
+      if (found > 1) exit 2
+    }
+  ' "$workflow")
+  if [ "$expected" = true ]; then
+    [ "$binding" = '          GH_TOKEN: ${{ github.token }}' ] || {
+      echo "credential contract: $marker is missing the explicit github.token binding" >&2
+      return 1
+    }
+  else
+    [ -z "$binding" ] || {
+      echo "credential mutant: $marker retained the github.token binding" >&2
+      return 1
+    }
+  fi
+}
+
+remove_identity_token_binding() {
+  local source=$1 output=$2
+  awk '
+    $0 == "      - name: Verify signed OCI attestation identity" {
+      in_identity=1
+    }
+    in_identity && /^      - / && $0 != "      - name: Verify signed OCI attestation identity" {
+      in_identity=0
+    }
+    in_identity && $0 == "          GH_TOKEN: ${{ github.token }}" {
+      next
+    }
+    { print }
+  ' "$source" >"$output"
+}
+
+make_credential_fixture() {
+  local root=$1
+  mkdir -p "$root/bin" "$root/home" "$root/gh-config" "$root/runner-temp" \
+    "$root/workspace/scripts"
+  cat >"$root/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${GH_TOKEN:-}" = fixture-token ] || {
+  printf '%s\n' gh-token-rejected >>"${CREDENTIAL_EVENTS:?}"
+  exit 91
+}
+[ "$#" -eq 7 ] || exit 92
+[ "$1" = attestation ] && [ "$2" = verify ] || exit 93
+case "$3" in
+  oci://example/meet-backend@sha256:*) ;;
+  *) exit 94 ;;
+esac
+[ "$4" = --repo ] && [ "$5" = example/meet-backend ] || exit 95
+[ "$6" = --source-digest ] && [ "$7" = 0123456789abcdef0123456789abcdef01234567 ] || exit 96
+printf 'identity-%s\n' "${ADMISSION_MODE:?}" >>"${CREDENTIAL_EVENTS:?}"
+EOF
+  chmod 755 "$root/bin/gh"
+  cat >"$root/workspace/scripts/admit-test-image.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = verify ] || exit 90
+printf 'admission-%s\n' "${ADMISSION_MODE:?}" >>"${CREDENTIAL_EVENTS:?}"
+EOF
+  chmod 755 "$root/workspace/scripts/admit-test-image.sh"
+  cat >"$root/workspace/scripts/collect-test-promotion-protected-state.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) output=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$output" ]
+printf '%s\n' '{"fixture":"protected"}' >"$output"
+EOF
+  chmod 755 "$root/workspace/scripts/collect-test-promotion-protected-state.sh"
+  cat >"$root/workspace/scripts/capture-test-promotion-protected-state.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+input=
+output=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --input) input=$2; shift 2 ;;
+    --output) output=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -f "$input" ] && [ -n "$output" ]
+cp -- "$input" "$output"
+printf 'protected-%s\n' "${ADMISSION_MODE:?}" >>"${CREDENTIAL_EVENTS:?}"
+EOF
+  chmod 755 "$root/workspace/scripts/capture-test-promotion-protected-state.sh"
+  printf '%s\n' '{"fixture":"protected"}' >"$root/runner-temp/protected-before.json"
+  printf '%s\n' publication-confirmed >"$root/journal-facts"
+}
+
+run_credential_identity_step() {
+  local workflow=$1 root=$2 block=$3 mode=$4
+  local status
+  local -a token_env=()
+  extract_run_block "$workflow" \
+    '      - name: Verify signed OCI attestation identity' "$block"
+  if awk '
+    $0 == "      - name: Verify signed OCI attestation identity" {
+      in_step=1
+      next
+    }
+    in_step && /^      - / { exit }
+    in_step && $0 == "          GH_TOKEN: ${{ github.token }}" { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$workflow"; then
+    token_env=(GH_TOKEN=fixture-token)
+  fi
+  set +e
+  (
+    cd "$root/workspace"
+    env -i \
+      HOME="$root/home" GH_CONFIG_DIR="$root/gh-config" \
+      PATH="$root/bin:$REAL_PATH" \
+      IMAGE=example/meet-backend \
+      ROOT_DIGEST=sha256:1111111111111111111111111111111111111111111111111111111111111111 \
+      SOURCE_SHA=0123456789abcdef0123456789abcdef01234567 \
+      GITHUB_REPOSITORY=example/meet-backend \
+      "${token_env[@]}" \
+      ADMISSION_MODE="$mode" CREDENTIAL_EVENTS="$root/events" \
+      "$BASH" "$block"
+  )
+  status=$?
+  set -e
+  return "$status"
+}
+
+run_credential_post_identity_steps() {
+  local workflow=$1 root=$2 final_block=$3 protected_block=$4 mode=$5
+  extract_run_block "$workflow" '      - name: Read-only image admission' "$final_block"
+  extract_run_block "$workflow" \
+    '      - name: Capture protected registry state after admission' "$protected_block"
+  (
+    cd "$root/workspace"
+    env -i \
+      HOME="$root/home" GH_CONFIG_DIR="$root/gh-config" \
+      PATH="$root/bin:$REAL_PATH" \
+      IMAGE=example/meet-backend \
+      ROOT_DIGEST=sha256:1111111111111111111111111111111111111111111111111111111111111111 \
+      PLATFORM_DIGEST=sha256:2222222222222222222222222222222222222222222222222222222222222222 \
+      SOURCE_SHA=0123456789abcdef0123456789abcdef01234567 \
+      VERSION=1.4.0 GITHUB_REPOSITORY=example/meet-backend \
+      GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/dev \
+      GITHUB_SHA=0123456789abcdef0123456789abcdef01234567 \
+      RUNNER_TEMP="$root/runner-temp" GH_TOKEN=fixture-token \
+      ADMISSION_MODE="$mode" CREDENTIAL_EVENTS="$root/events" \
+      "$BASH" "$final_block"
+  )
+  (
+    cd "$root/workspace"
+    env -i \
+      HOME="$root/home" GH_CONFIG_DIR="$root/gh-config" \
+      PATH="$root/bin:$REAL_PATH" \
+      IMAGE=example/meet-backend \
+      SOURCE_SHA=0123456789abcdef0123456789abcdef01234567 \
+      GITHUB_REPOSITORY=example/meet-backend \
+      RUNNER_TEMP="$root/runner-temp" GH_TOKEN=fixture-token \
+      ADMISSION_MODE="$mode" CREDENTIAL_EVENTS="$root/events" \
+      "$BASH" "$protected_block"
+  )
+}
+
+credential_step_contract() {
+  local workflow=$1 root=$2 mode=$3 identity_block=$4 final_block=$5 protected_block=$6
+  : >"$root/events"
+  if ! run_credential_identity_step "$workflow" "$root" "$identity_block" "$mode"; then
+    echo "credential fixture: signed identity failed on $mode positive path" >&2
+    return 1
+  fi
+  run_credential_post_identity_steps "$workflow" "$root" "$final_block" \
+    "$protected_block" "$mode"
+  grep -Fxq "identity-$mode" "$root/events"
+  grep -Fxq "admission-$mode" "$root/events"
+  grep -Fxq "protected-$mode" "$root/events"
+  ! grep -Eq '^(build|copy|sign|deploy)$' "$root/events"
+}
+
 workflow_contract() {
   local workflow=$1
   local block=$2
@@ -549,6 +747,56 @@ mkdir -p "$TEST_ROOT/workspace" "$TEST_ROOT/runner-temp"
 provision_block="$TEST_ROOT/provision.sh"
 workflow_metadata="$TEST_ROOT/steps.tsv"
 workflow_contract "$WORKFLOW" "$provision_block" "$workflow_metadata"
+
+for token_step in \
+  '      - id: protected-before' \
+  '      - id: publish' \
+  '      - id: fresh-inventory' \
+  '      - id: observed' \
+  '      - id: final-inventory' \
+  '      - id: final-observed' \
+  '      - name: Verify signed OCI attestation identity' \
+  '      - name: Read-only image admission' \
+  '      - name: Capture protected registry state after admission'; do
+  assert_step_token_binding "$WORKFLOW" "$token_step" true
+done
+
+credential_root="$TEST_ROOT/credential-fixture"
+make_credential_fixture "$credential_root"
+credential_identity="$TEST_ROOT/credential-identity.sh"
+credential_final="$TEST_ROOT/credential-final.sh"
+credential_protected="$TEST_ROOT/credential-protected.sh"
+extract_run_block "$WORKFLOW" \
+  '      - name: Verify signed OCI attestation identity' "$credential_identity"
+extract_run_block "$WORKFLOW" \
+  '      - name: Read-only image admission' "$credential_final"
+extract_run_block "$WORKFLOW" \
+  '      - name: Capture protected registry state after admission' \
+  "$credential_protected"
+for credential_mode in published reused; do
+  credential_step_contract "$WORKFLOW" "$credential_root" "$credential_mode" \
+    "$credential_identity" "$credential_final" "$credential_protected"
+done
+
+identity_token_mutant="$TEST_ROOT/workflow-without-identity-token.yml"
+remove_identity_token_binding "$WORKFLOW" "$identity_token_mutant"
+assert_step_token_binding "$identity_token_mutant" \
+  '      - name: Verify signed OCI attestation identity' false
+for credential_mode in published reused; do
+  : >"$credential_root/events"
+  journal_hash=$(sha256sum "$credential_root/journal-facts" | awk '{print $1}')
+  if run_credential_identity_step "$identity_token_mutant" "$credential_root" \
+    "$credential_identity" "$credential_mode"; then
+    echo "credential mutant: missing identity token unexpectedly passed" >&2
+    exit 1
+  fi
+  grep -Fxq gh-token-rejected "$credential_root/events"
+  ! grep -Eq '^(identity|admission|protected)-' "$credential_root/events"
+  ! grep -Fq fixture-token "$credential_root/events"
+  [ "$(sha256sum "$credential_root/journal-facts" | awk '{print $1}')" = "$journal_hash" ]
+done
+echo "credential fixtures passed: published/reused identity admission and removed-binding rejection"
+
 fixture_sha=$(awk '{print $1}' "$TEST_ROOT/fixture/archive.sha256")
 fixture_block="$TEST_ROOT/provision-fixture.sh"
 sed "s/^oras_sha256=.*/oras_sha256=$fixture_sha/" "$provision_block" >"$fixture_block"
@@ -705,12 +953,12 @@ move_provision_after() {
   local without_provision="$TEST_ROOT/workflow-without-provision.yml"
   awk '
     $0 == "      - id: provision-oras" { in_step=1 }
-    in_step && $0 == "      - name: Capture protected registry state before any writer" { exit }
+    in_step && $0 == "      - id: protected-before" { exit }
     in_step { print }
   ' "$source" >"$provision_block"
   awk '
     $0 == "      - id: provision-oras" { in_step=1; next }
-    in_step && $0 == "      - name: Capture protected registry state before any writer" { in_step=0 }
+    in_step && $0 == "      - id: protected-before" { in_step=0 }
     !in_step { print }
   ' "$source" >"$without_provision"
   awk -v marker="$target_marker" -v block="$provision_block" '
@@ -743,14 +991,14 @@ for mutation in duplicate missing bypass after-publish after-attestation; do
   cp -- "$WORKFLOW" "$workflow_mutant"
   case "$mutation" in
     duplicate) sed '/^      - id: provision-oras$/a\      - id: provision-oras' "$workflow_mutant" >"$workflow_mutant.tmp" ;;
-    missing) sed '/^      - id: provision-oras$/,/^      - name: Capture protected registry state before any writer$/d' "$workflow_mutant" >"$workflow_mutant.tmp" ;;
+    missing) sed '/^      - id: provision-oras$/,/^      - id: protected-before$/d' "$workflow_mutant" >"$workflow_mutant.tmp" ;;
     bypass) sed '/^        timeout-minutes: 5$/a\        continue-on-error: true' "$workflow_mutant" >"$workflow_mutant.tmp" ;;
     after-publish)
       move_provision_after "$workflow_mutant" '      - id: publish' "$workflow_mutant.tmp"
       ;;
     after-attestation)
       move_provision_after "$workflow_mutant" \
-        '      - name: Create signed OCI attestation for a first-time alias' \
+        '        name: Create signed OCI attestation for a first-time alias' \
         "$workflow_mutant.tmp"
       ;;
   esac
@@ -852,6 +1100,7 @@ sed -i \
   -e 's/\${{ needs\.admit-image\.outputs\.registry_publication }}/unknown/g' \
   -e 's/\${{ needs\.admit-image\.outputs\.attestation_write }}/unknown/g' \
   -e 's/\${{ needs\.admit-image\.outputs\.initial_alias_state }}/unknown/g' \
+  -e 's/\${{ needs\.deploy\.result }}/skipped/g' \
   -e 's/\${{ needs\.deploy\.outputs\.mutation_started }}/false/g' \
   -e 's/\${{ needs\.deploy\.outputs\.rollback_attempted }}/false/g' \
   -e 's/\${{ needs\.deploy\.outputs\.rollback_verified }}/false/g' \

@@ -181,6 +181,7 @@ jobs:
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           VERSION: ${{ needs.authorize.outputs.version }}
+          TREE_ID: ${{ needs.authorize.outputs.tree_id }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -211,6 +212,8 @@ jobs:
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           VERSION: ${{ needs.authorize.outputs.version }}
+          TREE_ID: ${{ needs.authorize.outputs.tree_id }}
+          STATE_MODE: ${{ inputs.state_mode }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -287,7 +290,7 @@ jobs:
             scripts/verify-test-promotion-publication.sh create \
               --image "$IMAGE" \
               --source-sha "$SOURCE_SHA" \
-              --tree-id "${{ needs.authorize.outputs.tree_id }}" \
+              --tree-id "$TREE_ID" \
               --version "$VERSION" \
               --run-id "$GITHUB_RUN_ID" \
               --run-attempt "$GITHUB_RUN_ATTEMPT" \
@@ -326,7 +329,7 @@ jobs:
           printf 'root_digest=%s\n' "$root_digest" >> "$GITHUB_OUTPUT"
           printf 'platform_digest=%s\n' "$platform_digest" >> "$GITHUB_OUTPUT"
           printf 'admission_mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
-          printf 'state_mode=%s\n' "${{ inputs.state_mode }}" >> "$GITHUB_OUTPUT"
+          printf 'state_mode=%s\n' "$STATE_MODE" >> "$GITHUB_OUTPUT"
           if [ "$mode" = published ]; then
             printf 'publication_proof=%s\n' "$publication_proof" >> "$GITHUB_OUTPUT"
             printf 'publication_proof_sha=%s\n' "$publication_proof_sha" >> "$GITHUB_OUTPUT"
@@ -337,18 +340,21 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          ROOT_DIGEST: ${{ steps.publish.outputs.root_digest }}
+          PLATFORM_DIGEST: ${{ steps.publish.outputs.platform_digest }}
+          ADMISSION_MODE: ${{ steps.publish.outputs.admission_mode }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           require_signature=false
-          if [ "${{ steps.publish.outputs.admission_mode }}" = reused ]; then
+          if [ "$ADMISSION_MODE" = reused ]; then
             require_signature=true
           fi
           fresh_info=$(scripts/read-test-promotion-inventory.sh \
             --image "$IMAGE" \
             --alias "test-sha-$SOURCE_SHA" \
-            --subject-digest "${{ steps.publish.outputs.root_digest }}" \
-            --platform-subject "${{ steps.publish.outputs.platform_digest }}" \
+            --subject-digest "$ROOT_DIGEST" \
+            --platform-subject "$PLATFORM_DIGEST" \
             --index-file "$RUNNER_TEMP/test-image-index.json" \
             --before-inventory "$RUNNER_TEMP/protected-package-versions.json" \
             --protected-state "$RUNNER_TEMP/protected-before.json" \
@@ -366,17 +372,20 @@ jobs:
             --image "$IMAGE" \
             --index-file "$RUNNER_TEMP/test-image-index.json" \
             --inventory-file "$(awk -F= '$1 == "package_versions_file" {print substr($0, index($0, "=") + 1)}' <<<"$fresh_info")" \
-            --subject-digest "${{ steps.publish.outputs.root_digest }}" \
-            --platform-subject "${{ steps.publish.outputs.platform_digest }}" \
+            --subject-digest "$ROOT_DIGEST" \
+            --platform-subject "$PLATFORM_DIGEST" \
             --promotion-baseline-file "$RUNNER_TEMP/protected-package-versions.json" \
             --protected-state-file "$RUNNER_TEMP/protected-before.json" \
-            --candidate-alias "test-sha-$SOURCE_SHA" >/dev/null
+            --candidate-alias "test-sha-$SOURCE_SHA" \
+            --require-signature "$require_signature" >/dev/null
       - id: observed
         name: Capture observed source-bound image admission
         timeout-minutes: 5
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          ROOT_DIGEST: ${{ steps.publish.outputs.root_digest }}
+          PLATFORM_DIGEST: ${{ steps.publish.outputs.platform_digest }}
           VERSION: ${{ needs.authorize.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -384,8 +393,8 @@ jobs:
           bash scripts/admit-test-image.sh inspect \
             --source "$SOURCE_SHA" --version "$VERSION" \
             --alias "test-sha-$SOURCE_SHA" \
-            --expected-root-digest "${{ steps.publish.outputs.root_digest }}" \
-            --expected-platform-digest "${{ steps.publish.outputs.platform_digest }}" \
+            --expected-root-digest "$ROOT_DIGEST" \
+            --expected-platform-digest "$PLATFORM_DIGEST" \
             --input-command scripts/read-test-image-state.sh \
             --output "$RUNNER_TEMP/observed-reader-before-signature.json"
       - id: publication-proof
@@ -395,13 +404,18 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          TREE_ID: ${{ needs.authorize.outputs.tree_id }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+          PUBLICATION_PROOF: ${{ steps.publish.outputs.publication_proof }}
+          PUBLICATION_PROOF_SHA: ${{ steps.publish.outputs.publication_proof_sha }}
+          CANDIDATE_INVENTORY: ${{ steps.fresh-inventory.outputs.registry_inventory_file }}
         run: |
           set -euo pipefail
           bash scripts/verify-test-promotion-publication.sh verify \
-            --proof "${{ steps.publish.outputs.publication_proof }}" \
-            --expected-proof-sha256 "${{ steps.publish.outputs.publication_proof_sha }}" \
+            --proof "$PUBLICATION_PROOF" \
+            --expected-proof-sha256 "$PUBLICATION_PROOF_SHA" \
             --index-file "$RUNNER_TEMP/test-image-index.json" \
-            --candidate-inventory "${{ steps.fresh-inventory.outputs.registry_inventory_file }}" \
+            --candidate-inventory "$CANDIDATE_INVENTORY" \
             --observed-reader "$RUNNER_TEMP/observed-reader-before-signature.json" \
             --registry-journal "$REGISTRY_STATE" \
             --before-inventory "$RUNNER_TEMP/protected-package-versions.json" \
@@ -409,8 +423,8 @@ jobs:
             --layout-proof "$RUNNER_TEMP/layout-proof.json" \
             --image "$IMAGE" \
             --source-sha "$SOURCE_SHA" \
-            --tree-id "${{ needs.authorize.outputs.tree_id }}" \
-            --version "${{ needs.authorize.outputs.version }}" \
+            --tree-id "$TREE_ID" \
+            --version "$VERSION" \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT"
       - name: Mark signer intent for a first-time alias
@@ -439,9 +453,10 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          ADMISSION_MODE: ${{ steps.publish.outputs.admission_mode }}
         run: |
           set -euo pipefail
-          if [ "${{ steps.publish.outputs.admission_mode }}" = published ]; then
+          if [ "$ADMISSION_MODE" = published ]; then
             bash scripts/record-test-promotion-registry-state.sh confirm \
               --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
               --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
@@ -454,15 +469,19 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          ROOT_DIGEST: ${{ steps.publish.outputs.root_digest }}
+          PLATFORM_DIGEST: ${{ steps.publish.outputs.platform_digest }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE@$ROOT_DIGEST" --raw \
+            >"$RUNNER_TEMP/test-image-index-after-signature.json"
           fresh_info=$(scripts/read-test-promotion-inventory.sh \
             --image "$IMAGE" \
             --alias "test-sha-$SOURCE_SHA" \
-            --subject-digest "${{ steps.publish.outputs.root_digest }}" \
-            --platform-subject "${{ steps.publish.outputs.platform_digest }}" \
-            --index-file "$RUNNER_TEMP/test-image-index.json" \
+            --subject-digest "$ROOT_DIGEST" \
+            --platform-subject "$PLATFORM_DIGEST" \
+            --index-file "$RUNNER_TEMP/test-image-index-after-signature.json" \
             --before-inventory "$RUNNER_TEMP/protected-package-versions.json" \
             --protected-state "$RUNNER_TEMP/protected-before.json" \
             --require-signature true \
@@ -477,13 +496,14 @@ jobs:
           done <<<"$fresh_info"
           scripts/verify-oci-referrer-closure.sh \
             --image "$IMAGE" \
-            --index-file "$RUNNER_TEMP/test-image-index.json" \
+            --index-file "$RUNNER_TEMP/test-image-index-after-signature.json" \
             --inventory-file "$(awk -F= '$1 == "package_versions_file" {print substr($0, index($0, "=") + 1)}' <<<"$fresh_info")" \
-            --subject-digest "${{ steps.publish.outputs.root_digest }}" \
-            --platform-subject "${{ steps.publish.outputs.platform_digest }}" \
+            --subject-digest "$ROOT_DIGEST" \
+            --platform-subject "$PLATFORM_DIGEST" \
             --promotion-baseline-file "$RUNNER_TEMP/protected-package-versions.json" \
             --protected-state-file "$RUNNER_TEMP/protected-before.json" \
-            --candidate-alias "test-sha-$SOURCE_SHA" >/dev/null
+            --candidate-alias "test-sha-$SOURCE_SHA" \
+            --require-signature true >/dev/null
       - id: final-observed
         name: Capture final signed image admission
         if: success() && steps.publish.outputs.admission_mode == 'published'
@@ -491,6 +511,8 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          ROOT_DIGEST: ${{ steps.publish.outputs.root_digest }}
+          PLATFORM_DIGEST: ${{ steps.publish.outputs.platform_digest }}
           VERSION: ${{ needs.authorize.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -498,8 +520,8 @@ jobs:
           bash scripts/admit-test-image.sh inspect \
             --source "$SOURCE_SHA" --version "$VERSION" \
             --alias "test-sha-$SOURCE_SHA" \
-            --expected-root-digest "${{ steps.publish.outputs.root_digest }}" \
-            --expected-platform-digest "${{ steps.publish.outputs.platform_digest }}" \
+            --expected-root-digest "$ROOT_DIGEST" \
+            --expected-platform-digest "$PLATFORM_DIGEST" \
             --input-command scripts/read-test-image-state.sh \
             --output "$RUNNER_TEMP/observed-reader-after-signature.json"
       - name: Verify signed OCI attestation identity
@@ -508,11 +530,12 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          ROOT_DIGEST: ${{ steps.publish.outputs.root_digest }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh attestation verify \
-            "oci://${IMAGE}@${{ steps.publish.outputs.root_digest }}" \
+            "oci://${IMAGE}@$ROOT_DIGEST" \
             --repo "$GITHUB_REPOSITORY" \
             --source-digest "$SOURCE_SHA" >/dev/null
       - name: Read-only image admission
@@ -522,6 +545,8 @@ jobs:
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           VERSION: ${{ needs.authorize.outputs.version }}
+          ROOT_DIGEST: ${{ steps.publish.outputs.root_digest }}
+          PLATFORM_DIGEST: ${{ steps.publish.outputs.platform_digest }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -530,8 +555,8 @@ jobs:
           [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]]
           bash scripts/admit-test-image.sh verify \
             --source "$SOURCE_SHA" --version "$VERSION" --alias "test-sha-$SOURCE_SHA" \
-            --expected-root-digest "${{ steps.publish.outputs.root_digest }}" \
-            --expected-platform-digest "${{ steps.publish.outputs.platform_digest }}" \
+            --expected-root-digest "$ROOT_DIGEST" \
+            --expected-platform-digest "$PLATFORM_DIGEST" \
             --input-command scripts/read-test-image-state.sh
           test ! -e release.json
           test ! -e protected-state-write.marker
@@ -584,6 +609,9 @@ jobs:
       SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
       PUBLIC_URL: https://api.whysoezzy.online
       IMAGE_DIGEST: ${{ needs.admit-image.outputs.root_digest }}
+      PLATFORM_DIGEST: ${{ needs.admit-image.outputs.platform_digest }}
+      ADMISSION_MODE: ${{ needs.admit-image.outputs.admission_mode }}
+      TREE_ID: ${{ needs.authorize.outputs.tree_id }}
       STATE_MODE: ${{ inputs.state_mode }}
     permissions:
       contents: read
@@ -968,10 +996,10 @@ jobs:
             --slurpfile finalBootstrap "$RUNNER_TEMP/bootstrap-final.json" \
             "${rollback_bootstrap_args[@]}" \
             --slurpfile authority "$RUNNER_TEMP/dev-promotion-source-deploy.json" \
-            --arg source "$SOURCE_SHA" --arg tree "${{ needs.authorize.outputs.tree_id }}" \
+            --arg source "$SOURCE_SHA" --arg tree "$TREE_ID" \
             --arg version "$VERSION" --arg image "$IMAGE" --arg alias "test-sha-$SOURCE_SHA" \
-            --arg admissionMode "${{ needs.admit-image.outputs.admission_mode }}" \
-            --arg root "$IMAGE_DIGEST" --arg platform "${{ needs.admit-image.outputs.platform_digest }}" \
+            --arg admissionMode "$ADMISSION_MODE" \
+            --arg root "$IMAGE_DIGEST" --arg platform "$PLATFORM_DIGEST" \
             --arg predecessorProof "$pre_proof" --arg candidateProof "$cand_proof" \
             --arg rollbackPredecessorProof "$rollback_pre_proof" \
             --arg rollbackProof "$rollback_proof" --arg finalProof "$final_proof" \

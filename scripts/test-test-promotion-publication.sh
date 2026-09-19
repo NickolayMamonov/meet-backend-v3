@@ -38,6 +38,7 @@ write_blob() {
 write_blob "$TMP/config.json" jq -nS \
   --arg source "$SOURCE" --arg version "$VERSION" \
   '{architecture:"amd64",os:"linux",config:{Labels:{
+    "org.opencontainers.image.source":"https://github.com/NickolayMamonov/meet-backend-v3",
     "org.opencontainers.image.revision":$source,
     "org.opencontainers.image.version":$version}}}'
 CONFIG=sha256:$(sha256sum "$TMP/config.json" | awk '{print $1}')
@@ -48,26 +49,30 @@ LAYER=sha256:$(sha256sum "$TMP/layer" | awk '{print $1}')
 cp -- "$TMP/layer" "$LAYOUT/blobs/sha256/${LAYER#sha256:}"
 
 jq -nS --arg config "$CONFIG" --arg layer "$LAYER" \
+  --argjson configSize "$(wc -c <"$TMP/config.json" | tr -d '[:space:]')" \
+  --argjson layerSize "$(wc -c <"$TMP/layer" | tr -d '[:space:]')" \
   '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",
-    config:{mediaType:"application/vnd.oci.image.config.v1+json",digest:$config,size:1},
-    layers:[{mediaType:"application/vnd.oci.image.layer.v1.tar+gzip",digest:$layer,size:14}]}' \
+    config:{mediaType:"application/vnd.oci.image.config.v1+json",digest:$config,size:$configSize},
+    layers:[{mediaType:"application/vnd.oci.image.layer.v1.tar+gzip",digest:$layer,size:$layerSize}]}' \
   >"$TMP/platform.json"
 PLATFORM=sha256:$(sha256sum "$TMP/platform.json" | awk '{print $1}')
 cp -- "$TMP/platform.json" "$LAYOUT/blobs/sha256/${PLATFORM#sha256:}"
 
 jq -nS --arg platform "$PLATFORM" \
+  --argjson platformSize "$(wc -c <"$TMP/platform.json" | tr -d '[:space:]')" \
   '{schemaVersion:2,mediaType:"application/vnd.oci.image.index.v1+json",
     manifests:[{mediaType:"application/vnd.oci.image.manifest.v1+json",
-      digest:$platform,size:1,platform:{os:"linux",architecture:"amd64"}}]}' \
+      digest:$platform,size:$platformSize,platform:{os:"linux",architecture:"amd64"}}]}' \
   >"$TMP/root.json"
 ROOT=sha256:$(sha256sum "$TMP/root.json" | awk '{print $1}')
 cp -- "$TMP/root.json" "$LAYOUT/blobs/sha256/${ROOT#sha256:}"
 
 jq -nS --arg root "$ROOT" \
   '{imageLayoutVersion:"1.0.0"}' >"$LAYOUT/oci-layout"
-jq -nS --arg root "$ROOT" \
-  '{manifests:[{mediaType:"application/vnd.oci.image.index.v1+json",
-    digest:$root,size:1}]}' >"$LAYOUT/index.json"
+ROOT_SIZE=$(wc -c <"$TMP/root.json" | tr -d '[:space:]')
+jq -nS --arg root "$ROOT" --argjson rootSize "$ROOT_SIZE" \
+  '{schemaVersion:2,manifests:[{mediaType:"application/vnd.oci.image.index.v1+json",
+    digest:$root,size:$rootSize}]}' >"$LAYOUT/index.json"
 
 BEFORE=$TMP/before.json
 PROTECTED=$TMP/protected.json
@@ -77,9 +82,11 @@ jq -nS '[[]]' >"$BEFORE"
 jq -nS '{schema:"meet-backend/test-promotion-protected-state/v1",
   protected:{rootDigests:[],platformDigests:[],subjectDigests:[]}}' >"$PROTECTED"
 jq -nS --arg source "$SOURCE" --arg tree "$TREE" --arg version "$VERSION" \
-  '{sourceSha:$source,treeId:$tree,version:$version}' >"$SOURCE_PROOF"
-jq -nS --arg source "$SOURCE" --arg tree "$TREE" --arg version "$VERSION" \
-  '{sourceSha:$source,treeId:$tree,version:$version}' >"$LAYOUT_PROOF"
+  '{schema:"meet-backend/dev-promotion-source/v1",sourceSha:$source,
+    authoritySha:$source,remoteSha:$source,treeId:$tree,version:$version,
+    clean:true,detached:true}' >"$SOURCE_PROOF"
+bash "$ROOT_DIR/scripts/verify-test-promotion-layout.sh" \
+  --layout "$LAYOUT" --protected-state "$PROTECTED" --output "$LAYOUT_PROOF"
 
 PROOF=$TMP/output/publication-proof.json
 bash "$PROOF_HELPER" create \
@@ -118,6 +125,15 @@ verify() {
 }
 
 verify
+
+EXISTING="$TMP/output/existing-proof.json"
+printf '%s\n' 'existing-proof' >"$EXISTING"
+expect_failure output-overwrite bash "$PROOF_HELPER" create \
+  --image "$IMAGE" --source-sha "$SOURCE" --tree-id "$TREE" --version "$VERSION" \
+  --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --layout "$LAYOUT" \
+  --layout-proof "$LAYOUT_PROOF" --source-proof "$SOURCE_PROOF" \
+  --before-inventory "$BEFORE" --protected-state "$PROTECTED" --output "$EXISTING"
+[ "$(cat "$EXISTING")" = existing-proof ]
 
 cp -- "$PROOF" "$TMP/tampered-proof.json"
 jq '.rootDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \

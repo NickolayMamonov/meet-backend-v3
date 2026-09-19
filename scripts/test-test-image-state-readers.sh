@@ -118,10 +118,16 @@ set -euo pipefail
 scenario=${FAKE_SCENARIO:-valid}
 output=
 url=
+config=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output) output=$2; shift 2 ;;
     --write-out) shift 2 ;;
+    --config) config=$2; shift 2 ;;
+    --header|Authorization:*|Bearer*)
+      echo "curl fixture rejects credentials in argv" >&2
+      exit 92
+      ;;
     --*) shift ;;
     *) url=$1; shift ;;
   esac
@@ -131,6 +137,11 @@ status=200
 if [[ "$url" == https://ghcr.io/token\?* ]]; then
   printf '{"token":"registry-token"}\n' >"$output"
 elif [[ "$url" == https://ghcr.io/v2/*/manifests/* ]]; then
+  [ -n "$config" ] || {
+    echo "curl fixture requires a private config for registry manifests" >&2
+    exit 93
+  }
+  [ -f "$config" ] || exit 94
   reference=${url##*/manifests/}
   case "$reference" in
     "$ALIAS")

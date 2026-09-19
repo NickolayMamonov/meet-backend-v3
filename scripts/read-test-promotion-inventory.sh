@@ -175,6 +175,16 @@ WRAPPER_COUNT=$(jq -r \
       .annotations["vnd.docker.reference.type"]? == "attestation-manifest")] | length
 ' "$INDEX_FILE" | tr -d '\r') || fail "candidate wrapper extraction failed"
 
+SIGNATURE_WRAPPER_COUNT=$(jq -r \
+  --arg signature_media "application/vnd.dev.sigstore.bundle.v0.3+json" '
+  [.manifests[] |
+    select(.digest != $platform and
+      .annotations["vnd.docker.reference.type"]? == "attestation-manifest" and
+      (.annotations["vnd.docker.reference.artifact.type"]? == $signature_media or
+       .annotations["org.opencontainers.artifact.type"]? == $signature_media))] | length
+' --arg platform "$PLATFORM_SUBJECT" "$INDEX_FILE" | tr -d '\r') ||
+  fail "candidate signature marker extraction failed"
+
 # The raw before snapshot is deliberately validated independently.  It is
 # never assembled with pages from a fresh attempt.
 validate_snapshot() {
@@ -247,16 +257,25 @@ ENDPOINT="users/$OWNER/packages/container/$NAME/versions?per_page=100"
 
 PHASE_DIR=
 GH_PID=
+GH_PGID=
 KEEP_PHASE=false
 # shellcheck disable=SC2329
 cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
-  if [ -n "$GH_PID" ] && kill -0 "$GH_PID" 2>/dev/null; then
-    kill -TERM "$GH_PID" 2>/dev/null || true
+  if [ -n "$GH_PGID" ]; then
+    kill -TERM -- "-$GH_PGID" 2>/dev/null || true
+    for _ in 1 2 3 4; do
+      kill -0 -- "-$GH_PGID" 2>/dev/null || break
+      sleep 0.5 || true
+    done
+    kill -KILL -- "-$GH_PGID" 2>/dev/null || true
+  fi
+  if [ -n "$GH_PID" ]; then
     wait "$GH_PID" 2>/dev/null || true
   fi
   GH_PID=
+  GH_PGID=
   if [ "$KEEP_PHASE" != true ] && [ -n "$PHASE_DIR" ] &&
      [ -d "$PHASE_DIR" ] && [ ! -L "$PHASE_DIR" ]; then
     rm -r -- "$PHASE_DIR" 2>/dev/null || true
@@ -285,20 +304,36 @@ read_attempt() {
   local destination=$1 budget=$2 status
   local stderr_file=$destination.stderr
   : >"$stderr_file"
-  timeout --signal=TERM --kill-after=2s "${budget}s" \
-    gh api --paginate --slurp "$ENDPOINT" >"$destination" 2>"$stderr_file" &
+  if command -v setsid >/dev/null 2>&1; then
+    setsid bash -c '
+      exec timeout --signal=TERM --kill-after=2s "$1" gh api --paginate --slurp "$2"
+    ' -- "${budget}s" "$ENDPOINT" >"$destination" 2>"$stderr_file" &
+  else
+    case "$(uname -s)" in
+      Linux*) fail "setsid is required for owned inventory process groups" ;;
+      *) timeout --signal=TERM --kill-after=2s "${budget}s" \
+        gh api --paginate --slurp "$ENDPOINT" >"$destination" 2>"$stderr_file" &
+        ;;
+    esac
+  fi
   GH_PID=$!
+  GH_PGID=$GH_PID
   set +e
   wait "$GH_PID"
   status=$?
   set -e
-  GH_PID=
   rm -f -- "$stderr_file"
   [ "$status" -eq 0 ] ||
     fail "GitHub package inventory request failed"
   [ -s "$destination" ] ||
     fail "GitHub package inventory response is empty"
+  GH_PID=
+  GH_PGID=
 }
+
+attempt_budget=${TEST_PROMOTION_INVENTORY_ATTEMPT_BUDGET_SECONDS:-28}
+[[ "$attempt_budget" =~ ^[1-9][0-9]*$ ]] || fail "inventory attempt budget is malformed"
+[ "$attempt_budget" -le 28 ] || fail "inventory attempt budget exceeds the bound"
 
 evaluate_snapshot() {
   local current=$1 candidate_rows candidate_with_marker current_non_candidate
@@ -391,7 +426,8 @@ evaluate_snapshot() {
   ' "$current" >/dev/null ||
     fail "candidate child carries an unexpected alias"
 
-  if [ "$REQUIRE_SIGNATURE" = true ] && [ "$WRAPPER_COUNT" -eq 0 ]; then
+  if [ "$REQUIRE_SIGNATURE" = true ] &&
+     { [ "$WRAPPER_COUNT" -eq 0 ] || [ "$SIGNATURE_WRAPPER_COUNT" -eq 0 ]; }; then
     return 75
   fi
 
@@ -414,7 +450,7 @@ while [ "$attempt" -le 5 ]; do
   now=$(date +%s)
   remaining=$((overall_deadline - now))
   [ "$remaining" -gt 0 ] || break
-  budget=28
+  budget=$attempt_budget
   [ "$remaining" -lt "$budget" ] && budget=$remaining
   temporary=$(mktemp -- "$PHASE_DIR/.package-versions.XXXXXX") ||
     fail "could not create package response temporary"

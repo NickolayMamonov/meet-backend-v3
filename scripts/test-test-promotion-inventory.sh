@@ -48,6 +48,7 @@ jq -nS --arg platform "$PLATFORM_DIGEST" --arg wrapper "$WRAPPER_DIGEST" \
        platform:{os:"linux",architecture:"amd64"}},
       {mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$wrapper,size:1,
        annotations:{"vnd.docker.reference.type":"attestation-manifest",
+         "vnd.docker.reference.artifact.type":"application/vnd.dev.sigstore.bundle.v0.3+json",
          "vnd.docker.reference.digest":$platform}}
     ]}' >"$ROOT_WORK"
 ROOT_DIGEST=sha256:$(sha256sum "$ROOT_WORK" | awk '{print $1}')
@@ -73,12 +74,13 @@ cat >"$GH" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [ "$1" = api ] && [ "$2" = --paginate ] && [ "$3" = --slurp ]
-response=${GH_RESPONSE:?}
 if [ -n "${GH_SEQUENCE_DIR:-}" ]; then
   count=$(tr -d '[:space:]' <"${GH_COUNT_FILE:?}")
   count=$((count + 1))
   printf '%s\n' "$count" >"${GH_COUNT_FILE:?}"
   response=$GH_SEQUENCE_DIR/$count.json
+else
+  response=${GH_RESPONSE:?}
 fi
 cat -- "$response"
 EOF
@@ -218,5 +220,57 @@ STATUS=$?
 set -e
 [ "$STATUS" -eq 1 ]
 [ ! -e "$TMP/sleeps" ]
+
+if [ "$(uname -s)" = Linux ]; then
+  HANG_GH=$TMP/gh-hang
+  HANG_CHILD=$TMP/hang-child.pid
+  HANG_GRANDCHILD=$TMP/hang-grandchild.pid
+  cat >"$HANG_GH" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+( trap '' TERM INT HUP; while :; do sleep 1; done ) &
+grandchild=$!
+printf '%s\n' "$BASHPID" >"${HANG_CHILD:?}"
+printf '%s\n' "$grandchild" >"${HANG_GRANDCHILD:?}"
+trap '' TERM INT HUP
+while :; do sleep 1; done
+EOF
+  chmod 755 "$HANG_GH"
+  run_hang() {
+    local signal=$1
+    cp -- "$HANG_GH" "$GH"
+    chmod 755 "$GH"
+    rm -f "$HANG_CHILD" "$HANG_GRANDCHILD"
+    set +e
+    PATH="$TMP:$PATH" \
+      HANG_GRANDCHILD="$HANG_GRANDCHILD" \
+      HANG_CHILD="$HANG_CHILD" \
+      TEST_PROMOTION_INVENTORY_ATTEMPT_BUDGET_SECONDS=5 \
+      "$READER" --image "$IMAGE" --alias "$ALIAS" \
+      --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
+      --index-file "$INDEX_WORK" --before-inventory "$BEFORE" \
+      --protected-state "$PROTECTED" --require-signature false \
+      --output-dir "$TMP" >/dev/null 2>&1 &
+    reader_pid=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ -s "$HANG_GRANDCHILD" ] && break
+      sleep 0.1
+    done
+    kill -"$signal" "$reader_pid" 2>/dev/null || true
+    wait "$reader_pid"
+    status=$?
+    set -e
+    [ "$status" -ne 0 ]
+    for pid_file in "$HANG_CHILD" "$HANG_GRANDCHILD"; do
+      if [ -s "$pid_file" ]; then
+        pid=$(tr -d '[:space:]' <"$pid_file")
+        ! kill -0 "$pid" 2>/dev/null
+      fi
+    done
+  }
+  run_hang TERM
+  run_hang INT
+  run_hang HUP
+fi
 
 echo "test-test-promotion-inventory passed: exact raw preservation, signature visibility, bounded exhaustion, and terminal API failure"

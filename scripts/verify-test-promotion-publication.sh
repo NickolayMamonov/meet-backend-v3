@@ -123,7 +123,7 @@ write_atomic() {
   local parent
   parent=$(dirname -- "$destination")
   directory "$parent" || fail "output directory is unsafe"
-  [ ! -e "$destination" ] || [ -f "$destination" ] || fail "output is not a regular file"
+  [ ! -e "$destination" ] || fail "output already exists"
   [ ! -L "$destination" ] || fail "output is a symlink"
   local temp
   temp=$(mktemp "$parent/.publication-proof.XXXXXX") || fail "cannot create output temporary"
@@ -132,7 +132,8 @@ write_atomic() {
   trap "rm -f -- '$temp'" RETURN
   chmod 600 "$temp" || fail "cannot protect output"
   cp -- "$source" "$temp" || fail "cannot write output"
-  mv -- "$temp" "$destination" || fail "cannot publish output"
+  ln -- "$temp" "$destination" || fail "cannot publish output without overwrite"
+  rm -f -- "$temp" || fail "cannot remove publication temporary"
   trap - RETURN
 }
 
@@ -151,13 +152,15 @@ layout_blob() {
 }
 
 digest_bytes() {
-  local file=$1 expected=$2
+  local file=$1 expected=$2 expected_size=${3:-}
   [ -f "$file" ] || fail "missing content-addressed blob"
   local actual size
   actual="sha256:$(sha256_file "$file")"
   size=$(wc -c <"$file" | tr -d ' ')
   [ "$actual" = "$expected" ] || fail "content-addressed blob hash mismatch"
   [ "$size" -gt 0 ] || fail "content-addressed blob is empty"
+  [ -z "$expected_size" ] || [ "$size" -eq "$expected_size" ] ||
+    fail "content-addressed blob size mismatch"
 }
 
 build_closure() {
@@ -168,19 +171,21 @@ build_closure() {
   local seen=$work/seen
   : >"$queue"
   : >"$seen"
-  printf '%s\n' "$root" >"$queue"
-  local queue_position=1 queue_length digest
+  printf '%s\t%s\n' "$root" "$(jq -r '.manifests[0].size' "$layout/index.json")" >"$queue"
+  local queue_position=1 queue_length digest queue_entry expected_size
   while :; do
     queue_length=$(wc -l <"$queue" | tr -d ' ')
     [ "$queue_position" -le "$queue_length" ] || break
-    digest=$(sed -n "${queue_position}p" "$queue")
+    queue_entry=$(sed -n "${queue_position}p" "$queue")
+    digest=${queue_entry%%$'\t'*}
+    expected_size=${queue_entry#*$'\t'}
     queue_position=$((queue_position + 1))
     [ -n "$digest" ] || continue
     grep -Fqx "$digest" "$seen" && continue
     printf '%s\n' "$digest" >>"$seen"
     local blob media
     blob=$(layout_blob "$layout" "$digest")
-    digest_bytes "$blob" "$digest"
+    digest_bytes "$blob" "$digest" "$expected_size"
     media=$(jq -r '.mediaType // empty' "$blob" 2>/dev/null || true)
     [ -n "$media" ] || continue
     case "$media" in
@@ -189,7 +194,8 @@ build_closure() {
           "$blob" >/dev/null || fail "malformed OCI index"
         while IFS= read -r descriptor; do
           validate_descriptor "$descriptor"
-          jq -r '.digest' <<<"$descriptor" >>"$queue"
+          printf '%s\t%s\n' "$(jq -r '.digest' <<<"$descriptor")" \
+            "$(jq -r '.size' <<<"$descriptor")" >>"$queue"
         done < <(jq -c '.manifests[]' "$blob")
         ;;
       "$MANIFEST_MEDIA")
@@ -197,7 +203,8 @@ build_closure() {
           "$blob" >/dev/null || fail "malformed OCI manifest"
         while IFS= read -r descriptor; do
           validate_descriptor "$descriptor"
-          jq -r '.digest' <<<"$descriptor" >>"$queue"
+          printf '%s\t%s\n' "$(jq -r '.digest' <<<"$descriptor")" \
+            "$(jq -r '.size' <<<"$descriptor")" >>"$queue"
         done < <(jq -c '.config, .layers[]' "$blob")
         ;;
       *) fail "unsupported OCI media type in closure" ;;
@@ -231,13 +238,30 @@ validate_source_identity() {
   local file=$1
   json_file "$file"
   jq -e --arg source "$SOURCE_SHA" --arg tree "$TREE_ID" --arg version "$VERSION" '
-    [.. | objects | select(has("sourceSha")) | .sourceSha] as $sources |
-    [.. | objects | select(has("treeId")) | .treeId] as $trees |
-    [.. | objects | select(has("version")) | .version] as $versions |
-    (($sources | length) == 0 or all($sources[]; . == $source)) and
-    (($trees | length) == 0 or all($trees[]; . == $tree)) and
-    (($versions | length) == 0 or all($versions[]; . == $version))
+    type == "object" and
+    (keys | sort) == [
+      "authoritySha","clean","detached","remoteSha","schema",
+      "sourceSha","treeId","version"
+    ] and
+    .schema == "meet-backend/dev-promotion-source/v1" and
+    .authoritySha == $source and .remoteSha == $source and
+    .clean == true and .detached == true and
+    (.sourceSha | type == "string" and . == $source) and
+    (.treeId | type == "string" and . == $tree) and
+    (.version | type == "string" and . == $version)
   ' "$file" >/dev/null || fail "source identity proof does not match"
+}
+
+validate_layout_proof() {
+  local file=$1 root=$2 platform=$3
+  jq -e --arg root "$root" --arg platform "$platform" '
+    type == "object" and
+    .schema == "meet-backend/test-promotion-layout/v1" and
+    .rootDigest == $root and .platformDigest == $platform and
+    (.descriptors | type == "array" and length > 0) and
+    (.referrerTargets | type == "array") and
+    .protectedSubjectsExcluded == true
+  ' "$file" >/dev/null || fail "layout proof schema or identity is incomplete"
 }
 
 create_proof() {
@@ -271,6 +295,22 @@ create_proof() {
   is_digest "$root" || fail "layout root digest is malformed"
   is_digest "$platform" || fail "layout platform digest is malformed"
   [ "$root" != "$platform" ] || fail "root and platform digests collide"
+  platform_blob=$(layout_blob "$LAYOUT" "$platform")
+  digest_bytes "$platform_blob" "$platform" "$(jq -r '.size' <<<"$platform_desc")"
+  config_descriptor=$(jq -c '.config' "$platform_blob")
+  validate_descriptor "$config_descriptor"
+  config_blob=$(layout_blob "$LAYOUT" "$(jq -r '.digest' <<<"$config_descriptor")")
+  digest_bytes "$config_blob" "$(jq -r '.digest' <<<"$config_descriptor")" \
+    "$(jq -r '.size' <<<"$config_descriptor")"
+  jq -e --arg source "$SOURCE_SHA" --arg version "$VERSION" '
+    .architecture == "amd64" and .os == "linux" and
+    (.config.Labels | type == "object") and
+    .config.Labels["org.opencontainers.image.source"] ==
+      "https://github.com/NickolayMamonov/meet-backend-v3" and
+    .config.Labels["org.opencontainers.image.revision"] == $source and
+    .config.Labels["org.opencontainers.image.version"] == $version
+  ' "$config_blob" >/dev/null || fail "platform config is not source-bound"
+  validate_layout_proof "$LAYOUT_PROOF" "$root" "$platform"
   local work closure
   work=$(mktemp -d)
   closure=$work/closure.jsonl
@@ -325,7 +365,14 @@ verify_proof() {
     (.runAttempt == ($attempt|tonumber)) and
     (.rootDigest | test("^sha256:[0-9a-f]{64}$")) and
     (.platformDigest | test("^sha256:[0-9a-f]{64}$")) and
-    (.manifestClosure | type == "array" and length > 0) and
+    (.manifestClosure | type == "array" and length > 0 and
+      all(.[]; type == "object" and
+        (.digest | test("^sha256:[0-9a-f]{64}$")) and
+        (.mediaType | type == "string" and length > 0) and
+        (.size | type == "number" and floor == . and . > 0) and
+        (.subjectDigest == null or (.subjectDigest | test("^sha256:[0-9a-f]{64}$"))) and
+        (.children | type == "array" and all(.[]; test("^sha256:[0-9a-f]{64}$")))) and
+      ([.[].digest] | unique | length) == length) and
     (.layoutProofSha256 | test("^[0-9a-f]{64}$")) and
     (.beforeInventorySha256 | test("^[0-9a-f]{64}$")) and
     (.protectedStateSha256 | test("^[0-9a-f]{64}$"))
@@ -352,6 +399,15 @@ verify_proof() {
   local selected_hash
   selected_hash="sha256:$(sha256_file "$INDEX_FILE")"
   [ "$selected_hash" = "$root" ] || fail "selected raw index bytes do not match root digest"
+  root_children=$(jq -c '[.manifests[].digest] | sort' "$INDEX_FILE")
+  root_size=$(wc -c <"$INDEX_FILE" | tr -d '[:space:]')
+  jq -e --arg root "$root" --argjson children "$root_children" \
+    --argjson size "$root_size" '
+    ([.manifestClosure[] | select(.digest == $root)] | length) == 1 and
+    ([.manifestClosure[] | select(.digest == $root)][0] |
+      .mediaType == "application/vnd.oci.image.index.v1+json" and
+      .size == $size and .children == $children)
+  ' "$PROOF" >/dev/null || fail "publication proof root closure is not exact"
   jq -e --arg alias "$alias" --arg root "$root" --arg platform "$platform" '
     (.versions | type == "array") and
     any(.versions[]; .digest == $root and ((.tags // []) | index($alias))) and
@@ -362,14 +418,16 @@ verify_proof() {
     (.digest == $root or .root.digest == $root) and
     (.platform.digest == $platform or .platformDigest == $platform)
   ' "$OBSERVED_READER" >/dev/null || fail "observed reader snapshot is not bound to proof"
-  jq -e --arg run "$RUN_ID" --arg attempt "$RUN_ATTEMPT" '
+  jq -e --arg run "$RUN_ID" --arg attempt "$RUN_ATTEMPT" --arg source "$SOURCE_SHA" '
+    (keys | sort) == [
+      "attestationWrite","initialAliasState","registryPublication",
+      "runAttempt","runId","schema","sourceSha"
+    ] and
     (.initialAliasState == "absent") and
-    (.registryPublication == "confirmed" or
-     .registryPublication.confirmed == true or
-     .registryPublication.state == "confirmed" or
-     .publication.confirmed == true) and
-    ((.runId // .run_id // ($run|tonumber)) == ($run|tonumber)) and
-    ((.runAttempt // .run_attempt // ($attempt|tonumber)) == ($attempt|tonumber))
+    .registryPublication == "confirmed" and
+    .sourceSha == $source and
+    .runId == ($run|tonumber) and
+    .runAttempt == ($attempt|tonumber)
   ' "$REGISTRY_JOURNAL" >/dev/null || fail "current-run publication journal is not confirmed"
   printf '%s\n' "$PROOF"
 }

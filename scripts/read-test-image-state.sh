@@ -37,6 +37,7 @@ owner=${package%%/*}
 name=${package#*/}
 tmp=$(mktemp -d)
 netrc=
+registry_config=
 main_bash_pid=$BASHPID
 # shellcheck disable=SC2329
 cleanup() {
@@ -44,6 +45,7 @@ cleanup() {
   trap - EXIT HUP INT TERM
   if [ "$BASHPID" = "$main_bash_pid" ]; then
     [ -z "$netrc" ] || rm -f -- "$netrc"
+    [ -z "$registry_config" ] || rm -f -- "$registry_config"
     rm -r -- "$tmp"
   fi
   exit "$status"
@@ -107,13 +109,18 @@ setup_registry_auth() {
     end
   ' "$response") ||
     fail "GHCR registry token response is malformed"
+  registry_config=$tmp/ghcr.config
+  {
+    printf 'header = "Authorization: Bearer %s"\n' "$registry_token"
+    printf '%s\n' 'header = "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json"'
+  } >"$registry_config"
+  chmod 600 "$registry_config"
 }
 
 registry_get() {
   local reference=$1 file=$2 response
   response=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
-    --header "Authorization: Bearer $registry_token" \
-    --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+    --config "$registry_config" \
     --output "$file" --write-out '%{http_code}' \
     "https://ghcr.io/v2/$package/manifests/$reference") ||
     fail "OCI manifest transport failed"
