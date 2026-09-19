@@ -277,7 +277,7 @@ remaining_ms() {
     printf '0\n'
     return
   }
-  printf '%s\n' "$((remaining / 1000000))"
+  printf '%s\n' "$remaining"
 }
 
 duration_from_ms() {
@@ -286,19 +286,30 @@ duration_from_ms() {
     "$((milliseconds / 1000))" "$((milliseconds % 1000))"
 }
 
+cleanup_sleep() {
+  case "$(uname -s)" in
+    Linux) /usr/bin/sleep "$1" ;;
+    *) sleep "$1" ;;
+  esac
+}
+
 terminate_owned_process() {
-  local remaining grace
+  local remaining grace cleanup_deadline
   [ -n "$OWNED_PGID" ] || {
     OWNED_PID=
-    return
+    return 0
   }
+  remaining=$(remaining_ms)
+  [ "$remaining" -gt 0 ] || remaining=1
+  grace=1000
+  [ "$remaining" -lt "$grace" ] && grace=$remaining
+  cleanup_deadline=$(( $(monotonic_now_ms) + grace ))
   kill -TERM -- "-$OWNED_PGID" 2>/dev/null || true
   while kill -0 -- "-$OWNED_PGID" 2>/dev/null; do
-    remaining=$(remaining_ms)
+    remaining=$((cleanup_deadline - $(monotonic_now_ms)))
     [ "$remaining" -gt 0 ] || break
-    grace=$remaining
-    [ "$grace" -le 100 ] || grace=100
-    sleep "$(duration_from_ms "$grace")" || true
+    [ "$remaining" -le 100 ] || remaining=100
+    cleanup_sleep "$(duration_from_ms "$remaining")" || true
   done
   if kill -0 -- "-$OWNED_PGID" 2>/dev/null; then
     kill -KILL -- "-$OWNED_PGID" 2>/dev/null || true
