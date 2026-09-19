@@ -277,18 +277,6 @@ REGISTRY_OUTPUT="$PHASE_DIR/registry-inventory.json"
 [ ! -e "$PACKAGE_OUTPUT" ] && [ ! -e "$REGISTRY_OUTPUT" ] ||
   fail "final inventory output already exists"
 
-baseline_rows=$(jq -c '
-  [.[][] |
-    .name as $digest |
-    .metadata.container.tags as $tags |
-    {id, digest:$digest, tags:$tags} |
-    select((any($candidate[]; . == $digest) | not) and
-      (any($tags[]; . == $marker) | not))] |
-  sort_by(.id,.digest)
-' --arg marker "sha256-${SUBJECT_DIGEST#sha256:}" \
-  --argjson candidate "$INDEX_DIGESTS" "$BEFORE_INVENTORY" | tr -d '\r') ||
-  fail "before-inventory projection failed"
-
 read_attempt() {
   local destination=$1 budget=$2 status
   local stderr_file=$destination.stderr
@@ -326,10 +314,51 @@ attempt_budget=${TEST_PROMOTION_INVENTORY_ATTEMPT_BUDGET_SECONDS:-28}
 
 evaluate_snapshot() {
   local current=$1 candidate_rows candidate_with_marker current_non_candidate
+  local reachability_output closure_output closure_status
   local root_count root_tags alias_count alias_digest marker_count digest count
   local current_count
 
   validate_snapshot "$current" "fresh"
+
+  reachability_output="$PHASE_DIR/.reachable-digests.json"
+  set +e
+  closure_output=$(timeout --kill-after=2s 30s "$CLOSURE" \
+    --image "$IMAGE" \
+    --index-file "$INDEX_FILE" \
+    --inventory-file "$current" \
+    --subject-digest "$SUBJECT_DIGEST" \
+    --platform-subject "$PLATFORM_SUBJECT" \
+    --reachable-output "$reachability_output" \
+    --pending-on-missing-package 2>&1)
+  closure_status=$?
+  set -e
+  case "$closure_status" in
+    0) ;;
+    75) return 75 ;;
+    *)
+      printf '%s\n' "$closure_output" >&2
+      fail "candidate reachability verification failed"
+      ;;
+  esac
+  [ -s "$reachability_output" ] ||
+    fail "candidate reachability output is empty"
+  INDEX_DIGESTS=$(cat "$reachability_output" | tr -d '\r') ||
+    fail "candidate reachability output could not be read"
+  jq -e --argjson candidate "$INDEX_DIGESTS" '
+    ($candidate | type == "array" and length > 0) and
+    all($candidate[]; type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+    (($candidate | unique | length) == ($candidate | length))
+  ' <<<null >/dev/null ||
+    fail "candidate reachability output is malformed"
+  baseline_rows=$(jq -c '
+    [.[][] |
+      .name as $digest |
+      .metadata.container.tags as $tags |
+      {id, digest:$digest, tags:$tags} |
+      select(any($candidate[]; . == $digest) | not)] |
+    sort_by(.id,.digest)
+  ' --argjson candidate "$INDEX_DIGESTS" "$BEFORE_INVENTORY" | tr -d '\r') ||
+    fail "before-inventory projection failed"
 
   # A package version outside the candidate is immutable for this phase.  The
   # full before snapshot is compared, so a writer or page-mixing mutation is
@@ -339,10 +368,9 @@ evaluate_snapshot() {
       .name as $digest |
       .metadata.container.tags as $tags |
       {id, digest:$digest, tags:$tags} |
-      select((any($candidate[]; . == $digest) | not) and
-        (any($tags[]; . == $marker) | not))] |
+      select(any($candidate[]; . == $digest) | not)] |
       sort_by(.id,.digest)
-  ' --arg marker "sha256-${SUBJECT_DIGEST#sha256:}" "$current" | tr -d '\r') ||
+  ' "$current" | tr -d '\r') ||
     fail "fresh inventory projection failed"
   current_count=$(jq -r '[.[][]] | length' "$current" | tr -d '\r') ||
     fail "fresh inventory cardinality failed"

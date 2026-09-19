@@ -552,8 +552,12 @@ assert_reuse_and_evidence_contract() {
   extract_run_block "$WORKFLOW" '      - id: publish' "$publish_block"
   ! grep -Fq 'imagetools inspect "$ref"' "$publish_block"
   grep -Fq 'docker buildx imagetools inspect "$IMAGE@$root_digest" --raw' "$publish_block"
-  grep -Fq "steps.publish.outputs.observed_state == 'partial'" "$WORKFLOW"
-  grep -Fq "steps.publish.outputs.observed_attestation_status == 'missing'" "$WORKFLOW"
+  grep -Fq "printf 'observed_state=%s\\n' \"\$observed_state\" >> \"\$GITHUB_OUTPUT\"" "$WORKFLOW"
+  grep -Fq "printf 'observed_attestation_status=%s\\n' \"\$observed_attestation_status\" >> \"\$GITHUB_OUTPUT\"" "$WORKFLOW"
+  grep -Fq "steps.observed.outputs.observed_state == 'partial'" "$WORKFLOW"
+  grep -Fq "steps.observed.outputs.observed_attestation_status == 'missing'" "$WORKFLOW"
+  ! grep -Fq "steps.publish.outputs.observed_state" "$WORKFLOW"
+  ! grep -Fq "steps.publish.outputs.observed_attestation_status" "$WORKFLOW"
   grep -Fq "steps.publish.outputs.admission_mode == 'reused'" "$WORKFLOW"
   grep -Fq 'test-promotion-admission-${{ github.run_id }}-${{ github.run_attempt }}' "$WORKFLOW"
   grep -Fq '${{ runner.temp }}/test-promotion-registry-state.json' "$WORKFLOW"
@@ -578,6 +582,151 @@ assert_reuse_and_evidence_contract() {
   set -e
   [ "$upload_status" -eq 17 ]
   echo "artifact-failure fixture passed: failed upload cannot become a success signal"
+}
+
+assert_observed_output_transport() {
+  local source=0123456789abcdef0123456789abcdef01234567
+  local version=1.2.3
+  local root=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  local platform=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  local observed_block="$TEST_ROOT/observed-step.sh"
+  extract_run_block "$WORKFLOW" '      - id: observed' "$observed_block"
+  sed -i \
+    -e 's/\${{ inputs\.source_sha }}/0123456789abcdef0123456789abcdef01234567/g' \
+    -e 's/\${{ needs\.authorize\.outputs\.version }}/1.2.3/g' \
+    "$observed_block"
+
+  run_case() {
+    local scenario=$1 expected_state=$2 expected_attestation=$3 initial_state=$4
+    local expected_write=$5
+    local case_root="$TEST_ROOT/observed-$scenario"
+    local output="$case_root/github-output"
+    local journal="$case_root/registry-state.json"
+    local facts="$case_root/facts"
+    mkdir -p "$case_root/scripts" "$case_root/temp" "$case_root/home"
+    cp -- "$ROOT_DIR/scripts/admit-test-image.sh" "$case_root/scripts/"
+    cp -- "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" "$case_root/scripts/"
+    cat >"$case_root/scripts/read-test-image-state.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source_sha=0123456789abcdef0123456789abcdef01234567
+version=1.2.3
+root=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+platform=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+alias=test-sha-$source_sha
+case "${OBSERVED_SCENARIO:?}" in
+  partial) status=missing ;;
+  verified) status=verified ;;
+  *) exit 2 ;;
+esac
+jq -nS --arg alias "$alias" --arg root "$root" --arg platform "$platform" \
+  --arg source "$source_sha" --arg version "$version" --arg status "$status" '
+  {
+    bindings:[{
+      alias:$alias,
+      digest:$root,
+      root:{
+        digest:$root,
+        mediaType:"application/vnd.oci.image.index.v1+json",
+        manifests:[{
+          digest:$platform,
+          mediaType:"application/vnd.oci.image.manifest.v1+json",
+          platform:{os:"linux",architecture:"amd64"}
+        }],
+        labels:{
+          "org.opencontainers.image.source":"https://github.com/NickolayMamonov/meet-backend-v3",
+          "org.opencontainers.image.revision":$source,
+          "org.opencontainers.image.version":$version
+        }
+      },
+      platform:{
+        digest:$platform,
+        mediaType:"application/vnd.oci.image.manifest.v1+json",
+        labels:{
+          "org.opencontainers.image.source":"https://github.com/NickolayMamonov/meet-backend-v3",
+          "org.opencontainers.image.revision":$source,
+          "org.opencontainers.image.version":$version
+        }
+      },
+      referrers:[
+        {kind:"provenance",digest:"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+         subject:$root,artifactType:"application/vnd.in-toto+json",
+         predicateType:"https://slsa.dev/provenance/v1"},
+        {kind:"sbom",digest:"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+         subject:$platform,artifactType:"application/vnd.in-toto+json",
+         predicateType:"https://spdx.dev/Document"}
+      ],
+      githubAttestations:(if $status == "verified" then [{
+        subject:$root,
+        repository:"https://github.com/NickolayMamonov/meet-backend-v3",
+        source:$source,
+        revision:$source,
+        version:$version,
+        workflow:"https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/ci.yml@refs/heads/dev"
+      }] else [] end),
+      attestationStatus:$status
+    }]
+  }'
+EOF
+    chmod 755 "$case_root/scripts/read-test-image-state.sh"
+    : >"$output"
+    (
+      cd "$case_root"
+      env -i HOME="$case_root/home" PATH="$REAL_PATH" IMAGE=ghcr.io/nickolaymamonov/meet-backend-v3 \
+        SOURCE_SHA="$source" VERSION="$version" ROOT_DIGEST="$root" \
+        PLATFORM_DIGEST="$platform" RUNNER_TEMP="$case_root/temp" \
+        GITHUB_OUTPUT="$output" GITHUB_RUN_ID=9001 GITHUB_RUN_ATTEMPT=1 \
+        OBSERVED_SCENARIO="$scenario" \
+        bash "$observed_block"
+    )
+    observed_state=$(awk -F= '$1 == "observed_state" {print $2}' "$output")
+    observed_status=$(awk -F= '$1 == "observed_attestation_status" {print $2}' "$output")
+    [ "$observed_state" = "$expected_state" ]
+    [ "$observed_status" = "$expected_attestation" ]
+
+    bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" init \
+      --file "$journal" --source "$source" --run-id 9001 --run-attempt 1
+    copy_count=0
+    signer_intent_count=0
+    signer_count=0
+    if [ "$observed_state:$observed_status" = partial:missing ]; then
+      copy_count=1
+      bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" classify \
+        --file "$journal" --source "$source" --run-id 9001 --run-attempt 1 \
+        --initial-state absent
+      bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" begin \
+        --file "$journal" --source "$source" --run-id 9001 --run-attempt 1 \
+        --operation publication
+      bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" confirm \
+        --file "$journal" --source "$source" --run-id 9001 --run-attempt 1 \
+        --operation publication
+      signer_intent_count=1
+      bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" begin \
+        --file "$journal" --source "$source" --run-id 9001 --run-attempt 1 \
+        --operation attestation
+      signer_count=1
+      bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" confirm \
+        --file "$journal" --source "$source" --run-id 9001 --run-attempt 1 \
+        --operation attestation
+    else
+      bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" classify \
+        --file "$journal" --source "$source" --run-id 9001 --run-attempt 1 \
+        --initial-state "$initial_state"
+    fi
+    [ "$copy_count" -eq "$([ "$initial_state" = absent ] && echo 1 || echo 0)" ]
+    [ "$signer_intent_count" -eq "$([ "$expected_state" = partial ] && echo 1 || echo 0)" ]
+    [ "$signer_count" -eq "$signer_intent_count" ]
+    : >"$facts"
+    GITHUB_OUTPUT="$facts" bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" export \
+      --file "$journal" --source "$source" --run-id 9001 --run-attempt 1 \
+      --github-output "$facts" >/dev/null
+    attestation_write=$(awk -F= '$1 == "attestation_write" {print $2}' "$facts")
+    [ "$attestation_write" = "$expected_write" ]
+    echo "observed transport fixture passed: $scenario copy=$copy_count signer=$signer_count attestationWrite=$expected_write"
+  }
+
+  run_case partial partial missing absent confirmed
+  run_case verified reusable verified reusable notStarted
 }
 
 make_fixture() {
@@ -823,6 +972,7 @@ provision_block="$TEST_ROOT/provision.sh"
 workflow_metadata="$TEST_ROOT/steps.tsv"
 workflow_contract "$WORKFLOW" "$provision_block" "$workflow_metadata"
 assert_reuse_and_evidence_contract
+assert_observed_output_transport
 
 for token_step in \
   '      - id: protected-before' \

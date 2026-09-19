@@ -154,6 +154,136 @@ jq -e --arg root "$ROOT_DIGEST" --arg alias "$ALIAS" '
 ' "$PHASE/registry-inventory.json" >/dev/null
 [ ! -s "$TMP/sleeps" ]
 
+# A marker-root index may expose a nested signature manifest that has no
+# package tag of its own. The nested row is still part of the candidate
+# closure and must converge inside the same bounded inventory operation.
+NESTED_SIGNATURE=$TMP/nested-signature.json
+jq -nS --arg root "$ROOT_DIGEST" '
+  {schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",
+   artifactType:"application/vnd.dev.sigstore.bundle.v0.3+json",
+   config:{mediaType:"application/vnd.oci.empty.v1+json",
+     digest:"sha256:5555555555555555555555555555555555555555555555555555555555555555",size:2},
+   layers:[{mediaType:"application/vnd.dev.sigstore.bundle.v0.3+json",
+     digest:"sha256:6666666666666666666666666666666666666666666666666666666666666666",size:17}],
+   subject:{mediaType:"application/vnd.oci.image.index.v1+json",digest:$root,size:1}}' \
+  >"$NESTED_SIGNATURE"
+NESTED_SIGNATURE_DIGEST=sha256:$(sha256sum "$NESTED_SIGNATURE" | awk '{print $1}')
+NESTED_SIGNATURE_SIZE=$(wc -c <"$NESTED_SIGNATURE" | tr -d '[:space:]')
+cp -- "$NESTED_SIGNATURE" "$TMP/${NESTED_SIGNATURE_DIGEST#sha256:}.json"
+MARKER_INDEX=$TMP/marker-index.json
+jq -nS --arg root "$ROOT_DIGEST" --arg signature "$NESTED_SIGNATURE_DIGEST" \
+  --argjson signatureSize "$NESTED_SIGNATURE_SIZE" '
+  {schemaVersion:2,mediaType:"application/vnd.oci.image.index.v1+json",
+   subject:{mediaType:"application/vnd.oci.image.index.v1+json",digest:$root,size:1},
+   manifests:[{mediaType:"application/vnd.oci.image.manifest.v1+json",
+     digest:$signature,size:$signatureSize}]}' >"$MARKER_INDEX"
+MARKER_INDEX_DIGEST=sha256:$(sha256sum "$MARKER_INDEX" | awk '{print $1}')
+cp -- "$MARKER_INDEX" "$TMP/${MARKER_INDEX_DIGEST#sha256:}.json"
+NESTED_BEFORE=$TMP/nested-before.json
+jq -nS --arg protected "$PROTECTED_DIGEST" \
+  '[[{id:1,name:$protected,metadata:{container:{tags:["v1.0.0"]}}}]]' \
+  >"$NESTED_BEFORE"
+NESTED_RESPONSE=$TMP/nested-response.json
+jq -nS --arg root "$ROOT_DIGEST" --arg platform "$PLATFORM_DIGEST" \
+  --arg wrapper "$WRAPPER_DIGEST" --arg marker_index "$MARKER_INDEX_DIGEST" \
+  --arg signature "$NESTED_SIGNATURE_DIGEST" --arg protected "$PROTECTED_DIGEST" \
+  --arg alias "$ALIAS" --arg marker "sha256-${ROOT_DIGEST#sha256:}" '
+  [[
+    {id:1,name:$protected,metadata:{container:{tags:["v1.0.0"]}}},
+    {id:2,name:$root,metadata:{container:{tags:[$alias]}}},
+    {id:3,name:$platform,metadata:{container:{tags:[]}}},
+    {id:4,name:$wrapper,metadata:{container:{tags:[]}}},
+    {id:5,name:$marker_index,metadata:{container:{tags:[$marker]}}},
+    {id:6,name:$signature,metadata:{container:{tags:[]}}}
+  ]]' >"$NESTED_RESPONSE"
+NESTED_OUTPUT=$TMP/nested-output
+mkdir -p "$NESTED_OUTPUT"
+BEFORE_NESTED_HASH=$(sha256sum "$NESTED_BEFORE" | awk '{print $1}')
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_RESPONSE=$NESTED_RESPONSE \
+  SLEEP_LOG=$TMP/sleeps \
+  "$READER" --image "$IMAGE" --alias "$ALIAS" \
+  --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
+  --index-file "$INDEX_WORK" --before-inventory "$NESTED_BEFORE" \
+  --protected-state "$PROTECTED" --require-signature true \
+  --output-dir "$NESTED_OUTPUT" >/dev/null
+NESTED_PHASE=$(find "$NESTED_OUTPUT" -mindepth 1 -maxdepth 1 \
+  -type d -name 'test-promotion-inventory.*' | head -1)
+[ -n "$NESTED_PHASE" ]
+cmp "$NESTED_RESPONSE" "$NESTED_PHASE/package-versions.json"
+[ "$(sha256sum "$NESTED_BEFORE" | awk '{print $1}')" = "$BEFORE_NESTED_HASH" ]
+jq -e --arg marker_index "$MARKER_INDEX_DIGEST" \
+  --arg signature "$NESTED_SIGNATURE_DIGEST" '
+  any(.versions[]; .digest == $marker_index) and
+  any(.versions[]; .digest == $signature)
+' "$NESTED_PHASE/registry-inventory.json" >/dev/null
+"$ROOT_DIR/scripts/verify-oci-referrer-closure.sh" \
+  --image "$IMAGE" --index-file "$INDEX_WORK" \
+  --inventory-file "$NESTED_PHASE/package-versions.json" \
+  --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
+  --fixture-dir "$TMP" \
+  --promotion-baseline-file "$NESTED_BEFORE" \
+  --protected-state-file "$PROTECTED" --candidate-alias "$ALIAS" \
+  --require-signature true >/dev/null
+echo "marker-root nested signature fixture passed: complete candidate reachability and signed closure"
+
+# The marker root may become visible before its untagged nested child. That
+# incomplete graph is retryable; malformed and foreign rows remain terminal.
+NESTED_LAG=$TMP/nested-lag.json
+jq --arg signature "$NESTED_SIGNATURE_DIGEST" \
+  '.[0] |= map(select(.name != $signature))' \
+  "$NESTED_RESPONSE" >"$NESTED_LAG"
+NESTED_SEQUENCE=$TMP/nested-sequence
+mkdir -p "$NESTED_SEQUENCE"
+for attempt in 1 2 3 4; do
+  cp -- "$NESTED_LAG" "$NESTED_SEQUENCE/$attempt.json"
+done
+cp -- "$NESTED_RESPONSE" "$NESTED_SEQUENCE/5.json"
+printf '0\n' >"$TMP/nested-count"
+rm -f "$TMP/sleeps"
+NESTED_LAG_OUTPUT=$TMP/nested-lag-output
+mkdir -p "$NESTED_LAG_OUTPUT"
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_SEQUENCE_DIR=$NESTED_SEQUENCE \
+  GH_COUNT_FILE=$TMP/nested-count SLEEP_LOG=$TMP/sleeps \
+  "$READER" --image "$IMAGE" --alias "$ALIAS" \
+  --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
+  --index-file "$INDEX_WORK" --before-inventory "$NESTED_BEFORE" \
+  --protected-state "$PROTECTED" --require-signature true \
+  --output-dir "$NESTED_LAG_OUTPUT" >/dev/null
+[ "$(tr -d '[:space:]' <"$TMP/nested-count")" -eq 5 ]
+[ "$(wc -l <"$TMP/sleeps" | tr -d '[:space:]')" -eq 4 ]
+
+MALFORMED_NESTED=$TMP/malformed-nested.json
+jq '.[0][0].metadata = null' "$NESTED_RESPONSE" >"$MALFORMED_NESTED"
+set +e
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_RESPONSE=$MALFORMED_NESTED \
+  SLEEP_LOG=$TMP/sleeps \
+  "$READER" --image "$IMAGE" --alias "$ALIAS" \
+  --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
+  --index-file "$INDEX_WORK" --before-inventory "$NESTED_BEFORE" \
+  --protected-state "$PROTECTED" --require-signature true \
+  --output-dir "$TMP" >/dev/null 2>&1
+MALFORMED_STATUS=$?
+set -e
+[ "$MALFORMED_STATUS" -eq 1 ]
+
+FOREIGN_DIGEST=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+FOREIGN_NESTED=$TMP/foreign-nested.json
+jq --arg digest "$FOREIGN_DIGEST" \
+  '.[0] += [{id:99,name:$digest,metadata:{container:{tags:[]}}}]' \
+  "$NESTED_RESPONSE" >"$FOREIGN_NESTED"
+set +e
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_RESPONSE=$FOREIGN_NESTED \
+  SLEEP_LOG=$TMP/sleeps \
+  "$READER" --image "$IMAGE" --alias "$ALIAS" \
+  --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
+  --index-file "$INDEX_WORK" --before-inventory "$NESTED_BEFORE" \
+  --protected-state "$PROTECTED" --require-signature true \
+  --output-dir "$TMP" >/dev/null 2>&1
+FOREIGN_STATUS=$?
+set -e
+[ "$FOREIGN_STATUS" -eq 1 ]
+echo "nested inventory mutants passed: delayed child, malformed row, and foreign row rejection"
+
 # A complete candidate snapshot whose marker is delayed is retryable without
 # discarding the root/platform observation.
 MARKER_LAG=$TMP/marker-lag.json

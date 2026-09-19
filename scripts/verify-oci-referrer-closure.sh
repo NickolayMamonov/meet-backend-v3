@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --image IMAGE --index-file PATH --inventory-file PATH --subject-digest sha256:... --platform-subject sha256:... [--promotion-baseline-file PATH --protected-state-file PATH --candidate-alias ALIAS] [--fixture-dir PATH] [--output PATH] [--pending-on-missing-signature]" >&2
+  echo "usage: $0 --image IMAGE --index-file PATH --inventory-file PATH --subject-digest sha256:... --platform-subject sha256:... [--promotion-baseline-file PATH --protected-state-file PATH --candidate-alias ALIAS] [--fixture-dir PATH] [--output PATH] [--reachable-output PATH] [--pending-on-missing-signature] [--pending-on-missing-package]" >&2
   exit 2
 }
 
@@ -18,11 +18,13 @@ SUBJECT_DIGEST=
 PLATFORM_SUBJECT=
 FIXTURE_DIR=
 OUTPUT=
+REACHABLE_OUTPUT=
 PROMOTION_BASELINE=
 PROMOTION_PROTECTED=
 CANDIDATE_ALIAS=
 REQUIRE_SIGNATURE=false
 PENDING_ON_MISSING_SIGNATURE=false
+PENDING_ON_MISSING_PACKAGE=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --image) [ "$#" -ge 2 ] || usage; IMAGE=$2; shift 2 ;;
@@ -32,11 +34,13 @@ while [ "$#" -gt 0 ]; do
     --platform-subject) [ "$#" -ge 2 ] || usage; PLATFORM_SUBJECT=$2; shift 2 ;;
     --fixture-dir) [ "$#" -ge 2 ] || usage; FIXTURE_DIR=$2; shift 2 ;;
     --output) [ "$#" -ge 2 ] || usage; OUTPUT=$2; shift 2 ;;
+    --reachable-output) [ "$#" -ge 2 ] || usage; REACHABLE_OUTPUT=$2; shift 2 ;;
     --promotion-baseline-file) [ "$#" -ge 2 ] || usage; PROMOTION_BASELINE=$2; shift 2 ;;
     --protected-state-file) [ "$#" -ge 2 ] || usage; PROMOTION_PROTECTED=$2; shift 2 ;;
     --candidate-alias) [ "$#" -ge 2 ] || usage; CANDIDATE_ALIAS=$2; shift 2 ;;
     --require-signature) [ "$#" -ge 2 ] || usage; REQUIRE_SIGNATURE=$2; shift 2 ;;
     --pending-on-missing-signature) PENDING_ON_MISSING_SIGNATURE=true; shift ;;
+    --pending-on-missing-package) PENDING_ON_MISSING_PACKAGE=true; shift ;;
     *) usage ;;
   esac
 done
@@ -63,6 +67,8 @@ fi
   fail "selected OCI index bytes do not match the subject digest"
 PROMOTION=false
 [ -z "$PROMOTION_BASELINE" ] || PROMOTION=true
+REACHABILITY_ONLY=false
+[ -z "$REACHABLE_OUTPUT" ] || REACHABILITY_ONLY=true
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -r -- "$WORK_DIR"' EXIT HUP INT TERM
@@ -71,7 +77,33 @@ INVENTORY_DIGESTS=$WORK_DIR/inventory-digests
 ATTRIBUTIONS=$WORK_DIR/attributions.jsonl
 : >"$ATTRIBUTIONS"
 
-if [ "$PROMOTION" = true ]; then
+if [ "$REACHABILITY_ONLY" = true ]; then
+  jq -e '
+    type == "array" and length > 0 and all(.[]; type == "array") and
+    all(.[][];
+      type == "object" and
+      (.id | type == "number" and floor == . and . > 0) and
+      (.name | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.metadata | type == "object") and
+      (.metadata.container | type == "object") and
+      (.metadata.container.tags | type == "array" and
+        all(.[]; type == "string" and length > 0))
+    ) and
+    ([.[][] | .id] | unique | length) == ([.[][]] | length) and
+    ([.[][] | .name] | unique | length) == ([.[][]] | length) and
+    ([.[][] | .metadata.container.tags[]] | unique | length) ==
+      ([.[][] | .metadata.container.tags[]] | length)
+  ' "$INVENTORY_FILE" >/dev/null ||
+    fail "promotion reachability snapshot is malformed"
+  jq -c '
+    {digest:null,aliases:{},latest:null,
+     versions:[.[][] | {
+       id,digest:.name,tags:.metadata.container.tags
+     }]}
+  ' "$INVENTORY_FILE" >"$WORK_DIR/promotion-inventory.json" ||
+    fail "promotion reachability inventory normalization failed"
+  INVENTORY_FILE=$WORK_DIR/promotion-inventory.json
+elif [ "$PROMOTION" = true ]; then
   jq -e '
     type == "array" and length > 0 and all(.[]; type == "array") and
     all(.[][];
@@ -175,7 +207,7 @@ jq -r \
   ' "$INDEX_FILE" | tr -d '\r' | sort -u >"$REFERRERS"
 [ -s "$REFERRERS" ] || fail "subject-bound OCI referrer descriptors are missing"
 
-if [ "$PROMOTION" = true ]; then
+if [ "$REACHABILITY_ONLY" = true ] || [ "$PROMOTION" = true ]; then
   jq -r --arg platform "$PLATFORM_SUBJECT" \
     '[$platform, (.manifests[] | .digest)] | unique[]' \
     "$INDEX_FILE" |
@@ -191,13 +223,23 @@ fi
 [ -s "$INVENTORY_DIGESTS" ] || fail "package inventory has no child or referrer versions"
 while IFS= read -r digest; do validate_digest "$digest"; done <"$INVENTORY_DIGESTS"
 while IFS= read -r digest; do
-  jq -e --arg digest "$digest" 'any(.versions[]; .digest == $digest)' \
-    "$INVENTORY_FILE" >/dev/null ||
+  if ! jq -e --arg digest "$digest" \
+      'any(.versions[]; .digest == $digest)' "$INVENTORY_FILE" >/dev/null; then
+    if [ "$REACHABILITY_ONLY" = true ] &&
+       [ "$PENDING_ON_MISSING_PACKAGE" = true ]; then
+      exit 75
+    fi
     fail "candidate package version is absent from package inventory"
+  fi
 done <"$INVENTORY_DIGESTS"
 while IFS= read -r digest; do
-  grep -Fqx "$digest" "$INVENTORY_DIGESTS" ||
+  if ! grep -Fqx "$digest" "$INVENTORY_DIGESTS"; then
+    if [ "$REACHABILITY_ONLY" = true ] &&
+       [ "$PENDING_ON_MISSING_PACKAGE" = true ]; then
+      exit 75
+    fi
     fail "top-level subject-bound referrer is absent from package inventory"
+  fi
 done <"$REFERRERS"
 
 fetch_raw() {
@@ -264,6 +306,11 @@ collect_reachable() {
           application/vnd.oci.image.index.v1+json) ;;
           *) fail "reachable OCI child media type is foreign" ;;
         esac
+        if [ "$PENDING_ON_MISSING_PACKAGE" = true ] &&
+           ! jq -e --arg child "$child" \
+             'any(.versions[]; .digest == $child)' "$INVENTORY_FILE" >/dev/null; then
+          return 75
+        fi
         collect_reachable "$child" "$((depth + 1))" "$child_size" "$child_media"
       done < <(jq -c '.manifests[]' "$file")
       ;;
@@ -320,45 +367,6 @@ while IFS= read -r digest; do
   grep -Fqx "$digest" "$REACHABLE" ||
     fail "package inventory version is absent from the referrer graph"
 done <"$INVENTORY_DIGESTS"
-
-# Marker-only package rows belong to the promotion closure too.  Validate and
-# attribute every reachable nested node so a signature hidden below the
-# subject marker participates in readiness and is visible in the output.
-while IFS= read -r digest; do
-  if [ "$digest" != "$SUBJECT_DIGEST" ] &&
-     [ "$digest" != "$PLATFORM_SUBJECT" ] &&
-     ! grep -Fqx "$digest" "$INVENTORY_DIGESTS"; then
-    NODE_PROVENANCE=0
-    NODE_SBOM=0
-    NODE_SIGNATURE=0
-    NODE_BOUND=0
-    # The marker-only attribution pass intentionally calls the recursive
-    # validator declared below.
-    # shellcheck disable=SC2218
-    validate_node "$digest" "$SUBJECT_DIGEST" 0 1
-    [ "$NODE_BOUND" -eq 1 ] ||
-      fail "reachable nested OCI node is not subject-bound"
-    kind=referrer
-    if [ "$NODE_SIGNATURE" -eq 1 ] && [ "$NODE_PROVENANCE" -eq 0 ] &&
-       [ "$NODE_SBOM" -eq 0 ]; then
-      kind=signature
-    elif [ "$NODE_PROVENANCE" -eq 1 ] && [ "$NODE_SBOM" -eq 1 ]; then
-      kind=referrer
-    elif [ "$NODE_PROVENANCE" -eq 1 ]; then
-      kind=provenance
-    elif [ "$NODE_SBOM" -eq 1 ]; then
-      kind=sbom
-    fi
-    jq -cn \
-      --arg digest "$digest" \
-      --arg subject "$SUBJECT_DIGEST" \
-      --arg platform "$PLATFORM_SUBJECT" \
-      --arg kind "$kind" \
-      '{digest:$digest,attribution:{
-        verified:true,subject:$subject,platformSubject:$platform,kind:$kind
-      }}' >>"$ATTRIBUTIONS"
-  fi
-done <"$REACHABLE"
 
 if [ "$PROMOTION" = true ]; then
   reachable_json=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$REACHABLE")
@@ -467,6 +475,11 @@ validate_node() {
           application/vnd.oci.image.index.v1+json) ;;
           *) fail "nested OCI child media type is foreign" ;;
         esac
+        if [ "$PENDING_ON_MISSING_PACKAGE" = true ] &&
+           ! jq -e --arg child "$child" \
+             'any(.versions[]; .digest == $child)' "$INVENTORY_FILE" >/dev/null; then
+          return 75
+        fi
         if [ "$PENDING_ON_MISSING_SIGNATURE" = true ] &&
            [ "$REQUIRE_SIGNATURE" = true ] &&
            ! jq -e --arg child "$child" \
@@ -547,9 +560,65 @@ if [ -n "$MARKER_ROOT" ]; then
   NODE_SBOM=0
   NODE_SIGNATURE=0
   NODE_BOUND=0
-  validate_node "$MARKER_ROOT" "$SUBJECT_DIGEST" 0 0
+  marker_allow_inherited=0
+  grep -Fqx "$MARKER_ROOT" "$REFERRERS" && marker_allow_inherited=1
+  validate_node "$MARKER_ROOT" "$SUBJECT_DIGEST" 0 "$marker_allow_inherited"
   [ "$NODE_BOUND" -eq 1 ] ||
     fail "subject marker graph is not subject-bound"
+fi
+
+if [ "$PROMOTION" = true ]; then
+  # Marker-only package rows belong to the promotion closure too.  Validate
+  # and attribute every reachable nested node so a signature hidden below the
+  # subject marker participates in readiness and is visible in the output.
+  while IFS= read -r digest; do
+    if [ "$digest" != "$SUBJECT_DIGEST" ] &&
+       [ "$digest" != "$PLATFORM_SUBJECT" ] &&
+       ! grep -Fqx "$digest" "$INVENTORY_DIGESTS"; then
+      NODE_PROVENANCE=0
+      NODE_SBOM=0
+      NODE_SIGNATURE=0
+      NODE_BOUND=0
+      validate_node "$digest" "$SUBJECT_DIGEST" 0 1
+      [ "$NODE_BOUND" -eq 1 ] ||
+        fail "reachable nested OCI node is not subject-bound"
+      kind=referrer
+      if [ "$NODE_SIGNATURE" -eq 1 ] && [ "$NODE_PROVENANCE" -eq 0 ] &&
+         [ "$NODE_SBOM" -eq 0 ]; then
+        kind=signature
+      elif [ "$NODE_PROVENANCE" -eq 1 ] && [ "$NODE_SBOM" -eq 1 ]; then
+        kind=referrer
+      elif [ "$NODE_PROVENANCE" -eq 1 ]; then
+        kind=provenance
+      elif [ "$NODE_SBOM" -eq 1 ]; then
+        kind=sbom
+      fi
+      jq -cn \
+        --arg digest "$digest" \
+        --arg subject "$SUBJECT_DIGEST" \
+        --arg platform "$PLATFORM_SUBJECT" \
+        --arg kind "$kind" \
+        '{digest:$digest,attribution:{
+          verified:true,subject:$subject,platformSubject:$platform,kind:$kind
+        }}' >>"$ATTRIBUTIONS"
+    fi
+  done <"$REACHABLE"
+fi
+
+if [ "$REACHABILITY_ONLY" = true ]; then
+  while IFS= read -r digest; do
+    if ! jq -e --arg digest "$digest" \
+        'any(.versions[]; .digest == $digest)' "$INVENTORY_FILE" >/dev/null; then
+      if [ "$PENDING_ON_MISSING_PACKAGE" = true ]; then
+        exit 75
+      fi
+      fail "reachable package version is absent from package inventory"
+    fi
+  done <"$REACHABLE"
+  jq -Rsc 'split("\n") | map(select(length > 0)) | unique' "$REACHABLE" \
+    >"$REACHABLE_OUTPUT" ||
+    fail "promotion reachability output could not be written"
+  exit 0
 fi
 
 while IFS= read -r digest; do

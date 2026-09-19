@@ -365,8 +365,6 @@ jobs:
           printf 'platform_digest=%s\n' "$platform_digest" >> "$GITHUB_OUTPUT"
           printf 'admission_mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
           printf 'state_mode=%s\n' "$STATE_MODE" >> "$GITHUB_OUTPUT"
-          printf 'observed_state=%s\n' "$state" >> "$GITHUB_OUTPUT"
-          printf 'observed_attestation_status=%s\n' "$observed_attestation_status" >> "$GITHUB_OUTPUT"
           if [ "$mode" = published ]; then
             printf 'publication_proof=%s\n' "$publication_proof" >> "$GITHUB_OUTPUT"
             printf 'publication_proof_sha=%s\n' "$publication_proof_sha" >> "$GITHUB_OUTPUT"
@@ -434,11 +432,21 @@ jobs:
             --expected-platform-digest "$PLATFORM_DIGEST" \
             --input-command scripts/read-test-image-state.sh \
             --output "$RUNNER_TEMP/observed-reader-before-signature.json"
+          observed_state=$(jq -er '.state' \
+            "$RUNNER_TEMP/observed-reader-before-signature.json")
+          observed_attestation_status=$(jq -er '.attestationStatus // empty' \
+            "$RUNNER_TEMP/observed-reader-before-signature.json")
+          case "$observed_state:$observed_attestation_status" in
+            partial:missing|reusable:verified) ;;
+            *) echo "post-publication observation is not an admissible state" >&2; exit 1 ;;
+          esac
+          printf 'observed_state=%s\n' "$observed_state" >> "$GITHUB_OUTPUT"
+          printf 'observed_attestation_status=%s\n' "$observed_attestation_status" >> "$GITHUB_OUTPUT"
       - id: publication-proof
         name: Verify same-run publication proof
         if: success() && steps.publish.outputs.admission_mode == 'published' &&
-          steps.publish.outputs.observed_state == 'partial' &&
-          steps.publish.outputs.observed_attestation_status == 'missing'
+          steps.observed.outputs.observed_state == 'partial' &&
+          steps.observed.outputs.observed_attestation_status == 'missing'
         timeout-minutes: 5
         shell: bash
         env:
@@ -469,8 +477,8 @@ jobs:
       - id: signer-intent
         name: Mark signer intent for a first-time alias
         if: steps.publish.outputs.admission_mode == 'published' &&
-          steps.publish.outputs.observed_state == 'partial' &&
-          steps.publish.outputs.observed_attestation_status == 'missing'
+          steps.observed.outputs.observed_state == 'partial' &&
+          steps.observed.outputs.observed_attestation_status == 'missing'
         timeout-minutes: 1
         shell: bash
         env:
@@ -484,8 +492,8 @@ jobs:
       - id: signer
         name: Create signed OCI attestation for a first-time alias
         if: steps.publish.outputs.admission_mode == 'published' &&
-          steps.publish.outputs.observed_state == 'partial' &&
-          steps.publish.outputs.observed_attestation_status == 'missing'
+          steps.observed.outputs.observed_state == 'partial' &&
+          steps.observed.outputs.observed_attestation_status == 'missing'
         timeout-minutes: 5
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
@@ -495,8 +503,8 @@ jobs:
       - name: Confirm signer completion
         if: always() && steps.signer.outcome == 'success' &&
           steps.publish.outputs.admission_mode == 'published' &&
-          steps.publish.outputs.observed_state == 'partial' &&
-          steps.publish.outputs.observed_attestation_status == 'missing'
+          steps.observed.outputs.observed_state == 'partial' &&
+          steps.observed.outputs.observed_attestation_status == 'missing'
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
