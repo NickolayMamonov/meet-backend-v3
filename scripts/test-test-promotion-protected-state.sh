@@ -782,6 +782,25 @@ expect_collector_rejection contextual-subject 'attestation subject binding disag
   STUB_PACKAGES="$collector_fixture/packages-bad-subject.json" \
   STUB_ROOT_DIGEST="$bad_subject_root_digest" STUB_ROOT_RAW="$bad_subject_root"
 
+unbound_artifact="$collector_fixture/unbound-artifact.json"
+jq 'del(.subject)' "$artifact_raw" >"$unbound_artifact"
+unbound_artifact_digest="sha256:$(sha256sum "$unbound_artifact" | awk '{print $1}')"
+unbound_root="$collector_fixture/unbound-root.json"
+jq --arg artifact "$artifact_digest" \
+  '.manifests |= map(select(.digest != $artifact))' \
+  "$root_raw" >"$unbound_root"
+unbound_root_digest="sha256:$(sha256sum "$unbound_root" | awk '{print $1}')"
+jq -cnS --arg root "$unbound_root_digest" --arg artifact "$unbound_artifact_digest" '[[
+  {id:9001,name:$root,metadata:{container:{tags:["candidate"]}}},
+  {id:9002,name:$artifact,metadata:{container:{tags:["candidate"]}}}
+]]' >"$collector_fixture/packages-unbound-artifact.json"
+expect_collector_rejection unbound-artifact \
+  'artifact manifest is unbound' \
+  STUB_PACKAGES="$collector_fixture/packages-unbound-artifact.json" \
+  STUB_ROOT_DIGEST="$unbound_root_digest" STUB_ROOT_RAW="$unbound_root" \
+  STUB_ARTIFACT_DIGEST="$unbound_artifact_digest" \
+  STUB_ARTIFACT_RAW="$unbound_artifact"
+
 # Inject the exact collector descriptors into the valid protected fixture under
 # an existing supported alias collision. Capture must retain the whole closure.
 injected="$TMP/injected-valid.json"

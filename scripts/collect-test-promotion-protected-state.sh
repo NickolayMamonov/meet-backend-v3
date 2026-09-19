@@ -977,7 +977,7 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
       [ "$(jq length <<<"$predicate_types")" -gt 0 ] ||
         fail "artifact manifest predicate binding is missing for $digest"
       if [ -z "$subject_digest" ]; then
-        continue
+        fail "artifact manifest is unbound for $digest"
       fi
       validate_digest "$subject_digest"
     fi
