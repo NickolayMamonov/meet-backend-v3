@@ -1110,11 +1110,11 @@ jobs:
           elif [ "$attestation_write" = startedUnconfirmed ]; then
             failure_class=terminalRegistryPartial
             stage=attestation
-          elif [ "${{ needs.deploy.result }}" != success ] &&
+          elif [ "${{ needs.deploy.result }}" = failure ] &&
                [ "$deployment_mutation_started" = true ]; then
             failure_class=mutationFailed
             stage=final
-          elif [ "${{ needs.deploy.result }}" != success ] &&
+          elif [ "${{ needs.deploy.result }}" = failure ] &&
                [ "$deployment_mutation_started" = false ]; then
             failure_class=finalVerificationFailed
             stage=final
