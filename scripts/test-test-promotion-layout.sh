@@ -105,9 +105,13 @@ build_fixture() {
   mkdir -p "$layout/blobs/sha256" "$work"
   jq -cnS '{imageLayoutVersion:"1.0.0"}' >"$layout/oci-layout"
 
-  jq -cnS '{
+  jq -cnS --arg source "$SOURCE_SHA" --arg version 1.2.3 '{
     architecture:"amd64",
-    config:{},
+    config:{Labels:{
+      "org.opencontainers.image.source":"https://github.com/NickolayMamonov/meet-backend-v3",
+      "org.opencontainers.image.revision":$source,
+      "org.opencontainers.image.version":$version
+    }},
     created:"1970-01-01T00:00:00Z",
     history:[],
     os:"linux",
@@ -249,7 +253,13 @@ make_sandbox_tools() {
   local sandbox=$1
   mkdir -p "$sandbox/scripts" "$sandbox/bin"
   cp -- "$VERIFY" "$sandbox/scripts/verify-test-promotion-layout.sh"
+  cp -- "$ROOT_DIR/scripts/verify-test-promotion-publication.sh" \
+    "$sandbox/scripts/verify-test-promotion-publication.sh"
+  cp -- "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" \
+    "$sandbox/scripts/record-test-promotion-registry-state.sh"
   chmod 755 "$sandbox/scripts/verify-test-promotion-layout.sh"
+  chmod 755 "$sandbox/scripts/verify-test-promotion-publication.sh" \
+    "$sandbox/scripts/record-test-promotion-registry-state.sh"
   cat >"$sandbox/scripts/verify-dev-promotion-source.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -272,7 +282,12 @@ done
   [ "$output" = "${RUNNER_TEMP:?}/dev-promotion-source-publish.json" ] ||
   { echo "fixture source verifier: unexpected invocation" >&2; exit 1; }
 printf '%s\n' source-verified >>"${ORAS_EVENTS:?}"
-jq -cnS --arg source "$source_sha" '{sourceSha:$source}' >"$output"
+jq -cnS --arg source "$source_sha" --arg tree "${TREE_ID:?}" \
+  --arg version "${VERSION:?}" '{
+    schema:"meet-backend/dev-promotion-source/v1",
+    sourceSha:$source, authoritySha:$source, remoteSha:$source,
+    treeId:$tree, version:$version, clean:true, detached:true
+  }' >"$output"
 EOF
   chmod 755 "$sandbox/scripts/verify-dev-promotion-source.sh"
   cat >"$sandbox/bin/oras" <<'EOF'
@@ -340,8 +355,18 @@ run_publish_fragment() {
   mkdir -p "$RUNNER_TEMP"
   local proof=$RUNNER_TEMP/layout-proof.json
   cp -- "$protected" "$RUNNER_TEMP/protected-before.json"
+  jq -n '[[]]' >"$RUNNER_TEMP/protected-package-versions.json"
   extract_publish_fragment "$fragment"
   make_sandbox_tools "$sandbox"
+  local github_output=$sandbox/github-output
+  local registry_state=$RUNNER_TEMP/test-promotion-registry-state.json
+  : >"$github_output"
+  bash "$sandbox/scripts/record-test-promotion-registry-state.sh" init \
+    --file "$registry_state" --source "$SOURCE_SHA" \
+    --run-id 35354750679 --run-attempt 2
+  bash "$sandbox/scripts/record-test-promotion-registry-state.sh" classify \
+    --file "$registry_state" --source "$SOURCE_SHA" \
+    --run-id 35354750679 --run-attempt 2 --initial-state absent
   set +e
   (
     cd -- "$sandbox"
@@ -351,9 +376,16 @@ run_publish_fragment() {
       ref="$IMAGE:$SOURCE_ALIAS" \
       GITHUB_WORKSPACE="$sandbox" \
       SOURCE_SHA="$SOURCE_SHA" \
-      VERSION=fixture-version \
+      TREE_ID=abcdefabcdefabcdefabcdefabcdefabcdefabcd \
+      VERSION=1.2.3 \
       IMAGE="$IMAGE" \
+      GITHUB_RUN_ID=35354750679 \
+      GITHUB_RUN_ATTEMPT=2 \
+      GITHUB_REPOSITORY=NickolayMamonov/meet-backend-v3 \
+      GITHUB_OUTPUT="$github_output" \
       RUNNER_TEMP="$RUNNER_TEMP" \
+      REGISTRY_STATE="$registry_state" \
+      GH_TOKEN=fixture-token \
       ORAS_EVENTS="$sandbox/events" \
       ORAS_LAYOUT="$layout" \
       bash -e -u -o pipefail "$fragment" \
@@ -518,6 +550,37 @@ run_valid_and_negative_fixtures() {
     --arg platform "$(layout_platform_digest "$base")" \
     '.protectedSubjectsExcluded == true and .rootDigest == $root and .platformDigest == $platform' \
     "$valid_sandbox/runner-temp/layout-proof.json" >/dev/null
+  jq -e --arg root "$(layout_root_digest "$base")" \
+    --arg platform "$(layout_platform_digest "$base")" \
+    '.rootDigest == $root and .platformDigest == $platform' \
+    "$valid_sandbox/runner-temp/test-promotion-publication-35354750679-2.json" >/dev/null
+  jq -e '
+    .initialAliasState == "absent" and
+    .registryPublication == "confirmed" and
+    .attestationWrite == "notStarted"
+  ' "$valid_sandbox/runner-temp/test-promotion-registry-state.json" >/dev/null
+  for alias_state in reusable partial rejected; do
+    state_file="$TMP/$alias_state-registry-state.json"
+    bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" init \
+      --file "$state_file" --source "$SOURCE_SHA" \
+      --run-id 35354750679 --run-attempt 2
+    bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" classify \
+      --file "$state_file" --source "$SOURCE_SHA" \
+      --run-id 35354750679 --run-attempt 2 --initial-state "$alias_state"
+    jq -e --arg state "$alias_state" \
+      '.initialAliasState == $state and
+       .registryPublication == "notStarted" and
+       .attestationWrite == "notStarted"' "$state_file" >/dev/null
+  done
+  unknown_state="$TMP/unknown-registry-state.json"
+  bash "$ROOT_DIR/scripts/record-test-promotion-registry-state.sh" init \
+    --file "$unknown_state" --source "$SOURCE_SHA" \
+    --run-id 35354750679 --run-attempt 2
+  jq -e '
+    .initialAliasState == "unknown" and
+    .registryPublication == "notStarted" and
+    .attestationWrite == "notStarted"
+  ' "$unknown_state" >/dev/null
   printf 'local fixture admitted source_sha=%s alias=%s root=%s platform=%s\n' \
     "$SOURCE_SHA" "$SOURCE_ALIAS" "$(layout_root_digest "$base")" "$(layout_platform_digest "$base")"
 

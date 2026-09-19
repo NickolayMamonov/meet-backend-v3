@@ -239,7 +239,20 @@ jobs:
                 --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
                 --initial-state reusable
               ;;
-            partial|rejected) mode=quarantined ;;
+            partial)
+              mode=quarantined
+              bash scripts/record-test-promotion-registry-state.sh classify \
+                --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
+                --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+                --initial-state partial
+              ;;
+            rejected)
+              mode=quarantined
+              bash scripts/record-test-promotion-registry-state.sh classify \
+                --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
+                --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+                --initial-state rejected
+              ;;
             *) echo "candidate alias is not safely reusable" >&2; exit 1 ;;
           esac
           [ "$mode" != quarantined ] || {
@@ -1090,8 +1103,40 @@ jobs:
               *) initial_alias_state=unknown ;;
             esac
           fi
+          failure_class=
+          if [ "$registry_publication" = startedUnconfirmed ]; then
+            failure_class=terminalRegistryPartial
+            stage=registryWrite
+          elif [ "$attestation_write" = startedUnconfirmed ]; then
+            failure_class=terminalRegistryPartial
+            stage=attestation
+          elif [ "${{ needs.deploy.result }}" != success ] &&
+               [ "$deployment_mutation_started" = true ]; then
+            failure_class=mutationFailed
+            stage=final
+          elif [ "${{ needs.deploy.result }}" != success ] &&
+               [ "$deployment_mutation_started" = false ]; then
+            failure_class=finalVerificationFailed
+            stage=final
+          elif [ "${{ needs.admit-image.result }}" != success ] &&
+               [ "$registry_publication" = confirmed ] &&
+               [ "$attestation_write" = confirmed ]; then
+            failure_class=finalVerificationFailed
+            stage=final
+          elif [ "${{ needs.authorize.result }}" != success ]; then
+            failure_class=validationFailed
+            stage=authorization
+          elif [ "${{ needs.admit-image.result }}" != success ] &&
+               [ "$initial_alias_state" != unknown ] &&
+               [ "$registry_publication" != unknown ] &&
+               [ "$attestation_write" != unknown ]; then
+            failure_class=validationFailed
+            stage=admission
+          else
+            failure_class=internalFailure
+          fi
           scripts/build-test-promotion-evidence.sh incident \
-            --stage "$stage" --failure-class internalFailure \
+            --stage "$stage" --failure-class "$failure_class" \
             --registry-publication "$registry_publication" \
             --attestation-write "$attestation_write" \
             --initial-alias-state "$initial_alias_state" \

@@ -168,23 +168,6 @@ INDEX_DIGESTS=$(jq -c \
     .digest]) | unique
 ' "$INDEX_FILE" | tr -d '\r') || fail "candidate descriptor extraction failed"
 
-WRAPPER_COUNT=$(jq -r \
-  --arg platform "$PLATFORM_SUBJECT" '
-  [.manifests[] |
-    select(.digest != $platform and
-      .annotations["vnd.docker.reference.type"]? == "attestation-manifest")] | length
-' "$INDEX_FILE" | tr -d '\r') || fail "candidate wrapper extraction failed"
-
-SIGNATURE_WRAPPER_COUNT=$(jq -r \
-  --arg signature_media "application/vnd.dev.sigstore.bundle.v0.3+json" '
-  [.manifests[] |
-    select(.digest != $platform and
-      .annotations["vnd.docker.reference.type"]? == "attestation-manifest" and
-      (.annotations["vnd.docker.reference.artifact.type"]? == $signature_media or
-       .annotations["org.opencontainers.artifact.type"]? == $signature_media))] | length
-' --arg platform "$PLATFORM_SUBJECT" "$INDEX_FILE" | tr -d '\r') ||
-  fail "candidate signature marker extraction failed"
-
 # The raw before snapshot is deliberately validated independently.  It is
 # never assembled with pages from a fresh attempt.
 validate_snapshot() {
@@ -426,10 +409,10 @@ evaluate_snapshot() {
   ' "$current" >/dev/null ||
     fail "candidate child carries an unexpected alias"
 
-  if [ "$REQUIRE_SIGNATURE" = true ] &&
-     { [ "$WRAPPER_COUNT" -eq 0 ] || [ "$SIGNATURE_WRAPPER_COUNT" -eq 0 ]; }; then
-    return 75
-  fi
+  # A signature may be reachable only through the package's subject marker
+  # and a nested OCI index.  Top-level marker counts cannot establish
+  # readiness; verify-oci-referrer-closure.sh performs the authoritative
+  # subject-bound graph traversal after this snapshot is collected.
 
   # Package rows for a marker are part of the candidate projection even when
   # the marker index itself is not a child of the selected root index.

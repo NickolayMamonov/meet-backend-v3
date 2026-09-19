@@ -415,8 +415,7 @@ verify_proof() {
       any(.versions[]; .digest == $platform[7:]))
   ' "$CANDIDATE_INVENTORY" >/dev/null || fail "candidate inventory is not bound to proof"
   jq -e --arg root "$root" --arg platform "$platform" '
-    (.digest == $root or .root.digest == $root) and
-    (.platform.digest == $platform or .platformDigest == $platform)
+    .rootDigest == $root and .platformDigest == $platform
   ' "$OBSERVED_READER" >/dev/null || fail "observed reader snapshot is not bound to proof"
   jq -e --arg run "$RUN_ID" --arg attempt "$RUN_ATTEMPT" --arg source "$SOURCE_SHA" '
     (keys | sort) == [

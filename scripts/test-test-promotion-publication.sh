@@ -105,7 +105,7 @@ jq -nS --arg root "$ROOT" --arg platform "$PLATFORM" --arg alias "$ALIAS" \
   '{versions:[{id:1,digest:$root,tags:[$alias]},
               {id:2,digest:$platform,tags:[]}]}' >"$CANDIDATE"
 jq -nS --arg root "$ROOT" --arg platform "$PLATFORM" \
-  '{root:{digest:$root},platform:{digest:$platform}}' >"$OBSERVED"
+  '{rootDigest:$root,platformDigest:$platform}' >"$OBSERVED"
 jq -nS --arg source "$SOURCE" \
   '{schema:"meet-backend/test-promotion-registry-state/v1",
     sourceSha:$source,runId:35354750679,runAttempt:2,
@@ -125,6 +125,27 @@ verify() {
 }
 
 verify
+
+jq 'del(.platformDigest)' "$OBSERVED" >"$TMP/observed-missing-mutant.json"
+expect_failure observed-missing-field bash "$PROOF_HELPER" verify \
+  --proof "$PROOF" --expected-proof-sha256 "$PROOF_SHA" \
+  --index-file "$LAYOUT/blobs/sha256/${ROOT#sha256:}" \
+  --candidate-inventory "$CANDIDATE" --observed-reader "$TMP/observed-missing-mutant.json" \
+  --registry-journal "$JOURNAL" --before-inventory "$BEFORE" \
+  --protected-state "$PROTECTED" --layout-proof "$LAYOUT_PROOF" \
+  --image "$IMAGE" --source-sha "$SOURCE" --tree-id "$TREE" \
+  --version "$VERSION" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT"
+
+jq --arg wrong "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  '.rootDigest = $wrong' "$OBSERVED" >"$TMP/observed-wrong-mutant.json"
+expect_failure observed-wrong-field bash "$PROOF_HELPER" verify \
+  --proof "$PROOF" --expected-proof-sha256 "$PROOF_SHA" \
+  --index-file "$LAYOUT/blobs/sha256/${ROOT#sha256:}" \
+  --candidate-inventory "$CANDIDATE" --observed-reader "$TMP/observed-wrong-mutant.json" \
+  --registry-journal "$JOURNAL" --before-inventory "$BEFORE" \
+  --protected-state "$PROTECTED" --layout-proof "$LAYOUT_PROOF" \
+  --image "$IMAGE" --source-sha "$SOURCE" --tree-id "$TREE" \
+  --version "$VERSION" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT"
 
 EXISTING="$TMP/output/existing-proof.json"
 printf '%s\n' 'existing-proof' >"$EXISTING"

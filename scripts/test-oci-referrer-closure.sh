@@ -177,6 +177,10 @@ run_valid "$TMP/inventory.json" "$TMP/attributed.json"
   --tag v1.0.1 \
   --version 1.0.1 \
   --source-sha "$SOURCE" >/dev/null
+jq -e --arg signature "$SIGNATURE" '
+  any(.versions[]; .digest == $signature and
+    .attribution.verified == true and .attribution.kind == "signature")
+' "$TMP/attributed.json" >/dev/null
 
 NO_SIGNATURE_INDEX=$TMP/no-signature-index.json
 jq --arg signature_index "$SIGNATURE_INDEX" '

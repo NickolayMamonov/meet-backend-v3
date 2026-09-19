@@ -244,7 +244,8 @@ collect_reachable() {
     application/vnd.oci.image.index.v1+json)
       jq -e '
         .schemaVersion == 2 and
-        (.manifests | type == "array" and length > 0)
+        (.manifests | type == "array" and length > 0) and
+        ([.manifests[].digest] | unique | length) == (.manifests | length)
       ' "$file" >/dev/null || fail "reachable OCI referrer index is invalid"
       while IFS= read -r descriptor; do
         validate_descriptor "$descriptor"
@@ -312,6 +313,42 @@ while IFS= read -r digest; do
   grep -Fqx "$digest" "$REACHABLE" ||
     fail "package inventory version is absent from the referrer graph"
 done <"$INVENTORY_DIGESTS"
+
+# Marker-only package rows belong to the promotion closure too.  Validate and
+# attribute every reachable nested node so a signature hidden below the
+# subject marker participates in readiness and is visible in the output.
+while IFS= read -r digest; do
+  if [ "$digest" != "$SUBJECT_DIGEST" ] &&
+     [ "$digest" != "$PLATFORM_SUBJECT" ] &&
+     ! grep -Fqx "$digest" "$INVENTORY_DIGESTS"; then
+    NODE_PROVENANCE=0
+    NODE_SBOM=0
+    NODE_SIGNATURE=0
+    NODE_BOUND=0
+    validate_node "$digest" "$SUBJECT_DIGEST" 0 1
+    [ "$NODE_BOUND" -eq 1 ] ||
+      fail "reachable nested OCI node is not subject-bound"
+    kind=referrer
+    if [ "$NODE_SIGNATURE" -eq 1 ] && [ "$NODE_PROVENANCE" -eq 0 ] &&
+       [ "$NODE_SBOM" -eq 0 ]; then
+      kind=signature
+    elif [ "$NODE_PROVENANCE" -eq 1 ] && [ "$NODE_SBOM" -eq 1 ]; then
+      kind=referrer
+    elif [ "$NODE_PROVENANCE" -eq 1 ]; then
+      kind=provenance
+    elif [ "$NODE_SBOM" -eq 1 ]; then
+      kind=sbom
+    fi
+    jq -cn \
+      --arg digest "$digest" \
+      --arg subject "$SUBJECT_DIGEST" \
+      --arg platform "$PLATFORM_SUBJECT" \
+      --arg kind "$kind" \
+      '{digest:$digest,attribution:{
+        verified:true,subject:$subject,platformSubject:$platform,kind:$kind
+      }}' >>"$ATTRIBUTIONS"
+  fi
+done <"$REACHABLE"
 
 if [ "$PROMOTION" = true ]; then
   reachable_json=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$REACHABLE")
@@ -381,7 +418,7 @@ validate_image_manifest() {
 validate_node() {
   local digest=$1 inherited_subject=$2 depth=$3 allow_inherited=$4
   local expected_size=${5:-} expected_media=${6:-}
-  local file media descriptor child child_media child_size declared_subject
+  local file media descriptor child child_media child_size declared_subject subject_descriptor
   [ "$depth" -le 8 ] || fail "OCI referrer graph exceeds the verification bound"
   file=$WORK_DIR/node-${digest#sha256:}.json
   fetch_raw "$digest" "$file" "$expected_size" "$expected_media"
@@ -390,9 +427,12 @@ validate_node() {
     application/vnd.oci.image.index.v1+json)
       jq -e '
         .schemaVersion == 2 and
-        (.manifests | type == "array" and length > 0)
+        (.manifests | type == "array" and length > 0) and
+        ([.manifests[].digest] | unique | length) == (.manifests | length)
       ' "$file" >/dev/null || fail "nested OCI referrer index is invalid"
       if jq -e '.subject != null' "$file" >/dev/null; then
+        subject_descriptor=$(jq -c '.subject' "$file")
+        validate_descriptor "$subject_descriptor"
         declared_subject=$(jq -r '.subject.digest // empty' "$file")
         validate_digest "$declared_subject"
         [ "$declared_subject" = "$SUBJECT_DIGEST" ] ||
@@ -410,12 +450,16 @@ validate_node() {
           application/vnd.oci.image.index.v1+json) ;;
           *) fail "nested OCI child media type is foreign" ;;
         esac
-        validate_node "$child" "$inherited_subject" "$((depth + 1))" \
-          "$allow_inherited" "$child_size" "$child_media"
+        child_allow=$allow_inherited
+        [ -n "$declared_subject" ] && child_allow=1
+        validate_node "$child" "${declared_subject:-$inherited_subject}" \
+          "$((depth + 1))" "$child_allow" "$child_size" "$child_media"
       done < <(jq -c '.manifests[]' "$file")
       ;;
     application/vnd.oci.image.manifest.v1+json)
       if jq -e '.subject != null' "$file" >/dev/null; then
+        subject_descriptor=$(jq -c '.subject' "$file")
+        validate_descriptor "$subject_descriptor"
         declared_subject=$(jq -r '.subject.digest // empty' "$file")
         validate_digest "$declared_subject"
         [ "$declared_subject" = "$SUBJECT_DIGEST" ] ||
@@ -474,6 +518,16 @@ NODE_PROVENANCE=0
 NODE_SBOM=0
 NODE_SIGNATURE=0
 SIGNATURE_FOUND=0
+
+if [ -n "$MARKER_ROOT" ]; then
+  NODE_PROVENANCE=0
+  NODE_SBOM=0
+  NODE_SIGNATURE=0
+  NODE_BOUND=0
+  validate_node "$MARKER_ROOT" "$SUBJECT_DIGEST" 0 0
+  [ "$NODE_BOUND" -eq 1 ] ||
+    fail "subject marker graph is not subject-bound"
+fi
 
 while IFS= read -r digest; do
   NODE_PROVENANCE=0

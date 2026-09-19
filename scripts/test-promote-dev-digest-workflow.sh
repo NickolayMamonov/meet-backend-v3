@@ -60,6 +60,10 @@ grep -Fq 'timeout 600s bash "$TOOLING_SCRIPTS/test-promote-dev-digest-workflow.s
 grep -Fq 'same-image redeploy requires explicit allow_same_digest_redeploy=true' "$WORKFLOW"
 grep -Fq 'if: always()' "$WORKFLOW"
 grep -Fq 'build-test-promotion-evidence.sh incident' "$WORKFLOW"
+grep -Fq -- '--initial-state partial' "$WORKFLOW"
+grep -Fq -- '--initial-state rejected' "$WORKFLOW"
+grep -Fq 'failure_class=' "$WORKFLOW"
+! grep -Fq -- '--failure-class internalFailure' "$WORKFLOW"
 grep -Fq 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' "$WORKFLOW"
 grep -Fq 'verify-test-vps-assets.sh' "$WORKFLOW"
 grep -Fq 'validate-test-vps-phase-file.sh' "$WORKFLOW"
@@ -737,6 +741,44 @@ run_incident_contract() {
   [ ! -e "$temp/candidate.json" ]
 }
 
+run_incident_case() {
+  local name=$1 registry=$2 attestation=$3 initial=$4 admit_result=$5
+  local deploy_result=$6 mutation=$7 expected_class=$8
+  local block="$TEST_ROOT/incident-$name.sh"
+  local root="$TEST_ROOT/incident-$name"
+  local workspace="$root/workspace"
+  local temp="$root/temp"
+  mkdir -p "$workspace/scripts" "$temp"
+  extract_run_block "$WORKFLOW" '      - name: Build sanitized incident document' "$block"
+  sed -i \
+    -e 's/${{ needs\.authorize\.result }}/success/g' \
+    -e "s/\${{ needs\.admit-image\.result }}/$admit_result/g" \
+    -e "s/\${{ needs\.admit-image\.outputs\.registry_publication }}/$registry/g" \
+    -e "s/\${{ needs\.admit-image\.outputs\.attestation_write }}/$attestation/g" \
+    -e "s/\${{ needs\.admit-image\.outputs\.initial_alias_state }}/$initial/g" \
+    -e "s/\${{ needs\.deploy\.result }}/$deploy_result/g" \
+    -e "s/\${{ needs\.deploy\.outputs\.mutation_started }}/$mutation/g" \
+    -e 's/${{ needs\.deploy\.outputs\.rollback_attempted }}/false/g' \
+    -e 's/${{ needs\.deploy\.outputs\.rollback_verified }}/false/g' \
+    "$block"
+  cp -- "$ROOT_DIR/scripts/build-test-promotion-evidence.sh" "$workspace/scripts/"
+  cp -- "$ROOT_DIR/scripts/test-vps-admission-contract.json" "$workspace/scripts/"
+  (
+    cd "$workspace"
+    env -i HOME="$root/home" PATH="$REAL_PATH" RUNNER_TEMP="$temp" \
+      GITHUB_WORKSPACE="$workspace" GITHUB_PATH="$root/github-path" \
+      "$BASH" "$block"
+  )
+  jq -e --arg expected "$expected_class" --arg registry "$registry" \
+    --arg attestation "$attestation" --arg initial "$initial" '
+    .failureClass == $expected and
+    .registryPublication == $registry and
+    .attestationWrite == $attestation and
+    .initialAliasState == $initial and
+    .evidenceSanitized == true and .retentionAuthorized == false
+  ' "$temp/promotion-incident.json" >/dev/null
+}
+
 REAL_PATH=$PATH
 REAL_SHA256SUM=$(command -v sha256sum)
 REAL_TAR=$(command -v tar)
@@ -1106,6 +1148,9 @@ sed -i \
   -e 's/\${{ needs\.deploy\.outputs\.rollback_verified }}/false/g' \
   "$incident_block"
 run_incident_contract "$incident_block" "$TEST_ROOT/incident"
+run_incident_case failed-copy startedUnconfirmed notStarted absent failure skipped false terminalRegistryPartial
+run_incident_case interrupted-signer confirmed startedUnconfirmed absent failure skipped false terminalRegistryPartial
+run_incident_case later-admission-failure confirmed confirmed absent failure skipped false finalVerificationFailed
 
 bash "$ROOT_DIR/scripts/test-test-promotion-input.sh"
 echo "dev promotion workflow fixture passed: ORAS readiness, ordering, bounds, incident and retention contracts"
