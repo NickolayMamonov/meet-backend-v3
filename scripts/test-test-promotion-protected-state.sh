@@ -437,4 +437,392 @@ modern_reject wrong-subject \
   '.subject.digest =
     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"'
 
+fixture_dir=$ROOT_DIR/scripts/fixtures/test-promotion-protected-state
+
+# The reducer is exercised through the same sourceable helpers used by the
+# collector.  Raw bytes provide complete facts; contextual descriptors provide
+# only positive/partial constraints.
+raw_manifest="$TMP/raw-manifest.json"
+raw_digest_file="$TMP/raw-manifest.digest"
+raw_subject=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+raw_child=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+jq -cnS --arg subject "$raw_subject" --arg child "$raw_child" '{
+  schemaVersion:2,
+  mediaType:"application/vnd.oci.image.manifest.v1+json",
+  subject:{digest:$subject},
+  artifactType:"application/vnd.example.artifact",
+  layers:[{annotations:{"in-toto.io/predicate-type":"predicate/example"}}],
+  manifests:[{digest:$child}]
+}' >"$raw_manifest"
+raw_digest="sha256:$(sha256sum "$raw_manifest" | awk '{print $1}')"
+raw_size=$(wc -c <"$raw_manifest" | tr -d ' ')
+printf '%s\n' "$raw_digest" >"$raw_digest_file"
+raw_observation=$(manifest_observation_from_raw \
+  "$raw_manifest" "$raw_digest" \
+  application/vnd.oci.image.manifest.v1+json "$raw_size") ||
+  fail "raw observation construction failed"
+context_observation=$(manifest_observation_from_descriptor "$(jq -cnS \
+  --arg digest "$raw_digest" --arg subject "$raw_subject" --arg child "$raw_child" \
+  --argjson size "$raw_size" '{
+    digest:$digest,mediaType:"application/vnd.oci.image.manifest.v1+json",
+    size:$size,subjectDigest:$subject,artifactType:"application/vnd.example.artifact",
+    predicateTypes:["predicate/example"],children:[$child]
+  }')") || fail "context observation construction failed"
+
+printf '%s\n%s\n%s\n%s\n' \
+  "$context_observation" "$raw_observation" "$raw_observation" \
+  "$context_observation" >"$TMP/observations-forward.jsonl"
+printf '%s\n%s\n%s\n%s\n' \
+  "$raw_observation" "$context_observation" "$context_observation" \
+  "$raw_observation" >"$TMP/observations-reversed.jsonl"
+canonicalize_manifest_observations "$TMP/observations-forward.jsonl" \
+  >"$TMP/observations-forward.json" ||
+  fail "forward observation reconciliation failed"
+canonicalize_manifest_observations "$TMP/observations-reversed.jsonl" \
+  >"$TMP/observations-reversed.json" ||
+  fail "reversed observation reconciliation failed"
+cmp --silent "$TMP/observations-forward.json" "$TMP/observations-reversed.json" ||
+  fail "equivalent observations changed canonical bytes"
+jq -e --arg digest "$raw_digest" --arg subject "$raw_subject" \
+  --arg child "$raw_child" --arg raw_size "$raw_size" '
+  length == 1 and .[0] == {
+    digest:$digest,mediaType:"application/vnd.oci.image.manifest.v1+json",
+    size:($raw_size | tonumber),subjectDigest:$subject,artifactType:"application/vnd.example.artifact",
+    predicateTypes:["predicate/example"],children:[$child]
+  }
+' "$TMP/observations-forward.json" >/dev/null ||
+  fail "canonical descriptor did not retain complete raw facts"
+
+expect_reducer_failure() {
+  local name=$1 field=$2 rows=$3
+  printf '%s\n' "$rows" >"$TMP/$name.jsonl"
+  canonicalize_manifest_observations "$TMP/$name.jsonl" \
+    >"$TMP/$name.stdout" 2>"$TMP/$name.stderr" &&
+    fail "reducer accepted conflict: $name"
+  [ ! -s "$TMP/$name.stdout" ] ||
+    fail "reducer emitted stdout on rejection: $name"
+  grep -Fq "manifest observation conflict: $raw_digest $field" \
+    "$TMP/$name.stderr" ||
+    fail "reducer omitted named conflict class: $name"
+}
+
+base_complete=$(jq -cnS --arg digest "$raw_digest" --argjson size "$raw_size" '{
+  digest:$digest,mediaType:"application/vnd.oci.image.manifest.v1+json",size:$size,
+  facts:{
+    subjectDigest:{state:"complete",value:null},
+    artifactType:{state:"complete",value:null},
+    predicateTypes:{state:"complete",values:[]},
+    children:{state:"complete",values:[]}
+  }
+}')
+expect_reducer_failure mediaType mediaType \
+  "$(printf '%s\n' "$base_complete" "$(jq '.mediaType = "application/vnd.oci.image.index.v1+json"' <<<"$base_complete")")"
+expect_reducer_failure size size \
+  "$(printf '%s\n' "$base_complete" "$(jq '.size += 1' <<<"$base_complete")")"
+expect_reducer_failure verified-absence subjectDigest \
+  "$(printf '%s\n' "$base_complete" "$(jq --arg subject "$raw_subject" \
+    '.facts.subjectDigest = {state:"positive",value:$subject}' \
+    <<<"$base_complete")")"
+expect_reducer_failure scalar-fact artifactType \
+  "$(printf '%s\n' \
+    "$(jq '.facts.artifactType = {state:"complete",value:"type/a"}' \
+      <<<"$base_complete")" \
+    "$(jq '.facts.artifactType = {state:"positive",value:"type/b"}' \
+      <<<"$base_complete")")"
+expect_reducer_failure unequal-complete-set predicateTypes \
+  "$(printf '%s\n' \
+    "$(jq '.facts.predicateTypes.values = ["predicate/a"]' <<<"$base_complete")" \
+    "$(jq '.facts.predicateTypes.values = ["predicate/b"]' <<<"$base_complete")")"
+expect_reducer_failure partial-outside children \
+  "$(printf '%s\n' \
+    "$(jq '.facts.children.values = ["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]' \
+      <<<"$base_complete")" \
+    "$(jq '.facts.children = {state:"partial",values:["sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"]}' \
+      <<<"$base_complete")")"
+
+unresolved=$(jq '.facts.subjectDigest = {state:"unknown"}' <<<"$base_complete")
+printf '%s\n' "$unresolved" >"$TMP/unresolved.jsonl"
+canonicalize_manifest_observations "$TMP/unresolved.jsonl" \
+  >"$TMP/unresolved.stdout" 2>"$TMP/unresolved.stderr" &&
+  fail "reducer accepted unresolved facts"
+[ ! -s "$TMP/unresolved.stdout" ] ||
+  fail "unresolved reducer rejection emitted stdout"
+grep -Fq "manifest observation unresolved: $raw_digest subjectDigest" \
+  "$TMP/unresolved.stderr" ||
+  fail "unresolved reducer rejection omitted its field"
+
+malformed_positive=$(jq '.facts.subjectDigest = {state:"positive"}' <<<"$base_complete")
+printf '%s\n' "$malformed_positive" >"$TMP/malformed-positive.jsonl"
+canonicalize_manifest_observations "$TMP/malformed-positive.jsonl" \
+  >"$TMP/malformed-positive.stdout" 2>"$TMP/malformed-positive.stderr" &&
+  fail "malformed positive scalar was accepted"
+[ ! -s "$TMP/malformed-positive.stdout" ] ||
+  fail "malformed positive scalar emitted stdout"
+grep -Fq "manifest observation positive scalar fact is malformed" \
+  "$TMP/malformed-positive.stderr" ||
+  fail "malformed positive scalar was not rejected at validation"
+
+multi_conflict=$(printf '%s\n%s\n' \
+  "$base_complete" \
+  "$(jq -cS --arg subject "$raw_subject" \
+    '.mediaType = "application/vnd.oci.image.index.v1+json" |
+     .facts.subjectDigest = {state:"positive",value:$subject}' \
+    <<<"$base_complete")")
+printf '%s\n' "$multi_conflict" >"$TMP/multi-conflict.jsonl"
+if canonicalize_manifest_observations "$TMP/multi-conflict.jsonl" \
+    >"$TMP/multi-forward.stdout" 2>"$TMP/multi-forward.stderr"; then
+  fail "multi-conflict reducer accepted forward order"
+fi
+printf '%s\n' "$(printf '%s\n' "$multi_conflict" | tail -n 1)" \
+  "$(printf '%s\n' "$multi_conflict" | head -n 1)" \
+  >"$TMP/multi-reversed.jsonl"
+if canonicalize_manifest_observations "$TMP/multi-reversed.jsonl" \
+    >"$TMP/multi-reversed.stdout" 2>"$TMP/multi-reversed.stderr"; then
+  fail "multi-conflict reducer accepted reversed order"
+fi
+grep -Fq "manifest observation conflict: $raw_digest mediaType" \
+  "$TMP/multi-forward.stderr" ||
+  fail "multi-conflict forward order selected the wrong field"
+grep -Fq "manifest observation conflict: $raw_digest mediaType" \
+  "$TMP/multi-reversed.stderr" ||
+  fail "multi-conflict reversal changed the selected field"
+
+duplicate_set=$(jq '
+  .facts.predicateTypes = {state:"complete",values:["z","a","a"]} |
+  .facts.children = {state:"complete",values:["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                                               "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}
+' <<<"$base_complete")
+ordered_set=$(jq '
+  .facts.predicateTypes = {state:"complete",values:["a","z"]} |
+  .facts.children = {state:"complete",values:["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}
+' <<<"$base_complete")
+printf '%s\n' "$duplicate_set" >"$TMP/duplicate-set.jsonl"
+printf '%s\n' "$ordered_set" >"$TMP/ordered-set.jsonl"
+canonicalize_manifest_observations "$TMP/duplicate-set.jsonl" \
+  >"$TMP/duplicate-set.json" || fail "duplicate sets were rejected"
+canonicalize_manifest_observations "$TMP/ordered-set.jsonl" \
+  >"$TMP/ordered-set.json" || fail "ordered sets were rejected"
+cmp --silent "$TMP/duplicate-set.json" "$TMP/ordered-set.json" ||
+  fail "duplicate/order set semantics changed canonical bytes"
+
+# Full collector proof: only the allowlisted read stubs are available, and
+# package traversal observes the same artifact as an index child and a package.
+collector_fixture="$TMP/collector-fixture"
+stub_bin="$TMP/collector-bin"
+mkdir "$collector_fixture" "$stub_bin"
+platform_raw="$collector_fixture/platform.json"
+artifact_raw="$collector_fixture/artifact.json"
+root_raw="$collector_fixture/root.json"
+jq -cnS '{
+  schemaVersion:2,
+  mediaType:"application/vnd.oci.image.manifest.v1+json",
+  config:{digest:"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
+}' >"$platform_raw"
+platform_digest="sha256:$(sha256sum "$platform_raw" | awk '{print $1}')"
+platform_size=$(wc -c <"$platform_raw" | tr -d ' ')
+jq -cnS --arg subject "$platform_digest" '{
+  schemaVersion:2,
+  mediaType:"application/vnd.oci.image.manifest.v1+json",
+  artifactType:"application/vnd.example.attestation",
+  subject:{digest:$subject},
+  layers:[{annotations:{"in-toto.io/predicate-type":"predicate/example"}}]
+}' >"$artifact_raw"
+artifact_digest="sha256:$(sha256sum "$artifact_raw" | awk '{print $1}')"
+artifact_size=$(wc -c <"$artifact_raw" | tr -d ' ')
+jq -cnS --arg platform "$platform_digest" --arg artifact "$artifact_digest" \
+  --argjson platformSize "$platform_size" --argjson artifactSize "$artifact_size" '{
+  schemaVersion:2,
+  mediaType:"application/vnd.oci.image.index.v1+json",
+  manifests:[
+    {digest:$platform,mediaType:"application/vnd.oci.image.manifest.v1+json",
+     size:$platformSize,platform:{os:"linux",architecture:"amd64"}},
+    {digest:$artifact,mediaType:"application/vnd.oci.image.manifest.v1+json",
+     size:$artifactSize,annotations:{
+       "vnd.docker.reference.type":"attestation-manifest",
+       "vnd.docker.reference.digest":$platform
+     }}
+  ]
+}' >"$root_raw"
+root_digest="sha256:$(sha256sum "$root_raw" | awk '{print $1}')"
+root_size=$(wc -c <"$root_raw" | tr -d ' ')
+packages="$collector_fixture/packages.json"
+jq -cnS --arg root "$root_digest" --arg artifact "$artifact_digest" '[[
+  {id:9001,name:$root,metadata:{container:{tags:["candidate"]}}},
+  {id:9002,name:$artifact,metadata:{container:{tags:["candidate"]}}}
+]]' >"$packages"
+cp "$fixture_dir/collector-gh-read-stub.sh" "$stub_bin/gh"
+cp "$fixture_dir/collector-docker-read-stub.sh" "$stub_bin/docker"
+chmod +x "$stub_bin/gh" "$stub_bin/docker"
+audit="$collector_fixture/audit.log"
+writer_marker="$collector_fixture/writer.marker"
+collector_output="$collector_fixture/collected.json"
+collector_env=(
+  "PATH=$stub_bin:$PATH"
+  "GH_TOKEN=fixture-token"
+  "STUB_AUDIT=$audit"
+  "STUB_ROOT_DIGEST=$root_digest"
+  "STUB_ROOT_RAW=$root_raw"
+  "STUB_PLATFORM_DIGEST=$platform_digest"
+  "STUB_PLATFORM_RAW=$platform_raw"
+  "STUB_ARTIFACT_DIGEST=$artifact_digest"
+  "STUB_ARTIFACT_RAW=$artifact_raw"
+  "STUB_WRITER_MARKER=$writer_marker"
+)
+env "${collector_env[@]}" STUB_PACKAGES="$packages" bash "$COLLECTOR" \
+  --repository fixture/repository \
+  --image ghcr.io/fixture/repository \
+  --output "$collector_output" \
+  --candidate-alias candidate \
+  >"$collector_fixture/initial.stdout" \
+  2>"$collector_fixture/initial.stderr" ||
+  { cat "$collector_fixture/initial.stderr" >&2
+  fail "strict read-stub collector rejected valid overlap"
+  }
+jq -e --arg root "$root_digest" --arg platform "$platform_digest" \
+  --arg artifact "$artifact_digest" --argjson rootSize "$root_size" \
+  --argjson platformSize "$platform_size" --argjson artifactSize "$artifact_size" '
+  .registry.manifests == ([
+    {digest:$artifact,mediaType:"application/vnd.oci.image.manifest.v1+json",
+     size:$artifactSize,subjectDigest:$platform,
+     artifactType:"application/vnd.example.attestation",
+     predicateTypes:["predicate/example"],children:[]},
+    {digest:$platform,mediaType:"application/vnd.oci.image.manifest.v1+json",
+     size:$platformSize,subjectDigest:null,artifactType:null,
+     predicateTypes:[],children:[]},
+    {digest:$root,mediaType:"application/vnd.oci.image.index.v1+json",
+     size:$rootSize,subjectDigest:null,artifactType:null,
+     predicateTypes:[],children:([$artifact,$platform] | unique | sort)}
+  ] | sort_by(.digest))
+' "$collector_output" >/dev/null ||
+  fail "collector did not publish exact canonical overlap descriptors"
+[ "$(grep -c '^gh ' "$audit")" -eq 2 ] ||
+  fail "collector read-stub audit omitted the two GitHub reads"
+[ "$(grep -c '^docker ' "$audit")" -eq 4 ] ||
+  fail "collector read-stub audit did not prove package/index overlap"
+[ ! -e "$writer_marker" ] || fail "collector reached a writer marker"
+grep -Fq 'releases?per_page=100' "$audit" ||
+  fail "collector did not use the expected release inventory read"
+grep -Fq 'versions?per_page=100' "$audit" ||
+  fail "collector did not use the expected package inventory read"
+
+ jq '.[0] |= reverse' "$packages" >"$collector_fixture/packages-reversed.json"
+if ! env "${collector_env[@]}" STUB_PACKAGES="$collector_fixture/packages-reversed.json" \
+  bash "$COLLECTOR" \
+  --repository fixture/repository \
+  --image ghcr.io/fixture/repository \
+  --output "$collector_fixture/collected-reversed.json" \
+  --candidate-alias candidate \
+  >"$collector_fixture/reversed.stdout" \
+  2>"$collector_fixture/reversed.stderr"; then
+  cat "$collector_fixture/reversed.stderr" >&2
+  fail "reversed strict read-stub collector rejected valid overlap"
+fi
+jq -cS '.registry.manifests' "$collector_output" \
+  >"$collector_fixture/collected-manifests.json"
+jq -cS '.registry.manifests' "$collector_fixture/collected-reversed.json" \
+  >"$collector_fixture/collected-reversed-manifests.json"
+cmp --silent "$collector_fixture/collected-manifests.json" \
+  "$collector_fixture/collected-reversed-manifests.json" ||
+  fail "collector source order changed canonical descriptor bytes"
+
+expect_collector_rejection() {
+  local name=$1 expected=$2
+  shift 2
+  printf 'sentinel-output\n' >"$collector_fixture/$name.output"
+  if env "${collector_env[@]}" STUB_PACKAGES="$packages" "$@" bash "$COLLECTOR" \
+      --repository fixture/repository \
+      --image ghcr.io/fixture/repository \
+      --output "$collector_fixture/$name.output" \
+      --candidate-alias candidate \
+      >"$collector_fixture/$name.stdout" \
+      2>"$collector_fixture/$name.stderr"; then
+    fail "collector accepted negative case: $name"
+  fi
+  [ ! -s "$collector_fixture/$name.stdout" ] ||
+    fail "collector negative case emitted stdout: $name"
+  grep -Fq "$expected" "$collector_fixture/$name.stderr" ||
+    fail "collector negative case omitted its terminal reason: $name"
+  grep -Fq 'sentinel-output' "$collector_fixture/$name.output" ||
+    fail "collector negative case replaced output: $name"
+  [ ! -e "$writer_marker" ] ||
+    fail "collector negative case reached a writer marker: $name"
+}
+expect_collector_rejection read-failure 'registry manifest read failed' \
+  STUB_FAIL_DIGEST="$artifact_digest"
+
+corrupt_artifact="$collector_fixture/corrupt-artifact.json"
+jq '.artifactType = "fixture-corruption"' "$artifact_raw" >"$corrupt_artifact"
+expect_collector_rejection raw-hash 'registry manifest bytes do not match' \
+  STUB_ARTIFACT_RAW="$corrupt_artifact"
+
+bad_root="$collector_fixture/bad-root.json"
+jq --arg artifact "$artifact_digest" \
+  '.manifests |= map(if .digest == $artifact then .size += 1 else . end)' \
+  "$root_raw" >"$bad_root"
+bad_root_digest="sha256:$(sha256sum "$bad_root" | awk '{print $1}')"
+jq -cnS --arg root "$bad_root_digest" --arg artifact "$artifact_digest" '[[
+  {id:9001,name:$root,metadata:{container:{tags:["candidate"]}}},
+  {id:9002,name:$artifact,metadata:{container:{tags:["candidate"]}}}
+]]' >"$collector_fixture/packages-bad-root.json"
+expect_collector_rejection descriptor-size 'registry descriptor size disagrees' \
+  STUB_PACKAGES="$collector_fixture/packages-bad-root.json" \
+  STUB_ROOT_DIGEST="$bad_root_digest" STUB_ROOT_RAW="$bad_root"
+
+bad_subject_root="$collector_fixture/bad-subject-root.json"
+jq '.manifests |= map(if .annotations? then
+  .annotations["vnd.docker.reference.digest"] =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  else . end)' "$root_raw" >"$bad_subject_root"
+bad_subject_root_digest="sha256:$(sha256sum "$bad_subject_root" | awk '{print $1}')"
+jq -cnS --arg root "$bad_subject_root_digest" --arg artifact "$artifact_digest" '[[
+  {id:9001,name:$root,metadata:{container:{tags:["candidate"]}}},
+  {id:9002,name:$artifact,metadata:{container:{tags:["candidate"]}}}
+]]' >"$collector_fixture/packages-bad-subject.json"
+expect_collector_rejection contextual-subject 'attestation subject binding disagrees' \
+  STUB_PACKAGES="$collector_fixture/packages-bad-subject.json" \
+  STUB_ROOT_DIGEST="$bad_subject_root_digest" STUB_ROOT_RAW="$bad_subject_root"
+
+unbound_artifact="$collector_fixture/unbound-artifact.json"
+jq 'del(.subject)' "$artifact_raw" >"$unbound_artifact"
+unbound_artifact_digest="sha256:$(sha256sum "$unbound_artifact" | awk '{print $1}')"
+unbound_root="$collector_fixture/unbound-root.json"
+jq --arg artifact "$artifact_digest" \
+  '.manifests |= map(select(.digest != $artifact))' \
+  "$root_raw" >"$unbound_root"
+unbound_root_digest="sha256:$(sha256sum "$unbound_root" | awk '{print $1}')"
+jq -cnS --arg root "$unbound_root_digest" --arg artifact "$unbound_artifact_digest" '[[
+  {id:9001,name:$root,metadata:{container:{tags:["candidate"]}}},
+  {id:9002,name:$artifact,metadata:{container:{tags:["candidate"]}}}
+]]' >"$collector_fixture/packages-unbound-artifact.json"
+expect_collector_rejection unbound-artifact \
+  'artifact manifest is unbound' \
+  STUB_PACKAGES="$collector_fixture/packages-unbound-artifact.json" \
+  STUB_ROOT_DIGEST="$unbound_root_digest" STUB_ROOT_RAW="$unbound_root" \
+  STUB_ARTIFACT_DIGEST="$unbound_artifact_digest" \
+  STUB_ARTIFACT_RAW="$unbound_artifact"
+
+# Inject the exact collector descriptors into the valid protected fixture under
+# an existing supported alias collision. Capture must retain the whole closure.
+injected="$TMP/injected-valid.json"
+jq --arg root "$root_digest" --arg platform "$platform_digest" \
+  --arg artifact "$artifact_digest" --argjson rootSize "$root_size" \
+  --argjson platformSize "$platform_size" --argjson artifactSize "$artifact_size" \
+  --slurpfile collected "$collector_output" '
+  ($collected[0].registry.manifests) as $synthetic |
+  .registry.versions += [{
+    id:9900000001,digest:$root,tags:["v1.2.0"]
+  }] |
+  .registry.manifests += $synthetic
+' "$TMP/floor-valid.json" >"$injected"
+run_capture "$injected" "$TMP/injected-capture.json"
+jq -e --slurpfile collected "$collector_output" '
+  ($collected[0].registry.manifests | map(.digest)) as $syntheticDigests |
+  ([.protected.manifests[] | select(
+    .digest as $digest | any($syntheticDigests[]; . == $digest)
+  )]) as $retained |
+  ($collected[0].registry.manifests | sort_by(.digest)) as $expected |
+  ($retained | sort_by(.digest)) == $expected
+' "$TMP/injected-capture.json" >/dev/null ||
+  fail "capture did not retain exact injected collector descriptors"
+
 echo "test-promotion protected-state fixtures passed: v1.2.0 floor, retired closure quarantine, supported authority, modern attestations, projector purity, and no writers"
