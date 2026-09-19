@@ -25,6 +25,8 @@ DATA=$TMP/data
 BIN=$TMP/bin
 mkdir "$DATA" "$BIN"
 
+command -v base64 >/dev/null 2>&1
+
 digest_of() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
 size_of() { wc -c <"$1" | tr -d ' '; }
 
@@ -111,6 +113,63 @@ jq -cS -n --arg root "$ROOT" --arg source "$SOURCE" '
       subjectAlternativeName:"https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/build.yml@refs/heads/dev"
     }}}}]
 ' >"$DATA/verified.json"
+
+jq -cS -n --arg root "$ROOT" --arg source "$SOURCE" '
+  {
+    _type:"https://in-toto.io/Statement/v1",
+    predicateType:"https://slsa.dev/provenance/v1",
+    subject:[{name:"image-index.json",
+      digest:{sha256:($root|sub("^sha256:";""))}}],
+    predicate:{
+      buildDefinition:{
+        externalParameters:{workflow:{
+          repository:"https://github.com/NickolayMamonov/meet-backend-v3",
+          ref:"refs/heads/dev"}},
+        resolvedDependencies:[{
+          uri:"git+https://github.com/NickolayMamonov/meet-backend-v3@refs/heads/dev",
+          digest:{gitCommit:$source}
+        }]
+      },
+      runDetails:{builder:{
+        id:"https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/build.yml@refs/heads/dev"
+      }}
+    }
+  }
+' >"$DATA/statement.json"
+STATEMENT_PAYLOAD=$(base64 <"$DATA/statement.json" | tr -d '\r\n')
+jq -cS -n --arg payload "$STATEMENT_PAYLOAD" '
+  {mediaType:"application/vnd.dev.sigstore.bundle.v0.3+json",
+   dsseEnvelope:{
+     payload:$payload,
+     signatures:[{keyid:"fixture",sig:"fixture"}]
+   }}
+' >"$DATA/bundle.json"
+jq -cS -n --arg source "$SOURCE" '
+  {
+    _type:"https://in-toto.io/Statement/v1",
+    predicateType:"https://slsa.dev/provenance/v1",
+    subject:[{name:"foreign-image",
+      digest:{sha256:"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}],
+    predicate:{
+      buildDefinition:{
+        externalParameters:{workflow:{
+          repository:"https://github.com/NickolayMamonov/meet-backend-v3",
+          ref:"refs/heads/dev"}},
+        resolvedDependencies:[{
+          uri:"git+https://github.com/NickolayMamonov/meet-backend-v3@refs/heads/dev",
+          digest:{gitCommit:$source}
+        }]
+      },
+      runDetails:{builder:{
+        id:"https://github.com/NickolayMamonov/meet-backend-v3/.github/workflows/build.yml@refs/heads/dev"
+      }}
+    }
+  }
+' >"$DATA/foreign-statement.json"
+FOREIGN_PAYLOAD=$(base64 <"$DATA/foreign-statement.json" | tr -d '\r\n')
+jq -cS --arg payload "$FOREIGN_PAYLOAD" \
+  '.dsseEnvelope.payload = $payload' "$DATA/bundle.json" \
+  >"$DATA/foreign-bundle.json"
 
 cat >"$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -225,7 +284,17 @@ if [ "$1" = api ]; then
       case "$scenario" in
         empty-attestation|absent) printf '{"attestations":[]}\n' ;;
         malformed-attestation) printf '{"attestations":{}}\n' ;;
-        *) printf '{"attestations":[{"bundle":{"fixture":"present"}}]}\n' ;;
+        duplicate-attestation)
+          jq -cn --argjson bundle "$(jq -cS . "$FIXTURE_DATA/bundle.json")" \
+            '{attestations:[{bundle:$bundle},{bundle:$bundle}]}' ;;
+        valid-plus-foreign)
+          jq -cn \
+            --argjson valid "$(jq -cS . "$FIXTURE_DATA/bundle.json")" \
+            --argjson foreign "$(jq -cS . "$FIXTURE_DATA/foreign-bundle.json")" \
+            '{attestations:[{bundle:$valid},{bundle:$foreign}]}' ;;
+        *) bundle=$(jq -cS . "$FIXTURE_DATA/bundle.json")
+          jq -cn --argjson bundle "$bundle" \
+          '{attestations:[{bundle:$bundle}]}' ;;
       esac
       ;;
     user) printf '{"login":"fixture-user"}\n' ;;
@@ -235,7 +304,16 @@ if [ "$1" = api ]; then
 fi
 if [ "$1" = attestation ] && [ "$2" = verify ]; then
   [ "$scenario" != verify-fail ] || exit 95
-  cat "$FIXTURE_DATA/verified.json"
+  case "$scenario" in
+    verify-bundle-mismatch)
+      bundle=$(jq -cS . "$FIXTURE_DATA/bundle.json")
+      jq --argjson bundle "$bundle" \
+        '.[0].attestation={bundle:($bundle | .dsseEnvelope.signatures[0].sig="different")}' \
+        "$FIXTURE_DATA/verified.json" ;;
+    *) bundle=$(jq -cS . "$FIXTURE_DATA/bundle.json")
+      jq --argjson bundle "$bundle" \
+      '.[0].attestation={bundle:$bundle}' "$FIXTURE_DATA/verified.json" ;;
+  esac
   exit 0
 fi
 echo "unexpected gh invocation: $*" >&2
@@ -284,7 +362,10 @@ expect_failure missing-tags run_read missing-tags
 expect_failure duplicate-tag run_read duplicate-tag
 expect_failure malformed-root run_read malformed-root
 expect_failure malformed-attestation run_read malformed-attestation
+expect_failure duplicate-attestation run_read duplicate-attestation
+expect_failure valid-plus-foreign run_read valid-plus-foreign
 expect_failure verify-fail run_read verify-fail
+expect_failure verify-bundle-mismatch run_read verify-bundle-mismatch
 expect_failure child-error run_read child-error
 expect_failure child-mismatch run_read child-mismatch
 

@@ -23,7 +23,7 @@ version=$4
 [[ "$source" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
 
-for command_name in curl docker gh jq sha256sum; do
+for command_name in base64 curl docker gh jq sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "$command_name is required"
 done
@@ -165,6 +165,160 @@ validate_missing_manifest() {
       type == "object" and .code == "MANIFEST_UNKNOWN" and
       (.message | type == "string" and length > 0))
   ' "$1" >/dev/null || fail "registry 404 response is not a missing-manifest error"
+}
+
+normalize_attestation_bundle() {
+  local bundle=$1 label=$2 statement
+  local subject_hex predicate_type source_repository source_digest workflow
+  local bundle_sha
+  statement=$tmp/attestation-statement-$label.json
+  jq -e '
+    type == "object" and
+    (.mediaType | type == "string" and length > 0) and
+    (.dsseEnvelope | type == "object") and
+    (.dsseEnvelope.payload | type == "string" and length > 0) and
+    (.dsseEnvelope.signatures | type == "array" and length > 0)
+  ' "$bundle" >/dev/null || fail "attestation bundle $label is malformed"
+  jq -rj '.dsseEnvelope.payload' "$bundle" |
+    base64 --decode >"$statement" 2>/dev/null ||
+    fail "attestation bundle $label payload is not valid base64"
+  jq -e \
+    --arg repository "https://github.com/$GITHUB_REPOSITORY" \
+    --arg source "$source" \
+    --arg ref "refs/heads/dev" \
+    --arg root "${root#sha256:}" \
+    --arg platform "${platform#sha256:}" '
+    type == "object" and
+    ._type == "https://in-toto.io/Statement/v1" and
+    (.predicateType | type == "string" and length > 0) and
+    (.subject | type == "array" and length == 1) and
+    (.subject[0].name | type == "string" and length > 0) and
+    (.subject[0].digest | type == "object" and
+      (keys | sort) == ["sha256"] and
+      (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      (.sha256 == $root or .sha256 == $platform)) and
+    (.predicate.buildDefinition.externalParameters.workflow.repository == $repository) and
+    (.predicate.buildDefinition.externalParameters.workflow.ref == $ref) and
+    ([
+      .predicate.buildDefinition.resolvedDependencies[]? |
+      select(.uri? == ("git+" + $repository + "@" + $ref)) |
+      select(.digest.gitCommit? == $source)
+    ] | length == 1) and
+    (.predicate.runDetails.builder.id |
+      type == "string" and
+      startswith($repository + "/.github/workflows/") and
+      endswith("@" + $ref))
+  ' "$statement" >/dev/null ||
+    fail "attestation bundle $label has an invalid subject or source claim"
+
+  subject_hex=$(jq -r '.subject[0].digest.sha256' "$statement")
+  predicate_type=$(jq -r '.predicateType' "$statement")
+  source_repository=$(jq -r '.predicate.buildDefinition.externalParameters.workflow.repository' "$statement")
+  source_digest="$source"
+  workflow=$(jq -r '.predicate.runDetails.builder.id' "$statement")
+  bundle_sha=$(jq -cS . "$bundle" | tr -d '\r\n' |
+    sha256sum | awk '{print $1}') ||
+    fail "attestation bundle $label hashing failed"
+  jq -cnS \
+    --arg subject "sha256:$subject_hex" \
+    --arg predicateType "$predicate_type" \
+    --arg sourceRepository "$source_repository" \
+    --arg sourceDigest "$source_digest" \
+    --arg workflow "$workflow" \
+    --arg bundleDigest "sha256:$bundle_sha" \
+    '{
+      subject:$subject,
+      predicateType:$predicateType,
+      sourceRepository:$sourceRepository,
+      sourceDigest:$sourceDigest,
+      workflow:$workflow,
+      bundleDigest:$bundleDigest,
+      claimKey:($subject + "|" + $predicateType + "|" + $sourceRepository +
+        "|" + $sourceDigest + "|" + $workflow)
+    }'
+}
+
+normalize_raw_attestations() {
+  local input=$1 output=$2 count index records bundle
+  jq -e '
+    type == "object" and
+    (.attestations | type == "array") and
+    all(.attestations[];
+      type == "object" and (.bundle | type == "object"))
+  ' "$input" >/dev/null || fail "GitHub attestation collection is malformed"
+  count=$(jq -r '.attestations | length' "$input")
+  records=$tmp/raw-attestation-records.jsonl
+  : >"$records"
+  for ((index = 0; index < count; index++)); do
+    bundle=$tmp/raw-attestation-$index.json
+    jq -cS ".attestations[$index].bundle" "$input" >"$bundle" ||
+      fail "GitHub attestation bundle $index cannot be read"
+    normalize_attestation_bundle "$bundle" "raw-$index" >>"$records"
+  done
+  jq -cS -s '
+    if (map(.bundleDigest) | unique | length) != length then
+      error("duplicate attestation bundle digest")
+    elif (map(.claimKey) | unique | length) != length then
+      error("duplicate attestation claim identity")
+    else sort_by(.subject,.predicateType,.workflow,.bundleDigest)
+    end
+  ' "$records" >"$output" ||
+    fail "GitHub attestation collection has duplicate identity"
+}
+
+normalize_verified_attestations() {
+  local input=$1 output=$2 count index records bundle normalized
+  jq -e '
+    type == "array" and length > 0 and
+    all(.[];
+      type == "object" and
+      (.attestation | type == "object") and
+      (.attestation.bundle | type == "object") and
+      (.verificationResult | type == "object"))
+  ' "$input" >/dev/null || fail "verified GitHub attestation output is malformed"
+  count=$(jq -r 'length' "$input")
+  records=$tmp/verified-attestation-records.jsonl
+  : >"$records"
+  for ((index = 0; index < count; index++)); do
+    bundle=$tmp/verified-attestation-$index.json
+    jq -cS ".[$index].attestation.bundle" "$input" >"$bundle" ||
+      fail "verified attestation bundle $index cannot be read"
+    normalized=$(normalize_attestation_bundle "$bundle" "verified-$index")
+    jq -e \
+      --arg repository "https://github.com/$GITHUB_REPOSITORY" \
+      --arg source "$source" \
+      --arg ref "refs/heads/dev" \
+      --argjson claim "$normalized" \
+      --argjson index "$index" '
+      .[$index] |
+      .verificationResult.statement as $statement |
+      .verificationResult.signature.certificate as $certificate |
+      ($statement.subject | type == "array" and length == 1) and
+      ($statement.predicateType == $claim.predicateType) and
+      ($statement.subject[0].digest.sha256 ==
+        ($claim.subject | sub("^sha256:";""))) and
+      $certificate.sourceRepositoryURI == $repository and
+      $certificate.sourceRepositoryDigest == $source and
+      $certificate.sourceRepositoryRef == $ref and
+      ($certificate.buildSignerURI |
+        type == "string" and
+        startswith($repository + "/.github/workflows/") and
+        endswith("@" + $ref)) and
+      $certificate.buildSignerURI == $claim.workflow and
+      $certificate.subjectAlternativeName == $certificate.buildSignerURI
+    ' "$input" >/dev/null ||
+      fail "verified attestation $index has an invalid subject or source workflow"
+    printf '%s\n' "$normalized" >>"$records"
+  done
+  jq -cS -s '
+    if (map(.bundleDigest) | unique | length) != length then
+      error("duplicate verified attestation bundle digest")
+    elif (map(.claimKey) | unique | length) != length then
+      error("duplicate verified attestation claim identity")
+    else sort_by(.subject,.predicateType,.workflow,.bundleDigest)
+    end
+  ' "$records" >"$output" ||
+    fail "verified attestations have duplicate identity"
 }
 
 read_raw_manifest() {
@@ -313,40 +467,34 @@ attestation_api=$tmp/attestations.json
 if ! gh api "repos/$GITHUB_REPOSITORY/attestations/$root" >"$attestation_api" 2>"$tmp/attestation-error"; then
   fail "GitHub attestation collection failed"
 fi
-jq -e '.attestations | type == "array"' "$attestation_api" >/dev/null ||
-  fail "GitHub attestation collection is malformed"
-if [ "$(jq '.attestations | length' "$attestation_api")" -gt 0 ]; then
+raw_attestations=$tmp/raw-attestations.json
+normalize_raw_attestations "$attestation_api" "$raw_attestations"
+if [ "$(jq 'length' "$raw_attestations")" -gt 0 ]; then
   verified=$tmp/verified-attestations.json
   gh attestation verify "oci://$image@$root" --repo "$GITHUB_REPOSITORY" \
     --source-digest "$source" --format json >"$verified" 2>"$tmp/verify-error" ||
     fail "GitHub OCI attestation verification failed"
-  jq -e --arg root "${root#sha256:}" --arg platform "${platform#sha256:}" \
-    --arg repository "https://github.com/$GITHUB_REPOSITORY" --arg source "$source" '
-    type == "array" and length == 1 and
-    (.[0].verificationResult.statement.subject |
-      type == "array" and length == 1 and
-      ((.[0].digest.sha256 == $root) or (.[0].digest.sha256 == $platform))) and
-    (.[0].verificationResult.signature.certificate as $certificate |
-      $certificate.sourceRepositoryURI == $repository and
-      $certificate.sourceRepositoryDigest == $source and
-      ($certificate.sourceRepositoryRef | type == "string" and startswith("refs/")) and
-      ($certificate.buildSignerURI | type == "string" and
-        startswith($repository + "/.github/workflows/") and
-        endswith("@" + $certificate.sourceRepositoryRef)) and
-      $certificate.subjectAlternativeName == $certificate.buildSignerURI)
-  ' "$verified" >/dev/null || fail "verified GitHub attestation identity or subject is malformed"
-  github_attestations=$(jq -cS --arg root "$root" --arg platform "$platform" \
-    --arg version "$actual_version" '
-    [ .[] | .verificationResult as $result |
-      $result.signature.certificate as $certificate |
-      ([ $result.statement.subject[] |
-        select(.digest.sha256? == ($root|sub("^sha256:";"")) or
-          .digest.sha256? == ($platform|sub("^sha256:";""))) |
-        "sha256:" + .digest.sha256 ][0]) as $subject |
-      {subject:$subject,repository:$certificate.sourceRepositoryURI,
-       source:$certificate.sourceRepositoryDigest,revision:$certificate.sourceRepositoryDigest,
-       version:$version,workflow:$certificate.buildSignerURI}
-    ]' "$verified") || fail "verified GitHub attestation normalization failed"
+  verified_attestations=$tmp/verified-attestations-normalized.json
+  normalize_verified_attestations "$verified" "$verified_attestations"
+  jq -n -e --slurpfile raw "$raw_attestations" \
+    --slurpfile verified "$verified_attestations" '
+    ($raw[0] | length) == ($verified[0] | length) and
+    ([$raw[0][].bundleDigest] | sort) ==
+      ([$verified[0][].bundleDigest] | sort) and
+    ([$raw[0][].claimKey] | sort) ==
+      ([$verified[0][].claimKey] | sort)
+  ' >/dev/null ||
+    fail "raw and cryptographically verified attestations do not correspond one-to-one"
+  github_attestations=$(jq -cS --arg version "$actual_version" '
+    map({
+      subject,
+      repository:.sourceRepository,
+      source:.sourceDigest,
+      revision:.sourceDigest,
+      version:$version,
+      workflow
+    })
+  ' "$verified_attestations")
   attestation_status=verified
 fi
 

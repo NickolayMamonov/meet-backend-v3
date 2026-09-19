@@ -242,26 +242,79 @@ NAME=${PACKAGE#*/}
 ENDPOINT="users/$OWNER/packages/container/$NAME/versions?per_page=100"
 
 PHASE_DIR=
-GH_PID=
-GH_PGID=
+OWNED_PID=
+OWNED_PGID=
 KEEP_PHASE=false
+OVERALL_DEADLINE_MS=
+CLEANUP_RESERVE_MS=2000
+
+monotonic_now_ms() {
+  case "$(uname -s)" in
+    Linux)
+      [ -r /proc/uptime ] || fail "Linux monotonic clock is unavailable"
+      awk '
+        {
+          split($1, parts, /\./);
+          fraction = substr((parts[2] "000"), 1, 3);
+          printf "%d\n", (parts[1] * 1000) + fraction;
+        }
+      ' /proc/uptime
+      ;;
+    *)
+      local now
+      now=$(date +%s%N) || fail "monotonic clock read failed"
+      [[ "$now" =~ ^[0-9]+$ ]] || fail "monotonic clock returned malformed data"
+      printf '%s\n' "$((now / 1000000))"
+      ;;
+  esac
+}
+
+remaining_ms() {
+  local now remaining
+  now=$(monotonic_now_ms)
+  remaining=$((OVERALL_DEADLINE_MS - now))
+  [ "$remaining" -gt 0 ] || {
+    printf '0\n'
+    return
+  }
+  printf '%s\n' "$((remaining / 1000000))"
+}
+
+duration_from_ms() {
+  local milliseconds=$1
+  printf '%s.%03ds' \
+    "$((milliseconds / 1000))" "$((milliseconds % 1000))"
+}
+
+terminate_owned_process() {
+  local remaining grace
+  [ -n "$OWNED_PGID" ] || {
+    OWNED_PID=
+    return
+  }
+  kill -TERM -- "-$OWNED_PGID" 2>/dev/null || true
+  while kill -0 -- "-$OWNED_PGID" 2>/dev/null; do
+    remaining=$(remaining_ms)
+    [ "$remaining" -gt 0 ] || break
+    grace=$remaining
+    [ "$grace" -le 100 ] || grace=100
+    sleep "$(duration_from_ms "$grace")" || true
+  done
+  if kill -0 -- "-$OWNED_PGID" 2>/dev/null; then
+    kill -KILL -- "-$OWNED_PGID" 2>/dev/null || true
+  fi
+  if [ -n "$OWNED_PID" ]; then
+    wait "$OWNED_PID" 2>/dev/null || true
+  fi
+  OWNED_PID=
+  OWNED_PGID=
+}
+
 # shellcheck disable=SC2329
 cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
-  if [ -n "$GH_PGID" ]; then
-    kill -TERM -- "-$GH_PGID" 2>/dev/null || true
-    for _ in 1 2 3 4; do
-      kill -0 -- "-$GH_PGID" 2>/dev/null || break
-      sleep 0.5 || true
-    done
-    kill -KILL -- "-$GH_PGID" 2>/dev/null || true
-  fi
-  if [ -n "$GH_PID" ]; then
-    wait "$GH_PID" 2>/dev/null || true
-  fi
-  GH_PID=
-  GH_PGID=
+  terminate_owned_process
   if [ "$KEEP_PHASE" != true ] && [ -n "$PHASE_DIR" ] &&
      [ -d "$PHASE_DIR" ] && [ ! -L "$PHASE_DIR" ]; then
     rm -r -- "$PHASE_DIR" 2>/dev/null || true
@@ -272,66 +325,109 @@ trap cleanup EXIT HUP INT TERM
 
 PHASE_DIR=$(mktemp -d -- "$OUTPUT_DIR/test-promotion-inventory.XXXXXX") ||
   fail "could not create a unique output phase directory"
+OVERALL_DEADLINE_MS=$(( $(monotonic_now_ms) + 180000 ))
 PACKAGE_OUTPUT="$PHASE_DIR/package-versions.json"
 REGISTRY_OUTPUT="$PHASE_DIR/registry-inventory.json"
 [ ! -e "$PACKAGE_OUTPUT" ] && [ ! -e "$REGISTRY_OUTPUT" ] ||
   fail "final inventory output already exists"
 
 read_attempt() {
-  local destination=$1 budget=$2 status
+  local destination=$1 budget_ms=$2 status budget
   local stderr_file=$destination.stderr
+  budget=$(duration_from_ms "$budget_ms")
   : >"$stderr_file"
   if command -v setsid >/dev/null 2>&1; then
     setsid bash -c '
-      exec timeout --signal=TERM --kill-after=2s "$1" gh api --paginate --slurp "$2"
-    ' -- "${budget}s" "$ENDPOINT" >"$destination" 2>"$stderr_file" &
+      exec timeout --signal=TERM --kill-after=1s "$1" gh api --paginate --slurp "$2"
+    ' -- "$budget" "$ENDPOINT" >"$destination" 2>"$stderr_file" &
   else
     case "$(uname -s)" in
       Linux*) fail "setsid is required for owned inventory process groups" ;;
-      *) timeout --signal=TERM --kill-after=2s "${budget}s" \
+      *) timeout --signal=TERM --kill-after=1s "$budget" \
         gh api --paginate --slurp "$ENDPOINT" >"$destination" 2>"$stderr_file" &
         ;;
     esac
   fi
-  GH_PID=$!
-  GH_PGID=$GH_PID
+  OWNED_PID=$!
+  OWNED_PGID=$OWNED_PID
   set +e
-  wait "$GH_PID"
+  wait "$OWNED_PID"
   status=$?
   set -e
+  if kill -0 -- "-$OWNED_PGID" 2>/dev/null; then
+    terminate_owned_process
+  fi
   rm -f -- "$stderr_file"
+  OWNED_PID=
+  OWNED_PGID=
   [ "$status" -eq 0 ] ||
     fail "GitHub package inventory request failed"
   [ -s "$destination" ] ||
     fail "GitHub package inventory response is empty"
-  GH_PID=
-  GH_PGID=
 }
 
 attempt_budget=${TEST_PROMOTION_INVENTORY_ATTEMPT_BUDGET_SECONDS:-28}
 [[ "$attempt_budget" =~ ^[1-9][0-9]*$ ]] || fail "inventory attempt budget is malformed"
 [ "$attempt_budget" -le 28 ] || fail "inventory attempt budget exceeds the bound"
 
+run_closure() {
+  local output=$1 budget_ms=$2 status budget
+  shift 2
+  budget=$(duration_from_ms "$budget_ms")
+  : >"$output"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid bash -c '
+      exec timeout --signal=TERM --kill-after=1s "$1" "$2" "${@:3}"
+    ' -- "$budget" "$CLOSURE" "$@" >"$output" 2>&1 &
+  else
+    case "$(uname -s)" in
+      Linux*) fail "setsid is required for owned closure process groups" ;;
+      *) timeout --signal=TERM --kill-after=1s "$budget" \
+        "$CLOSURE" "$@" >"$output" 2>&1 &
+        ;;
+    esac
+  fi
+  OWNED_PID=$!
+  OWNED_PGID=$OWNED_PID
+  set +e
+  wait "$OWNED_PID"
+  status=$?
+  set -e
+  if kill -0 -- "-$OWNED_PGID" 2>/dev/null; then
+    terminate_owned_process
+  fi
+  OWNED_PID=
+  OWNED_PGID=
+  return "$status"
+}
+
 evaluate_snapshot() {
   local current=$1 candidate_rows candidate_with_marker current_non_candidate
-  local reachability_output closure_output closure_status
+  local reachability_output closure_output closure_status closure_budget_ms
+  local closure_output_file
   local root_count root_tags alias_count alias_digest marker_count digest count
   local current_count
 
   validate_snapshot "$current" "fresh"
 
   reachability_output="$PHASE_DIR/.reachable-digests.json"
+  closure_output_file="$PHASE_DIR/.reachability-closure.log"
+  closure_budget_ms=$(remaining_ms)
+  [ "$closure_budget_ms" -gt "$CLEANUP_RESERVE_MS" ] || return 75
+  closure_budget_ms=$((closure_budget_ms - CLEANUP_RESERVE_MS))
+  [ "$closure_budget_ms" -le 30000 ] || closure_budget_ms=30000
   set +e
-  closure_output=$(timeout --kill-after=2s 30s "$CLOSURE" \
+  run_closure "$closure_output_file" "$closure_budget_ms" \
     --image "$IMAGE" \
     --index-file "$INDEX_FILE" \
     --inventory-file "$current" \
     --subject-digest "$SUBJECT_DIGEST" \
     --platform-subject "$PLATFORM_SUBJECT" \
     --reachable-output "$reachability_output" \
-    --pending-on-missing-package 2>&1)
+    --pending-on-missing-package
   closure_status=$?
   set -e
+  closure_output=$(<"$closure_output_file")
   case "$closure_status" in
     0) ;;
     75) return 75 ;;
@@ -435,8 +531,13 @@ evaluate_snapshot() {
       --digest "$SUBJECT_DIGEST" \
       --output "$normalized" >/dev/null ||
       fail "signature readiness inventory normalization failed"
+    closure_output_file="$PHASE_DIR/.signed-closure.log"
+    closure_budget_ms=$(remaining_ms)
+    [ "$closure_budget_ms" -gt "$CLEANUP_RESERVE_MS" ] || return 75
+    closure_budget_ms=$((closure_budget_ms - CLEANUP_RESERVE_MS))
+    [ "$closure_budget_ms" -le 30000 ] || closure_budget_ms=30000
     set +e
-    timeout --kill-after=2s 30s "$CLOSURE" \
+    run_closure "$closure_output_file" "$closure_budget_ms" \
       --image "$IMAGE" \
       --index-file "$INDEX_FILE" \
       --inventory-file "$current" \
@@ -446,9 +547,10 @@ evaluate_snapshot() {
       --protected-state-file "$PROTECTED_STATE" \
       --candidate-alias "$ALIAS" \
       --require-signature true \
-      --pending-on-missing-signature >/dev/null
+      --pending-on-missing-signature
     closure_status=$?
     set -e
+    closure_output=$(<"$closure_output_file")
     rm -f -- "$normalized"
     case "$closure_status" in
       0) ;;
@@ -490,17 +592,17 @@ evaluate_snapshot() {
 }
 
 attempt=1
-overall_deadline=$(( $(date +%s) + 178 ))
 while [ "$attempt" -le 5 ]; do
-  now=$(date +%s)
-  remaining=$((overall_deadline - now))
-  [ "$remaining" -gt 0 ] || break
-  budget=$attempt_budget
-  [ "$remaining" -lt "$budget" ] && budget=$remaining
+  remaining=$(remaining_ms)
+  [ "$remaining" -gt "$CLEANUP_RESERVE_MS" ] || break
+  budget_ms=$((attempt_budget * 1000))
+  available=$((remaining - CLEANUP_RESERVE_MS))
+  [ "$available" -lt "$budget_ms" ] && budget_ms=$available
+  [ "$budget_ms" -gt 0 ] || break
   temporary=$(mktemp -- "$PHASE_DIR/.package-versions.XXXXXX") ||
     fail "could not create package response temporary"
   chmod 600 "$temporary" 2>/dev/null || true
-  read_attempt "$temporary" "$budget"
+  read_attempt "$temporary" "$budget_ms"
 
   candidate_rows=
   if candidate_rows=$(evaluate_snapshot "$temporary"); then
@@ -557,10 +659,13 @@ while [ "$attempt" -le 5 ]; do
   fi
 
   if [ "$attempt" -lt 5 ]; then
-    now=$(date +%s)
-    remaining=$((overall_deadline - now))
-    [ "$remaining" -gt 5 ] || break
-    sleep 5 || fail "inventory readiness delay failed"
+    remaining=$(remaining_ms)
+    [ "$remaining" -gt "$CLEANUP_RESERVE_MS" ] || break
+    sleep_ms=5000
+    available=$((remaining - CLEANUP_RESERVE_MS))
+    [ "$available" -lt "$sleep_ms" ] && sleep_ms=$available
+    [ "$sleep_ms" -gt 0 ] || break
+    sleep "$(duration_from_ms "$sleep_ms")" || fail "inventory readiness delay failed"
   fi
   attempt=$((attempt + 1))
 done

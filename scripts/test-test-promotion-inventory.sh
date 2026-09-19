@@ -411,9 +411,11 @@ EOF
   chmod 755 "$HANG_GH"
   run_hang() {
     local signal=$1
+    local started_ns finished_ns elapsed_ms
     cp -- "$HANG_GH" "$GH"
     chmod 755 "$GH"
     rm -f "$HANG_CHILD" "$HANG_GRANDCHILD"
+    started_ns=$(date +%s%N)
     set +e
     PATH="$TMP:$PATH" FIXTURE_DATA=$TMP \
       HANG_GRANDCHILD="$HANG_GRANDCHILD" \
@@ -433,7 +435,10 @@ EOF
     wait "$reader_pid"
     status=$?
     set -e
+    finished_ns=$(date +%s%N)
+    elapsed_ms=$(( (finished_ns - started_ns) / 1000000 ))
     [ "$status" -ne 0 ]
+    [ "$elapsed_ms" -le 180000 ]
     for pid_file in "$HANG_CHILD" "$HANG_GRANDCHILD"; do
       if [ -s "$pid_file" ]; then
         pid=$(tr -d '[:space:]' <"$pid_file")
