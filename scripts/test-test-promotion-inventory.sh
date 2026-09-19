@@ -325,7 +325,7 @@ printf '0\n' >"$TMP/gh-count"
 rm -f "$TMP/sleeps"
 SEQUENCE_OUTPUT=$TMP/fifth-attempt
 mkdir -p "$SEQUENCE_OUTPUT"
-PATH="$TMP:$PATH" GH_SEQUENCE_DIR=$SEQUENCE GH_COUNT_FILE=$TMP/gh-count \
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_SEQUENCE_DIR=$SEQUENCE GH_COUNT_FILE=$TMP/gh-count \
   SLEEP_LOG=$TMP/sleeps \
   "$READER" --image "$IMAGE" --alias "$ALIAS" \
   --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
@@ -338,7 +338,7 @@ PATH="$TMP:$PATH" GH_SEQUENCE_DIR=$SEQUENCE GH_COUNT_FILE=$TMP/gh-count \
 # Five attempts produce four sleeps and no final file.
 rm -f "$TMP/sleeps"
 set +e
-PATH="$TMP:$PATH" GH_RESPONSE=$EMPTY \
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_RESPONSE=$EMPTY \
   SLEEP_LOG=$TMP/sleeps \
   "$READER" --image "$IMAGE" --alias "$ALIAS" \
   --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
@@ -360,7 +360,7 @@ EOF
 chmod 755 "$GH"
 rm -f "$TMP/sleeps"
 set +e
-PATH="$TMP:$PATH" GH_RESPONSE=$RESPONSE \
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_RESPONSE=$RESPONSE \
   SLEEP_LOG=$TMP/sleeps \
   "$READER" --image "$IMAGE" --alias "$ALIAS" \
   --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
@@ -382,7 +382,7 @@ chmod 755 "$GH"
 printf '[]\n' >"$TMP/malformed.json"
 rm -f "$TMP/sleeps"
 set +e
-PATH="$TMP:$PATH" GH_RESPONSE=$TMP/malformed.json \
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_RESPONSE=$TMP/malformed.json \
   SLEEP_LOG=$TMP/sleeps \
   "$READER" --image "$IMAGE" --alias "$ALIAS" \
   --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
@@ -415,7 +415,7 @@ EOF
     chmod 755 "$GH"
     rm -f "$HANG_CHILD" "$HANG_GRANDCHILD"
     set +e
-    PATH="$TMP:$PATH" \
+    PATH="$TMP:$PATH" FIXTURE_DATA=$TMP \
       HANG_GRANDCHILD="$HANG_GRANDCHILD" \
       HANG_CHILD="$HANG_CHILD" \
       TEST_PROMOTION_INVENTORY_ATTEMPT_BUDGET_SECONDS=5 \
