@@ -8,69 +8,17 @@ TMP=$(mktemp -d)
 trap 'rm -r -- "$TMP"' EXIT HUP INT TERM
 
 IMAGE=ghcr.io/example/meet-backend
-ROOT=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-PLATFORM=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-REFERRER=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-SIGNATURE_INDEX=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
-SIGNATURE=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ROOT=
+PLATFORM=
+REFERRER=
+SIGNATURE_INDEX=
+SIGNATURE=
 FOREIGN=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 UNBOUND=sha256:1111111111111111111111111111111111111111111111111111111111111111
 UNLISTED=sha256:2222222222222222222222222222222222222222222222222222222222222222
 SOURCE=d4102f3c1e4aa12488bd7e0396dfcbdb50ed85fc
 FIXTURE=$TMP/oci
 mkdir "$FIXTURE"
-
-jq -n \
-  --arg platform "$PLATFORM" \
-  --arg referrer "$REFERRER" '
-  {
-    schemaVersion: 2,
-    mediaType: "application/vnd.oci.image.index.v1+json",
-    manifests: [
-      {
-        mediaType: "application/vnd.oci.image.manifest.v1+json",
-        digest: $platform,
-        size: 100,
-        platform: {os:"linux", architecture:"amd64"}
-      },
-      {
-        mediaType: "application/vnd.oci.image.manifest.v1+json",
-        digest: $referrer,
-        size: 200,
-        platform: {os:"unknown", architecture:"unknown"},
-        annotations: {
-          "vnd.docker.reference.type": "attestation-manifest",
-          "vnd.docker.reference.digest": $platform
-        }
-      }
-    ]
-  }
-' >"$TMP/index.json"
-
-jq -n \
-  --arg root "$ROOT" \
-  --arg source "$SOURCE" \
-  --arg platform "$PLATFORM" \
-  --arg referrer "$REFERRER" \
-  --arg signature_index "$SIGNATURE_INDEX" \
-  --arg signature "$SIGNATURE" '
-  {
-    digest: $root,
-    aliases: {
-      "v1.0.1": $root,
-      "1.0.1": $root,
-      ("sha-" + $source): $root
-    },
-    latest: null,
-    versions: [
-      {digest:$root,tags:["v1.0.1","1.0.1",("sha-" + $source)]},
-      {digest:$platform,tags:[]},
-      {digest:$referrer,tags:[]},
-      {digest:$signature_index,tags:[("sha256-" + ($root | sub("^sha256:";"")))]},
-      {digest:$signature,tags:[]}
-    ]
-  }
-' >"$TMP/inventory.json"
 
 jq -n '
   {
@@ -87,7 +35,9 @@ jq -n '
       size: 1
     }]
   }
-' >"$FIXTURE/${PLATFORM#sha256:}.json"
+' >"$FIXTURE/platform-placeholder.json"
+PLATFORM=sha256:$(sha256sum "$FIXTURE/platform-placeholder.json" | awk '{print $1}')
+mv "$FIXTURE/platform-placeholder.json" "$FIXTURE/${PLATFORM#sha256:}.json"
 
 jq -n '
   {
@@ -113,19 +63,24 @@ jq -n '
       }
     ]
   }
-' >"$FIXTURE/${REFERRER#sha256:}.json"
+' >"$FIXTURE/referrer-placeholder.json"
+REFERRER=sha256:$(sha256sum "$FIXTURE/referrer-placeholder.json" | awk '{print $1}')
+mv "$FIXTURE/referrer-placeholder.json" "$FIXTURE/${REFERRER#sha256:}.json"
 
-jq -n --arg signature "$SIGNATURE" '
-  {
-    schemaVersion: 2,
-    mediaType: "application/vnd.oci.image.index.v1+json",
-    manifests: [{
-      mediaType: "application/vnd.oci.image.manifest.v1+json",
-      digest: $signature,
-      size: 300
-    }]
-  }
-' >"$FIXTURE/${SIGNATURE_INDEX#sha256:}.json"
+jq -n --arg platform "$PLATFORM" --arg referrer "$REFERRER" \
+  --argjson platformSize "$(wc -c <"$FIXTURE/${PLATFORM#sha256:}.json" | tr -d '[:space:]')" \
+  --argjson referrerSize "$(wc -c <"$FIXTURE/${REFERRER#sha256:}.json" | tr -d '[:space:]')" '
+  {schemaVersion:2,mediaType:"application/vnd.oci.image.index.v1+json",
+   manifests:[
+     {mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$platform,
+      size:$platformSize,platform:{os:"linux",architecture:"amd64"}},
+     {mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$referrer,
+      size:$referrerSize,platform:{os:"unknown",architecture:"unknown"},
+      annotations:{"vnd.docker.reference.type":"attestation-manifest",
+        "vnd.docker.reference.digest":$platform}}
+   ]}
+' >"$TMP/index.json"
+ROOT=sha256:$(sha256sum "$TMP/index.json" | awk '{print $1}')
 
 jq -n --arg root "$ROOT" '
   {
@@ -148,7 +103,18 @@ jq -n --arg root "$ROOT" '
       size: 400
     }
   }
-' >"$FIXTURE/${SIGNATURE#sha256:}.json"
+' >"$FIXTURE/signature-placeholder.json"
+SIGNATURE=sha256:$(sha256sum "$FIXTURE/signature-placeholder.json" | awk '{print $1}')
+mv "$FIXTURE/signature-placeholder.json" "$FIXTURE/${SIGNATURE#sha256:}.json"
+
+jq -n --arg signature "$SIGNATURE" \
+  --argjson signatureSize "$(wc -c <"$FIXTURE/${SIGNATURE#sha256:}.json" | tr -d '[:space:]')" '
+  {schemaVersion:2,mediaType:"application/vnd.oci.image.index.v1+json",
+   manifests:[{mediaType:"application/vnd.oci.image.manifest.v1+json",
+     digest:$signature,size:$signatureSize}]}
+' >"$FIXTURE/signature-index-placeholder.json"
+SIGNATURE_INDEX=sha256:$(sha256sum "$FIXTURE/signature-index-placeholder.json" | awk '{print $1}')
+mv "$FIXTURE/signature-index-placeholder.json" "$FIXTURE/${SIGNATURE_INDEX#sha256:}.json"
 
 jq -n --arg root "$ROOT" '
   {
@@ -173,6 +139,24 @@ jq -n --arg root "$ROOT" '
   }
 ' >"$FIXTURE/${UNLISTED#sha256:}.json"
 
+jq -n \
+  --arg root "$ROOT" --arg source "$SOURCE" --arg platform "$PLATFORM" \
+  --arg referrer "$REFERRER" --arg signature_index "$SIGNATURE_INDEX" \
+  --arg signature "$SIGNATURE" '
+  {
+    digest:$root,
+    aliases:{"v1.0.1":$root,"1.0.1":$root,("sha-" + $source):$root},
+    latest:null,
+    versions:[
+      {digest:$root,tags:["v1.0.1","1.0.1",("sha-" + $source)]},
+      {digest:$platform,tags:[]},
+      {digest:$referrer,tags:[]},
+      {digest:$signature_index,tags:[("sha256-" + ($root|sub("^sha256:";"")))]},
+      {digest:$signature,tags:[]}
+    ]
+  }
+' >"$TMP/inventory.json"
+
 run_valid() {
   local inventory=$1 output=$2
   "$VERIFY" \
@@ -193,6 +177,36 @@ run_valid "$TMP/inventory.json" "$TMP/attributed.json"
   --tag v1.0.1 \
   --version 1.0.1 \
   --source-sha "$SOURCE" >/dev/null
+jq -e --arg signature "$SIGNATURE" '
+  any(.versions[]; .digest == $signature and
+    .attribution.verified == true and .attribution.kind == "signature")
+' "$TMP/attributed.json" >/dev/null
+
+NO_SIGNATURE_INDEX=$TMP/no-signature-index.json
+jq --arg signature_index "$SIGNATURE_INDEX" '
+  .manifests |= map(select(.digest != $signature_index))
+' "$TMP/index.json" >"$NO_SIGNATURE_INDEX"
+NO_SIGNATURE_ROOT=sha256:$(sha256sum "$NO_SIGNATURE_INDEX" | awk '{print $1}')
+NO_SIGNATURE_INVENTORY=$TMP/no-signature-inventory.json
+jq --arg old_root "$ROOT" --arg new_root "$NO_SIGNATURE_ROOT" \
+  --arg signature_index "$SIGNATURE_INDEX" --arg signature "$SIGNATURE" '
+  .versions |= map(
+    select(.digest != $signature_index and .digest != $signature) |
+    if .digest == $old_root then .digest = $new_root else . end
+  )
+' "$TMP/inventory.json" >"$NO_SIGNATURE_INVENTORY"
+if "$VERIFY" \
+    --image "$IMAGE" \
+    --index-file "$NO_SIGNATURE_INDEX" \
+    --inventory-file "$NO_SIGNATURE_INVENTORY" \
+    --subject-digest "$NO_SIGNATURE_ROOT" \
+    --platform-subject "$PLATFORM" \
+    --fixture-dir "$FIXTURE" \
+    --require-signature true \
+    >"$TMP/no-signature.out" 2>&1; then
+  echo "expected OCI closure rejection: missing subject-bound signature" >&2
+  exit 1
+fi
 
 expect_failure() {
   local name=$1
@@ -247,4 +261,4 @@ if run_valid "$TMP/inventory.json" "$TMP/bad-child.json" \
   exit 1
 fi
 
-echo "OCI referrer closure fixtures passed: valid graph and six rejects"
+echo "OCI referrer closure fixtures passed: valid graph and seven rejects"

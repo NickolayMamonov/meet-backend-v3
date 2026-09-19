@@ -206,3 +206,36 @@ validation. Every failed mutation or verifier selects sanitized incident
 evidence and leaves retention unauthorized. Retention is authorized only
 after final verification, required rollback policy, evidence sanitation, and
 artifact upload all succeed.
+
+### Post-publish admission and failure facts
+
+Post-publish admission is a same-run transaction. The workflow captures the
+protected package and release state once before selecting the candidate, keeps
+those files immutable, and writes every later observation into a separate
+fresh phase snapshot. A fresh inventory is bounded to five complete reads and
+four five-second visibility gaps, with a 30-second snapshot limit and a
+180-second overall limit including child cleanup. Only a validated missing
+candidate row may be retried; malformed, conflicting, failed, or ambiguous
+responses stop the run without another writer.
+
+An absent candidate is admitted only after the local OCI layout, source
+identity, protected-state exclusion, and a content-addressed same-run
+publication proof agree on the exact root, Linux/amd64 platform, labels, and
+manifest closure. The proof is carried by hash into final admission and is
+invalidated by any byte, subject, alias, run, attempt, before-state, or
+protected-state change. Publication and signing intents are journaled before
+their writers and confirmed immediately after success. A failed or
+interrupted writer remains `startedUnconfirmed`, never a fabricated
+`notStarted` result.
+
+Pre-existing unsigned partial aliases are quarantine-only: they receive no
+build, copy, signing, deployment, or cleanup operation. A fully authenticated
+signed alias may be reused without registry writes, while final admission
+still verifies its exact root/platform and protected closure. Registry
+publication, attestation writing, and deployment mutation are reported as
+independent facts. If a journal, job output, or transport is lost, the
+corresponding fact is `unknown`; rollback proves deployment started but never
+proves registry state. Incident v3 retains the sanitized v2 contract while
+carrying these explicit write and uncertainty fields. Do not dispatch a
+second promotion to reconcile an uncertain writer; preserve the current-run
+evidence for authorized investigation.

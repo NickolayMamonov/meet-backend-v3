@@ -5,7 +5,12 @@ usage() {
   cat >&2 <<EOF
 usage:
   $0 success --input PATH --output PATH
-  $0 incident --stage STAGE --failure-class CLASS --mutation-started BOOL --rollback-attempted BOOL --rollback-verified BOOL --output PATH
+  $0 incident --stage STAGE --failure-class CLASS
+      --registry-publication notStarted|startedUnconfirmed|confirmed|unknown
+      --attestation-write notStarted|startedUnconfirmed|confirmed|unknown
+      --initial-alias-state unknown|absent|partial|reusable|rejected
+      --deployment-mutation-started true|false|unknown
+      --rollback-attempted BOOL --rollback-verified BOOL --output PATH
   $0 authorize-retention --evidence PATH --artifact-uploaded true --output PATH
 EOF
   exit 2
@@ -542,6 +547,10 @@ case "$operation" in
   incident)
     stage=
     failure_class=
+    registry_publication=
+    attestation_write=
+    initial_alias_state=
+    deployment_mutation_started=
     mutation_started=
     rollback_attempted=
     rollback_verified=
@@ -550,6 +559,10 @@ case "$operation" in
       case "$1" in
         --stage) [ "$#" -ge 2 ] && [ -z "$stage" ] || usage; stage=$2; shift 2 ;;
         --failure-class) [ "$#" -ge 2 ] && [ -z "$failure_class" ] || usage; failure_class=$2; shift 2 ;;
+        --registry-publication) [ "$#" -ge 2 ] && [ -z "$registry_publication" ] || usage; registry_publication=$2; shift 2 ;;
+        --attestation-write) [ "$#" -ge 2 ] && [ -z "$attestation_write" ] || usage; attestation_write=$2; shift 2 ;;
+        --initial-alias-state) [ "$#" -ge 2 ] && [ -z "$initial_alias_state" ] || usage; initial_alias_state=$2; shift 2 ;;
+        --deployment-mutation-started) [ "$#" -ge 2 ] && [ -z "$deployment_mutation_started" ] || usage; deployment_mutation_started=$2; shift 2 ;;
         --mutation-started) [ "$#" -ge 2 ] && [ -z "$mutation_started" ] || usage; mutation_started=$2; shift 2 ;;
         --rollback-attempted) [ "$#" -ge 2 ] && [ -z "$rollback_attempted" ] || usage; rollback_attempted=$2; shift 2 ;;
         --rollback-verified) [ "$#" -ge 2 ] && [ -z "$rollback_verified" ] || usage; rollback_verified=$2; shift 2 ;;
@@ -559,20 +572,48 @@ case "$operation" in
     done
     case "$stage" in authorization|source|protectedState|admission|registryWrite|attestation|predecessor|candidate|rollback|final|evidence|artifactUpload|retention) ;; *) usage ;; esac
     case "$failure_class" in validationFailed|authorityMoved|protectedDigestCollision|protectedStateDrift|terminalRegistryPartial|mutationFailed|rollbackFailed|finalVerificationFailed|sanitizationFailed|remoteEvidenceInvalid|artifactUploadFailed|internalFailure) ;; *) usage ;; esac
-    is_bool "$mutation_started" && is_bool "$rollback_attempted" && is_bool "$rollback_verified" || usage
+    [ -n "$registry_publication" ] && [ -n "$attestation_write" ] &&
+      [ -n "$initial_alias_state" ] && [ -n "$deployment_mutation_started" ] ||
+      usage
+    if [ "$deployment_mutation_started" = unknown ]; then
+      deployment_json=null
+      legacy_mutation=false
+    else
+      [ "$deployment_mutation_started" = true ] ||
+        [ "$deployment_mutation_started" = false ] || usage
+      deployment_json=$deployment_mutation_started
+      legacy_mutation=$deployment_mutation_started
+    fi
+    case "$registry_publication" in notStarted|startedUnconfirmed|confirmed|unknown) ;; *) usage ;; esac
+    case "$attestation_write" in notStarted|startedUnconfirmed|confirmed|unknown) ;; *) usage ;; esac
+    case "$initial_alias_state" in unknown|absent|partial|reusable|rejected) ;; *) usage ;; esac
+    is_bool "$rollback_attempted" || usage
+    is_bool "$rollback_verified" || usage
     [ -n "$output" ] || usage
     [ "$rollback_verified" = false ] || [ "$rollback_attempted" = true ] ||
       fail "rollback verification requires a rollback attempt"
-    [ "$rollback_attempted" = false ] || [ "$mutation_started" = true ] ||
+    if [ "$rollback_attempted" = true ]; then
+      [ "$deployment_mutation_started" = true ] ||
+        fail "rollback observation proves deployment mutation started"
+    fi
+    [ "$rollback_attempted" = false ] || [ "$deployment_mutation_started" = true ] ||
       fail "rollback cannot precede mutation"
     candidate=$(mktemp)
     trap 'rm -f -- "$candidate"' EXIT HUP INT TERM
-    jq -cnS --arg schema "meet-backend/test-promotion-incident/v2" \
+    jq -cnS --arg schema "meet-backend/test-promotion-incident/v3" \
       --arg stage "$stage" --arg failureClass "$failure_class" \
-      --argjson mutationStarted "$mutation_started" \
+      --arg registryPublication "$registry_publication" \
+      --arg attestationWrite "$attestation_write" \
+      --arg initialAliasState "$initial_alias_state" \
+      --argjson deploymentMutationStarted "$deployment_json" \
+      --argjson mutationStarted "$legacy_mutation" \
       --argjson rollbackAttempted "$rollback_attempted" \
       --argjson rollbackVerified "$rollback_verified" '
       {schema:$schema,kind:"incident",stage:$stage,failureClass:$failureClass,
+       registryPublication:$registryPublication,
+       attestationWrite:$attestationWrite,
+       initialAliasState:$initialAliasState,
+       deploymentMutationStarted:$deploymentMutationStarted,
        mutationStarted:$mutationStarted,rollbackAttempted:$rollbackAttempted,
        rollbackVerified:$rollbackVerified,evidenceSanitized:true,
        artifactUploaded:false,retentionAuthorized:false}

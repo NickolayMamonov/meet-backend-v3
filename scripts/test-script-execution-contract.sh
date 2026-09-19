@@ -115,7 +115,10 @@ mkdir -p "$tmp/uploaded"
 bash "$BUILDER" incident \
   --stage authorization \
   --failure-class internalFailure \
-  --mutation-started false \
+  --registry-publication notStarted \
+  --attestation-write notStarted \
+  --initial-alias-state unknown \
+  --deployment-mutation-started false \
   --rollback-attempted false \
   --rollback-verified false \
   --output "$incident" >/dev/null
@@ -123,15 +126,20 @@ bash "$BUILDER" incident \
   fail "authorization fixture unexpectedly mutated the writer marker"
 jq -e '
   keys == [
-    "artifactUploaded","evidenceSanitized","failureClass","kind",
-    "mutationStarted","retentionAuthorized","rollbackAttempted",
-    "rollbackVerified","schema","stage"
+    "artifactUploaded","attestationWrite","deploymentMutationStarted",
+    "evidenceSanitized","failureClass","initialAliasState","kind",
+    "mutationStarted","registryPublication","retentionAuthorized",
+    "rollbackAttempted","rollbackVerified","schema","stage"
   ] and
-  .schema == "meet-backend/test-promotion-incident/v2" and
+  .schema == "meet-backend/test-promotion-incident/v3" and
   .kind == "incident" and
   .stage == "authorization" and
   .failureClass == "internalFailure" and
   .mutationStarted == false and
+  .deploymentMutationStarted == false and
+  .registryPublication == "notStarted" and
+  .attestationWrite == "notStarted" and
+  .initialAliasState == "unknown" and
   .rollbackAttempted == false and
   .rollbackVerified == false and
   .evidenceSanitized == true and

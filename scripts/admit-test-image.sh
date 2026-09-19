@@ -14,8 +14,10 @@ usage() {
 usage:
   admit-test-image.sh inspect --source SHA --version X.Y.Z
       (--input PATH | --input-command PATH) [--alias ALIAS] [--output PATH]
+      [--expected-root-digest DIGEST --expected-platform-digest DIGEST]
   admit-test-image.sh verify --source SHA --version X.Y.Z
       (--input PATH | --input-command PATH) [--alias ALIAS] [--output PATH]
+      [--expected-root-digest DIGEST --expected-platform-digest DIGEST]
 
 The input is a read-only registry snapshot with a top-level "bindings" array.
 An input command is an explicit offline shim. It receives:
@@ -61,6 +63,8 @@ OUTPUT=
 OUTPUT_DIR=
 TEMP_INPUT=
 TEMP_OUTPUT=
+EXPECTED_ROOT_DIGEST=
+EXPECTED_PLATFORM_DIGEST=
 
 [ "$#" -ge 1 ] || fail_usage
 MODE=$1
@@ -102,6 +106,16 @@ while [ "$#" -gt 0 ]; do
       OUTPUT=$2
       shift 2
       ;;
+    --expected-root-digest)
+      [ "$#" -ge 2 ] || fail_usage
+      EXPECTED_ROOT_DIGEST=$2
+      shift 2
+      ;;
+    --expected-platform-digest)
+      [ "$#" -ge 2 ] || fail_usage
+      EXPECTED_PLATFORM_DIGEST=$2
+      shift 2
+      ;;
     --help|-h) usage ;;
     *) fail_usage ;;
   esac
@@ -111,6 +125,12 @@ done
 is_semver "$VERSION" || fail_usage
 [ -n "$INPUT" ] || [ -n "$INPUT_COMMAND" ] || fail_usage
 [ -z "$INPUT" ] || [ -z "$INPUT_COMMAND" ] || fail_usage
+[ -z "$EXPECTED_ROOT_DIGEST" ] || [[ "$EXPECTED_ROOT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+  fail_usage
+[ -z "$EXPECTED_PLATFORM_DIGEST" ] ||
+  [[ "$EXPECTED_PLATFORM_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail_usage
+[ -z "$EXPECTED_ROOT_DIGEST" ] || [ -n "$EXPECTED_PLATFORM_DIGEST" ] || fail_usage
+[ -z "$EXPECTED_PLATFORM_DIGEST" ] || [ -n "$EXPECTED_ROOT_DIGEST" ] || fail_usage
 
 if [ -n "$OUTPUT" ]; then
   OUTPUT_DIR=$(dirname -- "$OUTPUT")
@@ -123,6 +143,7 @@ fi
 EXPECTED_ALIAS="test-sha-$SOURCE"
 ALIAS=${REQUESTED_ALIAS:-$EXPECTED_ALIAS}
 
+# shellcheck disable=SC2329
 cleanup() {
   [ -z "$TEMP_INPUT" ] || rm -f -- "$TEMP_INPUT"
   [ -z "$TEMP_OUTPUT" ] || rm -f -- "$TEMP_OUTPUT"
@@ -171,19 +192,30 @@ emit() {
   local state=$1
   local reason=$2
   local result
+  local root_digest=${ROOT_DIGEST:-} platform_digest=${PLATFORM_DIGEST:-}
+  local attestation_status=${ATTESTATION_STATUS:-}
   result=$(jq -cnS \
     --arg alias "$ALIAS" \
     --arg image "$IMAGE" \
     --arg reason "$reason" \
     --arg source "$SOURCE" \
     --arg state "$state" \
+    --arg rootDigest "$root_digest" \
+    --arg platformDigest "$platform_digest" \
+    --arg attestationStatus "$attestation_status" \
     '{
       alias: $alias,
       image: $image,
       reason: $reason,
       source: $source,
       state: $state
-    }')
+    } +
+    (if ($state != "reusable" and $state != "partial") or
+        $rootDigest == "" or $platformDigest == ""
+     then {}
+     else {rootDigest:$rootDigest,platformDigest:$platformDigest,
+       attestationStatus:$attestationStatus}
+     end)')
   write_output "$result"
   printf '%s\n' "$result"
 }
@@ -269,6 +301,8 @@ if ! jq -e \
     (.platform | type == "object") and
     (.referrers | type == "array") and
     (.githubAttestations | type == "array") and
+    ((.attestationStatus? // null) == null or
+      .attestationStatus == "missing" or .attestationStatus == "verified") and
     (.root.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
     (.platform.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
     (.digest == .root.digest) and
@@ -295,6 +329,30 @@ fi
 
 ROOT_DIGEST=$(jq -r '.root.digest' <<<"$BINDING")
 PLATFORM_DIGEST=$(jq -r '.platform.digest' <<<"$BINDING")
+ATTESTATION_STATUS=$(jq -r '.attestationStatus? // empty' <<<"$BINDING")
+if [ -z "$ATTESTATION_STATUS" ]; then
+  [ "$(jq '.githubAttestations | length' <<<"$BINDING")" -gt 0 ] ||
+    { emit rejected missing-attestation-status; exit 1; }
+  ATTESTATION_STATUS=verified
+fi
+[ "$ATTESTATION_STATUS" = verified ] ||
+  [ "$ATTESTATION_STATUS" = missing ] ||
+  { emit rejected partial-binding; exit 1; }
+case "$ATTESTATION_STATUS" in
+  missing)
+    [ "$(jq '.githubAttestations | length' <<<"$BINDING")" -eq 0 ] ||
+      { emit rejected partial-binding; exit 1; }
+    ;;
+  verified)
+    [ "$(jq '.githubAttestations | length' <<<"$BINDING")" -gt 0 ] ||
+      { emit rejected partial-binding; exit 1; }
+    ;;
+esac
+[ -z "$EXPECTED_ROOT_DIGEST" ] || [ "$EXPECTED_ROOT_DIGEST" = "$ROOT_DIGEST" ] ||
+  { emit rejected digest-mismatch; exit 1; }
+[ -z "$EXPECTED_PLATFORM_DIGEST" ] ||
+  [ "$EXPECTED_PLATFORM_DIGEST" = "$PLATFORM_DIGEST" ] ||
+  { emit rejected digest-mismatch; exit 1; }
 
 if ! jq -e \
   --arg root "$ROOT_DIGEST" \
@@ -332,7 +390,7 @@ if ! jq -e \
   exit 1
 fi
 
-if ! jq -e \
+if [ "$ATTESTATION_STATUS" = verified ] && ! jq -e \
   --arg root "$ROOT_DIGEST" \
   --arg platform "$PLATFORM_DIGEST" \
   --arg source "$SOURCE" \
@@ -350,6 +408,12 @@ if ! jq -e \
       contains("@refs/"))
   ' <<<"$BINDING" >/dev/null; then
   emit rejected missing-github-attestation
+  exit 1
+fi
+
+if [ "$ATTESTATION_STATUS" = missing ]; then
+  emit partial missing-github-attestation
+  [ "$MODE" = inspect ] && exit 0
   exit 1
 fi
 
