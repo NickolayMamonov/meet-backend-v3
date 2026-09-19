@@ -2,9 +2,11 @@
 set -euo pipefail
 
 audit=${STUB_AUDIT:?STUB_AUDIT is required}
-printf 'gh' >>"$audit"
-printf ' %s' "$@" >>"$audit"
-printf '\n' >>"$audit"
+{
+  printf 'gh'
+  printf ' %s' "$@"
+  printf '\n'
+} >>"$audit"
 
 [ "$#" -eq 4 ] &&
   [ "$1" = api ] &&

@@ -2,9 +2,11 @@
 set -euo pipefail
 
 audit=${STUB_AUDIT:?STUB_AUDIT is required}
-printf 'docker' >>"$audit"
-printf ' %q' "$@" >>"$audit"
-printf '\n' >>"$audit"
+{
+  printf 'docker'
+  printf ' %q' "$@"
+  printf '\n'
+} >>"$audit"
 
 [ "$#" -eq 5 ] &&
   [ "$1" = buildx ] &&
