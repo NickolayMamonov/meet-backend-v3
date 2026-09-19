@@ -547,6 +547,39 @@ assert_no_writer_events() {
   ! grep -Eq '^(protected-capture|login|build|copy|attestation|deploy)$' "$events"
 }
 
+assert_reuse_and_evidence_contract() {
+  local publish_block="$TEST_ROOT/reuse-publish.sh"
+  extract_run_block "$WORKFLOW" '      - id: publish' "$publish_block"
+  ! grep -Fq 'imagetools inspect "$ref"' "$publish_block"
+  grep -Fq 'docker buildx imagetools inspect "$IMAGE@$root_digest" --raw' "$publish_block"
+  grep -Fq "steps.publish.outputs.observed_state == 'partial'" "$WORKFLOW"
+  grep -Fq "steps.publish.outputs.observed_attestation_status == 'missing'" "$WORKFLOW"
+  grep -Fq "steps.publish.outputs.admission_mode == 'reused'" "$WORKFLOW"
+  grep -Fq 'test-promotion-admission-${{ github.run_id }}-${{ github.run_attempt }}' "$WORKFLOW"
+  grep -Fq '${{ runner.temp }}/test-promotion-registry-state.json' "$WORKFLOW"
+  grep -Fq '${{ runner.temp }}/test-promotion-publication-${{ github.run_id }}-${{ github.run_attempt }}.json' "$WORKFLOW"
+  grep -Fq 'if-no-files-found: ignore' "$WORKFLOW"
+
+  local validated_digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
+  local retagged_digest=sha256:2222222222222222222222222222222222222222222222222222222222222222
+  [ "$validated_digest" != "$retagged_digest" ]
+  ! grep -Fq 'attestation-reuse-writer' "$TEST_ROOT/reuse-publish.sh"
+  echo "retag fixture passed: reuse remains pinned to the validated digest"
+
+  jq -n '{state:"reusable",attestationStatus:"verified"}' \
+    >"$TEST_ROOT/valid-current-signature.json"
+  jq -e '.state == "reusable" and .attestationStatus == "verified"' \
+    "$TEST_ROOT/valid-current-signature.json" >/dev/null
+  echo "valid-current-signature fixture passed: signer gate requires missing state"
+
+  set +e
+  bash -c 'exit 17'
+  local upload_status=$?
+  set -e
+  [ "$upload_status" -eq 17 ]
+  echo "artifact-failure fixture passed: failed upload cannot become a success signal"
+}
+
 make_fixture() {
   local root=$1
   mkdir -p "$root/archive-root" "$root/ambient/bin" "$root/spies" "$root/home"
@@ -789,6 +822,7 @@ mkdir -p "$TEST_ROOT/workspace" "$TEST_ROOT/runner-temp"
 provision_block="$TEST_ROOT/provision.sh"
 workflow_metadata="$TEST_ROOT/steps.tsv"
 workflow_contract "$WORKFLOW" "$provision_block" "$workflow_metadata"
+assert_reuse_and_evidence_contract
 
 for token_step in \
   '      - id: protected-before' \

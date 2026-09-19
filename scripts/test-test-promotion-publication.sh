@@ -105,12 +105,12 @@ jq -nS --arg root "$ROOT" --arg platform "$PLATFORM" --arg alias "$ALIAS" \
   '{versions:[{id:1,digest:$root,tags:[$alias]},
               {id:2,digest:$platform,tags:[]}]}' >"$CANDIDATE"
 jq -nS --arg root "$ROOT" --arg platform "$PLATFORM" \
-  '{rootDigest:$root,platformDigest:$platform}' >"$OBSERVED"
+  '{state:"partial",attestationStatus:"missing",rootDigest:$root,platformDigest:$platform}' >"$OBSERVED"
 jq -nS --arg source "$SOURCE" \
   '{schema:"meet-backend/test-promotion-registry-state/v1",
     sourceSha:$source,runId:35354750679,runAttempt:2,
     initialAliasState:"absent",registryPublication:"confirmed",
-    attestationWrite:"startedUnconfirmed"}' >"$JOURNAL"
+    attestationWrite:"notStarted"}' >"$JOURNAL"
 
 verify() {
   bash "$PROOF_HELPER" verify \
@@ -125,6 +125,19 @@ verify() {
 }
 
 verify
+
+for attestation_state in startedUnconfirmed confirmed; do
+  jq --arg state "$attestation_state" '.attestationWrite = $state' \
+    "$JOURNAL" >"$TMP/journal-$attestation_state.json"
+  expect_failure "journal-transition-$attestation_state" bash "$PROOF_HELPER" verify \
+    --proof "$PROOF" --expected-proof-sha256 "$PROOF_SHA" \
+    --index-file "$LAYOUT/blobs/sha256/${ROOT#sha256:}" \
+    --candidate-inventory "$CANDIDATE" --observed-reader "$OBSERVED" \
+    --registry-journal "$TMP/journal-$attestation_state.json" --before-inventory "$BEFORE" \
+    --protected-state "$PROTECTED" --layout-proof "$LAYOUT_PROOF" \
+    --image "$IMAGE" --source-sha "$SOURCE" --tree-id "$TREE" \
+    --version "$VERSION" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT"
+done
 
 jq 'del(.platformDigest)' "$OBSERVED" >"$TMP/observed-missing-mutant.json"
 expect_failure observed-missing-field bash "$PROOF_HELPER" verify \

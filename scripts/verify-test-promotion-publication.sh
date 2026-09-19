@@ -415,6 +415,7 @@ verify_proof() {
       any(.versions[]; .digest == $platform[7:]))
   ' "$CANDIDATE_INVENTORY" >/dev/null || fail "candidate inventory is not bound to proof"
   jq -e --arg root "$root" --arg platform "$platform" '
+    .state == "partial" and .attestationStatus == "missing" and
     .rootDigest == $root and .platformDigest == $platform
   ' "$OBSERVED_READER" >/dev/null || fail "observed reader snapshot is not bound to proof"
   jq -e --arg run "$RUN_ID" --arg attempt "$RUN_ATTEMPT" --arg source "$SOURCE_SHA" '
@@ -424,6 +425,7 @@ verify_proof() {
     ] and
     (.initialAliasState == "absent") and
     .registryPublication == "confirmed" and
+    .attestationWrite == "notStarted" and
     .sourceSha == $source and
     .runId == ($run|tonumber) and
     .runAttempt == ($attempt|tonumber)

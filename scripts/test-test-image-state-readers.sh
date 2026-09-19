@@ -206,6 +206,16 @@ if [ "$1" = api ]; then
           jq -cn --arg alias "$ALIAS" --arg root "$ROOT" '
             [[{id:1,name:$root,metadata:{container:{tags:[$alias,"v1.2.3"]}}}]]
           ' ;;
+        missing-metadata)
+          jq -cn --arg root "$ROOT" '[[{id:1,name:$root,metadata:{}}]]' ;;
+        missing-container)
+          jq -cn --arg root "$ROOT" '[[{id:1,name:$root,metadata:{container:{}}}]]' ;;
+        missing-tags)
+          jq -cn --arg root "$ROOT" '[[{id:1,name:$root,metadata:{container:{tags:null}}}]]' ;;
+        duplicate-tag)
+          jq -cn --arg alias "$ALIAS" --arg root "$ROOT" '
+            [[{id:1,name:$root,metadata:{container:{tags:[$alias,$alias]}}}]]
+          ' ;;
         *) jq -cn --arg alias "$ALIAS" --arg root "$ROOT" '
           [[{id:1,name:$root,metadata:{container:{tags:[$alias]}}}]]
         ' ;;
@@ -268,6 +278,10 @@ jq -e '.bindings == []' "$TMP/absent.json" >/dev/null || fail "confirmed absence
 expect_failure unknown-404 run_read unknown-404
 expect_failure ambiguous-404 run_read ambiguous-404
 expect_failure extra-alias run_read extra-alias
+expect_failure missing-metadata run_read missing-metadata
+expect_failure missing-container run_read missing-container
+expect_failure missing-tags run_read missing-tags
+expect_failure duplicate-tag run_read duplicate-tag
 expect_failure malformed-root run_read malformed-root
 expect_failure malformed-attestation run_read malformed-attestation
 expect_failure verify-fail run_read verify-fail

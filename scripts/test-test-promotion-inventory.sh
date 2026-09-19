@@ -31,37 +31,47 @@ jq -nS \
   '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",
     config:{mediaType:"application/vnd.oci.image.config.v1+json",
       digest:"sha256:1111111111111111111111111111111111111111111111111111111111111111",size:1},
-    layers:[]}' >"$PLATFORM_WORK"
+    layers:[{mediaType:"application/vnd.oci.image.layer.v1.tar+gzip",
+      digest:"sha256:4444444444444444444444444444444444444444444444444444444444444444",size:1}]}' \
+  >"$PLATFORM_WORK"
 PLATFORM_DIGEST=sha256:$(sha256sum "$PLATFORM_WORK" | awk '{print $1}')
+PLATFORM_SIZE=$(wc -c <"$PLATFORM_WORK" | tr -d '[:space:]')
 jq -nS --arg digest "$PLATFORM_DIGEST" \
   '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",
     config:{mediaType:"application/vnd.oci.image.config.v1+json",
       digest:"sha256:2222222222222222222222222222222222222222222222222222222222222222",size:1},
-    layers:[],subject:{mediaType:"application/vnd.oci.image.manifest.v1+json",
-      digest:$digest,size:1},
+    layers:[{mediaType:"application/vnd.dev.sigstore.bundle.v0.3+json",
+      digest:"sha256:3333333333333333333333333333333333333333333333333333333333333333",size:17}],
+    subject:{mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$digest,size:1},
     artifactType:"application/vnd.dev.sigstore.bundle.v0.3+json"}' >"$WRAPPER_WORK"
 WRAPPER_DIGEST=sha256:$(sha256sum "$WRAPPER_WORK" | awk '{print $1}')
+WRAPPER_SIZE=$(wc -c <"$WRAPPER_WORK" | tr -d '[:space:]')
 jq -nS --arg platform "$PLATFORM_DIGEST" --arg wrapper "$WRAPPER_DIGEST" \
+  --argjson platformSize "$PLATFORM_SIZE" --argjson wrapperSize "$WRAPPER_SIZE" \
   '{schemaVersion:2,mediaType:"application/vnd.oci.image.index.v1+json",
     manifests:[
-      {mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$platform,size:1,
+      {mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$platform,size:$platformSize,
        platform:{os:"linux",architecture:"amd64"}},
-      {mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$wrapper,size:1,
+      {mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$wrapper,size:$wrapperSize,
        annotations:{"vnd.docker.reference.type":"attestation-manifest",
          "vnd.docker.reference.artifact.type":"application/vnd.dev.sigstore.bundle.v0.3+json",
          "vnd.docker.reference.digest":$platform}}
     ]}' >"$ROOT_WORK"
 ROOT_DIGEST=sha256:$(sha256sum "$ROOT_WORK" | awk '{print $1}')
 cp -- "$ROOT_WORK" "$INDEX_WORK"
+cp -- "$ROOT_WORK" "$TMP/${ROOT_DIGEST#sha256:}.json"
+cp -- "$PLATFORM_WORK" "$TMP/${PLATFORM_DIGEST#sha256:}.json"
+cp -- "$WRAPPER_WORK" "$TMP/${WRAPPER_DIGEST#sha256:}.json"
 
 jq -nS --arg digest "$ROOT_DIGEST" --arg platform "$PLATFORM_DIGEST" \
   --arg wrapper "$WRAPPER_DIGEST" --arg alias "$ALIAS" \
-  --arg protected "$PROTECTED_DIGEST" '
+  --arg protected "$PROTECTED_DIGEST" \
+  --arg marker "sha256-${ROOT_DIGEST#sha256:}" '
   [[
     {id:1,name:$protected,metadata:{container:{tags:["v1.0.0"]}}},
     {id:2,name:$digest,metadata:{container:{tags:[$alias]}}},
     {id:3,name:$platform,metadata:{container:{tags:[]}}},
-    {id:4,name:$wrapper,metadata:{container:{tags:[]}}}
+    {id:4,name:$wrapper,metadata:{container:{tags:[$marker]}}}
   ]]
 ' >"$BEFORE"
 jq -nS --arg protected "$PROTECTED_DIGEST" \
@@ -90,6 +100,15 @@ set -euo pipefail
 printf '%s\n' "${1:?}" >>"${SLEEP_LOG:?}"
 EOF
 chmod 755 "$GH" "$SLEEP"
+cat >"$TMP/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = buildx ] && [ "$2" = imagetools ] && [ "$3" = inspect ] && [ "$4" = --raw ]
+reference=${5:?}
+digest=${reference##*@}
+cat "${FIXTURE_DATA:?}/${digest#sha256:}.json"
+EOF
+chmod 755 "$TMP/docker"
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
   cat >"$TMP/timeout" <<'EOF'
 #!/usr/bin/env bash
@@ -117,8 +136,8 @@ make_response() {
 }
 
 RESPONSE=$TMP/response.json
-make_response "$RESPONSE" "[\"$ALIAS\"]" '[]' '[]'
-PATH="$TMP:$PATH" GH_RESPONSE=$RESPONSE \
+make_response "$RESPONSE" "[\"$ALIAS\"]" '[]' "[\"sha256-${ROOT_DIGEST#sha256:}\"]"
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_RESPONSE=$RESPONSE \
   SLEEP_LOG=$TMP/sleeps \
   "$READER" --image "$IMAGE" --alias "$ALIAS" \
   --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
@@ -134,6 +153,30 @@ jq -e --arg root "$ROOT_DIGEST" --arg alias "$ALIAS" '
   ([.versions[] | select(.digest == $root)][0].tags == [$alias])
 ' "$PHASE/registry-inventory.json" >/dev/null
 [ ! -s "$TMP/sleeps" ]
+
+# A complete candidate snapshot whose marker is delayed is retryable without
+# discarding the root/platform observation.
+MARKER_LAG=$TMP/marker-lag.json
+make_response "$MARKER_LAG" "[\"$ALIAS\"]" '[]' '[]'
+MARKER_SEQUENCE=$TMP/marker-sequence
+mkdir -p "$MARKER_SEQUENCE"
+for attempt in 1 2 3 4; do
+  cp -- "$MARKER_LAG" "$MARKER_SEQUENCE/$attempt.json"
+done
+cp -- "$RESPONSE" "$MARKER_SEQUENCE/5.json"
+printf '0\n' >"$TMP/marker-count"
+rm -f "$TMP/sleeps"
+MARKER_OUTPUT=$TMP/marker-output
+mkdir -p "$MARKER_OUTPUT"
+PATH="$TMP:$PATH" FIXTURE_DATA=$TMP GH_SEQUENCE_DIR=$MARKER_SEQUENCE \
+  GH_COUNT_FILE=$TMP/marker-count SLEEP_LOG=$TMP/sleeps \
+  "$READER" --image "$IMAGE" --alias "$ALIAS" \
+  --subject-digest "$ROOT_DIGEST" --platform-subject "$PLATFORM_DIGEST" \
+  --index-file "$INDEX_WORK" --before-inventory "$BEFORE" \
+  --protected-state "$PROTECTED" --require-signature true \
+  --output-dir "$MARKER_OUTPUT" >/dev/null
+[ "$(tr -d '[:space:]' <"$TMP/marker-count")" -eq 5 ]
+[ "$(wc -l <"$TMP/sleeps" | tr -d '[:space:]')" -eq 4 ]
 
 # A complete empty snapshot is valid, but missing candidate visibility is the
 # sole retryable result.

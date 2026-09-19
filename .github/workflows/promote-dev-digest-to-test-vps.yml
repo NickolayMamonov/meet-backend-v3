@@ -224,6 +224,8 @@ jobs:
             --alias "$alias" --input-command scripts/read-test-image-state.sh \
             --output "$RUNNER_TEMP/admission-state.json"
           state=$(jq -r .state "$RUNNER_TEMP/admission-state.json")
+          observed_attestation_status=$(jq -r '.attestationStatus // empty' \
+            "$RUNNER_TEMP/admission-state.json")
           case "$state" in
             absent)
               mode=published
@@ -259,8 +261,14 @@ jobs:
             echo "candidate alias is quarantined; no writer is permitted" >&2
             exit 1
           }
+          if [ "$mode" = reused ] && [ "$observed_attestation_status" != verified ]; then
+            echo "reusable admission does not have verified attestation state" >&2
+            exit 1
+          fi
           publication_proof=
           publication_proof_sha=
+          root_digest=
+          platform_digest=
           if [ "$mode" = published ]; then
             printf "%s" "$GH_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
             layout="$RUNNER_TEMP/test-image-layout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
@@ -325,15 +333,29 @@ jobs:
               --file "$REGISTRY_STATE" --source "$SOURCE_SHA" \
               --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
               --operation publication
+            root_digest=$local_root_digest
+            platform_digest=$local_platform_digest
+          else
+            root_digest=$(jq -er '.rootDigest' "$RUNNER_TEMP/admission-state.json")
+            platform_digest=$(jq -er '.platformDigest' "$RUNNER_TEMP/admission-state.json")
           fi
-          root_digest=$(docker buildx imagetools inspect "$ref" --format "{{.Manifest.Digest}}")
           raw="$RUNNER_TEMP/test-image-index.json"
-          docker buildx imagetools inspect "$ref" --raw >"$raw"
+          docker buildx imagetools inspect "$IMAGE@$root_digest" --raw >"$raw"
+          test "sha256:$(sha256sum "$raw" | awk '{print $1}')" = "$root_digest" ||
+            { echo "selected OCI index bytes do not match the pinned root digest" >&2; exit 1; }
           if [ "$mode" = published ]; then
             test "$local_root_digest" = "$root_digest" ||
               { echo "published OCI subject differs from admitted OCI layout" >&2; exit 1; }
           fi
-          platform_digest=$(jq -r '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest] | if length == 1 then .[0] else empty end' "$raw")
+          observed_platform_digest=$(jq -er '
+            [.manifests[] |
+              select(.mediaType == "application/vnd.oci.image.manifest.v1+json" and
+                .platform.os == "linux" and .platform.architecture == "amd64") |
+              .digest] |
+            if length == 1 then .[0] else error("OCI platform subject is not unique") end
+          ' "$raw")
+          test "$platform_digest" = "$observed_platform_digest" ||
+            { echo "selected OCI platform subject differs from the pinned digest" >&2; exit 1; }
           if [ "$mode" = published ]; then
             test "$local_platform_digest" = "$platform_digest" ||
               { echo "published OCI platform subject differs from admitted OCI layout" >&2; exit 1; }
@@ -343,6 +365,8 @@ jobs:
           printf 'platform_digest=%s\n' "$platform_digest" >> "$GITHUB_OUTPUT"
           printf 'admission_mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
           printf 'state_mode=%s\n' "$STATE_MODE" >> "$GITHUB_OUTPUT"
+          printf 'observed_state=%s\n' "$state" >> "$GITHUB_OUTPUT"
+          printf 'observed_attestation_status=%s\n' "$observed_attestation_status" >> "$GITHUB_OUTPUT"
           if [ "$mode" = published ]; then
             printf 'publication_proof=%s\n' "$publication_proof" >> "$GITHUB_OUTPUT"
             printf 'publication_proof_sha=%s\n' "$publication_proof_sha" >> "$GITHUB_OUTPUT"
@@ -412,7 +436,9 @@ jobs:
             --output "$RUNNER_TEMP/observed-reader-before-signature.json"
       - id: publication-proof
         name: Verify same-run publication proof
-        if: success() && steps.publish.outputs.admission_mode == 'published'
+        if: success() && steps.publish.outputs.admission_mode == 'published' &&
+          steps.publish.outputs.observed_state == 'partial' &&
+          steps.publish.outputs.observed_attestation_status == 'missing'
         timeout-minutes: 5
         shell: bash
         env:
@@ -440,8 +466,11 @@ jobs:
             --version "$VERSION" \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT"
-      - name: Mark signer intent for a first-time alias
-        if: steps.publish.outputs.admission_mode == 'published'
+      - id: signer-intent
+        name: Mark signer intent for a first-time alias
+        if: steps.publish.outputs.admission_mode == 'published' &&
+          steps.publish.outputs.observed_state == 'partial' &&
+          steps.publish.outputs.observed_attestation_status == 'missing'
         timeout-minutes: 1
         shell: bash
         env:
@@ -454,7 +483,9 @@ jobs:
             --operation attestation
       - id: signer
         name: Create signed OCI attestation for a first-time alias
-        if: steps.publish.outputs.admission_mode == 'published'
+        if: steps.publish.outputs.admission_mode == 'published' &&
+          steps.publish.outputs.observed_state == 'partial' &&
+          steps.publish.outputs.observed_attestation_status == 'missing'
         timeout-minutes: 5
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
@@ -462,7 +493,10 @@ jobs:
           subject-digest: ${{ steps.publish.outputs.root_digest }}
           push-to-registry: true
       - name: Confirm signer completion
-        if: always() && steps.signer.outcome == 'success'
+        if: always() && steps.signer.outcome == 'success' &&
+          steps.publish.outputs.admission_mode == 'published' &&
+          steps.publish.outputs.observed_state == 'partial' &&
+          steps.publish.outputs.observed_attestation_status == 'missing'
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -477,7 +511,9 @@ jobs:
           fi
       - id: final-inventory
         name: Collect fresh signed inventory after publication
-        if: success() && steps.publish.outputs.admission_mode == 'published'
+        if: success() &&
+          (steps.publish.outputs.admission_mode == 'published' ||
+           steps.publish.outputs.admission_mode == 'reused')
         timeout-minutes: 5
         shell: bash
         env:
@@ -519,7 +555,9 @@ jobs:
             --require-signature true >/dev/null
       - id: final-observed
         name: Capture final signed image admission
-        if: success() && steps.publish.outputs.admission_mode == 'published'
+        if: success() &&
+          (steps.publish.outputs.admission_mode == 'published' ||
+           steps.publish.outputs.admission_mode == 'reused')
         timeout-minutes: 5
         shell: bash
         env:
@@ -607,6 +645,17 @@ jobs:
             --file "$registry_state" --source "$SOURCE_SHA" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --github-output "$GITHUB_OUTPUT"
+      - name: Upload current-run admission evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: test-promotion-admission-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/test-promotion-registry-state.json
+            ${{ runner.temp }}/test-promotion-publication-${{ github.run_id }}-${{ github.run_attempt }}.json
+            ${{ runner.temp }}/layout-proof.json
   deploy:
     name: Locked exact-digest test VPS deployment
     needs: [authorize, admit-image]

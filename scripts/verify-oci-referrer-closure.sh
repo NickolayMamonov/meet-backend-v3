@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --image IMAGE --index-file PATH --inventory-file PATH --subject-digest sha256:... --platform-subject sha256:... [--promotion-baseline-file PATH --protected-state-file PATH --candidate-alias ALIAS] [--fixture-dir PATH] [--output PATH]" >&2
+  echo "usage: $0 --image IMAGE --index-file PATH --inventory-file PATH --subject-digest sha256:... --platform-subject sha256:... [--promotion-baseline-file PATH --protected-state-file PATH --candidate-alias ALIAS] [--fixture-dir PATH] [--output PATH] [--pending-on-missing-signature]" >&2
   exit 2
 }
 
@@ -22,6 +22,7 @@ PROMOTION_BASELINE=
 PROMOTION_PROTECTED=
 CANDIDATE_ALIAS=
 REQUIRE_SIGNATURE=false
+PENDING_ON_MISSING_SIGNATURE=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --image) [ "$#" -ge 2 ] || usage; IMAGE=$2; shift 2 ;;
@@ -35,6 +36,7 @@ while [ "$#" -gt 0 ]; do
     --protected-state-file) [ "$#" -ge 2 ] || usage; PROMOTION_PROTECTED=$2; shift 2 ;;
     --candidate-alias) [ "$#" -ge 2 ] || usage; CANDIDATE_ALIAS=$2; shift 2 ;;
     --require-signature) [ "$#" -ge 2 ] || usage; REQUIRE_SIGNATURE=$2; shift 2 ;;
+    --pending-on-missing-signature) PENDING_ON_MISSING_SIGNATURE=true; shift ;;
     *) usage ;;
   esac
 done
@@ -44,8 +46,12 @@ command -v jq >/dev/null 2>&1 || fail "jq is required"
 [ -f "$INVENTORY_FILE" ] || usage
 [[ "$SUBJECT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || usage
 [[ "$PLATFORM_SUBJECT" =~ ^sha256:[0-9a-f]{64}$ ]] || usage
-[ -n "$FIXTURE_DIR" ] || command -v docker >/dev/null 2>&1 ||
-  fail "docker is required for live OCI manifest reads"
+if [ -z "$FIXTURE_DIR" ]; then
+  command -v docker >/dev/null 2>&1 ||
+    fail "docker is required for live OCI manifest reads"
+  command -v timeout >/dev/null 2>&1 ||
+    fail "GNU timeout is required for live OCI manifest reads"
+fi
 [ -z "$PROMOTION_BASELINE" ] && [ -z "$PROMOTION_PROTECTED" ] &&
   [ -z "$CANDIDATE_ALIAS" ] || {
   [ -f "$PROMOTION_BASELINE" ] && [ -f "$PROMOTION_PROTECTED" ] &&
@@ -202,7 +208,8 @@ fetch_raw() {
     cp -- "$fixture" "$destination" ||
       fail "OCI child manifest could not be copied"
   else
-    docker buildx imagetools inspect --raw "$IMAGE@$digest" >"$destination" ||
+    timeout --kill-after=2s 30s \
+      docker buildx imagetools inspect --raw "$IMAGE@$digest" >"$destination" ||
       fail "OCI child manifest lookup failed"
   fi
   jq -e 'type == "object"' "$destination" >/dev/null ||
@@ -325,6 +332,9 @@ while IFS= read -r digest; do
     NODE_SBOM=0
     NODE_SIGNATURE=0
     NODE_BOUND=0
+    # The marker-only attribution pass intentionally calls the recursive
+    # validator declared below.
+    # shellcheck disable=SC2218
     validate_node "$digest" "$SUBJECT_DIGEST" 0 1
     [ "$NODE_BOUND" -eq 1 ] ||
       fail "reachable nested OCI node is not subject-bound"
@@ -353,11 +363,15 @@ done <"$REACHABLE"
 if [ "$PROMOTION" = true ]; then
   reachable_json=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$REACHABLE")
   baseline_non_candidate=$(jq -cS --argjson reachable "$reachable_json" '
-    [.[][] | {id,digest:.name,tags:.metadata.container.tags} as $row |
-      select(($reachable | index($row.digest)) == null)] | sort_by(.id,.digest)
+    [.[][] |
+      .name as $digest |
+      .metadata.container.tags as $tags |
+      {id,digest:$digest,tags:$tags} |
+      select((any($reachable[]; . == $digest) | not))] | sort_by(.id,.digest)
   ' "$PROMOTION_BASELINE")
   current_non_candidate=$(jq -cS --argjson reachable "$reachable_json" '
-    [.versions[] as $row | select(($reachable | index($row.digest)) == null)] |
+    [.versions[] | . as $row |
+      select(($reachable | index($row.digest)) == null)] |
     sort_by(.id,.digest)
   ' "$INVENTORY_FILE")
   [ "$baseline_non_candidate" = "$current_non_candidate" ] ||
@@ -381,9 +395,11 @@ if [ "$PROMOTION" = true ]; then
     fail "promotion candidate intersects protected state"
   jq -e --arg subject "$SUBJECT_DIGEST" --arg marker "$MARKER" \
     --arg alias "$CANDIDATE_ALIAS" --argjson reachable "$reachable_json" '
-    all(.versions[] as $row | select(($reachable | index($row.digest)) != null);
-      if $row.digest == $subject then $row.tags == [$alias]
-      else all($row.tags[]; . == $marker)
+    all(
+      [.versions[] | . as $row |
+        select(any($reachable[]; . == $row.digest))][]?;
+      if .digest == $subject then .tags == [$alias]
+      else all(.tags[]; . == $marker)
       end)
   ' "$INVENTORY_FILE" >/dev/null ||
     fail "promotion candidate has an unexpected alias or marker"
@@ -451,6 +467,12 @@ validate_node() {
           application/vnd.oci.image.index.v1+json) ;;
           *) fail "nested OCI child media type is foreign" ;;
         esac
+        if [ "$PENDING_ON_MISSING_SIGNATURE" = true ] &&
+           [ "$REQUIRE_SIGNATURE" = true ] &&
+           ! jq -e --arg child "$child" \
+             'any(.versions[]; .digest == $child)' "$INVENTORY_FILE" >/dev/null; then
+          return 75
+        fi
         child_allow=$allow_inherited
         [ -n "$declared_subject" ] && child_allow=1
         validate_node "$child" "${declared_subject:-$inherited_subject}" \
@@ -591,6 +613,9 @@ while IFS= read -r digest; do
 done <"$INVENTORY_DIGESTS"
 
 if [ "$REQUIRE_SIGNATURE" = true ] && [ "$SIGNATURE_FOUND" -ne 1 ]; then
+  if [ "$PENDING_ON_MISSING_SIGNATURE" = true ]; then
+    exit 75
+  fi
   fail "required subject-bound OCI signature node is missing"
 fi
 

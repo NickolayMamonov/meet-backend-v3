@@ -106,6 +106,9 @@ safe_directory "$OUTPUT_DIR" || usage
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 NORMALIZE="$SCRIPT_DIR/normalize-ghcr-package-inventory.sh"
+[ -x "$SCRIPT_DIR/verify-oci-referrer-closure.sh" ] ||
+  fail "OCI referrer closure verifier is unavailable"
+CLOSURE="$SCRIPT_DIR/verify-oci-referrer-closure.sh"
 [ -x "$NORMALIZE" ] || fail "package inventory normalizer is unavailable"
 
 INDEX_SIZE=$(wc -c <"$INDEX_FILE" | tr -d '[:space:]')
@@ -275,9 +278,12 @@ REGISTRY_OUTPUT="$PHASE_DIR/registry-inventory.json"
   fail "final inventory output already exists"
 
 baseline_rows=$(jq -c '
-  [.[][] | {id, digest:.name, tags:.metadata.container.tags} as $row |
-    select(($candidate | index($row.digest)) == null and
-      (any($row.tags[]; . == $marker) | not)) | $row] |
+  [.[][] |
+    .name as $digest |
+    .metadata.container.tags as $tags |
+    {id, digest:$digest, tags:$tags} |
+    select((any($candidate[]; . == $digest) | not) and
+      (any($tags[]; . == $marker) | not))] |
   sort_by(.id,.digest)
 ' --arg marker "sha256-${SUBJECT_DIGEST#sha256:}" \
   --argjson candidate "$INDEX_DIGESTS" "$BEFORE_INVENTORY" | tr -d '\r') ||
@@ -329,9 +335,12 @@ evaluate_snapshot() {
   # full before snapshot is compared, so a writer or page-mixing mutation is
   # terminal rather than a reason to retry.
   current_non_candidate=$(jq -c --argjson candidate "$INDEX_DIGESTS" '
-    [.[][] | {id, digest:.name, tags:.metadata.container.tags} as $row |
-      select(($candidate | index($row.digest)) == null and
-        (any($row.tags[]; . == $marker) | not)) | $row] |
+    [.[][] |
+      .name as $digest |
+      .metadata.container.tags as $tags |
+      {id, digest:$digest, tags:$tags} |
+      select((any($candidate[]; . == $digest) | not) and
+        (any($tags[]; . == $marker) | not))] |
       sort_by(.id,.digest)
   ' --arg marker "sha256-${SUBJECT_DIGEST#sha256:}" "$current" | tr -d '\r') ||
     fail "fresh inventory projection failed"
@@ -390,6 +399,36 @@ evaluate_snapshot() {
     is_digest "$marker_digest" || fail "subject marker digest is malformed"
   fi
 
+  if [ "$REQUIRE_SIGNATURE" = true ]; then
+    [ "$marker_count" -eq 1 ] || return 75
+    normalized=$PHASE_DIR/.signature-readiness.json
+    "$NORMALIZE" \
+      --package-versions-file "$current" \
+      --digest "$SUBJECT_DIGEST" \
+      --output "$normalized" >/dev/null ||
+      fail "signature readiness inventory normalization failed"
+    set +e
+    timeout --kill-after=2s 30s "$CLOSURE" \
+      --image "$IMAGE" \
+      --index-file "$INDEX_FILE" \
+      --inventory-file "$current" \
+      --subject-digest "$SUBJECT_DIGEST" \
+      --platform-subject "$PLATFORM_SUBJECT" \
+      --promotion-baseline-file "$BEFORE_INVENTORY" \
+      --protected-state-file "$PROTECTED_STATE" \
+      --candidate-alias "$ALIAS" \
+      --require-signature true \
+      --pending-on-missing-signature >/dev/null
+    closure_status=$?
+    set -e
+    rm -f -- "$normalized"
+    case "$closure_status" in
+      0) ;;
+      75) return 75 ;;
+      *) return "$closure_status" ;;
+    esac
+  fi
+
   # Child package rows may carry only the OCI subject marker.  Ordinary
   # release aliases on a child are an unexpected mutation.
   jq -e \
@@ -408,11 +447,6 @@ evaluate_snapshot() {
     )
   ' "$current" >/dev/null ||
     fail "candidate child carries an unexpected alias"
-
-  # A signature may be reachable only through the package's subject marker
-  # and a nested OCI index.  Top-level marker counts cannot establish
-  # readiness; verify-oci-referrer-closure.sh performs the authoritative
-  # subject-bound graph traversal after this snapshot is collected.
 
   # Package rows for a marker are part of the candidate projection even when
   # the marker index itself is not a child of the selected root index.

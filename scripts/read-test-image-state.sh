@@ -138,11 +138,15 @@ read_package_inventory() {
       all($rows[]; type == "object" and
         (.id | type == "number" and floor == . and . > 0) and
         (.name | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
-        ((.metadata.container.tags // []) | type == "array" and
+        (.metadata | type == "object") and
+        (.metadata.container | type == "object") and
+        (.metadata.container.tags | type == "array" and
           all(.[]; type == "string" and length > 0) and
           (unique | length == length))) and
       ([$rows[].id] | unique | length == ($rows | length)) and
-      ([$rows[].name] | unique | length == ($rows | length)))
+      ([$rows[].name] | unique | length == ($rows | length)) and
+      ([$rows[].metadata.container.tags[]] | unique | length ==
+        ([$rows[].metadata.container.tags[]] | length)))
   ' "$file" >/dev/null || fail "package inventory is malformed"
   jq -c 'add' "$file"
 }
@@ -150,7 +154,7 @@ read_package_inventory() {
 alias_rows() {
   local inventory=$1
   jq -c --arg alias "$alias" \
-    '[.[] | select(any((.metadata.container.tags // [])[]?; . == $alias))]' \
+    '[.[] | select(any(.metadata.container.tags[]; . == $alias))]' \
     <<<"$inventory"
 }
 
