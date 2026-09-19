@@ -379,6 +379,7 @@ run_publish_fragment() {
       TREE_ID=abcdefabcdefabcdefabcdefabcdefabcdefabcd \
       VERSION=1.2.3 \
       IMAGE="$IMAGE" \
+      mode=published \
       GITHUB_RUN_ID=35354750679 \
       GITHUB_RUN_ATTEMPT=2 \
       GITHUB_REPOSITORY=NickolayMamonov/meet-backend-v3 \
