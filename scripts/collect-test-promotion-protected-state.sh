@@ -378,6 +378,277 @@ normalize_modern_attestation_predicates() {
   ' "$manifest"
 }
 
+manifest_observation_from_raw() {
+  local manifest=$1 digest=$2 media_type=$3 size=$4
+  jq -cS --arg digest "$digest" --arg mediaType "$media_type" \
+    --argjson size "$size" '
+    def valid_digest:
+      type == "string" and test("^sha256:[0-9a-f]{64}$");
+    def scalar_fact($value):
+      {state:"complete",value:$value};
+    def set_fact($values):
+      {state:"complete",values:($values | unique | sort)};
+    if type != "object" or .schemaVersion != 2 then
+      error("raw manifest shape is malformed")
+    elif (($digest | valid_digest) | not) or
+         ($mediaType | type != "string" or length == 0) or
+         ($size | type != "number" or floor != . or . <= 0) then
+      error("raw manifest identity is malformed")
+    elif (has("subject") and .subject != null and
+          (.subject | type) != "object") then
+      error("raw manifest subject is malformed")
+    elif (.subject? != null and
+          ((.subject.digest? | valid_digest) | not)) then
+      error("raw manifest subject digest is malformed")
+    elif (has("artifactType") and .artifactType != null and
+          (.artifactType | type != "string" or length == 0)) then
+      error("raw manifest artifact type is malformed")
+    elif (.manifests? != null and
+          ((.manifests | type) != "array" or
+           any(.manifests[]; type != "object" or
+             ((.digest | valid_digest) | not)))) then
+      error("raw manifest children are malformed")
+    elif (.layers? != null and (.layers | type) != "array") then
+      error("raw manifest layers are malformed")
+    elif (.layers? != null and any(.layers[];
+          type != "object" or
+          (.annotations? != null and
+           (.annotations | type) != "object") or
+          ((.annotations? // {})["in-toto.io/predicate-type"]? != null and
+           ((((.annotations? // {})["in-toto.io/predicate-type"] | type) !=
+              "string") or
+            (((.annotations? // {})["in-toto.io/predicate-type"] | length) ==
+              0))))) then
+      error("raw manifest predicates are malformed")
+    else
+      {
+        digest:$digest,
+        mediaType:$mediaType,
+        size:$size,
+        facts:{
+          subjectDigest:scalar_fact(
+            if .subject? == null then null else .subject.digest end),
+          artifactType:scalar_fact(.artifactType? // null),
+          predicateTypes:set_fact([
+            .layers[]?.annotations["in-toto.io/predicate-type"]?
+            | select(type == "string" and length > 0)
+          ]),
+          children:set_fact([.manifests[]?.digest])
+        }
+      }
+    end
+  ' "$manifest"
+}
+
+manifest_observation_from_descriptor() {
+  local descriptor=$1
+  jq -cS '
+    def valid_digest:
+      type == "string" and test("^sha256:[0-9a-f]{64}$");
+    def unknown:
+      {state:"unknown"};
+    def positive_scalar($value):
+      if ($value | type) == "string" and ($value | length) > 0 then
+        {state:"positive",value:$value}
+      else
+        error("contextual scalar fact is malformed")
+      end;
+    def partial_set($values):
+      if ($values | type) != "array" or
+         any($values[]; type != "string" or length == 0) then
+        error("contextual set fact is malformed")
+      else
+        {state:"partial",values:($values | unique | sort)}
+      end;
+    if type != "object" or
+       (.digest | valid_digest | not) or
+       (.mediaType | type != "string" or length == 0) or
+       (.size | type != "number" or floor != . or . <= 0) then
+      error("contextual descriptor is malformed")
+    elif (has("subjectDigest") and .subjectDigest != null and
+          (.subjectDigest | valid_digest | not)) then
+      error("contextual subject digest is malformed")
+    elif (has("artifactType") and .artifactType != null and
+          (.artifactType | type != "string" or length == 0)) then
+      error("contextual artifact type is malformed")
+    elif (has("predicateTypes") and .predicateTypes != null and
+          (.predicateTypes | type != "array" or
+           any(.[]; type != "string" or length == 0))) then
+      error("contextual predicate types are malformed")
+    elif (has("children") and .children != null and
+          (.children | type != "array" or
+           any(.[]; valid_digest | not))) then
+      error("contextual children are malformed")
+    else
+      {
+        digest,
+        mediaType,
+        size,
+        facts:{
+          subjectDigest:
+            if (.subjectDigest? // null) == null then unknown
+            else positive_scalar(.subjectDigest) end,
+          artifactType:
+            if (.artifactType? // null) == null then unknown
+            else positive_scalar(.artifactType) end,
+          predicateTypes:
+            if (.predicateTypes? // null) == null or
+               (.predicateTypes | length) == 0 then unknown
+            else partial_set(.predicateTypes) end,
+          children:
+            if (.children? // null) == null or
+               (.children | length) == 0 then unknown
+            else partial_set(.children) end
+        }
+      }
+    end
+  ' <<<"$descriptor"
+}
+
+canonicalize_manifest_observations() {
+  local observations=$1
+  jq -csS '
+    def valid_digest:
+      type == "string" and test("^sha256:[0-9a-f]{64}$");
+    def normalize_set($values):
+      if ($values | type) != "array" or
+         any($values[]; type != "string" or length == 0) then
+        error("manifest observation set is malformed")
+      else
+        $values | unique | sort
+      end;
+    def nonempty_string($value):
+      ($value | type) == "string" and ($value | length) > 0;
+    def validate_scalar_fact:
+      . as $fact |
+      if ($fact | type) != "object" or
+         ($fact.state | type) != "string" then
+        error("manifest observation scalar fact is malformed")
+      elif $fact.state == "unknown" and
+           (($fact | has("value")) or ($fact | has("values"))) then
+        error("manifest observation unknown scalar fact has a value")
+      elif $fact.state == "positive" and
+           ((nonempty_string($fact.value) | not) or
+            ($fact | has("values"))) then
+        error("manifest observation positive scalar fact is malformed")
+      elif $fact.state == "complete" and
+           (($fact | has("value") | not) or
+            ($fact.value != null and
+             (nonempty_string($fact.value) | not))) then
+        error("manifest observation complete scalar fact is malformed")
+      elif $fact.state == "positive" or $fact.state == "complete" then
+        .
+      elif $fact.state == "unknown" then
+        .
+      else
+        error("manifest observation scalar state is unsupported")
+      end;
+    def validate_set_fact:
+      . as $fact |
+      if ($fact | type) != "object" or
+         ($fact.state | type) != "string" then
+        error("manifest observation set fact is malformed")
+      elif $fact.state == "unknown" and ($fact | has("values")) then
+        error("manifest observation unknown set fact has values")
+      elif ($fact.state == "partial" or $fact.state == "complete") and
+           ($fact | has("values") | not) then
+        error("manifest observation set fact has no values")
+      elif $fact.state == "partial" or $fact.state == "complete" then
+        $fact.values = normalize_set($fact.values)
+      elif $fact.state == "unknown" then
+        .
+      else
+        error("manifest observation set state is unsupported")
+      end;
+    def validate_observation:
+      if type != "object" or
+         (.digest | valid_digest | not) or
+         (.mediaType | type != "string" or length == 0) or
+         (.size | type != "number" or floor != . or . <= 0) or
+         (.facts | type != "object") then
+        error("manifest observation identity is malformed")
+      elif (
+        (.facts.subjectDigest | validate_scalar_fact) and
+        (.facts.artifactType | validate_scalar_fact) and
+        (.facts.predicateTypes | validate_set_fact) and
+        (.facts.children | validate_set_fact)
+      ) then
+        .
+      else
+        error("manifest observation facts are malformed")
+      end;
+    def conflict($digest;$field):
+      error("manifest observation conflict: \($digest) \($field)");
+    def scalar_facts($rows;$name):
+      [$rows[].facts[$name]];
+    def positive_values($rows;$name):
+      [scalar_facts($rows;$name)[] |
+        select(.state == "positive") | .value];
+    def complete_values($rows;$name):
+      [scalar_facts($rows;$name)[] |
+        select(.state == "complete") | .value];
+    def scalar_result($rows;$digest;$name):
+      (positive_values($rows;$name) | unique) as $positive |
+      (complete_values($rows;$name) | unique) as $complete |
+      if ($positive | length) > 1 or ($complete | length) > 1 or
+         (($complete | index(null)) != null and ($positive | length) > 0) or
+         (($complete | length) == 1 and $complete[0] != null and
+          ($positive | length) > 0 and $positive[0] != $complete[0]) then
+        conflict($digest;$name)
+      elif ($complete | length) == 1 then
+        $complete[0]
+      else
+        error("manifest observation unresolved: \($digest) \($name)")
+      end;
+    def set_facts($rows;$name):
+      [$rows[].facts[$name]];
+    def partial_values($rows;$name):
+      [set_facts($rows;$name)[] |
+        select(.state == "partial") | .values];
+    def complete_sets($rows;$name):
+      [set_facts($rows;$name)[] |
+        select(.state == "complete") | .values];
+    def union_sets($sets):
+      reduce $sets[] as $set ([]; . + $set) | unique | sort;
+    def set_result($rows;$digest;$name):
+      (partial_values($rows;$name)) as $partial |
+      (complete_sets($rows;$name) | map(unique | sort) | unique) as $complete |
+      if ($complete | length) > 1 then
+        conflict($digest;$name)
+      elif ($complete | length) == 1 and
+           any($partial[]; . as $part |
+             any($part[]; . as $value |
+               (($complete[0] | index($value)) == null))) then
+        conflict($digest;$name)
+      elif ($complete | length) == 1 then
+        $complete[0]
+      else
+        error("manifest observation unresolved: \($digest) \($name)")
+      end;
+    (map(validate_observation) | group_by(.digest) |
+      map(
+        . as $rows |
+        $rows[0].digest as $digest |
+        if any($rows[]; .mediaType != $rows[0].mediaType) then
+          conflict($digest;"mediaType")
+        elif any($rows[]; .size != $rows[0].size) then
+          conflict($digest;"size")
+        else
+          {
+            digest:$digest,
+            mediaType:$rows[0].mediaType,
+            size:$rows[0].size,
+            subjectDigest:scalar_result($rows;$digest;"subjectDigest"),
+            artifactType:scalar_result($rows;$digest;"artifactType"),
+            predicateTypes:set_result($rows;$digest;"predicateTypes"),
+            children:set_result($rows;$digest;"children")
+          }
+        end
+      ) |
+      sort_by(.digest))
+  ' "$observations"
+}
+
 main() {
 repository=
 image=
@@ -629,11 +900,9 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
         "$tmp/releases-normalized.json")
       collect_verified_attestations "$digest" "$release_source" "$selection"
     fi
-    jq -cnS --arg digest "$digest" --arg mediaType "$media_type" \
-      --argjson size "$manifest_size" \
-      --argjson children "$(jq '[.manifests[] | .digest]' "$raw")" \
-      '{digest:$digest,mediaType:$mediaType,size:$size,subjectDigest:null,
-        artifactType:null,predicateTypes:[],children:$children}' >>"$tmp/manifests.jsonl"
+    manifest_observation_from_raw "$raw" "$digest" "$media_type" "$manifest_size" \
+      >>"$tmp/manifests.jsonl" ||
+      fail "registry image index observation construction failed for $digest"
     while IFS= read -r descriptor; do
       child_digest=$(jq -r '.digest' <<<"$descriptor")
       ! is_retired_digest "$child_digest" ||
@@ -642,6 +911,10 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
       child_size=$(jq -r '.size' <<<"$descriptor")
       child_raw="$tmp/raw-${child_digest#sha256:}.json"
       read_raw_manifest "$child_digest" "$child_raw" "$child_media" "$child_size"
+      manifest_observation_from_raw \
+        "$child_raw" "$child_digest" "$child_media" "$child_size" \
+        >>"$tmp/manifests.jsonl" ||
+        fail "registry child observation construction failed for $child_digest"
       if [ "$release_id" -gt 0 ] &&
          jq -e '
            .platform.os == "linux" and
@@ -679,19 +952,18 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
           fail "attestation artifact type is missing for $child_digest"
         [ "$(jq length <<<"$predicate_types")" -gt 0 ] ||
           fail "attestation predicate binding is missing for $child_digest"
-        jq -cnS --arg digest "$child_digest" --arg mediaType "$child_media" \
+        contextual_descriptor=$(jq -cnS \
+          --arg digest "$child_digest" --arg mediaType "$child_media" \
           --argjson size "$child_size" \
           --arg subjectDigest "$descriptor_subject" \
           --arg artifactType "$artifact_type" \
           --argjson predicateTypes "$predicate_types" \
           '{digest:$digest,mediaType:$mediaType,size:$size,
             subjectDigest:$subjectDigest,artifactType:$artifactType,
-            predicateTypes:$predicateTypes,children:[]}' >>"$tmp/manifests.jsonl"
-      else
-        jq -cnS --arg digest "$child_digest" --arg mediaType "$child_media" \
-          --argjson size "$child_size" \
-          '{digest:$digest,mediaType:$mediaType,size:$size,subjectDigest:null,
-            artifactType:null,predicateTypes:[],children:[]}' >>"$tmp/manifests.jsonl"
+            predicateTypes:$predicateTypes}')
+        manifest_observation_from_descriptor "$contextual_descriptor" \
+          >>"$tmp/manifests.jsonl" ||
+          fail "attestation observation construction failed for $child_digest"
       fi
     done < <(jq -c '.manifests[]' "$raw")
   else
@@ -712,19 +984,10 @@ release_record=$(jq -c --argjson id "$release_id" '.[]|select(.id==$id)|{id,tag:
         continue
       fi
       validate_digest "$subject_digest"
-      jq -cnS --arg digest "$digest" --arg mediaType "$media_type" \
-        --argjson size "$manifest_size" --arg subjectDigest "$subject_digest" \
-        --arg artifactType "$artifact_type" \
-        --argjson predicateTypes "$predicate_types" \
-        '{digest:$digest,mediaType:$mediaType,size:$size,
-          subjectDigest:$subjectDigest,artifactType:$artifactType,
-          predicateTypes:$predicateTypes,children:[]}' >>"$tmp/manifests.jsonl"
-    else
-      jq -cnS --arg digest "$digest" --arg mediaType "$media_type" \
-        --argjson size "$manifest_size" \
-        '{digest:$digest,mediaType:$mediaType,size:$size,subjectDigest:null,
-          artifactType:null,predicateTypes:[],children:[]}' >>"$tmp/manifests.jsonl"
     fi
+    manifest_observation_from_raw "$raw" "$digest" "$media_type" "$manifest_size" \
+      >>"$tmp/manifests.jsonl" ||
+      fail "registry manifest observation construction failed for $digest"
   fi
 done < <(jq -r '.[] | [.id,.digest,(.tags | @json)] | @tsv' "$tmp/versions.json")
 
@@ -735,12 +998,7 @@ jq -sS '
   sort_by(.digest)
 ' "$tmp/subjects.jsonl" >"$tmp/subjects.json" ||
   fail "registry subject bindings conflict"
-jq -sS '
-  group_by(.digest) |
-  map(if (unique | length) == 1 then .[0]
-      else error("conflicting registry manifest descriptors") end) |
-  sort_by(.digest)
-' "$tmp/manifests.jsonl" >"$tmp/manifests.json" ||
+canonicalize_manifest_observations "$tmp/manifests.jsonl" >"$tmp/manifests.json" ||
   fail "registry manifest descriptors conflict"
 jq -e --slurpfile manifests "$tmp/manifests.json" '
   [.[] as $version |
