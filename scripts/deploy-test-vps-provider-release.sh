@@ -156,10 +156,139 @@ runtime_release_field_bounded() {
   ' _ "$runtime_helper" "$root" "$1"
 }
 
+configuration_file_identity() {
+  timeout 30s python3 - "$1" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    if os.path.islink(path):
+        raise OSError(40, "symlink")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(1)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise SystemExit(1)
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    print(
+        f"{info.st_dev}:{info.st_ino}:{info.st_mode}:{info.st_uid}:"
+        f"{info.st_gid}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}:"
+        f"{digest.hexdigest()}"
+    )
+finally:
+    os.close(fd)
+PY
+}
+
+snapshot_configuration() {
+  local source snapshot identity
+  for source in "$root/.env.production" "$base_compose"; do
+    case "$source" in
+      "$root/.env.production") snapshot="$state/config.env.production" ;;
+      "$base_compose") snapshot="$state/config.base-compose.yml" ;;
+      *) fail "PROVIDER_STATE_INVALID" ;;
+    esac
+    identity=$(configuration_file_identity "$source") ||
+      fail "PROVIDER_STATE_INVALID"
+    timeout 30s install -m 600 "$source" "$snapshot" ||
+      fail "PROVIDER_STATE_INVALID"
+    cmp -s "$source" "$snapshot" ||
+      fail "PROVIDER_STATE_INVALID"
+    [ "$(configuration_file_identity "$source")" = "$identity" ] ||
+      fail "PROVIDER_STATE_INVALID"
+    printf '%s\n' "$identity" >"$snapshot.identity"
+    chmod 600 "$snapshot.identity"
+  done
+}
+
+validate_configuration_boundary() {
+  local expected_env=$1
+  local source expected expected_identity expected_value
+  [ -f "$expected_env" ] && [ ! -L "$expected_env" ] ||
+    fail "PROVIDER_STATE_INVALID"
+  for source in "$root/.env.production" "$base_compose"; do
+    case "$source" in
+      "$root/.env.production")
+        expected=$expected_env
+        case "$expected_env" in
+          "$state/config.env.production") expected_identity="$state/config.env.production.identity" ;;
+          "$state/config.env.target") expected_identity="$state/config.env.target.identity" ;;
+          "$state/config.env.previous") expected_identity="$state/config.env.previous.identity" ;;
+          *) fail "PROVIDER_STATE_INVALID" ;;
+        esac
+        ;;
+      "$base_compose")
+        expected="$state/config.base-compose.yml"
+        expected_identity="$state/config.base-compose.yml.identity"
+        ;;
+      *) fail "PROVIDER_STATE_INVALID" ;;
+    esac
+    cmp -s "$source" "$expected" ||
+      fail "PROVIDER_STATE_INVALID"
+    [ -s "$expected_identity" ] ||
+      fail "PROVIDER_STATE_INVALID"
+    expected_value=$(<"$expected_identity")
+    [ "$(configuration_file_identity "$source")" = "$expected_value" ] ||
+      fail "PROVIDER_STATE_INVALID"
+  done
+}
+
+make_environment_candidate() {
+  timeout 30s python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+source, destination, image, revision, version = sys.argv[1:]
+data = pathlib.Path(source).read_bytes().decode("utf-8")
+replacements = {
+    "BACKEND_IMAGE": image,
+    "BACKEND_REVISION": revision,
+    "BACKEND_VERSION": version,
+}
+seen = set()
+lines = []
+for line in data.splitlines(keepends=True):
+    match = re.match(r"^(BACKEND_IMAGE|BACKEND_REVISION|BACKEND_VERSION)=", line)
+    if match:
+        key = match.group(1)
+        if key in seen:
+            raise SystemExit(1)
+        seen.add(key)
+        newline = "\n" if line.endswith("\n") else ""
+        lines.append(replacements[key] + newline)
+    else:
+        lines.append(line)
+if seen != set(replacements):
+    raise SystemExit(1)
+path = pathlib.Path(destination)
+fd = os.open(
+    path,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+try:
+    os.write(fd, "".join(lines).encode("utf-8"))
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
 active_file_identity() {
   local file=$1
-  [ -f "$file" ] && [ ! -L "$file" ] || return 1
-  timeout 10s stat -Lc '%d:%i:%s:%u:%g:%a:%Y:%Z:%y:%z' "$file"
+  configuration_file_identity "$file"
 }
 
 snapshot_active_file() {
@@ -213,6 +342,9 @@ record_candidate_active_file() {
   local identity
   [ -f "$file" ] && [ ! -L "$file" ] ||
     fail "RECOVERY_REQUIRED"
+  timeout 30s install -m 600 "$file" \
+    "$state/candidate-active-$name.yml" ||
+    fail "RECOVERY_REQUIRED"
   identity=$(active_file_identity "$file") || fail "RECOVERY_REQUIRED"
   printf '%s\n' "$identity" >"$state/candidate-active-$name.identity"
 }
@@ -220,33 +352,144 @@ record_candidate_active_file() {
 restore_active_file() {
   local file=$1
   local name=$2
-  local previous candidate actual
-  if [ -e "$state/had-active-$name" ]; then
-    previous=$(<"$state/previous-active-$name.identity")
-    actual=$(active_file_identity "$file") || fail "RECOVERY_REQUIRED"
-    if [ "$actual" = "$previous" ]; then
-      cmp -s "$file" "$state/previous-active-$name.yml" ||
-        fail "RECOVERY_REQUIRED"
-      return
-    fi
-    [ -s "$state/candidate-active-$name.identity" ] ||
-      fail "RECOVERY_REQUIRED"
-    candidate=$(<"$state/candidate-active-$name.identity")
-    [ "$actual" = "$candidate" ] || fail "RECOVERY_REQUIRED"
-    timeout 30s install -m 600 "$state/previous-active-$name.yml" "$file" ||
-      fail "RECOVERY_REQUIRED"
-    cmp -s "$file" "$state/previous-active-$name.yml" ||
-      fail "RECOVERY_REQUIRED"
-  else
-    if [ -e "$file" ] || [ -L "$file" ]; then
-      [ -s "$state/candidate-active-$name.identity" ] ||
-        fail "RECOVERY_REQUIRED"
-      candidate=$(<"$state/candidate-active-$name.identity")
-      actual=$(active_file_identity "$file") || fail "RECOVERY_REQUIRED"
-      [ "$actual" = "$candidate" ] || fail "RECOVERY_REQUIRED"
-      timeout 30s rm -f -- "$file" || fail "RECOVERY_REQUIRED"
-    fi
-    [ ! -e "$file" ] && [ ! -L "$file" ] || fail "RECOVERY_REQUIRED"
+  if ! timeout 30s python3 - "$file" "$state" "$name" <<'PY'
+import fcntl
+import hashlib
+import os
+import stat
+import sys
+
+file_path, state, name = sys.argv[1:]
+parent, basename = os.path.split(file_path)
+if not parent or not basename or "/" in basename:
+    raise SystemExit(1)
+
+def read_private(path):
+    if os.path.islink(path):
+        raise SystemExit(1)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        return os.read(fd, 1024 * 1024 * 16)
+    finally:
+        os.close(fd)
+
+def identity(fd):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise SystemExit(1)
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < info.st_size:
+        chunk = os.pread(fd, min(1024 * 1024, info.st_size - offset), offset)
+        if not chunk:
+            raise SystemExit(1)
+        digest.update(chunk)
+        offset += len(chunk)
+    return (
+        f"{info.st_dev}:{info.st_ino}:{info.st_mode}:{info.st_uid}:"
+        f"{info.st_gid}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}:"
+        f"{digest.hexdigest()}"
+    )
+
+def open_current(directory_fd):
+    info = os.stat(basename, dir_fd=directory_fd, follow_symlinks=False)
+    if stat.S_ISLNK(info.st_mode):
+        raise OSError(40, "symlink")
+    return os.open(
+        basename,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+
+parent_fd = os.open(
+    parent,
+    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    fcntl.flock(parent_fd, fcntl.LOCK_EX)
+    previous_exists = os.path.exists(os.path.join(state, f"had-active-{name}"))
+    previous_bytes = read_private(
+        os.path.join(state, f"previous-active-{name}.yml")
+    ) if previous_exists else b""
+    candidate_identity_path = os.path.join(
+        state, f"candidate-active-{name}.identity"
+    )
+    candidate_bytes_path = os.path.join(state, f"candidate-active-{name}.yml")
+    candidate_identity = read_private(candidate_identity_path).decode().strip() \
+        if os.path.exists(candidate_identity_path) else ""
+    candidate_bytes = read_private(candidate_bytes_path) \
+        if os.path.exists(candidate_bytes_path) else b""
+
+    try:
+        current_fd = open_current(parent_fd)
+    except FileNotFoundError:
+        current_fd = None
+    if previous_exists:
+        if current_fd is None:
+            raise SystemExit(1)
+        try:
+            current_identity = identity(current_fd)
+            os.lseek(current_fd, 0, os.SEEK_SET)
+            current_bytes = os.read(current_fd, 16 * 1024 * 1024)
+        finally:
+            os.close(current_fd)
+        if current_identity == read_private(
+            os.path.join(state, f"previous-active-{name}.identity")
+        ).decode().strip():
+            if current_bytes != previous_bytes:
+                raise SystemExit(1)
+            raise SystemExit(0)
+        if not candidate_identity or current_identity != candidate_identity:
+            raise SystemExit(1)
+        if current_bytes != candidate_bytes:
+            raise SystemExit(1)
+        replacement = previous_bytes
+    else:
+        if current_fd is None:
+            raise SystemExit(0)
+        try:
+            current_identity = identity(current_fd)
+            os.lseek(current_fd, 0, os.SEEK_SET)
+            current_bytes = os.read(current_fd, 16 * 1024 * 1024)
+        finally:
+            os.close(current_fd)
+        if not candidate_identity or current_identity != candidate_identity:
+            raise SystemExit(1)
+        if current_bytes != candidate_bytes:
+            raise SystemExit(1)
+        os.unlink(basename, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        raise SystemExit(0)
+
+    temporary = f".{basename}.rollback.{os.getpid()}"
+    temp_fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=parent_fd,
+    )
+    try:
+        view = memoryview(replacement)
+        while view:
+            written = os.write(temp_fd, view)
+            view = view[written:]
+        os.fsync(temp_fd)
+        os.fchmod(temp_fd, 0o600)
+    finally:
+        os.close(temp_fd)
+    os.replace(
+        temporary,
+        basename,
+        src_dir_fd=parent_fd,
+        dst_dir_fd=parent_fd,
+    )
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+  then
+    echo "RECOVERY_REQUIRED" >&2
+    return 1
   fi
 }
 
@@ -406,6 +649,8 @@ timeout 30s python3 "$provider_helper" retention-check \
 
 [ ! -e "$state" ] || fail "run state already exists"
 install -d -m 700 "$state"
+snapshot_configuration
+validate_configuration_boundary "$state/config.env.production"
 
 compose() {
   timeout 30s bash -c '
@@ -725,8 +970,9 @@ chmod 600 "$state/target-runtime.override.yml"
 target_config=$(
   env -i PATH="$PATH" HOME=/root COMPOSE_PROJECT_NAME=meet-production \
     BACKEND_IMAGE="$image" BACKEND_VERSION="$version" BACKEND_REVISION="$revision" \
-    timeout 30s docker compose --project-directory "$root" --env-file "$root/.env.production" \
-    -f "$base_compose" -f "$state/target-runtime.override.yml" \
+    timeout 30s docker compose --project-directory "$root" \
+    --env-file "$state/config.env.production" \
+    -f "$state/config.base-compose.yml" -f "$state/target-runtime.override.yml" \
     config --format json 2>/dev/null
 ) || fail "PROVIDER_STATE_INVALID"
 target_image_inspect=$(docker_image_inspect "$image" 2>/dev/null) ||
@@ -777,6 +1023,13 @@ printf '%s\n%s\n%s\n' "$previous_inspect" "$target_image_inspect" "$target_confi
       tuple($previous).APP_PUSH_MAINTENANCE_ENABLED == "false")
   ' >/dev/null 2>&1 || fail "PROVIDER_STATE_INVALID"
 
+make_environment_candidate "$state/config.env.production" \
+  "$state/config.env.target" "$image" "$revision" "$version" ||
+  fail "PROVIDER_STATE_INVALID"
+make_environment_candidate "$state/config.env.production" \
+  "$state/config.env.previous" "$previous_image" "$previous_revision" \
+  "$previous_version" || fail "PROVIDER_STATE_INVALID"
+
 write_provider_marker preparing none
 printf '%s' "$previous_inspect" |
   timeout 30s python3 "$provider_helper" prepare \
@@ -811,11 +1064,19 @@ restore_previous_active_files() {
 rollback() {
   recovery_started_at=$SECONDS
   recovery_deadline_check
+  validate_configuration_boundary "$state/config.env.target"
   write_provider_marker rolling-back "${durable_disposition:-none}"
   restore_previous_active_files
+  validate_configuration_boundary "$state/config.env.target"
   PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
     timeout 60s "$update_script" "$previous_image" "$previous_revision" "$previous_version" \
     >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
+  cmp -s "$root/.env.production" "$state/config.env.previous" ||
+    fail "RECOVERY_REQUIRED"
+  printf '%s\n' "$(configuration_file_identity "$root/.env.production")" \
+    >"$state/config.env.previous.identity"
+  chmod 600 "$state/config.env.previous.identity"
+  validate_configuration_boundary "$state/config.env.previous"
   compose_up -d --no-deps --no-build --pull never --force-recreate \
     --wait --wait-timeout 180 backend >/dev/null
   recovery_deadline_check
@@ -857,17 +1118,27 @@ verify_predecessor_before_writers() {
 
 validate_active_files_before_writers
 verify_predecessor_before_writers
+validate_configuration_boundary "$state/config.env.production"
 write_provider_marker applying "$durable_disposition"
 mutation_started=true
-timeout 30s install -m 600 "$base_compose" "$active_compose" ||
+validate_configuration_boundary "$state/config.env.production"
+timeout 30s install -m 600 "$state/config.base-compose.yml" "$active_compose" ||
   fail "PROVIDER_STATE_INVALID"
 record_candidate_active_file "$active_compose" compose
+validate_configuration_boundary "$state/config.env.production"
 timeout 30s install -m 600 "$state/target-runtime.override.yml" "$active_runtime" ||
   fail "PROVIDER_STATE_INVALID"
 record_candidate_active_file "$active_runtime" runtime
+validate_configuration_boundary "$state/config.env.production"
 PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
   timeout 60s "$update_script" "$image" "$revision" "$version" >/dev/null 2>&1 ||
   fail "PROVIDER_STATE_INVALID"
+cmp -s "$root/.env.production" "$state/config.env.target" ||
+  fail "PROVIDER_STATE_INVALID"
+printf '%s\n' "$(configuration_file_identity "$root/.env.production")" \
+  >"$state/config.env.target.identity"
+chmod 600 "$state/config.env.target.identity"
+validate_configuration_boundary "$state/config.env.target"
 compose_up -d --no-deps --no-build --pull never --force-recreate \
   --wait --wait-timeout 180 backend >/dev/null
 candidate_container=$(compose ps -q backend)
@@ -896,6 +1167,7 @@ fi
 
 run_safety_hook final "$image" "$target_id" \
   "$revision" "$version" "$target_hash"
+validate_configuration_boundary "$state/config.env.target"
 provider_finish committed "$candidate_inspect"
 mutation_started=false
 rollback_complete=true

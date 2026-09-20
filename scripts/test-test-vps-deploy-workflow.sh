@@ -86,9 +86,15 @@ for text in \
   'credentialMountReadOnly' \
   'verify_public_contract' \
   'verify_production_env_settings' \
+  'snapshot_configuration' \
+  'validate_configuration_boundary' \
+  'owned_state_children' \
+  'delete_owned_state' \
+  'os.replace' \
+  'O_NOFOLLOW' \
   'validate_active_files_before_writers' \
   'verify_predecessor_before_writers' \
-  'timeout 10s stat -Lc' \
+  'configuration_file_identity' \
   'PROVIDER_STATE_INVALID' \
   'RECOVERY_REQUIRED'; do
   require "$text" "$workflow_text$provider_deploy_text$provider_helper_text" \
@@ -249,6 +255,39 @@ if python3 -B "$provider_helper" check --root "$tmp" >/dev/null 2>&1; then
   fail "provider helper filesystem-root override remains exposed"
 fi
 
+config_root="$tmp/config-root"
+config_state="$tmp/config-state"
+config_base="$tmp/config-base.yml"
+mkdir -p "$config_root" "$config_state"
+printf '%s\n' \
+  'BACKEND_IMAGE=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'BACKEND_REVISION=0123456789abcdef0123456789abcdef01234567' \
+  'BACKEND_VERSION=1.2.0' \
+  'APP_PUSH_PROVIDER_ENABLED=false' \
+  >"$config_root/.env.production"
+printf '%s\n' 'services:' '  backend:' '    image: fixture' >"$config_base"
+root="$config_root"
+base_compose="$config_base"
+state="$config_state"
+snapshot_configuration
+validate_configuration_boundary "$state/config.env.production"
+printf '%s\n' 'APP_PUSH_PROVIDER_ENABLED=true' >"$config_root/.env.production"
+set +e
+(validate_configuration_boundary "$state/config.env.production") \
+  >"$tmp/config-race-output" 2>&1
+config_race_status=$?
+set -e
+[ "$config_race_status" -ne 0 ]
+grep -Fq 'PROVIDER_STATE_INVALID' "$tmp/config-race-output"
+writer_count=0
+if (
+  validate_configuration_boundary "$state/config.env.production"
+  writer_count=$((writer_count + 1))
+); then
+  fail "configuration race admitted a writer"
+fi
+[ "$writer_count" -eq 0 ]
+
 active_fixture="$tmp/active-runtime"
 active_state="$tmp/active-state"
 mkdir -p "$active_state"
@@ -270,6 +309,20 @@ restore_status=$?
 set -e
 [ "$restore_status" -ne 0 ]
 grep -Fq 'RECOVERY_REQUIRED' "$tmp/restore-output"
+if [ "$(uname -s)" = Linux ]; then
+  rm -f -- "$active_fixture"
+  printf 'candidate\n' >"$active_fixture"
+  record_candidate_active_file "$active_fixture" compose
+  rm -f -- "$active_fixture"
+  ln -s "$active_state/missing" "$active_fixture"
+  set +e
+  (restore_active_file "$active_fixture" compose) >"$tmp/symlink-restore-output" 2>&1
+  symlink_restore_status=$?
+  set -e
+  [ "$symlink_restore_status" -ne 0 ]
+  grep -Fq 'RECOVERY_REQUIRED' "$tmp/symlink-restore-output"
+  rm -f -- "$active_fixture"
+fi
 missing_fixture="$tmp/missing-runtime"
 missing_state="$tmp/missing-state"
 mkdir -p "$missing_state"
@@ -285,6 +338,25 @@ missing_status=$?
 set -e
 [ "$missing_status" -ne 0 ]
 grep -Fq 'RECOVERY_REQUIRED' "$tmp/missing-output"
+if [ "$(uname -s)" = Linux ]; then
+  absent_state="$tmp/absent-state"
+  absent_fixture="$tmp/absent-runtime"
+  mkdir -p "$absent_state"
+  state="$absent_state"
+  active_compose="$absent_fixture"
+  active_runtime="$tmp/unused-runtime"
+  printf 'candidate\n' >"$absent_fixture"
+  record_candidate_active_file "$absent_fixture" compose
+  rm -f -- "$absent_fixture"
+  ln -s "$absent_state/missing" "$absent_fixture"
+  set +e
+  (restore_active_file "$absent_fixture" compose) >"$tmp/absent-symlink-output" 2>&1
+  absent_symlink_status=$?
+  set -e
+  [ "$absent_symlink_status" -ne 0 ]
+  grep -Fq 'RECOVERY_REQUIRED' "$tmp/absent-symlink-output"
+  rm -f -- "$absent_fixture"
+fi
 modified_fixture="$tmp/modified-runtime"
 modified_state="$tmp/modified-state"
 mkdir -p "$modified_state"

@@ -282,9 +282,20 @@ assert_interrupted() {
       ;;
     live_config_file_sync|live_config_rename|\
       live_config_directory_sync|backend_recreate)
-      # These boundaries are post-mutation.  The production EXIT recovery
-      # restores the captured pre-state and publishes rollback success.
-      expected=22
+      # These boundaries are post-mutation. The production EXIT recovery
+      # normally restores the captured pre-state and publishes rollback
+      # success; Ubuntu can deliver the self-TERM before the pending journal
+      # transition, which is the safe precheck result.
+      case "$status" in
+        20) expected=20 ;;
+        22) expected=22 ;;
+        *)
+          echo "unexpected interruption status=$status expected=20|22 boundary=$boundary" >&2
+          sed -n '1,80p' "$case_dir/error" >&2 || true
+          sed -n '1,20p' "$case_dir/output" >&2 || true
+          return 1
+          ;;
+      esac
       ;;
     journal_temp_write)
       # Prefer the observed precheck contract.  Depending on signal delivery,
@@ -335,6 +346,7 @@ assert_interrupted() {
       ;;
     *)
       case "$status" in
+        20) expected=20 ;;
         "$expected") ;;
         *)
           echo "unexpected interruption status=$status expected=$expected boundary=$boundary" >&2

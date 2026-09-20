@@ -88,8 +88,28 @@ printf 'services:\n  backend:\n    volumes: []\n' \
 ln -s "$state_root/12-1-final-deploy" "$state_root/13-1-final-deploy"
 install -d -m 700 "$state_root/12-1-final-deploy-shadow"
 install -d -m 700 "$state_root/14-1-final-deploy"
+printf '{"schemaVersion":1,"runKey":"14-1","outcome":"committed","providerEnabled":false}\n' \
+  >"$state_root/14-1-final-deploy/terminal.json"
 printf 'unknown\n' >"$state_root/14-1-final-deploy/unknown.txt"
 touch -d '@1799999980' "$state_root/14-1-final-deploy"
+install -d -m 700 "$state_root/17-1-final-deploy"
+printf '{"schemaVersion":1,"runKey":"17-1","outcome":"committed","providerEnabled":false}\n' \
+  >"$state_root/17-1-final-deploy/terminal.json"
+printf 'unknown-before-race\n' >"$state_root/17-1-final-deploy/unknown-before-race.txt"
+touch -d '@1799999970' "$state_root/17-1-final-deploy"
+
+real_rmdir=$(command -v rmdir)
+cat >"$fake_bin/rmdir" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+path=\${1:-}
+if [ "\${path##*/}" = 17-1-final-deploy ] &&
+  [ ! -e "\$path/concurrent-unknown.txt" ]; then
+  printf 'unknown-concurrent\n' >"\$path/concurrent-unknown.txt"
+fi
+exec "$real_rmdir" "\$@"
+EOF
+chmod 700 "$fake_bin/rmdir"
 
 tooling_root="$production_root/.test-vps-tooling-1-1"
 install -d -m 700 "$tooling_root/scripts"
@@ -105,6 +125,10 @@ PATH="$fake_bin:$PATH" bash "$remote_script" \
 [ -L "$state_root/13-1-final-deploy" ]
 [ -d "$state_root/12-1-final-deploy-shadow" ]
 [ -d "$state_root/14-1-final-deploy" ]
+[ -f "$state_root/14-1-final-deploy/unknown.txt" ]
+[ -d "$state_root/17-1-final-deploy" ]
+[ -f "$state_root/17-1-final-deploy/unknown-before-race.txt" ]
+[ -f "$state_root/17-1-final-deploy/concurrent-unknown.txt" ]
 [ ! -e "$tooling_root" ]
 
 hang_bin="$fixture_root/hang-bin"
