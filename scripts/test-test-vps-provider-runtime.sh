@@ -646,6 +646,86 @@ expect_provider_error(
 )
 helper.os.unlink = original_unlink
 finish_and_remove("cleanup-unlink-race", candidate)
+
+for child in ("identity.json", "snapshot", "publication"):
+    run_key = "cleanup-same-metadata-" + child.replace(".", "-")
+    candidate = prepare_finalizing(run_key)
+    tx = parent / (".transaction-" + run_key)
+    original_witness = helper._child_witness
+    replaced = [False]
+
+    def replace_transaction_child(directory_fd, name, **kwargs):
+        result = original_witness(directory_fd, name, **kwargs)
+        if name == child and not replaced[0]:
+            replacement = fixture / ("replacement-" + run_key)
+            data = (tx / child).read_bytes()
+            info = os.stat(tx / child, follow_symlinks=False)
+            os.unlink(tx / child)
+            replacement.write_bytes(data)
+            os.chown(replacement, info.st_uid, info.st_gid)
+            os.chmod(replacement, stat.S_IMODE(info.st_mode))
+            os.rename(replacement, tx / child)
+            replaced[0] = True
+        return result
+
+    helper._child_witness = replace_transaction_child
+    expect_provider_error(
+        lambda: helper._finish(
+            run_key,
+            str(state),
+            "",
+            "committed",
+            json.dumps(candidate).encode(),
+        ),
+        "RECOVERY_REQUIRED",
+    )
+    helper._child_witness = original_witness
+    assert (tx / child).exists()
+    assert marker.exists()
+    shutil.rmtree(tx)
+    marker.unlink()
+    pathlib.Path(helper.HOST_CREDENTIAL_PATH).unlink(missing_ok=True)
+
+retention_root = fixture / "retention-root"
+retention_root.mkdir(mode=0o700)
+os.chown(retention_root, 0, 0)
+for child in sorted(helper.RETENTION_CHILDREN):
+    retention_state = retention_root / ("77-1-final-deploy-" + child.replace(".", "-"))
+    retention_state.mkdir(mode=0o700)
+    os.chown(retention_state, 0, 0)
+    for state_child in helper.RETENTION_CHILDREN:
+        path = retention_state / state_child
+        path.write_bytes(("retention-" + state_child).encode())
+        os.chown(path, 0, 0)
+        os.chmod(path, 0o600)
+    original_witness = helper._child_witness
+    replaced = [False]
+
+    def replace_retention_child(directory_fd, name, **kwargs):
+        result = original_witness(directory_fd, name, **kwargs)
+        if name == child and not replaced[0]:
+            replacement = fixture / ("retention-replacement-" + child.replace(".", "-"))
+            data = (retention_state / child).read_bytes()
+            os.unlink(retention_state / child)
+            replacement.write_bytes(data)
+            os.chown(replacement, 0, 0)
+            os.chmod(replacement, 0o600)
+            os.rename(replacement, retention_state / child)
+            replaced[0] = True
+        return result
+
+    helper._child_witness = replace_retention_child
+    expect_provider_error(
+        lambda: helper._retention_delete(
+            str(retention_root),
+            str(retention_state),
+        ),
+        "RECOVERY_REQUIRED",
+    )
+    helper._child_witness = original_witness
+    assert retention_state.exists()
+    assert (retention_state / child).exists()
+    shutil.rmtree(retention_state)
 PY
 then
   echo "provider runtime fixture failed" >&2

@@ -898,6 +898,9 @@ PY
 mutation_started=false
 credential_prepared=false
 rollback_complete=false
+updater_started=false
+updater_completed=false
+cleanup_inspect=
 recovery_started_at=
 recovery_deadline_check() {
   [ -n "$recovery_started_at" ] || return 0
@@ -911,10 +914,10 @@ on_exit() {
     if [ "$mutation_started" = true ]; then
       rollback || status=1
     elif [ "$credential_prepared" = true ]; then
-      runtime_invariants_bounded "$previous_id" "$previous_revision" \
-        "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 || status=1
-      if [ "$status" -eq 0 ]; then
-        provider_finish rolled-back "$previous_inspect" || status=1
+      if verify_predecessor_for_cleanup; then
+        provider_finish rolled-back "$cleanup_inspect" || status=1
+      else
+        status=1
       fi
     fi
   fi
@@ -1081,10 +1084,17 @@ restore_previous_active_files() {
 rollback() {
   recovery_started_at=$SECONDS
   recovery_deadline_check
-  validate_configuration_boundary "$state/config.env.target"
+  if [ "$updater_completed" = true ]; then
+    validate_configuration_boundary "$state/config.env.target"
+  elif [ "$updater_started" = false ]; then
+    validate_configuration_boundary "$state/config.env.production"
+  fi
   write_provider_marker rolling-back "${durable_disposition:-none}"
   restore_previous_active_files
-  validate_configuration_boundary "$state/config.env.target"
+  if [ "$updater_completed" = true ]; then
+    validate_configuration_boundary "$state/config.env.target"
+  fi
+  updater_started=true
   PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
     timeout 60s "$update_script" "$previous_image" "$previous_revision" "$previous_version" \
     >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
@@ -1133,6 +1143,30 @@ verify_predecessor_before_writers() {
     fail "PROVIDER_STATE_INVALID"
 }
 
+verify_predecessor_for_cleanup() {
+  local current_container current_inspect
+  current_container=$(compose ps -q backend 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  [ -n "$current_container" ] || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  current_inspect=$(docker_container_inspect "$current_container" 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  cleanup_inspect=$current_inspect
+  printf '[%s,%s]' "$previous_inspect" "$current_inspect" |
+    timeout 30s python3 "$provider_helper" verify \
+      --run-key "$run_key" --state-root "$state_root" --phase predecessor \
+      >/dev/null || {
+        echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+        return 1
+      }
+}
+
 validate_active_files_before_writers
 verify_predecessor_before_writers
 validate_configuration_boundary "$state/config.env.production"
@@ -1147,9 +1181,11 @@ timeout 30s install -m 600 "$state/target-runtime.override.yml" "$active_runtime
   fail "PROVIDER_STATE_INVALID"
 record_candidate_active_file "$active_runtime" runtime
 validate_configuration_boundary "$state/config.env.production"
+updater_started=true
 PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
   timeout 60s "$update_script" "$image" "$revision" "$version" >/dev/null 2>&1 ||
   fail "PROVIDER_STATE_INVALID"
+updater_completed=true
 cmp -s "$root/.env.production" "$state/config.env.target" ||
   fail "PROVIDER_STATE_INVALID"
 printf '%s\n' "$(configuration_file_identity "$root/.env.production")" \

@@ -12,12 +12,15 @@ provider_tests=scripts/test-test-vps-provider-credential.py
 provider_runtime=scripts/test-test-vps-provider-runtime.sh
 retention_fixture=scripts/test-test-vps-retention.sh
 public_probes=scripts/test-test-vps-public-probes.sh
+public_probe=scripts/test-vps-public-probe.sh
+closed_beta_fixture=scripts/test-test-vps-closed-beta-deploy.sh
 baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
 
 [ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ] &&
   [ -f "$provider_deploy" ] && [ -f "$provider_helper" ] &&
   [ -f "$provider_tests" ] && [ -f "$provider_runtime" ] &&
-  [ -f "$retention_fixture" ] && [ -f "$public_probes" ]
+  [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
+  [ -f "$public_probe" ] && [ -f "$closed_beta_fixture" ]
 workflow_text=$(<"$workflow")
 deploy_text=$(<"$deploy")
 runtime_text=$(<"$runtime")
@@ -57,6 +60,7 @@ for text in \
   'ServerAliveCountMax 2' \
   'scripts/deploy-test-vps-release.sh' \
   'scripts/test-vps-runtime-invariants.sh' \
+  'scripts/test-vps-public-probe.sh' \
   '[ "$status" -eq 86 ]' \
   'rollback=completed previous_image_id=' \
   '--mode deploy' \
@@ -102,6 +106,21 @@ for text in \
   require "$text" "$workflow_text$provider_deploy_text$provider_helper_text" \
     "release-first provider lane"
 done
+for text in \
+  'updater_started=false' \
+  'updater_completed=false' \
+  'updater_started=true' \
+  'updater_completed=true' \
+  'verify_predecessor_for_cleanup'; do
+  require "$text" "$provider_deploy_text" "rollback and cleanup boundary"
+done
+for text in \
+  '_child_witness' \
+  'expected_identity=child_identity' \
+  'expected_data=child_data' \
+  '_validate_terminal_state'; do
+  require "$text" "$provider_helper_text" "exact cleanup witness"
+done
 if timeout 1s sh -c 'sleep 2' >/dev/null 2>&1; then
   echo "timeout capability fixture unexpectedly completed" >&2
   exit 1
@@ -137,6 +156,8 @@ esac
 require 'timeout 1s sh -c' "$provider_deploy_text" "timeout capability preflight"
 ! grep -Fq 'meetings.json' "$workflow" ||
   { echo "raw meetings body capture remains in workflow" >&2; exit 1; }
+require 'probe_output=$(timeout 45s "$tooling/scripts/test-vps-public-probe.sh"' \
+  "$workflow_text" "actual bounded workflow public probe"
 ! grep -Fq '"$REMOTE_TOOLING/scripts/deploy-test-vps-release.sh"' "$workflow" ||
   { echo "workflow still invokes frozen legacy coordinator" >&2; exit 1; }
 require 'state_suffix=final-deploy' "$provider_deploy_text" \
@@ -157,7 +178,17 @@ for frozen in \
 done
 
 python3 -B "$provider_tests"
-timeout 120s bash "$public_probes"
+if [ "$(uname -s)" = Linux ]; then
+  timeout 120s bash "$public_probes"
+else
+  set +e
+  timeout 120s bash "$public_probes"
+  public_probe_status=$?
+  set -e
+  [ "$public_probe_status" -eq 77 ] ||
+    fail "Windows public probe matrix returned an unexpected status"
+  echo "public probe matrix environment-blocked on Windows control-plane pipe semantics"
+fi
 
 for text in \
   'smtp_pointer="$state_root/.smtp-transaction.current"' \
@@ -492,6 +523,8 @@ grep -Fq 'target version must be at least v1.2.0' "$tmp/invalid-target.stderr" |
   fail "pre-floor target created deployment state before rejection"
 
 state_writer_line=$(awk '/install -d -m 700 "\$state_root"/{print NR; exit}' "$deploy")
+state_directory_line=$(awk '/install -d -m 700 "\$state"/{print NR; exit}' "$provider_deploy")
+provider_retention_line=$(awk '/retention-check/{print NR; exit}' "$provider_deploy")
 mutation_line=$(awk '/mutation_started=true/{print NR; exit}' "$deploy")
 target_line=$(awk '/is_supported_test_vps_version "\$version"/{print NR; exit}' "$deploy")
 predecessor_line=$(awk '/is_supported_test_vps_version "\$previous_version"/{print NR; exit}' "$deploy")
@@ -505,10 +538,13 @@ update_line=$(awk '/"\$update_script" "\$image"/{print NR; exit}' "$deploy")
   [ "$predecessor_line" -lt "$compose_write_line" ] &&
   [ "$predecessor_line" -lt "$update_line" ] ||
   fail "deployment floor checks are ordered after a protected writer"
+[ "$provider_retention_line" -lt "$state_directory_line" ] ||
+  fail "provider retention admission runs after state-directory creation"
 
 require 'runtime_check=network' "$runtime_text" "shared runtime helper"
 
 if [ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ]; then
+  timeout 300s bash "$closed_beta_fixture"
   timeout 300s bash "$retention_fixture"
 fi
 

@@ -26,6 +26,7 @@ except ImportError:  # The production cleanup protocol requires Linux.
 SCHEMA_VERSION = 1
 MAX_INSPECTION_BYTES = 8 * 1024 * 1024
 MAX_CREDENTIAL_BYTES = 1024 * 1024
+MAX_WITNESS_BYTES = 16 * 1024 * 1024
 MAX_JSON_DEPTH = 32
 CONTAINER_CREDENTIAL_PATH = "/run/secrets/meet-firebase-service-account.json"
 HOST_CREDENTIAL_PARENT = "/var/lib/meet-production/credentials"
@@ -291,6 +292,46 @@ def _same_identity(left: dict[str, int], right: dict[str, int]) -> bool:
 
 def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _read_fd_bounded(fd: int, limit: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = bytearray()
+    while len(data) <= limit:
+        chunk = os.read(fd, min(65536, limit + 1 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if len(data) > limit:
+        _fail("recovery")
+    return bytes(data)
+
+
+def _child_witness(
+    directory_fd: int,
+    name: str,
+    *,
+    limit: int = MAX_WITNESS_BYTES,
+) -> tuple[dict[str, int], bytes]:
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+    except OSError:
+        _fail("recovery")
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            _fail("recovery")
+        data = _read_fd_bounded(fd, limit)
+        after = os.fstat(fd)
+        if _identity(before) != _identity(after):
+            _fail("recovery")
+        return _identity(before), data
+    finally:
+        os.close(fd)
 
 
 def _validate_credential(data: bytes) -> None:
@@ -823,17 +864,10 @@ def _witnessed_unlink(
             category="recovery",
         )
         if expected_data is not None:
-            os.lseek(entry_fd, 0, os.SEEK_SET)
-            data = bytearray()
-            while len(data) <= MAX_CREDENTIAL_BYTES:
-                chunk = os.read(
-                    entry_fd,
-                    min(65536, MAX_CREDENTIAL_BYTES + 1 - len(data)),
-                )
-                if not chunk:
-                    break
-                data.extend(chunk)
-            if bytes(data) != expected_data:
+            if _read_fd_bounded(
+                entry_fd,
+                max(MAX_CREDENTIAL_BYTES, len(expected_data)),
+            ) != expected_data:
                 _fail("recovery")
         final_fd_info = os.fstat(entry_fd)
         final_path_info = os.stat(
@@ -844,6 +878,10 @@ def _witnessed_unlink(
         if (
             _identity(final_fd_info) != _identity(opened)
             or _identity(final_path_info) != _identity(final_fd_info)
+            or (
+                expected_identity is not None
+                and _identity(final_path_info) != expected_identity
+            )
             or final_fd_info.st_uid != uid
             or final_fd_info.st_gid != gid
             or stat.S_IMODE(final_fd_info.st_mode) != mode
@@ -854,6 +892,18 @@ def _witnessed_unlink(
             or final_path_info.st_nlink != link_count
         ):
             _fail("recovery")
+        if expected_data is not None:
+            final_before = os.fstat(entry_fd)
+            final_data = _read_fd_bounded(
+                entry_fd,
+                max(MAX_CREDENTIAL_BYTES, len(expected_data)),
+            )
+            final_after = os.fstat(entry_fd)
+            if (
+                _identity(final_before) != _identity(final_after)
+                or final_data != expected_data
+            ):
+                _fail("recovery")
         try:
             os.unlink(name, dir_fd=directory_fd)
         except OSError:
@@ -901,6 +951,7 @@ def _remove_transaction(
     *,
     outcome: str,
     disposition: str,
+    snapshot: bytes,
 ) -> None:
     parent, name = os.path.split(tx)
     if not parent or not name or "/" in name:
@@ -927,15 +978,22 @@ def _remove_transaction(
                 allowed.add("publication")
             if not names.issubset(allowed) or not {"snapshot", "identity.json"}.issubset(names):
                 _fail("recovery")
+            witnesses = {
+                child: _child_witness(tx_fd, child)
+                for child in names
+            }
             for child in ("identity.json", "snapshot", "publication"):
                 if child not in names:
                     continue
                 child_gid = 10001 if child == "publication" else 0
                 child_mode = 0o440 if child == "publication" else 0o600
                 child_links = 2 if child == "publication" and outcome == "committed" else 1
+                child_identity, child_data = witnesses[child]
                 _witnessed_unlink(
                     tx_fd,
                     child,
+                    expected_identity=child_identity,
+                    expected_data=snapshot if child == "publication" else child_data,
                     uid=0,
                     gid=child_gid,
                     mode=child_mode,
@@ -1187,6 +1245,7 @@ def _finish(run_key: str, state_root: str, root: str, outcome: str, inspect_data
             tx,
             outcome=outcome,
             disposition=disposition,
+            snapshot=snapshot,
         )
     _result(enabled, present, read_only, outcome)
 
@@ -1213,6 +1272,31 @@ def _retention_reference(path: str) -> str:
     if os.path.lexists(path) and os.path.realpath(path) != path:
         _fail("recovery")
     return path
+
+
+def _validate_terminal_state(path: str, name: str) -> None:
+    if os.path.islink(path) or not os.path.isdir(path):
+        _fail("recovery")
+    info = os.stat(path, follow_symlinks=False)
+    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+        _fail("recovery")
+    terminal = os.path.join(path, "terminal.json")
+    value = _json(_read_private(terminal), "recovery")
+    run_key = name.rsplit("-", 2)[0]
+    if set(value) != {
+        "schemaVersion",
+        "runKey",
+        "outcome",
+        "providerEnabled",
+    }:
+        _fail("recovery")
+    if (
+        value["schemaVersion"] != SCHEMA_VERSION
+        or value["runKey"] != run_key
+        or value["outcome"] not in ("committed", "rolled-back")
+        or not isinstance(value["providerEnabled"], bool)
+    ):
+        _fail("recovery")
 
 
 def _retention_check(
@@ -1256,6 +1340,11 @@ def _retention_check(
                 _fail("recovery")
         for name in os.listdir(state_root):
             path = os.path.join(state_root, name)
+            if re.fullmatch(
+                r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)",
+                name,
+            ):
+                _validate_terminal_state(path, name)
             if os.path.islink(path):
                 continue
             if not os.path.isdir(path):
@@ -1355,6 +1444,10 @@ def _retention_delete(state_root: str, state_path: str) -> None:
             _lock_directory(state_fd)
             names = set(os.listdir(state_fd))
             if not names.difference(RETENTION_CHILDREN):
+                witnesses = {
+                    child: _child_witness(state_fd, child)
+                    for child in names
+                }
                 for child in sorted(names):
                     child_info = os.stat(
                         child,
@@ -1368,9 +1461,12 @@ def _retention_delete(state_root: str, state_path: str) -> None:
                         or child_info.st_nlink != 1
                     ):
                         _fail("recovery")
+                    child_identity, child_data = witnesses[child]
                     _witnessed_unlink(
                         state_fd,
                         child,
+                        expected_identity=child_identity,
+                        expected_data=child_data,
                         uid=0,
                         gid=0,
                         mode=0o600,

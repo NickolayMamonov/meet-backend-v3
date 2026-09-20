@@ -226,6 +226,7 @@ jobs:
             scripts/production-compose.sh
             scripts/production-config-digest.sh
             scripts/test-vps-runtime-invariants.sh
+            scripts/test-vps-public-probe.sh
             scripts/update-production-release.sh
             scripts/deploy-test-vps-release.sh
             scripts/deploy-test-vps-provider-release.sh
@@ -453,23 +454,15 @@ jobs:
               .postgresVolume == "meet-production_postgres_data"
             ' <<<"$runtime" >/dev/null
 
-          meetings_probe=$(timeout 30s curl --silent --connect-timeout 5 \
-            --max-time 15 --write-out $'\n%{http_code}' \
-            "$PUBLIC_URL/meetings" 2>/dev/null |
-            timeout 5s python3 -c 'import json,sys; d=sys.stdin.buffer.read(8*1024*1024+64); b,s,t=d.rpartition(b"\n"); assert s and len(b)<=8*1024*1024 and t==b"200"; assert isinstance(json.loads(b.decode("utf-8")),list); print("meetings_status=200 meetings_array=true")' \
-            2>/dev/null)
-          meetings_status=200
-          [ "$meetings_probe" = "meetings_status=200 meetings_array=true" ]
-          actuator_status=$(curl --silent --connect-timeout 5 --max-time 15 \
-            --output /dev/null \
-            --write-out '%{http_code}' "$PUBLIC_URL/actuator")
-          [ "$actuator_status" = 404 ]
-          redirect_headers=$(curl --silent --connect-timeout 5 --max-time 15 \
-            --dump-header - --output /dev/null --write-out '%{http_code}' \
-            "http://api.whysoezzy.online/meetings")
-          redirect_status=${redirect_headers: -3}
+          probe_output=$(timeout 45s "$tooling/scripts/test-vps-public-probe.sh" \
+            "$PUBLIC_URL")
+          grep -Fxq 'meetings_status=200' <<<"$probe_output"
+          grep -Fxq 'meetings_array=true' <<<"$probe_output"
+          grep -Fxq 'actuator_status=404' <<<"$probe_output"
+          redirect_status=$(sed -n 's/^redirect_status=//p' <<<"$probe_output")
           case "$redirect_status" in 301|302|307|308) ;; *) exit 1 ;; esac
-          grep -Eiq '^location:[[:space:]]+https://' <<<"$redirect_headers"
+          meetings_status=200
+          actuator_status=404
 
           {
             echo "## Test VPS deployment evidence"

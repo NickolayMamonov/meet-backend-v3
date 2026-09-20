@@ -86,7 +86,6 @@ install -d -m 700 "$state_root/12-1-final-deploy/protected-input"
 install -d -m 700 "$state_root/12-1-final-deploy/provider-runtime"
 printf 'services:\n  backend:\n    volumes: []\n' \
   >"$state_root/12-1-final-deploy/target-runtime.override.yml"
-ln -s "$state_root/12-1-final-deploy" "$state_root/13-1-final-deploy"
 install -d -m 700 "$state_root/12-1-final-deploy-shadow"
 install -d -m 700 "$state_root/14-1-final-deploy"
 printf '{"schemaVersion":1,"runKey":"14-1","outcome":"committed","providerEnabled":false}\n' \
@@ -134,7 +133,6 @@ PATH="$fake_bin:$PATH" bash "$remote_script" \
 [ ! -e "$state_root/11-1-final-deploy" ]
 [ -d "$state_root/12-1-final-deploy" ]
 [ -d "$state_root/12-1-final-deploy/provider-runtime" ]
-[ -L "$state_root/13-1-final-deploy" ]
 [ -d "$state_root/12-1-final-deploy-shadow" ]
 [ -d "$state_root/14-1-final-deploy" ]
 [ -f "$state_root/14-1-final-deploy/unknown.txt" ]
@@ -142,6 +140,17 @@ PATH="$fake_bin:$PATH" bash "$remote_script" \
 [ -f "$state_root/17-1-final-deploy/unknown-before-race.txt" ]
 [ -f "$state_root/17-1-final-deploy/concurrent-unknown.txt" ]
 [ ! -e "$tooling_root" ]
+
+ln -s "$state_root/12-1-final-deploy" "$state_root/13-1-final-deploy"
+set +e
+symlink_output=$(bash "$remote_script" \
+  "$production_root" 1 1 "$production_root/.missing-tooling" 2>&1)
+symlink_status=$?
+set -e
+[ "$symlink_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$symlink_output"
+[ -L "$state_root/13-1-final-deploy" ]
+rm -f -- "$state_root/13-1-final-deploy"
 
 unresolved_state="$state_root/19-1-final-deploy"
 install -d -m 700 "$unresolved_state"
