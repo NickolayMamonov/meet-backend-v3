@@ -1125,7 +1125,21 @@ rollback() {
   recovery_deadline_check
   run_safety_hook rollback "$previous_image" "$previous_id" \
     "$previous_revision" "$previous_version" "$previous_runtime_hash"
-  provider_finish rolled-back "$restored_inspect"
+  final_restored_container=$(compose ps -q backend)
+  [ "$final_restored_container" = "$restored_container" ] ||
+    fail "RECOVERY_REQUIRED"
+  final_restored_inspect=$(docker_container_inspect "$final_restored_container" \
+    2>/dev/null) || fail "RECOVERY_REQUIRED"
+  runtime_invariants_bounded "$previous_id" "$previous_revision" \
+    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 ||
+    fail "RECOVERY_REQUIRED"
+  runtime_environment_bounded >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
+  (verify_public_contract "$public_url") || fail "RECOVERY_REQUIRED"
+  printf '[%s,%s]' "$previous_inspect" "$final_restored_inspect" |
+    timeout 30s python3 "$provider_helper" verify \
+      --run-key "$run_key" --state-root "$state_root" --phase rollback >/dev/null ||
+    fail "RECOVERY_REQUIRED"
+  provider_finish rolled-back "$final_restored_inspect"
   rollback_complete=true
   echo "rollback=completed previous_image_id=$previous_id"
 }
