@@ -79,6 +79,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import stat
 import struct
 import sys
@@ -116,6 +117,29 @@ helper.CONTAINER_CREDENTIAL_PATH = "/run/secrets/meet-firebase-service-account.j
 state = fixture / "state"
 state.mkdir(mode=0o700)
 os.chown(state, 0, 0)
+marker = state / ".provider-transaction.current"
+
+def prepare_marker(run_key: str) -> None:
+    helper._write_private(
+        str(marker),
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "runKey": run_key,
+                "phase": "preparing",
+                "providerEnabled": True,
+                "durableDisposition": "none",
+            },
+            separators=(",", ":"),
+        ).encode(),
+        0o600,
+    )
+
+def cleanup_transaction(run_key: str, remove_destination: bool = True) -> None:
+    marker.unlink(missing_ok=True)
+    shutil.rmtree(parent / f".transaction-{run_key}", ignore_errors=True)
+    if remove_destination:
+        pathlib.Path(helper.HOST_CREDENTIAL_PATH).unlink(missing_ok=True)
 
 def acl(entries: list[tuple[int, int, int]]) -> bytes:
     return struct.pack("<I", 2) + b"".join(
@@ -223,8 +247,157 @@ expect_provider_error(
 remove_acl(parent, "system.posix_acl_default")
 assert not (parent / ".transaction-default-acl-parent").exists()
 
+prepare_marker("race-disappearance")
+original_read_existing = helper._read_existing
+race_removed = False
+
+def remove_destination_before_read(path: str, source: bool = False):
+    global race_removed
+    if path == helper.HOST_CREDENTIAL_PATH and not source and not race_removed:
+        race_removed = True
+        pathlib.Path(path).unlink()
+    return original_read_existing(path, source=source)
+
+helper._read_existing = remove_destination_before_read
+expect_provider_error(
+    lambda: helper._prepare(
+        "race-disappearance", str(state), "", json.dumps(predecessor).encode()
+    ),
+    "CREDENTIAL_INVALID",
+)
+helper._read_existing = original_read_existing
+assert not pathlib.Path(helper.HOST_CREDENTIAL_PATH).exists()
+assert (parent / ".transaction-race-disappearance" / "snapshot").exists()
+assert json.loads(marker.read_text())["durableDisposition"] == "none"
+cleanup_transaction("race-disappearance")
+
+prepare_marker("race-appearance")
+original_link = helper.os.link
+
+def create_raced_destination(source_path: str, destination_path: str, **kwargs):
+    fd = os.open(destination_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o440)
+    try:
+        os.write(fd, source.read_bytes())
+        os.fchown(fd, 0, 10001)
+        os.fchmod(fd, 0o440)
+    finally:
+        os.close(fd)
+    raise FileExistsError(17, "destination appeared", destination_path)
+
+helper.os.link = create_raced_destination
+expect_provider_error(
+    lambda: helper._prepare(
+        "race-appearance", str(state), "", json.dumps(predecessor).encode()
+    ),
+    "DURABLE_CONFLICT",
+)
+helper.os.link = original_link
+assert pathlib.Path(helper.HOST_CREDENTIAL_PATH).exists()
+assert (parent / ".transaction-race-appearance" / "publication").exists()
+assert json.loads(marker.read_text())["durableDisposition"] == "none"
+cleanup_transaction("race-appearance")
+
+prepare_marker("source-drift")
+helper._prepare("source-drift", str(state), "", json.dumps(predecessor).encode())
+marker.unlink()
+helper._write_private(
+    str(marker),
+    json.dumps(
+        {
+            "schemaVersion": 1,
+            "runKey": "source-drift",
+            "phase": "prepared",
+            "providerEnabled": True,
+            "durableDisposition": "created",
+        },
+        separators=(",", ":"),
+    ).encode(),
+    0o600,
+)
+changed_account = dict(account)
+changed_account["client_id"] = "runtime-fixture-changed-id"
+source.write_text(json.dumps(changed_account), encoding="utf-8")
+os.chown(source, 0, 10001)
+os.chmod(source, 0o640)
+expect_provider_error(
+    lambda: helper._verify(
+        "source-drift",
+        "",
+        json.dumps([predecessor, predecessor]).encode(),
+        "predecessor",
+        str(state),
+    ),
+    "CREDENTIAL_CHANGED",
+)
+source.write_text(json.dumps(account), encoding="utf-8")
+os.chown(source, 0, 10001)
+os.chmod(source, 0o640)
+cleanup_transaction("source-drift")
+
+prepare_marker("witness-removal")
+helper._prepare("witness-removal", str(state), "", json.dumps(predecessor).encode())
+marker.unlink()
+helper._write_private(
+    str(marker),
+    json.dumps(
+        {
+            "schemaVersion": 1,
+            "runKey": "witness-removal",
+            "phase": "verifying",
+            "providerEnabled": True,
+            "durableDisposition": "created",
+        },
+        separators=(",", ":"),
+    ).encode(),
+    0o600,
+)
+(parent / ".transaction-witness-removal" / "publication").unlink()
+candidate = inspect(pathlib.Path(helper.HOST_CREDENTIAL_PATH))
+expect_provider_error(
+    lambda: helper._verify(
+        "witness-removal",
+        "",
+        json.dumps([predecessor, candidate]).encode(),
+        "candidate",
+        str(state),
+    ),
+    "RECOVERY_REQUIRED",
+)
+cleanup_transaction("witness-removal")
+
+prepare_marker("marker-drift")
+helper._prepare("marker-drift", str(state), "", json.dumps(predecessor).encode())
+marker.unlink()
+helper._write_private(
+    str(marker),
+    json.dumps(
+        {
+            "schemaVersion": 1,
+            "runKey": "marker-drift",
+            "phase": "prepared",
+            "providerEnabled": True,
+            "durableDisposition": "created",
+        },
+        separators=(",", ":"),
+    ).encode(),
+    0o600,
+)
+expect_provider_error(
+    lambda: helper._verify(
+        "marker-drift",
+        "",
+        json.dumps([predecessor, candidate]).encode(),
+        "candidate",
+        str(state),
+    ),
+    "RECOVERY_REQUIRED",
+)
+cleanup_transaction("marker-drift")
+
+prepare_marker("created")
 helper._prepare("created", str(state), "", json.dumps(predecessor).encode())
-marker = state / ".provider-transaction.current"
+assert json.loads(marker.read_text())["durableDisposition"] == "created"
+marker.unlink()
 helper._write_private(
     str(marker),
     json.dumps(
@@ -276,7 +449,10 @@ marker.unlink()
 assert pathlib.Path(helper.HOST_CREDENTIAL_PATH).exists()
 assert not (parent / ".transaction-created").exists()
 
+prepare_marker("reused")
 helper._prepare("reused", str(state), "", json.dumps(predecessor).encode())
+assert json.loads(marker.read_text())["durableDisposition"] == "reused"
+marker.unlink()
 helper._write_private(
     str(marker),
     json.dumps(
@@ -296,7 +472,9 @@ marker.unlink()
 assert pathlib.Path(helper.HOST_CREDENTIAL_PATH).exists()
 
 os.unlink(helper.HOST_CREDENTIAL_PATH)
+prepare_marker("rollback")
 helper._prepare("rollback", str(state), "", json.dumps(predecessor).encode())
+marker.unlink()
 helper._write_private(
     str(marker),
     json.dumps(
@@ -315,7 +493,9 @@ helper._finish("rollback", str(state), "", "rolled-back", json.dumps(predecessor
 assert not pathlib.Path(helper.HOST_CREDENTIAL_PATH).exists()
 marker.unlink()
 
+prepare_marker("witness-tamper")
 helper._prepare("witness-tamper", str(state), "", json.dumps(predecessor).encode())
+marker.unlink()
 helper._write_private(
     str(marker),
     json.dumps(

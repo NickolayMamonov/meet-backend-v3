@@ -23,6 +23,76 @@ fail() {
   exit 1
 }
 
+verify_production_env_settings() {
+  timeout 30s python3 - "$1" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path = sys.argv[1]
+info = os.lstat(path)
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    raise SystemExit(1)
+data = open(path, "rb").read(1024 * 1024 + 1)
+if len(data) > 1024 * 1024:
+    raise SystemExit(1)
+try:
+    text = data.decode("utf-8")
+except UnicodeDecodeError:
+    raise SystemExit(1)
+
+push_keys = {
+    "APP_PUSH_PROVIDER_ENABLED",
+    "APP_PUSH_DISCOVERY_ENABLED",
+    "APP_PUSH_DISPATCH_ENABLED",
+    "APP_PUSH_DIAGNOSTIC_ENABLED",
+    "APP_PUSH_MAINTENANCE_ENABLED",
+    "APP_PUSH_PROJECT_ID",
+    "APP_PUSH_CREDENTIALS_FILE",
+}
+alternate = {
+    "SPRING_APPLICATION_JSON",
+    "SPRING_CONFIG_LOCATION",
+    "SPRING_CONFIG_ADDITIONAL_LOCATION",
+    "SPRING_CONFIG_IMPORT",
+    "SPRING_CONFIG_NAME",
+    "SPRING_CONFIG_DATA_LOCATION",
+}
+seen = set()
+for raw in text.splitlines():
+    line = raw.rstrip("\r")
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+    if match is None:
+        raise SystemExit(1)
+    key, value = match.groups()
+    normalized = key.upper().replace("-", "_").replace(".", "_")
+    if normalized in push_keys:
+        if key != normalized or key in seen:
+            raise SystemExit(1)
+        seen.add(key)
+    if normalized in alternate:
+        raise SystemExit(1)
+    if key in {"JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"}:
+        lowered = value.lower()
+        if any(
+            token in lowered
+            for token in (
+                "app.push",
+                "spring.application.json",
+                "spring.config.location",
+                "spring.config.additional-location",
+                "spring.config.import",
+                "spring.config.name",
+                "spring.config.data.location",
+            )
+        ):
+            raise SystemExit(1)
+PY
+}
+
 verify_public_contract() {
   local public_url=${1:-}
   [ -n "$public_url" ] || return 0
@@ -76,6 +146,108 @@ print("meetings_status=200 meetings_array=true")
     --data '{}' 2>/dev/null) || fail "admin guard probe failed"
   [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ] ||
     fail "admin guard probe failed"
+}
+
+runtime_release_field_bounded() {
+  timeout 30s bash -c '
+    set -euo pipefail
+    source "$1"
+    runtime_release_field "$2" "$3"
+  ' _ "$runtime_helper" "$root" "$1"
+}
+
+active_file_identity() {
+  local file=$1
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  timeout 10s stat -Lc '%d:%i:%s:%u:%g:%a:%Y:%Z:%y:%z' "$file"
+}
+
+snapshot_active_file() {
+  local file=$1
+  local name=$2
+  local identity
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    [ -f "$file" ] && [ ! -L "$file" ] || fail "PROVIDER_STATE_INVALID"
+    identity=$(active_file_identity "$file") || fail "PROVIDER_STATE_INVALID"
+    printf '%s\n' "$identity" >"$state/previous-active-$name.identity"
+    timeout 30s install -m 600 "$file" "$state/previous-active-$name.yml" ||
+      fail "PROVIDER_STATE_INVALID"
+    cmp -s "$file" "$state/previous-active-$name.yml" ||
+      fail "PROVIDER_STATE_INVALID"
+    [ "$(active_file_identity "$file")" = "$identity" ] ||
+      fail "PROVIDER_STATE_INVALID"
+    : >"$state/had-active-$name"
+  fi
+}
+
+validate_active_files_before_writers() {
+  local name file expected actual
+  for name in compose runtime; do
+    if [ -e "$state/had-active-$name" ]; then
+      case "$name" in
+        compose) file=$active_compose ;;
+        runtime) file=$active_runtime ;;
+        *) fail "PROVIDER_STATE_INVALID" ;;
+      esac
+      expected=$(<"$state/previous-active-$name.identity")
+      actual=$(active_file_identity "$file") ||
+        fail "PROVIDER_STATE_INVALID"
+      [ "$actual" = "$expected" ] || fail "PROVIDER_STATE_INVALID"
+      cmp -s "$file" "$state/previous-active-$name.yml" ||
+        fail "PROVIDER_STATE_INVALID"
+    else
+      case "$name" in
+        compose) file=$active_compose ;;
+        runtime) file=$active_runtime ;;
+        *) fail "PROVIDER_STATE_INVALID" ;;
+      esac
+      [ ! -e "$file" ] && [ ! -L "$file" ] ||
+        fail "PROVIDER_STATE_INVALID"
+    fi
+  done
+}
+
+record_candidate_active_file() {
+  local file=$1
+  local name=$2
+  local identity
+  [ -f "$file" ] && [ ! -L "$file" ] ||
+    fail "RECOVERY_REQUIRED"
+  identity=$(active_file_identity "$file") || fail "RECOVERY_REQUIRED"
+  printf '%s\n' "$identity" >"$state/candidate-active-$name.identity"
+}
+
+restore_active_file() {
+  local file=$1
+  local name=$2
+  local previous candidate actual
+  if [ -e "$state/had-active-$name" ]; then
+    previous=$(<"$state/previous-active-$name.identity")
+    actual=$(active_file_identity "$file") || fail "RECOVERY_REQUIRED"
+    if [ "$actual" = "$previous" ]; then
+      cmp -s "$file" "$state/previous-active-$name.yml" ||
+        fail "RECOVERY_REQUIRED"
+      return
+    fi
+    [ -s "$state/candidate-active-$name.identity" ] ||
+      fail "RECOVERY_REQUIRED"
+    candidate=$(<"$state/candidate-active-$name.identity")
+    [ "$actual" = "$candidate" ] || fail "RECOVERY_REQUIRED"
+    timeout 30s install -m 600 "$state/previous-active-$name.yml" "$file" ||
+      fail "RECOVERY_REQUIRED"
+    cmp -s "$file" "$state/previous-active-$name.yml" ||
+      fail "RECOVERY_REQUIRED"
+  else
+    if [ -e "$file" ] || [ -L "$file" ]; then
+      [ -s "$state/candidate-active-$name.identity" ] ||
+        fail "RECOVERY_REQUIRED"
+      candidate=$(<"$state/candidate-active-$name.identity")
+      actual=$(active_file_identity "$file") || fail "RECOVERY_REQUIRED"
+      [ "$actual" = "$candidate" ] || fail "RECOVERY_REQUIRED"
+      timeout 30s rm -f -- "$file" || fail "RECOVERY_REQUIRED"
+    fi
+    [ ! -e "$file" ] && [ ! -L "$file" ] || fail "RECOVERY_REQUIRED"
+  fi
 }
 
 provider_release_main() {
@@ -155,6 +327,8 @@ fi
 [ -s "$root/docker-compose.production.yml" ] ||
   fail "existing production Compose file is unavailable"
 [ -s "$base_compose" ] || fail "reviewed target Compose file is unavailable"
+verify_production_env_settings "$root/.env.production" ||
+  fail "PROVIDER_STATE_INVALID"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 compose_script=$script_dir/production-compose.sh
@@ -249,9 +423,12 @@ compose_up() {
   ' _ "$runtime_helper" "$root" "$compose_script" "$@" 2>/dev/null
 }
 
-previous_image=$(runtime_release_field "$root" BACKEND_IMAGE)
-previous_version=$(runtime_release_field "$root" BACKEND_VERSION)
-previous_revision=$(runtime_release_field "$root" BACKEND_REVISION)
+previous_image=$(runtime_release_field_bounded BACKEND_IMAGE) ||
+  fail "PROVIDER_STATE_INVALID"
+previous_version=$(runtime_release_field_bounded BACKEND_VERSION) ||
+  fail "PROVIDER_STATE_INVALID"
+previous_revision=$(runtime_release_field_bounded BACKEND_REVISION) ||
+  fail "PROVIDER_STATE_INVALID"
 [[ "$previous_revision" =~ ^[0-9a-f]{40}$ ]] ||
   fail "running revision is malformed"
 [[ "$previous_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
@@ -294,14 +471,12 @@ printf '%s\n' "$previous_version" >"$state/previous-version"
 printf '%s\n' "$previous_runtime_hash" >"$state/previous-runtime-config-hash"
 if [ -e "$active_compose" ]; then
   [ -s "$active_compose" ] || fail "active Compose file is empty"
-  install -m 600 "$active_compose" "$state/previous-active-compose.yml"
-  : >"$state/had-active-compose"
 fi
 if [ -e "$active_runtime" ]; then
   [ -s "$active_runtime" ] || fail "active runtime override is empty"
-  install -m 600 "$active_runtime" "$state/previous-active-runtime.yml"
-  : >"$state/had-active-runtime"
 fi
+snapshot_active_file "$active_compose" compose
+snapshot_active_file "$active_runtime" runtime
 
 run_safety_hook() {
   local phase=$1
@@ -388,7 +563,7 @@ write_provider_marker() {
   printf '{"schemaVersion":1,"runKey":"%s","phase":"%s","providerEnabled":%s,"durableDisposition":"%s"}\n' \
     "$run_key" "$phase" "$provider_enabled" "$disposition" >"$temporary"
   chmod 600 "$temporary"
-  python3 - "$temporary" "$state_root" <<'PY'
+  timeout 30s python3 - "$temporary" "$state_root" <<'PY'
 import os
 import sys
 
@@ -400,8 +575,8 @@ for path, directory in ((sys.argv[1], False), (sys.argv[2], True)):
     finally:
         os.close(fd)
 PY
-  mv -f -- "$temporary" "$provider_pointer"
-  python3 - "$state_root" <<'PY'
+  timeout 30s mv -f -- "$temporary" "$provider_pointer"
+  timeout 30s python3 - "$state_root" <<'PY'
 import os
 import sys
 
@@ -419,12 +594,12 @@ write_terminal_record() {
   [ "$outcome" = committed ] || [ "$outcome" = rolled-back ] ||
     fail "RECOVERY_REQUIRED"
   umask 077
-  jq -cn --arg run_key "$run_key" --arg outcome "$outcome" \
+  timeout 30s jq -cn --arg run_key "$run_key" --arg outcome "$outcome" \
     --argjson enabled "$provider_enabled" \
     '{schemaVersion:1,runKey:$run_key,outcome:$outcome,providerEnabled:$enabled}' \
     >"$terminal"
   chmod 600 "$terminal"
-  python3 - "$terminal" <<'PY'
+  timeout 30s python3 - "$terminal" <<'PY'
 import os
 import sys
 
@@ -447,8 +622,18 @@ provider_finish() {
       --outcome "$outcome" >/dev/null ||
     fail "RECOVERY_REQUIRED"
   write_terminal_record "$outcome"
-  rm -f -- "$provider_pointer"
-  jq -cn --argjson enabled "$provider_enabled" --arg outcome "$outcome" \
+  timeout 30s rm -f -- "$provider_pointer" || fail "RECOVERY_REQUIRED"
+  timeout 30s python3 - "$state_root" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+  timeout 30s jq -cn --argjson enabled "$provider_enabled" --arg outcome "$outcome" \
     '{schemaVersion:1,providerEnabled:$enabled,credentialMountPresent:$enabled,
       credentialMountReadOnly:$enabled,outcome:$outcome}'
 }
@@ -593,38 +778,34 @@ printf '%s\n%s\n%s\n' "$previous_inspect" "$target_image_inspect" "$target_confi
   ' >/dev/null 2>&1 || fail "PROVIDER_STATE_INVALID"
 
 write_provider_marker preparing none
-durable_existed=false
-if [ -e /var/lib/meet-production/credentials/firebase-service-account.json ] ||
-  [ -L /var/lib/meet-production/credentials/firebase-service-account.json ]; then
-  durable_existed=true
-fi
 printf '%s' "$previous_inspect" |
   timeout 30s python3 "$provider_helper" prepare \
     --run-key "$run_key" --state-root "$state_root" >/dev/null ||
   fail "CREDENTIAL_INVALID"
-durable_disposition=none
+durable_disposition=$(timeout 5s jq -er \
+  --arg run_key "$run_key" --argjson enabled "$provider_enabled" '
+    select(
+      type == "object" and
+      .schemaVersion == 1 and
+      .runKey == $run_key and
+      .phase == "preparing" and
+      .providerEnabled == $enabled
+    ) |
+    .durableDisposition |
+    select(. == "none" or . == "created" or . == "reused")
+  ' \
+  "$provider_pointer") || fail "RECOVERY_REQUIRED"
 if [ "$provider_enabled" = true ]; then
-  if [ "$durable_existed" = true ]; then
-    durable_disposition=reused
-  else
-    durable_disposition=created
-  fi
+  case "$durable_disposition" in created|reused) ;; *) fail "RECOVERY_REQUIRED" ;; esac
+else
+  [ "$durable_disposition" = none ] || fail "RECOVERY_REQUIRED"
 fi
-case "$durable_disposition" in none|created|reused) ;; *) fail "RECOVERY_REQUIRED" ;; esac
 write_provider_marker prepared "$durable_disposition"
 credential_prepared=true
 
 restore_previous_active_files() {
-  if [ -e "$state/had-active-compose" ]; then
-    install -m 600 "$state/previous-active-compose.yml" "$active_compose"
-  else
-    rm -f "$active_compose"
-  fi
-  if [ -e "$state/had-active-runtime" ]; then
-    install -m 600 "$state/previous-active-runtime.yml" "$active_runtime"
-  else
-    rm -f "$active_runtime"
-  fi
+  restore_active_file "$active_compose" compose || fail "RECOVERY_REQUIRED"
+  restore_active_file "$active_runtime" runtime || fail "RECOVERY_REQUIRED"
 }
 
 rollback() {
@@ -650,7 +831,7 @@ rollback() {
     fail "RECOVERY_REQUIRED"
   printf '[%s,%s]' "$previous_inspect" "$restored_inspect" |
     timeout 30s python3 "$provider_helper" verify \
-      --run-key "$run_key" --phase rollback >/dev/null ||
+      --run-key "$run_key" --state-root "$state_root" --phase rollback >/dev/null ||
     fail "RECOVERY_REQUIRED"
   verify_public_contract "$public_url"
   recovery_deadline_check
@@ -661,10 +842,29 @@ rollback() {
   echo "rollback=completed previous_image_id=$previous_id"
 }
 
+verify_predecessor_before_writers() {
+  local current_container current_inspect
+  current_container=$(compose ps -q backend) ||
+    fail "PROVIDER_STATE_INVALID"
+  [ -n "$current_container" ] || fail "PROVIDER_STATE_INVALID"
+  current_inspect=$(docker_container_inspect "$current_container" 2>/dev/null) ||
+    fail "PROVIDER_STATE_INVALID"
+  printf '[%s,%s]' "$previous_inspect" "$current_inspect" |
+    timeout 30s python3 "$provider_helper" verify \
+      --run-key "$run_key" --state-root "$state_root" --phase predecessor >/dev/null ||
+    fail "PROVIDER_STATE_INVALID"
+}
+
+validate_active_files_before_writers
+verify_predecessor_before_writers
 write_provider_marker applying "$durable_disposition"
 mutation_started=true
-install -m 600 "$base_compose" "$active_compose"
-install -m 600 "$state/target-runtime.override.yml" "$active_runtime"
+timeout 30s install -m 600 "$base_compose" "$active_compose" ||
+  fail "PROVIDER_STATE_INVALID"
+record_candidate_active_file "$active_compose" compose
+timeout 30s install -m 600 "$state/target-runtime.override.yml" "$active_runtime" ||
+  fail "PROVIDER_STATE_INVALID"
+record_candidate_active_file "$active_runtime" runtime
 PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
   timeout 60s "$update_script" "$image" "$revision" "$version" >/dev/null 2>&1 ||
   fail "PROVIDER_STATE_INVALID"
@@ -680,7 +880,7 @@ target_hash=$(docker_container_inspect "$candidate_container" \
 write_provider_marker verifying "$durable_disposition"
 printf '[%s,%s]' "$previous_inspect" "$candidate_inspect" |
   timeout 30s python3 "$provider_helper" verify \
-    --run-key "$run_key" --phase candidate >/dev/null ||
+    --run-key "$run_key" --state-root "$state_root" --phase candidate >/dev/null ||
   fail "PROVIDER_STATE_INVALID"
 runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
   >/dev/null 2>&1 || fail "PROVIDER_STATE_INVALID"

@@ -87,10 +87,36 @@ class ProviderCredentialTests(unittest.TestCase):
         value["Config"]["Env"].append("APP-PUSH-DISPATCH-ENABLED=false")
         with self.assertRaises(helper.ProviderError):
             helper._provider_state(value)
+        for alternate in (
+            "SPRING_APPLICATION_JSON={}",
+            "SPRING_CONFIG_NAME=evil",
+            "spring.config.name=evil",
+            "JAVA_TOOL_OPTIONS=-Dspring.application.json={}",
+            "JAVA_TOOL_OPTIONS=-Dspring.config.name=evil",
+            "JDK_JAVA_OPTIONS=-Dspring.config.import=evil",
+            "_JAVA_OPTIONS=-Dspring.config.data.location=evil",
+            "JAVA_TOOL_OPTIONS=-Dapp.push.provider.enabled=true",
+        ):
+            value = inspection(False)
+            value["Config"]["Env"].append(alternate)
+            with self.assertRaises(helper.ProviderError):
+                helper._provider_state(value)
+
+    def test_explicit_blank_project_is_rejected(self) -> None:
         value = inspection(False)
-        value["Config"]["Env"].append("SPRING_APPLICATION_JSON={}")
+        value["Config"]["Env"] = [
+            item
+            for item in value["Config"]["Env"]
+            if not item.startswith("APP_PUSH_PROJECT_ID=")
+        ]
+        value["Config"]["Env"].append("APP_PUSH_PROJECT_ID=")
         with self.assertRaises(helper.ProviderError):
             helper._provider_state(value)
+
+    def test_production_cli_has_no_filesystem_root_override(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                helper._parser().parse_args(["check", "--root", "/tmp"])
 
     def test_credential_shape_is_private_and_strict(self) -> None:
         valid = json.dumps(

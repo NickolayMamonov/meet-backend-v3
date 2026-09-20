@@ -37,6 +37,14 @@ PUSH_KEYS = (
     "APP_PUSH_CREDENTIALS_FILE",
 )
 FLAG_KEYS = set(PUSH_KEYS[:5])
+ALTERNATE_CONFIG_KEYS = {
+    "SPRING_APPLICATION_JSON",
+    "SPRING_CONFIG_LOCATION",
+    "SPRING_CONFIG_ADDITIONAL_LOCATION",
+    "SPRING_CONFIG_IMPORT",
+    "SPRING_CONFIG_NAME",
+    "SPRING_CONFIG_DATA_LOCATION",
+}
 ERRORS = {
     "provider": "PROVIDER_STATE_INVALID",
     "credential": "CREDENTIAL_INVALID",
@@ -175,7 +183,7 @@ def _components(path: str) -> tuple[str, list[str]]:
     return "/", parts[1:]
 
 
-def _check_ancestors(path: str) -> None:
+def _check_ancestors(path: str, *, category: str = "credential") -> None:
     base, parts = _components(path)
     fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -183,8 +191,12 @@ def _check_ancestors(path: str) -> None:
         if root_info.st_uid != 0 or stat.S_IMODE(root_info.st_mode) & (
             stat.S_IWGRP | stat.S_IWOTH
         ):
-            _fail("credential")
-        _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True)
+            _fail(category)
+        _acl_is_safe(
+            f"/proc/self/fd/{fd}",
+            follow_symlinks=True,
+            category=category,
+        )
         for part in parts[:-1]:
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             previous_fd = fd
@@ -194,8 +206,12 @@ def _check_ancestors(path: str) -> None:
             if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & (
                 stat.S_IWGRP | stat.S_IWOTH
             ):
-                _fail("credential")
-            _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True)
+                _fail(category)
+            _acl_is_safe(
+                f"/proc/self/fd/{fd}",
+                follow_symlinks=True,
+                category=category,
+            )
     finally:
         os.close(fd)
 
@@ -306,27 +322,23 @@ def _provider_state(inspect: dict[str, Any]) -> tuple[bool, dict[str, str]]:
     entries = _env_entries(inspect)
     values = dict(entries)
     for key, value in entries:
-        normalized = key.upper().replace("-", "_")
+        normalized = key.upper().replace("-", "_").replace(".", "_")
         if normalized in PUSH_KEYS and key != normalized:
             _fail("provider")
-        if normalized in ("SPRING_APPLICATION_JSON",):
-            if value:
-                _fail("provider")
-        if key in (
-            "SPRING_CONFIG_LOCATION",
-            "SPRING_CONFIG_ADDITIONAL_LOCATION",
-            "SPRING_CONFIG_IMPORT",
-        ) and value:
+        if normalized in ALTERNATE_CONFIG_KEYS:
             _fail("provider")
         if key in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"):
+            lowered = value.lower()
             if any(
-                token in value
+                token in lowered
                 for token in (
                     "app.push",
-                    "APP_PUSH",
+                    "spring.application.json",
                     "spring.config.location",
                     "spring.config.additional-location",
                     "spring.config.import",
+                    "spring.config.name",
+                    "spring.config.data.location",
                 )
             ):
                 _fail("provider")
@@ -337,14 +349,17 @@ def _provider_state(inspect: dict[str, Any]) -> tuple[bool, dict[str, str]]:
         if not isinstance(command, list) or any(not isinstance(item, str) for item in command):
             _fail("provider")
         if any(
-            token in item
+            token in item.lower()
             for item in command
             for token in (
                 "--app.push",
                 "-Dapp.push",
+                "spring.application.json",
                 "spring.config.location",
                 "spring.config.additional-location",
                 "spring.config.import",
+                "spring.config.name",
+                "spring.config.data.location",
             )
         ):
             _fail("provider")
@@ -358,7 +373,7 @@ def _provider_state(inspect: dict[str, Any]) -> tuple[bool, dict[str, str]]:
             _fail("provider")
     project = values.get("APP_PUSH_PROJECT_ID", EXPECTED_PROJECT)
     credentials = values.get("APP_PUSH_CREDENTIALS_FILE", "")
-    if project and project != EXPECTED_PROJECT:
+    if project != EXPECTED_PROJECT:
         _fail("provider")
     if enabled and credentials != CONTAINER_CREDENTIAL_PATH:
         _fail("provider")
@@ -464,13 +479,11 @@ def _effective_tuple(inspect: dict[str, Any]) -> dict[str, str]:
 
 
 def _rooted(path: str, root: str | None) -> str:
-    # Production paths are compiled constants.  Tests can inject a complete
-    # filesystem root by importing this module and replacing these constants.
+    # Production paths are compiled constants. Tests inject isolated roots by
+    # replacing these constants after importing the module; no production
+    # caller may remap a fixed destination through an argument.
     if root:
-        if path == HOST_CREDENTIAL_PARENT:
-            return root
-        if path.startswith(HOST_CREDENTIAL_PARENT + "/"):
-            return root + path[len(HOST_CREDENTIAL_PARENT) :]
+        _fail("provider")
     return path
 
 
@@ -548,7 +561,7 @@ def _revalidate_open_source(
 
 
 def _read_private(path: str) -> bytes:
-    _check_ancestors(path)
+    _check_ancestors(path, category="recovery")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
@@ -619,6 +632,41 @@ def _marker(state_root: str, run_key: str) -> dict[str, Any]:
     return value
 
 
+def _update_marker_disposition(
+    state_root: str,
+    run_key: str,
+    enabled: bool,
+    disposition: str,
+) -> None:
+    if disposition not in ("created", "reused"):
+        _fail("recovery")
+    marker_path = os.path.join(state_root, ".provider-transaction.current")
+    marker = _marker(state_root, run_key)
+    if (
+        marker["phase"] != "preparing"
+        or marker["providerEnabled"] != enabled
+        or marker["durableDisposition"] != "none"
+    ):
+        _fail("recovery")
+    marker["durableDisposition"] = disposition
+    encoded = json.dumps(marker, separators=(",", ":"), sort_keys=True).encode()
+    temporary = os.path.join(state_root, ".provider-transaction." + run_key + ".prepare")
+    if os.path.lexists(temporary):
+        _fail("recovery")
+    _write_private(temporary, encoded, 0o600)
+    try:
+        os.replace(temporary, marker_path)
+        fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+        _fail("recovery")
+
+
 def _validate_identity(value: Any) -> None:
     if not isinstance(value, dict) or set(value) != {
         "schemaVersion",
@@ -643,7 +691,7 @@ def _validate_identity(value: Any) -> None:
 def _validate_transaction(tx: str) -> None:
     if not os.path.isdir(tx) or os.path.islink(tx):
         _fail("recovery")
-    _check_ancestors(tx)
+    _check_ancestors(tx, category="recovery")
     info = os.stat(tx, follow_symlinks=False)
     if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
         _fail("recovery")
@@ -765,11 +813,12 @@ def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> t
                 disposition = "created"
             _revalidate_open_source(source, source_fd, source_info, source_data)
             _record(tx, source_identity, durable_identity)
-            fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            _update_marker_disposition(state_root, run_key, enabled, disposition)
         except Exception:
             # Never remove a published destination here.  Bash recovery/retention
             # must prove ownership before cleanup after a failed publication.
@@ -780,7 +829,13 @@ def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> t
         os.close(source_fd)
 
 
-def _verify(run_key: str, root: str, inspect_data: bytes, phase: str) -> None:
+def _verify(
+    run_key: str,
+    root: str,
+    inspect_data: bytes,
+    phase: str,
+    state_root: str = "",
+) -> None:
     if phase not in ("predecessor", "candidate", "rollback"):
         _fail("provider")
     inspect, previous = _inspect_records(inspect_data)
@@ -790,13 +845,44 @@ def _verify(run_key: str, root: str, inspect_data: bytes, phase: str) -> None:
     present, read_only, source = _provider_mount(
         inspect,
         enabled,
-        allow_external_source=phase == "rollback",
+        allow_external_source=phase in ("predecessor", "rollback"),
     )
+    identity: dict[str, Any] = {}
+    disposition = "none"
+    if state_root:
+        marker = _marker(state_root, run_key)
+        expected_phases = {
+            "predecessor": {"prepared"},
+            "candidate": {"verifying"},
+            "rollback": {"rolling-back"},
+        }
+        if marker["phase"] not in expected_phases[phase]:
+            _fail("recovery")
+        if marker["providerEnabled"] != enabled:
+            _fail("recovery")
+        disposition = marker["durableDisposition"]
+        if enabled and marker["durableDisposition"] not in ("created", "reused"):
+            _fail("recovery")
+        if not enabled and marker["durableDisposition"] != "none":
+            _fail("recovery")
     if enabled:
         if source is None:
             _fail("provider")
         if phase == "candidate" and source != HOST_CREDENTIAL_PATH:
             _fail("provider")
+        if phase == "predecessor" and previous is not None:
+            previous_enabled, _ = _provider_state(previous)
+            previous_mount = _provider_mount(
+                previous,
+                previous_enabled,
+                allow_external_source=True,
+            )
+            if (
+                previous_enabled != enabled
+                or _effective_tuple(previous) != _effective_tuple(inspect)
+                or previous_mount != (present, read_only, source)
+            ):
+                _fail("changed")
         if phase == "rollback" and previous is not None:
             _, previous_present, previous_source = (
                 _provider_mount(
@@ -808,15 +894,30 @@ def _verify(run_key: str, root: str, inspect_data: bytes, phase: str) -> None:
             if previous_present != present or previous_source != source:
                 _fail("provider")
         destination = _rooted(HOST_CREDENTIAL_PATH, root)
-        _, durable = _read_existing(destination)
+        durable_identity, durable = _read_existing(destination)
         _validate_credential(durable)
         tx = _transaction(_rooted(HOST_CREDENTIAL_PARENT, root), run_key)
         snapshot_path = os.path.join(tx, "snapshot")
-        if phase in ("candidate", "rollback"):
+        if phase in ("predecessor", "candidate", "rollback") and state_root:
             _validate_transaction(tx)
+            identity = _json(_read_private(os.path.join(tx, "identity.json")), "recovery")
+            _validate_identity(identity)
         snapshot = _read_private(snapshot_path)
+        if state_root and disposition == "created":
+            _verify_created_publication(tx, destination, identity, snapshot)
+        elif state_root and identity["durable"] != durable_identity:
+            _fail("changed")
         if snapshot != durable:
             _fail("changed")
+        if phase == "predecessor" and state_root:
+            if source is None:
+                _fail("changed")
+            source_identity, source_data = _read_existing(source, source=True)
+            if (
+                identity["predecessor"] != source_identity
+                or source_data != snapshot
+            ):
+                _fail("changed")
     _result(enabled, present, read_only, "verified")
 
 
@@ -971,7 +1072,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("command", choices=("check", "observe", "prepare", "verify", "finish", "retention-check"))
     parser.add_argument("--run-key", default="")
     parser.add_argument("--state-root", default="/var/lib/meet-test-vps-deploy")
-    parser.add_argument("--filesystem-root", "--root", dest="filesystem_root", default="")
     parser.add_argument("--phase", default="")
     parser.add_argument("--outcome", default="")
     parser.add_argument("--protected-path", action="append", default=[])
@@ -995,16 +1095,22 @@ def main(argv: Iterable[str] | None = None) -> int:
             _result(enabled, present, read_only, "observed")
         elif args.command == "prepare":
             _run_key(args.run_key)
-            _prepare(args.run_key, args.state_root, args.filesystem_root, _bounded_stdin(MAX_INSPECTION_BYTES))
+            _prepare(args.run_key, args.state_root, "", _bounded_stdin(MAX_INSPECTION_BYTES))
         elif args.command == "verify":
             _run_key(args.run_key)
-            _verify(args.run_key, args.filesystem_root, _bounded_stdin(MAX_INSPECTION_BYTES), args.phase)
+            _verify(
+                args.run_key,
+                "",
+                _bounded_stdin(MAX_INSPECTION_BYTES),
+                args.phase,
+                args.state_root,
+            )
         elif args.command == "finish":
             _run_key(args.run_key)
-            _finish(args.run_key, args.state_root, args.filesystem_root, args.outcome, _bounded_stdin(MAX_INSPECTION_BYTES))
+            _finish(args.run_key, args.state_root, "", args.outcome, _bounded_stdin(MAX_INSPECTION_BYTES))
         else:
             _retention_check(
-                args.filesystem_root,
+                "",
                 args.state_root,
                 args.protected_path,
                 args.protected_state,

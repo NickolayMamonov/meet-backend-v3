@@ -51,6 +51,10 @@ for text in \
   'gh attestation verify "oci://$IMAGE@$digest"' \
   'ssh-keyscan -T 5 -p "$PORT" "$HOST"' \
   'ssh-keygen -lf - -E sha256' \
+  'timeout 900s ssh' \
+  'timeout 60s scp' \
+  'ServerAliveInterval 5' \
+  'ServerAliveCountMax 2' \
   'scripts/deploy-test-vps-release.sh' \
   'scripts/test-vps-runtime-invariants.sh' \
   '[ "$status" -eq 86 ]' \
@@ -81,6 +85,10 @@ for text in \
   'APP_PUSH_MAINTENANCE_ENABLED' \
   'credentialMountReadOnly' \
   'verify_public_contract' \
+  'verify_production_env_settings' \
+  'validate_active_files_before_writers' \
+  'verify_predecessor_before_writers' \
+  'timeout 10s stat -Lc' \
   'PROVIDER_STATE_INVALID' \
   'RECOVERY_REQUIRED'; do
   require "$text" "$workflow_text$provider_deploy_text$provider_helper_text" \
@@ -102,6 +110,22 @@ helper_line=$(grep -nF 'timeout 30s python3 "$tooling/scripts/test-vps-provider-
 [ "$helper_line" -lt "$tooling_line" ]
 require '_verify_created_publication' "$provider_helper_text" \
   "created credential publication witness"
+require 'durable_disposition=$(timeout 5s jq -er' "$provider_deploy_text" \
+  "authoritative durable disposition"
+require '--state-root "$state_root" --phase predecessor' "$provider_deploy_text" \
+  "pre-writer provider revalidation"
+case "$provider_deploy_text" in
+  *durable_existed=*)
+    echo "shell durable existence probe remains authoritative" >&2
+    exit 1
+    ;;
+esac
+case "$provider_helper_text" in
+  *--filesystem-root*)
+    echo "production helper exposes a filesystem-root override" >&2
+    exit 1
+    ;;
+esac
 require 'timeout 1s sh -c' "$provider_deploy_text" "timeout capability preflight"
 ! grep -Fq 'meetings.json' "$workflow" ||
   { echo "raw meetings body capture remains in workflow" >&2; exit 1; }
@@ -171,6 +195,121 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+
+# shellcheck source=scripts/deploy-test-vps-provider-release.sh
+source "$provider_deploy"
+printf '%s\n' \
+  'APP_PUSH_PROVIDER_ENABLED=false' \
+  'APP_PUSH_PROJECT_ID=meeting-1d258' \
+  >"$tmp/valid.env"
+verify_production_env_settings "$tmp/valid.env"
+printf '%s\n' \
+  'APP_PUSH_PROVIDER_ENABLED=false' \
+  'APP_PUSH_PROVIDER_ENABLED=false' \
+  >"$tmp/duplicate.env"
+if verify_production_env_settings "$tmp/duplicate.env"; then
+  fail "duplicate relevant environment setting was accepted"
+fi
+for duplicate_key in \
+  APP_PUSH_PROVIDER_ENABLED \
+  APP_PUSH_DISCOVERY_ENABLED \
+  APP_PUSH_DISPATCH_ENABLED \
+  APP_PUSH_DIAGNOSTIC_ENABLED \
+  APP_PUSH_MAINTENANCE_ENABLED \
+  APP_PUSH_PROJECT_ID \
+  APP_PUSH_CREDENTIALS_FILE; do
+  printf '%s\n%s\n' \
+    "$duplicate_key=first" "$duplicate_key=first" \
+    >"$tmp/duplicate-$duplicate_key.env"
+  if verify_production_env_settings "$tmp/duplicate-$duplicate_key.env"; then
+    fail "same-value duplicate was accepted for $duplicate_key"
+  fi
+  printf '%s\n%s\n' \
+    "$duplicate_key=first" "$duplicate_key=second" \
+    >"$tmp/conflicting-$duplicate_key.env"
+  if verify_production_env_settings "$tmp/conflicting-$duplicate_key.env"; then
+    fail "conflicting duplicate was accepted for $duplicate_key"
+  fi
+done
+printf '%s\n' \
+  'APP_PUSH_PROVIDER_ENABLED=false' \
+  'SPRING_CONFIG_NAME=evil' \
+  >"$tmp/alternate.env"
+if verify_production_env_settings "$tmp/alternate.env"; then
+  fail "alternate Spring configuration setting was accepted"
+fi
+printf '%s\n' \
+  'APP_PUSH_PROVIDER_ENABLED=false' \
+  'JAVA_TOOL_OPTIONS=-Dspring.config.name=evil' \
+  >"$tmp/java-alternate.env"
+if verify_production_env_settings "$tmp/java-alternate.env"; then
+  fail "Java alternate Spring configuration setting was accepted"
+fi
+if python3 -B "$provider_helper" check --root "$tmp" >/dev/null 2>&1; then
+  fail "provider helper filesystem-root override remains exposed"
+fi
+
+active_fixture="$tmp/active-runtime"
+active_state="$tmp/active-state"
+mkdir -p "$active_state"
+printf 'predecessor\n' >"$active_fixture"
+# shellcheck disable=SC2034
+state="$active_state"
+active_compose="$active_fixture"
+active_runtime="$tmp/unused-runtime"
+snapshot_active_file "$active_fixture" compose
+validate_active_files_before_writers
+printf 'candidate\n' >"$active_state/candidate-compose"
+timeout 30s mv -- "$active_state/candidate-compose" "$active_fixture"
+record_candidate_active_file "$active_fixture" compose
+printf 'unknown\n' >"$active_state/unknown-compose"
+timeout 30s mv -- "$active_state/unknown-compose" "$active_fixture"
+set +e
+(restore_active_file "$active_fixture" compose) >"$tmp/restore-output" 2>&1
+restore_status=$?
+set -e
+[ "$restore_status" -ne 0 ]
+grep -Fq 'RECOVERY_REQUIRED' "$tmp/restore-output"
+missing_fixture="$tmp/missing-runtime"
+missing_state="$tmp/missing-state"
+mkdir -p "$missing_state"
+printf 'predecessor\n' >"$missing_fixture"
+state="$missing_state"
+active_compose="$missing_fixture"
+active_runtime="$tmp/unused-runtime"
+snapshot_active_file "$missing_fixture" compose
+rm -f -- "$missing_fixture"
+set +e
+(restore_active_file "$missing_fixture" compose) >"$tmp/missing-output" 2>&1
+missing_status=$?
+set -e
+[ "$missing_status" -ne 0 ]
+grep -Fq 'RECOVERY_REQUIRED' "$tmp/missing-output"
+modified_fixture="$tmp/modified-runtime"
+modified_state="$tmp/modified-state"
+mkdir -p "$modified_state"
+printf 'predecessor\n' >"$modified_fixture"
+state="$modified_state"
+active_compose="$modified_fixture"
+active_runtime="$tmp/unused-runtime"
+snapshot_active_file "$modified_fixture" compose
+printf 'modified\n' >"$modified_fixture"
+set +e
+(validate_active_files_before_writers) >"$tmp/modified-output" 2>&1
+modified_status=$?
+set -e
+[ "$modified_status" -ne 0 ]
+grep -Fq 'PROVIDER_STATE_INVALID' "$tmp/modified-output"
+if [ "$(uname -s)" = Linux ]; then
+  symlink_fixture="$active_state/symlink"
+  ln -s "$active_state/missing" "$symlink_fixture"
+  set +e
+  (snapshot_active_file "$symlink_fixture" compose) >"$tmp/symlink-output" 2>&1
+  symlink_status=$?
+  set -e
+  [ "$symlink_status" -ne 0 ]
+  grep -Fq 'PROVIDER_STATE_INVALID' "$tmp/symlink-output"
+fi
 
 for version in 1.2.0 1.2.1 1.10.0 2.0.0; do
   is_supported_test_vps_version "$version" ||

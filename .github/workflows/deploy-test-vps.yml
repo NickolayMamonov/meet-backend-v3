@@ -182,17 +182,17 @@ jobs:
           umask 077
           printf '%s\n' "$SSH_PRIVATE_KEY" >"$key_file"
           chmod 600 "$key_file"
-          ssh-keygen -y -P '' -f "$key_file" >/dev/null
+          timeout 30s ssh-keygen -y -P '' -f "$key_file" >/dev/null
           : >"$known_hosts"
           matched=0
           while IFS= read -r key_line; do
             fingerprint=$(printf '%s\n' "$key_line" |
-              ssh-keygen -lf - -E sha256 | awk '{print $2}')
+              timeout 30s ssh-keygen -lf - -E sha256 | timeout 30s awk '{print $2}')
             if [ "$fingerprint" = "$HOST_FINGERPRINT" ]; then
               printf '%s\n' "$key_line" >>"$known_hosts"
               matched=$((matched + 1))
             fi
-          done < <(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null)
+          done < <(timeout 30s ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null)
           [ "$matched" -eq 1 ]
           {
             echo 'Host test-vps'
@@ -206,6 +206,9 @@ jobs:
             echo '  StrictHostKeyChecking yes'
             echo '  ConnectTimeout 10'
             echo '  ConnectionAttempts 1'
+            echo '  ServerAliveInterval 5'
+            echo '  ServerAliveCountMax 2'
+            echo '  TCPKeepAlive yes'
           } >"$ssh_config"
           chmod 600 "$ssh_config"
           echo "SSH_CONFIG=$ssh_config" >>"$GITHUB_ENV"
@@ -238,7 +241,7 @@ jobs:
             sha256sum "${files[@]}" >SHA256SUMS
           )
           tar -C "$stage" -cf "$archive" "${files[@]}" SHA256SUMS
-          ssh -F "$SSH_CONFIG" test-vps bash -s -- "$PATH_ON_HOST" "$remote" <<'REMOTE'
+          timeout 60s ssh -F "$SSH_CONFIG" test-vps bash -s -- "$PATH_ON_HOST" "$remote" <<'REMOTE'
           set -euo pipefail
           root=$1
           stage=$2
@@ -248,8 +251,8 @@ jobs:
           [ ! -e "$stage" ]
           install -d -m 700 "$stage"
           REMOTE
-          scp -F "$SSH_CONFIG" "$archive" "test-vps:$remote/tooling.tar"
-          ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote" <<'REMOTE'
+          timeout 60s scp -F "$SSH_CONFIG" "$archive" "test-vps:$remote/tooling.tar"
+          timeout 120s ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote" <<'REMOTE'
           set -euo pipefail
           stage=$1
           tar -xf "$stage/tooling.tar" -C "$stage"
@@ -265,7 +268,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          target_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+          target_id=$(timeout 300s ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
           set -euo pipefail
           image=$1
@@ -291,7 +294,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          previous_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
+          previous_id=$(timeout 60s ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
           set -euo pipefail
           mapfile -t containers < <(timeout 30s docker ps -q \
             --filter label=com.docker.compose.project=meet-production \
@@ -304,7 +307,7 @@ jobs:
           [ "$previous_id" != "$TARGET_IMAGE_ID" ]
 
           set +e
-          output=$(ssh -F "$SSH_CONFIG" test-vps \
+          output=$(timeout 900s ssh -F "$SSH_CONFIG" test-vps \
             "$REMOTE_TOOLING/scripts/deploy-test-vps-provider-release.sh" \
             --root "$PATH_ON_HOST" \
             --base-compose "$REMOTE_TOOLING/docker-compose.production.yml" \
@@ -316,6 +319,10 @@ jobs:
             --mode rollback-drill 2>&1)
           status=$?
           set -e
+          if [ "$status" -eq 124 ] || [ "$status" -eq 143 ]; then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
           printf '%s\n' "$output"
           [ "$status" -eq 86 ]
           grep -Fq "candidate=ready image_id=$TARGET_IMAGE_ID" <<<"$output"
@@ -330,7 +337,7 @@ jobs:
             .outcome == "rolled-back"
           ' <<<"$provider_json" >/dev/null
 
-          restored_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
+          restored_id=$(timeout 60s ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
           set -euo pipefail
           mapfile -t containers < <(timeout 30s docker ps -q \
             --filter label=com.docker.compose.project=meet-production \
@@ -349,7 +356,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ssh -F "$SSH_CONFIG" test-vps \
+          if ! timeout 900s ssh -F "$SSH_CONFIG" test-vps \
             "$REMOTE_TOOLING/scripts/deploy-test-vps-provider-release.sh" \
             --root "$PATH_ON_HOST" \
             --base-compose "$REMOTE_TOOLING/docker-compose.production.yml" \
@@ -359,7 +366,10 @@ jobs:
             --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --public-url "$PUBLIC_URL" \
             --mode deploy |
-            tee "$RUNNER_TEMP/deploy-output.txt"
+            tee "$RUNNER_TEMP/deploy-output.txt"; then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
           grep -Fq "deployment=completed image_id=$TARGET_IMAGE_ID" \
             "$RUNNER_TEMP/deploy-output.txt"
           provider_json=$(grep -E '^\{"schemaVersion":1,' \
@@ -376,7 +386,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          runtime=$(ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+          runtime=$(timeout 180s ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$TARGET_IMAGE_ID" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
           set -euo pipefail
           expected_id=$1
@@ -482,7 +492,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ssh -F "$SSH_CONFIG" test-vps bash -s -- \
+          if ! timeout 300s ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$PATH_ON_HOST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
             "$REMOTE_TOOLING" <<'REMOTE'
           set -euo pipefail
@@ -683,3 +693,7 @@ jobs:
           kept=$((${#states[@]} - states_removed))
           echo "retention=applied tooling_removed=$tooling_removed states_removed=$states_removed states_kept=$kept"
           REMOTE
+          then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
