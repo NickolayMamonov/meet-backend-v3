@@ -365,7 +365,7 @@ def _validate_configuration_channels(
             for item in command
             for token in (
                 "--app.push",
-                "-Dapp.push",
+                "-dapp.push",
                 "spring.application.json",
                 "spring.config.location",
                 "spring.config.additional-location",
