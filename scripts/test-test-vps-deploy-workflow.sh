@@ -137,6 +137,12 @@ require 'timeout 1s sh -c' "$provider_deploy_text" "timeout capability preflight
   { echo "raw meetings body capture remains in workflow" >&2; exit 1; }
 ! grep -Fq '"$REMOTE_TOOLING/scripts/deploy-test-vps-release.sh"' "$workflow" ||
   { echo "workflow still invokes frozen legacy coordinator" >&2; exit 1; }
+require 'state_suffix=final-deploy' "$provider_deploy_text" \
+  "canonical final retention state suffix"
+require '[ "$mode" = rollback-drill ] && state_suffix=rollback-drill' \
+  "$provider_deploy_text" "canonical rollback-drill state suffix"
+require 'state=$state_root/$run_key-$state_suffix' "$provider_deploy_text" \
+  "retention-recognized provider state path"
 
 for frozen in \
   .github/workflows/promote-dev-digest-to-test-vps.yml \
@@ -209,6 +215,80 @@ printf '%s\n' \
   'APP_PUSH_PROJECT_ID=meeting-1d258' \
   >"$tmp/valid.env"
 verify_production_env_settings "$tmp/valid.env"
+
+candidate_source="$tmp/candidate-source.env"
+candidate_target="$tmp/candidate-target.env"
+candidate_previous="$tmp/candidate-previous.env"
+candidate_target_root="$tmp/candidate-target-root"
+candidate_previous_root="$tmp/candidate-previous-root"
+mkdir -p "$candidate_target_root" "$candidate_previous_root"
+python3 - "$candidate_source" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_bytes(
+    b"BACKEND_IMAGE=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:"
+    b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+    b"BACKEND_REVISION=0123456789abcdef0123456789abcdef01234567\n"
+    b"BACKEND_VERSION=1.2.0\n"
+    b"APP_PUSH_PROVIDER_ENABLED=false\n"
+)
+PY
+target_image='ghcr.io/nickolaymamonov/meet-backend-v3@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+target_revision=abcdef0123456789abcdef0123456789abcdef01
+target_version=1.3.0
+previous_image='ghcr.io/nickolaymamonov/meet-backend-v3@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+previous_revision=89abcdef0123456789abcdef0123456789abcdef
+previous_version=1.2.1
+make_environment_candidate "$candidate_source" "$candidate_target" \
+  "$target_image" "$target_revision" "$target_version"
+make_environment_candidate "$candidate_source" "$candidate_previous" \
+  "$previous_image" "$previous_revision" "$previous_version"
+grep -Fxq "BACKEND_IMAGE=$target_image" "$candidate_target"
+grep -Fxq "BACKEND_REVISION=$target_revision" "$candidate_target"
+grep -Fxq "BACKEND_VERSION=$target_version" "$candidate_target"
+grep -Fxq "BACKEND_IMAGE=$previous_image" "$candidate_previous"
+grep -Fxq "BACKEND_REVISION=$previous_revision" "$candidate_previous"
+grep -Fxq "BACKEND_VERSION=$previous_version" "$candidate_previous"
+cp "$candidate_source" "$candidate_target_root/.env.production"
+cp "$candidate_source" "$candidate_previous_root/.env.production"
+PRODUCTION_ROOT="$candidate_target_root" \
+  PRODUCTION_SCRIPTS_DIR="$ROOT_DIR/scripts" \
+  "$ROOT_DIR/scripts/update-production-release.sh" \
+  "$target_image" "$target_revision" "$target_version" >/dev/null
+PRODUCTION_ROOT="$candidate_previous_root" \
+  PRODUCTION_SCRIPTS_DIR="$ROOT_DIR/scripts" \
+  "$ROOT_DIR/scripts/update-production-release.sh" \
+  "$previous_image" "$previous_revision" "$previous_version" >/dev/null
+cmp -s "$candidate_target" "$candidate_target_root/.env.production"
+cmp -s "$candidate_previous" "$candidate_previous_root/.env.production"
+python3 - "$tmp/crlf-source.env" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_bytes(
+    b"BACKEND_IMAGE=old\r\n"
+    b"BACKEND_REVISION=0123456789abcdef0123456789abcdef01234567\r\n"
+    b"BACKEND_VERSION=1.2.0\r\n"
+)
+PY
+make_environment_candidate "$tmp/crlf-source.env" "$tmp/crlf-candidate.env" \
+  "$target_image" "$target_revision" "$target_version"
+python3 - "$tmp/crlf-candidate.env" "$target_image" "$target_revision" \
+  "$target_version" <<'PY'
+import pathlib
+import sys
+
+path, image, revision, version = sys.argv[1:]
+expected = (
+    f"BACKEND_IMAGE={image}\r\n"
+    f"BACKEND_REVISION={revision}\r\n"
+    f"BACKEND_VERSION={version}\r\n"
+).encode()
+if pathlib.Path(path).read_bytes() != expected:
+    raise SystemExit(1)
+PY
+
 printf '%s\n' \
   'APP_PUSH_PROVIDER_ENABLED=false' \
   'APP_PUSH_PROVIDER_ENABLED=false' \

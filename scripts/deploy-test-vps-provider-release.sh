@@ -266,8 +266,9 @@ for line in data.splitlines(keepends=True):
         if key in seen:
             raise SystemExit(1)
         seen.add(key)
-        newline = "\n" if line.endswith("\n") else ""
-        lines.append(replacements[key] + newline)
+        line_without_ending = line.rstrip("\r\n")
+        line_ending = line[len(line_without_ending):]
+        lines.append(f"{key}={replacements[key]}{line_ending}")
     else:
         lines.append(line)
 if seen != set(replacements):
@@ -275,7 +276,11 @@ if seen != set(replacements):
 path = pathlib.Path(destination)
 fd = os.open(
     path,
-    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_BINARY", 0),
     0o600,
 )
 try:
@@ -626,7 +631,9 @@ active_compose=/var/lib/meet-production/active-compose.yml
 active_runtime=/var/lib/meet-production/active-runtime.override.yml
 smtp_pointer=$state_root/.smtp-transaction.current
 provider_pointer=$state_root/.provider-transaction.current
-state=$state_root/$run_key-$mode
+state_suffix=final-deploy
+[ "$mode" = rollback-drill ] && state_suffix=rollback-drill
+state=$state_root/$run_key-$state_suffix
 install -d -m 700 "$state_root"
 exec 9>"$state_root/.deploy.lock"
 flock -n 9 || fail "another test VPS deployment is active"
