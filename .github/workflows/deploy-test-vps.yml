@@ -454,7 +454,8 @@ jobs:
               .postgresVolume == "meet-production_postgres_data"
             ' <<<"$runtime" >/dev/null
 
-          probe_output=$(timeout 45s "$tooling/scripts/test-vps-public-probe.sh" \
+          probe_output=$(timeout 45s \
+            "$GITHUB_WORKSPACE/scripts/test-vps-public-probe.sh" \
             "$PUBLIC_URL")
           grep -Fxq 'meetings_status=200' <<<"$probe_output"
           grep -Fxq 'meetings_array=true' <<<"$probe_output"

@@ -135,7 +135,6 @@ def _result(enabled: bool, present: bool, read_only: bool, outcome: str) -> None
                 "outcome": outcome,
             },
             separators=(",", ":"),
-            sort_keys=True,
         )
     )
 
@@ -1231,14 +1230,18 @@ def _verify(
             ):
                 _fail("changed")
         if phase == "rollback" and previous is not None:
-            _, previous_present, previous_source = (
+            previous_present, previous_read_only, previous_source = (
                 _provider_mount(
                     previous,
                     _provider_state(previous)[0],
                     allow_external_source=True,
                 )
             )
-            if previous_present != present or previous_source != source:
+            if (
+                previous_present != present
+                or previous_read_only != read_only
+                or previous_source != source
+            ):
                 _fail("provider")
         destination = _rooted(HOST_CREDENTIAL_PATH, root)
         durable_identity, durable = _read_existing(destination)

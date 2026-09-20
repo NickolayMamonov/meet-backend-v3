@@ -167,8 +167,10 @@ esac
 require 'timeout 1s sh -c' "$provider_deploy_text" "timeout capability preflight"
 ! grep -Fq 'meetings.json' "$workflow" ||
   { echo "raw meetings body capture remains in workflow" >&2; exit 1; }
-require 'probe_output=$(timeout 45s "$tooling/scripts/test-vps-public-probe.sh"' \
+require 'probe_output=$(timeout 45s' \
   "$workflow_text" "actual bounded workflow public probe"
+require '"$GITHUB_WORKSPACE/scripts/test-vps-public-probe.sh"' \
+  "$workflow_text" "workflow public probe script"
 ! grep -Fq '"$REMOTE_TOOLING/scripts/deploy-test-vps-release.sh"' "$workflow" ||
   { echo "workflow still invokes frozen legacy coordinator" >&2; exit 1; }
 require 'state_suffix=final-deploy' "$provider_deploy_text" \
