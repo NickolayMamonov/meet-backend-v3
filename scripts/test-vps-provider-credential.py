@@ -18,6 +18,11 @@ import stat
 import sys
 from typing import Any, Iterable
 
+try:
+    import fcntl
+except ImportError:  # The production cleanup protocol requires Linux.
+    fcntl = None
+
 SCHEMA_VERSION = 1
 MAX_INSPECTION_BYTES = 8 * 1024 * 1024
 MAX_CREDENTIAL_BYTES = 1024 * 1024
@@ -63,6 +68,12 @@ class ProviderError(Exception):
 
 def _fail(category: str) -> None:
     raise ProviderError(ERRORS[category])
+
+
+def _lock_directory(fd: int) -> None:
+    if fcntl is None:
+        _fail("prerequisite")
+    fcntl.flock(fd, fcntl.LOCK_EX)
 
 
 def _bounded_stdin(limit: int) -> bytes:
@@ -278,6 +289,10 @@ def _same_identity(left: dict[str, int], right: dict[str, int]) -> bool:
     return left == right
 
 
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
 def _validate_credential(data: bytes) -> None:
     if len(data) > MAX_CREDENTIAL_BYTES:
         _fail("credential")
@@ -315,12 +330,9 @@ def _env_entries(inspect: dict[str, Any]) -> list[tuple[str, str]]:
     return entries
 
 
-def _provider_state(inspect: dict[str, Any]) -> tuple[bool, dict[str, str]]:
-    config = inspect.get("Config")
-    if not isinstance(config, dict):
-        _fail("provider")
-    entries = _env_entries(inspect)
-    values = dict(entries)
+def _validate_configuration_channels(
+    config: dict[str, Any], entries: list[tuple[str, str]]
+) -> None:
     for key, value in entries:
         normalized = key.upper().replace("-", "_").replace(".", "_")
         if normalized in PUSH_KEYS and key != normalized:
@@ -363,6 +375,22 @@ def _provider_state(inspect: dict[str, Any]) -> tuple[bool, dict[str, str]]:
             )
         ):
             _fail("provider")
+
+
+def _image_admission(inspect: dict[str, Any]) -> None:
+    config = inspect.get("Config")
+    if not isinstance(config, dict):
+        _fail("provider")
+    _validate_configuration_channels(config, _env_entries(inspect))
+
+
+def _provider_state(inspect: dict[str, Any]) -> tuple[bool, dict[str, str]]:
+    config = inspect.get("Config")
+    if not isinstance(config, dict):
+        _fail("provider")
+    entries = _env_entries(inspect)
+    _validate_configuration_channels(config, entries)
+    values = dict(entries)
     enabled_value = values.get("APP_PUSH_PROVIDER_ENABLED", "false").strip().lower()
     if enabled_value not in ("true", "false"):
         _fail("provider")
@@ -747,6 +775,185 @@ def _verify_created_publication(
     return durable_identity
 
 
+def _witnessed_unlink(
+    directory_fd: int,
+    name: str,
+    *,
+    expected_identity: dict[str, int] | None = None,
+    expected_data: bytes | None = None,
+    uid: int,
+    gid: int,
+    mode: int,
+    link_count: int,
+) -> None:
+    try:
+        path_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        _fail("recovery")
+    if (
+        not stat.S_ISREG(path_info.st_mode)
+        or path_info.st_uid != uid
+        or path_info.st_gid != gid
+        or stat.S_IMODE(path_info.st_mode) != mode
+        or path_info.st_nlink != link_count
+        or (expected_identity is not None and _identity(path_info) != expected_identity)
+    ):
+        _fail("recovery")
+    try:
+        entry_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+    except OSError:
+        _fail("recovery")
+    try:
+        opened = os.fstat(entry_fd)
+        if (
+            _identity(opened) != _identity(path_info)
+            or opened.st_uid != uid
+            or opened.st_gid != gid
+            or stat.S_IMODE(opened.st_mode) != mode
+            or opened.st_nlink != link_count
+        ):
+            _fail("recovery")
+        _acl_is_safe(
+            f"/proc/self/fd/{entry_fd}",
+            follow_symlinks=True,
+            category="recovery",
+        )
+        if expected_data is not None:
+            os.lseek(entry_fd, 0, os.SEEK_SET)
+            data = bytearray()
+            while len(data) <= MAX_CREDENTIAL_BYTES:
+                chunk = os.read(
+                    entry_fd,
+                    min(65536, MAX_CREDENTIAL_BYTES + 1 - len(data)),
+                )
+                if not chunk:
+                    break
+                data.extend(chunk)
+            if bytes(data) != expected_data:
+                _fail("recovery")
+        final_fd_info = os.fstat(entry_fd)
+        final_path_info = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _identity(final_fd_info) != _identity(opened)
+            or _identity(final_path_info) != _identity(final_fd_info)
+            or final_fd_info.st_uid != uid
+            or final_fd_info.st_gid != gid
+            or stat.S_IMODE(final_fd_info.st_mode) != mode
+            or final_path_info.st_uid != uid
+            or final_path_info.st_gid != gid
+            or stat.S_IMODE(final_path_info.st_mode) != mode
+            or final_fd_info.st_nlink != link_count
+            or final_path_info.st_nlink != link_count
+        ):
+            _fail("recovery")
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError:
+            _fail("recovery")
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        _fail("recovery")
+    finally:
+        os.close(entry_fd)
+
+
+def _remove_created_destination(
+    destination: str,
+    expected_identity: dict[str, int],
+    snapshot: bytes,
+) -> None:
+    parent, name = os.path.split(destination)
+    if not parent or not name or "/" in name:
+        _fail("recovery")
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        _lock_directory(parent_fd)
+        _witnessed_unlink(
+            parent_fd,
+            name,
+            expected_identity=expected_identity,
+            expected_data=snapshot,
+            uid=0,
+            gid=10001,
+            mode=0o440,
+            link_count=2,
+        )
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _remove_transaction(
+    tx: str,
+    *,
+    outcome: str,
+    disposition: str,
+) -> None:
+    parent, name = os.path.split(tx)
+    if not parent or not name or "/" in name:
+        _fail("recovery")
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        _lock_directory(parent_fd)
+        tx_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(tx_info.st_mode) or tx_info.st_uid != 0 or stat.S_IMODE(tx_info.st_mode) != 0o700:
+            _fail("recovery")
+        tx_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            _lock_directory(tx_fd)
+            names = set(os.listdir(tx_fd))
+            allowed = {"snapshot", "identity.json"}
+            if disposition == "created":
+                allowed.add("publication")
+            if not names.issubset(allowed) or not {"snapshot", "identity.json"}.issubset(names):
+                _fail("recovery")
+            for child in ("identity.json", "snapshot", "publication"):
+                if child not in names:
+                    continue
+                child_gid = 10001 if child == "publication" else 0
+                child_mode = 0o440 if child == "publication" else 0o600
+                child_links = 2 if child == "publication" and outcome == "committed" else 1
+                _witnessed_unlink(
+                    tx_fd,
+                    child,
+                    uid=0,
+                    gid=child_gid,
+                    mode=child_mode,
+                    link_count=child_links,
+                )
+            if os.listdir(tx_fd):
+                _fail("recovery")
+        finally:
+            os.close(tx_fd)
+        final_tx_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_inode(final_tx_info, tx_info):
+            _fail("recovery")
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> tuple[bool, bool, bool]:
     inspect, previous = _inspect_records(inspect_data)
     enabled, _ = _provider_state(inspect)
@@ -975,12 +1182,12 @@ def _finish(run_key: str, state_root: str, root: str, outcome: str, inspect_data
                 if source_identity == durable_identity:
                     _fail("recovery")
         if outcome == "rolled-back" and disposition == "created":
-            os.unlink(destination)
-        for name in ("identity.json", "snapshot", "publication"):
-            path = os.path.join(tx, name)
-            if os.path.lexists(path):
-                os.unlink(path)
-        os.rmdir(tx)
+            _remove_created_destination(destination, durable_identity, snapshot)
+        _remove_transaction(
+            tx,
+            outcome=outcome,
+            disposition=disposition,
+        )
     _result(enabled, present, read_only, outcome)
 
 
@@ -1067,15 +1274,150 @@ def _retention_check(
     _result(False, False, False, "retention-safe")
 
 
+RETENTION_CHILDREN = frozenset(
+    {
+        "terminal.json",
+        "previous-active-compose.yml",
+        "previous-active-compose.identity",
+        "previous-active-runtime.yml",
+        "previous-active-runtime.identity",
+        "candidate-active-compose.yml",
+        "candidate-active-compose.identity",
+        "candidate-active-runtime.yml",
+        "candidate-active-runtime.identity",
+        "had-active-compose",
+        "had-active-runtime",
+        "previous-image",
+        "previous-image-id",
+        "previous-revision",
+        "previous-version",
+        "previous-runtime-config-hash",
+        "target-runtime.override.yml",
+        "predecessor.json",
+        "candidate.json",
+        "final.json",
+        "rollback.json",
+        "frozen-assets.json",
+        "config.env.production",
+        "config.env.production.identity",
+        "config.env.target",
+        "config.env.target.identity",
+        "config.env.previous",
+        "config.env.previous.identity",
+        "config.base-compose.yml",
+        "config.base-compose.yml.identity",
+    }
+)
+
+
+def _retention_delete(state_root: str, state_path: str) -> None:
+    if (
+        not isinstance(state_root, str)
+        or not state_root.startswith("/")
+        or not isinstance(state_path, str)
+        or not state_path.startswith("/")
+    ):
+        _fail("recovery")
+    name = os.path.basename(state_path)
+    if not re.fullmatch(
+        r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)",
+        name,
+    ):
+        _fail("recovery")
+    _run_key(name.rsplit("-", 2)[0])
+    if os.path.lexists(state_root) and (
+        os.path.islink(state_root) or not os.path.isdir(state_root)
+    ):
+        _fail("recovery")
+    parent_fd = os.open(
+        state_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        _lock_directory(parent_fd)
+        if (
+            os.path.dirname(os.path.normpath(state_path)) != os.path.normpath(state_root)
+        ):
+            _fail("recovery")
+        state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(state_info.st_mode)
+            or state_info.st_uid != 0
+            or stat.S_IMODE(state_info.st_mode) != 0o700
+        ):
+            _fail("recovery")
+        state_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            _lock_directory(state_fd)
+            names = set(os.listdir(state_fd))
+            if not names.difference(RETENTION_CHILDREN):
+                for child in sorted(names):
+                    child_info = os.stat(
+                        child,
+                        dir_fd=state_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        not stat.S_ISREG(child_info.st_mode)
+                        or child_info.st_uid != 0
+                        or stat.S_IMODE(child_info.st_mode) != 0o600
+                        or child_info.st_nlink != 1
+                    ):
+                        _fail("recovery")
+                    _witnessed_unlink(
+                        state_fd,
+                        child,
+                        uid=0,
+                        gid=0,
+                        mode=0o600,
+                        link_count=1,
+                    )
+            final_state_info = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not _same_inode(final_state_info, state_info):
+                _fail("recovery")
+        finally:
+            os.close(state_fd)
+        try:
+            os.rmdir(name, dir_fd=parent_fd)
+        except OSError as error:
+            if error.errno != errno.ENOTEMPTY:
+                _fail("recovery")
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    _result(False, False, False, "retention-safe")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("command", choices=("check", "observe", "prepare", "verify", "finish", "retention-check"))
+    parser.add_argument(
+        "command",
+        choices=(
+            "check",
+            "check-image",
+            "observe",
+            "prepare",
+            "verify",
+            "finish",
+            "retention-check",
+            "retention-delete",
+        ),
+    )
     parser.add_argument("--run-key", default="")
     parser.add_argument("--state-root", default="/var/lib/meet-test-vps-deploy")
     parser.add_argument("--phase", default="")
     parser.add_argument("--outcome", default="")
     parser.add_argument("--protected-path", action="append", default=[])
     parser.add_argument("--protected-state", action="append", default=[])
+    parser.add_argument("--retention-state", default="")
     return parser
 
 
@@ -1084,6 +1426,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         args = _parser().parse_args(list(argv) if argv is not None else None)
         if args.command == "check":
             _check()
+        elif args.command == "check-image":
+            _image_admission(_inspect(_bounded_stdin(MAX_INSPECTION_BYTES)))
+            _result(False, False, False, "checked")
         elif args.command == "observe":
             inspect = _inspect(_bounded_stdin(MAX_INSPECTION_BYTES))
             enabled, _ = _provider_state(inspect)
@@ -1108,13 +1453,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "finish":
             _run_key(args.run_key)
             _finish(args.run_key, args.state_root, "", args.outcome, _bounded_stdin(MAX_INSPECTION_BYTES))
-        else:
+        elif args.command == "retention-check":
             _retention_check(
                 "",
                 args.state_root,
                 args.protected_path,
                 args.protected_state,
             )
+        else:
+            _retention_delete(args.state_root, args.retention_state)
         return 0
     except ProviderError as exc:
         sys.stderr.write(exc.category + "\n")

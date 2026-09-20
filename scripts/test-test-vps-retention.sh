@@ -79,6 +79,7 @@ for index in $(seq 1 12); do
   install -d -m 700 "$state"
   printf '{"schemaVersion":1,"runKey":"%s-1","outcome":"committed","providerEnabled":false}\n' \
     "$index" >"$state/terminal.json"
+  chmod 600 "$state/terminal.json"
   touch -d "@$((1800000000 - index))" "$state"
 done
 install -d -m 700 "$state_root/12-1-final-deploy/protected-input"
@@ -90,33 +91,41 @@ install -d -m 700 "$state_root/12-1-final-deploy-shadow"
 install -d -m 700 "$state_root/14-1-final-deploy"
 printf '{"schemaVersion":1,"runKey":"14-1","outcome":"committed","providerEnabled":false}\n' \
   >"$state_root/14-1-final-deploy/terminal.json"
+chmod 600 "$state_root/14-1-final-deploy/terminal.json"
 printf 'unknown\n' >"$state_root/14-1-final-deploy/unknown.txt"
 touch -d '@1799999980' "$state_root/14-1-final-deploy"
 install -d -m 700 "$state_root/17-1-final-deploy"
 printf '{"schemaVersion":1,"runKey":"17-1","outcome":"committed","providerEnabled":false}\n' \
   >"$state_root/17-1-final-deploy/terminal.json"
+chmod 600 "$state_root/17-1-final-deploy/terminal.json"
 printf 'unknown-before-race\n' >"$state_root/17-1-final-deploy/unknown-before-race.txt"
 touch -d '@1799999970' "$state_root/17-1-final-deploy"
 
-real_rmdir=$(command -v rmdir)
-cat >"$fake_bin/rmdir" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-path=\${1:-}
-if [ "\$path" = -- ]; then
-  path=\${2:-}
-fi
-if [ "\${path##*/}" = 17-1-final-deploy ] &&
-  [ ! -e "\$path/concurrent-unknown.txt" ]; then
-  printf 'unknown-concurrent\n' >"\$path/concurrent-unknown.txt"
-fi
-exec "$real_rmdir" "\$@"
-EOF
-chmod 700 "$fake_bin/rmdir"
-
 tooling_root="$production_root/.test-vps-tooling-1-1"
 install -d -m 700 "$tooling_root/scripts"
-cp scripts/test-vps-provider-credential.py "$tooling_root/scripts/"
+cp scripts/test-vps-provider-credential.py \
+  "$tooling_root/scripts/provider-credential-real.py"
+cat >"$tooling_root/scripts/test-vps-provider-credential.py" <<EOF
+#!/usr/bin/env python3
+import pathlib
+import runpy
+import sys
+
+arguments = sys.argv[1:]
+if arguments and arguments[0] == "retention-delete":
+    state_index = arguments.index("--retention-state") + 1
+    state_path = arguments[state_index]
+    if (
+        state_path == "$state_root/17-1-final-deploy"
+        and not pathlib.Path("$state_root/17-1-final-deploy/concurrent-unknown.txt").exists()
+    ):
+        pathlib.Path("$state_root/17-1-final-deploy/concurrent-unknown.txt").write_text(
+            "unknown-concurrent\n", encoding="utf-8"
+        )
+module = runpy.run_path("$tooling_root/scripts/provider-credential-real.py")
+raise SystemExit(module["main"](arguments))
+EOF
+chmod 700 "$tooling_root/scripts/test-vps-provider-credential.py"
 PATH="$fake_bin:$PATH" bash "$remote_script" \
   "$production_root" 1 1 "$tooling_root"
 
@@ -134,6 +143,42 @@ PATH="$fake_bin:$PATH" bash "$remote_script" \
 [ -f "$state_root/17-1-final-deploy/concurrent-unknown.txt" ]
 [ ! -e "$tooling_root" ]
 
+unresolved_state="$state_root/19-1-final-deploy"
+install -d -m 700 "$unresolved_state"
+printf 'pre-marker-snapshot\n' >"$unresolved_state/config.env.production"
+chmod 600 "$unresolved_state/config.env.production"
+set +e
+unresolved_output=$(bash "$remote_script" \
+  "$production_root" 1 1 "$production_root/.missing-tooling" 2>&1)
+unresolved_status=$?
+set -e
+[ "$unresolved_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$unresolved_output"
+[ -d "$unresolved_state" ]
+rm -r -- "$unresolved_state"
+
+hard_state="$state_root/18-1-final-deploy"
+install -d -m 700 "$hard_state"
+hard_witness="$fixture_root/operator-owned-terminal.json"
+printf '{"schemaVersion":1,"runKey":"18-1","outcome":"committed","providerEnabled":false}\n' \
+  >"$hard_witness"
+rm -f -- "$hard_state/terminal.json"
+ln "$hard_witness" "$hard_state/terminal.json"
+touch -d '@1799999960' "$hard_state"
+chmod 600 "$hard_witness"
+set +e
+hard_output=$(python3 scripts/test-vps-provider-credential.py \
+  retention-delete --state-root "$state_root" \
+  --retention-state "$hard_state" 2>&1)
+hard_status=$?
+set -e
+[ "$hard_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$hard_output"
+[ -d "$hard_state" ]
+[ -f "$hard_witness" ]
+[ "$(stat -c '%d:%i' "$hard_state/terminal.json")" = "$(stat -c '%d:%i' "$hard_witness")" ]
+rm -r -- "$hard_state" "$hard_witness"
+
 hang_bin="$fixture_root/hang-bin"
 install -d -m 700 "$hang_bin"
 real_timeout=$(command -v timeout)
@@ -149,10 +194,21 @@ state="$state_root/16-1-final-deploy"
 install -d -m 700 "$state"
 printf '{"schemaVersion":1,"runKey":"16-1","outcome":"committed","providerEnabled":false}\n' \
   >"$state/terminal.json"
+chmod 600 "$state/terminal.json"
 touch -d '@1799999980' "$state"
 tooling_root="$production_root/.test-vps-tooling-1-1"
 install -d -m 700 "$tooling_root/scripts"
-cp scripts/test-vps-provider-credential.py "$tooling_root/scripts/"
+cp scripts/test-vps-provider-credential.py \
+  "$tooling_root/scripts/provider-credential-real.py"
+cat >"$tooling_root/scripts/test-vps-provider-credential.py" <<EOF
+#!/usr/bin/env python3
+import runpy
+import sys
+
+module = runpy.run_path("$tooling_root/scripts/provider-credential-real.py")
+raise SystemExit(module["main"](sys.argv[1:]))
+EOF
+chmod 700 "$tooling_root/scripts/test-vps-provider-credential.py"
 set +e
 timeout_output=$(PATH="$hang_bin:$fake_bin:$PATH" bash "$remote_script" \
   "$production_root" 1 1 "$tooling_root" 2>&1)
@@ -171,10 +227,21 @@ state="$state_root/15-1-final-deploy"
 install -d -m 700 "$state"
 printf '{"schemaVersion":1,"runKey":"15-1","outcome":"committed","providerEnabled":false}\n' \
   >"$state/terminal.json"
+chmod 600 "$state/terminal.json"
 touch -d '@1799999970' "$state"
 tooling_root="$production_root/.test-vps-tooling-1-1"
 install -d -m 700 "$tooling_root/scripts"
-cp scripts/test-vps-provider-credential.py "$tooling_root/scripts/"
+cp scripts/test-vps-provider-credential.py \
+  "$tooling_root/scripts/provider-credential-real.py"
+cat >"$tooling_root/scripts/test-vps-provider-credential.py" <<EOF
+#!/usr/bin/env python3
+import runpy
+import sys
+
+module = runpy.run_path("$tooling_root/scripts/provider-credential-real.py")
+raise SystemExit(module["main"](sys.argv[1:]))
+EOF
+chmod 700 "$tooling_root/scripts/test-vps-provider-credential.py"
 PATH="$fake_bin:$PATH" bash "$remote_script" \
   "$production_root" 1 1 "$tooling_root"
 [ ! -e "$state_root/15-1-final-deploy" ]

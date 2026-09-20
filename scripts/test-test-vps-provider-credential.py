@@ -102,6 +102,45 @@ class ProviderCredentialTests(unittest.TestCase):
             with self.assertRaises(helper.ProviderError):
                 helper._provider_state(value)
 
+    def test_target_image_channels_are_checked_before_runtime_writers(self) -> None:
+        image = inspection(False)
+        image["Config"]["Entrypoint"] = ["java", "-jar", "app.jar"]
+        helper._image_admission(image)
+        writer_count = 0
+        cases = (
+            ("APP_PUSH_PROVIDER_ENABLED=false", "duplicate"),
+            ("APP-PUSH-DISPATCH-ENABLED=false", "alias"),
+            ("SPRING_CONFIG_NAME=evil", "alternate environment"),
+            ("JAVA_TOOL_OPTIONS=-Dspring.config.name=evil", "alternate Java environment"),
+        )
+        for entry, label in cases:
+            candidate = inspection(False)
+            candidate["Config"]["Entrypoint"] = ["java", "-jar", "app.jar"]
+            candidate["Config"]["Env"].append(entry)
+            if label == "duplicate":
+                candidate["Config"]["Env"].append(entry)
+            try:
+                helper._image_admission(candidate)
+            except helper.ProviderError:
+                pass
+            else:
+                writer_count += 1
+                self.fail(f"{label} image admission reached a writer")
+        for command in (
+            ["java", "-Dapp.push.provider.enabled=true", "-jar", "app.jar"],
+            ["java", "--spring.config.name=evil", "-jar", "app.jar"],
+        ):
+            candidate = inspection(False)
+            candidate["Config"]["Entrypoint"] = command
+            try:
+                helper._image_admission(candidate)
+            except helper.ProviderError:
+                pass
+            else:
+                writer_count += 1
+                self.fail("alternate command image admission reached a writer")
+        self.assertEqual(0, writer_count)
+
     def test_explicit_blank_project_is_rejected(self) -> None:
         value = inspection(False)
         value["Config"]["Env"] = [

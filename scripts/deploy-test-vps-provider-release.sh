@@ -656,8 +656,6 @@ timeout 30s python3 "$provider_helper" retention-check \
 
 [ ! -e "$state" ] || fail "run state already exists"
 install -d -m 700 "$state"
-snapshot_configuration
-validate_configuration_boundary "$state/config.env.production"
 
 compose() {
   timeout 30s bash -c '
@@ -716,6 +714,13 @@ jq -e '
 ' <<<"$provider_observed" >/dev/null || fail "PROVIDER_STATE_INVALID"
 provider_enabled=$(jq -r '.providerEnabled' <<<"$provider_observed")
 
+# Register the transaction before creating any private snapshot or identity
+# file.  An interrupted pre-marker snapshot is otherwise indistinguishable
+# from an abandoned ordinary run directory to retention.
+write_provider_marker preparing none
+
+snapshot_configuration
+validate_configuration_boundary "$state/config.env.production"
 printf '%s\n' "$previous_image" >"$state/previous-image"
 printf '%s\n' "$previous_id" >"$state/previous-image-id"
 printf '%s\n' "$previous_revision" >"$state/previous-revision"
@@ -935,6 +940,11 @@ target_id=$(docker_image_inspect "$image" --format '{{.Id}}') ||
 if [ "$mode" = rollback-drill ] && [ "$target_id" = "$previous_id" ]; then
   fail "rollback drill requires a target image distinct from the predecessor"
 fi
+target_image_inspect=$(docker_image_inspect "$image" 2>/dev/null) ||
+  fail "PROVIDER_STATE_INVALID"
+printf '%s' "$target_image_inspect" |
+  timeout 30s python3 "$provider_helper" check-image >/dev/null ||
+  fail "PROVIDER_STATE_INVALID"
 run_safety_hook predecessor "$previous_image" "$previous_id" \
   "$previous_revision" "$previous_version" "$previous_runtime_hash"
 
@@ -982,8 +992,6 @@ target_config=$(
     -f "$state/config.base-compose.yml" -f "$state/target-runtime.override.yml" \
     config --format json 2>/dev/null
 ) || fail "PROVIDER_STATE_INVALID"
-target_image_inspect=$(docker_image_inspect "$image" 2>/dev/null) ||
-  fail "PROVIDER_STATE_INVALID"
 printf '%s\n%s\n%s\n' "$previous_inspect" "$target_image_inspect" "$target_config" |
   jq -s -e '
     def envmap:
@@ -992,7 +1000,10 @@ printf '%s\n%s\n%s\n' "$previous_inspect" "$target_image_inspect" "$target_confi
           if ($entry | type) != "string" or ($entry | contains("=") | not)
           then error("invalid environment")
           else ($entry | index("=")) as $i |
-            . + {($entry[0:$i]): $entry[($i + 1):]}
+            ($entry[0:$i]) as $key |
+            if has($key) then error("duplicate environment") else
+              . + {($key): $entry[($i + 1):]}
+            end
           end)
       elif type == "object" then
         reduce to_entries[] as $entry ({};
@@ -1037,7 +1048,6 @@ make_environment_candidate "$state/config.env.production" \
   "$state/config.env.previous" "$previous_image" "$previous_revision" \
   "$previous_version" || fail "PROVIDER_STATE_INVALID"
 
-write_provider_marker preparing none
 printf '%s' "$previous_inspect" |
   timeout 30s python3 "$provider_helper" prepare \
     --run-key "$run_key" --state-root "$state_root" >/dev/null ||

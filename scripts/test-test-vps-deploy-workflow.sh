@@ -88,8 +88,10 @@ for text in \
   'verify_production_env_settings' \
   'snapshot_configuration' \
   'validate_configuration_boundary' \
-  'owned_state_children' \
   'delete_owned_state' \
+  'check-image' \
+  'retention-delete' \
+  '_witnessed_unlink' \
   'os.replace' \
   'O_NOFOLLOW' \
   'validate_active_files_before_writers' \

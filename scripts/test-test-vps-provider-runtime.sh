@@ -523,6 +523,129 @@ except helper.ProviderError as error:
     assert error.category == "RECOVERY_REQUIRED"
 else:
     raise AssertionError("tampered publication witness was accepted")
+cleanup_transaction("witness-tamper")
+
+def prepare_finalizing(run_key: str) -> dict:
+    prepare_marker(run_key)
+    helper._prepare(run_key, str(state), "", json.dumps(predecessor).encode())
+    marker.unlink()
+    helper._write_private(
+        str(marker),
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "runKey": run_key,
+                "phase": "finalizing",
+                "providerEnabled": True,
+                "durableDisposition": "created",
+            },
+            separators=(",", ":"),
+        ).encode(),
+        0o600,
+    )
+    return inspect(pathlib.Path(helper.HOST_CREDENTIAL_PATH))
+
+def finish_and_remove(run_key: str, candidate: dict) -> None:
+    helper._finish(
+        run_key,
+        str(state),
+        "",
+        "committed",
+        json.dumps(candidate).encode(),
+    )
+    marker.unlink()
+    assert pathlib.Path(helper.HOST_CREDENTIAL_PATH).exists()
+    cleanup_transaction(run_key)
+
+candidate = prepare_finalizing("cleanup-hard-link")
+hard_link = parent / "operator-hard-link"
+os.link(helper.HOST_CREDENTIAL_PATH, hard_link)
+expect_provider_error(
+    lambda: helper._finish(
+        "cleanup-hard-link",
+        str(state),
+        "",
+        "committed",
+        json.dumps(candidate).encode(),
+    ),
+    "RECOVERY_REQUIRED",
+)
+assert hard_link.exists()
+hard_link.unlink()
+cleanup_transaction("cleanup-hard-link")
+
+candidate = prepare_finalizing("cleanup-metadata")
+os.chmod(helper.HOST_CREDENTIAL_PATH, 0o600)
+expect_provider_error(
+    lambda: helper._finish(
+        "cleanup-metadata",
+        str(state),
+        "",
+        "committed",
+        json.dumps(candidate).encode(),
+    ),
+    "RECOVERY_REQUIRED",
+)
+os.chmod(helper.HOST_CREDENTIAL_PATH, 0o440)
+cleanup_transaction("cleanup-metadata")
+
+candidate = prepare_finalizing("cleanup-replacement")
+os.unlink(helper.HOST_CREDENTIAL_PATH)
+replacement = parent / "operator-replacement"
+replacement.write_bytes(b"operator replacement")
+os.chown(replacement, 0, 10001)
+os.chmod(replacement, 0o440)
+os.rename(replacement, helper.HOST_CREDENTIAL_PATH)
+expect_provider_error(
+    lambda: helper._finish(
+        "cleanup-replacement",
+        str(state),
+        "",
+        "committed",
+        json.dumps(candidate).encode(),
+    ),
+    "RECOVERY_REQUIRED",
+)
+assert pathlib.Path(helper.HOST_CREDENTIAL_PATH).read_bytes() == b"operator replacement"
+cleanup_transaction("cleanup-replacement")
+
+candidate = prepare_finalizing("cleanup-symlink")
+os.unlink(helper.HOST_CREDENTIAL_PATH)
+os.symlink(source, helper.HOST_CREDENTIAL_PATH)
+expect_provider_error(
+    lambda: helper._finish(
+        "cleanup-symlink",
+        str(state),
+        "",
+        "committed",
+        json.dumps(candidate).encode(),
+    ),
+    "RECOVERY_REQUIRED",
+)
+assert pathlib.Path(helper.HOST_CREDENTIAL_PATH).is_symlink()
+cleanup_transaction("cleanup-symlink")
+
+candidate = prepare_finalizing("cleanup-unlink-race")
+original_unlink = helper.os.unlink
+
+def reject_descriptor_unlink(path, **kwargs):
+    if kwargs.get("dir_fd") is not None:
+        raise OSError(11, "operator replacement race")
+    return original_unlink(path, **kwargs)
+
+helper.os.unlink = reject_descriptor_unlink
+expect_provider_error(
+    lambda: helper._finish(
+        "cleanup-unlink-race",
+        str(state),
+        "",
+        "committed",
+        json.dumps(candidate).encode(),
+    ),
+    "RECOVERY_REQUIRED",
+)
+helper.os.unlink = original_unlink
+finish_and_remove("cleanup-unlink-race", candidate)
 PY
 then
   echo "provider runtime fixture failed" >&2
