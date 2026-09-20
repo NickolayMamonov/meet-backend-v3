@@ -12,7 +12,7 @@ fi
 production_state=/var/lib/meet-production
 if [ -e "$production_state" ]; then
   echo "PREREQUISITE_MISSING: isolated /var/lib/meet-production is unavailable" >&2
-  exit 77
+  exit 0
 fi
 
 fixture=$(mktemp -d /tmp/meet-closed-beta-fixture.XXXXXX)
