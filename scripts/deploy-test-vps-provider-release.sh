@@ -23,6 +23,61 @@ fail() {
   exit 1
 }
 
+verify_public_contract() {
+  local public_url=${1:-}
+  [ -n "$public_url" ] || return 0
+  local meetings_probe actuator_status redirect_headers redirect_status
+  meetings_probe=$(timeout 30s curl --silent --connect-timeout 5 \
+    --max-time 15 --write-out $'\n%{http_code}' \
+    "$public_url/meetings" 2>/dev/null |
+    timeout 5s python3 -c '
+import json
+import sys
+
+data = sys.stdin.buffer.read(8 * 1024 * 1024 + 64)
+body, separator, status = data.rpartition(b"\n")
+if not separator or len(body) > 8 * 1024 * 1024 or status != b"200":
+    raise SystemExit(1)
+try:
+    value = json.loads(body.decode("utf-8"))
+except (UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(value, list):
+    raise SystemExit(1)
+print("meetings_status=200 meetings_array=true")
+') || fail "public meetings probe failed"
+  [ "$meetings_probe" = "meetings_status=200 meetings_array=true" ] ||
+    fail "public meetings probe failed"
+  actuator_status=$(curl --silent --show-error --connect-timeout 5 \
+    --max-time 15 --output /dev/null --write-out '%{http_code}' \
+    "$public_url/actuator" 2>/dev/null) || fail "public actuator probe failed"
+  [ "$actuator_status" = 404 ] || fail "public actuator probe failed"
+  redirect_headers=$(curl --silent --connect-timeout 5 --max-time 15 \
+    --dump-header - --output /dev/null --write-out '%{http_code}' \
+    "${public_url/https:\/\//http://}/meetings" 2>/dev/null) ||
+    fail "public redirect probe failed"
+  redirect_status=${redirect_headers: -3}
+  case "$redirect_status" in 301|302|307|308) ;; *)
+    fail "public redirect probe failed"
+    ;;
+  esac
+  grep -Eiq '^location:[[:space:]]+https://' <<<"$redirect_headers" ||
+    fail "public redirect probe failed"
+  local missing_admin wrong_admin
+  missing_admin=$(curl --silent --connect-timeout 5 --max-time 15 \
+    --output /dev/null --write-out '%{http_code}' -X POST \
+    "$public_url/admin/demo-catalog/bootstrap" \
+    -H 'Content-Type: application/json' --data '{}' 2>/dev/null) ||
+    fail "admin guard probe failed"
+  wrong_admin=$(curl --silent --connect-timeout 5 --max-time 15 \
+    --output /dev/null --write-out '%{http_code}' -X POST \
+    "$public_url/admin/demo-catalog/bootstrap" \
+    -H 'X-Admin-Key: wrong' -H 'Content-Type: application/json' \
+    --data '{}' 2>/dev/null) || fail "admin guard probe failed"
+  [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ] ||
+    fail "admin guard probe failed"
+}
+
 provider_release_main() {
 root=
 base_compose=
@@ -87,6 +142,13 @@ for command_name in docker curl jq flock python3 timeout; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "$command_name is required"
 done
+if timeout 1s sh -c 'sleep 2' >/dev/null 2>&1; then
+  fail "timeout capability is unavailable"
+else
+  timeout_status=$?
+  [ "$timeout_status" -eq 124 ] ||
+    fail "timeout capability is unavailable"
+fi
 [ "$(id -u)" -eq 0 ] || fail "the test VPS deploy must run as root"
 [ -d "$root" ] || fail "deployment root is unavailable"
 [ -s "$root/.env.production" ] || fail "existing production environment is unavailable"
@@ -109,6 +171,38 @@ timeout 30s python3 "$provider_helper" check >/dev/null ||
   fail "PREREQUISITE_MISSING"
 # shellcheck source=/dev/null
 source "$runtime_helper"
+
+docker_image_inspect() {
+  timeout 30s docker image inspect "$@" 2>/dev/null
+}
+
+docker_container_inspect() {
+  timeout 30s docker inspect "$@" 2>/dev/null
+}
+
+runtime_image_id_bounded() {
+  timeout 30s bash -c '
+    set -euo pipefail
+    source "$1"
+    runtime_image_id "$2" "$3"
+  ' _ "$runtime_helper" "$root" "$compose_script"
+}
+
+runtime_environment_bounded() {
+  timeout 60s bash -c '
+    set -euo pipefail
+    source "$1"
+    verify_environment_matches_container "$2" "$3"
+  ' _ "$runtime_helper" "$root" "$compose_script"
+}
+
+runtime_invariants_bounded() {
+  timeout 60s bash -c '
+    set -euo pipefail
+    source "$1"
+    verify_runtime_invariants "$2" "$3" "$4" "$5" "$6" "$7"
+  ' _ "$runtime_helper" "$root" "$compose_script" "$1" "$2" "$3" "$4" "$5"
+}
 
 state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
 active_compose=/var/lib/meet-production/active-compose.yml
@@ -140,7 +234,19 @@ timeout 30s python3 "$provider_helper" retention-check \
 install -d -m 700 "$state"
 
 compose() {
-  runtime_compose "$root" "$compose_script" "$@"
+  timeout 30s bash -c '
+    set -euo pipefail
+    source "$1"
+    runtime_compose "$2" "$3" "${@:4}"
+  ' _ "$runtime_helper" "$root" "$compose_script" "$@" 2>/dev/null
+}
+
+compose_up() {
+  timeout 240s bash -c '
+    set -euo pipefail
+    source "$1"
+    runtime_compose "$2" "$3" "${@:4}"
+  ' _ "$runtime_helper" "$root" "$compose_script" "$@" 2>/dev/null
 }
 
 previous_image=$(runtime_release_field "$root" BACKEND_IMAGE)
@@ -152,18 +258,22 @@ previous_revision=$(runtime_release_field "$root" BACKEND_REVISION)
   fail "running version is malformed"
 is_supported_test_vps_version "$previous_version" ||
   fail "predecessor version must be at least v1.2.0"
-previous_id=$(runtime_image_id "$root" "$compose_script")
-[ "$(docker image inspect "$previous_image" --format '{{.Id}}')" = "$previous_id" ]
+previous_id=$(runtime_image_id_bounded) ||
+  fail "PROVIDER_STATE_INVALID"
+[ "$(docker_image_inspect "$previous_image" --format '{{.Id}}')" = "$previous_id" ] ||
+  fail "PROVIDER_STATE_INVALID"
 previous_container=$(compose ps -q backend)
 [ -n "$previous_container" ] || fail "predecessor backend is unavailable"
-previous_runtime_hash=$(docker inspect "$previous_container" \
-  --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
+previous_runtime_hash=$(docker_container_inspect "$previous_container" \
+  --format '{{index .Config.Labels "com.docker.compose.config-hash"}}') ||
+  fail "PROVIDER_STATE_INVALID"
 [[ "$previous_runtime_hash" =~ ^[0-9a-f]{64}$ ]]
-verify_runtime_invariants "$root" "$compose_script" "$previous_id" \
-  "$previous_revision" "$previous_version" "$previous_runtime_hash"
-verify_environment_matches_container "$root" "$compose_script" ||
+runtime_invariants_bounded "$previous_id" "$previous_revision" \
+  "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 ||
+  fail "PROVIDER_STATE_INVALID"
+runtime_environment_bounded >/dev/null 2>&1 ||
   fail "running container does not match the current production environment"
-previous_inspect=$(docker inspect "$previous_container" 2>/dev/null) ||
+previous_inspect=$(docker_container_inspect "$previous_container" 2>/dev/null) ||
   fail "PROVIDER_STATE_INVALID"
 provider_observed=$(printf '%s' "$previous_inspect" |
   timeout 30s python3 "$provider_helper" observe) ||
@@ -219,32 +329,39 @@ run_safety_hook() {
   if [ -n "$public_url" ]; then
     safety_args+=(--public-url "$public_url")
   fi
-  "$safety_hook" "${safety_args[@]}" \
-    --output "$output" >/dev/null
+  timeout 60s "$safety_hook" "${safety_args[@]}" \
+    --output "$output" >/dev/null 2>&1 ||
+    fail "RECOVERY_REQUIRED"
   [ -f "$output" ] && [ ! -L "$output" ] && [ -s "$output" ] ||
     fail "closed-beta $phase evidence is unavailable"
   chmod 600 "$output"
   if [ "$phase" = final ] && [ -n "$public_url" ]; then
-    "$script_dir/verify-test-vps-assets.sh" \
+    timeout 60s "$script_dir/verify-test-vps-assets.sh" \
       --public-url "$public_url" \
-      --output "$state/frozen-assets.json" >/dev/null
-    curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+      --output "$state/frozen-assets.json" >/dev/null 2>&1 ||
+      fail "RECOVERY_REQUIRED"
+    curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+      --proto '=https' --tlsv1.2 \
       "$public_url/meetings" | jq -e 'type == "array"' >/dev/null
-    [ "$(curl --silent --show-error --proto '=https' --tlsv1.2 \
+    [ "$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
+      --proto '=https' --tlsv1.2 \
       -o /dev/null -w '%{http_code}' "$public_url/actuator")" = 404 ] ||
       fail "Actuator is not private"
     headers=$(mktemp)
     trap 'rm -f -- "$headers"' RETURN
-    curl --silent --show-error --proto '=http' --max-time 10 \
+    curl --silent --show-error --connect-timeout 5 --max-time 15 \
+      --proto '=http' \
       -D "$headers" -o /dev/null "${public_url/https:\/\//http://}/meetings"
     grep -Eiq '^location: https://' "$headers" ||
       fail "HTTP does not redirect to HTTPS"
     rm -f -- "$headers"
-    missing_admin=$(curl --silent --show-error --output /dev/null \
+    missing_admin=$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
+      --output /dev/null \
       --write-out '%{http_code}' -X POST \
       "$public_url/admin/demo-catalog/bootstrap" \
       -H 'Content-Type: application/json' --data '{}')
-    wrong_admin=$(curl --silent --show-error --output /dev/null \
+    wrong_admin=$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
+      --output /dev/null \
       --write-out '%{http_code}' -X POST \
       "$public_url/admin/demo-catalog/bootstrap" \
       -H 'X-Admin-Key: wrong' -H 'Content-Type: application/json' --data '{}')
@@ -336,63 +453,15 @@ provider_finish() {
       credentialMountReadOnly:$enabled,outcome:$outcome}'
 }
 
-verify_public_contract() {
-  [ -n "$public_url" ] || return 0
-  local meetings_probe actuator_status redirect_headers redirect_status
-  meetings_probe=$(timeout 30s curl --silent --connect-timeout 5 \
-    --max-time 15 --write-out $'\n%{http_code}' \
-    "$public_url/meetings" 2>/dev/null |
-    timeout 5s python3 -c '
-import json
-import sys
-
-data = sys.stdin.buffer.read(8 * 1024 * 1024 + 64)
-body, separator, status = data.rpartition(b"\n")
-if not separator or len(body) > 8 * 1024 * 1024 or status != b"200":
-    raise SystemExit(1)
-try:
-    value = json.loads(body.decode("utf-8"))
-except (UnicodeDecodeError, json.JSONDecodeError):
-    raise SystemExit(1)
-if not isinstance(value, list):
-    raise SystemExit(1)
-print("meetings_status=200 meetings_array=true")
-') || fail "public meetings probe failed"
-  [ "$meetings_probe" = "meetings_status=200 meetings_array=true" ] ||
-    fail "public meetings probe failed"
-  actuator_status=$(curl --silent --show-error --connect-timeout 5 \
-    --max-time 15 --output /dev/null --write-out '%{http_code}' \
-    "$public_url/actuator" 2>/dev/null) || fail "public actuator probe failed"
-  [ "$actuator_status" = 404 ] || fail "public actuator probe failed"
-  redirect_headers=$(curl --silent --connect-timeout 5 --max-time 15 \
-    --dump-header - --output /dev/null --write-out '%{http_code}' \
-    "${public_url/https:\/\//http://}/meetings" 2>/dev/null) ||
-    fail "public redirect probe failed"
-  redirect_status=${redirect_headers: -3}
-  case "$redirect_status" in 301|302|307|308) ;; *)
-    fail "public redirect probe failed"
-    ;;
-  esac
-  grep -Eiq '^location:[[:space:]]+https://' <<<"$redirect_headers" ||
-    fail "public redirect probe failed"
-  local missing_admin wrong_admin
-  missing_admin=$(curl --silent --connect-timeout 5 --max-time 15 \
-    --output /dev/null --write-out '%{http_code}' -X POST \
-    "$public_url/admin/demo-catalog/bootstrap" \
-    -H 'Content-Type: application/json' --data '{}' 2>/dev/null) ||
-    fail "admin guard probe failed"
-  wrong_admin=$(curl --silent --connect-timeout 5 --max-time 15 \
-    --output /dev/null --write-out '%{http_code}' -X POST \
-    "$public_url/admin/demo-catalog/bootstrap" \
-    -H 'X-Admin-Key: wrong' -H 'Content-Type: application/json' \
-    --data '{}' 2>/dev/null) || fail "admin guard probe failed"
-  [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ] ||
-    fail "admin guard probe failed"
-}
-
 mutation_started=false
 credential_prepared=false
 rollback_complete=false
+recovery_started_at=
+recovery_deadline_check() {
+  [ -n "$recovery_started_at" ] || return 0
+  [ "$((SECONDS - recovery_started_at))" -lt 600 ] ||
+    fail "RECOVERY_REQUIRED"
+}
 on_exit() {
   local status=$?
   trap - EXIT
@@ -400,9 +469,8 @@ on_exit() {
     if [ "$mutation_started" = true ]; then
       rollback || status=1
     elif [ "$credential_prepared" = true ]; then
-      verify_runtime_invariants "$root" "$compose_script" "$previous_id" \
-        "$previous_revision" "$previous_version" "$previous_runtime_hash" \
-        >/dev/null 2>&1 || status=1
+      runtime_invariants_bounded "$previous_id" "$previous_revision" \
+        "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 || status=1
       if [ "$status" -eq 0 ]; then
         provider_finish rolled-back "$previous_inspect" || status=1
       fi
@@ -413,15 +481,20 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 143' TERM INT HUP
 
-target_id=$(docker image inspect "$image" --format '{{.Id}}')
-[ "$(docker image inspect "$image" \
-  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision" ]
-[ "$(docker image inspect "$image" \
-  --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version" ]
-[ "$(docker image inspect "$image" \
+target_id=$(docker_image_inspect "$image" --format '{{.Id}}') ||
+  fail "PROVIDER_STATE_INVALID"
+[ "$(docker_image_inspect "$image" \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision" ] ||
+  fail "PROVIDER_STATE_INVALID"
+[ "$(docker_image_inspect "$image" \
+  --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version" ] ||
+  fail "PROVIDER_STATE_INVALID"
+[ "$(docker_image_inspect "$image" \
   --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
-  "https://github.com/NickolayMamonov/meet-backend-v3" ]
-[ "$(docker image inspect "$image" --format '{{.Config.User}}')" = 10001:10001 ]
+  "https://github.com/NickolayMamonov/meet-backend-v3" ] ||
+  fail "PROVIDER_STATE_INVALID"
+[ "$(docker_image_inspect "$image" --format '{{.Config.User}}')" = 10001:10001 ] ||
+  fail "PROVIDER_STATE_INVALID"
 if [ "$mode" = rollback-drill ] && [ "$target_id" = "$previous_id" ]; then
   fail "rollback drill requires a target image distinct from the predecessor"
 fi
@@ -467,11 +540,11 @@ chmod 600 "$state/target-runtime.override.yml"
 target_config=$(
   env -i PATH="$PATH" HOME=/root COMPOSE_PROJECT_NAME=meet-production \
     BACKEND_IMAGE="$image" BACKEND_VERSION="$version" BACKEND_REVISION="$revision" \
-    docker compose --project-directory "$root" --env-file "$root/.env.production" \
+    timeout 30s docker compose --project-directory "$root" --env-file "$root/.env.production" \
     -f "$base_compose" -f "$state/target-runtime.override.yml" \
     config --format json 2>/dev/null
 ) || fail "PROVIDER_STATE_INVALID"
-target_image_inspect=$(docker image inspect "$image" 2>/dev/null) ||
+target_image_inspect=$(docker_image_inspect "$image" 2>/dev/null) ||
   fail "PROVIDER_STATE_INVALID"
 printf '%s\n%s\n%s\n' "$previous_inspect" "$target_image_inspect" "$target_config" |
   jq -s -e '
@@ -555,27 +628,32 @@ restore_previous_active_files() {
 }
 
 rollback() {
+  recovery_started_at=$SECONDS
+  recovery_deadline_check
   write_provider_marker rolling-back "${durable_disposition:-none}"
   restore_previous_active_files
   PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
-    "$update_script" "$previous_image" "$previous_revision" "$previous_version" \
-    >/dev/null
-  timeout 240s compose up -d --no-deps --no-build --pull never --force-recreate \
+    timeout 60s "$update_script" "$previous_image" "$previous_revision" "$previous_version" \
+    >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
+  compose_up -d --no-deps --no-build --pull never --force-recreate \
     --wait --wait-timeout 180 backend >/dev/null
+  recovery_deadline_check
   restored_container=$(compose ps -q backend)
-  restored_inspect=$(docker inspect "$restored_container" 2>/dev/null) ||
+  restored_inspect=$(docker_container_inspect "$restored_container" 2>/dev/null) ||
     fail "RECOVERY_REQUIRED"
-  restored_hash=$(docker inspect "$restored_container" \
+  restored_hash=$(docker_container_inspect "$restored_container" \
     --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
   [ "$restored_hash" = "$previous_runtime_hash" ] ||
     fail "rollback did not restore the exact predecessor Compose runtime"
-  verify_runtime_invariants "$root" "$compose_script" "$previous_id" \
-    "$previous_revision" "$previous_version" "$previous_runtime_hash"
+  runtime_invariants_bounded "$previous_id" "$previous_revision" \
+    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 ||
+    fail "RECOVERY_REQUIRED"
   printf '[%s,%s]' "$previous_inspect" "$restored_inspect" |
     timeout 30s python3 "$provider_helper" verify \
       --run-key "$run_key" --phase rollback >/dev/null ||
     fail "RECOVERY_REQUIRED"
-  verify_public_contract
+  verify_public_contract "$public_url"
+  recovery_deadline_check
   run_safety_hook rollback "$previous_image" "$previous_id" \
     "$previous_revision" "$previous_version" "$previous_runtime_hash"
   provider_finish rolled-back "$restored_inspect"
@@ -588,23 +666,25 @@ mutation_started=true
 install -m 600 "$base_compose" "$active_compose"
 install -m 600 "$state/target-runtime.override.yml" "$active_runtime"
 PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
-  "$update_script" "$image" "$revision" "$version" >/dev/null
-timeout 240s compose up -d --no-deps --no-build --pull never --force-recreate \
+  timeout 60s "$update_script" "$image" "$revision" "$version" >/dev/null 2>&1 ||
+  fail "PROVIDER_STATE_INVALID"
+compose_up -d --no-deps --no-build --pull never --force-recreate \
   --wait --wait-timeout 180 backend >/dev/null
 candidate_container=$(compose ps -q backend)
-candidate_inspect=$(docker inspect "$candidate_container" 2>/dev/null) ||
+candidate_inspect=$(docker_container_inspect "$candidate_container" 2>/dev/null) ||
   fail "RECOVERY_REQUIRED"
-target_hash=$(docker inspect "$candidate_container" \
-  --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
+target_hash=$(docker_container_inspect "$candidate_container" \
+  --format '{{index .Config.Labels "com.docker.compose.config-hash"}}') ||
+  fail "RECOVERY_REQUIRED"
 [[ "$target_hash" =~ ^[0-9a-f]{64}$ ]] || fail "candidate runtime hash unavailable"
 write_provider_marker verifying "$durable_disposition"
 printf '[%s,%s]' "$previous_inspect" "$candidate_inspect" |
   timeout 30s python3 "$provider_helper" verify \
     --run-key "$run_key" --phase candidate >/dev/null ||
   fail "PROVIDER_STATE_INVALID"
-verify_runtime_invariants "$root" "$compose_script" "$target_id" \
-  "$revision" "$version" "$target_hash"
-verify_public_contract
+runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
+  >/dev/null 2>&1 || fail "PROVIDER_STATE_INVALID"
+verify_public_contract "$public_url"
 run_safety_hook candidate "$image" "$target_id" \
   "$revision" "$version" "$target_hash"
 echo "candidate=ready image_id=$target_id version=$version revision=$revision"

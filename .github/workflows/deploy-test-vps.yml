@@ -133,7 +133,7 @@ jobs:
               .evidence == ["image-index.json","image-inspect.txt"]
             ' "$release_dir/release-manifest.json" >/dev/null
 
-          docker buildx imagetools inspect "$IMAGE@$digest" --raw \
+          timeout 30s docker buildx imagetools inspect "$IMAGE@$digest" --raw \
             >"$release_dir/live-image-index.json"
           cmp -s "$release_dir/image-index.json" \
             "$release_dir/live-image-index.json"
@@ -160,16 +160,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker pull "$IMAGE@$DIGEST" >/dev/null
-          test "$(docker image inspect "$IMAGE@$DIGEST" \
+          timeout 240s docker pull "$IMAGE@$DIGEST" >/dev/null
+          test "$(timeout 30s docker image inspect "$IMAGE@$DIGEST" \
             --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
-          test "$(docker image inspect "$IMAGE@$DIGEST" \
+          test "$(timeout 30s docker image inspect "$IMAGE@$DIGEST" \
             --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
             "$SOURCE_SHA"
-          test "$(docker image inspect "$IMAGE@$DIGEST" \
+          test "$(timeout 30s docker image inspect "$IMAGE@$DIGEST" \
             --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = \
             "$VERSION"
-          test "$(docker image inspect "$IMAGE@$DIGEST" \
+          test "$(timeout 30s docker image inspect "$IMAGE@$DIGEST" \
             --format '{{.Config.User}}')" = 10001:10001
 
       - name: Establish strict SSH host trust
@@ -271,16 +271,16 @@ jobs:
           image=$1
           revision=$2
           version=$3
-          docker pull "$image" >/dev/null
-          test "$(docker image inspect "$image" \
+          timeout 240s docker pull "$image" >/dev/null
+          test "$(timeout 30s docker image inspect "$image" \
             --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
             "$revision"
-          test "$(docker image inspect "$image" \
+          test "$(timeout 30s docker image inspect "$image" \
             --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = \
             "$version"
-          test "$(docker image inspect "$image" --format '{{.Config.User}}')" = \
+          test "$(timeout 30s docker image inspect "$image" --format '{{.Config.User}}')" = \
             10001:10001
-          docker image inspect "$image" --format '{{.Id}}'
+          timeout 30s docker image inspect "$image" --format '{{.Id}}'
           REMOTE
           )
           [[ "$target_id" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -293,11 +293,11 @@ jobs:
           set -euo pipefail
           previous_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
           set -euo pipefail
-          mapfile -t containers < <(docker ps -q \
+          mapfile -t containers < <(timeout 30s docker ps -q \
             --filter label=com.docker.compose.project=meet-production \
             --filter label=com.docker.compose.service=backend)
           [ "${#containers[@]}" -eq 1 ]
-          docker inspect "${containers[0]}" --format '{{.Image}}'
+          timeout 30s docker inspect "${containers[0]}" --format '{{.Image}}'
           REMOTE
           )
           [[ "$previous_id" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -312,6 +312,7 @@ jobs:
             --revision "$SOURCE_SHA" \
             --version "$VERSION" \
             --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --public-url "$PUBLIC_URL" \
             --mode rollback-drill 2>&1)
           status=$?
           set -e
@@ -331,11 +332,11 @@ jobs:
 
           restored_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
           set -euo pipefail
-          mapfile -t containers < <(docker ps -q \
+          mapfile -t containers < <(timeout 30s docker ps -q \
             --filter label=com.docker.compose.project=meet-production \
             --filter label=com.docker.compose.service=backend)
           [ "${#containers[@]}" -eq 1 ]
-          docker inspect "${containers[0]}" --format '{{.Image}}'
+          timeout 30s docker inspect "${containers[0]}" --format '{{.Image}}'
           REMOTE
           )
           [ "$restored_id" = "$previous_id" ]
@@ -355,7 +356,8 @@ jobs:
             --image "$IMAGE@$DIGEST" \
             --revision "$SOURCE_SHA" \
             --version "$VERSION" \
-            --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final" \
+            --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --public-url "$PUBLIC_URL" \
             --mode deploy |
             tee "$RUNNER_TEMP/deploy-output.txt"
           grep -Fq "deployment=completed image_id=$TARGET_IMAGE_ID" \
@@ -380,38 +382,38 @@ jobs:
           expected_id=$1
           revision=$2
           version=$3
-          mapfile -t backends < <(docker ps -q \
+          mapfile -t backends < <(timeout 30s docker ps -q \
             --filter label=com.docker.compose.project=meet-production \
             --filter label=com.docker.compose.service=backend)
-          mapfile -t postgres < <(docker ps -q \
+          mapfile -t postgres < <(timeout 30s docker ps -q \
             --filter label=com.docker.compose.project=meet-production \
             --filter label=com.docker.compose.service=postgres)
           [ "${#backends[@]}" -eq 1 ] && [ "${#postgres[@]}" -eq 1 ]
           backend=${backends[0]}
           database=${postgres[0]}
-          image_id=$(docker inspect "$backend" --format '{{.Image}}')
+          image_id=$(timeout 30s docker inspect "$backend" --format '{{.Image}}')
           [ "$image_id" = "$expected_id" ]
-          [ "$(docker image inspect "$image_id" \
+          [ "$(timeout 30s docker image inspect "$image_id" \
             --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
             "$revision" ]
-          [ "$(docker image inspect "$image_id" \
+          [ "$(timeout 30s docker image inspect "$image_id" \
             --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = \
             "$version" ]
-          uid=$(docker exec "$backend" id -u)
-          gid=$(docker exec "$backend" id -g)
+          uid=$(timeout 30s docker exec "$backend" id -u)
+          gid=$(timeout 30s docker exec "$backend" id -g)
           [ "$uid:$gid" = 10001:10001 ]
-          health=$(docker inspect "$backend" --format '{{.State.Health.Status}}')
+          health=$(timeout 30s docker inspect "$backend" --format '{{.State.Health.Status}}')
           [ "$health" = healthy ]
-          binding=$(docker inspect "$backend" --format \
+          binding=$(timeout 30s docker inspect "$backend" --format \
             '{{range $port, $bindings := .NetworkSettings.Ports}}{{if eq $port "8080/tcp"}}{{range $bindings}}{{.HostIp}}:{{.HostPort}}{{println}}{{end}}{{end}}{{end}}')
           [ "$(wc -l <<<"$binding")" -eq 1 ]
           [[ "$binding" =~ ^127\.0\.0\.1:[0-9]+$ ]]
-          [ -z "$(docker port "$database")" ]
-          upload=$(docker inspect "$backend" --format \
+          [ -z "$(timeout 30s docker port "$database")" ]
+          upload=$(timeout 30s docker inspect "$backend" --format \
             '{{range .Mounts}}{{if eq .Destination "/data/uploads"}}{{.Name}}{{end}}{{end}}')
           [ "$upload" = meet-production_uploads_data ]
-          docker volume inspect meet-production_uploads_data >/dev/null
-          docker volume inspect meet-production_postgres_data >/dev/null
+          timeout 30s docker volume inspect meet-production_uploads_data >/dev/null
+          timeout 30s docker volume inspect meet-production_postgres_data >/dev/null
           jq -cn \
             --arg imageId "$image_id" \
             --arg revision "$revision" \
@@ -492,6 +494,16 @@ jobs:
           state_root=/var/lib/meet-test-vps-deploy
           [[ "$run_id" =~ ^[0-9]+$ ]] && [[ "$run_attempt" =~ ^[0-9]+$ ]]
           [ -d "$root" ] && [ -d "$state_root" ]
+          if timeout 1s sh -c 'sleep 2' >/dev/null 2>&1; then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          else
+            timeout_status=$?
+            [ "$timeout_status" -eq 124 ] || {
+              echo "RECOVERY_REQUIRED" >&2
+              exit 1
+            }
+          fi
           exec 9>"$state_root/.deploy.lock"
           flock -n 9
           smtp_pointer="$state_root/.smtp-transaction.current"
@@ -513,7 +525,7 @@ jobs:
           }
           compose_refs() {
             local rendered
-            rendered=$(env -i PATH="$PATH" HOME=/root COMPOSE_PROJECT_NAME=meet-production \
+            rendered=$(timeout 30s env -i PATH="$PATH" HOME=/root COMPOSE_PROJECT_NAME=meet-production \
               docker compose --project-directory "$root" \
               --env-file "$root/.env.production" "$@" config --format json 2>/dev/null) ||
               return 1
@@ -527,29 +539,29 @@ jobs:
               add_protected_ref "$ref" || return 1
             done <<<"$refs"
           }
-          backend=$(docker ps -q \
-            --filter label=com.docker.compose.project=meet-production \
-            --filter label=com.docker.compose.service=backend)
-          [ "$(wc -l <<<"$backend" | tr -d '[:space:]')" = 1 ] &&
-            [ -n "$backend" ] || retention_unresolved=true
+          running_containers=$(timeout 30s docker ps -q \
+            --filter label=com.docker.compose.project=meet-production 2>/dev/null) ||
+            retention_unresolved=true
+          [ -n "$running_containers" ] || retention_unresolved=true
           if [ "$retention_unresolved" = false ]; then
-            mount_json=$(docker inspect "$backend" --format '{{json .Mounts}}' 2>/dev/null) ||
-              retention_unresolved=true
-            if [ "$retention_unresolved" = false ]; then
+            while IFS= read -r container; do
+              [ -n "$container" ] || continue
+              mount_json=$(timeout 30s docker inspect "$container" \
+                --format '{{json .Mounts}}' 2>/dev/null) ||
+                { retention_unresolved=true; break; }
               mount_refs=$(jq -r '
                 if type == "array" then
                   .[] | select(.Type == "bind") | .Source
                 else
                   error("invalid mounts")
                 end
-              ' <<<"$mount_json") || retention_unresolved=true
-              if [ "$retention_unresolved" = false ]; then
-                while IFS= read -r ref; do
-                  [ -n "$ref" ] || continue
-                  add_protected_ref "$ref" || retention_unresolved=true
-                done <<<"$mount_refs"
-              fi
-            fi
+              ' <<<"$mount_json") || { retention_unresolved=true; break; }
+              while IFS= read -r ref; do
+                [ -n "$ref" ] || continue
+                add_protected_ref "$ref" || retention_unresolved=true
+              done <<<"$mount_refs"
+              [ "$retention_unresolved" = false ] || break
+            done <<<"$running_containers"
           fi
           if [ -s /var/lib/meet-production/active-compose.yml ] &&
             [ -s /var/lib/meet-production/active-runtime.override.yml ]; then
@@ -569,15 +581,6 @@ jobs:
             find "$path" -xdev -depth -type d -empty -delete
             [ ! -e "$path" ]
           }
-
-          tooling_removed=0
-          for path in "$tooling_prefix"*; do
-            [ -e "$path" ] || continue
-            name=${path#"$tooling_prefix"}
-            [[ "$name" =~ ^[0-9]+-[0-9]+$ ]]
-            delete_tree "$path"
-            tooling_removed=$((tooling_removed + 1))
-          done
 
           mapfile -t state_paths < <(
             find "$state_root" -mindepth 1 -maxdepth 1 -type d \
@@ -641,8 +644,20 @@ jobs:
             echo "RECOVERY_REQUIRED" >&2
             exit 1
           fi
-          python3 "$tooling/scripts/test-vps-provider-credential.py" \
-            "${provider_args[@]}" >/dev/null
+          if ! timeout 30s python3 "$tooling/scripts/test-vps-provider-credential.py" \
+            "${provider_args[@]}" >/dev/null 2>&1; then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
+
+          tooling_removed=0
+          for path in "$tooling_prefix"*; do
+            [ -e "$path" ] || continue
+            name=${path#"$tooling_prefix"}
+            [[ "$name" =~ ^[0-9]+-[0-9]+$ ]]
+            delete_tree "$path"
+            tooling_removed=$((tooling_removed + 1))
+          done
 
           states_removed=0
           for ((index=10; index<${#states[@]}; index++)); do

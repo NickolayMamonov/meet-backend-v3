@@ -11,12 +11,13 @@ provider_helper=scripts/test-vps-provider-credential.py
 provider_tests=scripts/test-test-vps-provider-credential.py
 provider_runtime=scripts/test-test-vps-provider-runtime.sh
 retention_fixture=scripts/test-test-vps-retention.sh
+public_probes=scripts/test-test-vps-public-probes.sh
 baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
 
 [ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ] &&
   [ -f "$provider_deploy" ] && [ -f "$provider_helper" ] &&
   [ -f "$provider_tests" ] && [ -f "$provider_runtime" ] &&
-  [ -f "$retention_fixture" ]
+  [ -f "$retention_fixture" ] && [ -f "$public_probes" ]
 workflow_text=$(<"$workflow")
 deploy_text=$(<"$deploy")
 runtime_text=$(<"$runtime")
@@ -56,6 +57,11 @@ for text in \
   'rollback=completed previous_image_id=' \
   '--mode deploy' \
   'https://api.whysoezzy.online' \
+  '--public-url "$PUBLIC_URL"' \
+  'running_containers=$(timeout 30s docker ps -q' \
+  'timeout 30s docker inspect "$container"' \
+  'timeout 30s python3 "$tooling/scripts/test-vps-provider-credential.py"' \
+  'if timeout 1s sh -c' \
   'Apply bounded test-VPS deployment retention' \
   'docker compose --project-directory "$root"' \
   '--protected-path' \
@@ -74,11 +80,29 @@ for text in \
   'provider_release_main' \
   'APP_PUSH_MAINTENANCE_ENABLED' \
   'credentialMountReadOnly' \
+  'verify_public_contract' \
   'PROVIDER_STATE_INVALID' \
   'RECOVERY_REQUIRED'; do
   require "$text" "$workflow_text$provider_deploy_text$provider_helper_text" \
     "release-first provider lane"
 done
+if timeout 1s sh -c 'sleep 2' >/dev/null 2>&1; then
+  echo "timeout capability fixture unexpectedly completed" >&2
+  exit 1
+else
+  timeout_status=$?
+  [ "$timeout_status" -eq 124 ] ||
+    { echo "timeout capability fixture returned an unexpected status" >&2; exit 1; }
+fi
+! grep -Fq '$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-final' "$workflow" ||
+  { echo "final deployment uses a noncanonical retention run key" >&2; exit 1; }
+tooling_line=$(grep -nF 'tooling_removed=0' "$workflow" | cut -d: -f1 | head -n 1)
+helper_line=$(grep -nF 'timeout 30s python3 "$tooling/scripts/test-vps-provider-credential.py"' \
+  "$workflow" | cut -d: -f1 | head -n 1)
+[ "$helper_line" -lt "$tooling_line" ]
+require '_verify_created_publication' "$provider_helper_text" \
+  "created credential publication witness"
+require 'timeout 1s sh -c' "$provider_deploy_text" "timeout capability preflight"
 ! grep -Fq 'meetings.json' "$workflow" ||
   { echo "raw meetings body capture remains in workflow" >&2; exit 1; }
 ! grep -Fq '"$REMOTE_TOOLING/scripts/deploy-test-vps-release.sh"' "$workflow" ||
@@ -95,6 +119,7 @@ for frozen in \
 done
 
 python3 -B "$provider_tests"
+timeout 120s bash "$public_probes"
 
 for text in \
   'smtp_pointer="$state_root/.smtp-transaction.current"' \

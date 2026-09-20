@@ -313,6 +313,36 @@ helper._write_private(
 )
 helper._finish("rollback", str(state), "", "rolled-back", json.dumps(predecessor).encode())
 assert not pathlib.Path(helper.HOST_CREDENTIAL_PATH).exists()
+marker.unlink()
+
+helper._prepare("witness-tamper", str(state), "", json.dumps(predecessor).encode())
+helper._write_private(
+    str(marker),
+    json.dumps(
+        {
+            "schemaVersion": 1,
+            "runKey": "witness-tamper",
+            "phase": "finalizing",
+            "providerEnabled": True,
+            "durableDisposition": "created",
+        },
+        separators=(",", ":"),
+    ).encode(),
+    0o600,
+)
+os.chmod(parent / ".transaction-witness-tamper" / "publication", 0o600)
+try:
+    helper._finish(
+        "witness-tamper",
+        str(state),
+        "",
+        "committed",
+        json.dumps(candidate).encode(),
+    )
+except helper.ProviderError as error:
+    assert error.category == "RECOVERY_REQUIRED"
+else:
+    raise AssertionError("tampered publication witness was accepted")
 PY
 then
   echo "provider runtime fixture failed" >&2

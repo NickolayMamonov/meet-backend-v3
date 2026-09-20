@@ -34,14 +34,20 @@ cat >"$fake_bin/docker" <<'FAKE_DOCKER'
 set -euo pipefail
 case "${1:-}" in
   ps)
-    printf 'fixture-backend\n'
+    printf 'fixture-backend\nfixture-provider\n'
     ;;
   inspect)
-    if [ "${2:-}" = fixture-backend ]; then
-      printf '[]\n'
-    else
-      printf '{}\n'
-    fi
+    case "${2:-}" in
+      fixture-backend)
+        printf '[{"Type":"volume","Name":"uploads","Destination":"/data/uploads"}]\n'
+        ;;
+      fixture-provider)
+        printf '[{"Type":"bind","Source":"/var/lib/meet-test-vps-deploy/12-1-final-deploy/provider-runtime","Destination":"/run/provider"}]\n'
+        ;;
+      *)
+        printf '{}\n'
+        ;;
+    esac
     ;;
   compose)
     case " $* " in
@@ -76,6 +82,7 @@ for index in $(seq 1 12); do
   touch -d "@$((1800000000 - index))" "$state"
 done
 install -d -m 700 "$state_root/12-1-final-deploy/protected-input"
+install -d -m 700 "$state_root/12-1-final-deploy/provider-runtime"
 printf 'services:\n  backend:\n    volumes: []\n' \
   >"$state_root/12-1-final-deploy/target-runtime.override.yml"
 ln -s "$state_root/12-1-final-deploy" "$state_root/13-1-final-deploy"
@@ -84,14 +91,65 @@ install -d -m 700 "$state_root/14-1-final-deploy"
 printf 'unknown\n' >"$state_root/14-1-final-deploy/unknown.txt"
 touch -d '@1799999980' "$state_root/14-1-final-deploy"
 
+tooling_root="$production_root/.test-vps-tooling-1-1"
+install -d -m 700 "$tooling_root/scripts"
+cp scripts/test-vps-provider-credential.py "$tooling_root/scripts/"
 PATH="$fake_bin:$PATH" bash "$remote_script" \
-  "$production_root" 1 1 "$ROOT_DIR"
+  "$production_root" 1 1 "$tooling_root"
 
 [ -d "$state_root/1-1-final-deploy" ]
 [ -d "$state_root/10-1-final-deploy" ]
 [ ! -e "$state_root/11-1-final-deploy" ]
 [ -d "$state_root/12-1-final-deploy" ]
+[ -d "$state_root/12-1-final-deploy/provider-runtime" ]
 [ -L "$state_root/13-1-final-deploy" ]
 [ -d "$state_root/12-1-final-deploy-shadow" ]
 [ -d "$state_root/14-1-final-deploy" ]
-echo "retention fixture passed: 12 states, protected reference, unknown, symlink and prefix-collision cases"
+[ ! -e "$tooling_root" ]
+
+hang_bin="$fixture_root/hang-bin"
+install -d -m 700 "$hang_bin"
+real_timeout=$(command -v timeout)
+cat >"$hang_bin/timeout" <<EOF
+#!/usr/bin/env bash
+if [ "\${2:-}" = docker ]; then
+  exit 124
+fi
+exec "$real_timeout" "\$@"
+EOF
+chmod 700 "$hang_bin/timeout"
+state="$state_root/16-1-final-deploy"
+install -d -m 700 "$state"
+printf '{"schemaVersion":1,"runKey":"16-1","outcome":"committed","providerEnabled":false}\n' \
+  >"$state/terminal.json"
+touch -d '@1799999980' "$state"
+tooling_root="$production_root/.test-vps-tooling-1-1"
+install -d -m 700 "$tooling_root/scripts"
+cp scripts/test-vps-provider-credential.py "$tooling_root/scripts/"
+set +e
+timeout_output=$(PATH="$hang_bin:$fake_bin:$PATH" bash "$remote_script" \
+  "$production_root" 1 1 "$tooling_root" 2>&1)
+timeout_status=$?
+set -e
+[ "$timeout_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$timeout_output"
+[ -d "$state" ]
+[ -d "$tooling_root" ]
+PATH="$fake_bin:$PATH" bash "$remote_script" \
+  "$production_root" 1 1 "$tooling_root"
+[ ! -e "$state" ]
+[ ! -e "$tooling_root" ]
+
+state="$state_root/15-1-final-deploy"
+install -d -m 700 "$state"
+printf '{"schemaVersion":1,"runKey":"15-1","outcome":"committed","providerEnabled":false}\n' \
+  >"$state/terminal.json"
+touch -d '@1799999970' "$state"
+tooling_root="$production_root/.test-vps-tooling-1-1"
+install -d -m 700 "$tooling_root/scripts"
+cp scripts/test-vps-provider-credential.py "$tooling_root/scripts/"
+PATH="$fake_bin:$PATH" bash "$remote_script" \
+  "$production_root" 1 1 "$tooling_root"
+[ ! -e "$state_root/15-1-final-deploy" ]
+[ ! -e "$tooling_root" ]
+echo "retention fixture passed: all-service mounts, timeout failure, self-tooling ordering, repeated-run cleanup, protected reference, unknown, symlink and prefix-collision cases"

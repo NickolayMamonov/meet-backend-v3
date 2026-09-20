@@ -107,8 +107,10 @@ publication and keeps it through candidate verification, rollback, and
 finalization. A failed writer restores the predecessor image, release fields,
 active file presence/bytes, runtime hash, provider mount state, hardening, and
 public probes before cleanup. Created durable state is removed only when its
-identity and bytes still match the transaction witness and the restored
-runtime does not reference it. Reused or unknown operator-owned state is never
+identity and bytes still match the transaction snapshot, the private
+publication hard-link witness still has the approved owner/group/mode and link
+count, and the restored runtime proves that it references neither the
+published path nor its inode. Reused or unknown operator-owned state is never
 deleted. Unresolved markers and private transaction directories block
 retention and require separately authorized operator reconciliation.
 
@@ -124,18 +126,22 @@ canonical `sha256sum` format and are rejected if they use the compact form.
 ## Bounded retention
 
 After final runtime and public evidence passes, the workflow acquires the same
-remote deployment lock, removes only checksum-bound
-`.test-vps-tooling-<run>-<attempt>` directories, and retains the ten newest
-proven terminal deployment-state directories under
-`/var/lib/meet-test-vps-deploy`. It first resolves the running backend's bind
-mounts and the active plus predecessor/target rollback Compose inputs through
-bounded `docker inspect` and `docker compose config --format json` calls.
-Referenced paths, protected active/predecessor inputs, symlinked states,
-unknown or unproven states, and path-prefix collisions are never deletion
-candidates; any unresolved reference fails closed. Failed runs remain
-available until a later successful deployment applies retention. The active
-Compose/runtime files under `/var/lib/meet-production` are outside the cleanup
-roots and must still exist after cleanup.
+remote deployment lock and retains the ten newest proven terminal
+deployment-state directories under `/var/lib/meet-test-vps-deploy`. The
+rollback and final coordinator calls use the one canonical
+`<run-id>-<attempt>` run key; `rollback-drill` and `final-deploy` are state
+directory suffixes, so repeated final runs do not create an unparseable second
+key. Before invoking the retention helper, it resolves every bind mount from
+all running `meet-production` containers plus the active and
+predecessor/target rollback Compose inputs through bounded `docker inspect` and
+`docker compose config --format json` calls. The checksum-bound remote tooling
+is kept until that helper has completed successfully, then removed in a
+proven-safe order. Referenced paths, protected active/predecessor inputs,
+symlinked states, unknown or unproven states, and path-prefix collisions are
+never deletion candidates; any unresolved reference or timeout fails closed.
+Failed runs remain available until a later successful deployment applies
+retention. The active Compose/runtime files under `/var/lib/meet-production`
+are outside the cleanup roots and must still exist after cleanup.
 
 ## Yandex SMTP transaction workflow
 

@@ -661,6 +661,44 @@ def _validate_transaction(tx: str) -> None:
         _acl_is_safe(path, category="recovery")
 
 
+def _verify_created_publication(
+    tx: str,
+    destination: str,
+    identity: dict[str, Any],
+    snapshot: bytes,
+) -> dict[str, int]:
+    publication = os.path.join(tx, "publication")
+    if not os.path.isfile(publication) or os.path.islink(publication):
+        _fail("recovery")
+    try:
+        publication_identity, publication_data = _read_existing(
+            publication,
+            source=True,
+        )
+        durable_identity, durable_data = _read_existing(destination)
+        publication_info = os.stat(publication, follow_symlinks=False)
+        durable_info = os.stat(destination, follow_symlinks=False)
+    except ProviderError as error:
+        if error.category == ERRORS["recovery"]:
+            raise
+        _fail("recovery")
+    if (
+        publication_identity != durable_identity
+        or identity["durable"] != durable_identity
+        or publication_data != snapshot
+        or durable_data != snapshot
+        or publication_info.st_nlink != 2
+        or publication_info.st_uid != 0
+        or publication_info.st_gid != 10001
+        or stat.S_IMODE(publication_info.st_mode) != 0o440
+        or durable_info.st_uid != 0
+        or durable_info.st_gid != 10001
+        or stat.S_IMODE(durable_info.st_mode) != 0o440
+    ):
+        _fail("recovery")
+    return durable_identity
+
+
 def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> tuple[bool, bool, bool]:
     inspect, previous = _inspect_records(inspect_data)
     enabled, _ = _provider_state(inspect)
@@ -721,7 +759,7 @@ def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> t
                 destination_info = os.stat(destination, follow_symlinks=False)
                 if (
                     _identity(publication_info) != _identity(destination_info)
-                    or publication_info.st_nlink < 2
+                    or publication_info.st_nlink != 2
                 ):
                     _fail("changed")
                 disposition = "created"
@@ -812,9 +850,17 @@ def _finish(run_key: str, state_root: str, root: str, outcome: str, inspect_data
         _validate_identity(identity)
         snapshot = _read_private(os.path.join(tx, "snapshot"))
         destination = _rooted(HOST_CREDENTIAL_PATH, root)
-        durable_identity, durable_data = _read_existing(destination)
-        if identity["durable"] != durable_identity or durable_data != snapshot:
-            _fail("recovery")
+        if disposition == "created":
+            durable_identity = _verify_created_publication(
+                tx,
+                destination,
+                identity,
+                snapshot,
+            )
+        else:
+            durable_identity, durable_data = _read_existing(destination)
+            if identity["durable"] != durable_identity or durable_data != snapshot:
+                _fail("recovery")
         if enabled:
             if source is None:
                 _fail("recovery")
@@ -824,9 +870,10 @@ def _finish(run_key: str, state_root: str, root: str, outcome: str, inspect_data
                 or source_data != snapshot
             ):
                 _fail("recovery")
+            if outcome == "rolled-back" and disposition == "created":
+                if source_identity == durable_identity:
+                    _fail("recovery")
         if outcome == "rolled-back" and disposition == "created":
-            if present and source == HOST_CREDENTIAL_PATH:
-                _fail("recovery")
             os.unlink(destination)
         for name in ("identity.json", "snapshot", "publication"):
             path = os.path.join(tx, name)
