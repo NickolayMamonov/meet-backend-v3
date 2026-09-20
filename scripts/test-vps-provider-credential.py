@@ -134,22 +134,36 @@ def _mode_is_safe(mode: int, *, source: bool = False) -> bool:
     return True
 
 
-def _acl_is_safe(path: str, *, follow_symlinks: bool = False) -> bool:
-    # An extended access ACL is not represented by ordinary mode bits.  If the
-    # Linux xattr interface is available, reject an ACL we cannot prove safe.
+def _acl_is_safe(
+    path: str,
+    *,
+    follow_symlinks: bool = False,
+    category: str = "credential",
+) -> bool:
+    # Ordinary mode bits do not represent POSIX access or default ACL entries.
+    # Missing ACL xattrs are safe; an unavailable xattr interface is not proof
+    # that a private object is safe and therefore blocks the operation.
     getter = getattr(os, "getxattr", None)
     if getter is None:
-        return True
-    try:
-        getter(path, "system.posix_acl_access", follow_symlinks=follow_symlinks)
-    except OSError as exc:
-        if exc.errno in (
-            errno.ENODATA,
-            errno.ENOATTR if hasattr(errno, "ENOATTR") else errno.ENODATA,
-        ):
-            return True
-        _fail("credential")
-    return False
+        _fail("prerequisite")
+    for attribute in ("system.posix_acl_access", "system.posix_acl_default"):
+        try:
+            getter(path, attribute, follow_symlinks=follow_symlinks)
+        except OSError as exc:
+            if exc.errno in (
+                errno.ENODATA,
+                errno.ENOATTR if hasattr(errno, "ENOATTR") else errno.ENODATA,
+            ):
+                continue
+            if exc.errno in (
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP if hasattr(errno, "EOPNOTSUPP") else errno.ENOTSUP,
+            ):
+                _fail("prerequisite")
+            _fail(category)
+        else:
+            _fail(category)
+    return True
 
 
 def _components(path: str) -> tuple[str, list[str]]:
@@ -170,17 +184,18 @@ def _check_ancestors(path: str) -> None:
             stat.S_IWGRP | stat.S_IWOTH
         ):
             _fail("credential")
+        _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True)
         for part in parts[:-1]:
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            try:
-                info = os.fstat(child)
-                if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
-                    _fail("credential")
-                if not _acl_is_safe(f"/proc/self/fd/{child}", follow_symlinks=True):
-                    _fail("credential")
-            finally:
-                os.close(fd)
+            previous_fd = fd
             fd = child
+            os.close(previous_fd)
+            info = os.fstat(fd)
+            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & (
+                stat.S_IWGRP | stat.S_IWOTH
+            ):
+                _fail("credential")
+            _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True)
     finally:
         os.close(fd)
 
@@ -361,7 +376,12 @@ def _mounts(inspect: dict[str, Any]) -> list[dict[str, Any]]:
     return list(mounts)
 
 
-def _provider_mount(inspect: dict[str, Any], enabled: bool) -> tuple[bool, bool, str | None]:
+def _provider_mount(
+    inspect: dict[str, Any],
+    enabled: bool,
+    *,
+    allow_external_source: bool = False,
+) -> tuple[bool, bool, str | None]:
     matches: list[dict[str, Any]] = []
     seen_upload = False
     seen_tmpfs = False
@@ -394,7 +414,11 @@ def _provider_mount(inspect: dict[str, Any], enabled: bool) -> tuple[bool, bool,
     if mount.get("Type") != "bind" or bool(mount.get("RW", True)):
         _fail("provider")
     source = mount.get("Source")
-    if source != HOST_CREDENTIAL_PATH:
+    if not isinstance(source, str) or not source.startswith("/") or "\x00" in source:
+        _fail("provider")
+    if any(part in ("", ".", "..") for part in source.split("/")[1:]):
+        _fail("provider")
+    if not allow_external_source and source != HOST_CREDENTIAL_PATH:
         _fail("provider")
     return True, True, source
 
@@ -467,11 +491,12 @@ def _ensure_parent(parent: str) -> None:
         os.mkdir(parent, 0o700)
         os.chown(parent, 0, 0)
         os.chmod(parent, 0o700)
-    if not _acl_is_safe(parent):
-        _fail("credential")
+    _check_ancestors(parent)
+    _acl_is_safe(parent)
 
 
 def _write_private(path: str, data: bytes, mode: int, gid: int = 0) -> None:
+    _check_ancestors(path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     fd = os.open(path, flags, mode)
     try:
@@ -481,6 +506,7 @@ def _write_private(path: str, data: bytes, mode: int, gid: int = 0) -> None:
         os.fsync(fd)
         os.fchown(fd, 0, gid)
         os.fchmod(fd, mode)
+        _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -522,6 +548,7 @@ def _revalidate_open_source(
 
 
 def _read_private(path: str) -> bytes:
+    _check_ancestors(path)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
@@ -530,6 +557,11 @@ def _read_private(path: str) -> bytes:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
             _fail("recovery")
+        _acl_is_safe(
+            f"/proc/self/fd/{fd}",
+            follow_symlinks=True,
+            category="recovery",
+        )
         data = bytearray()
         while len(data) <= MAX_CREDENTIAL_BYTES:
             chunk = os.read(fd, min(65536, MAX_CREDENTIAL_BYTES + 1 - len(data)))
@@ -611,9 +643,11 @@ def _validate_identity(value: Any) -> None:
 def _validate_transaction(tx: str) -> None:
     if not os.path.isdir(tx) or os.path.islink(tx):
         _fail("recovery")
+    _check_ancestors(tx)
     info = os.stat(tx, follow_symlinks=False)
     if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
         _fail("recovery")
+    _acl_is_safe(tx, category="recovery")
     allowed = {"snapshot", "publication", "identity.json"}
     names = set(os.listdir(tx))
     if not names.issubset(allowed):
@@ -624,6 +658,7 @@ def _validate_transaction(tx: str) -> None:
         path = os.path.join(tx, name)
         if os.path.islink(path):
             _fail("recovery")
+        _acl_is_safe(path, category="recovery")
 
 
 def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> tuple[bool, bool, bool]:
@@ -632,7 +667,11 @@ def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> t
     if previous is not None:
         if _effective_tuple(inspect) != _effective_tuple(previous):
             _fail("provider")
-    present, read_only, source = _provider_mount(inspect, enabled)
+    present, read_only, source = _provider_mount(
+        inspect,
+        enabled,
+        allow_external_source=True,
+    )
     if not enabled:
         _result(False, False, False, "prepared")
         return False, False, False
@@ -710,7 +749,11 @@ def _verify(run_key: str, root: str, inspect_data: bytes, phase: str) -> None:
     enabled, _ = _provider_state(inspect)
     if previous is not None and _effective_tuple(inspect) != _effective_tuple(previous):
         _fail("provider")
-    present, read_only, source = _provider_mount(inspect, enabled)
+    present, read_only, source = _provider_mount(
+        inspect,
+        enabled,
+        allow_external_source=phase == "rollback",
+    )
     if enabled:
         if source is None:
             _fail("provider")
@@ -718,7 +761,11 @@ def _verify(run_key: str, root: str, inspect_data: bytes, phase: str) -> None:
             _fail("provider")
         if phase == "rollback" and previous is not None:
             _, previous_present, previous_source = (
-                _provider_mount(previous, _provider_state(previous)[0])
+                _provider_mount(
+                    previous,
+                    _provider_state(previous)[0],
+                    allow_external_source=True,
+                )
             )
             if previous_present != present or previous_source != source:
                 _fail("provider")
@@ -740,7 +787,11 @@ def _finish(run_key: str, state_root: str, root: str, outcome: str, inspect_data
         _fail("provider")
     inspect = _inspect(inspect_data)
     enabled, _ = _provider_state(inspect)
-    present, read_only, source = _provider_mount(inspect, enabled)
+    present, read_only, source = _provider_mount(
+        inspect,
+        enabled,
+        allow_external_source=outcome == "rolled-back",
+    )
     parent = _rooted(HOST_CREDENTIAL_PARENT, root)
     tx = _transaction(parent, run_key)
     marker = _marker(state_root, run_key)
@@ -789,12 +840,32 @@ def _check() -> None:
     required = ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "O_NOATIME")
     if any(not hasattr(os, name) for name in required):
         _fail("prerequisite")
+    if not hasattr(os, "getxattr"):
+        _fail("prerequisite")
     if not hasattr(os, "link") or not hasattr(os, "fsync") or not hasattr(os.stat_result, "st_mtime_ns"):
         _fail("prerequisite")
     _result(False, False, False, "checked")
 
 
-def _retention_check(root: str, state_root: str) -> None:
+def _retention_reference(path: str) -> str:
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or "\x00" in path
+        or any(part in ("", ".", "..") for part in path.split("/")[1:])
+    ):
+        _fail("recovery")
+    if os.path.lexists(path) and os.path.realpath(path) != path:
+        _fail("recovery")
+    return path
+
+
+def _retention_check(
+    root: str,
+    state_root: str,
+    protected_paths: Iterable[str] = (),
+    protected_states: Iterable[str] = (),
+) -> None:
     parent = _rooted(HOST_CREDENTIAL_PARENT, root)
     marker = os.path.join(state_root, ".provider-transaction.current")
     if os.path.lexists(marker):
@@ -808,6 +879,43 @@ def _retention_check(root: str, state_root: str) -> None:
         for name in os.listdir(parent):
             if name.startswith(".transaction-"):
                 _fail("recovery")
+    if os.path.lexists(state_root) and (
+        os.path.islink(state_root)
+        or not os.path.isdir(state_root)
+    ):
+        _fail("recovery")
+    if os.path.isdir(state_root):
+        state_root_real = os.path.realpath(state_root)
+        references = [_retention_reference(path) for path in protected_paths]
+        explicit_states = {
+            os.path.realpath(path)
+            for path in protected_states
+        }
+        for path in protected_states:
+            if (
+                not isinstance(path, str)
+                or os.path.dirname(path.rstrip("/")) != state_root.rstrip("/")
+                or os.path.islink(path)
+                or not os.path.isdir(path)
+            ):
+                _fail("recovery")
+        for name in os.listdir(state_root):
+            path = os.path.join(state_root, name)
+            if os.path.islink(path):
+                continue
+            if not os.path.isdir(path):
+                continue
+            real_path = os.path.realpath(path)
+            if real_path == state_root_real:
+                _fail("recovery")
+            if real_path in explicit_states:
+                continue
+            for reference in references:
+                if reference == path or reference.startswith(path + "/"):
+                    # The caller resolves Docker/Compose references and passes
+                    # them here.  A component boundary is required so a state
+                    # named "1-2" cannot protect or match "1-20".
+                    break
     _result(False, False, False, "retention-safe")
 
 
@@ -819,6 +927,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--filesystem-root", "--root", dest="filesystem_root", default="")
     parser.add_argument("--phase", default="")
     parser.add_argument("--outcome", default="")
+    parser.add_argument("--protected-path", action="append", default=[])
+    parser.add_argument("--protected-state", action="append", default=[])
     return parser
 
 
@@ -830,7 +940,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "observe":
             inspect = _inspect(_bounded_stdin(MAX_INSPECTION_BYTES))
             enabled, _ = _provider_state(inspect)
-            present, read_only, _ = _provider_mount(inspect, enabled)
+            present, read_only, _ = _provider_mount(
+                inspect,
+                enabled,
+                allow_external_source=True,
+            )
             _result(enabled, present, read_only, "observed")
         elif args.command == "prepare":
             _run_key(args.run_key)
@@ -842,7 +956,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             _run_key(args.run_key)
             _finish(args.run_key, args.state_root, args.filesystem_root, args.outcome, _bounded_stdin(MAX_INSPECTION_BYTES))
         else:
-            _retention_check(args.filesystem_root, args.state_root)
+            _retention_check(
+                args.filesystem_root,
+                args.state_root,
+                args.protected_path,
+                args.protected_state,
+            )
         return 0
     except ProviderError as exc:
         sys.stderr.write(exc.category + "\n")

@@ -90,12 +90,15 @@ predecessor image or pull policy.
 
 Credential reconciliation is operator-owned and fail-closed. It accepts an
 unchanged safe durable file without repairing permissions, rejects malformed,
-ambiguous, duplicate, symlinked, raced, ACL-unsafe, wrong-owner, wrong-mode,
-wrong-project, changed, or mismatched state, and never rotates or overwrites
-an existing file. Transaction-created state is retained until exact rollback
-or commit proof. The private transaction marker, snapshot, witness, and
-identity record contain no credential values, paths, hashes, account identity,
-or raw inspection. Static failure categories are
+ambiguous, duplicate, symlinked, raced, access-ACL/default-ACL-unsafe,
+wrong-owner, wrong-mode, wrong-project, changed, or mismatched state, and
+never rotates or overwrites an existing file. Every trusted ancestor and
+private transaction object is checked through the Linux ACL xattr interface;
+missing ACL inspection support is a prerequisite failure, not an implicit
+safe fallback. Transaction-created state is retained until exact rollback or
+commit proof. The private transaction marker, snapshot, witness, and identity
+record contain no credential values, paths, hashes, account identity, or raw
+inspection. Static failure categories are
 `PROVIDER_STATE_INVALID`, `CREDENTIAL_INVALID`, `CREDENTIAL_CHANGED`,
 `DURABLE_CONFLICT`, `RECOVERY_REQUIRED`, and `PREREQUISITE_MISSING`.
 
@@ -123,10 +126,16 @@ canonical `sha256sum` format and are rejected if they use the compact form.
 After final runtime and public evidence passes, the workflow acquires the same
 remote deployment lock, removes only checksum-bound
 `.test-vps-tooling-<run>-<attempt>` directories, and retains the ten newest
-deployment-state directories under `/var/lib/meet-test-vps-deploy`. Failed
-runs remain available until the next successful deployment applies retention.
-The active Compose/runtime files under `/var/lib/meet-production` are outside
-the cleanup roots and must still exist after cleanup.
+proven terminal deployment-state directories under
+`/var/lib/meet-test-vps-deploy`. It first resolves the running backend's bind
+mounts and the active plus predecessor/target rollback Compose inputs through
+bounded `docker inspect` and `docker compose config --format json` calls.
+Referenced paths, protected active/predecessor inputs, symlinked states,
+unknown or unproven states, and path-prefix collisions are never deletion
+candidates; any unresolved reference fails closed. Failed runs remain
+available until a later successful deployment applies retention. The active
+Compose/runtime files under `/var/lib/meet-production` are outside the cleanup
+roots and must still exist after cleanup.
 
 ## Yandex SMTP transaction workflow
 

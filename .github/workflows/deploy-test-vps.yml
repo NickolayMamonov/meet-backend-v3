@@ -499,14 +499,73 @@ jobs:
             echo "retention=skipped smtp_transaction_present"
             exit 1
           fi
-          python3 "$tooling/scripts/test-vps-provider-credential.py" \
-            retention-check --state-root "$state_root" >/dev/null
+          protected_refs=()
+          protected_states=()
+          retention_unresolved=false
+          add_protected_ref() {
+            local ref=$1
+            [[ "$ref" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$ref" != *..* ]] ||
+              return 1
+            if [ -L "$ref" ] || { [ -e "$ref" ] && [ "$(realpath -- "$ref")" != "$ref" ]; }; then
+              return 1
+            fi
+            protected_refs+=("$ref")
+          }
+          compose_refs() {
+            local rendered
+            rendered=$(env -i PATH="$PATH" HOME=/root COMPOSE_PROJECT_NAME=meet-production \
+              docker compose --project-directory "$root" \
+              --env-file "$root/.env.production" "$@" config --format json 2>/dev/null) ||
+              return 1
+            refs=$(jq -r '
+              .. | objects |
+              select(.type? == "bind" and (.source? | type == "string")) |
+              .source
+            ' <<<"$rendered") || return 1
+            while IFS= read -r ref; do
+              [ -n "$ref" ] || continue
+              add_protected_ref "$ref" || return 1
+            done <<<"$refs"
+          }
+          backend=$(docker ps -q \
+            --filter label=com.docker.compose.project=meet-production \
+            --filter label=com.docker.compose.service=backend)
+          [ "$(wc -l <<<"$backend" | tr -d '[:space:]')" = 1 ] &&
+            [ -n "$backend" ] || retention_unresolved=true
+          if [ "$retention_unresolved" = false ]; then
+            mount_json=$(docker inspect "$backend" --format '{{json .Mounts}}' 2>/dev/null) ||
+              retention_unresolved=true
+            if [ "$retention_unresolved" = false ]; then
+              mount_refs=$(jq -r '
+                if type == "array" then
+                  .[] | select(.Type == "bind") | .Source
+                else
+                  error("invalid mounts")
+                end
+              ' <<<"$mount_json") || retention_unresolved=true
+              if [ "$retention_unresolved" = false ]; then
+                while IFS= read -r ref; do
+                  [ -n "$ref" ] || continue
+                  add_protected_ref "$ref" || retention_unresolved=true
+                done <<<"$mount_refs"
+              fi
+            fi
+          fi
+          if [ -s /var/lib/meet-production/active-compose.yml ] &&
+            [ -s /var/lib/meet-production/active-runtime.override.yml ]; then
+            compose_refs \
+              -f /var/lib/meet-production/active-compose.yml \
+              -f /var/lib/meet-production/active-runtime.override.yml ||
+              retention_unresolved=true
+          else
+            retention_unresolved=true
+          fi
 
           delete_tree() {
             local path=$1
             [ -d "$path" ] && [ ! -L "$path" ]
+            ! find "$path" -xdev -type l -print -quit | grep -q .
             find "$path" -xdev -type f -delete
-            find "$path" -xdev -type l -delete
             find "$path" -xdev -depth -type d -empty -delete
             [ ! -e "$path" ]
           }
@@ -520,7 +579,7 @@ jobs:
             tooling_removed=$((tooling_removed + 1))
           done
 
-          mapfile -t states < <(
+          mapfile -t state_paths < <(
             find "$state_root" -mindepth 1 -maxdepth 1 -type d \
               -printf '%T@ %p\n' |
               while IFS=' ' read -r timestamp path; do
@@ -532,9 +591,74 @@ jobs:
               sort -nr |
               cut -d' ' -f2-
           )
+          states=()
+          for path in "${state_paths[@]}"; do
+            name=${path#"$state_root/"}
+            case "$name" in
+              *-final-deploy) state_run_key=${name%-final-deploy} ;;
+              *-rollback-drill) state_run_key=${name%-rollback-drill} ;;
+              *) continue ;;
+            esac
+            terminal="$path/terminal.json"
+            jq -e --arg run_key "$state_run_key" '
+              type == "object" and
+              (keys | sort) == ["outcome","providerEnabled","runKey","schemaVersion"] and
+              .schemaVersion == 1 and .runKey == $run_key and
+              (.outcome == "committed" or .outcome == "rolled-back") and
+              (.providerEnabled | type == "boolean")
+            ' "$terminal" >/dev/null 2>&1 || continue
+            if find "$path" -xdev -type l -print -quit | grep -q .; then
+              protected_states+=("$path")
+              continue
+            fi
+            if [ -s "$path/previous-active-compose.yml" ]; then
+              compose_args=(-f "$path/previous-active-compose.yml")
+              [ -s "$path/previous-active-runtime.yml" ] &&
+                compose_args+=(-f "$path/previous-active-runtime.yml")
+              compose_refs "${compose_args[@]}" || {
+                protected_states+=("$path")
+                continue
+              }
+            fi
+            if [ -s "$path/target-runtime.override.yml" ]; then
+              compose_refs \
+                -f "$root/docker-compose.production.yml" \
+                -f "$path/target-runtime.override.yml" || {
+                  protected_states+=("$path")
+                  continue
+                }
+            fi
+            states+=("$path")
+          done
+          provider_args=(retention-check --state-root "$state_root")
+          for ref in "${protected_refs[@]}"; do
+            provider_args+=(--protected-path "$ref")
+          done
+          for path in "${protected_states[@]}"; do
+            provider_args+=(--protected-state "$path")
+          done
+          if [ "$retention_unresolved" != false ]; then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
+          python3 "$tooling/scripts/test-vps-provider-credential.py" \
+            "${provider_args[@]}" >/dev/null
+
           states_removed=0
           for ((index=10; index<${#states[@]}; index++)); do
             path=${states[$index]}
+            protected=false
+            for protected_path in "${protected_states[@]}"; do
+              [ "$path" = "$protected_path" ] && protected=true
+            done
+            if [ "$protected" = false ]; then
+              for ref in "${protected_refs[@]}"; do
+                case "$ref" in
+                  "$path"|"$path"/*) protected=true; break ;;
+                esac
+              done
+            fi
+            [ "$protected" = false ] || continue
             delete_tree "$path"
             states_removed=$((states_removed + 1))
           done

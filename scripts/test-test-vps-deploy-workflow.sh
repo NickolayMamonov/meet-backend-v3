@@ -10,11 +10,13 @@ provider_deploy=scripts/deploy-test-vps-provider-release.sh
 provider_helper=scripts/test-vps-provider-credential.py
 provider_tests=scripts/test-test-vps-provider-credential.py
 provider_runtime=scripts/test-test-vps-provider-runtime.sh
+retention_fixture=scripts/test-test-vps-retention.sh
 baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
 
 [ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ] &&
   [ -f "$provider_deploy" ] && [ -f "$provider_helper" ] &&
-  [ -f "$provider_tests" ] && [ -f "$provider_runtime" ]
+  [ -f "$provider_tests" ] && [ -f "$provider_runtime" ] &&
+  [ -f "$retention_fixture" ]
 workflow_text=$(<"$workflow")
 deploy_text=$(<"$deploy")
 runtime_text=$(<"$runtime")
@@ -55,6 +57,10 @@ for text in \
   '--mode deploy' \
   'https://api.whysoezzy.online' \
   'Apply bounded test-VPS deployment retention' \
+  'docker compose --project-directory "$root"' \
+  '--protected-path' \
+  '--protected-state' \
+  'RECOVERY_REQUIRED' \
   'find "$path" -xdev -type f -delete' \
   'index=10' \
   'retention=applied'; do
@@ -183,6 +189,10 @@ update_line=$(awk '/"\$update_script" "\$image"/{print NR; exit}' "$deploy")
   fail "deployment floor checks are ordered after a protected writer"
 
 require 'runtime_check=network' "$runtime_text" "shared runtime helper"
+
+if [ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ]; then
+  timeout 300s bash "$retention_fixture"
+fi
 
 case "$workflow_text"$'\n'"$deploy_text" in
   *'rm -rf'*) echo "test VPS deployment must not recursively delete host state" >&2; exit 1 ;;

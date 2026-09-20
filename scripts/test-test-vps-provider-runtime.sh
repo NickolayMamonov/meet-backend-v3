@@ -72,12 +72,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 - "$fixture" <<'PY'
+fixture_log="$fixture/output.log"
+fixture_secret=RUNTIME_FIXTURE_PRIVATE_SECRET_9f7d8d
+if ! python3 - "$fixture" >"$fixture_log" 2>&1 <<'PY'
 import importlib.util
 import json
 import os
 import pathlib
 import stat
+import struct
 import sys
 import tempfile
 
@@ -100,7 +103,7 @@ account = {
     "client_email": "runtime-fixture@example.invalid",
     "client_id": "runtime-fixture-id",
     "private_key_id": "runtime-fixture-key",
-    "private_key": "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----",
+    "private_key": "-----BEGIN PRIVATE KEY-----\nRUNTIME_FIXTURE_PRIVATE_SECRET_9f7d8d\n-----END PRIVATE KEY-----",
     "token_uri": "https://oauth2.example.invalid/token",
 }
 source.write_text(json.dumps(account), encoding="utf-8")
@@ -113,6 +116,71 @@ helper.CONTAINER_CREDENTIAL_PATH = "/run/secrets/meet-firebase-service-account.j
 state = fixture / "state"
 state.mkdir(mode=0o700)
 os.chown(state, 0, 0)
+
+def acl(entries: list[tuple[int, int, int]]) -> bytes:
+    return struct.pack("<I", 2) + b"".join(
+        struct.pack("<HHI", tag, permission, identifier)
+        for tag, permission, identifier in entries
+    )
+
+def add_default_acl(path: pathlib.Path) -> None:
+    os.setxattr(
+        path,
+        "system.posix_acl_default",
+        acl(
+            [
+                (1, 7, 0xFFFFFFFF),
+                (2, 4, 20002),
+                (4, 5, 0xFFFFFFFF),
+                (16, 5, 0xFFFFFFFF),
+                (32, 5, 0xFFFFFFFF),
+            ]
+        ),
+    )
+
+def add_private_access_acl(path: pathlib.Path) -> None:
+    os.setxattr(
+        path,
+        "system.posix_acl_access",
+        acl(
+            [
+                (1, 0, 0xFFFFFFFF),
+                (2, 4, 20002),
+                (4, 0, 0xFFFFFFFF),
+                (16, 0, 0xFFFFFFFF),
+                (32, 0, 0xFFFFFFFF),
+            ]
+        ),
+    )
+
+def remove_acl(path: pathlib.Path, attribute: str) -> None:
+    try:
+        os.removexattr(path, attribute)
+    except OSError as error:
+        if error.errno != 61:
+            raise
+
+def expect_provider_error(action, category: str) -> None:
+    try:
+        action()
+    except helper.ProviderError as error:
+        assert error.category == category, error.category
+    else:
+        raise AssertionError(f"expected {category}")
+
+def deny_unprivileged_read(path: pathlib.Path) -> None:
+    child = os.fork()
+    if child == 0:
+        try:
+            os.setgroups([])
+            os.setgid(20002)
+            os.setuid(20002)
+            with path.open("rb"):
+                os._exit(0)
+        except OSError:
+            os._exit(1)
+    _, status = os.waitpid(child, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
 
 def inspect(source_path: pathlib.Path) -> dict:
     return {
@@ -140,6 +208,21 @@ def inspect(source_path: pathlib.Path) -> dict:
     }
 
 predecessor = inspect(source)
+add_default_acl(parent)
+assert os.getxattr(parent, "system.posix_acl_default")
+expect_provider_error(
+    lambda: helper._acl_is_safe(str(parent)),
+    "CREDENTIAL_INVALID",
+)
+expect_provider_error(
+    lambda: helper._prepare(
+        "default-acl-parent", str(state), "", json.dumps(predecessor).encode()
+    ),
+    "CREDENTIAL_INVALID",
+)
+remove_acl(parent, "system.posix_acl_default")
+assert not (parent / ".transaction-default-acl-parent").exists()
+
 helper._prepare("created", str(state), "", json.dumps(predecessor).encode())
 marker = state / ".provider-transaction.current"
 helper._write_private(
@@ -156,6 +239,31 @@ helper._write_private(
     ).encode(),
     0o600,
 )
+deny_unprivileged_read(parent / ".transaction-created" / "snapshot")
+deny_unprivileged_read(parent / ".transaction-created" / "identity.json")
+add_default_acl(parent / ".transaction-created")
+expect_provider_error(
+    lambda: helper._verify(
+        "created",
+        "",
+        json.dumps([predecessor, inspect(pathlib.Path(helper.HOST_CREDENTIAL_PATH))]).encode(),
+        "candidate",
+    ),
+    "RECOVERY_REQUIRED",
+)
+remove_acl(parent / ".transaction-created", "system.posix_acl_default")
+add_private_access_acl(parent / ".transaction-created" / "snapshot")
+expect_provider_error(
+    lambda: helper._verify(
+        "created",
+        "",
+        json.dumps([predecessor, inspect(pathlib.Path(helper.HOST_CREDENTIAL_PATH))]).encode(),
+        "candidate",
+    ),
+    "RECOVERY_REQUIRED",
+)
+remove_acl(parent / ".transaction-created" / "snapshot", "system.posix_acl_access")
+os.chmod(parent / ".transaction-created" / "snapshot", 0o600)
 candidate = inspect(pathlib.Path(helper.HOST_CREDENTIAL_PATH))
 helper._verify(
     "created",
@@ -206,6 +314,13 @@ helper._write_private(
 helper._finish("rollback", str(state), "", "rolled-back", json.dumps(predecessor).encode())
 assert not pathlib.Path(helper.HOST_CREDENTIAL_PATH).exists()
 PY
+then
+  echo "provider runtime fixture failed" >&2
+  sed -n '1,160p' "$fixture_log" >&2
+  exit 1
+fi
+! grep -Fq "$fixture_secret" "$fixture_log" ||
+  { echo "provider runtime fixture leaked private credential bytes" >&2; exit 1; }
 
 python3 -B scripts/test-test-vps-provider-credential.py
-echo "provider filesystem fixture passed: bounded parsing, no-follow publication, reuse and rollback cleanup"
+echo "provider filesystem fixture passed: ACL/default-ACL rejection, unprivileged private-read denial, bounded parsing, no-follow publication, reuse and rollback cleanup; secret scan passed"
