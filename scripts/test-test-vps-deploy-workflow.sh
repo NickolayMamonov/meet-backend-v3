@@ -379,7 +379,9 @@ printf '%s\n' \
   'APP_PUSH_PROVIDER_ENABLED=false' \
   >"$config_root/.env.production"
 printf '%s\n' 'services:' '  backend:' '    image: fixture' >"$config_base"
+# shellcheck disable=SC2034
 root="$config_root"
+# shellcheck disable=SC2034
 base_compose="$config_base"
 state="$config_state"
 snapshot_configuration
@@ -407,7 +409,9 @@ mkdir -p "$active_state"
 printf 'predecessor\n' >"$active_fixture"
 # shellcheck disable=SC2034
 state="$active_state"
+# shellcheck disable=SC2034
 active_compose="$active_fixture"
+# shellcheck disable=SC2034
 active_runtime="$tmp/unused-runtime"
 snapshot_active_file "$active_fixture" compose
 validate_active_files_before_writers
@@ -475,7 +479,9 @@ modified_state="$tmp/modified-state"
 mkdir -p "$modified_state"
 printf 'predecessor\n' >"$modified_fixture"
 state="$modified_state"
+# shellcheck disable=SC2034
 active_compose="$modified_fixture"
+# shellcheck disable=SC2034
 active_runtime="$tmp/unused-runtime"
 snapshot_active_file "$modified_fixture" compose
 printf 'modified\n' >"$modified_fixture"
@@ -544,7 +550,19 @@ update_line=$(awk '/"\$update_script" "\$image"/{print NR; exit}' "$deploy")
 require 'runtime_check=network' "$runtime_text" "shared runtime helper"
 
 if [ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ]; then
+  set +e
   timeout 300s bash "$closed_beta_fixture"
+  closed_beta_status=$?
+  set -e
+  case "$closed_beta_status" in
+    0) ;;
+    77)
+      echo "closed-beta staged compatibility environment-blocked: isolated /var/lib/meet-production is unavailable"
+      ;;
+    *)
+      exit "$closed_beta_status"
+      ;;
+  esac
   timeout 300s bash "$retention_fixture"
 fi
 
