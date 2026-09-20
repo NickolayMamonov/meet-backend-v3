@@ -103,6 +103,9 @@ cat >"$fake_bin/rmdir" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 path=\${1:-}
+if [ "\$path" = -- ]; then
+  path=\${2:-}
+fi
 if [ "\${path##*/}" = 17-1-final-deploy ] &&
   [ ! -e "\$path/concurrent-unknown.txt" ]; then
   printf 'unknown-concurrent\n' >"\$path/concurrent-unknown.txt"
