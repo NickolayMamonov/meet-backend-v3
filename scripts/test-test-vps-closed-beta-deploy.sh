@@ -315,6 +315,7 @@ current_state=$(sed -n '2p' <<<"$current_root_state")
 current_status=$(<"$fixture/current-rollback-drill.status")
 [ "$current_status" -eq 86 ]
 grep -Fq 'rollback=completed previous_image_id=' "$fixture/current-rollback-drill.output"
+cp -- "$trace" "$fixture/current-rollback.trace"
 grep -Fxq "BACKEND_IMAGE=$previous_image" "$current_root/.env.production"
 cmp -s "$production_state/active-compose.yml" "$fixture/predecessor-compose"
 cmp -s "$production_state/active-runtime.override.yml" "$fixture/predecessor-runtime"
@@ -354,11 +355,18 @@ run_legacy "$baseline_coordinator" baseline rollback-drill >/dev/null
 baseline_status=$(<"$fixture/baseline-rollback-drill.status")
 [ "$baseline_status" -eq 86 ]
 grep -Fq 'rollback=completed previous_image_id=' "$fixture/baseline-rollback-drill.output"
+cp -- "$trace" "$fixture/baseline-rollback.trace"
 sed -E "s#$fixture/[A-Za-z0-9._/-]+#FIXTURE#g" \
   "$fixture/current-rollback-drill.output" >"$fixture/current.normalized"
 sed -E "s#$fixture/[A-Za-z0-9._/-]+#FIXTURE#g" \
   "$fixture/baseline-rollback-drill.output" >"$fixture/baseline.normalized"
 cmp -s "$fixture/current.normalized" "$fixture/baseline.normalized"
+sed -E "s#$fixture/[A-Za-z0-9._/-]+#FIXTURE#g" \
+  "$fixture/current-rollback.trace" >"$fixture/current-rollback.normalized"
+sed -E "s#$fixture/[A-Za-z0-9._/-]+#FIXTURE#g" \
+  "$fixture/baseline-rollback.trace" >"$fixture/baseline-rollback.normalized"
+cmp -s "$fixture/current-rollback.normalized" \
+  "$fixture/baseline-rollback.normalized"
 
 current_root_state=$(run_legacy "$staged/scripts/deploy-test-vps-release.sh" current-final deploy)
 current_root=$(sed -n '1p' <<<"$current_root_state")
