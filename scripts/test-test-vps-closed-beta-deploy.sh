@@ -6,13 +6,13 @@ cd "$ROOT_DIR"
 
 if [ "$(uname -s)" != Linux ] || [ "$(id -u)" -ne 0 ]; then
   echo "PREREQUISITE_MISSING" >&2
-  exit 0
+  exit 77
 fi
 
 production_state=/var/lib/meet-production
 if [ -e "$production_state" ]; then
   echo "PREREQUISITE_MISSING: isolated /var/lib/meet-production is unavailable" >&2
-  exit 0
+  exit 77
 fi
 
 fixture=$(mktemp -d /tmp/meet-closed-beta-fixture.XXXXXX)
@@ -366,10 +366,26 @@ current_state=$(sed -n '2p' <<<"$current_root_state")
 current_status=$(<"$fixture/current-final-deploy.status")
 [ "$current_status" -eq 0 ]
 grep -Fq 'deployment=completed image_id=' "$fixture/current-final-deploy.output"
+cp -- "$trace" "$fixture/current-final.trace"
 grep -Fxq 'hook phase=predecessor' "$trace"
 grep -Fxq 'hook phase=candidate' "$trace"
 grep -Fxq 'hook phase=final' "$trace"
 ! find "$current_state" -name '.provider-*' -print -quit | grep -q .
 ! grep -Eiq 'provider-transaction|test-vps-provider' "$trace"
+
+run_legacy "$baseline_coordinator" baseline-final deploy >/dev/null
+baseline_final_status=$(<"$fixture/baseline-final-deploy.status")
+[ "$baseline_final_status" -eq 0 ]
+grep -Fq 'deployment=completed image_id=' "$fixture/baseline-final-deploy.output"
+cp -- "$trace" "$fixture/baseline-final.trace"
+grep -Fxq 'hook phase=predecessor' "$trace"
+grep -Fxq 'hook phase=candidate' "$trace"
+grep -Fxq 'hook phase=final' "$trace"
+! grep -Eiq 'provider-transaction|test-vps-provider' "$trace"
+sed -E "s#$fixture/[A-Za-z0-9._/-]+#FIXTURE#g" \
+  "$fixture/current-final.trace" >"$fixture/current-final.normalized"
+sed -E "s#$fixture/[A-Za-z0-9._/-]+#FIXTURE#g" \
+  "$fixture/baseline-final.trace" >"$fixture/baseline-final.normalized"
+cmp -s "$fixture/current-final.normalized" "$fixture/baseline-final.normalized"
 
 echo "closed-beta staged archive fixture passed: extracted workflow archive, legacy rollback status 86, final success, baseline trace parity, and provider-lane isolation"

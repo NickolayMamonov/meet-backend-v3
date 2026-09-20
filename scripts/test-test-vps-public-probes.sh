@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT_DIR"
 
+case "${OSTYPE:-}: ${MSYSTEM:-}" in
+  msys*|cygwin*|mingw*|*:MINGW*|*:MSYS*|*:CYGWIN*)
+    echo "PREREQUISITE_MISSING: complete public probe matrix requires native Ubuntu pipe semantics" >&2
+    exit 77
+    ;;
+esac
 if [ "$(uname -s)" != Linux ]; then
   echo "PREREQUISITE_MISSING: complete public probe matrix requires Ubuntu pipe semantics" >&2
   exit 77
@@ -138,7 +144,7 @@ run_probe() {
 }
 
 probe_modes=(
-  success object malformed non200 oversized transport actuator-status
+  success object malformed non200 oversized transport timeout actuator-status
   actuator-transport redirect-status redirect-location redirect-transport
 )
 for mode in "${probe_modes[@]}"; do

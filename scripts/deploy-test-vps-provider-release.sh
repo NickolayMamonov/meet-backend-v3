@@ -1158,6 +1158,19 @@ verify_predecessor_for_cleanup() {
     return 1
   }
   cleanup_inspect=$current_inspect
+  runtime_invariants_bounded "$previous_id" "$previous_revision" \
+    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 || {
+      echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+      return 1
+    }
+  runtime_environment_bounded >/dev/null 2>&1 || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  if ! (verify_public_contract "$public_url" >/dev/null 2>&1); then
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  fi
   printf '[%s,%s]' "$previous_inspect" "$current_inspect" |
     timeout 30s python3 "$provider_helper" verify \
       --run-key "$run_key" --state-root "$state_root" --phase predecessor \
