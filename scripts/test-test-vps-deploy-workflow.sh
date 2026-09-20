@@ -6,11 +6,20 @@ cd "$ROOT_DIR"
 workflow=.github/workflows/deploy-test-vps.yml
 deploy=scripts/deploy-test-vps-release.sh
 runtime=scripts/test-vps-runtime-invariants.sh
+provider_deploy=scripts/deploy-test-vps-provider-release.sh
+provider_helper=scripts/test-vps-provider-credential.py
+provider_tests=scripts/test-test-vps-provider-credential.py
+provider_runtime=scripts/test-test-vps-provider-runtime.sh
+baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
 
-[ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ]
+[ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ] &&
+  [ -f "$provider_deploy" ] && [ -f "$provider_helper" ] &&
+  [ -f "$provider_tests" ] && [ -f "$provider_runtime" ]
 workflow_text=$(<"$workflow")
 deploy_text=$(<"$deploy")
 runtime_text=$(<"$runtime")
+provider_deploy_text=$(<"$provider_deploy")
+provider_helper_text=$(<"$provider_helper")
 # shellcheck source=scripts/deploy-test-vps-release.sh
 source "$deploy"
 
@@ -51,6 +60,35 @@ for text in \
   'retention=applied'; do
   require "$text" "$workflow_text" "test VPS workflow"
 done
+
+for text in \
+  'scripts/deploy-test-vps-provider-release.sh' \
+  'scripts/test-vps-provider-credential.py' \
+  'python3' \
+  'provider_release_main' \
+  'APP_PUSH_MAINTENANCE_ENABLED' \
+  'credentialMountReadOnly' \
+  'PROVIDER_STATE_INVALID' \
+  'RECOVERY_REQUIRED'; do
+  require "$text" "$workflow_text$provider_deploy_text$provider_helper_text" \
+    "release-first provider lane"
+done
+! grep -Fq 'meetings.json' "$workflow" ||
+  { echo "raw meetings body capture remains in workflow" >&2; exit 1; }
+! grep -Fq '"$REMOTE_TOOLING/scripts/deploy-test-vps-release.sh"' "$workflow" ||
+  { echo "workflow still invokes frozen legacy coordinator" >&2; exit 1; }
+
+for frozen in \
+  .github/workflows/promote-dev-digest-to-test-vps.yml \
+  scripts/deploy-test-vps-release.sh \
+  scripts/test-vps-runtime-invariants.sh \
+  scripts/production-compose.sh \
+  scripts/update-production-release.sh; do
+  git diff --quiet "$baseline" -- "$frozen" ||
+    { echo "frozen release/promotion file changed: $frozen" >&2; exit 1; }
+done
+
+python3 -B "$provider_tests"
 
 for text in \
   'smtp_pointer="$state_root/.smtp-transaction.current"' \

@@ -57,6 +57,58 @@ This is not the production workflow. It intentionally does not claim the
 production backup/off-host recovery infrastructure required by
 [`docs/production-deployment.md`](../production-deployment.md).
 
+## Release-first provider preservation
+
+The release workflow uses the explicit
+`scripts/deploy-test-vps-provider-release.sh` entry point. It requires the
+existing Ubuntu `python3` runtime and the checksum-bound
+`scripts/test-vps-provider-credential.py` helper; it never installs Python or
+another dependency. The helper is not used by the frozen
+`promote-dev-digest-to-test-vps.yml` workflow or by the legacy
+`scripts/deploy-test-vps-release.sh` caller. That promotion lane remains
+byte- and behavior-compatible and receives no provider repair, registration,
+dispatch, or new prerequisite.
+
+The reviewed fixed paths are:
+
+- container credential target:
+  `/run/secrets/meet-firebase-service-account.json`;
+- durable host credential:
+  `/var/lib/meet-production/credentials/firebase-service-account.json`;
+- durable parent: `/var/lib/meet-production/credentials`, owned by `root:root`
+  with mode `0700`;
+- durable file: `root:10001`, mode `0440`, mounted read-only.
+
+These are policy constants, not credential material. The release lane observes
+the actual predecessor container and complete effective push tuple before any
+credential, active-file, release-updater, or Compose writer. Enabled state
+must preserve all push flags, project `meeting-1d258`, and the exact durable
+read-only bind. Disabled state rejects credential mounts and does not read or
+create durable credentials. The canonical target override owns only the
+reviewed `/meetings` healthcheck and the enabled bind; it does not inherit a
+predecessor image or pull policy.
+
+Credential reconciliation is operator-owned and fail-closed. It accepts an
+unchanged safe durable file without repairing permissions, rejects malformed,
+ambiguous, duplicate, symlinked, raced, ACL-unsafe, wrong-owner, wrong-mode,
+wrong-project, changed, or mismatched state, and never rotates or overwrites
+an existing file. Transaction-created state is retained until exact rollback
+or commit proof. The private transaction marker, snapshot, witness, and
+identity record contain no credential values, paths, hashes, account identity,
+or raw inspection. Static failure categories are
+`PROVIDER_STATE_INVALID`, `CREDENTIAL_INVALID`, `CREDENTIAL_CHANGED`,
+`DURABLE_CONFLICT`, `RECOVERY_REQUIRED`, and `PREREQUISITE_MISSING`.
+
+The release coordinator records a private unresolved marker before credential
+publication and keeps it through candidate verification, rollback, and
+finalization. A failed writer restores the predecessor image, release fields,
+active file presence/bytes, runtime hash, provider mount state, hardening, and
+public probes before cleanup. Created durable state is removed only when its
+identity and bytes still match the transaction witness and the restored
+runtime does not reference it. Reused or unknown operator-owned state is never
+deleted. Unresolved markers and private transaction directories block
+retention and require separately authorized operator reconciliation.
+
 ## Immutable v1.2.0 checksum exception
 
 Public immutable release ID `371012814` has a known `SHA256SUMS` formatting

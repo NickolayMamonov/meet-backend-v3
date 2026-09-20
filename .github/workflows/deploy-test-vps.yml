@@ -225,12 +225,14 @@ jobs:
             scripts/test-vps-runtime-invariants.sh
             scripts/update-production-release.sh
             scripts/deploy-test-vps-release.sh
+            scripts/deploy-test-vps-provider-release.sh
+            scripts/test-vps-provider-credential.py
           )
           for file in "${files[@]}"; do
             mkdir -p "$stage/$(dirname "$file")"
             cp -- "$file" "$stage/$file"
           done
-          chmod 755 "$stage"/scripts/*.sh
+          chmod 755 "$stage"/scripts/*.sh "$stage"/scripts/test-vps-provider-credential.py
           (
             cd "$stage"
             sha256sum "${files[@]}" >SHA256SUMS
@@ -241,6 +243,8 @@ jobs:
           root=$1
           stage=$2
           [ -d "$root" ] && [ -s "$root/.env.production" ]
+          command -v python3 >/dev/null 2>&1
+          python3 --version >/dev/null 2>&1
           [ ! -e "$stage" ]
           install -d -m 700 "$stage"
           REMOTE
@@ -301,7 +305,7 @@ jobs:
 
           set +e
           output=$(ssh -F "$SSH_CONFIG" test-vps \
-            "$REMOTE_TOOLING/scripts/deploy-test-vps-release.sh" \
+            "$REMOTE_TOOLING/scripts/deploy-test-vps-provider-release.sh" \
             --root "$PATH_ON_HOST" \
             --base-compose "$REMOTE_TOOLING/docker-compose.production.yml" \
             --image "$IMAGE@$DIGEST" \
@@ -316,6 +320,14 @@ jobs:
           grep -Fq "candidate=ready image_id=$TARGET_IMAGE_ID" <<<"$output"
           grep -Fq 'rollback_drill=triggered' <<<"$output"
           grep -Fq "rollback=completed previous_image_id=$previous_id" <<<"$output"
+          provider_json=$(grep -E '^\{"schemaVersion":1,' <<<"$output" | tail -n 1)
+          jq -e '
+            .schemaVersion == 1 and
+            (.providerEnabled | type == "boolean") and
+            (.credentialMountPresent | type == "boolean") and
+            (.credentialMountReadOnly | type == "boolean") and
+            .outcome == "rolled-back"
+          ' <<<"$provider_json" >/dev/null
 
           restored_id=$(ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
           set -euo pipefail
@@ -337,7 +349,7 @@ jobs:
         run: |
           set -euo pipefail
           ssh -F "$SSH_CONFIG" test-vps \
-            "$REMOTE_TOOLING/scripts/deploy-test-vps-release.sh" \
+            "$REMOTE_TOOLING/scripts/deploy-test-vps-provider-release.sh" \
             --root "$PATH_ON_HOST" \
             --base-compose "$REMOTE_TOOLING/docker-compose.production.yml" \
             --image "$IMAGE@$DIGEST" \
@@ -348,6 +360,15 @@ jobs:
             tee "$RUNNER_TEMP/deploy-output.txt"
           grep -Fq "deployment=completed image_id=$TARGET_IMAGE_ID" \
             "$RUNNER_TEMP/deploy-output.txt"
+          provider_json=$(grep -E '^\{"schemaVersion":1,' \
+            "$RUNNER_TEMP/deploy-output.txt" | tail -n 1)
+          jq -e '
+            .schemaVersion == 1 and
+            (.providerEnabled | type == "boolean") and
+            (.credentialMountPresent | type == "boolean") and
+            (.credentialMountReadOnly | type == "boolean") and
+            .outcome == "committed"
+          ' <<<"$provider_json" >/dev/null
 
       - name: Capture runtime and public HTTPS evidence
         shell: bash
@@ -420,18 +441,23 @@ jobs:
               .postgresVolume == "meet-production_postgres_data"
             ' <<<"$runtime" >/dev/null
 
-          meetings_status=$(curl --silent --show-error --output \
-            "$RUNNER_TEMP/meetings.json" --write-out '%{http_code}' \
-            "$PUBLIC_URL/meetings")
-          [ "$meetings_status" = 200 ]
-          jq -e 'type == "array"' "$RUNNER_TEMP/meetings.json" >/dev/null
-          actuator_status=$(curl --silent --show-error --output /dev/null \
+          meetings_probe=$(timeout 30s curl --silent --connect-timeout 5 \
+            --max-time 15 --write-out $'\n%{http_code}' \
+            "$PUBLIC_URL/meetings" 2>/dev/null |
+            timeout 5s python3 -c 'import json,sys; d=sys.stdin.buffer.read(8*1024*1024+64); b,s,t=d.rpartition(b"\n"); assert s and len(b)<=8*1024*1024 and t==b"200"; assert isinstance(json.loads(b.decode("utf-8")),list); print("meetings_status=200 meetings_array=true")' \
+            2>/dev/null)
+          meetings_status=200
+          [ "$meetings_probe" = "meetings_status=200 meetings_array=true" ]
+          actuator_status=$(curl --silent --connect-timeout 5 --max-time 15 \
+            --output /dev/null \
             --write-out '%{http_code}' "$PUBLIC_URL/actuator")
           [ "$actuator_status" = 404 ]
-          redirect_status=$(curl --silent --show-error --output /dev/null \
-            --write-out '%{http_code}' \
+          redirect_headers=$(curl --silent --connect-timeout 5 --max-time 15 \
+            --dump-header - --output /dev/null --write-out '%{http_code}' \
             "http://api.whysoezzy.online/meetings")
+          redirect_status=${redirect_headers: -3}
           case "$redirect_status" in 301|302|307|308) ;; *) exit 1 ;; esac
+          grep -Eiq '^location:[[:space:]]+https://' <<<"$redirect_headers"
 
           {
             echo "## Test VPS deployment evidence"
@@ -455,11 +481,13 @@ jobs:
         run: |
           set -euo pipefail
           ssh -F "$SSH_CONFIG" test-vps bash -s -- \
-            "$PATH_ON_HOST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'REMOTE'
+            "$PATH_ON_HOST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$REMOTE_TOOLING" <<'REMOTE'
           set -euo pipefail
           root=$1
           run_id=$2
           run_attempt=$3
+          tooling=$4
           tooling_prefix="$root/.test-vps-tooling-"
           state_root=/var/lib/meet-test-vps-deploy
           [[ "$run_id" =~ ^[0-9]+$ ]] && [[ "$run_attempt" =~ ^[0-9]+$ ]]
@@ -471,6 +499,8 @@ jobs:
             echo "retention=skipped smtp_transaction_present"
             exit 1
           fi
+          python3 "$tooling/scripts/test-vps-provider-credential.py" \
+            retention-check --state-root "$state_root" >/dev/null
 
           delete_tree() {
             local path=$1
