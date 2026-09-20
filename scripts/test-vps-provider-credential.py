@@ -14,6 +14,7 @@ import errno
 import json
 import os
 import re
+import secrets
 import stat
 import sys
 from typing import Any, Iterable
@@ -292,6 +293,19 @@ def _same_identity(left: dict[str, int], right: dict[str, int]) -> bool:
 
 def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _stable_entry_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_nlink,
+    )
 
 
 def _read_fd_bounded(fd: int, limit: int) -> bytes:
@@ -904,12 +918,78 @@ def _witnessed_unlink(
                 or final_data != expected_data
             ):
                 _fail("recovery")
-        try:
-            os.unlink(name, dir_fd=directory_fd)
-        except OSError:
+        quarantine = None
+        for _ in range(8):
+            candidate = f".cleanup-{os.getpid()}-{secrets.token_hex(8)}"
+            try:
+                os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                quarantine = candidate
+                break
+        if quarantine is None:
             _fail("recovery")
         try:
-            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            os.rename(
+                name,
+                quarantine,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        except OSError:
+            _fail("recovery")
+        quarantine_info = os.stat(
+            quarantine,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if _stable_entry_identity(quarantine_info) != _stable_entry_identity(final_fd_info):
+            try:
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    os.rename(
+                        quarantine,
+                        name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                except OSError:
+                    pass
+            _fail("recovery")
+        post_rename_info = os.fstat(entry_fd)
+        if (
+            _stable_entry_identity(post_rename_info)
+            != _stable_entry_identity(final_fd_info)
+            or post_rename_info.st_uid != uid
+            or post_rename_info.st_gid != gid
+            or stat.S_IMODE(post_rename_info.st_mode) != mode
+            or post_rename_info.st_nlink != link_count
+        ):
+            _fail("recovery")
+        if expected_data is not None:
+            if _read_fd_bounded(
+                entry_fd,
+                max(MAX_CREDENTIAL_BYTES, len(expected_data)),
+            ) != expected_data:
+                _fail("recovery")
+        try:
+            os.unlink(quarantine, dir_fd=directory_fd)
+        except OSError:
+            try:
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    os.rename(
+                        quarantine,
+                        name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                except OSError:
+                    pass
+            _fail("recovery")
+        try:
+            os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
             return
         _fail("recovery")
@@ -971,6 +1051,8 @@ def _remove_transaction(
             dir_fd=parent_fd,
         )
         try:
+            if not _same_inode(os.fstat(tx_fd), tx_info):
+                _fail("recovery")
             _lock_directory(tx_fd)
             names = set(os.listdir(tx_fd))
             allowed = {"snapshot", "identity.json"}
@@ -1441,6 +1523,8 @@ def _retention_delete(state_root: str, state_path: str) -> None:
             dir_fd=parent_fd,
         )
         try:
+            if not _same_inode(os.fstat(state_fd), state_info):
+                _fail("recovery")
             _lock_directory(state_fd)
             names = set(os.listdir(state_fd))
             if not names.difference(RETENTION_CHILDREN):

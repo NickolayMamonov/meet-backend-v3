@@ -1171,7 +1171,21 @@ verify_predecessor_for_cleanup() {
     echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
     return 1
   fi
-  printf '[%s,%s]' "$previous_inspect" "$current_inspect" |
+  local final_container final_inspect
+  final_container=$(compose ps -q backend 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  [ "$final_container" = "$current_container" ] || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  final_inspect=$(docker_container_inspect "$final_container" 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  cleanup_inspect=$final_inspect
+  printf '[%s,%s]' "$previous_inspect" "$final_inspect" |
     timeout 30s python3 "$provider_helper" verify \
       --run-key "$run_key" --state-root "$state_root" --phase predecessor \
       >/dev/null || {
@@ -1198,13 +1212,13 @@ updater_started=true
 PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
   timeout 60s "$update_script" "$image" "$revision" "$version" >/dev/null 2>&1 ||
   fail "PROVIDER_STATE_INVALID"
-updater_completed=true
 cmp -s "$root/.env.production" "$state/config.env.target" ||
   fail "PROVIDER_STATE_INVALID"
 printf '%s\n' "$(configuration_file_identity "$root/.env.production")" \
   >"$state/config.env.target.identity"
 chmod 600 "$state/config.env.target.identity"
 validate_configuration_boundary "$state/config.env.target"
+updater_completed=true
 compose_up -d --no-deps --no-build --pull never --force-recreate \
   --wait --wait-timeout 180 backend >/dev/null
 candidate_container=$(compose ps -q backend)

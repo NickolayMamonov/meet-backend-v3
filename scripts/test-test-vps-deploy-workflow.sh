@@ -114,6 +114,17 @@ for text in \
   'verify_predecessor_for_cleanup'; do
   require "$text" "$provider_deploy_text" "rollback and cleanup boundary"
 done
+updater_complete_line=$(grep -nF 'updater_completed=true' "$provider_deploy" | tail -n 1 | cut -d: -f1)
+target_boundary_line=$(awk '
+  /updater_started=true/ { started=1; next }
+  started && /validate_configuration_boundary "\$state\/config.env.target"/ {
+    print NR
+    exit
+  }
+' "$provider_deploy")
+[ -n "$updater_complete_line" ] && [ -n "$target_boundary_line" ] &&
+  [ "$updater_complete_line" -gt "$target_boundary_line" ] ||
+  fail "updater completion is recorded before target boundary proof"
 for text in \
   '_child_witness' \
   'expected_identity=child_identity' \
