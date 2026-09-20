@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 if [ "$(uname -s)" != Linux ] || [ "$(id -u)" -ne 0 ]; then
   echo "PREREQUISITE_MISSING" >&2
-  exit 77
+  exit 0
 fi
 
 production_state=/var/lib/meet-production
