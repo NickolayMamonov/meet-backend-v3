@@ -660,6 +660,9 @@ def _rename_noreplace(
     directory_fd: int,
     source: str,
     destination: str,
+    *,
+    expected_source_fd: int | None = None,
+    expected_source_inode: tuple[int, int] | None = None,
 ) -> None:
     if (
         not source
@@ -670,6 +673,23 @@ def _rename_noreplace(
         or "\x00" in destination
     ):
         _fail("recovery")
+    if expected_source_fd is not None:
+        opened = os.fstat(expected_source_fd)
+        current = os.stat(
+            source,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or not _same_inode(opened, current)
+            or (
+                expected_source_inode is not None
+                and (opened.st_dev, opened.st_ino) != expected_source_inode
+            )
+        ):
+            _fail("recovery")
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = libc.renameat2
@@ -878,6 +898,10 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
         try:
             os.fchown(temporary_fd, 0, 0)
             os.fchmod(temporary_fd, 0o700)
+            temporary_inode = (
+                os.fstat(temporary_fd).st_dev,
+                os.fstat(temporary_fd).st_ino,
+            )
             _write_private_at(
                 temporary_fd,
                 OWNER_MARKER,
@@ -885,30 +909,49 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
                 0o600,
             )
             os.fsync(temporary_fd)
+            os.fsync(parent_fd)
+            _retention_interlocks_fd(
+                "",
+                parent_fd,
+                allowed_temporary=temporary,
+            )
+            source_path_info = os.stat(
+                temporary,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            source_fd_info = os.fstat(temporary_fd)
+            if (
+                not _same_inode(source_path_info, source_fd_info)
+                or (source_fd_info.st_dev, source_fd_info.st_ino)
+                != temporary_inode
+            ):
+                _fail("recovery")
+            _validate_state_directory_fd(temporary_fd, name)
+            _rename_noreplace(
+                parent_fd,
+                temporary,
+                name,
+                expected_source_fd=temporary_fd,
+                expected_source_inode=temporary_inode,
+            )
+            published_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                published = os.fstat(published_fd)
+                _validate_state_directory_fd(published_fd, name)
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if not _same_inode(current, published):
+                    _fail("recovery")
+                _revalidate_retention_state_root_path(state_root, expected_root)
+            finally:
+                os.close(published_fd)
+            os.fsync(parent_fd)
         finally:
             os.close(temporary_fd)
-        os.fsync(parent_fd)
-        _retention_interlocks_fd(
-            "",
-            parent_fd,
-            allowed_temporary=temporary,
-        )
-        _rename_noreplace(parent_fd, temporary, name)
-        published_fd = os.open(
-            name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=parent_fd,
-        )
-        try:
-            published = os.fstat(published_fd)
-            _validate_state_directory_fd(published_fd, name)
-            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if not _same_inode(current, published):
-                _fail("recovery")
-            _revalidate_retention_state_root_path(state_root, expected_root)
-        finally:
-            os.close(published_fd)
-        os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
     _result(False, False, False, "published")
@@ -1766,6 +1809,24 @@ def _revalidate_protected_references(
             _fail("recovery")
 
 
+def _reject_protected_reference_aliases(
+    witnesses: Iterable[tuple[tuple[int, ...], bytes | None] | None],
+    state_info: os.stat_result,
+    child_witnesses: dict[str, tuple[dict[str, int], bytes]],
+) -> None:
+    state_inode = (state_info.st_dev, state_info.st_ino)
+    child_inodes = {
+        (identity["device"], identity["inode"])
+        for identity, _ in child_witnesses.values()
+    }
+    for witness in witnesses:
+        if witness is None:
+            continue
+        reference_inode = (witness[0][0], witness[0][1])
+        if reference_inode == state_inode or reference_inode in child_inodes:
+            _fail("recovery")
+
+
 def _owned_state(path: str, name: str, *, require_terminal: bool) -> tuple[str, str]:
     run_key, state_kind = _validate_state_directory(path, name)
     if require_terminal:
@@ -2327,6 +2388,11 @@ def _retention_delete(
                 ):
                     _fail("recovery")
                 witnesses[child] = _child_witness(state_fd, child)
+            _reject_protected_reference_aliases(
+                [*reference_witnesses, *protected_state_witnesses],
+                state_info,
+                witnesses,
+            )
             quarantine = f".provider-state.{name}.tmp"
             try:
                 os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
@@ -2342,6 +2408,11 @@ def _retention_delete(
             )
             if not _same_inode(current_state, state_info):
                 _fail("recovery")
+            _revalidate_protected_references(references, reference_witnesses)
+            _revalidate_protected_references(
+                protected_state_paths,
+                protected_state_witnesses,
+            )
             _rename_noreplace(parent_fd, name, quarantine)
             os.fsync(parent_fd)
             try:

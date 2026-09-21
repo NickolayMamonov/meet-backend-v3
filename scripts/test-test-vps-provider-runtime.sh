@@ -1140,6 +1140,80 @@ if temporary_publication.exists():
     shutil.rmtree(temporary_publication)
 shutil.rmtree(publication_interlock_root)
 
+publication_source_race_root = fixture / "publication-source-race-root"
+publication_source_race_root.mkdir(mode=0o700)
+os.chown(publication_source_race_root, 0, 0)
+publication_source_race_name = "123456792-1-final-deploy"
+publication_source_race_temporary = (
+    ".provider-state." + publication_source_race_name + ".tmp"
+)
+publication_source_race_displaced = (
+    publication_source_race_root / (publication_source_race_temporary + ".displaced")
+)
+original_publication_rename = helper._rename_noreplace
+
+def replace_publication_source_before_rename(
+    directory_fd,
+    source_name,
+    destination_name,
+    **kwargs,
+):
+    if (
+        source_name == publication_source_race_temporary
+        and destination_name == publication_source_race_name
+    ):
+        os.rename(
+            source_name,
+            publication_source_race_displaced.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.mkdir(source_name, 0o700, dir_fd=directory_fd)
+        replacement_fd = os.open(
+            source_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        try:
+            os.fchown(replacement_fd, 0, 0)
+            os.fchmod(replacement_fd, 0o700)
+            helper._write_private_at(
+                replacement_fd,
+                helper.OWNER_MARKER,
+                helper._state_marker("123456792-1", "final-deploy"),
+                0o600,
+            )
+            os.fsync(replacement_fd)
+        finally:
+            os.close(replacement_fd)
+    return original_publication_rename(
+        directory_fd,
+        source_name,
+        destination_name,
+        **kwargs,
+    )
+
+helper._rename_noreplace = replace_publication_source_before_rename
+try:
+    helper._state_publish(
+        str(publication_source_race_root),
+        "123456792-1",
+        "final-deploy",
+    )
+except helper.ProviderError as error:
+    assert error.category == "RECOVERY_REQUIRED"
+else:
+    raise AssertionError("state publication accepted a replaced source")
+helper._rename_noreplace = original_publication_rename
+assert publication_source_race_displaced.is_dir()
+assert (
+    publication_source_race_root / publication_source_race_temporary
+).is_dir()
+assert not (
+    publication_source_race_root / publication_source_race_name
+).exists()
+shutil.rmtree(publication_source_race_root)
+
 def prepare_marker(run_key: str) -> None:
     helper._write_private(
         str(marker),
@@ -1922,6 +1996,76 @@ assert not (
 ).exists()
 protected_reference.unlink()
 shutil.rmtree(protected_reference_state)
+
+protected_alias_state = valid_retention_state("94-1-final-deploy")
+protected_alias_before = retention_snapshot(protected_alias_state)
+protected_alias = fixture / "protected-alias"
+protected_alias.write_bytes(b"protected-alias")
+os.chown(protected_alias, 0, 0)
+os.chmod(protected_alias, 0o600)
+original_reference_witness = helper._protected_reference_witness
+alias_child_info = os.stat(
+    protected_alias_state / "terminal.json",
+    follow_symlinks=False,
+)
+
+def synthetic_protected_alias(path):
+    witness = original_reference_witness(path)
+    if path == str(protected_alias):
+        assert witness is not None
+        return (
+            helper._stable_entry_identity(alias_child_info),
+            witness[1],
+        )
+    return witness
+
+helper._protected_reference_witness = synthetic_protected_alias
+expect_provider_error(
+    lambda: helper._retention_delete(
+        str(retention_root),
+        str(protected_alias_state),
+        protected_paths=[str(protected_alias)],
+    ),
+    "RECOVERY_REQUIRED",
+)
+helper._protected_reference_witness = original_reference_witness
+assert retention_snapshot(protected_alias_state) == protected_alias_before
+protected_alias.unlink()
+shutil.rmtree(protected_alias_state)
+
+final_boundary_state = valid_retention_state("95-1-final-deploy")
+final_boundary_before = retention_snapshot(final_boundary_state)
+final_boundary_reference = fixture / "final-boundary-reference"
+final_boundary_reference.write_bytes(b"final-boundary-before-race")
+os.chown(final_boundary_reference, 0, 0)
+os.chmod(final_boundary_reference, 0o600)
+original_final_boundary_revalidate = helper._revalidate_protected_references
+final_boundary_calls = [0]
+
+def replace_final_boundary_reference(paths, witnesses):
+    final_boundary_calls[0] += 1
+    if final_boundary_calls[0] == 5:
+        replacement = fixture / "final-boundary-reference-replacement"
+        replacement.write_bytes(b"final-boundary-replacement")
+        os.chown(replacement, 0, 0)
+        os.chmod(replacement, 0o600)
+        os.rename(replacement, final_boundary_reference)
+    return original_final_boundary_revalidate(paths, witnesses)
+
+helper._revalidate_protected_references = replace_final_boundary_reference
+expect_provider_error(
+    lambda: helper._retention_delete(
+        str(retention_root),
+        str(final_boundary_state),
+        protected_paths=[str(final_boundary_reference)],
+    ),
+    "RECOVERY_REQUIRED",
+)
+helper._revalidate_protected_references = original_final_boundary_revalidate
+assert final_boundary_calls[0] == 5
+assert retention_snapshot(final_boundary_state) == final_boundary_before
+final_boundary_reference.unlink()
+shutil.rmtree(final_boundary_state)
 
 quarantine_race_state = valid_retention_state("92-1-final-deploy")
 quarantine_race_before = retention_snapshot(quarantine_race_state)
