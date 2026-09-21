@@ -193,6 +193,7 @@ PY
     local deploy_run_key=$4
     local provider_enabled=$5
     local case_root=/var/lib/meet-production
+    local state_parent=/var/lib/meet-test-vps-deploy
     local state_root=/var/lib/meet-test-vps-deploy/mee2-93-runtime-$case_name
     local case_log="$matrix_fixture/$case_name.log"
     local case_secret="RUNTIME_IMAGE_PRIVATE_SECRET_${case_name}_9f7d8d"
@@ -206,20 +207,115 @@ PY
     local probe_cert="$case_root/probe-cert.pem"
     local probe_key="$case_root/probe-key.pem"
     local probe_log="$case_root/probe.log"
-    local created_root=false
+    local coordinator_pid=
+    local case_root_created=false
+    local state_parent_created=false
+    local state_root_created=false
+    local case_root_identity=
+    local state_parent_identity=
+    local state_root_identity=
     local backend postgres observed
     local rollback_output rollback_status deploy_output deploy_status
     local rollback_capture="$matrix_fixture/$case_name-rollback.out"
     local deploy_capture="$matrix_fixture/$case_name-deploy.out"
+    local cleanup_capture="$matrix_fixture/$case_name-cleanup.out"
+    local cleanup_network_capture="$matrix_fixture/$case_name-cleanup-network.out"
     local previous_state target_state legacy_before legacy_after
+
+    capture_command() {
+      local output=$1
+      shift
+      local capture_status producer_status
+      local restore_errexit=false
+      case "$-" in
+        *e*)
+          restore_errexit=true
+          set +e
+          ;;
+      esac
+      : >"$output"
+      "$@" 2>&1 |
+        python3 -c '
+import sys
+
+path = sys.argv[1]
+limit = 8 * 1024 * 1024
+written = 0
+overflow = False
+with open(path, "wb") as output:
+    while True:
+        chunk = sys.stdin.buffer.read(65536)
+        if not chunk:
+            break
+        remaining = limit - written
+        if remaining > 0:
+            output.write(chunk[:remaining])
+            written += min(len(chunk), remaining)
+        if len(chunk) > remaining:
+            overflow = True
+sys.exit(125 if overflow else 0)
+' "$output"
+      local -a pipe_status=("${PIPESTATUS[@]}")
+      producer_status=${pipe_status[0]}
+      capture_status=${pipe_status[1]}
+      if [ "$restore_errexit" = true ]; then
+        set -e
+      fi
+      [ "$capture_status" -eq 0 ] || return "$capture_status"
+      return "$producer_status"
+    }
+
+    root_identity() {
+      stat -c '%d:%i:%f:%u:%g' -- "$1"
+    }
+    assert_resource_absent() {
+      local kind=$1
+      local name=$2
+      local inspect_output inspect_status
+      if inspect_output=$(timeout 30s docker "$kind" inspect "$name" 2>&1); then
+        return 1
+      else
+        inspect_status=$?
+      fi
+      [ "$inspect_status" -eq 1 ] || return 1
+      case "$inspect_output" in
+        *"No such "*|*"not found"*) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+    assert_no_compose_containers() {
+      local containers
+      containers=$(timeout 30s docker ps -aq \
+        --filter label=com.docker.compose.project=meet-production) || return 1
+      [ -z "$containers" ]
+    }
+    remove_owned_root() {
+      local path=$1
+      local expected_identity=$2
+      local actual_identity
+      [ -e "$path" ] || [ -L "$path" ] || return 0
+      [ -d "$path" ] && [ ! -L "$path" ] || return 1
+      actual_identity=$(root_identity "$path") || return 1
+      [ "$actual_identity" = "$expected_identity" ] || return 1
+      timeout 30s rm -r -- "$path"
+    }
 
     cleanup_case() {
       local status=$?
       local cleanup_status=0
-      local pattern
       trap - EXIT
       set +e
-      if [ "$created_root" = true ]; then
+      if [ "$case_root_created" = true ]; then
+        if [ -n "$coordinator_pid" ] && kill -0 "$coordinator_pid" 2>/dev/null; then
+          kill "$coordinator_pid" 2>/dev/null || cleanup_status=1
+          for _ in $(seq 1 30); do
+            kill -0 "$coordinator_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$coordinator_pid" 2>/dev/null; then
+            kill -9 "$coordinator_pid" 2>/dev/null || cleanup_status=1
+          fi
+        fi
         if [ -n "$probe_pid" ] && kill -0 "$probe_pid" 2>/dev/null; then
           kill "$probe_pid" 2>/dev/null || cleanup_status=1
           for _ in $(seq 1 30); do
@@ -231,38 +327,48 @@ PY
           fi
         fi
         scan_case_secrets || cleanup_status=1
-        timeout 300s docker compose -p meet-production \
+        capture_command "$cleanup_capture" timeout 300s docker compose -p meet-production \
           --project-directory "$case_root" \
           --env-file "$case_root/.env.production" \
           -f "$case_root/docker-compose.production.yml" \
           -f "$case_root/isolated-network.yml" \
-          down --volumes --remove-orphans >>"$case_log" 2>&1 ||
+          down --volumes --remove-orphans ||
           cleanup_status=1
         if [ "$network_created" = true ]; then
-          timeout 30s docker network rm "$network_name" >>"$case_log" 2>&1 ||
+          capture_command "$cleanup_network_capture" timeout 30s docker network rm \
+            "$network_name" ||
             cleanup_status=1
           network_created=false
         fi
-        [ -z "$(timeout 30s docker ps -aq \
-          --filter label=com.docker.compose.project=meet-production)" ] ||
-          cleanup_status=1
+        assert_no_compose_containers || cleanup_status=1
         for resource in meet-production_default meet-production_postgres_data \
           meet-production_uploads_data; do
-          if timeout 30s docker network inspect "$resource" >/dev/null 2>&1 ||
-            timeout 30s docker volume inspect "$resource" >/dev/null 2>&1; then
-            cleanup_status=1
-          fi
+          assert_resource_absent network "$resource" || cleanup_status=1
+          assert_resource_absent volume "$resource" || cleanup_status=1
         done
-        for pattern in "$case_secret" "$credential_email" \
-          '-----BEGIN PRIVATE KEY-----'; do
-          if grep -R -F -n --binary-files=without-match "$pattern" \
-            "$case_log" "$rollback_capture" "$deploy_capture" 2>/dev/null; then
-            cleanup_status=1
-          fi
-        done
-        timeout 30s rm -r -- "$case_root" "$state_root" || cleanup_status=1
-        [ ! -e "$case_root" ] && [ ! -e "$state_root" ] ||
+      fi
+      if [ "$case_root_created" = true ]; then
+        remove_owned_root "$case_root" "$case_root_identity" ||
           cleanup_status=1
+      fi
+      if [ "$state_root_created" = true ]; then
+        remove_owned_root "$state_root" "$state_root_identity" ||
+          cleanup_status=1
+      fi
+      if [ "$state_parent_created" = true ] &&
+        [ "$state_root_created" = true ] &&
+        [ ! -e "$state_root" ] && [ ! -L "$state_root" ]; then
+        local parent_entries
+        if parent_entries=$(timeout 30s find "$state_parent" -mindepth 1 \
+          -maxdepth 1 -print -quit); then
+          [ -z "$parent_entries" ] || cleanup_status=1
+        else
+          cleanup_status=1
+        fi
+        if [ "$cleanup_status" -eq 0 ]; then
+          remove_owned_root "$state_parent" "$state_parent_identity" ||
+            cleanup_status=1
+        fi
       fi
       [ "$status" -ne 0 ] || [ "$cleanup_status" -eq 0 ] ||
         status=1
@@ -288,61 +394,114 @@ PY
       "https://oauth2.example.invalid/token"
       '-----BEGIN PRIVATE KEY-----'
     )
+    check_capture_bound() {
+      [ "$(wc -c <"$1")" -le 8388608 ]
+    }
+    scan_file_for_pattern() {
+      local pattern=$1
+      local file=$2
+      local scan_status
+      if timeout 30s grep -r -F -n --binary-files=without-match \
+        --exclude='config.*' --exclude='*.identity' --exclude='*.yml' \
+        --exclude='*.env*' "$pattern" "$file" >/dev/null 2>&1; then
+        return 1
+      else
+        scan_status=$?
+      fi
+      [ "$scan_status" -eq 1 ] || return 2
+      return 0
+    }
     scan_case_secrets() {
-      local pattern file container
+      local pattern file container container_list scan_status
       local evidence_files=(
         "$case_log"
         "$rollback_capture"
         "$deploy_capture"
+        "$cleanup_capture"
+        "$cleanup_network_capture"
         "$probe_log"
         "$state_root"
+        "$matrix_fixture"/"$case_name"-*.out
       )
       for pattern in "${secret_sentinels[@]}"; do
         for file in "${evidence_files[@]}"; do
           [ -e "$file" ] || continue
-          if grep -R -F -n --binary-files=without-match "$pattern" \
-            --exclude='config.*' --exclude='*.identity' --exclude='*.yml' \
-            --exclude='*.env*' "$file" 2>/dev/null; then
-            return 1
+          if scan_file_for_pattern "$pattern" "$file"; then
+            :
+          else
+            scan_status=$?
+            [ "$scan_status" -eq 1 ] && return 1
+            return 2
           fi
         done
+        if ! container_list=$(timeout 30s docker ps -aq \
+          --filter label=com.docker.compose.project=meet-production); then
+          return 2
+        fi
         while IFS= read -r container; do
           [ -n "$container" ] || continue
-          if timeout 30s docker logs "$container" 2>&1 |
-            grep -F -- "$pattern" >/dev/null; then
-            return 1
+          local container_log="$matrix_fixture/$case_name-container-$container.log"
+          if ! timeout 30s docker logs --tail 10000 "$container" \
+            >"$container_log" 2>&1; then
+            return 2
           fi
-        done < <(timeout 30s docker ps -aq \
-          --filter label=com.docker.compose.project=meet-production 2>/dev/null || true)
+          check_capture_bound "$container_log" || return 2
+          if scan_file_for_pattern "$pattern" "$container_log"; then
+            :
+          else
+            scan_status=$?
+            [ "$scan_status" -eq 1 ] && return 1
+            return 2
+          fi
+        done <<<"$container_list"
       done
       return 0
     }
 
     if [ -e "$case_root" ] || [ -L "$case_root" ] ||
+      [ -e "$state_parent" ] || [ -L "$state_parent" ] ||
       [ -e "$state_root" ] || [ -L "$state_root" ]; then
       echo "PREREQUISITE_MISSING: immutable runtime fixed root already exists" >&2
       exit 77
     fi
-    if [ -n "$(timeout 30s docker ps -aq \
-      --filter label=com.docker.compose.project=meet-production)" ]; then
+    existing_containers=$(timeout 30s docker ps -aq \
+      --filter label=com.docker.compose.project=meet-production) || {
+      echo "PREREQUISITE_MISSING: cannot inspect existing Compose containers" >&2
+      exit 77
+    }
+    if [ -n "$existing_containers" ]; then
       echo "PREREQUISITE_MISSING: meet-production containers already exist" >&2
       exit 77
     fi
     for resource in meet-production_default meet-production_postgres_data \
       meet-production_uploads_data; do
-      if timeout 30s docker network inspect "$resource" >/dev/null 2>&1 ||
-        timeout 30s docker volume inspect "$resource" >/dev/null 2>&1; then
+      if ! assert_resource_absent network "$resource" ||
+        ! assert_resource_absent volume "$resource"; then
         echo "PREREQUISITE_MISSING: fixed Compose resource already exists" >&2
         exit 77
       fi
     done
 
     trap cleanup_case EXIT
-    install -d -m 700 "$case_root" "$state_root"
-    created_root=true
+    install -d -m 700 "$case_root"
+    case_root_created=true
+    case_root_identity=$(root_identity "$case_root")
+    install -d -m 700 "$state_parent"
+    state_parent_created=true
+    state_parent_identity=$(root_identity "$state_parent")
+    install -d -m 700 "$state_root"
+    state_root_created=true
+    state_root_identity=$(root_identity "$state_root")
     cp -- "$ROOT_DIR/docker-compose.production.yml" \
       "$case_root/docker-compose.production.yml"
     chmod 600 "$case_root/docker-compose.production.yml"
+    cat >>"$case_root/docker-compose.production.yml" <<'EOF'
+
+networks:
+  default:
+    external: true
+    name: meet-production_default
+EOF
     cat >"$case_root/.env.production" <<EOF
 APP_PORT=$app_port
 BACKEND_MEMORY_LIMIT=768m
@@ -588,15 +747,30 @@ PY
         --env-file "$case_root/.env.production" \
         -f "$case_root/docker-compose.production.yml" "$@"
     }
-    check_capture_bound() {
-      [ "$(wc -c <"$1")" -le 8388608 ]
+    assert_internal_network() {
+      [ "$(timeout 30s docker network inspect "$network_name" \
+        --format '{{.Internal}}')" = true ]
+    }
+    assert_outbound_blocked() {
+      local container=$1
+      local status
+      if timeout 15s docker exec "$container" curl \
+        --connect-timeout 3 --max-time 5 --silent --show-error \
+        --output /dev/null https://example.com >/dev/null 2>&1; then
+        return 1
+      else
+        status=$?
+      fi
+      case "$status" in
+        6|7|28) return 0 ;;
+        *) return 1 ;;
+      esac
     }
     : >"$case_log"
     timeout 30s docker network create --driver bridge --internal "$network_name" \
       >>"$case_log" 2>&1
     network_created=true
-    [ "$(timeout 30s docker network inspect "$network_name" \
-      --format '{{.Internal}}')" = true ]
+    assert_internal_network
     printf 'network_isolation internal=true name=%s\n' "$network_name" >>"$case_log"
     compose() {
       timeout 300s docker compose -p meet-production \
@@ -605,15 +779,17 @@ PY
         -f "$case_root/docker-compose.production.yml" \
         -f "$case_root/isolated-network.yml" "$@"
     }
-    compose up -d --wait --no-build --pull never >>"$case_log" 2>&1
+    capture_command "$case_log" compose up -d --wait --no-build --pull never
     check_capture_bound "$case_log"
     backend=$(compose ps -q backend)
     postgres=$(compose ps -q postgres)
     [ -n "$backend" ] && [ -n "$postgres" ]
     [ "$(timeout 30s docker inspect "$backend" --format '{{.Image}}')" = "$previous_id" ]
     [ "$(timeout 30s docker inspect "$postgres" --format '{{.State.Health.Status}}')" = healthy ]
-    timeout 1800s python3 "$case_root/probe.py" "$probe_port" "$app_port" \
-      "$probe_cert" "$probe_key" >"$probe_log" 2>&1 &
+    assert_internal_network
+    assert_outbound_blocked "$backend"
+    capture_command "$probe_log" timeout 1800s python3 "$case_root/probe.py" \
+      "$probe_port" "$app_port" "$probe_cert" "$probe_key" &
     probe_pid=$!
     probe_ready=false
     for _ in $(seq 1 30); do
@@ -640,7 +816,8 @@ PY
       [ -n "$current_backend" ]
       current_hash=$(timeout 30s docker inspect "$current_backend" \
         --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
-      timeout 90s bash -c '
+      capture_command "$matrix_fixture/$case_name-runtime-$expected_version.out" \
+        timeout 90s bash -c '
         set -euo pipefail
         source "$1"
         verify_runtime_invariants "$2" "$3" "$4" "$5" "$6" "$7"
@@ -648,7 +825,9 @@ PY
       ' _ "$ROOT_DIR/scripts/test-vps-runtime-invariants.sh" \
         "$case_root" "$ROOT_DIR/scripts/production-compose.sh" \
         "$expected_id" "$expected_revision" "$expected_version" \
-        "$current_hash" >>"$case_log" 2>&1
+        "$current_hash"
+      printf 'runtime_invariants case=%s version=%s passed\n' \
+        "$case_name" "$expected_version" >>"$case_log"
     }
 
     observe_provider() {
@@ -690,21 +869,30 @@ PY
     }
 
     run_coordinator() {
-      timeout 1200s env \
+      local coordinator_status
+      assert_internal_network || return 1
+      if timeout 1200s env \
         CURL_CA_BUNDLE="$probe_cert" \
         TEST_VPS_STATE_ROOT="$state_root" \
         bash "$ROOT_DIR/scripts/deploy-test-vps-provider-release.sh" \
         --root "$case_root" \
         --base-compose "$case_root/docker-compose.production.yml" \
         --image "$1" --revision "$2" --version "$3" \
-        --run-key "$4" --mode "$5" --public-url "$public_url"
+        --run-key "$4" --mode "$5" --public-url "$public_url"; then
+        coordinator_status=0
+      else
+        coordinator_status=$?
+      fi
+      assert_internal_network || return 1
+      return "$coordinator_status"
     }
 
     run_rollback_drill() {
-      local coordinator_pid current_backend target_seen=false
-      run_coordinator "$target_image" "$target_revision" \
+      local current_backend target_seen=false
+      capture_command "$rollback_capture" run_coordinator \
+        "$target_image" "$target_revision" \
         "$target_version" "$rollback_run_key" rollback-drill \
-        >"$rollback_capture" 2>&1 &
+        &
       coordinator_pid=$!
       for _ in $(seq 1 300); do
         if ! kill -0 "$coordinator_pid" 2>/dev/null; then
@@ -715,6 +903,11 @@ PY
           [ "$(timeout 30s docker inspect "$current_backend" \
             --format '{{.Image}}')" = "$target_id" ]; then
           target_seen=true
+          if ! assert_internal_network ||
+            ! assert_outbound_blocked "$current_backend"; then
+            kill "$coordinator_pid" 2>/dev/null || true
+            return 1
+          fi
           verify_case_runtime "$target_id" "$target_revision" "$target_version"
           break
         fi
@@ -734,8 +927,8 @@ PY
     set -e
     check_capture_bound "$rollback_capture"
     rollback_output=$(<"$rollback_capture")
-    printf '%s\n' "$rollback_output" >>"$case_log"
-    check_capture_bound "$case_log"
+    printf 'rollback_capture case=%s bytes=%s status=%s\n' \
+      "$case_name" "$(wc -c <"$rollback_capture")" "$rollback_status" >>"$case_log"
     [ "$rollback_status" -eq 86 ]
     grep -Fq 'candidate=ready' <<<"$rollback_output"
     grep -Fq 'rollback=completed previous_image_id=' <<<"$rollback_output"
@@ -749,15 +942,15 @@ PY
     [ "$legacy_before" = "$legacy_after" ]
 
     set +e
-    run_coordinator "$target_image" "$target_revision" \
-      "$target_version" "$deploy_run_key" deploy \
-      >"$deploy_capture" 2>&1
+    capture_command "$deploy_capture" run_coordinator \
+      "$target_image" "$target_revision" \
+      "$target_version" "$deploy_run_key" deploy
     deploy_status=$?
     set -e
     check_capture_bound "$deploy_capture"
     deploy_output=$(<"$deploy_capture")
-    printf '%s\n' "$deploy_output" >>"$case_log"
-    check_capture_bound "$case_log"
+    printf 'deploy_capture case=%s bytes=%s status=%s\n' \
+      "$case_name" "$(wc -c <"$deploy_capture")" "$deploy_status" >>"$case_log"
     [ "$deploy_status" -eq 0 ]
     grep -Fq 'candidate=ready' <<<"$deploy_output"
     grep -Fq 'deployment=completed image_id=' <<<"$deploy_output"
@@ -765,6 +958,8 @@ PY
     assert_terminal_state "$target_state" committed "$provider_enabled"
     backend=$(compose ps -q backend)
     [ "$(timeout 30s docker inspect "$backend" --format '{{.Image}}')" = "$target_id" ]
+    assert_internal_network
+    assert_outbound_blocked "$backend"
     verify_case_runtime "$target_id" "$target_revision" "$target_version"
     assert_provider_state "$provider_enabled"
     [ "$(grep '^BACKEND_IMAGE=' "$case_root/.env.production")" = \
@@ -1427,6 +1622,22 @@ for child in ("identity.json", "snapshot", "publication"):
 retention_root = fixture / "retention-root"
 retention_root.mkdir(mode=0o700)
 os.chown(retention_root, 0, 0)
+unsafe_state_root = fixture / "unsafe-retention-root"
+unsafe_state_root.mkdir(mode=0o700)
+os.chown(unsafe_state_root, 0, 0)
+os.chmod(unsafe_state_root, 0o755)
+expect_provider_error(
+    lambda: helper._retention_check("", str(unsafe_state_root)),
+    "RECOVERY_REQUIRED",
+)
+os.chmod(unsafe_state_root, 0o700)
+os.chown(unsafe_state_root, 65534, 65534)
+expect_provider_error(
+    lambda: helper._retention_check("", str(unsafe_state_root)),
+    "RECOVERY_REQUIRED",
+)
+os.chown(unsafe_state_root, 0, 0)
+shutil.rmtree(unsafe_state_root)
 for child in sorted(helper.RETENTION_CHILDREN - {"provider-owner.json", "terminal.json"}):
     retention_state = retention_root / "77-1-final-deploy"
     retention_state.mkdir(mode=0o700)

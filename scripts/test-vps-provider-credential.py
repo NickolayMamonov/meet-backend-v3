@@ -858,6 +858,9 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
             if published.st_uid != 0 or stat.S_IMODE(published.st_mode) != 0o700:
                 _fail("recovery")
             _validate_state_directory(os.path.join(state_root, name), name)
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not _same_inode(current, published):
+                _fail("recovery")
         finally:
             os.close(published_fd)
         os.fsync(parent_fd)
@@ -1700,6 +1703,36 @@ def _retention_interlocks(root: str, state_root: str) -> None:
                 _fail("recovery")
 
 
+def _validate_retention_state_root_path(state_root: str) -> None:
+    if (
+        not isinstance(state_root, str)
+        or not state_root.startswith("/")
+        or "\x00" in state_root
+        or any(part in ("", ".", "..") for part in state_root.split("/")[1:])
+        or not os.path.lexists(state_root)
+        or os.path.islink(state_root)
+        or not os.path.isdir(state_root)
+    ):
+        _fail("recovery")
+    info = os.stat(state_root, follow_symlinks=False)
+    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+        _fail("recovery")
+    _check_ancestors(state_root, category="recovery")
+    _acl_is_safe(state_root, category="recovery")
+
+
+def _validate_retention_state_root_fd(fd: int, state_root: str) -> None:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        _fail("recovery")
+    _check_ancestors(state_root, category="recovery")
+    _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+
+
 def _retention_check(
     root: str,
     state_root: str,
@@ -1713,11 +1746,8 @@ def _retention_check(
         or any(part in ("", ".", "..") for part in state_root.split("/")[1:])
     ):
         _fail("recovery")
-    if os.path.lexists(state_root) and (
-        os.path.islink(state_root)
-        or not os.path.isdir(state_root)
-    ):
-        _fail("recovery")
+    if os.path.lexists(state_root):
+        _validate_retention_state_root_path(state_root)
     _retention_interlocks(root, state_root)
     owned_states: list[str] = []
     if os.path.isdir(state_root):
@@ -1835,16 +1865,14 @@ def _retention_delete(
     if re.fullmatch(r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name) is None:
         _fail("recovery")
     run_key, state_kind = _state_parts(name)
-    if os.path.lexists(state_root) and (
-        os.path.islink(state_root) or not os.path.isdir(state_root)
-    ):
-        _fail("recovery")
+    _validate_retention_state_root_path(state_root)
     parent_fd = os.open(
         state_root,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
     try:
         _lock_directory(parent_fd)
+        _validate_retention_state_root_fd(parent_fd, state_root)
         _retention_interlocks("", state_root)
         if os.path.dirname(os.path.normpath(state_path)) != os.path.normpath(state_root):
             _fail("recovery")
