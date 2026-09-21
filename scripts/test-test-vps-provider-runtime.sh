@@ -4,9 +4,43 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT_DIR"
 
+prerequisite_missing() {
+  echo "PREREQUISITE_MISSING" >&2
+  exit 77
+}
+
 filesystem_only=false
 previous_image=
 target_image=
+transport_source_host=${MEE2_93_IMAGE_TRANSPORT_SOURCE:-}
+transport_target_host=${MEE2_93_IMAGE_TRANSPORT_TARGET:-}
+transport_loaded=false
+transport_map_dir=
+transport_real_docker=
+transport_previous_id=
+transport_target_id=
+transport_postgres_ref=
+transport_postgres_id=${MEE2_93_IMAGE_TRANSPORT_POSTGRES_ID:-}
+transport_cleanup() {
+  local status=$?
+  if [ "$transport_loaded" = true ]; then
+    set +e
+    remove_ids=()
+    [ -n "$transport_previous_id" ] && remove_ids+=("$transport_previous_id")
+    [ -n "$transport_target_id" ] && remove_ids+=("$transport_target_id")
+    if [ "${#remove_ids[@]}" -gt 0 ]; then
+      timeout 60s env DOCKER_HOST="$transport_target_host" \
+        "$transport_real_docker" image rm "${remove_ids[@]}" >/dev/null 2>&1
+      [ "$?" -eq 0 ] || { [ "$status" -ne 0 ] || status=1; }
+    fi
+    if [ -n "$transport_map_dir" ]; then
+      timeout 30s rm -r -- "$transport_map_dir" >/dev/null 2>&1
+      [ "$?" -eq 0 ] || { [ "$status" -ne 0 ] || status=1; }
+    fi
+    set -e
+  fi
+  exit "$status"
+}
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --filesystem-only)
@@ -32,50 +66,196 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$filesystem_only" = false ]; then
-  [[ "$previous_image" =~ ^.+@sha256:[0-9a-f]{64}$ ]]
-  [[ "$target_image" =~ ^.+@sha256:[0-9a-f]{64}$ ]]
-  [ "$previous_image" != "$target_image" ]
   [[ "$previous_image" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+    prerequisite_missing
   [[ "$target_image" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+    prerequisite_missing
+  [ "$previous_image" != "$target_image" ] || prerequisite_missing
   command -v docker >/dev/null 2>&1 || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
+  transport_real_docker=$(command -v docker)
+  if [ -n "$transport_target_host" ]; then
+    [ -n "$transport_source_host" ] || prerequisite_missing
+    timeout 30s env DOCKER_HOST="$transport_source_host" docker info >/dev/null 2>&1 ||
+      prerequisite_missing
+    timeout 30s env DOCKER_HOST="$transport_target_host" docker info >/dev/null 2>&1 ||
+      prerequisite_missing
+    transport_loaded=true
+    trap transport_cleanup EXIT
+    for image in "$previous_image" "$target_image"; do
+      timeout 30s env DOCKER_HOST="$transport_source_host" \
+        docker image inspect "$image" --format '{{.Id}}' >/dev/null ||
+        prerequisite_missing
+      if timeout 30s env DOCKER_HOST="$transport_target_host" \
+        docker image inspect "$image" --format '{{.Id}}' >/dev/null 2>&1; then
+        prerequisite_missing
+      fi
+      load_output=$(
+        timeout 300s env DOCKER_HOST="$transport_source_host" docker save "$image" |
+          timeout 300s env DOCKER_HOST="$transport_target_host" docker load
+      ) || prerequisite_missing
+      loaded_id=$(sed -nE \
+        's/^Loaded image ID: (sha256:[0-9a-f]{64})$/\1/p' <<<"$load_output")
+      [[ "$loaded_id" =~ ^sha256:[0-9a-f]{64}$ ]] || prerequisite_missing
+      target_id=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
+        docker image inspect "$loaded_id" --format '{{.Id}}') ||
+        prerequisite_missing
+      [ "$loaded_id" = "$target_id" ] || prerequisite_missing
+      source_metadata=$(timeout 30s env DOCKER_HOST="$transport_source_host" \
+        docker image inspect "$image" \
+        --format '{{json .Config}}|{{json .RootFS}}|{{.Architecture}}|{{.Os}}') ||
+        prerequisite_missing
+      target_metadata=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
+        docker image inspect "$loaded_id" \
+        --format '{{json .Config}}|{{json .RootFS}}|{{.Architecture}}|{{.Os}}') ||
+        prerequisite_missing
+      [ "$source_metadata" = "$target_metadata" ] || prerequisite_missing
+      case "$image" in
+        "$previous_image") transport_previous_id=$loaded_id ;;
+        "$target_image") transport_target_id=$loaded_id ;;
+      esac
+    done
+    transport_postgres_ref=$(sed -nE \
+      's/^[[:space:]]*image:[[:space:]]*(postgres:16-alpine@sha256:[0-9a-f]{64})[[:space:]]*$/\1/p' \
+      "$ROOT_DIR/docker-compose.production.yml")
+    [ -n "$transport_postgres_ref" ] || prerequisite_missing
+    if [ -n "$transport_postgres_id" ]; then
+      [[ "$transport_postgres_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+        prerequisite_missing
+      timeout 30s env DOCKER_HOST="$transport_target_host" \
+        docker image inspect "$transport_postgres_id" --format '{{.Id}}' \
+        >/dev/null || prerequisite_missing
+    fi
+    transport_map_dir=$(mktemp -d /tmp/meet-provider-image-map.XXXXXX)
+    chmod 700 "$transport_map_dir"
+    cat >"$transport_map_dir/docker" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_docker=${MEE2_93_REAL_DOCKER:?}
+previous_ref=${MEE2_93_TRANSPORT_PREVIOUS_REF:?}
+previous_id=${MEE2_93_TRANSPORT_PREVIOUS_ID:?}
+target_ref=${MEE2_93_TRANSPORT_TARGET_REF:?}
+target_id=${MEE2_93_TRANSPORT_TARGET_ID:?}
+postgres_ref=${MEE2_93_TRANSPORT_POSTGRES_REF:-}
+postgres_id=${MEE2_93_TRANSPORT_POSTGRES_ID:-}
+
+map_image() {
+  case "$1" in
+    "$previous_ref") printf '%s' "$previous_id" ;;
+    "$target_ref") printf '%s' "$target_id" ;;
+    "$postgres_ref") printf '%s' "$postgres_id" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+if [ "${1:-}" = image ] && [ "${2:-}" = inspect ] && [ "$#" -ge 3 ]; then
+  set -- "$1" "$2" "$(map_image "$3")" "${@:4}"
+elif [ "${1:-}" = image ] && [ "${2:-}" = rm ] && [ "$#" -ge 3 ]; then
+  args=("$@")
+  for ((index = 2; index < ${#args[@]}; index += 1)); do
+    case "${args[index]}" in
+      -*) ;;
+      *) args[index]=$(map_image "${args[index]}") ;;
+    esac
+  done
+  set -- "${args[@]}"
+fi
+
+if [ "${1:-}" = compose ]; then
+  args=("$@")
+  env_index=-1
+  for ((index = 0; index + 1 < ${#args[@]}; index += 1)); do
+    if [ "${args[index]}" = --env-file ]; then
+      env_index=$((index + 1))
+      break
+    fi
+  done
+  if [ "$env_index" -ge 0 ]; then
+    env_file=${args[env_index]}
+    backend_line=$(grep '^BACKEND_IMAGE=' "$env_file" || true)
+    if [ "$backend_line" = "BACKEND_IMAGE=$previous_ref" ]; then
+      mapped_id=$previous_id
+    elif [ "$backend_line" = "BACKEND_IMAGE=$target_ref" ]; then
+      mapped_id=$target_id
+    else
+      exit 77
+    fi
+    mapped_env="$MEE2_93_TRANSPORT_MAP_DIR/compose-${BASHPID}.env"
+    sed "s|^BACKEND_IMAGE=.*$|BACKEND_IMAGE=$mapped_id|" \
+      "$env_file" >"$mapped_env"
+    args[env_index]=$mapped_env
+  fi
+  for ((index = 0; index + 1 < ${#args[@]}; index += 1)); do
+    if [ "${args[index]}" = -f ] || [ "${args[index]}" = --file ]; then
+      compose_file=${args[index + 1]}
+      mapped_compose="$MEE2_93_TRANSPORT_MAP_DIR/compose-${BASHPID}-${index}.yml"
+      if [ -n "$postgres_id" ] &&
+        grep -Fq "$postgres_ref" "$compose_file"; then
+        sed "s|$postgres_ref|$postgres_id|g" \
+          "$compose_file" >"$mapped_compose"
+      else
+        cp "$compose_file" "$mapped_compose"
+      fi
+      args[index + 1]=$mapped_compose
+    fi
+  done
+  exec "$real_docker" "${args[@]}"
+fi
+
+exec "$real_docker" "$@"
+SHIM
+    chmod 700 "$transport_map_dir/docker"
+    export MEE2_93_REAL_DOCKER="$transport_real_docker"
+    export MEE2_93_TRANSPORT_PREVIOUS_REF="$previous_image"
+    export MEE2_93_TRANSPORT_PREVIOUS_ID="$transport_previous_id"
+    export MEE2_93_TRANSPORT_TARGET_REF="$target_image"
+    export MEE2_93_TRANSPORT_TARGET_ID="$transport_target_id"
+    export MEE2_93_TRANSPORT_POSTGRES_REF="$transport_postgres_ref"
+    export MEE2_93_TRANSPORT_POSTGRES_ID="$transport_postgres_id"
+    export MEE2_93_TRANSPORT_MAP_DIR="$transport_map_dir"
+    export PATH="$transport_map_dir:$PATH"
+    export DOCKER_HOST="$transport_target_host"
+  fi
   timeout 30s docker info >/dev/null 2>&1 || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
   previous_id=$(timeout 30s docker image inspect "$previous_image" --format '{{.Id}}') || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
   target_id=$(timeout 30s docker image inspect "$target_image" --format '{{.Id}}') || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
-  [ "$previous_id" != "$target_id" ] || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
-  }
+  [[ "$previous_id" =~ ^sha256:[0-9a-f]{64}$ ]] || prerequisite_missing
+  [[ "$target_id" =~ ^sha256:[0-9a-f]{64}$ ]] || prerequisite_missing
+  [ "$previous_id" != "$target_id" ] || prerequisite_missing
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "PREREQUISITE_MISSING" >&2
-  exit 77
+  prerequisite_missing
+fi
+
+if [ "$filesystem_only" = true ]; then
+  malformed_status=0
+  malformed_output=$(
+    timeout 30s "$0" \
+      --previous-image malformed \
+      --target-image ghcr.io/nickolaymamonov/meet-backend-v3@sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+      2>&1
+  ) || malformed_status=$?
+  [ "$malformed_status" -eq 77 ]
+  grep -Fxq "PREREQUISITE_MISSING" <<<"$malformed_output"
 fi
 
 if [ "$filesystem_only" = false ]; then
   for command_name in docker curl jq flock openssl python3 timeout; do
     command -v "$command_name" >/dev/null 2>&1 || {
-      echo "PREREQUISITE_MISSING" >&2
-      exit 77
+      prerequisite_missing
     }
   done
   timeout 30s docker compose version >/dev/null 2>&1 || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
 
   image_label() {
@@ -99,57 +279,45 @@ PY
 
   previous_revision=$(image_label "$previous_image" \
     '{{index .Config.Labels "org.opencontainers.image.revision"}}') || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
   previous_version=$(image_label "$previous_image" \
     '{{index .Config.Labels "org.opencontainers.image.version"}}') || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
   target_revision=$(image_label "$target_image" \
     '{{index .Config.Labels "org.opencontainers.image.revision"}}') || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
   target_version=$(image_label "$target_image" \
     '{{index .Config.Labels "org.opencontainers.image.version"}}') || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
-  [[ "$previous_revision" =~ ^[0-9a-f]{40}$ ]] ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
-  [[ "$target_revision" =~ ^[0-9a-f]{40}$ ]] ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
-  version_supported "$previous_version" ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
-  version_supported "$target_version" ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+  [[ "$previous_revision" =~ ^[0-9a-f]{40}$ ]] || prerequisite_missing
+  [[ "$target_revision" =~ ^[0-9a-f]{40}$ ]] || prerequisite_missing
+  version_supported "$previous_version" || prerequisite_missing
+  version_supported "$target_version" || prerequisite_missing
   [ "$(image_label "$previous_image" \
     '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
     "https://github.com/NickolayMamonov/meet-backend-v3" ] ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+    prerequisite_missing
   [ "$(image_label "$target_image" \
     '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
     "https://github.com/NickolayMamonov/meet-backend-v3" ] ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+    prerequisite_missing
   [ "$(image_label "$previous_image" '{{.Config.User}}')" = "10001:10001" ] ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+    prerequisite_missing
   [ "$(image_label "$target_image" '{{.Config.User}}')" = "10001:10001" ] ||
-    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+    prerequisite_missing
 
   postgres_image=$(
     sed -nE \
       's/^[[:space:]]*image:[[:space:]]*(postgres:16-alpine@sha256:[0-9a-f]{64})[[:space:]]*$/\1/p' \
       "$ROOT_DIR/docker-compose.production.yml"
   )
-  [ -n "$postgres_image" ] || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
-  }
+  [ -n "$postgres_image" ] || prerequisite_missing
   timeout 30s docker image inspect "$postgres_image" >/dev/null 2>&1 || {
-    echo "PREREQUISITE_MISSING" >&2
-    exit 77
+    prerequisite_missing
   }
   timeout 30s python3 - "$ROOT_DIR/scripts/test-vps-provider-credential.py" \
     "$previous_image" "$target_image" <<'PY'
@@ -181,6 +349,13 @@ PY
     local status=$?
     trap - EXIT
     timeout 30s rm -r -- "$matrix_fixture"
+    if [ "$transport_loaded" = true ]; then
+      set +e
+      timeout 60s docker image rm "$previous_image" "$target_image" >/dev/null 2>&1
+      local transport_status=$?
+      set -e
+      [ "$transport_status" -eq 0 ] || status=1
+    fi
     exit "$status"
   }
   trap matrix_cleanup EXIT
@@ -287,8 +462,9 @@ sys.exit(125 if overflow else 0)
         inspect_status=$?
       fi
       [ "$inspect_status" -eq 1 ] || return 1
+      inspect_output=${inspect_output,,}
       case "$inspect_output" in
-        *"No such "*|*"not found"*) return 0 ;;
+        *"no such "*|*"not found"*) return 0 ;;
         *) return 1 ;;
       esac
     }
@@ -1996,6 +2172,7 @@ def retention_snapshot(path):
                 info.st_uid,
                 info.st_gid,
                 info.st_nlink,
+                info.st_mtime_ns,
                 data,
             )
         )
@@ -2017,9 +2194,14 @@ def valid_retention_state(name):
             % helper._state_parts(name)[0]
         ).encode()
     )
-    for child in (marker_path, terminal_path):
+    for child, mtime_ns in (
+        (marker_path, 1_700_000_000_123_456_789),
+        (terminal_path, 1_700_000_000_987_654_321),
+    ):
         os.chown(child, 0, 0)
         os.chmod(child, 0o600)
+        os.utime(child, ns=(mtime_ns, mtime_ns))
+    os.utime(path, ns=(1_700_000_001_987_654_321,) * 2)
     return path
 
 def assert_direct_retention_refusal(path, **kwargs):
@@ -2171,6 +2353,224 @@ assert final_boundary_calls[0] == 5
 assert retention_snapshot(final_boundary_state) == final_boundary_before
 final_boundary_reference.unlink()
 shutil.rmtree(final_boundary_state)
+
+semantic_witness_state = valid_retention_state("96-1-final-deploy")
+semantic_witness_quarantine = (
+    retention_root / ".provider-state.96-1-final-deploy.tmp"
+)
+original_semantic_witness = helper._child_witness
+semantic_witness_replaced = [False]
+
+def replace_terminal_after_witness(directory_fd, name, **kwargs):
+    result = original_semantic_witness(directory_fd, name, **kwargs)
+    if name == "terminal.json" and not semantic_witness_replaced[0]:
+        replacement = (
+            '{"schemaVersion":1,"runKey":"96-1","outcome":"rolled-back",'
+            '"providerEnabled":true}'
+        ).encode()
+        helper._write_private_at(
+            directory_fd,
+            ".terminal-replacement",
+            replacement,
+            0o600,
+        )
+        os.rename(
+            ".terminal-replacement",
+            "terminal.json",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        semantic_witness_replaced[0] = True
+    return result
+
+helper._child_witness = replace_terminal_after_witness
+expect_provider_error(
+    lambda: helper._retention_delete(
+        str(retention_root),
+        str(semantic_witness_state),
+    ),
+    "RECOVERY_REQUIRED",
+)
+helper._child_witness = original_semantic_witness
+assert semantic_witness_replaced[0]
+assert not semantic_witness_state.exists()
+assert semantic_witness_quarantine.exists()
+assert (
+    json.loads((semantic_witness_quarantine / "terminal.json").read_text())
+    == {
+        "schemaVersion": 1,
+        "runKey": "96-1",
+        "outcome": "rolled-back",
+        "providerEnabled": True,
+    }
+)
+shutil.rmtree(semantic_witness_quarantine)
+
+def expect_fault(action):
+    try:
+        action()
+    except (helper.ProviderError, OSError):
+        return
+    raise AssertionError("fault injection unexpectedly succeeded")
+
+def cleanup_fault_state(state):
+    quarantine = retention_root / (".provider-state." + state.name + ".tmp")
+    if state.exists():
+        shutil.rmtree(state)
+    if quarantine.exists():
+        shutil.rmtree(quarantine)
+
+fault_events = []
+fault_publication_root = fixture / "fault-publication-root"
+fault_publication_root.mkdir(mode=0o700)
+os.chown(fault_publication_root, 0, 0)
+original_fsync = helper.os.fsync
+publication_fsync_failed = [False]
+
+def fail_publication_fsync(fd):
+    if not publication_fsync_failed[0]:
+        publication_fsync_failed[0] = True
+        raise OSError(5, "publication fsync fault")
+    return original_fsync(fd)
+
+helper.os.fsync = fail_publication_fsync
+expect_fault(
+    lambda: helper._state_publish(
+        str(fault_publication_root),
+        "97-1",
+        "final-deploy",
+    )
+)
+helper.os.fsync = original_fsync
+fault_events.append("publication-fsync")
+shutil.rmtree(fault_publication_root)
+
+def retention_fault(name, fail):
+    state = valid_retention_state(name)
+    try:
+        fail()
+    finally:
+        cleanup_fault_state(state)
+
+def fail_quarantine_fsync():
+    original = helper.os.fsync
+    failed = [False]
+
+    def injected(fd):
+        if not failed[0]:
+            failed[0] = True
+            raise OSError(5, "quarantine fsync fault")
+        return original(fd)
+
+    helper.os.fsync = injected
+    try:
+        expect_fault(
+            lambda: helper._retention_delete(
+                str(retention_root),
+                str(retention_root / "98-1-final-deploy"),
+            )
+        )
+    finally:
+        helper.os.fsync = original
+
+retention_fault("98-1-final-deploy", fail_quarantine_fsync)
+fault_events.append("quarantine-fsync")
+
+def fail_child_unlink():
+    original = helper._witnessed_unlink
+
+    def injected(*args, **kwargs):
+        raise OSError(5, "child unlink fault")
+
+    helper._witnessed_unlink = injected
+    try:
+        expect_fault(
+            lambda: helper._retention_delete(
+                str(retention_root),
+                str(retention_root / "99-1-final-deploy"),
+            )
+        )
+    finally:
+        helper._witnessed_unlink = original
+
+retention_fault("99-1-final-deploy", fail_child_unlink)
+fault_events.append("child-unlink")
+
+def fail_owner_unlink():
+    original = helper._witnessed_unlink
+
+    def injected(directory_fd, name, **kwargs):
+        if name == helper.OWNER_MARKER:
+            raise OSError(5, "owner unlink fault")
+        return original(directory_fd, name, **kwargs)
+
+    helper._witnessed_unlink = injected
+    try:
+        expect_fault(
+            lambda: helper._retention_delete(
+                str(retention_root),
+                str(retention_root / "100-1-final-deploy"),
+            )
+        )
+    finally:
+        helper._witnessed_unlink = original
+
+retention_fault("100-1-final-deploy", fail_owner_unlink)
+fault_events.append("owner-unlink")
+
+def fail_rmdir():
+    original = helper.os.rmdir
+
+    def injected(path, **kwargs):
+        if path == ".provider-state.101-1-final-deploy.tmp":
+            raise OSError(5, "rmdir fault")
+        return original(path, **kwargs)
+
+    helper.os.rmdir = injected
+    try:
+        expect_fault(
+            lambda: helper._retention_delete(
+                str(retention_root),
+                str(retention_root / "101-1-final-deploy"),
+            )
+        )
+    finally:
+        helper.os.rmdir = original
+
+retention_fault("101-1-final-deploy", fail_rmdir)
+fault_events.append("rmdir")
+
+def fail_final_fsync():
+    original = helper.os.fsync
+    calls = [0]
+
+    def injected(fd):
+        calls[0] += 1
+        if calls[0] == 4:
+            raise OSError(5, "final fsync fault")
+        return original(fd)
+
+    helper.os.fsync = injected
+    try:
+        expect_fault(
+            lambda: helper._retention_delete(
+                str(retention_root),
+                str(retention_root / "102-1-final-deploy"),
+            )
+        )
+    finally:
+        helper.os.fsync = original
+
+retention_fault("102-1-final-deploy", fail_final_fsync)
+fault_events.append("final-fsync")
+assert fault_events == [
+    "publication-fsync",
+    "quarantine-fsync",
+    "child-unlink",
+    "owner-unlink",
+    "rmdir",
+    "final-fsync",
+]
 
 quarantine_race_state = valid_retention_state("92-1-final-deploy")
 quarantine_race_before = retention_snapshot(quarantine_race_state)

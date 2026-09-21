@@ -1077,7 +1077,7 @@ def _marker(state_root: str, run_key: str) -> dict[str, Any]:
         _fail("recovery")
     if value["durableDisposition"] not in ("none", "created", "reused"):
         _fail("recovery")
-    if not isinstance(value["providerEnabled"], bool):
+    if type(value["providerEnabled"]) is not bool:
         _fail("recovery")
     return value
 
@@ -1877,13 +1877,8 @@ def _validate_state_directory_fd(directory_fd: int, name: str) -> tuple[str, str
     return run_key, state_kind
 
 
-def _validate_terminal_state(path: str, name: str) -> None:
-    terminal = os.path.join(path, "terminal.json")
-    terminal_fd, terminal_info, terminal_data = _open_private_state_file(terminal)
-    os.close(terminal_fd)
-    if terminal_info.st_uid != 0 or terminal_info.st_nlink != 1:
-        _fail("recovery")
-    value = _json(terminal_data, "recovery")
+def _parse_terminal_state_data(data: bytes, name: str) -> tuple[str, bool]:
+    value = _json(data, "recovery")
     run_key, _ = _state_parts(name)
     if set(value) != {
         "schemaVersion",
@@ -1895,11 +1890,23 @@ def _validate_terminal_state(path: str, name: str) -> None:
     if (
         type(value["schemaVersion"]) is not int
         or value["schemaVersion"] != SCHEMA_VERSION
+        or type(value["runKey"]) is not str
         or value["runKey"] != run_key
+        or type(value["outcome"]) is not str
         or value["outcome"] not in ("committed", "rolled-back")
         or type(value["providerEnabled"]) is not bool
     ):
         _fail("recovery")
+    return value["outcome"], value["providerEnabled"]
+
+
+def _validate_terminal_state(path: str, name: str) -> None:
+    terminal = os.path.join(path, "terminal.json")
+    terminal_fd, terminal_info, terminal_data = _open_private_state_file(terminal)
+    os.close(terminal_fd)
+    if terminal_info.st_uid != 0 or terminal_info.st_nlink != 1:
+        _fail("recovery")
+    _parse_terminal_state_data(terminal_data, name)
 
 
 def _validate_terminal_state_fd(directory_fd: int, name: str) -> None:
@@ -1910,23 +1917,7 @@ def _validate_terminal_state_fd(directory_fd: int, name: str) -> None:
     os.close(terminal_fd)
     if terminal_info.st_uid != 0 or terminal_info.st_nlink != 1:
         _fail("recovery")
-    value = _json(terminal_data, "recovery")
-    run_key, _ = _state_parts(name)
-    if set(value) != {
-        "schemaVersion",
-        "runKey",
-        "outcome",
-        "providerEnabled",
-    }:
-        _fail("recovery")
-    if (
-        type(value["schemaVersion"]) is not int
-        or value["schemaVersion"] != SCHEMA_VERSION
-        or value["runKey"] != run_key
-        or value["outcome"] not in ("committed", "rolled-back")
-        or type(value["providerEnabled"]) is not bool
-    ):
-        _fail("recovery")
+    _parse_terminal_state_data(terminal_data, name)
 
 
 def _owned_state_fd(
@@ -2402,6 +2393,16 @@ def _retention_delete(
                 ):
                     _fail("recovery")
                 witnesses[child] = _child_witness(state_fd, child)
+            # Re-parse the bytes captured by the deletion witnesses.  The
+            # earlier path-based validation only admits the state; it must not
+            # authorize deletion after a child replacement.  Semantic
+            # admission and unlink authorization therefore share these exact
+            # descriptor-backed bytes and identities.
+            _parse_state_marker(
+                witnesses[OWNER_MARKER][1],
+                *_state_parts(name),
+            )
+            _parse_terminal_state_data(witnesses["terminal.json"][1], name)
             _reject_protected_reference_aliases(
                 [*reference_witnesses, *protected_state_witnesses],
                 state_info,

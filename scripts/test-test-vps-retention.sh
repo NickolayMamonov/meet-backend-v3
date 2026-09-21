@@ -219,7 +219,7 @@ done
   done
   fixed_before=$(
     for path in "$state_root" "$production_root" "$production_runtime_root"; do
-      find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n'
+      find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l|%T@\n'
       find "$path" -xdev -type f -exec sha256sum {} +
     done | sort
   )
@@ -231,7 +231,7 @@ done
   grep -Fq 'fixed fixture root already exists' <<<"$fixed_output"
   test "$fixed_before" = "$(
     for path in "$state_root" "$production_root" "$production_runtime_root"; do
-      find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n'
+      find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l|%T@\n'
       find "$path" -xdev -type f -exec sha256sum {} +
     done | sort
   )"
@@ -251,7 +251,7 @@ legacy_digest() {
   local name path
   for name in "${legacy_names[@]}"; do
     path="$state_root/$name"
-    find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n' | sort
+    find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l|%T@\n' | sort
     find "$path" -xdev -type f -exec sha256sum {} +
   done
 }
@@ -346,11 +346,11 @@ for index in $(seq 1 12); do
     "$index" >"$state/terminal.json"
   chmod 600 "$state/terminal.json"
   write_owner_marker "$state"
-  touch -d "@$((1800000000 - index))" "$state"
+  touch -d "@$((1800000000 - index)).123456789" "$state"
 done
 owned_digest() {
   local path=$1
-  find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n' | sort
+  find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l|%T@\n' | sort
   find "$path" -xdev -type f -exec sha256sum {} +
 }
 protected_state="$state_root/1-1-final-deploy"
@@ -401,14 +401,14 @@ printf '{"schemaVersion":1,"runKey":"14-1","outcome":"committed","providerEnable
 chmod 600 "$state_root/14-1-final-deploy/terminal.json"
 write_owner_marker "$state_root/14-1-final-deploy"
 printf 'unknown\n' >"$state_root/14-1-final-deploy/unknown.txt"
-touch -d '@1799999980' "$state_root/14-1-final-deploy"
+touch -d '@1799999980.123456789' "$state_root/14-1-final-deploy"
 install -d -m 700 "$state_root/17-1-final-deploy"
 printf '{"schemaVersion":1,"runKey":"17-1","outcome":"committed","providerEnabled":false}\n' \
   >"$state_root/17-1-final-deploy/terminal.json"
 chmod 600 "$state_root/17-1-final-deploy/terminal.json"
 write_owner_marker "$state_root/17-1-final-deploy"
 printf 'unknown-before-race\n' >"$state_root/17-1-final-deploy/unknown-before-race.txt"
-touch -d '@1799999970' "$state_root/17-1-final-deploy"
+touch -d '@1799999970.123456789' "$state_root/17-1-final-deploy"
 
 tooling_root="$production_root/.test-vps-tooling-1-1"
 install -d -m 700 "$tooling_root/scripts"
@@ -483,7 +483,7 @@ printf '{"schemaVersion":1,"runKey":"18-1","outcome":"committed","providerEnable
   >"$hard_witness"
 rm -f -- "$hard_state/terminal.json"
 ln "$hard_witness" "$hard_state/terminal.json"
-touch -d '@1799999960' "$hard_state"
+touch -d '@1799999960.123456789' "$hard_state"
 chmod 600 "$hard_witness"
 set +e
 hard_output=$(python3 scripts/test-vps-provider-credential.py \
@@ -515,7 +515,7 @@ printf '{"schemaVersion":1,"runKey":"16-1","outcome":"committed","providerEnable
   >"$state/terminal.json"
 chmod 600 "$state/terminal.json"
 write_owner_marker "$state"
-touch -d '@1799999980' "$state"
+touch -d '@1799999980.123456789' "$state"
 tooling_root="$production_root/.test-vps-tooling-1-1"
 install -d -m 700 "$tooling_root/scripts"
 cp scripts/test-vps-provider-credential.py \
@@ -549,7 +549,7 @@ printf '{"schemaVersion":1,"runKey":"15-1","outcome":"committed","providerEnable
   >"$state/terminal.json"
 chmod 600 "$state/terminal.json"
 write_owner_marker "$state"
-touch -d '@1799999970' "$state"
+touch -d '@1799999970.123456789' "$state"
 tooling_root="$production_root/.test-vps-tooling-1-1"
 install -d -m 700 "$tooling_root/scripts"
 cp scripts/test-vps-provider-credential.py \
