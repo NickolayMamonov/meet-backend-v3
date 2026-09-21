@@ -992,6 +992,8 @@ fixture_log="$fixture/output.log"
 fixture_secret=RUNTIME_FIXTURE_PRIVATE_SECRET_9f7d8d
 if ! python3 - "$fixture" >"$fixture_log" 2>&1 <<'PY'
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -1623,6 +1625,32 @@ for child in ("identity.json", "snapshot", "publication"):
 retention_root = fixture / "retention-root"
 retention_root.mkdir(mode=0o700)
 os.chown(retention_root, 0, 0)
+retention_check_output = io.StringIO()
+with contextlib.redirect_stdout(retention_check_output):
+    helper._retention_check("", str(retention_root))
+assert json.loads(retention_check_output.getvalue()) == {
+    "schemaVersion": 1,
+    "providerEnabled": False,
+    "credentialMountPresent": False,
+    "credentialMountReadOnly": False,
+    "outcome": "retention-safe",
+}
+retention_list_output = io.BytesIO()
+saved_stdout = sys.stdout
+sys.stdout = type(
+    "BinaryCapture",
+    (),
+    {"buffer": retention_list_output},
+)()
+try:
+    helper._retention_list("", str(retention_root))
+finally:
+    sys.stdout = saved_stdout
+assert json.loads(retention_list_output.getvalue()) == {
+    "schemaVersion": 1,
+    "outcome": "retention-safe",
+    "ownedStates": [],
+}
 missing_retention_root = fixture / "missing-retention-root"
 expect_provider_error(
     lambda: helper._retention_check("", str(missing_retention_root)),
@@ -1744,6 +1772,34 @@ def assert_direct_retention_refusal(path, **kwargs):
     )
     assert retention_snapshot(path) == before
     assert quarantine.exists() == quarantine_before
+
+root_swap_state = valid_retention_state("90-1-final-deploy")
+root_swap_before = retention_snapshot(root_swap_state)
+swapped_root = fixture / "retention-root-swapped-away"
+original_interlocks_fd = helper._retention_interlocks_fd
+
+def swap_root_after_interlocks(root, state_root_fd):
+    original_interlocks_fd(root, state_root_fd)
+    os.rename(retention_root, swapped_root)
+    retention_root.mkdir(mode=0o700)
+    os.chown(retention_root, 0, 0)
+
+helper._retention_interlocks_fd = swap_root_after_interlocks
+expect_provider_error(
+    lambda: helper._retention_delete(
+        str(retention_root),
+        str(root_swap_state),
+    ),
+    "RECOVERY_REQUIRED",
+)
+helper._retention_interlocks_fd = original_interlocks_fd
+assert retention_snapshot(swapped_root / root_swap_state.name) == root_swap_before
+assert not (retention_root / root_swap_state.name).exists()
+assert not (retention_root / (".provider-state." + root_swap_state.name + ".tmp")).exists()
+shutil.rmtree(retention_root)
+os.rename(swapped_root, retention_root)
+assert retention_snapshot(root_swap_state) == root_swap_before
+shutil.rmtree(root_swap_state)
 
 protected_state = valid_retention_state("88-1-final-deploy")
 assert_direct_retention_refusal(

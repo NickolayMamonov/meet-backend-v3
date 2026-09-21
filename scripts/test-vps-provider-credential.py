@@ -791,6 +791,40 @@ def _open_private_state_file(path: str) -> tuple[int, os.stat_result, bytes]:
         raise
 
 
+def _open_private_state_file_at(
+    directory_fd: int,
+    name: str,
+) -> tuple[int, os.stat_result, bytes]:
+    if not name or "/" in name or "\x00" in name:
+        _fail("recovery")
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+    except OSError:
+        _fail("recovery")
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            _fail("recovery")
+        _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+        data = _read_fd_bounded(fd, MAX_OWNER_BYTES)
+        final = os.fstat(fd)
+        if _identity(info) != _identity(final):
+            _fail("recovery")
+        return fd, info, data
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def _ensure_state_root(state_root: str) -> None:
     if (
         not isinstance(state_root, str)
@@ -1657,6 +1691,35 @@ def _owned_state(path: str, name: str, *, require_terminal: bool) -> tuple[str, 
     return run_key, state_kind
 
 
+def _validate_state_directory_fd(directory_fd: int, name: str) -> tuple[str, str]:
+    run_key, state_kind = _state_parts(name)
+    info = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        _fail("recovery")
+    _acl_is_safe(
+        f"/proc/self/fd/{directory_fd}",
+        follow_symlinks=True,
+        category="recovery",
+    )
+    marker_fd, marker_info, data = _open_private_state_file_at(
+        directory_fd,
+        OWNER_MARKER,
+    )
+    os.close(marker_fd)
+    if (
+        marker_info.st_uid != 0
+        or marker_info.st_nlink != 1
+        or stat.S_IMODE(marker_info.st_mode) != 0o600
+    ):
+        _fail("recovery")
+    _parse_state_marker(data, run_key, state_kind)
+    return run_key, state_kind
+
+
 def _validate_terminal_state(path: str, name: str) -> None:
     terminal = os.path.join(path, "terminal.json")
     terminal_fd, terminal_info, terminal_data = _open_private_state_file(terminal)
@@ -1682,25 +1745,77 @@ def _validate_terminal_state(path: str, name: str) -> None:
         _fail("recovery")
 
 
-def _retention_interlocks(root: str, state_root: str) -> None:
+def _validate_terminal_state_fd(directory_fd: int, name: str) -> None:
+    terminal_fd, terminal_info, terminal_data = _open_private_state_file_at(
+        directory_fd,
+        "terminal.json",
+    )
+    os.close(terminal_fd)
+    if terminal_info.st_uid != 0 or terminal_info.st_nlink != 1:
+        _fail("recovery")
+    value = _json(terminal_data, "recovery")
+    run_key, _ = _state_parts(name)
+    if set(value) != {
+        "schemaVersion",
+        "runKey",
+        "outcome",
+        "providerEnabled",
+    }:
+        _fail("recovery")
+    if (
+        type(value["schemaVersion"]) is not int
+        or value["schemaVersion"] != SCHEMA_VERSION
+        or value["runKey"] != run_key
+        or value["outcome"] not in ("committed", "rolled-back")
+        or type(value["providerEnabled"]) is not bool
+    ):
+        _fail("recovery")
+
+
+def _owned_state_fd(
+    directory_fd: int,
+    name: str,
+    *,
+    require_terminal: bool,
+) -> tuple[str, str]:
+    result = _validate_state_directory_fd(directory_fd, name)
+    if require_terminal:
+        _validate_terminal_state_fd(directory_fd, name)
+    return result
+
+
+def _retention_interlocks_fd(root: str, state_root_fd: int) -> None:
     parent = _rooted(HOST_CREDENTIAL_PARENT, root)
-    marker = os.path.join(state_root, ".provider-transaction.current")
-    if os.path.lexists(marker):
-        _fail("recovery")
-    smtp_marker = os.path.join(state_root, ".smtp-transaction.current")
-    if os.path.lexists(smtp_marker):
-        _fail("recovery")
-    if os.path.isdir(state_root):
-        for name in os.listdir(state_root):
-            if (
-                name.startswith(".provider-transaction.")
-                or name.startswith(".provider-state.")
-            ):
-                _fail("recovery")
+    for name in (
+        ".provider-transaction.current",
+        ".smtp-transaction.current",
+    ):
+        try:
+            os.stat(name, dir_fd=state_root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        else:
+            _fail("recovery")
+    for name in os.listdir(state_root_fd):
+        if name.startswith(".provider-transaction.") or name.startswith(
+            ".provider-state."
+        ):
+            _fail("recovery")
     if os.path.isdir(parent):
         for name in os.listdir(parent):
             if name.startswith(".transaction-"):
                 _fail("recovery")
+
+
+def _retention_interlocks(root: str, state_root: str) -> None:
+    state_root_fd = os.open(
+        state_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        _retention_interlocks_fd(root, state_root_fd)
+    finally:
+        os.close(state_root_fd)
 
 
 def _validate_retention_state_root_path(state_root: str) -> os.stat_result:
@@ -1722,7 +1837,7 @@ def _validate_retention_state_root_path(state_root: str) -> os.stat_result:
     return info
 
 
-def _validate_retention_state_root_fd(fd: int, state_root: str) -> None:
+def _validate_retention_state_root_fd(fd: int) -> None:
     info = os.fstat(fd)
     if (
         not stat.S_ISDIR(info.st_mode)
@@ -1730,16 +1845,27 @@ def _validate_retention_state_root_fd(fd: int, state_root: str) -> None:
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         _fail("recovery")
-    _check_ancestors(state_root, category="recovery")
     _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
 
 
-def _retention_check(
+def _revalidate_retention_state_root_path(
+    state_root: str,
+    expected_root: os.stat_result,
+) -> None:
+    try:
+        current = os.stat(state_root, follow_symlinks=False)
+    except OSError:
+        _fail("recovery")
+    if not _same_inode(current, expected_root):
+        _fail("recovery")
+
+
+def _retention_classify(
     root: str,
     state_root: str,
     protected_paths: Iterable[str] = (),
     protected_states: Iterable[str] = (),
-) -> None:
+) -> list[str]:
     if (
         not isinstance(state_root, str)
         or not state_root.startswith("/")
@@ -1747,10 +1873,19 @@ def _retention_check(
         or any(part in ("", ".", "..") for part in state_root.split("/")[1:])
     ):
         _fail("recovery")
-    _validate_retention_state_root_path(state_root)
-    _retention_interlocks(root, state_root)
-    owned_states: list[str] = []
-    if os.path.isdir(state_root):
+    expected_root = _validate_retention_state_root_path(state_root)
+    parent_fd = os.open(
+        state_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
+        _lock_directory(parent_fd)
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
+        _validate_retention_state_root_fd(parent_fd)
+        _retention_interlocks_fd(root, parent_fd)
         references = [_retention_reference(path) for path in protected_paths]
         explicit_states: set[str] = set()
         for path in protected_states:
@@ -1762,31 +1897,61 @@ def _retention_check(
                 or not os.path.isdir(path)
             ):
                 _fail("recovery")
-            explicit_states.add(os.path.realpath(path))
-        for name in os.listdir(state_root):
-            path = os.path.join(state_root, name)
+            explicit_states.add(os.path.normpath(path))
+        owned_states: list[str] = []
+        for name in os.listdir(parent_fd):
             if re.fullmatch(r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name):
-                if os.path.islink(path):
+                state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(
+                    state_info.st_mode
+                ):
                     _fail("recovery")
-                if not os.path.isdir(path):
-                    _fail("recovery")
-                if os.path.lexists(os.path.join(path, OWNER_MARKER)):
-                    _owned_state(path, name, require_terminal=True)
-                    if set(os.listdir(path)).issubset(RETENTION_CHILDREN):
+                state_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    try:
+                        os.stat(
+                            OWNER_MARKER,
+                            dir_fd=state_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        # An absent marker is an unowned legacy state.  Its
+                        # contents are deliberately opaque and never
+                        # participate in retention.
+                        continue
+                    _owned_state_fd(state_fd, name, require_terminal=True)
+                    if set(os.listdir(state_fd)).issubset(RETENTION_CHILDREN):
                         owned_states.append(name)
-                # An absent marker is an unowned legacy state.  Its contents
-                # are deliberately opaque and never participate in retention.
+                finally:
+                    os.close(state_fd)
                 continue
-            if os.path.islink(path):
+            state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(state_info.st_mode):
                 _fail("recovery")
-            if not os.path.isdir(path):
+            if not stat.S_ISDIR(state_info.st_mode):
                 continue
             if name.startswith(".provider-state."):
                 _fail("recovery")
-            if os.path.lexists(os.path.join(path, OWNER_MARKER)):
-                _fail("recovery")
-            real_path = os.path.realpath(path)
-            if real_path in explicit_states:
+            state_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                try:
+                    os.stat(OWNER_MARKER, dir_fd=state_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    _fail("recovery")
+            finally:
+                os.close(state_fd)
+            path = os.path.join(state_root, name)
+            if os.path.normpath(path) in explicit_states:
                 continue
             for reference in references:
                 if reference == path or reference.startswith(path + "/"):
@@ -1794,17 +1959,44 @@ def _retention_check(
                     # them here.  A component boundary is required so a state
                     # named "1-2" cannot protect or match "1-20".
                     break
+    finally:
+        os.close(parent_fd)
+    return sorted(owned_states)
+
+
+def _retention_list(
+    root: str,
+    state_root: str,
+    protected_paths: Iterable[str] = (),
+    protected_states: Iterable[str] = (),
+) -> None:
+    owned_states = _retention_classify(
+        root,
+        state_root,
+        protected_paths,
+        protected_states,
+    )
     encoded = json.dumps(
         {
             "schemaVersion": 1,
             "outcome": "retention-safe",
-            "ownedStates": sorted(owned_states),
+            "ownedStates": owned_states,
         },
         separators=(",", ":"),
     ).encode()
     if len(encoded) > MAX_INSPECTION_BYTES:
         _fail("recovery")
     sys.stdout.buffer.write(encoded + b"\n")
+
+
+def _retention_check(
+    root: str,
+    state_root: str,
+    protected_paths: Iterable[str] = (),
+    protected_states: Iterable[str] = (),
+) -> None:
+    _retention_classify(root, state_root, protected_paths, protected_states)
+    _result(False, False, False, "retention-safe")
 
 
 RETENTION_CHILDREN = frozenset(
@@ -1864,7 +2056,35 @@ def _retention_delete(
     name = os.path.basename(state_path)
     if re.fullmatch(r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name) is None:
         _fail("recovery")
-    run_key, state_kind = _state_parts(name)
+    state_norm = os.path.normpath(state_path)
+    root_norm = os.path.normpath(state_root)
+    if os.path.dirname(state_norm) != root_norm:
+        _fail("recovery")
+    references = [_retention_reference(path) for path in protected_paths]
+    for protected in protected_states:
+        _retention_reference(protected)
+        if (
+            not isinstance(protected, str)
+            or os.path.dirname(protected.rstrip("/")) != root_norm
+            or os.path.islink(protected)
+            or not os.path.isdir(protected)
+        ):
+            _fail("recovery")
+        protected_norm = os.path.normpath(protected)
+        if (
+            protected_norm == state_norm
+            or protected_norm.startswith(state_norm + os.sep)
+            or state_norm.startswith(protected_norm + os.sep)
+        ):
+            _fail("recovery")
+    for reference in references:
+        reference_norm = os.path.normpath(reference)
+        if (
+            reference_norm == state_norm
+            or reference_norm.startswith(state_norm + os.sep)
+            or state_norm.startswith(reference_norm + os.sep)
+        ):
+            _fail("recovery")
     expected_root = _validate_retention_state_root_path(state_root)
     parent_fd = os.open(
         state_root,
@@ -1876,10 +2096,9 @@ def _retention_delete(
         _lock_directory(parent_fd)
         if not _same_inode(os.fstat(parent_fd), expected_root):
             _fail("recovery")
-        _validate_retention_state_root_fd(parent_fd, state_root)
-        _retention_interlocks("", state_root)
-        if os.path.dirname(os.path.normpath(state_path)) != os.path.normpath(state_root):
-            _fail("recovery")
+        _validate_retention_state_root_fd(parent_fd)
+        _retention_interlocks_fd("", parent_fd)
+        _revalidate_retention_state_root_path(state_root, expected_root)
         state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (
             not stat.S_ISDIR(state_info.st_mode)
@@ -1887,36 +2106,6 @@ def _retention_delete(
             or stat.S_IMODE(state_info.st_mode) != 0o700
         ):
             _fail("recovery")
-        if not os.path.lexists(os.path.join(state_path, OWNER_MARKER)):
-            _fail("recovery")
-        _owned_state(state_path, name, require_terminal=True)
-        references = [_retention_reference(path) for path in protected_paths]
-        for protected in protected_states:
-            _retention_reference(protected)
-            if (
-                not isinstance(protected, str)
-                or os.path.dirname(protected.rstrip("/")) != os.path.normpath(state_root)
-                or os.path.islink(protected)
-                or not os.path.isdir(protected)
-            ):
-                _fail("recovery")
-            protected_norm = os.path.normpath(protected)
-            state_norm = os.path.normpath(state_path)
-            if (
-                protected_norm == state_norm
-                or protected_norm.startswith(state_norm + os.sep)
-                or state_norm.startswith(protected_norm + os.sep)
-            ):
-                _fail("recovery")
-        for reference in references:
-            reference_norm = os.path.normpath(reference)
-            state_norm = os.path.normpath(state_path)
-            if (
-                reference_norm == state_norm
-                or reference_norm.startswith(state_norm + os.sep)
-                or state_norm.startswith(reference_norm + os.sep)
-            ):
-                _fail("recovery")
         state_fd = os.open(
             name,
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -1926,6 +2115,10 @@ def _retention_delete(
             if not _same_inode(os.fstat(state_fd), state_info):
                 _fail("recovery")
             _lock_directory(state_fd)
+            if not _same_inode(os.fstat(state_fd), state_info):
+                _fail("recovery")
+            _validate_state_directory_fd(state_fd, name)
+            _validate_terminal_state_fd(state_fd, name)
             names = set(os.listdir(state_fd))
             if not names or not names.issubset(RETENTION_CHILDREN):
                 _fail("recovery")
@@ -2061,7 +2254,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "state-publish":
             _state_publish(args.state_root, args.run_key, args.state_kind)
         elif args.command == "retention-list":
-            _retention_check(
+            _retention_list(
                 "",
                 args.state_root,
                 args.protected_path,
