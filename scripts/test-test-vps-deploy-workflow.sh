@@ -94,7 +94,12 @@ for text in \
   'validate_configuration_boundary' \
   'delete_owned_state' \
   'check-image' \
+  'state-publish' \
+  'retention-list' \
   'retention-delete' \
+  'provider-owner.json' \
+  'renameat2' \
+  'RENAME_NOREPLACE' \
   '_witnessed_unlink' \
   'os.replace' \
   'O_NOFOLLOW' \
@@ -623,7 +628,7 @@ grep -Fq 'target version must be at least v1.2.0' "$tmp/invalid-target.stderr" |
   fail "pre-floor target created deployment state before rejection"
 
 state_writer_line=$(awk '/install -d -m 700 "\$state_root"/{print NR; exit}' "$deploy")
-state_directory_line=$(awk '/install -d -m 700 "\$state"/{print NR; exit}' "$provider_deploy")
+state_directory_line=$(awk '/state-publish/{print NR; exit}' "$provider_deploy")
 provider_retention_line=$(awk '/retention-check/{print NR; exit}' "$provider_deploy")
 mutation_line=$(awk '/mutation_started=true/{print NR; exit}' "$deploy")
 target_line=$(awk '/is_supported_test_vps_version "\$version"/{print NR; exit}' "$deploy")

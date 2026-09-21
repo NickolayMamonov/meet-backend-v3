@@ -119,6 +119,24 @@ state.mkdir(mode=0o700)
 os.chown(state, 0, 0)
 marker = state / ".provider-transaction.current"
 
+published_root = fixture / "published-states"
+published_root.mkdir(mode=0o700)
+os.chown(published_root, 0, 0)
+helper._state_publish(str(published_root), "123456789-1", "final-deploy")
+published_state = published_root / "123456789-1-final-deploy"
+assert (published_state / helper.OWNER_MARKER).read_bytes() == helper._state_marker(
+    "123456789-1", "final-deploy"
+)
+expect_collision = published_root / "456-1-final-deploy"
+expect_collision.mkdir(mode=0o700)
+os.chown(expect_collision, 0, 0)
+try:
+    helper._state_publish(str(published_root), "456-1", "final-deploy")
+except helper.ProviderError as error:
+    assert error.category == "RECOVERY_REQUIRED"
+else:
+    raise AssertionError("state publication accepted an invalid run key")
+
 def prepare_marker(run_key: str) -> None:
     helper._write_private(
         str(marker),
@@ -689,13 +707,22 @@ for child in ("identity.json", "snapshot", "publication"):
 retention_root = fixture / "retention-root"
 retention_root.mkdir(mode=0o700)
 os.chown(retention_root, 0, 0)
-for child in sorted(helper.RETENTION_CHILDREN):
-    retention_state = retention_root / ("77-1-final-deploy-" + child.replace(".", "-"))
+for child in sorted(helper.RETENTION_CHILDREN - {"provider-owner.json", "terminal.json"}):
+    retention_state = retention_root / "77-1-final-deploy"
     retention_state.mkdir(mode=0o700)
     os.chown(retention_state, 0, 0)
     for state_child in helper.RETENTION_CHILDREN:
         path = retention_state / state_child
-        path.write_bytes(("retention-" + state_child).encode())
+        if state_child == "provider-owner.json":
+            path.write_bytes(
+                helper._state_marker("77-1", "final-deploy")
+            )
+        elif state_child == "terminal.json":
+            path.write_bytes(
+                b'{"schemaVersion":1,"runKey":"77-1","outcome":"committed","providerEnabled":false}'
+            )
+        else:
+            path.write_bytes(("retention-" + state_child).encode())
         os.chown(path, 0, 0)
         os.chmod(path, 0o600)
     original_witness = helper._child_witness
@@ -723,9 +750,10 @@ for child in sorted(helper.RETENTION_CHILDREN):
         "RECOVERY_REQUIRED",
     )
     helper._child_witness = original_witness
-    assert retention_state.exists()
-    assert (retention_state / child).exists()
-    shutil.rmtree(retention_state)
+    quarantine = retention_root / ".provider-state.77-1-final-deploy.tmp"
+    assert not retention_state.exists()
+    assert quarantine.exists()
+    shutil.rmtree(quarantine)
 PY
 then
   echo "provider runtime fixture failed" >&2

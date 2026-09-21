@@ -22,12 +22,57 @@ cleanup() {
 }
 trap cleanup EXIT
 
+legacy_names=(
+  31885558214-1-rollback-drill
+  31886011287-1-rollback-drill
+  31886542144-1-final-deploy
+  31886542144-1-rollback-drill
+  31887546557-1-final-deploy
+  33076843662-1-final-deploy
+  33076843662-1-rollback-drill
+  35471104657-1-rollback-drill
+)
+legacy_digest() {
+  local name path
+  for name in "${legacy_names[@]}"; do
+    path="$state_root/$name"
+    find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n' | sort
+    find "$path" -xdev -type f -exec sha256sum {} +
+  done
+}
+write_owner_marker() {
+  local state=$1
+  local name=${state##*/}
+  local run_key=${name%-final-deploy}
+  [ "$run_key" = "$name" ] && run_key=${name%-rollback-drill}
+  local state_kind=${name#"$run_key"-}
+  printf '{"schemaVersion":1,"owner":"meet-test-vps-provider","runKey":"%s","stateKind":"%s"}\n' \
+    "$run_key" "$state_kind" >"$state/provider-owner.json"
+  chmod 600 "$state/provider-owner.json"
+}
+
 install -d -m 700 "$fake_bin" "$state_root" "$production_root"
 install -d -m 700 /var/lib/meet-production
 printf 'fixture\n' >"$production_root/.env.production"
 printf 'services:\n  backend:\n    image: fixture\n' >"$production_root/docker-compose.production.yml"
 printf 'services:\n  backend:\n    image: fixture\n' >/var/lib/meet-production/active-compose.yml
 printf 'services:\n  backend:\n    healthcheck:\n      test: ["CMD", "true"]\n' >/var/lib/meet-production/active-runtime.override.yml
+
+for name in "${legacy_names[@]}"; do
+  install -d -m 700 "$state_root/$name"
+  printf 'legacy synthetic bytes: %s\n' "$name" >"$state_root/$name/opaque.bin"
+  chmod 600 "$state_root/$name/opaque.bin"
+done
+legacy_before=$(legacy_digest)
+set +e
+legacy_delete_output=$(python3 scripts/test-vps-provider-credential.py \
+  retention-delete --state-root "$state_root" \
+  --retention-state "$state_root/${legacy_names[0]}" 2>&1)
+legacy_delete_status=$?
+set -e
+[ "$legacy_delete_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$legacy_delete_output"
+test "$legacy_before" = "$(legacy_digest)"
 
 cat >"$fake_bin/docker" <<'FAKE_DOCKER'
 #!/usr/bin/env bash
@@ -80,6 +125,7 @@ for index in $(seq 1 12); do
   printf '{"schemaVersion":1,"runKey":"%s-1","outcome":"committed","providerEnabled":false}\n' \
     "$index" >"$state/terminal.json"
   chmod 600 "$state/terminal.json"
+  write_owner_marker "$state"
   touch -d "@$((1800000000 - index))" "$state"
 done
 install -d -m 700 "$state_root/12-1-final-deploy/protected-input"
@@ -91,12 +137,14 @@ install -d -m 700 "$state_root/14-1-final-deploy"
 printf '{"schemaVersion":1,"runKey":"14-1","outcome":"committed","providerEnabled":false}\n' \
   >"$state_root/14-1-final-deploy/terminal.json"
 chmod 600 "$state_root/14-1-final-deploy/terminal.json"
+write_owner_marker "$state_root/14-1-final-deploy"
 printf 'unknown\n' >"$state_root/14-1-final-deploy/unknown.txt"
 touch -d '@1799999980' "$state_root/14-1-final-deploy"
 install -d -m 700 "$state_root/17-1-final-deploy"
 printf '{"schemaVersion":1,"runKey":"17-1","outcome":"committed","providerEnabled":false}\n' \
   >"$state_root/17-1-final-deploy/terminal.json"
 chmod 600 "$state_root/17-1-final-deploy/terminal.json"
+write_owner_marker "$state_root/17-1-final-deploy"
 printf 'unknown-before-race\n' >"$state_root/17-1-final-deploy/unknown-before-race.txt"
 touch -d '@1799999970' "$state_root/17-1-final-deploy"
 
@@ -138,7 +186,7 @@ PATH="$fake_bin:$PATH" bash "$remote_script" \
 [ -f "$state_root/14-1-final-deploy/unknown.txt" ]
 [ -d "$state_root/17-1-final-deploy" ]
 [ -f "$state_root/17-1-final-deploy/unknown-before-race.txt" ]
-[ -f "$state_root/17-1-final-deploy/concurrent-unknown.txt" ]
+[ ! -e "$state_root/17-1-final-deploy/concurrent-unknown.txt" ]
 [ ! -e "$tooling_root" ]
 
 ln -s "$state_root/12-1-final-deploy" "$state_root/13-1-final-deploy"
@@ -204,6 +252,7 @@ install -d -m 700 "$state"
 printf '{"schemaVersion":1,"runKey":"16-1","outcome":"committed","providerEnabled":false}\n' \
   >"$state/terminal.json"
 chmod 600 "$state/terminal.json"
+write_owner_marker "$state"
 touch -d '@1799999980' "$state"
 tooling_root="$production_root/.test-vps-tooling-1-1"
 install -d -m 700 "$tooling_root/scripts"
@@ -237,6 +286,7 @@ install -d -m 700 "$state"
 printf '{"schemaVersion":1,"runKey":"15-1","outcome":"committed","providerEnabled":false}\n' \
   >"$state/terminal.json"
 chmod 600 "$state/terminal.json"
+write_owner_marker "$state"
 touch -d '@1799999970' "$state"
 tooling_root="$production_root/.test-vps-tooling-1-1"
 install -d -m 700 "$tooling_root/scripts"
@@ -255,4 +305,5 @@ PATH="$fake_bin:$PATH" bash "$remote_script" \
   "$production_root" 1 1 "$tooling_root"
 [ ! -e "$state_root/15-1-final-deploy" ]
 [ ! -e "$tooling_root" ]
+test "$legacy_before" = "$(legacy_digest)"
 echo "retention fixture passed: all-service mounts, timeout failure, self-tooling ordering, repeated-run cleanup, protected reference, unknown, symlink and prefix-collision cases"

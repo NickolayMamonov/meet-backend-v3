@@ -185,6 +185,28 @@ class ProviderCredentialTests(unittest.TestCase):
             helper._bounded_stdin  # keep the public bound covered by the constant
             helper._json(b"[" + b"0" * (helper.MAX_INSPECTION_BYTES + 1) + b"]")
 
+    def test_owner_marker_is_exact_and_typed(self) -> None:
+        marker = helper._state_marker("31885558214-1", "rollback-drill")
+        helper._parse_state_marker(marker, "31885558214-1", "rollback-drill")
+        for value in (
+            b'{"schemaVersion":true,"owner":"meet-test-vps-provider","runKey":"31885558214-1","stateKind":"rollback-drill"}',
+            b'{"schemaVersion":1,"owner":"other","runKey":"31885558214-1","stateKind":"rollback-drill"}',
+            b'{"schemaVersion":1,"owner":"meet-test-vps-provider","runKey":"31885558214-1","stateKind":"final-deploy"}',
+            b'{"schemaVersion":1,"owner":"meet-test-vps-provider","runKey":"31885558214-1","stateKind":"rollback-drill","extra":1}',
+            b'{"schemaVersion":1,"owner":"meet-test-vps-provider","runKey":"31885558214-1","stateKind":"rollback-drill","stateKind":"rollback-drill"}',
+        ):
+            with self.assertRaises(helper.ProviderError) as error:
+                helper._parse_state_marker(value, "31885558214-1", "rollback-drill")
+            self.assertEqual("RECOVERY_REQUIRED", error.exception.category)
+
+    def test_state_names_are_numeric_and_canonical(self) -> None:
+        self.assertEqual(
+            ("31885558214-1", "rollback-drill"),
+            helper._state_parts("31885558214-1-rollback-drill"),
+        )
+        with self.assertRaises(helper.ProviderError):
+            helper._state_parts("run-key-final-deploy")
+
     def test_success_output_is_allowlisted(self) -> None:
         stream = io.StringIO()
         with contextlib.redirect_stdout(stream):
