@@ -1040,7 +1040,16 @@ marker = state / ".provider-transaction.current"
 published_root = fixture / "published-states"
 published_root.mkdir(mode=0o700)
 os.chown(published_root, 0, 0)
-helper._state_publish(str(published_root), "123456789-1", "final-deploy")
+state_publish_output = io.StringIO()
+with contextlib.redirect_stdout(state_publish_output):
+    helper._state_publish(str(published_root), "123456789-1", "final-deploy")
+assert json.loads(state_publish_output.getvalue()) == {
+    "schemaVersion": 1,
+    "providerEnabled": False,
+    "credentialMountPresent": False,
+    "credentialMountReadOnly": False,
+    "outcome": "published",
+}
 published_state = published_root / "123456789-1-final-deploy"
 assert (published_state / helper.OWNER_MARKER).read_bytes() == helper._state_marker(
     "123456789-1", "final-deploy"
@@ -1087,6 +1096,49 @@ assert not (publication_race_root / publication_race_name).exists()
 assert (publication_race_moved / publication_race_name).is_dir()
 shutil.rmtree(publication_race_root)
 shutil.rmtree(publication_race_moved)
+
+publication_interlock_root = fixture / "publication-interlock-root"
+publication_interlock_root.mkdir(mode=0o700)
+os.chown(publication_interlock_root, 0, 0)
+publication_interlock_name = "123456791-1-final-deploy"
+original_publication_interlocks = helper._retention_interlocks_fd
+publication_interlock_calls = [0]
+
+def inject_publication_interlock(root, state_root_fd, **kwargs):
+    publication_interlock_calls[0] += 1
+    if publication_interlock_calls[0] == 2:
+        helper._write_private_at(
+            state_root_fd,
+            ".provider-transaction.current",
+            b"publication-interlock-race",
+            0o600,
+        )
+    return original_publication_interlocks(root, state_root_fd, **kwargs)
+
+helper._retention_interlocks_fd = inject_publication_interlock
+try:
+    helper._state_publish(
+        str(publication_interlock_root),
+        "123456791-1",
+        "final-deploy",
+    )
+except helper.ProviderError as error:
+    assert error.category == "RECOVERY_REQUIRED"
+else:
+    raise AssertionError("state publication ignored a new interlock")
+helper._retention_interlocks_fd = original_publication_interlocks
+assert not (publication_interlock_root / publication_interlock_name).exists()
+assert (
+    publication_interlock_root / ".provider-transaction.current"
+).exists()
+(publication_interlock_root / ".provider-transaction.current").unlink()
+temporary_publication = (
+    publication_interlock_root
+    / (".provider-state." + publication_interlock_name + ".tmp")
+)
+if temporary_publication.exists():
+    shutil.rmtree(temporary_publication)
+shutil.rmtree(publication_interlock_root)
 
 def prepare_marker(run_key: str) -> None:
     helper._write_private(

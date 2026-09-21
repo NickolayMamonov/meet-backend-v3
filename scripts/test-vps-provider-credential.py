@@ -862,6 +862,7 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
         if not _same_inode(os.fstat(parent_fd), expected_root):
             _fail("recovery")
         _validate_retention_state_root_fd(parent_fd)
+        _retention_interlocks_fd("", parent_fd)
         for candidate in (temporary, name):
             try:
                 os.stat(candidate, dir_fd=parent_fd, follow_symlinks=False)
@@ -887,6 +888,11 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
         finally:
             os.close(temporary_fd)
         os.fsync(parent_fd)
+        _retention_interlocks_fd(
+            "",
+            parent_fd,
+            allowed_temporary=temporary,
+        )
         _rename_noreplace(parent_fd, temporary, name)
         published_fd = os.open(
             name,
@@ -905,6 +911,7 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
+    _result(False, False, False, "published")
 
 
 def _read_existing(path: str, source: bool = False) -> tuple[dict[str, int], bytes]:
@@ -1902,7 +1909,12 @@ def _open_optional_directory_reference(path: str) -> int | None:
         os.close(parent_fd)
 
 
-def _retention_interlocks_fd(root: str, state_root_fd: int) -> None:
+def _retention_interlocks_fd(
+    root: str,
+    state_root_fd: int,
+    *,
+    allowed_temporary: str | None = None,
+) -> None:
     parent = _rooted(HOST_CREDENTIAL_PARENT, root)
     for name in (
         ".provider-transaction.current",
@@ -1918,6 +1930,8 @@ def _retention_interlocks_fd(root: str, state_root_fd: int) -> None:
         if name.startswith(".provider-transaction.") or name.startswith(
             ".provider-state."
         ):
+            if allowed_temporary is not None and name == allowed_temporary:
+                continue
             _fail("recovery")
     parent_fd = _open_optional_directory_reference(parent)
     if parent_fd is None:
