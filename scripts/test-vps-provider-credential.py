@@ -656,6 +656,14 @@ def _write_private_at(
         os.close(fd)
 
 
+def _rename_noreplace_boundary(
+    directory_fd: int,
+    source: str,
+    destination: str,
+) -> None:
+    return None
+
+
 def _rename_noreplace(
     directory_fd: int,
     source: str,
@@ -690,6 +698,7 @@ def _rename_noreplace(
             )
         ):
             _fail("recovery")
+    _rename_noreplace_boundary(directory_fd, source, destination)
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = libc.renameat2
@@ -942,6 +951,11 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
             )
             try:
                 published = os.fstat(published_fd)
+                if (
+                    not _same_inode(published, os.fstat(temporary_fd))
+                    or (published.st_dev, published.st_ino) != temporary_inode
+                ):
+                    _fail("recovery")
                 _validate_state_directory_fd(published_fd, name)
                 current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 if not _same_inode(current, published):

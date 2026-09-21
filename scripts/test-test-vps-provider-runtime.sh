@@ -268,6 +268,15 @@ sys.exit(125 if overflow else 0)
     root_identity() {
       stat -c '%d:%i:%f:%u:%g' -- "$1"
     }
+    create_owned_root() {
+      local path=$1
+      if ! mkdir -m 700 -- "$path"; then
+        echo "PREREQUISITE_MISSING: fixed runtime root creation raced or already exists" >&2
+        return 77
+      fi
+      chown 0:0 -- "$path"
+      chmod 700 -- "$path"
+    }
     assert_resource_absent() {
       local kind=$1
       local name=$2
@@ -292,12 +301,115 @@ sys.exit(125 if overflow else 0)
     remove_owned_root() {
       local path=$1
       local expected_identity=$2
-      local actual_identity
+      local require_empty=${3:-false}
       [ -e "$path" ] || [ -L "$path" ] || return 0
-      [ -d "$path" ] && [ ! -L "$path" ] || return 1
-      actual_identity=$(root_identity "$path") || return 1
-      [ "$actual_identity" = "$expected_identity" ] || return 1
-      timeout 30s rm -r -- "$path"
+      timeout 30s python3 - "$path" "$expected_identity" "$require_empty" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+path, expected, require_empty = sys.argv[1:]
+
+
+def identity(info):
+    return f"{info.st_dev}:{info.st_ino}:{info.st_mode:x}:{info.st_uid}:{info.st_gid}"
+
+
+def same_inode(left, right):
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def fail():
+    raise SystemExit(1)
+
+
+parent_path, name = os.path.split(path)
+parent_fd = os.open(
+    parent_path or "/",
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+)
+try:
+    fcntl.flock(parent_fd, fcntl.LOCK_EX)
+    root_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or identity(root_info) != expected
+    ):
+        fail()
+    root_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(root_fd)
+        if not same_inode(opened, root_info) or identity(opened) != expected:
+            fail()
+        entries = list(os.scandir(f"/proc/self/fd/{root_fd}"))
+        if require_empty == "true" and entries:
+            fail()
+
+        def remove_contents(directory_fd, directory_entries):
+            for entry in directory_entries:
+                child_info = os.stat(
+                    entry.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(child_info.st_mode):
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        opened_child = os.fstat(child_fd)
+                        if not same_inode(opened_child, child_info):
+                            fail()
+                        remove_contents(
+                            child_fd,
+                            list(os.scandir(f"/proc/self/fd/{child_fd}")),
+                        )
+                        current_child = os.stat(
+                            entry.name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                        if not same_inode(current_child, opened_child):
+                            fail()
+                    finally:
+                        os.close(child_fd)
+                    os.rmdir(entry.name, dir_fd=directory_fd)
+                else:
+                    current_child = os.stat(
+                        entry.name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if not same_inode(current_child, child_info):
+                        fail()
+                    os.unlink(entry.name, dir_fd=directory_fd)
+
+        remove_contents(root_fd, entries)
+        if next(os.scandir(f"/proc/self/fd/{root_fd}"), None) is not None:
+            fail()
+        current_root = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not same_inode(current_root, opened) or identity(current_root) != expected:
+            fail()
+    finally:
+        os.close(root_fd)
+    current_root = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if identity(current_root) != expected:
+        fail()
+    os.rmdir(name, dir_fd=parent_fd)
+finally:
+    os.close(parent_fd)
+PY
     }
 
     cleanup_case() {
@@ -306,26 +418,37 @@ sys.exit(125 if overflow else 0)
       trap - EXIT
       set +e
       if [ "$case_root_created" = true ]; then
-        if [ -n "$coordinator_pid" ] && kill -0 "$coordinator_pid" 2>/dev/null; then
-          kill "$coordinator_pid" 2>/dev/null || cleanup_status=1
-          for _ in $(seq 1 30); do
-            kill -0 "$coordinator_pid" 2>/dev/null || break
-            sleep 1
-          done
-          if kill -0 "$coordinator_pid" 2>/dev/null; then
-            kill -9 "$coordinator_pid" 2>/dev/null || cleanup_status=1
+        stop_owned_process() {
+          local pid=$1
+          local signal=$2
+          local child
+          [ -n "$pid" ] || return 0
+          if kill -0 "$pid" 2>/dev/null; then
+            for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+              stop_owned_process "$child" "$signal" || return 1
+            done
+            kill "-$signal" "$pid" 2>/dev/null || true
           fi
-        fi
-        if [ -n "$probe_pid" ] && kill -0 "$probe_pid" 2>/dev/null; then
-          kill "$probe_pid" 2>/dev/null || cleanup_status=1
-          for _ in $(seq 1 30); do
-            kill -0 "$probe_pid" 2>/dev/null || break
-            sleep 1
+          return 0
+        }
+        reap_owned_process() {
+          local pid=$1
+          local child
+          [ -n "$pid" ] || return 0
+          for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+            reap_owned_process "$child" || return 1
           done
-          if kill -0 "$probe_pid" 2>/dev/null; then
-            kill -9 "$probe_pid" 2>/dev/null || cleanup_status=1
+          wait "$pid" 2>/dev/null || true
+          ! kill -0 "$pid" 2>/dev/null
+        }
+        for owned_pid in "$coordinator_pid" "$probe_pid"; do
+          if [ -n "$owned_pid" ] && kill -0 "$owned_pid" 2>/dev/null; then
+            stop_owned_process "$owned_pid" TERM || cleanup_status=1
+            sleep 1
+            stop_owned_process "$owned_pid" KILL || cleanup_status=1
           fi
-        fi
+          reap_owned_process "$owned_pid" || cleanup_status=1
+        done
         scan_case_secrets || cleanup_status=1
         capture_command "$cleanup_capture" timeout 300s docker compose -p meet-production \
           --project-directory "$case_root" \
@@ -359,17 +482,8 @@ sys.exit(125 if overflow else 0)
       if [ "$state_parent_created" = true ] &&
         [ "$state_root_created" = true ] &&
         [ ! -e "$state_root" ] && [ ! -L "$state_root" ]; then
-        local parent_entries
-        if parent_entries=$(timeout 30s find "$state_parent" -mindepth 1 \
-          -maxdepth 1 -print -quit); then
-          [ -z "$parent_entries" ] || cleanup_status=1
-        else
+        remove_owned_root "$state_parent" "$state_parent_identity" true ||
           cleanup_status=1
-        fi
-        if [ "$cleanup_status" -eq 0 ]; then
-          remove_owned_root "$state_parent" "$state_parent_identity" ||
-            cleanup_status=1
-        fi
       fi
       [ "$status" -ne 0 ] || [ "$cleanup_status" -eq 0 ] ||
         status=1
@@ -389,10 +503,6 @@ sys.exit(125 if overflow else 0)
       "runtime-smtp-password"
       "runtime-key"
       "cmVhbC1ydW50aW1lLWtleS1ieXRlcy1mb3ItdGVzdA=="
-      "meeting-1d258"
-      "runtime-image-id"
-      "runtime-image-key"
-      "https://oauth2.example.invalid/token"
       '-----BEGIN PRIVATE KEY-----'
     )
     check_capture_bound() {
@@ -403,8 +513,7 @@ sys.exit(125 if overflow else 0)
       local file=$2
       local scan_status
       if timeout 30s grep -r -F -n --binary-files=without-match \
-        --exclude='config.*' --exclude='*.identity' --exclude='*.yml' \
-        --exclude='*.env*' "$pattern" "$file" >/dev/null 2>&1; then
+        "$pattern" "$file" >/dev/null 2>&1; then
         return 1
       else
         scan_status=$?
@@ -484,13 +593,13 @@ sys.exit(125 if overflow else 0)
     done
 
     trap cleanup_case EXIT
-    install -d -m 700 "$case_root"
+    create_owned_root "$case_root"
     case_root_created=true
     case_root_identity=$(root_identity "$case_root")
-    install -d -m 700 "$state_parent"
+    create_owned_root "$state_parent"
     state_parent_created=true
     state_parent_identity=$(root_identity "$state_parent")
-    install -d -m 700 "$state_root"
+    create_owned_root "$state_root"
     state_root_created=true
     state_root_identity=$(root_identity "$state_root")
     cp -- "$ROOT_DIR/docker-compose.production.yml" \
@@ -1150,13 +1259,12 @@ publication_source_race_temporary = (
 publication_source_race_displaced = (
     publication_source_race_root / (publication_source_race_temporary + ".displaced")
 )
-original_publication_rename = helper._rename_noreplace
+original_publication_boundary = helper._rename_noreplace_boundary
 
-def replace_publication_source_before_rename(
+def replace_publication_source_at_boundary(
     directory_fd,
     source_name,
     destination_name,
-    **kwargs,
 ):
     if (
         source_name == publication_source_race_temporary
@@ -1186,14 +1294,13 @@ def replace_publication_source_before_rename(
             os.fsync(replacement_fd)
         finally:
             os.close(replacement_fd)
-    return original_publication_rename(
+    return original_publication_boundary(
         directory_fd,
         source_name,
         destination_name,
-        **kwargs,
     )
 
-helper._rename_noreplace = replace_publication_source_before_rename
+helper._rename_noreplace_boundary = replace_publication_source_at_boundary
 try:
     helper._state_publish(
         str(publication_source_race_root),
@@ -1204,14 +1311,12 @@ except helper.ProviderError as error:
     assert error.category == "RECOVERY_REQUIRED"
 else:
     raise AssertionError("state publication accepted a replaced source")
-helper._rename_noreplace = original_publication_rename
+helper._rename_noreplace_boundary = original_publication_boundary
 assert publication_source_race_displaced.is_dir()
 assert (
-    publication_source_race_root / publication_source_race_temporary
-).is_dir()
-assert not (
     publication_source_race_root / publication_source_race_name
-).exists()
+).is_dir()
+assert not (publication_source_race_root / publication_source_race_temporary).exists()
 shutil.rmtree(publication_source_race_root)
 
 def prepare_marker(run_key: str) -> None:

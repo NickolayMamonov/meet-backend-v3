@@ -20,6 +20,128 @@ created_fixed_root_identities=()
 root_identity() {
   stat -c '%d:%i:%f:%u:%g' -- "$1"
 }
+create_owned_root() {
+  local path=$1
+  if ! mkdir -m 700 -- "$path"; then
+    echo "PREREQUISITE_MISSING: fixed retention root creation raced or already exists" >&2
+    return 77
+  fi
+  chown 0:0 -- "$path"
+  chmod 700 -- "$path"
+}
+remove_owned_root() {
+  local path=$1
+  local expected_identity=$2
+  local require_empty=${3:-false}
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  timeout 30s python3 - "$path" "$expected_identity" "$require_empty" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+path, expected, require_empty = sys.argv[1:]
+
+
+def identity(info):
+    return f"{info.st_dev}:{info.st_ino}:{info.st_mode:x}:{info.st_uid}:{info.st_gid}"
+
+
+def same_inode(left, right):
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def fail():
+    raise SystemExit(1)
+
+
+parent_path, name = os.path.split(path)
+parent_fd = os.open(
+    parent_path or "/",
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+)
+try:
+    fcntl.flock(parent_fd, fcntl.LOCK_EX)
+    root_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or identity(root_info) != expected
+    ):
+        fail()
+    root_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(root_fd)
+        if not same_inode(opened, root_info) or identity(opened) != expected:
+            fail()
+        entries = list(os.scandir(f"/proc/self/fd/{root_fd}"))
+        if require_empty == "true" and entries:
+            fail()
+
+        def remove_contents(directory_fd, directory_entries):
+            for entry in directory_entries:
+                child_info = os.stat(
+                    entry.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(child_info.st_mode):
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        opened_child = os.fstat(child_fd)
+                        if not same_inode(opened_child, child_info):
+                            fail()
+                        remove_contents(
+                            child_fd,
+                            list(os.scandir(f"/proc/self/fd/{child_fd}")),
+                        )
+                        current_child = os.stat(
+                            entry.name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                        if not same_inode(current_child, opened_child):
+                            fail()
+                    finally:
+                        os.close(child_fd)
+                    os.rmdir(entry.name, dir_fd=directory_fd)
+                else:
+                    current_child = os.stat(
+                        entry.name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if not same_inode(current_child, child_info):
+                        fail()
+                    os.unlink(entry.name, dir_fd=directory_fd)
+
+        remove_contents(root_fd, entries)
+        if next(os.scandir(f"/proc/self/fd/{root_fd}"), None) is not None:
+            fail()
+        current_root = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not same_inode(current_root, opened) or identity(current_root) != expected:
+            fail()
+    finally:
+        os.close(root_fd)
+    current_root = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if identity(current_root) != expected:
+        fail()
+    os.rmdir(name, dir_fd=parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+}
 record_created_root() {
   local path=$1
   [ -d "$path" ] && [ ! -L "$path" ]
@@ -39,7 +161,7 @@ cleanup() {
         ! actual=$(root_identity "$path") || [ "$actual" != "$expected" ]; then
         cleanup_status=1
       else
-        timeout 30s rm -r -- "$path" || cleanup_status=1
+        remove_owned_root "$path" "$expected" || cleanup_status=1
       fi
     fi
   done
@@ -84,13 +206,13 @@ done
       if [ -e "$path" ] || [ -L "$path" ]; then
         actual=$(root_identity "$path") || exit 1
         [ "$actual" = "$expected" ] || exit 1
-        timeout 30s rm -r -- "$path" || exit 1
+        remove_owned_root "$path" "$expected" || exit 1
       fi
     done
   }
   trap probe_cleanup EXIT
   for path in "$state_root" "$production_root" "$production_runtime_root"; do
-    install -d -m 700 "$path"
+    create_owned_root "$path"
     record_probe_root "$path"
     printf 'fixed-root-sentinel\n' >"$path/sentinel"
     chmod 600 "$path/sentinel"
@@ -145,11 +267,11 @@ write_owner_marker() {
 }
 
 install -d -m 700 "$fake_bin"
-install -d -m 700 "$state_root"
+create_owned_root "$state_root"
 record_created_root "$state_root"
-install -d -m 700 "$production_root"
+create_owned_root "$production_root"
 record_created_root "$production_root"
-install -d -m 700 "$production_runtime_root"
+create_owned_root "$production_runtime_root"
 record_created_root "$production_runtime_root"
 printf 'fixture\n' >"$production_root/.env.production"
 printf 'services:\n  backend:\n    image: fixture\n' >"$production_root/docker-compose.production.yml"
