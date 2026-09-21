@@ -57,6 +57,63 @@ This is not the production workflow. It intentionally does not claim the
 production backup/off-host recovery infrastructure required by
 [`docs/production-deployment.md`](../production-deployment.md).
 
+## Release-first provider preservation
+
+The release workflow uses the explicit
+`scripts/deploy-test-vps-provider-release.sh` entry point. It requires the
+existing Ubuntu `python3` runtime and the checksum-bound
+`scripts/test-vps-provider-credential.py` helper; it never installs Python or
+another dependency. The helper is not used by the frozen
+`promote-dev-digest-to-test-vps.yml` workflow or by the legacy
+`scripts/deploy-test-vps-release.sh` caller. That promotion lane remains
+byte- and behavior-compatible and receives no provider repair, registration,
+dispatch, or new prerequisite.
+
+The reviewed fixed paths are:
+
+- container credential target:
+  `/run/secrets/meet-firebase-service-account.json`;
+- durable host credential:
+  `/var/lib/meet-production/credentials/firebase-service-account.json`;
+- durable parent: `/var/lib/meet-production/credentials`, owned by `root:root`
+  with mode `0700`;
+- durable file: `root:10001`, mode `0440`, mounted read-only.
+
+These are policy constants, not credential material. The release lane observes
+the actual predecessor container and complete effective push tuple before any
+credential, active-file, release-updater, or Compose writer. Enabled state
+must preserve all push flags, project `meeting-1d258`, and the exact durable
+read-only bind. Disabled state rejects credential mounts and does not read or
+create durable credentials. The canonical target override owns only the
+reviewed `/meetings` healthcheck and the enabled bind; it does not inherit a
+predecessor image or pull policy.
+
+Credential reconciliation is operator-owned and fail-closed. It accepts an
+unchanged safe durable file without repairing permissions, rejects malformed,
+ambiguous, duplicate, symlinked, raced, access-ACL/default-ACL-unsafe,
+wrong-owner, wrong-mode, wrong-project, changed, or mismatched state, and
+never rotates or overwrites an existing file. Every trusted ancestor and
+private transaction object is checked through the Linux ACL xattr interface;
+missing ACL inspection support is a prerequisite failure, not an implicit
+safe fallback. Transaction-created state is retained until exact rollback or
+commit proof. The private transaction marker, snapshot, witness, and identity
+record contain no credential values, paths, hashes, account identity, or raw
+inspection. Static failure categories are
+`PROVIDER_STATE_INVALID`, `CREDENTIAL_INVALID`, `CREDENTIAL_CHANGED`,
+`DURABLE_CONFLICT`, `RECOVERY_REQUIRED`, and `PREREQUISITE_MISSING`.
+
+The release coordinator records a private unresolved marker before credential
+publication and keeps it through candidate verification, rollback, and
+finalization. A failed writer restores the predecessor image, release fields,
+active file presence/bytes, runtime hash, provider mount state, hardening, and
+public probes before cleanup. Created durable state is removed only when its
+identity and bytes still match the transaction snapshot, the private
+publication hard-link witness still has the approved owner/group/mode and link
+count, and the restored runtime proves that it references neither the
+published path nor its inode. Reused or unknown operator-owned state is never
+deleted. Unresolved markers and private transaction directories block
+retention and require separately authorized operator reconciliation.
+
 ## Immutable v1.2.0 checksum exception
 
 Public immutable release ID `371012814` has a known `SHA256SUMS` formatting
@@ -69,12 +126,22 @@ canonical `sha256sum` format and are rejected if they use the compact form.
 ## Bounded retention
 
 After final runtime and public evidence passes, the workflow acquires the same
-remote deployment lock, removes only checksum-bound
-`.test-vps-tooling-<run>-<attempt>` directories, and retains the ten newest
-deployment-state directories under `/var/lib/meet-test-vps-deploy`. Failed
-runs remain available until the next successful deployment applies retention.
-The active Compose/runtime files under `/var/lib/meet-production` are outside
-the cleanup roots and must still exist after cleanup.
+remote deployment lock and retains the ten newest proven terminal
+deployment-state directories under `/var/lib/meet-test-vps-deploy`. The
+rollback and final coordinator calls use the one canonical
+`<run-id>-<attempt>` run key; `rollback-drill` and `final-deploy` are state
+directory suffixes, so repeated final runs do not create an unparseable second
+key. Before invoking the retention helper, it resolves every bind mount from
+all running `meet-production` containers plus the active and
+predecessor/target rollback Compose inputs through bounded `docker inspect` and
+`docker compose config --format json` calls. The checksum-bound remote tooling
+is kept until that helper has completed successfully, then removed in a
+proven-safe order. Referenced paths, protected active/predecessor inputs,
+symlinked states, unknown or unproven states, and path-prefix collisions are
+never deletion candidates; any unresolved reference or timeout fails closed.
+Failed runs remain available until a later successful deployment applies
+retention. The active Compose/runtime files under `/var/lib/meet-production`
+are outside the cleanup roots and must still exist after cleanup.
 
 ## Yandex SMTP transaction workflow
 

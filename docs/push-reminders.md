@@ -19,9 +19,15 @@ APP_PUSH_CREDENTIALS_FILE="<PROTECTED_ADC_FILE>"
 ```
 
 `APP_PUSH_CREDENTIALS_FILE` is a placeholder only. Do not put a service-account
-key, FID, JWT, or credential path in source control, issue comments, shell
-history, logs, or this document. Disabled contexts do not load ADC or create a
-Firebase client. Discovery, dispatch, and the diagnostic require the provider
+key, FID, JWT, a discovered credential path, account identity, fingerprint, or
+private metadata in source control, issue comments, shell history, logs, or
+this document. The only documented path exception is the reviewed fixed
+contract: the container target
+`/run/secrets/meet-firebase-service-account.json` and durable host file
+`/var/lib/meet-production/credentials/firebase-service-account.json`. These
+constants identify policy locations and never authorize reading, copying,
+rotating, or deleting a credential. Disabled contexts do not load ADC or
+create a Firebase client. Discovery, dispatch, and the diagnostic require the provider
 flag; credential-free maintenance may still run when maintenance, discovery,
 or dispatch is enabled.
 
