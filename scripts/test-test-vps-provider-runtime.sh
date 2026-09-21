@@ -140,20 +140,24 @@ if [ "$filesystem_only" = false ]; then
       "$ROOT_DIR/docker-compose.production.yml")
     [ -n "$transport_postgres_ref" ] || prerequisite_missing
     if [ -n "$transport_postgres_id" ]; then
-      transport_postgres_run_owned=true
       [[ "$transport_postgres_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
         prerequisite_missing
-      timeout 30s env DOCKER_HOST="$transport_target_host" \
-        docker image inspect "$transport_postgres_id" --format '{{.Id}}' \
-        >/dev/null || prerequisite_missing
-    else
-      transport_postgres_id=$(timeout 30s \
-        env DOCKER_HOST="$transport_target_host" \
-        docker image inspect "$transport_postgres_ref" --format '{{.Id}}') ||
-        prerequisite_missing
     fi
-    [[ "$transport_postgres_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    pinned_postgres_id=$(timeout 30s \
+      env DOCKER_HOST="$transport_target_host" \
+      docker image inspect "$transport_postgres_ref" --format '{{.Id}}' \
+      2>/dev/null) || prerequisite_missing
+    [[ "$pinned_postgres_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
       prerequisite_missing
+    if [ -n "$transport_postgres_id" ]; then
+      [ "$transport_postgres_id" = "$pinned_postgres_id" ] ||
+        prerequisite_missing
+    else
+      transport_postgres_id=$pinned_postgres_id
+    fi
+    # The pinned database image is pre-provisioned on the target daemon; this
+    # invocation never loads it, so an externally supplied ID is never owned.
+    transport_postgres_run_owned=false
     transport_map_dir=$(mktemp -d /tmp/meet-provider-image-map.XXXXXX)
     chmod 700 "$transport_map_dir"
     cat >"$transport_map_dir/docker" <<'SHIM'
