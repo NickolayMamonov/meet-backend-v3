@@ -1055,6 +1055,39 @@ except helper.ProviderError as error:
 else:
     raise AssertionError("state publication accepted an invalid run key")
 
+publication_race_root = fixture / "publication-race-root"
+publication_race_root.mkdir(mode=0o700)
+os.chown(publication_race_root, 0, 0)
+publication_race_moved = fixture / "publication-race-root-moved"
+publication_race_name = "123456790-1-final-deploy"
+original_lock_directory = helper._lock_directory
+publication_swapped = [False]
+
+def swap_publication_root_after_lock(fd):
+    original_lock_directory(fd)
+    if not publication_swapped[0]:
+        os.rename(publication_race_root, publication_race_moved)
+        publication_race_root.mkdir(mode=0o700)
+        os.chown(publication_race_root, 0, 0)
+        publication_swapped[0] = True
+
+helper._lock_directory = swap_publication_root_after_lock
+try:
+    helper._state_publish(
+        str(publication_race_root),
+        "123456790-1",
+        "final-deploy",
+    )
+except helper.ProviderError as error:
+    assert error.category == "RECOVERY_REQUIRED"
+else:
+    raise AssertionError("state publication accepted a swapped root")
+helper._lock_directory = original_lock_directory
+assert not (publication_race_root / publication_race_name).exists()
+assert (publication_race_moved / publication_race_name).is_dir()
+shutil.rmtree(publication_race_root)
+shutil.rmtree(publication_race_moved)
+
 def prepare_marker(run_key: str) -> None:
     helper._write_private(
         str(marker),
@@ -1888,6 +1921,39 @@ assert retention_snapshot(quarantine_displaced) == quarantine_race_before
 assert retention_snapshot(quarantine_attacker) == quarantine_race_before
 shutil.rmtree(quarantine_displaced)
 shutil.rmtree(quarantine_attacker)
+
+interlock_race_state = valid_retention_state("93-1-final-deploy")
+interlock_race_before = retention_snapshot(interlock_race_state)
+original_interlocks_fd = helper._retention_interlocks_fd
+interlock_calls = [0]
+
+def inject_interlock_before_quarantine(root, state_root_fd):
+    interlock_calls[0] += 1
+    if interlock_calls[0] == 2:
+        helper._write_private_at(
+            state_root_fd,
+            ".provider-transaction.current",
+            b"interlock-race",
+            0o600,
+        )
+    return original_interlocks_fd(root, state_root_fd)
+
+helper._retention_interlocks_fd = inject_interlock_before_quarantine
+expect_provider_error(
+    lambda: helper._retention_delete(
+        str(retention_root),
+        str(interlock_race_state),
+    ),
+    "RECOVERY_REQUIRED",
+)
+helper._retention_interlocks_fd = original_interlocks_fd
+assert retention_snapshot(interlock_race_state) == interlock_race_before
+assert not (
+    retention_root
+    / (".provider-state." + interlock_race_state.name + ".tmp")
+).exists()
+(retention_root / ".provider-transaction.current").unlink()
+shutil.rmtree(interlock_race_state)
 
 protected_state = valid_retention_state("88-1-final-deploy")
 assert_direct_retention_refusal(

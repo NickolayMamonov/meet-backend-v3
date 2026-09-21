@@ -825,7 +825,7 @@ def _open_private_state_file_at(
         raise
 
 
-def _ensure_state_root(state_root: str) -> None:
+def _ensure_state_root(state_root: str) -> os.stat_result:
     if (
         not isinstance(state_root, str)
         or not state_root.startswith("/")
@@ -846,16 +846,22 @@ def _ensure_state_root(state_root: str) -> None:
         os.chmod(state_root, 0o700)
     _check_ancestors(state_root, category="recovery")
     _acl_is_safe(state_root, category="recovery")
+    return os.stat(state_root, follow_symlinks=False)
 
 
 def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
     _state_marker(run_key, state_kind)
-    _ensure_state_root(state_root)
+    expected_root = _ensure_state_root(state_root)
     name = f"{run_key}-{state_kind}"
     temporary = f".provider-state.{name}.tmp"
     parent_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
         _lock_directory(parent_fd)
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
+        _validate_retention_state_root_fd(parent_fd)
         for candidate in (temporary, name):
             try:
                 os.stat(candidate, dir_fd=parent_fd, follow_symlinks=False)
@@ -889,12 +895,11 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
         )
         try:
             published = os.fstat(published_fd)
-            if published.st_uid != 0 or stat.S_IMODE(published.st_mode) != 0o700:
-                _fail("recovery")
-            _validate_state_directory(os.path.join(state_root, name), name)
+            _validate_state_directory_fd(published_fd, name)
             current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if not _same_inode(current, published):
                 _fail("recovery")
+            _revalidate_retention_state_root_path(state_root, expected_root)
         finally:
             os.close(published_fd)
         os.fsync(parent_fd)
@@ -1854,6 +1859,49 @@ def _owned_state_fd(
     return result
 
 
+def _iter_directory_fd_names(directory_fd: int) -> Iterable[str]:
+    with os.scandir(f"/proc/self/fd/{directory_fd}") as entries:
+        for entry in entries:
+            yield entry.name
+
+
+def _open_optional_directory_reference(path: str) -> int | None:
+    _retention_reference(path)
+    try:
+        parent_fd, name = _open_reference_parent(path)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if (
+            stat.S_ISLNK(expected.st_mode)
+            or not stat.S_ISDIR(expected.st_mode)
+            or expected.st_uid != 0
+            or stat.S_IMODE(expected.st_mode) != 0o700
+        ):
+            _fail("recovery")
+        directory_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(directory_fd)
+        if not _same_inode(opened, expected):
+            os.close(directory_fd)
+            _fail("recovery")
+        _acl_is_safe(
+            f"/proc/self/fd/{directory_fd}",
+            follow_symlinks=True,
+            category="recovery",
+        )
+        return directory_fd
+    finally:
+        os.close(parent_fd)
+
+
 def _retention_interlocks_fd(root: str, state_root_fd: int) -> None:
     parent = _rooted(HOST_CREDENTIAL_PARENT, root)
     for name in (
@@ -1866,15 +1914,20 @@ def _retention_interlocks_fd(root: str, state_root_fd: int) -> None:
             continue
         else:
             _fail("recovery")
-    for name in os.listdir(state_root_fd):
+    for name in _iter_directory_fd_names(state_root_fd):
         if name.startswith(".provider-transaction.") or name.startswith(
             ".provider-state."
         ):
             _fail("recovery")
-    if os.path.isdir(parent):
-        for name in os.listdir(parent):
+    parent_fd = _open_optional_directory_reference(parent)
+    if parent_fd is None:
+        return
+    try:
+        for name in _iter_directory_fd_names(parent_fd):
             if name.startswith(".transaction-"):
                 _fail("recovery")
+    finally:
+        os.close(parent_fd)
 
 
 def _retention_interlocks(root: str, state_root: str) -> None:
@@ -1972,7 +2025,10 @@ def _retention_classify(
             explicit_states.add(os.path.normpath(path))
         _revalidate_protected_references(references, reference_witnesses)
         owned_states: list[str] = []
-        for name in os.listdir(parent_fd):
+        encoded_size = len(
+            b'{"schemaVersion":1,"outcome":"retention-safe","ownedStates":['
+        ) + len(b"]}\n")
+        for name in _iter_directory_fd_names(parent_fd):
             if re.fullmatch(r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name):
                 state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(
@@ -1985,6 +2041,8 @@ def _retention_classify(
                     dir_fd=parent_fd,
                 )
                 try:
+                    if not _same_inode(os.fstat(state_fd), state_info):
+                        _fail("recovery")
                     try:
                         os.stat(
                             OWNER_MARKER,
@@ -1997,8 +2055,21 @@ def _retention_classify(
                         # participate in retention.
                         continue
                     _owned_state_fd(state_fd, name, require_terminal=True)
-                    if set(os.listdir(state_fd)).issubset(RETENTION_CHILDREN):
+                    child_names = _bounded_retention_children(state_fd)
+                    if child_names is not None:
+                        encoded_name = json.dumps(
+                            name,
+                            separators=(",", ":"),
+                        ).encode()
+                        additional = len(encoded_name) + (
+                            1 if owned_states else 0
+                        )
+                        if encoded_size + additional > MAX_INSPECTION_BYTES:
+                            _fail("recovery")
+                        encoded_size += additional
                         owned_states.append(name)
+                    if not _same_inode(os.fstat(state_fd), state_info):
+                        _fail("recovery")
                 finally:
                     os.close(state_fd)
                 continue
@@ -2015,11 +2086,19 @@ def _retention_classify(
                 dir_fd=parent_fd,
             )
             try:
+                if not _same_inode(os.fstat(state_fd), state_info):
+                    _fail("recovery")
                 try:
-                    os.stat(OWNER_MARKER, dir_fd=state_fd, follow_symlinks=False)
+                    os.stat(
+                        OWNER_MARKER,
+                        dir_fd=state_fd,
+                        follow_symlinks=False,
+                    )
                 except FileNotFoundError:
                     pass
                 else:
+                    _fail("recovery")
+                if not _same_inode(os.fstat(state_fd), state_info):
                     _fail("recovery")
             finally:
                 os.close(state_fd)
@@ -2107,6 +2186,15 @@ RETENTION_CHILDREN = frozenset(
         "config.base-compose.yml.identity",
     }
 )
+
+
+def _bounded_retention_children(directory_fd: int) -> set[str] | None:
+    names: set[str] = set()
+    for name in _iter_directory_fd_names(directory_fd):
+        if name not in RETENTION_CHILDREN:
+            return None
+        names.add(name)
+    return names
 
 
 def _retention_delete(
@@ -2209,8 +2297,8 @@ def _retention_delete(
                 protected_state_paths,
                 protected_state_witnesses,
             )
-            names = set(os.listdir(state_fd))
-            if not names or not names.issubset(RETENTION_CHILDREN):
+            names = _bounded_retention_children(state_fd)
+            if not names:
                 _fail("recovery")
             if OWNER_MARKER not in names or "terminal.json" not in names:
                 _fail("recovery")
@@ -2232,6 +2320,7 @@ def _retention_delete(
                 pass
             else:
                 _fail("recovery")
+            _retention_interlocks_fd("", parent_fd)
             current_state = os.stat(
                 name,
                 dir_fd=parent_fd,
@@ -2286,7 +2375,7 @@ def _retention_delete(
                     link_count=1,
                 )
                 os.fsync(quarantine_fd)
-                if os.listdir(quarantine_fd):
+                if next(_iter_directory_fd_names(quarantine_fd), None) is not None:
                     _fail("recovery")
             finally:
                 os.close(quarantine_fd)
