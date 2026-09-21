@@ -329,14 +329,40 @@ jobs:
           grep -Fq "candidate=ready image_id=$TARGET_IMAGE_ID" <<<"$output"
           grep -Fq 'rollback_drill=triggered' <<<"$output"
           grep -Fq "rollback=completed previous_image_id=$previous_id" <<<"$output"
+          validate_provider_json() {
+            local json=$1
+            local expected_outcome=$2
+            jq -e --arg expected_outcome "$expected_outcome" '
+              type == "object" and
+              (keys | sort) == [
+                "credentialMountPresent",
+                "credentialMountReadOnly",
+                "outcome",
+                "providerEnabled",
+                "schemaVersion"
+              ] and
+              .schemaVersion == 1 and
+              (.providerEnabled | type == "boolean") and
+              (.credentialMountPresent | type == "boolean") and
+              (.credentialMountReadOnly | type == "boolean") and
+              (
+                (
+                  .providerEnabled == true and
+                  .credentialMountPresent == true and
+                  .credentialMountReadOnly == true
+                ) or
+                (
+                  .providerEnabled == false and
+                  .credentialMountPresent == false and
+                  .credentialMountReadOnly == false
+                )
+              ) and
+              .outcome == $expected_outcome
+            ' <<<"$json" >/dev/null
+          }
+          [ "$(grep -Ec '^\{"schemaVersion":1,' <<<"$output")" -eq 1 ]
           provider_json=$(grep -E '^\{"schemaVersion":1,' <<<"$output" | tail -n 1)
-          jq -e '
-            .schemaVersion == 1 and
-            (.providerEnabled | type == "boolean") and
-            (.credentialMountPresent | type == "boolean") and
-            (.credentialMountReadOnly | type == "boolean") and
-            .outcome == "rolled-back"
-          ' <<<"$provider_json" >/dev/null
+          validate_provider_json "$provider_json" rolled-back
 
           restored_id=$(timeout 60s ssh -F "$SSH_CONFIG" test-vps bash -s <<'REMOTE'
           set -euo pipefail
@@ -373,15 +399,50 @@ jobs:
           fi
           grep -Fq "deployment=completed image_id=$TARGET_IMAGE_ID" \
             "$RUNNER_TEMP/deploy-output.txt"
+          validate_provider_json() {
+            local json=$1
+            local expected_outcome=$2
+            jq -e --arg expected_outcome "$expected_outcome" '
+              type == "object" and
+              (keys | sort) == [
+                "credentialMountPresent",
+                "credentialMountReadOnly",
+                "outcome",
+                "providerEnabled",
+                "schemaVersion"
+              ] and
+              .schemaVersion == 1 and
+              (.providerEnabled | type == "boolean") and
+              (.credentialMountPresent | type == "boolean") and
+              (.credentialMountReadOnly | type == "boolean") and
+              (
+                (
+                  .providerEnabled == true and
+                  .credentialMountPresent == true and
+                  .credentialMountReadOnly == true
+                ) or
+                (
+                  .providerEnabled == false and
+                  .credentialMountPresent == false and
+                  .credentialMountReadOnly == false
+                )
+              ) and
+              .outcome == $expected_outcome
+            ' <<<"$json" >/dev/null
+          }
+          [ "$(grep -Ec '^\{"schemaVersion":1,' \
+            "$RUNNER_TEMP/deploy-output.txt")" -eq 1 ]
           provider_json=$(grep -E '^\{"schemaVersion":1,' \
             "$RUNNER_TEMP/deploy-output.txt" | tail -n 1)
-          jq -e '
-            .schemaVersion == 1 and
-            (.providerEnabled | type == "boolean") and
-            (.credentialMountPresent | type == "boolean") and
-            (.credentialMountReadOnly | type == "boolean") and
-            .outcome == "committed"
-          ' <<<"$provider_json" >/dev/null
+          validate_provider_json "$provider_json" committed
+          provider_enabled=$(jq -er '.providerEnabled' <<<"$provider_json")
+          credential_mount_present=$(jq -er '.credentialMountPresent' <<<"$provider_json")
+          credential_mount_read_only=$(jq -er '.credentialMountReadOnly' <<<"$provider_json")
+          {
+            echo "PROVIDER_ENABLED=$provider_enabled"
+            echo "CREDENTIAL_MOUNT_PRESENT=$credential_mount_present"
+            echo "CREDENTIAL_MOUNT_READ_ONLY=$credential_mount_read_only"
+          } >>"$GITHUB_ENV"
 
       - name: Capture runtime and public HTTPS evidence
         shell: bash
@@ -479,6 +540,7 @@ jobs:
             echo "- Final image ID: \`$TARGET_IMAGE_ID\`"
             echo "- Runtime: healthy, user \`10001:10001\`, backend loopback-only"
             echo "- Volumes: PostgreSQL and uploads preserved"
+            echo "- Provider: enabled=$PROVIDER_ENABLED, credential mount present=$CREDENTIAL_MOUNT_PRESENT, read-only=$CREDENTIAL_MOUNT_READ_ONLY"
             echo "- Public probes: meetings=$meetings_status, actuator=$actuator_status, HTTP redirect=$redirect_status"
           } >>"$GITHUB_STEP_SUMMARY"
 

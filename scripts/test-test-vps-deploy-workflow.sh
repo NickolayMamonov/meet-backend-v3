@@ -254,6 +254,87 @@ cleanup() {
 }
 trap cleanup EXIT
 
+for text in \
+  '(keys | sort) == [' \
+  '"credentialMountPresent",' \
+  '"credentialMountReadOnly",' \
+  '"outcome",' \
+  '"providerEnabled",' \
+  '"schemaVersion"' \
+  '.providerEnabled == true and' \
+  '.providerEnabled == false and' \
+  'PROVIDER_ENABLED=$provider_enabled' \
+  'CREDENTIAL_MOUNT_PRESENT=$credential_mount_present' \
+  'CREDENTIAL_MOUNT_READ_ONLY=$credential_mount_read_only' \
+  'enabled=$PROVIDER_ENABLED, credential mount present=$CREDENTIAL_MOUNT_PRESENT, read-only=$CREDENTIAL_MOUNT_READ_ONLY'; do
+  require "$text" "$workflow_text" "provider evidence schema and summary"
+done
+
+provider_evidence_secret='PROVIDER_EVIDENCE_PRIVATE_MARKER'
+provider_evidence_summary="$tmp/provider-evidence-summary"
+provider_evidence_output="$tmp/provider-evidence-output"
+printf '%s\n' \
+  '{"schemaVersion":1,"providerEnabled":true,"credentialMountPresent":true,"credentialMountReadOnly":true,"outcome":"committed"}' \
+  >"$provider_evidence_output"
+provider_evidence_json=$(<"$provider_evidence_output")
+validate_provider_evidence_fixture() {
+  local json=$1
+  local expected_outcome=$2
+  jq -e --arg expected_outcome "$expected_outcome" '
+    type == "object" and
+    (keys | sort) == [
+      "credentialMountPresent",
+      "credentialMountReadOnly",
+      "outcome",
+      "providerEnabled",
+      "schemaVersion"
+    ] and
+    .schemaVersion == 1 and
+    (.providerEnabled | type == "boolean") and
+    (.credentialMountPresent | type == "boolean") and
+    (.credentialMountReadOnly | type == "boolean") and
+    (
+      (
+        .providerEnabled == true and
+        .credentialMountPresent == true and
+        .credentialMountReadOnly == true
+      ) or
+      (
+        .providerEnabled == false and
+        .credentialMountPresent == false and
+        .credentialMountReadOnly == false
+      )
+    ) and
+    .outcome == $expected_outcome
+  ' <<<"$json" >/dev/null
+}
+validate_provider_evidence_fixture "$provider_evidence_json" committed
+validate_provider_evidence_fixture \
+  '{"schemaVersion":1,"providerEnabled":false,"credentialMountPresent":false,"credentialMountReadOnly":false,"outcome":"committed"}' \
+  committed
+if validate_provider_evidence_fixture \
+  '{"schemaVersion":1,"providerEnabled":true,"credentialMountPresent":false,"credentialMountReadOnly":true,"outcome":"committed"}' \
+  committed; then
+  fail "provider evidence accepted an enabled state without its read-only mount"
+fi
+if validate_provider_evidence_fixture \
+  '{"schemaVersion":1,"providerEnabled":false,"credentialMountPresent":true,"credentialMountReadOnly":true,"outcome":"committed"}' \
+  committed; then
+  fail "provider evidence accepted a disabled state with a credential mount"
+fi
+if validate_provider_evidence_fixture \
+  '{"schemaVersion":1,"providerEnabled":false,"credentialMountPresent":false,"credentialMountReadOnly":false,"outcome":"committed","unexpected":"raw"}' \
+  committed; then
+  fail "provider evidence accepted an extra key"
+fi
+printf '%s\n' \
+  '- Provider: enabled=true, credential mount present=true, read-only=true' \
+  >"$provider_evidence_summary"
+! grep -Fq "$provider_evidence_secret" "$provider_evidence_summary" ||
+  fail "provider summary leaked a private marker"
+! grep -Fq '{"schemaVersion":1' "$provider_evidence_summary" ||
+  fail "provider summary retained raw provider JSON"
+
 # shellcheck source=scripts/deploy-test-vps-provider-release.sh
 source "$provider_deploy"
 printf '%s\n' \
