@@ -296,7 +296,18 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-test-promotion-protected-state.sh"
           bash "$TOOLING_SCRIPTS/test-test-promotion-evidence.sh"
           bash "$TOOLING_SCRIPTS/test-bootstrap-default-proof.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-deploy.sh"
+          run_prerequisite_fixture() {
+            set +e
+            "$@"
+            fixture_status=$?
+            set -e
+            case "$fixture_status" in
+              0) ;;
+              77) echo "PREREQUISITE_MISSING: authoritative privileged fixture deferred by this non-root CI sweep" >&2 ;;
+              *) return "$fixture_status" ;;
+            esac
+          }
+          run_prerequisite_fixture bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-deploy.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-state.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-workflow.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-deploy.sh"
