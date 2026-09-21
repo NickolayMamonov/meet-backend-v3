@@ -21,24 +21,43 @@ transport_previous_id=
 transport_target_id=
 transport_postgres_ref=
 transport_postgres_id=${MEE2_93_IMAGE_TRANSPORT_POSTGRES_ID:-}
-transport_cleanup() {
-  local status=$?
+transport_postgres_run_owned=false
+transport_cleanup_body() {
+  local status=$1
+  local cleanup_status=0
+  local -a remove_ids=()
   if [ "$transport_loaded" = true ]; then
-    set +e
-    remove_ids=()
     [ -n "$transport_previous_id" ] && remove_ids+=("$transport_previous_id")
     [ -n "$transport_target_id" ] && remove_ids+=("$transport_target_id")
+    if [ "$transport_postgres_run_owned" = true ] &&
+      [ -n "$transport_postgres_id" ]; then
+      remove_ids+=("$transport_postgres_id")
+    fi
     if [ "${#remove_ids[@]}" -gt 0 ]; then
-      timeout 60s env DOCKER_HOST="$transport_target_host" \
-        "$transport_real_docker" image rm "${remove_ids[@]}" >/dev/null 2>&1
-      [ "$?" -eq 0 ] || { [ "$status" -ne 0 ] || status=1; }
+      if ! timeout 60s env DOCKER_HOST="$transport_target_host" \
+        "$transport_real_docker" image rm "${remove_ids[@]}" >/dev/null 2>&1; then
+        cleanup_status=1
+      fi
     fi
     if [ -n "$transport_map_dir" ]; then
-      timeout 30s rm -r -- "$transport_map_dir" >/dev/null 2>&1
-      [ "$?" -eq 0 ] || { [ "$status" -ne 0 ] || status=1; }
+      if ! timeout 30s rm -r -- "$transport_map_dir" >/dev/null 2>&1; then
+        cleanup_status=1
+      fi
     fi
-    set -e
+    transport_loaded=false
+    transport_map_dir=
+    transport_postgres_run_owned=false
   fi
+  [ "$status" -ne 0 ] || [ "$cleanup_status" -eq 0 ] || status=1
+  return "$status"
+}
+transport_cleanup() {
+  local status=$?
+  trap - EXIT
+  set +e
+  transport_cleanup_body "$status"
+  status=$?
+  set -e
   exit "$status"
 }
 while [ "$#" -gt 0 ]; do
@@ -121,12 +140,20 @@ if [ "$filesystem_only" = false ]; then
       "$ROOT_DIR/docker-compose.production.yml")
     [ -n "$transport_postgres_ref" ] || prerequisite_missing
     if [ -n "$transport_postgres_id" ]; then
+      transport_postgres_run_owned=true
       [[ "$transport_postgres_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
         prerequisite_missing
       timeout 30s env DOCKER_HOST="$transport_target_host" \
         docker image inspect "$transport_postgres_id" --format '{{.Id}}' \
         >/dev/null || prerequisite_missing
+    else
+      transport_postgres_id=$(timeout 30s \
+        env DOCKER_HOST="$transport_target_host" \
+        docker image inspect "$transport_postgres_ref" --format '{{.Id}}') ||
+        prerequisite_missing
     fi
+    [[ "$transport_postgres_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+      prerequisite_missing
     transport_map_dir=$(mktemp -d /tmp/meet-provider-image-map.XXXXXX)
     chmod 700 "$transport_map_dir"
     cat >"$transport_map_dir/docker" <<'SHIM'
@@ -347,16 +374,19 @@ PY
   chmod 700 "$matrix_fixture"
   matrix_cleanup() {
     local status=$?
+    local cleanup_status=0
+    local transport_status
     trap - EXIT
-    timeout 30s rm -r -- "$matrix_fixture"
-    if [ "$transport_loaded" = true ]; then
-      set +e
-      timeout 60s docker image rm "$previous_image" "$target_image" >/dev/null 2>&1
-      local transport_status=$?
-      set -e
-      [ "$transport_status" -eq 0 ] || status=1
+    if ! timeout 30s rm -r -- "$matrix_fixture"; then
+      cleanup_status=1
     fi
-    exit "$status"
+    set +e
+    transport_cleanup_body "$status"
+    transport_status=$?
+    set -e
+    [ "$cleanup_status" -eq 0 ] || [ "$transport_status" -ne 0 ] ||
+      transport_status=1
+    exit "$transport_status"
   }
   trap matrix_cleanup EXIT
 
@@ -1015,17 +1045,22 @@ PY
       local name path
       for name in "${legacy_names[@]}"; do
         path="$state_root/$name"
-        find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n' | sort
+        find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l|%T@\n' | sort
         find "$path" -xdev -type f -exec sha256sum {} +
       done
     }
+    legacy_index=0
     for name in "${legacy_names[@]}"; do
       install -d -m 700 "$state_root/$name"
       printf 'legacy immutable-runtime bytes: %s\n' "$name" \
         >"$state_root/$name/opaque.bin"
       chmod 600 "$state_root/$name/opaque.bin"
+      touch -d "@$((1700000000 + legacy_index)).123456789" \
+        "$state_root/$name/opaque.bin" "$state_root/$name"
+      legacy_index=$((legacy_index + 1))
     done
     legacy_before=$(legacy_digest)
+    grep -Eq '\|[0-9]+\.[0-9]{9,}$' <<<"$legacy_before"
 
     compose() {
       timeout 300s docker compose -p meet-production \
@@ -1259,8 +1294,14 @@ PY
 
   run_image_case disabled 1 930000001-1 930000002-1 false
   run_image_case enabled 2 930000003-1 930000004-1 true
-  trap - EXIT
+  set +e
   timeout 30s rm -r -- "$matrix_fixture"
+  matrix_status=$?
+  transport_cleanup_body "$matrix_status"
+  transport_status=$?
+  set -e
+  trap - EXIT
+  [ "$transport_status" -eq 0 ] || exit "$transport_status"
 fi
 
 fixture=$(mktemp -d /var/lib/meet-provider-fixture.XXXXXX)
