@@ -35,19 +35,23 @@ if [ "$filesystem_only" = false ]; then
   [[ "$previous_image" =~ ^.+@sha256:[0-9a-f]{64}$ ]]
   [[ "$target_image" =~ ^.+@sha256:[0-9a-f]{64}$ ]]
   [ "$previous_image" != "$target_image" ]
+  [[ "$previous_image" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+  [[ "$target_image" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
   command -v docker >/dev/null 2>&1 || {
     echo "PREREQUISITE_MISSING" >&2
     exit 77
   }
-  docker info >/dev/null 2>&1 || {
+  timeout 30s docker info >/dev/null 2>&1 || {
     echo "PREREQUISITE_MISSING" >&2
     exit 77
   }
-  previous_id=$(docker image inspect "$previous_image" --format '{{.Id}}') || {
+  previous_id=$(timeout 30s docker image inspect "$previous_image" --format '{{.Id}}') || {
     echo "PREREQUISITE_MISSING" >&2
     exit 77
   }
-  target_id=$(docker image inspect "$target_image" --format '{{.Id}}') || {
+  target_id=$(timeout 30s docker image inspect "$target_image" --format '{{.Id}}') || {
     echo "PREREQUISITE_MISSING" >&2
     exit 77
   }
@@ -60,6 +64,463 @@ fi
 if [ "$(id -u)" -ne 0 ]; then
   echo "PREREQUISITE_MISSING" >&2
   exit 77
+fi
+
+if [ "$filesystem_only" = false ]; then
+  for command_name in docker curl jq flock python3 timeout; do
+    command -v "$command_name" >/dev/null 2>&1 || {
+      echo "PREREQUISITE_MISSING" >&2
+      exit 77
+    }
+  done
+  docker compose version >/dev/null 2>&1 || {
+    echo "PREREQUISITE_MISSING" >&2
+    exit 77
+  }
+
+  image_label() {
+    timeout 30s docker image inspect "$1" \
+      --format "$2"
+  }
+
+  version_supported() {
+    timeout 30s python3 - "$1" <<'PY'
+import re
+import sys
+
+match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", sys.argv[1])
+raise SystemExit(
+    0
+    if match is not None and tuple(map(int, match.groups())) >= (1, 2, 0)
+    else 1
+)
+PY
+  }
+
+  previous_revision=$(image_label "$previous_image" \
+    '{{index .Config.Labels "org.opencontainers.image.revision"}}') || {
+    echo "PREREQUISITE_MISSING" >&2
+    exit 77
+  }
+  previous_version=$(image_label "$previous_image" \
+    '{{index .Config.Labels "org.opencontainers.image.version"}}') || {
+    echo "PREREQUISITE_MISSING" >&2
+    exit 77
+  }
+  target_revision=$(image_label "$target_image" \
+    '{{index .Config.Labels "org.opencontainers.image.revision"}}') || {
+    echo "PREREQUISITE_MISSING" >&2
+    exit 77
+  }
+  target_version=$(image_label "$target_image" \
+    '{{index .Config.Labels "org.opencontainers.image.version"}}') || {
+    echo "PREREQUISITE_MISSING" >&2
+    exit 77
+  }
+  [[ "$previous_revision" =~ ^[0-9a-f]{40}$ ]] ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+  [[ "$target_revision" =~ ^[0-9a-f]{40}$ ]] ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+  version_supported "$previous_version" ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+  version_supported "$target_version" ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+  [ "$(image_label "$previous_image" \
+    '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
+    "https://github.com/NickolayMamonov/meet-backend-v3" ] ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+  [ "$(image_label "$target_image" \
+    '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
+    "https://github.com/NickolayMamonov/meet-backend-v3" ] ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+  [ "$(image_label "$previous_image" '{{.Config.User}}')" = "10001:10001" ] ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+  [ "$(image_label "$target_image" '{{.Config.User}}')" = "10001:10001" ] ||
+    { echo "PREREQUISITE_MISSING" >&2; exit 77; }
+
+  postgres_image=$(
+    sed -nE \
+      's/^[[:space:]]*image:[[:space:]]*(postgres:16-alpine@sha256:[0-9a-f]{64})[[:space:]]*$/\1/p' \
+      "$ROOT_DIR/docker-compose.production.yml"
+  )
+  [ -n "$postgres_image" ] || {
+    echo "PREREQUISITE_MISSING" >&2
+    exit 77
+  }
+  timeout 30s docker image inspect "$postgres_image" >/dev/null 2>&1 || {
+    echo "PREREQUISITE_MISSING" >&2
+    exit 77
+  }
+  timeout 30s python3 - "$ROOT_DIR/scripts/test-vps-provider-credential.py" \
+    "$previous_image" "$target_image" <<'PY'
+import json
+import subprocess
+import sys
+
+helper, *images = sys.argv[1:]
+for image in images:
+    result = subprocess.run(
+        ["docker", "image", "inspect", image],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    subprocess.run(
+        ["python3", helper, "check-image"],
+        check=True,
+        input=result.stdout,
+        text=True,
+        stdout=subprocess.DEVNULL,
+    )
+PY
+
+  matrix_fixture=$(mktemp -d /var/lib/meet-provider-image.XXXXXX)
+  chmod 700 "$matrix_fixture"
+  matrix_cleanup() {
+    local status=$?
+    trap - EXIT
+    rm -r -- "$matrix_fixture"
+    exit "$status"
+  }
+  trap matrix_cleanup EXIT
+
+  run_image_case() (
+    set -euo pipefail
+    local case_name=$1
+    local case_number=$2
+    local rollback_run_key=$3
+    local deploy_run_key=$4
+    local provider_enabled=$5
+    local case_root=/var/lib/meet-production
+    local state_root=/var/lib/meet-test-vps-deploy/mee2-93-runtime-$case_name
+    local case_log="$matrix_fixture/$case_name.log"
+    local case_secret="RUNTIME_IMAGE_PRIVATE_SECRET_${case_name}_9f7d8d"
+    local credential_email="runtime-image-$case_name@example.invalid"
+    local app_port=$((18080 + case_number))
+    local created_root=false
+    local backend postgres observed
+    local rollback_output rollback_status deploy_output deploy_status
+    local rollback_capture="$matrix_fixture/$case_name-rollback.out"
+    local deploy_capture="$matrix_fixture/$case_name-deploy.out"
+    local previous_state target_state legacy_before legacy_after
+
+    cleanup_case() {
+      local status=$?
+      local cleanup_status=0
+      local pattern
+      trap - EXIT
+      set +e
+      if [ "$created_root" = true ]; then
+        timeout 300s docker compose -p meet-production \
+          --project-directory "$case_root" \
+          --env-file "$case_root/.env.production" \
+          -f "$case_root/docker-compose.production.yml" \
+          down --volumes --remove-orphans >>"$case_log" 2>&1 ||
+          cleanup_status=1
+        [ -z "$(timeout 30s docker ps -aq \
+          --filter label=com.docker.compose.project=meet-production)" ] ||
+          cleanup_status=1
+        for resource in meet-production_default meet-production_postgres_data \
+          meet-production_uploads_data; do
+          if timeout 30s docker network inspect "$resource" >/dev/null 2>&1 ||
+            timeout 30s docker volume inspect "$resource" >/dev/null 2>&1; then
+            cleanup_status=1
+          fi
+        done
+        for pattern in "$case_secret" "$credential_email" \
+          '-----BEGIN PRIVATE KEY-----'; do
+          if grep -R -F -n --binary-files=without-match "$pattern" \
+            "$case_log" "$rollback_capture" "$deploy_capture" 2>/dev/null; then
+            cleanup_status=1
+          fi
+        done
+        rm -r -- "$case_root" "$state_root" || cleanup_status=1
+        [ ! -e "$case_root" ] && [ ! -e "$state_root" ] ||
+          cleanup_status=1
+      fi
+      [ "$status" -ne 0 ] || [ "$cleanup_status" -eq 0 ] ||
+        status=1
+      if [ "$status" -eq 0 ]; then
+        printf 'image_runtime_cleanup case=%s containers=0 fixed_roots=0\\n' \
+          "$case_name"
+      fi
+      exit "$status"
+    }
+
+    if [ -e "$case_root" ] || [ -L "$case_root" ] ||
+      [ -e "$state_root" ] || [ -L "$state_root" ]; then
+      echo "PREREQUISITE_MISSING: immutable runtime fixed root already exists" >&2
+      exit 77
+    fi
+    if [ -n "$(timeout 30s docker ps -aq \
+      --filter label=com.docker.compose.project=meet-production)" ]; then
+      echo "PREREQUISITE_MISSING: meet-production containers already exist" >&2
+      exit 77
+    fi
+    for resource in meet-production_default meet-production_postgres_data \
+      meet-production_uploads_data; do
+      if timeout 30s docker network inspect "$resource" >/dev/null 2>&1 ||
+        timeout 30s docker volume inspect "$resource" >/dev/null 2>&1; then
+        echo "PREREQUISITE_MISSING: fixed Compose resource already exists" >&2
+        exit 77
+      fi
+    done
+
+    trap cleanup_case EXIT
+    install -d -m 700 "$case_root" "$state_root"
+    created_root=true
+    cp -- "$ROOT_DIR/docker-compose.production.yml" \
+      "$case_root/docker-compose.production.yml"
+    chmod 600 "$case_root/docker-compose.production.yml"
+    cat >"$case_root/.env.production" <<EOF
+APP_PORT=$app_port
+BACKEND_MEMORY_LIMIT=768m
+DOCKER_LOG_MAX_SIZE=10m
+DOCKER_LOG_MAX_FILE=5
+BACKEND_VERSION=$previous_version
+BACKEND_REVISION=$previous_revision
+BACKEND_IMAGE=$previous_image
+DB_NAME=meet
+DB_USERNAME=meet
+DB_PASSWORD=runtime-db-password-$case_name
+APP_JWT_SECRET=runtime-jwt-secret-$case_name-0123456789abcdef0123456789abcdef
+APP_STORAGE_BASE_URL=http://127.0.0.1:$app_port/media
+ADMIN_API_KEY=
+APP_EMAIL_PROVIDER=smtp
+APP_EMAIL_FROM=no-reply@example.invalid
+APP_EMAIL_FROM_NAME=Meet
+SPRING_MAIL_HOST=smtp.invalid
+SPRING_MAIL_PORT=2525
+SPRING_MAIL_USERNAME=runtime-smtp-user
+SPRING_MAIL_PASSWORD=runtime-smtp-password
+APP_EMAIL_CONNECT_TIMEOUT_MS=5000
+APP_EMAIL_READ_TIMEOUT_MS=5000
+APP_EMAIL_WRITE_TIMEOUT_MS=5000
+APP_OTP_HMAC_CURRENT_KEY_ID=runtime-key
+APP_OTP_HMAC_CURRENT_KEY_BASE64=cmVhbC1ydW50aW1lLWtleS1ieXRlcy1mb3ItdGVzdA==
+APP_OTP_HMAC_PREVIOUS_KEY_ID=
+APP_OTP_HMAC_PREVIOUS_KEY_BASE64=
+APP_SMS_PROVIDER=disabled
+APP_PUSH_PROVIDER_ENABLED=$provider_enabled
+APP_PUSH_DISCOVERY_ENABLED=false
+APP_PUSH_DISPATCH_ENABLED=false
+APP_PUSH_DIAGNOSTIC_ENABLED=false
+APP_PUSH_MAINTENANCE_ENABLED=false
+APP_PUSH_PROJECT_ID=meeting-1d258
+APP_PUSH_CREDENTIALS_FILE=$(
+  if [ "$provider_enabled" = true ]; then
+    printf '%s' /run/secrets/meet-firebase-service-account.json
+  fi
+)
+INGESTION_ENABLED=false
+INGESTION_CRON=
+INGESTION_ZONE=
+GEOCODER_ENABLED=false
+LOCATIONIQ_KEY=
+TIMEPAD_ENABLED=false
+TIMEPAD_TOKEN=
+TIMEPAD_CATEGORY_IDS=
+TIMEPAD_KEYWORDS=
+TIMEPAD_CITIES=
+SPRINGDOC_API_DOCS_ENABLED=false
+SPRINGDOC_SWAGGER_UI_ENABLED=false
+EOF
+    chmod 600 "$case_root/.env.production"
+    if [ "$provider_enabled" = true ]; then
+      install -d -m 700 "$case_root/credentials"
+      cat >"$case_root/credentials/firebase-service-account.json" <<EOF
+{"type":"service_account","project_id":"meeting-1d258","client_email":"$credential_email","client_id":"runtime-image-id","private_key_id":"runtime-image-key","private_key":"-----BEGIN PRIVATE KEY-----\n$case_secret\n-----END PRIVATE KEY-----","token_uri":"https://oauth2.example.invalid/token"}
+EOF
+      chown 0:10001 "$case_root/credentials/firebase-service-account.json"
+      chmod 640 "$case_root/credentials/firebase-service-account.json"
+    fi
+
+    legacy_names=(
+      31885558214-1-rollback-drill
+      31886011287-1-rollback-drill
+      31886542144-1-final-deploy
+      31886542144-1-rollback-drill
+      31887546557-1-final-deploy
+      33076843662-1-final-deploy
+      33076843662-1-rollback-drill
+      35471104657-1-rollback-drill
+    )
+    legacy_digest() {
+      local name path
+      for name in "${legacy_names[@]}"; do
+        path="$state_root/$name"
+        find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n' | sort
+        find "$path" -xdev -type f -exec sha256sum {} +
+      done
+    }
+    for name in "${legacy_names[@]}"; do
+      install -d -m 700 "$state_root/$name"
+      printf 'legacy immutable-runtime bytes: %s\n' "$name" \
+        >"$state_root/$name/opaque.bin"
+      chmod 600 "$state_root/$name/opaque.bin"
+    done
+    legacy_before=$(legacy_digest)
+
+    compose() {
+      timeout 300s docker compose -p meet-production \
+        --project-directory "$case_root" \
+        --env-file "$case_root/.env.production" \
+        -f "$case_root/docker-compose.production.yml" "$@"
+    }
+    check_capture_bound() {
+      [ "$(wc -c <"$1")" -le 8388608 ]
+    }
+    compose up -d --wait --no-build --pull never >"$case_log" 2>&1
+    check_capture_bound "$case_log"
+    backend=$(compose ps -q backend)
+    postgres=$(compose ps -q postgres)
+    [ -n "$backend" ] && [ -n "$postgres" ]
+    [ "$(docker inspect "$backend" --format '{{.Image}}')" = "$previous_id" ]
+    [ "$(docker inspect "$postgres" --format '{{.State.Health.Status}}')" = healthy ]
+
+    verify_case_runtime() {
+      local expected_id=$1
+      local expected_revision=$2
+      local expected_version=$3
+      local current_backend current_hash
+      current_backend=$(compose ps -q backend)
+      [ -n "$current_backend" ]
+      current_hash=$(docker inspect "$current_backend" \
+        --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
+      timeout 90s bash -c '
+        set -euo pipefail
+        source "$1"
+        verify_runtime_invariants "$2" "$3" "$4" "$5" "$6" "$7"
+        verify_environment_matches_container "$2" "$3"
+      ' _ "$ROOT_DIR/scripts/test-vps-runtime-invariants.sh" \
+        "$case_root" "$ROOT_DIR/scripts/production-compose.sh" \
+        "$expected_id" "$expected_revision" "$expected_version" \
+        "$current_hash" >>"$case_log" 2>&1
+    }
+
+    observe_provider() {
+      local current_backend
+      current_backend=$(compose ps -q backend)
+      docker inspect "$current_backend" |
+        timeout 30s python3 "$ROOT_DIR/scripts/test-vps-provider-credential.py" observe
+    }
+
+    assert_provider_state() {
+      local expected_enabled=$1
+      observed=$(observe_provider)
+      jq -e --argjson enabled "$expected_enabled" '
+        type == "object" and .schemaVersion == 1 and
+        .providerEnabled == $enabled and
+        .credentialMountPresent == $enabled and
+        .credentialMountReadOnly == $enabled and
+        .outcome == "observed"
+      ' <<<"$observed" >/dev/null
+      printf 'provider_observed case=%s enabled=%s\n' \
+        "$case_name" "$expected_enabled" >>"$case_log"
+    }
+
+    assert_terminal_state() {
+      local state_path=$1
+      local expected_outcome=$2
+      local expected_enabled=$3
+      jq -e --arg outcome "$expected_outcome" \
+        --argjson enabled "$expected_enabled" \
+        --arg run_key "${state_path##*/}" '
+        .schemaVersion == 1 and .runKey == ($run_key
+          | sub("-(rollback-drill|final-deploy)$"; "")) and
+        .outcome == $outcome and .providerEnabled == $enabled and
+        (.providerEnabled | type == "boolean")
+      ' "$state_path/terminal.json" >/dev/null
+      [ -f "$state_path/provider-owner.json" ]
+      timeout 30s python3 "$ROOT_DIR/scripts/test-vps-provider-credential.py" \
+        retention-list --state-root "$state_root" >/dev/null
+    }
+
+    scan_case_secrets() {
+      local pattern container
+      for pattern in "$case_secret" "$credential_email" \
+        '-----BEGIN PRIVATE KEY-----'; do
+        if grep -R -F -n --binary-files=without-match "$pattern" \
+          "$case_log" "$state_root" "$case_root/.env.production" \
+          "$case_root/docker-compose.production.yml" \
+          "$case_root/active-compose.yml" \
+          "$case_root/active-runtime.override.yml" 2>/dev/null; then
+          echo "runtime fixture leaked synthetic credential material" >&2
+          return 1
+        fi
+        for container in $(compose ps -q backend) $(compose ps -q postgres); do
+          if timeout 30s docker logs "$container" 2>&1 |
+            grep -F -- "$pattern" >/dev/null; then
+            return 1
+          fi
+        done
+      done
+    }
+
+    run_coordinator() {
+      timeout 1200s env TEST_VPS_STATE_ROOT="$state_root" \
+        bash "$ROOT_DIR/scripts/deploy-test-vps-provider-release.sh" \
+        --root "$case_root" \
+        --base-compose "$case_root/docker-compose.production.yml" \
+        --image "$1" --revision "$2" --version "$3" \
+        --run-key "$4" --mode "$5"
+    }
+
+    set +e
+    run_coordinator "$target_image" "$target_revision" \
+      "$target_version" "$rollback_run_key" rollback-drill \
+      >"$rollback_capture" 2>&1
+    rollback_status=$?
+    set -e
+    check_capture_bound "$rollback_capture"
+    rollback_output=$(<"$rollback_capture")
+    printf '%s\n' "$rollback_output" >>"$case_log"
+    check_capture_bound "$case_log"
+    [ "$rollback_status" -eq 86 ]
+    grep -Fq 'candidate=ready' <<<"$rollback_output"
+    grep -Fq 'rollback=completed previous_image_id=' <<<"$rollback_output"
+    previous_state="$state_root/$rollback_run_key-rollback-drill"
+    assert_terminal_state "$previous_state" rolled-back "$provider_enabled"
+    verify_case_runtime "$previous_id" "$previous_revision" "$previous_version"
+    assert_provider_state "$provider_enabled"
+    [ "$(grep '^BACKEND_IMAGE=' "$case_root/.env.production")" = \
+      "BACKEND_IMAGE=$previous_image" ]
+    legacy_after=$(legacy_digest)
+    [ "$legacy_before" = "$legacy_after" ]
+
+    set +e
+    run_coordinator "$target_image" "$target_revision" \
+      "$target_version" "$deploy_run_key" deploy \
+      >"$deploy_capture" 2>&1
+    deploy_status=$?
+    set -e
+    check_capture_bound "$deploy_capture"
+    deploy_output=$(<"$deploy_capture")
+    printf '%s\n' "$deploy_output" >>"$case_log"
+    check_capture_bound "$case_log"
+    [ "$deploy_status" -eq 0 ]
+    grep -Fq 'candidate=ready' <<<"$deploy_output"
+    grep -Fq 'deployment=completed image_id=' <<<"$deploy_output"
+    target_state="$state_root/$deploy_run_key-final-deploy"
+    assert_terminal_state "$target_state" committed "$provider_enabled"
+    backend=$(compose ps -q backend)
+    [ "$(docker inspect "$backend" --format '{{.Image}}')" = "$target_id" ]
+    verify_case_runtime "$target_id" "$target_revision" "$target_version"
+    assert_provider_state "$provider_enabled"
+    [ "$(grep '^BACKEND_IMAGE=' "$case_root/.env.production")" = \
+      "BACKEND_IMAGE=$target_image" ]
+    legacy_after=$(legacy_digest)
+    [ "$legacy_before" = "$legacy_after" ]
+    scan_case_secrets
+    printf 'image_runtime case=%s previous_id=%s target_id=%s cleanup=pending\n' \
+      "$case_name" "$previous_id" "$target_id"
+  )
+
+  run_image_case disabled 1 930000001-1 930000002-1 false
+  run_image_case enabled 2 930000003-1 930000004-1 true
+  trap - EXIT
+  rm -r -- "$matrix_fixture"
 fi
 
 fixture=$(mktemp -d /var/lib/meet-provider-fixture.XXXXXX)
@@ -754,6 +1215,108 @@ for child in sorted(helper.RETENTION_CHILDREN - {"provider-owner.json", "termina
     assert not retention_state.exists()
     assert quarantine.exists()
     shutil.rmtree(quarantine)
+
+def retention_snapshot(path):
+    snapshot = []
+    for entry in sorted(path.rglob("*")):
+        info = os.lstat(entry)
+        data = entry.read_bytes() if stat.S_ISREG(info.st_mode) else None
+        snapshot.append(
+            (
+                str(entry.relative_to(path)),
+                info.st_mode,
+                info.st_uid,
+                info.st_gid,
+                info.st_nlink,
+                data,
+            )
+        )
+    return snapshot
+
+def valid_retention_state(name):
+    path = retention_root / name
+    path.mkdir(mode=0o700)
+    os.chown(path, 0, 0)
+    marker_path = path / "provider-owner.json"
+    marker_path.write_bytes(helper._state_marker(*helper._state_parts(name)))
+    terminal_path = path / "terminal.json"
+    terminal_path.write_bytes(
+        (
+            (
+                '{"schemaVersion":1,"runKey":"%s","outcome":"committed",'
+                '"providerEnabled":false}'
+            )
+            % helper._state_parts(name)[0]
+        ).encode()
+    )
+    for child in (marker_path, terminal_path):
+        os.chown(child, 0, 0)
+        os.chmod(child, 0o600)
+    return path
+
+def assert_direct_retention_refusal(path, **kwargs):
+    before = retention_snapshot(path)
+    quarantine = retention_root / (".provider-state." + path.name + ".tmp")
+    quarantine_before = quarantine.exists()
+    expect_provider_error(
+        lambda: helper._retention_delete(
+            str(retention_root),
+            str(path),
+            **kwargs,
+        ),
+        "RECOVERY_REQUIRED",
+    )
+    assert retention_snapshot(path) == before
+    assert quarantine.exists() == quarantine_before
+
+protected_state = valid_retention_state("88-1-final-deploy")
+assert_direct_retention_refusal(
+    protected_state,
+    protected_states=[str(protected_state)],
+)
+shutil.rmtree(protected_state)
+
+interlocked_state = valid_retention_state("89-1-final-deploy")
+helper._write_private(
+    str(retention_root / ".provider-transaction.current"),
+    b"blocking",
+    0o600,
+)
+assert_direct_retention_refusal(interlocked_state)
+(retention_root / ".provider-transaction.current").unlink()
+
+reserved = retention_root / ".provider-state.89-1-final-deploy.tmp"
+reserved.mkdir(mode=0o700)
+os.chown(reserved, 0, 0)
+assert_direct_retention_refusal(interlocked_state)
+shutil.rmtree(reserved)
+
+parent_transaction = parent / ".transaction-retention-interlock"
+parent_transaction.mkdir(mode=0o700)
+os.chown(parent_transaction, 0, 0)
+assert_direct_retention_refusal(interlocked_state)
+shutil.rmtree(parent_transaction)
+shutil.rmtree(interlocked_state)
+
+malformed_marker = {
+    "schemaVersion": True,
+    "runKey": "boolean-marker",
+    "phase": "preparing",
+    "providerEnabled": True,
+    "durableDisposition": "none",
+}
+helper._write_private(
+    str(marker),
+    json.dumps(malformed_marker, separators=(",", ":")).encode(),
+    0o600,
+)
+marker_bytes = marker.read_bytes()
+expect_provider_error(
+    lambda: helper._marker(str(state), "boolean-marker"),
+    "RECOVERY_REQUIRED",
+)
+assert marker.read_bytes() == marker_bytes
+marker.unlink()
 PY
 then
   echo "provider runtime fixture failed" >&2

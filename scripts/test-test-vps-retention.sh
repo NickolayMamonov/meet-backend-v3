@@ -12,15 +12,74 @@ fi
 fixture_root=$(mktemp -d /tmp/meet-retention-fixture.XXXXXX)
 state_root=/var/lib/meet-test-vps-deploy
 production_root=/var/lib/meet-retention-production
+production_runtime_root=/var/lib/meet-production
 fake_bin="$fixture_root/bin"
 remote_script="$fixture_root/retention-remote.sh"
+created_fixed_roots=()
 cleanup() {
   local status=$?
   trap - EXIT
-  rm -r -- "$fixture_root" "$state_root" "$production_root"
+  for path in "${created_fixed_roots[@]}"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      rm -r -- "$path"
+    fi
+  done
+  rm -r -- "$fixture_root"
   exit "$status"
 }
 trap cleanup EXIT
+
+if [ "${1:-}" = --check-fixed-roots ]; then
+  for path in "$state_root" "$production_root" "$production_runtime_root"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      echo "PREREQUISITE_MISSING: fixed fixture root already exists" >&2
+      exit 77
+    fi
+  done
+  exit 0
+fi
+
+for path in "$state_root" "$production_root" "$production_runtime_root"; do
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    echo "PREREQUISITE_MISSING: fixed fixture root already exists" >&2
+    exit 77
+  fi
+done
+
+(
+  set -euo pipefail
+  probe_cleanup() {
+    for path in "$state_root" "$production_root" "$production_runtime_root"; do
+      if [ -e "$path" ] || [ -L "$path" ]; then
+        rm -r -- "$path"
+      fi
+    done
+  }
+  trap probe_cleanup EXIT
+  for path in "$state_root" "$production_root" "$production_runtime_root"; do
+    install -d -m 700 "$path"
+    printf 'fixed-root-sentinel\n' >"$path/sentinel"
+    chmod 600 "$path/sentinel"
+  done
+  fixed_before=$(
+    for path in "$state_root" "$production_root" "$production_runtime_root"; do
+      find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n'
+      find "$path" -xdev -type f -exec sha256sum {} +
+    done | sort
+  )
+  set +e
+  fixed_output=$(bash "$0" --check-fixed-roots 2>&1)
+  fixed_status=$?
+  set -e
+  [ "$fixed_status" -eq 77 ]
+  grep -Fq 'fixed fixture root already exists' <<<"$fixed_output"
+  test "$fixed_before" = "$(
+    for path in "$state_root" "$production_root" "$production_runtime_root"; do
+      find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n'
+      find "$path" -xdev -type f -exec sha256sum {} +
+    done | sort
+  )"
+)
 
 legacy_names=(
   31885558214-1-rollback-drill
@@ -51,12 +110,17 @@ write_owner_marker() {
   chmod 600 "$state/provider-owner.json"
 }
 
-install -d -m 700 "$fake_bin" "$state_root" "$production_root"
-install -d -m 700 /var/lib/meet-production
+install -d -m 700 "$fake_bin"
+install -d -m 700 "$state_root"
+created_fixed_roots+=("$state_root" "$production_root")
+install -d -m 700 "$production_root"
+created_fixed_roots+=("$production_root")
+install -d -m 700 "$production_runtime_root"
+created_fixed_roots+=("$production_runtime_root")
 printf 'fixture\n' >"$production_root/.env.production"
 printf 'services:\n  backend:\n    image: fixture\n' >"$production_root/docker-compose.production.yml"
-printf 'services:\n  backend:\n    image: fixture\n' >/var/lib/meet-production/active-compose.yml
-printf 'services:\n  backend:\n    healthcheck:\n      test: ["CMD", "true"]\n' >/var/lib/meet-production/active-runtime.override.yml
+printf 'services:\n  backend:\n    image: fixture\n' >"$production_runtime_root/active-compose.yml"
+printf 'services:\n  backend:\n    healthcheck:\n      test: ["CMD", "true"]\n' >"$production_runtime_root/active-runtime.override.yml"
 
 for name in "${legacy_names[@]}"; do
   install -d -m 700 "$state_root/$name"
@@ -128,6 +192,25 @@ for index in $(seq 1 12); do
   write_owner_marker "$state"
   touch -d "@$((1800000000 - index))" "$state"
 done
+owned_digest() {
+  local path=$1
+  find "$path" -xdev -printf '%p|%y|%m|%u|%g|%l\n' | sort
+  find "$path" -xdev -type f -exec sha256sum {} +
+}
+protected_state="$state_root/1-1-final-deploy"
+protected_before=$(owned_digest "$protected_state")
+set +e
+protected_output=$(python3 scripts/test-vps-provider-credential.py \
+  retention-delete --state-root "$state_root" \
+  --retention-state "$protected_state" \
+  --protected-state "$protected_state" 2>&1)
+protected_status=$?
+set -e
+[ "$protected_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$protected_output"
+[ -d "$protected_state" ]
+[ ! -e "$state_root/.provider-state.1-1-final-deploy.tmp" ]
+test "$protected_before" = "$(owned_digest "$protected_state")"
 install -d -m 700 "$state_root/12-1-final-deploy/protected-input"
 install -d -m 700 "$state_root/12-1-final-deploy/provider-runtime"
 printf 'services:\n  backend:\n    volumes: []\n' \

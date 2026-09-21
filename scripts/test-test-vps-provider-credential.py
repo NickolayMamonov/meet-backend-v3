@@ -199,6 +199,33 @@ class ProviderCredentialTests(unittest.TestCase):
                 helper._parse_state_marker(value, "31885558214-1", "rollback-drill")
             self.assertEqual("RECOVERY_REQUIRED", error.exception.category)
 
+    def test_transaction_integer_primitives_are_exact(self) -> None:
+        valid = {
+            "schemaVersion": 1,
+            "predecessor": {
+                "device": 1,
+                "inode": 2,
+                "mtimeNs": 3,
+                "ctimeNs": 4,
+            },
+            "durable": {
+                "device": 5,
+                "inode": 6,
+                "mtimeNs": 7,
+                "ctimeNs": 8,
+            },
+        }
+        helper._validate_identity(valid)
+        malformed_schema = dict(valid, schemaVersion=True)
+        with self.assertRaises(helper.ProviderError):
+            helper._validate_identity(malformed_schema)
+        for record_name in ("predecessor", "durable"):
+            for field in ("device", "inode", "mtimeNs", "ctimeNs"):
+                malformed = json.loads(json.dumps(valid))
+                malformed[record_name][field] = True
+                with self.assertRaises(helper.ProviderError):
+                    helper._validate_identity(malformed)
+
     def test_state_names_are_numeric_and_canonical(self) -> None:
         self.assertEqual(
             ("31885558214-1", "rollback-drill"),

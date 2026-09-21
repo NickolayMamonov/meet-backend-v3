@@ -954,7 +954,11 @@ def _marker(state_root: str, run_key: str) -> dict[str, Any]:
         "durableDisposition",
     }:
         _fail("recovery")
-    if value["schemaVersion"] != SCHEMA_VERSION or value["runKey"] != run_key:
+    if (
+        type(value["schemaVersion"]) is not int
+        or value["schemaVersion"] != SCHEMA_VERSION
+        or value["runKey"] != run_key
+    ):
         _fail("recovery")
     if value["phase"] not in (
         "preparing",
@@ -1014,7 +1018,7 @@ def _validate_identity(value: Any) -> None:
         "durable",
     }:
         _fail("recovery")
-    if value["schemaVersion"] != SCHEMA_VERSION:
+    if type(value["schemaVersion"]) is not int or value["schemaVersion"] != SCHEMA_VERSION:
         _fail("recovery")
     for record in (value["predecessor"], value["durable"]):
         if not isinstance(record, dict) or set(record) != {
@@ -1024,7 +1028,10 @@ def _validate_identity(value: Any) -> None:
             "ctimeNs",
         }:
             _fail("recovery")
-        if any(not isinstance(record[key], int) or record[key] < 0 for key in record):
+        if any(
+            type(record[key]) is not int or record[key] < 0
+            for key in record
+        ):
             _fail("recovery")
 
 
@@ -1672,6 +1679,24 @@ def _validate_terminal_state(path: str, name: str) -> None:
         _fail("recovery")
 
 
+def _retention_interlocks(root: str, state_root: str) -> None:
+    parent = _rooted(HOST_CREDENTIAL_PARENT, root)
+    marker = os.path.join(state_root, ".provider-transaction.current")
+    if os.path.lexists(marker):
+        _fail("recovery")
+    if os.path.isdir(state_root):
+        for name in os.listdir(state_root):
+            if (
+                name.startswith(".provider-transaction.")
+                or name.startswith(".provider-state.")
+            ):
+                _fail("recovery")
+    if os.path.isdir(parent):
+        for name in os.listdir(parent):
+            if name.startswith(".transaction-"):
+                _fail("recovery")
+
+
 def _retention_check(
     root: str,
     state_root: str,
@@ -1685,25 +1710,12 @@ def _retention_check(
         or any(part in ("", ".", "..") for part in state_root.split("/")[1:])
     ):
         _fail("recovery")
-    parent = _rooted(HOST_CREDENTIAL_PARENT, root)
-    marker = os.path.join(state_root, ".provider-transaction.current")
-    if os.path.lexists(marker):
-        _fail("recovery")
-    if os.path.isdir(state_root) and any(
-        name.startswith(".provider-transaction.")
-        or name.startswith(".provider-state.")
-        for name in os.listdir(state_root)
-    ):
-        _fail("recovery")
-    if os.path.isdir(parent):
-        for name in os.listdir(parent):
-            if name.startswith(".transaction-"):
-                _fail("recovery")
     if os.path.lexists(state_root) and (
         os.path.islink(state_root)
         or not os.path.isdir(state_root)
     ):
         _fail("recovery")
+    _retention_interlocks(root, state_root)
     owned_states: list[str] = []
     if os.path.isdir(state_root):
         references = [_retention_reference(path) for path in protected_paths]
@@ -1830,6 +1842,7 @@ def _retention_delete(
     )
     try:
         _lock_directory(parent_fd)
+        _retention_interlocks("", state_root)
         if os.path.dirname(os.path.normpath(state_path)) != os.path.normpath(state_root):
             _fail("recovery")
         state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1852,8 +1865,22 @@ def _retention_delete(
                 or not os.path.isdir(protected)
             ):
                 _fail("recovery")
+            protected_norm = os.path.normpath(protected)
+            state_norm = os.path.normpath(state_path)
+            if (
+                protected_norm == state_norm
+                or protected_norm.startswith(state_norm + os.sep)
+                or state_norm.startswith(protected_norm + os.sep)
+            ):
+                _fail("recovery")
         for reference in references:
-            if reference == state_path or reference.startswith(state_path.rstrip("/") + "/"):
+            reference_norm = os.path.normpath(reference)
+            state_norm = os.path.normpath(state_path)
+            if (
+                reference_norm == state_norm
+                or reference_norm.startswith(state_norm + os.sep)
+                or state_norm.startswith(reference_norm + os.sep)
+            ):
                 _fail("recovery")
         state_fd = os.open(
             name,
