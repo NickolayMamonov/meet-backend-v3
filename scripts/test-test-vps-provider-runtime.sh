@@ -346,6 +346,7 @@ sys.exit(125 if overflow else 0)
           assert_resource_absent network "$resource" || cleanup_status=1
           assert_resource_absent volume "$resource" || cleanup_status=1
         done
+        scan_case_secrets || cleanup_status=1
       fi
       if [ "$case_root_created" = true ]; then
         remove_owned_root "$case_root" "$case_root_identity" ||
@@ -441,8 +442,8 @@ sys.exit(125 if overflow else 0)
         while IFS= read -r container; do
           [ -n "$container" ] || continue
           local container_log="$matrix_fixture/$case_name-container-$container.log"
-          if ! timeout 30s docker logs --tail 10000 "$container" \
-            >"$container_log" 2>&1; then
+          if ! capture_command "$container_log" timeout 30s docker logs \
+            --tail 10000 "$container"; then
             return 2
           fi
           check_capture_bound "$container_log" || return 2
@@ -1622,6 +1623,11 @@ for child in ("identity.json", "snapshot", "publication"):
 retention_root = fixture / "retention-root"
 retention_root.mkdir(mode=0o700)
 os.chown(retention_root, 0, 0)
+missing_retention_root = fixture / "missing-retention-root"
+expect_provider_error(
+    lambda: helper._retention_check("", str(missing_retention_root)),
+    "RECOVERY_REQUIRED",
+)
 unsafe_state_root = fixture / "unsafe-retention-root"
 unsafe_state_root.mkdir(mode=0o700)
 os.chown(unsafe_state_root, 0, 0)

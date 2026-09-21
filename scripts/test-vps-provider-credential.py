@@ -1703,7 +1703,7 @@ def _retention_interlocks(root: str, state_root: str) -> None:
                 _fail("recovery")
 
 
-def _validate_retention_state_root_path(state_root: str) -> None:
+def _validate_retention_state_root_path(state_root: str) -> os.stat_result:
     if (
         not isinstance(state_root, str)
         or not state_root.startswith("/")
@@ -1719,6 +1719,7 @@ def _validate_retention_state_root_path(state_root: str) -> None:
         _fail("recovery")
     _check_ancestors(state_root, category="recovery")
     _acl_is_safe(state_root, category="recovery")
+    return info
 
 
 def _validate_retention_state_root_fd(fd: int, state_root: str) -> None:
@@ -1746,8 +1747,7 @@ def _retention_check(
         or any(part in ("", ".", "..") for part in state_root.split("/")[1:])
     ):
         _fail("recovery")
-    if os.path.lexists(state_root):
-        _validate_retention_state_root_path(state_root)
+    _validate_retention_state_root_path(state_root)
     _retention_interlocks(root, state_root)
     owned_states: list[str] = []
     if os.path.isdir(state_root):
@@ -1865,13 +1865,17 @@ def _retention_delete(
     if re.fullmatch(r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name) is None:
         _fail("recovery")
     run_key, state_kind = _state_parts(name)
-    _validate_retention_state_root_path(state_root)
+    expected_root = _validate_retention_state_root_path(state_root)
     parent_fd = os.open(
         state_root,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
     try:
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
         _lock_directory(parent_fd)
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
         _validate_retention_state_root_fd(parent_fd, state_root)
         _retention_interlocks("", state_root)
         if os.path.dirname(os.path.normpath(state_path)) != os.path.normpath(state_root):

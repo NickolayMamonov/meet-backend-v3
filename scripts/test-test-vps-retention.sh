@@ -16,15 +16,35 @@ production_runtime_root=/var/lib/meet-production
 fake_bin="$fixture_root/bin"
 remote_script="$fixture_root/retention-remote.sh"
 created_fixed_roots=()
+created_fixed_root_identities=()
+root_identity() {
+  stat -c '%d:%i:%f:%u:%g' -- "$1"
+}
+record_created_root() {
+  local path=$1
+  [ -d "$path" ] && [ ! -L "$path" ]
+  created_fixed_roots+=("$path")
+  created_fixed_root_identities+=("$(root_identity "$path")")
+}
 cleanup() {
   local status=$?
+  local cleanup_status=0
+  local index path expected actual
   trap - EXIT
-  for path in "${created_fixed_roots[@]}"; do
+  for index in "${!created_fixed_roots[@]}"; do
+    path=${created_fixed_roots[$index]}
+    expected=${created_fixed_root_identities[$index]}
     if [ -e "$path" ] || [ -L "$path" ]; then
-      rm -r -- "$path"
+      if [ ! -d "$path" ] || [ -L "$path" ] ||
+        ! actual=$(root_identity "$path") || [ "$actual" != "$expected" ]; then
+        cleanup_status=1
+      else
+        timeout 30s rm -r -- "$path" || cleanup_status=1
+      fi
     fi
   done
-  rm -r -- "$fixture_root"
+  timeout 30s rm -r -- "$fixture_root" || cleanup_status=1
+  [ "$status" -ne 0 ] || [ "$cleanup_status" -eq 0 ] || status=1
   exit "$status"
 }
 trap cleanup EXIT
@@ -48,16 +68,30 @@ done
 
 (
   set -euo pipefail
+  probe_roots=()
+  probe_root_identities=()
+  record_probe_root() {
+    local path=$1
+    [ -d "$path" ] && [ ! -L "$path" ]
+    probe_roots+=("$path")
+    probe_root_identities+=("$(root_identity "$path")")
+  }
   probe_cleanup() {
-    for path in "$state_root" "$production_root" "$production_runtime_root"; do
+    local index path expected actual
+    for index in "${!probe_roots[@]}"; do
+      path=${probe_roots[$index]}
+      expected=${probe_root_identities[$index]}
       if [ -e "$path" ] || [ -L "$path" ]; then
-        rm -r -- "$path"
+        actual=$(root_identity "$path") || exit 1
+        [ "$actual" = "$expected" ] || exit 1
+        timeout 30s rm -r -- "$path" || exit 1
       fi
     done
   }
   trap probe_cleanup EXIT
   for path in "$state_root" "$production_root" "$production_runtime_root"; do
     install -d -m 700 "$path"
+    record_probe_root "$path"
     printf 'fixed-root-sentinel\n' >"$path/sentinel"
     chmod 600 "$path/sentinel"
   done
@@ -112,11 +146,11 @@ write_owner_marker() {
 
 install -d -m 700 "$fake_bin"
 install -d -m 700 "$state_root"
-created_fixed_roots+=("$state_root" "$production_root")
+record_created_root "$state_root"
 install -d -m 700 "$production_root"
-created_fixed_roots+=("$production_root")
+record_created_root "$production_root"
 install -d -m 700 "$production_runtime_root"
-created_fixed_roots+=("$production_runtime_root")
+record_created_root "$production_runtime_root"
 printf 'fixture\n' >"$production_root/.env.production"
 printf 'services:\n  backend:\n    image: fixture\n' >"$production_root/docker-compose.production.yml"
 printf 'services:\n  backend:\n    image: fixture\n' >"$production_runtime_root/active-compose.yml"

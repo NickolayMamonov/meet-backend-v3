@@ -688,19 +688,30 @@ jobs:
             echo "RECOVERY_REQUIRED" >&2
             exit 1
           fi
-          mapfile -t owned_state_names < <(
-            jq -er '
-              if type == "object" and .schemaVersion == 1 and
-                .outcome == "retention-safe" and
-                (.ownedStates | type == "array")
-              then .ownedStates[]
-              else error("invalid retention admission")
-              end
-            ' <<<"$owned_json"
-          ) || {
+          if ! owned_state_names_json=$(jq -e -c '
+            if type == "object" and .schemaVersion == 1 and
+              .outcome == "retention-safe" and
+              (.ownedStates | type == "array") and
+              all(.ownedStates[];
+                type == "string" and
+                test("^[0-9]+-[0-9]+-(rollback-drill|final-deploy)$")
+              ) and
+              ((.ownedStates | unique | length) == (.ownedStates | length))
+            then .ownedStates
+            else error("invalid retention admission")
+            end
+          ' <<<"$owned_json"); then
             echo "RECOVERY_REQUIRED" >&2
             exit 1
-          }
+          fi
+          if ! owned_state_names_text=$(jq -r '.[]' <<<"$owned_state_names_json"); then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
+          owned_state_names=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && owned_state_names+=("$name")
+          done <<<"$owned_state_names_text"
           states=()
           for path in "${state_paths[@]}"; do
             name=${path#"$state_root/"}
