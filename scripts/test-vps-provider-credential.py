@@ -1684,6 +1684,76 @@ def _retention_reference(path: str) -> str:
     return path
 
 
+def _open_reference_parent(path: str) -> tuple[int, str]:
+    components = path.split("/")[1:]
+    if not components or any(not component for component in components):
+        _fail("recovery")
+    parent_fd = os.open(
+        "/",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        for component in components[:-1]:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return parent_fd, components[-1]
+    except Exception:
+        os.close(parent_fd)
+        raise
+
+
+def _protected_reference_witness(
+    path: str,
+) -> tuple[tuple[int, ...], bytes | None] | None:
+    _retention_reference(path)
+    try:
+        parent_fd, name = _open_reference_parent(path)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            _fail("recovery")
+        data: bytes | None = None
+        if stat.S_ISREG(info.st_mode):
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+            try:
+                before = os.fstat(fd)
+                if not _same_inode(before, info):
+                    _fail("recovery")
+                data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
+                after = os.fstat(fd)
+                if _stable_entry_identity(before) != _stable_entry_identity(after):
+                    _fail("recovery")
+                info = before
+            finally:
+                os.close(fd)
+        return _stable_entry_identity(info), data
+    finally:
+        os.close(parent_fd)
+
+
+def _revalidate_protected_references(
+    paths: Iterable[str],
+    witnesses: Iterable[tuple[tuple[int, ...], bytes | None] | None],
+) -> None:
+    for path, witness in zip(paths, witnesses):
+        if _protected_reference_witness(path) != witness:
+            _fail("recovery")
+
+
 def _owned_state(path: str, name: str, *, require_terminal: bool) -> tuple[str, str]:
     run_key, state_kind = _validate_state_directory(path, name)
     if require_terminal:
@@ -1886,18 +1956,21 @@ def _retention_classify(
             _fail("recovery")
         _validate_retention_state_root_fd(parent_fd)
         _retention_interlocks_fd(root, parent_fd)
-        references = [_retention_reference(path) for path in protected_paths]
+        references = list(protected_paths)
+        reference_witnesses = [
+            _protected_reference_witness(path) for path in references
+        ]
         explicit_states: set[str] = set()
         for path in protected_states:
-            _retention_reference(path)
+            witness = _protected_reference_witness(path)
             if (
-                not isinstance(path, str)
-                or os.path.dirname(path.rstrip("/")) != state_root.rstrip("/")
-                or os.path.islink(path)
-                or not os.path.isdir(path)
+                os.path.dirname(path.rstrip("/")) != state_root.rstrip("/")
+                or witness is None
+                or not stat.S_ISDIR(witness[0][2])
             ):
                 _fail("recovery")
             explicit_states.add(os.path.normpath(path))
+        _revalidate_protected_references(references, reference_witnesses)
         owned_states: list[str] = []
         for name in os.listdir(parent_fd):
             if re.fullmatch(r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name):
@@ -2060,16 +2133,23 @@ def _retention_delete(
     root_norm = os.path.normpath(state_root)
     if os.path.dirname(state_norm) != root_norm:
         _fail("recovery")
-    references = [_retention_reference(path) for path in protected_paths]
-    for protected in protected_states:
-        _retention_reference(protected)
+    references = list(protected_paths)
+    reference_witnesses = [
+        _protected_reference_witness(path) for path in references
+    ]
+    protected_state_paths = list(protected_states)
+    protected_state_witnesses: list[
+        tuple[tuple[int, ...], bytes | None] | None
+    ] = []
+    for protected in protected_state_paths:
+        witness = _protected_reference_witness(protected)
         if (
-            not isinstance(protected, str)
-            or os.path.dirname(protected.rstrip("/")) != root_norm
-            or os.path.islink(protected)
-            or not os.path.isdir(protected)
+            os.path.dirname(protected.rstrip("/")) != root_norm
+            or witness is None
+            or not stat.S_ISDIR(witness[0][2])
         ):
             _fail("recovery")
+        protected_state_witnesses.append(witness)
         protected_norm = os.path.normpath(protected)
         if (
             protected_norm == state_norm
@@ -2098,6 +2178,11 @@ def _retention_delete(
             _fail("recovery")
         _validate_retention_state_root_fd(parent_fd)
         _retention_interlocks_fd("", parent_fd)
+        _revalidate_protected_references(references, reference_witnesses)
+        _revalidate_protected_references(
+            protected_state_paths,
+            protected_state_witnesses,
+        )
         _revalidate_retention_state_root_path(state_root, expected_root)
         state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (
@@ -2119,6 +2204,11 @@ def _retention_delete(
                 _fail("recovery")
             _validate_state_directory_fd(state_fd, name)
             _validate_terminal_state_fd(state_fd, name)
+            _revalidate_protected_references(references, reference_witnesses)
+            _revalidate_protected_references(
+                protected_state_paths,
+                protected_state_witnesses,
+            )
             names = set(os.listdir(state_fd))
             if not names or not names.issubset(RETENTION_CHILDREN):
                 _fail("recovery")
@@ -2142,14 +2232,32 @@ def _retention_delete(
                 pass
             else:
                 _fail("recovery")
+            current_state = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not _same_inode(current_state, state_info):
+                _fail("recovery")
             _rename_noreplace(parent_fd, name, quarantine)
             os.fsync(parent_fd)
+            try:
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                _fail("recovery")
             quarantine_fd = os.open(
                 quarantine,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                 dir_fd=parent_fd,
             )
             try:
+                if (
+                    not _same_inode(os.fstat(quarantine_fd), state_info)
+                    or not _same_inode(os.fstat(quarantine_fd), os.fstat(state_fd))
+                ):
+                    _fail("recovery")
                 # state_fd already holds the descriptor lock for this inode;
                 # reopening it after the no-replace move would deadlock on
                 # Linux flock semantics.

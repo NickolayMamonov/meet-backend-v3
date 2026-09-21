@@ -1801,6 +1801,94 @@ os.rename(swapped_root, retention_root)
 assert retention_snapshot(root_swap_state) == root_swap_before
 shutil.rmtree(root_swap_state)
 
+protected_reference_state = valid_retention_state("91-1-final-deploy")
+protected_reference_before = retention_snapshot(protected_reference_state)
+protected_reference = fixture / "protected-reference"
+protected_reference.write_bytes(b"protected-reference-before-race")
+os.chown(protected_reference, 0, 0)
+os.chmod(protected_reference, 0o600)
+original_revalidate_references = helper._revalidate_protected_references
+reference_replaced = [False]
+
+def replace_protected_reference(paths, witnesses):
+    if not reference_replaced[0]:
+        replacement = fixture / "protected-reference-replacement"
+        replacement.write_bytes(b"protected-reference-replacement")
+        os.chown(replacement, 0, 0)
+        os.chmod(replacement, 0o600)
+        os.rename(replacement, protected_reference)
+        reference_replaced[0] = True
+    return original_revalidate_references(paths, witnesses)
+
+helper._revalidate_protected_references = replace_protected_reference
+expect_provider_error(
+    lambda: helper._retention_delete(
+        str(retention_root),
+        str(protected_reference_state),
+        protected_paths=[str(protected_reference)],
+    ),
+    "RECOVERY_REQUIRED",
+)
+helper._revalidate_protected_references = original_revalidate_references
+assert retention_snapshot(protected_reference_state) == protected_reference_before
+assert not (
+    retention_root
+    / (".provider-state." + protected_reference_state.name + ".tmp")
+).exists()
+protected_reference.unlink()
+shutil.rmtree(protected_reference_state)
+
+quarantine_race_state = valid_retention_state("92-1-final-deploy")
+quarantine_race_before = retention_snapshot(quarantine_race_state)
+quarantine_name = ".provider-state." + quarantine_race_state.name + ".tmp"
+quarantine_displaced = retention_root / (quarantine_name + ".displaced")
+quarantine_attacker = retention_root / quarantine_name
+original_rename_noreplace = helper._rename_noreplace
+
+def replace_quarantine_after_rename(directory_fd, source, destination):
+    result = original_rename_noreplace(directory_fd, source, destination)
+    if source == quarantine_race_state.name and destination == quarantine_name:
+        os.rename(
+            destination,
+            quarantine_displaced.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.mkdir(destination, 0o700, dir_fd=directory_fd)
+        attacker_fd = os.open(
+            destination,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        try:
+            os.fchown(attacker_fd, 0, 0)
+            os.fchmod(attacker_fd, 0o700)
+            for child in quarantine_displaced.iterdir():
+                helper._write_private_at(
+                    attacker_fd,
+                    child.name,
+                    child.read_bytes(),
+                    0o600,
+                )
+            os.fsync(attacker_fd)
+        finally:
+            os.close(attacker_fd)
+    return result
+
+helper._rename_noreplace = replace_quarantine_after_rename
+expect_provider_error(
+    lambda: helper._retention_delete(
+        str(retention_root),
+        str(quarantine_race_state),
+    ),
+    "RECOVERY_REQUIRED",
+)
+helper._rename_noreplace = original_rename_noreplace
+assert retention_snapshot(quarantine_displaced) == quarantine_race_before
+assert retention_snapshot(quarantine_attacker) == quarantine_race_before
+shutil.rmtree(quarantine_displaced)
+shutil.rmtree(quarantine_attacker)
+
 protected_state = valid_retention_state("88-1-final-deploy")
 assert_direct_retention_refusal(
     protected_state,
