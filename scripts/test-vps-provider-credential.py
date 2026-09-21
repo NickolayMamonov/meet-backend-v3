@@ -1684,6 +1684,9 @@ def _retention_interlocks(root: str, state_root: str) -> None:
     marker = os.path.join(state_root, ".provider-transaction.current")
     if os.path.lexists(marker):
         _fail("recovery")
+    smtp_marker = os.path.join(state_root, ".smtp-transaction.current")
+    if os.path.lexists(smtp_marker):
+        _fail("recovery")
     if os.path.isdir(state_root):
         for name in os.listdir(state_root):
             if (

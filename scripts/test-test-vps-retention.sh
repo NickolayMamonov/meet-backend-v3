@@ -211,6 +211,29 @@ grep -Fq 'RECOVERY_REQUIRED' <<<"$protected_output"
 [ -d "$protected_state" ]
 [ ! -e "$state_root/.provider-state.1-1-final-deploy.tmp" ]
 test "$protected_before" = "$(owned_digest "$protected_state")"
+smtp_guard="$state_root/2-1-final-deploy"
+smtp_before=$(owned_digest "$smtp_guard")
+smtp_quarantine="$state_root/.provider-state.smtp-guard.tmp"
+install -d -m 700 "$smtp_quarantine"
+printf 'pre-existing smtp quarantine\n' >"$smtp_quarantine/sentinel"
+chmod 600 "$smtp_quarantine/sentinel"
+smtp_quarantine_before=$(owned_digest "$smtp_quarantine")
+ln -s "$state_root/missing-smtp-transaction-target" \
+  "$state_root/.smtp-transaction.current"
+set +e
+smtp_output=$(python3 scripts/test-vps-provider-credential.py \
+  retention-delete --state-root "$state_root" \
+  --retention-state "$smtp_guard" 2>&1)
+smtp_status=$?
+set -e
+[ "$smtp_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$smtp_output"
+[ -L "$state_root/.smtp-transaction.current" ]
+[ -d "$smtp_guard" ]
+test "$smtp_before" = "$(owned_digest "$smtp_guard")"
+test "$smtp_quarantine_before" = "$(owned_digest "$smtp_quarantine")"
+rm -f -- "$state_root/.smtp-transaction.current"
+rm -r -- "$smtp_quarantine"
 install -d -m 700 "$state_root/12-1-final-deploy/protected-input"
 install -d -m 700 "$state_root/12-1-final-deploy/provider-runtime"
 printf 'services:\n  backend:\n    volumes: []\n' \

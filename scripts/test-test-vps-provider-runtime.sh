@@ -67,13 +67,13 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "$filesystem_only" = false ]; then
-  for command_name in docker curl jq flock python3 timeout; do
+  for command_name in docker curl jq flock openssl python3 timeout; do
     command -v "$command_name" >/dev/null 2>&1 || {
       echo "PREREQUISITE_MISSING" >&2
       exit 77
     }
   done
-  docker compose version >/dev/null 2>&1 || {
+  timeout 30s docker compose version >/dev/null 2>&1 || {
     echo "PREREQUISITE_MISSING" >&2
     exit 77
   }
@@ -180,7 +180,7 @@ PY
   matrix_cleanup() {
     local status=$?
     trap - EXIT
-    rm -r -- "$matrix_fixture"
+    timeout 30s rm -r -- "$matrix_fixture"
     exit "$status"
   }
   trap matrix_cleanup EXIT
@@ -198,6 +198,14 @@ PY
     local case_secret="RUNTIME_IMAGE_PRIVATE_SECRET_${case_name}_9f7d8d"
     local credential_email="runtime-image-$case_name@example.invalid"
     local app_port=$((18080 + case_number))
+    local probe_port=$((28080 + case_number))
+    local public_url="https://127.0.0.1:$probe_port"
+    local network_name=meet-production_default
+    local network_created=false
+    local probe_pid=
+    local probe_cert="$case_root/probe-cert.pem"
+    local probe_key="$case_root/probe-key.pem"
+    local probe_log="$case_root/probe.log"
     local created_root=false
     local backend postgres observed
     local rollback_output rollback_status deploy_output deploy_status
@@ -212,12 +220,29 @@ PY
       trap - EXIT
       set +e
       if [ "$created_root" = true ]; then
+        if [ -n "$probe_pid" ] && kill -0 "$probe_pid" 2>/dev/null; then
+          kill "$probe_pid" 2>/dev/null || cleanup_status=1
+          for _ in $(seq 1 30); do
+            kill -0 "$probe_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$probe_pid" 2>/dev/null; then
+            kill -9 "$probe_pid" 2>/dev/null || cleanup_status=1
+          fi
+        fi
+        scan_case_secrets || cleanup_status=1
         timeout 300s docker compose -p meet-production \
           --project-directory "$case_root" \
           --env-file "$case_root/.env.production" \
           -f "$case_root/docker-compose.production.yml" \
+          -f "$case_root/isolated-network.yml" \
           down --volumes --remove-orphans >>"$case_log" 2>&1 ||
           cleanup_status=1
+        if [ "$network_created" = true ]; then
+          timeout 30s docker network rm "$network_name" >>"$case_log" 2>&1 ||
+            cleanup_status=1
+          network_created=false
+        fi
         [ -z "$(timeout 30s docker ps -aq \
           --filter label=com.docker.compose.project=meet-production)" ] ||
           cleanup_status=1
@@ -235,7 +260,7 @@ PY
             cleanup_status=1
           fi
         done
-        rm -r -- "$case_root" "$state_root" || cleanup_status=1
+        timeout 30s rm -r -- "$case_root" "$state_root" || cleanup_status=1
         [ ! -e "$case_root" ] && [ ! -e "$state_root" ] ||
           cleanup_status=1
       fi
@@ -246,6 +271,51 @@ PY
           "$case_name"
       fi
       exit "$status"
+    }
+
+    secret_sentinels=(
+      "$case_secret"
+      "$credential_email"
+      "runtime-db-password-$case_name"
+      "runtime-jwt-secret-$case_name-0123456789abcdef0123456789abcdef"
+      "runtime-smtp-user"
+      "runtime-smtp-password"
+      "runtime-key"
+      "cmVhbC1ydW50aW1lLWtleS1ieXRlcy1mb3ItdGVzdA=="
+      "meeting-1d258"
+      "runtime-image-id"
+      "runtime-image-key"
+      "https://oauth2.example.invalid/token"
+      '-----BEGIN PRIVATE KEY-----'
+    )
+    scan_case_secrets() {
+      local pattern file container
+      local evidence_files=(
+        "$case_log"
+        "$rollback_capture"
+        "$deploy_capture"
+        "$probe_log"
+        "$state_root"
+      )
+      for pattern in "${secret_sentinels[@]}"; do
+        for file in "${evidence_files[@]}"; do
+          [ -e "$file" ] || continue
+          if grep -R -F -n --binary-files=without-match "$pattern" \
+            --exclude='config.*' --exclude='*.identity' --exclude='*.yml' \
+            --exclude='*.env*' "$file" 2>/dev/null; then
+            return 1
+          fi
+        done
+        while IFS= read -r container; do
+          [ -n "$container" ] || continue
+          if timeout 30s docker logs "$container" 2>&1 |
+            grep -F -- "$pattern" >/dev/null; then
+            return 1
+          fi
+        done < <(timeout 30s docker ps -aq \
+          --filter label=com.docker.compose.project=meet-production 2>/dev/null || true)
+      done
+      return 0
     }
 
     if [ -e "$case_root" ] || [ -L "$case_root" ] ||
@@ -327,6 +397,33 @@ SPRINGDOC_API_DOCS_ENABLED=false
 SPRINGDOC_SWAGGER_UI_ENABLED=false
 EOF
     chmod 600 "$case_root/.env.production"
+    cat >"$case_root/isolated-network.yml" <<'EOF'
+services:
+  backend:
+    networks:
+      - default
+  postgres:
+    networks:
+      - default
+networks:
+  default:
+    external: true
+    name: meet-production_default
+EOF
+    chmod 600 "$case_root/isolated-network.yml"
+    if timeout 30s python3 - "$probe_port" <<'PY'
+import socket
+import sys
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", int(sys.argv[1])))
+PY
+    then
+      :
+    else
+      echo "PREREQUISITE_MISSING: immutable runtime probe port is unavailable" >&2
+      exit 77
+    fi
     if [ "$provider_enabled" = true ]; then
       install -d -m 700 "$case_root/credentials"
       cat >"$case_root/credentials/firebase-service-account.json" <<EOF
@@ -335,6 +432,129 @@ EOF
       chown 0:10001 "$case_root/credentials/firebase-service-account.json"
       chmod 640 "$case_root/credentials/firebase-service-account.json"
     fi
+    cat >"$case_root/probe.py" <<'PY'
+import http.client
+import socket
+import ssl
+import sys
+
+probe_port, backend_port, certificate, private_key = sys.argv[1:]
+backend_port = int(backend_port)
+
+
+def read_request(connection):
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = connection.recv(4096)
+        if not chunk:
+            return None
+        data.extend(chunk)
+        if len(data) > 64 * 1024:
+            return None
+    head, _, remainder = bytes(data).partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    method, path, version = lines[0].split(" ", 2)
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    if length > 1024 * 1024:
+        return None
+    body = bytearray(remainder)
+    while len(body) < length:
+        chunk = connection.recv(min(4096, length - len(body)))
+        if not chunk:
+            return None
+        body.extend(chunk)
+    return method, path, version, headers, bytes(body[:length])
+
+
+def response(connection, status, body=b"", headers=None):
+    phrases = {200: "OK", 403: "Forbidden", 404: "Not Found", 308: "Permanent Redirect"}
+    response_headers = dict(headers or {})
+    response_headers.setdefault("Content-Type", "application/json")
+    response_headers["Content-Length"] = str(len(body))
+    response_headers["Connection"] = "close"
+    lines = [f"HTTP/1.1 {status} {phrases.get(status, 'Error')}\r\n"]
+    lines.extend(f"{key}: {value}\r\n" for key, value in response_headers.items())
+    connection.sendall("".join(lines).encode("latin-1") + b"\r\n" + body)
+
+
+def backend_request(method, path, body, request_headers):
+    connection = http.client.HTTPConnection("127.0.0.1", backend_port, timeout=10)
+    headers = {}
+    if "content-type" in request_headers:
+        headers["Content-Type"] = request_headers["content-type"]
+    connection.request(method, path, body=body, headers=headers)
+    result = connection.getresponse()
+    data = result.read(8 * 1024 * 1024 + 1)
+    if len(data) > 8 * 1024 * 1024:
+        raise RuntimeError("bounded proxy response exceeded")
+    return result.status, data, {
+        "Content-Type": result.getheader("Content-Type", "application/json")
+    }
+
+
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(certificate, private_key)
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", int(probe_port)))
+    listener.listen(16)
+    listener.settimeout(1)
+    while True:
+        try:
+            connection, _ = listener.accept()
+        except socket.timeout:
+            continue
+        with connection:
+            connection.settimeout(15)
+            try:
+                first = connection.recv(1, socket.MSG_PEEK)
+                tls = first == b"\x16"
+                if tls:
+                    connection = context.wrap_socket(connection, server_side=True)
+                request = read_request(connection)
+                if request is None:
+                    continue
+                method, path, _version, headers, body = request
+                if not tls:
+                    host = headers.get("host", f"127.0.0.1:{probe_port}")
+                    response(
+                        connection,
+                        308,
+                        headers={"Location": f"https://{host}{path}"},
+                    )
+                    continue
+                if path == "/actuator":
+                    response(connection, 404)
+                    continue
+                if path == "/meetings" and method == "GET":
+                    status, data, response_headers = backend_request(
+                        method, path, body, headers
+                    )
+                    response(connection, status, data, response_headers)
+                    continue
+                if path == "/admin/demo-catalog/bootstrap" and method == "POST":
+                    status, data, response_headers = backend_request(
+                        method, path, body, headers
+                    )
+                    response(connection, status, data, response_headers)
+                    continue
+                response(connection, 404)
+            except Exception:
+                try:
+                    response(connection, 404)
+                except Exception:
+                    pass
+PY
+    chmod 700 "$case_root/probe.py"
+    timeout 30s openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+      -subj /CN=127.0.0.1 \
+      -addext subjectAltName=IP:127.0.0.1 \
+      -keyout "$probe_key" -out "$probe_cert" >/dev/null 2>&1
+    chmod 600 "$probe_key" "$probe_cert"
 
     legacy_names=(
       31885558214-1-rollback-drill
@@ -371,13 +591,45 @@ EOF
     check_capture_bound() {
       [ "$(wc -c <"$1")" -le 8388608 ]
     }
-    compose up -d --wait --no-build --pull never >"$case_log" 2>&1
+    : >"$case_log"
+    timeout 30s docker network create --driver bridge --internal "$network_name" \
+      >>"$case_log" 2>&1
+    network_created=true
+    [ "$(timeout 30s docker network inspect "$network_name" \
+      --format '{{.Internal}}')" = true ]
+    printf 'network_isolation internal=true name=%s\n' "$network_name" >>"$case_log"
+    compose() {
+      timeout 300s docker compose -p meet-production \
+        --project-directory "$case_root" \
+        --env-file "$case_root/.env.production" \
+        -f "$case_root/docker-compose.production.yml" \
+        -f "$case_root/isolated-network.yml" "$@"
+    }
+    compose up -d --wait --no-build --pull never >>"$case_log" 2>&1
     check_capture_bound "$case_log"
     backend=$(compose ps -q backend)
     postgres=$(compose ps -q postgres)
     [ -n "$backend" ] && [ -n "$postgres" ]
-    [ "$(docker inspect "$backend" --format '{{.Image}}')" = "$previous_id" ]
-    [ "$(docker inspect "$postgres" --format '{{.State.Health.Status}}')" = healthy ]
+    [ "$(timeout 30s docker inspect "$backend" --format '{{.Image}}')" = "$previous_id" ]
+    [ "$(timeout 30s docker inspect "$postgres" --format '{{.State.Health.Status}}')" = healthy ]
+    timeout 1800s python3 "$case_root/probe.py" "$probe_port" "$app_port" \
+      "$probe_cert" "$probe_key" >"$probe_log" 2>&1 &
+    probe_pid=$!
+    probe_ready=false
+    for _ in $(seq 1 30); do
+      if ! kill -0 "$probe_pid" 2>/dev/null; then
+        break
+      fi
+      probe_status=$(CURL_CA_BUNDLE="$probe_cert" timeout 3s curl \
+        --silent --output /dev/null --write-out '%{http_code}' \
+        "$public_url/actuator" 2>/dev/null || true)
+      if [ "$probe_status" = 404 ]; then
+        probe_ready=true
+        break
+      fi
+      sleep 1
+    done
+    [ "$probe_ready" = true ]
 
     verify_case_runtime() {
       local expected_id=$1
@@ -386,7 +638,7 @@ EOF
       local current_backend current_hash
       current_backend=$(compose ps -q backend)
       [ -n "$current_backend" ]
-      current_hash=$(docker inspect "$current_backend" \
+      current_hash=$(timeout 30s docker inspect "$current_backend" \
         --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
       timeout 90s bash -c '
         set -euo pipefail
@@ -402,7 +654,7 @@ EOF
     observe_provider() {
       local current_backend
       current_backend=$(compose ps -q backend)
-      docker inspect "$current_backend" |
+      timeout 30s docker inspect "$current_backend" |
         timeout 30s python3 "$ROOT_DIR/scripts/test-vps-provider-credential.py" observe
     }
 
@@ -437,40 +689,47 @@ EOF
         retention-list --state-root "$state_root" >/dev/null
     }
 
-    scan_case_secrets() {
-      local pattern container
-      for pattern in "$case_secret" "$credential_email" \
-        '-----BEGIN PRIVATE KEY-----'; do
-        if grep -R -F -n --binary-files=without-match "$pattern" \
-          "$case_log" "$state_root" "$case_root/.env.production" \
-          "$case_root/docker-compose.production.yml" \
-          "$case_root/active-compose.yml" \
-          "$case_root/active-runtime.override.yml" 2>/dev/null; then
-          echo "runtime fixture leaked synthetic credential material" >&2
-          return 1
-        fi
-        for container in $(compose ps -q backend) $(compose ps -q postgres); do
-          if timeout 30s docker logs "$container" 2>&1 |
-            grep -F -- "$pattern" >/dev/null; then
-            return 1
-          fi
-        done
-      done
-    }
-
     run_coordinator() {
-      timeout 1200s env TEST_VPS_STATE_ROOT="$state_root" \
+      timeout 1200s env \
+        CURL_CA_BUNDLE="$probe_cert" \
+        TEST_VPS_STATE_ROOT="$state_root" \
         bash "$ROOT_DIR/scripts/deploy-test-vps-provider-release.sh" \
         --root "$case_root" \
         --base-compose "$case_root/docker-compose.production.yml" \
         --image "$1" --revision "$2" --version "$3" \
-        --run-key "$4" --mode "$5"
+        --run-key "$4" --mode "$5" --public-url "$public_url"
+    }
+
+    run_rollback_drill() {
+      local coordinator_pid current_backend target_seen=false
+      run_coordinator "$target_image" "$target_revision" \
+        "$target_version" "$rollback_run_key" rollback-drill \
+        >"$rollback_capture" 2>&1 &
+      coordinator_pid=$!
+      for _ in $(seq 1 300); do
+        if ! kill -0 "$coordinator_pid" 2>/dev/null; then
+          break
+        fi
+        current_backend=$(compose ps -q backend)
+        if [ -n "$current_backend" ] &&
+          [ "$(timeout 30s docker inspect "$current_backend" \
+            --format '{{.Image}}')" = "$target_id" ]; then
+          target_seen=true
+          verify_case_runtime "$target_id" "$target_revision" "$target_version"
+          break
+        fi
+        sleep 1
+      done
+      set +e
+      wait "$coordinator_pid"
+      local coordinator_status=$?
+      set -e
+      [ "$target_seen" = true ]
+      return "$coordinator_status"
     }
 
     set +e
-    run_coordinator "$target_image" "$target_revision" \
-      "$target_version" "$rollback_run_key" rollback-drill \
-      >"$rollback_capture" 2>&1
+    run_rollback_drill
     rollback_status=$?
     set -e
     check_capture_bound "$rollback_capture"
@@ -505,7 +764,7 @@ EOF
     target_state="$state_root/$deploy_run_key-final-deploy"
     assert_terminal_state "$target_state" committed "$provider_enabled"
     backend=$(compose ps -q backend)
-    [ "$(docker inspect "$backend" --format '{{.Image}}')" = "$target_id" ]
+    [ "$(timeout 30s docker inspect "$backend" --format '{{.Image}}')" = "$target_id" ]
     verify_case_runtime "$target_id" "$target_revision" "$target_version"
     assert_provider_state "$provider_enabled"
     [ "$(grep '^BACKEND_IMAGE=' "$case_root/.env.production")" = \
@@ -520,7 +779,7 @@ EOF
   run_image_case disabled 1 930000001-1 930000002-1 false
   run_image_case enabled 2 930000003-1 930000004-1 true
   trap - EXIT
-  rm -r -- "$matrix_fixture"
+  timeout 30s rm -r -- "$matrix_fixture"
 fi
 
 fixture=$(mktemp -d /var/lib/meet-provider-fixture.XXXXXX)
@@ -528,7 +787,7 @@ chmod 700 "$fixture"
 cleanup() {
   local status=$?
   trap - EXIT
-  rm -r -- "$fixture"
+  timeout 30s rm -r -- "$fixture"
   exit "$status"
 }
 trap cleanup EXIT
