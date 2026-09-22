@@ -492,7 +492,7 @@ PY
           set +e
           ;;
       esac
-      : >"$output"
+      : >"$output" 2>/dev/null || prerequisite_missing
       "$@" 2>&1 |
         python3 -c '
 import sys
@@ -527,13 +527,65 @@ sys.exit(125 if overflow else 0)
     root_identity() {
       stat -c '%d:%i:%f:%u:%g' -- "$1"
     }
+    record_owned_root() {
+      local path=$1 identity
+      identity=$(root_identity "$path" 2>/dev/null) || prerequisite_missing
+      case "$path" in
+        "$case_root")
+          case_root_created=true
+          case_root_identity=$identity
+          ;;
+        "$state_parent")
+          state_parent_created=true
+          state_parent_identity=$identity
+          ;;
+        "$state_root")
+          state_root_created=true
+          state_root_identity=$identity
+          ;;
+      esac
+    }
     create_owned_root() {
       local path=$1
       if ! mkdir -m 700 -- "$path" 2>/dev/null; then
         prerequisite_missing
       fi
+      record_owned_root "$path"
       chown 0:0 -- "$path" 2>/dev/null || prerequisite_missing
       chmod 700 -- "$path" 2>/dev/null || prerequisite_missing
+    }
+    fixture_copy() {
+      cp -- "$1" "$2" 2>/dev/null || prerequisite_missing
+    }
+    fixture_install_dir() {
+      install -d -m "$1" -- "$2" 2>/dev/null || prerequisite_missing
+    }
+    fixture_write() {
+      local path=$1
+      local mode=$2
+      cat >"$path" 2>/dev/null || prerequisite_missing
+      chmod "$mode" "$path" 2>/dev/null || prerequisite_missing
+    }
+    fixture_append() {
+      cat >>"$1" 2>/dev/null || prerequisite_missing
+    }
+    fixture_chown() {
+      chown "$1" "$2" 2>/dev/null || prerequisite_missing
+    }
+    fixture_touch() {
+      touch "$@" 2>/dev/null || prerequisite_missing
+    }
+    fixture_truncate() {
+      : >"$1" 2>/dev/null || prerequisite_missing
+    }
+    fixture_tls() {
+      timeout 30s openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -subj /CN=127.0.0.1 \
+        -addext subjectAltName=IP:127.0.0.1 \
+        -keyout "$probe_key" -out "$probe_cert" >/dev/null 2>&1 ||
+        prerequisite_missing
+      chmod 600 "$probe_key" "$probe_cert" 2>/dev/null ||
+        prerequisite_missing
     }
     assert_resource_absent() {
       local kind=$1
@@ -849,25 +901,20 @@ PY
 
     trap cleanup_case EXIT
     create_owned_root "$case_root"
-    case_root_created=true
-    case_root_identity=$(root_identity "$case_root")
     create_owned_root "$state_parent"
-    state_parent_created=true
-    state_parent_identity=$(root_identity "$state_parent")
     create_owned_root "$state_root"
-    state_root_created=true
-    state_root_identity=$(root_identity "$state_root")
-    cp -- "$ROOT_DIR/docker-compose.production.yml" \
+    fixture_copy "$ROOT_DIR/docker-compose.production.yml" \
       "$case_root/docker-compose.production.yml"
-    chmod 600 "$case_root/docker-compose.production.yml"
-    cat >>"$case_root/docker-compose.production.yml" <<'EOF'
+    chmod 600 "$case_root/docker-compose.production.yml" 2>/dev/null ||
+      prerequisite_missing
+    fixture_append "$case_root/docker-compose.production.yml" <<'EOF'
 
 networks:
   default:
     external: true
     name: meet-production_default
 EOF
-    cat >"$case_root/.env.production" <<EOF
+    fixture_write "$case_root/.env.production" 600 <<EOF
 APP_PORT=$app_port
 BACKEND_MEMORY_LIMIT=768m
 DOCKER_LOG_MAX_SIZE=10m
@@ -920,8 +967,7 @@ TIMEPAD_CITIES=
 SPRINGDOC_API_DOCS_ENABLED=false
 SPRINGDOC_SWAGGER_UI_ENABLED=false
 EOF
-    chmod 600 "$case_root/.env.production"
-    cat >"$case_root/isolated-network.yml" <<'EOF'
+    fixture_write "$case_root/isolated-network.yml" 600 <<'EOF'
 services:
   backend:
     networks:
@@ -934,7 +980,6 @@ networks:
     external: true
     name: meet-production_default
 EOF
-    chmod 600 "$case_root/isolated-network.yml"
     if timeout 30s python3 - "$probe_port" 2>/dev/null <<'PY'
 import socket
 import sys
@@ -948,14 +993,13 @@ PY
       prerequisite_missing
     fi
     if [ "$provider_enabled" = true ]; then
-      install -d -m 700 "$case_root/credentials"
-      cat >"$case_root/credentials/firebase-service-account.json" <<EOF
+      fixture_install_dir 700 "$case_root/credentials"
+      fixture_write "$case_root/credentials/firebase-service-account.json" 640 <<EOF
 {"type":"service_account","project_id":"meeting-1d258","client_email":"$credential_email","client_id":"runtime-image-id","private_key_id":"runtime-image-key","private_key":"-----BEGIN PRIVATE KEY-----\n$case_secret\n-----END PRIVATE KEY-----","token_uri":"https://oauth2.example.invalid/token"}
 EOF
-      chown 0:10001 "$case_root/credentials/firebase-service-account.json"
-      chmod 640 "$case_root/credentials/firebase-service-account.json"
+      fixture_chown 0:10001 "$case_root/credentials/firebase-service-account.json"
     fi
-    cat >"$case_root/probe.py" <<'PY'
+    fixture_write "$case_root/probe.py" 700 <<'PY'
 import http.client
 import socket
 import ssl
@@ -1072,12 +1116,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
                 except Exception:
                     pass
 PY
-    chmod 700 "$case_root/probe.py"
-    timeout 30s openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-      -subj /CN=127.0.0.1 \
-      -addext subjectAltName=IP:127.0.0.1 \
-      -keyout "$probe_key" -out "$probe_cert" >/dev/null 2>&1
-    chmod 600 "$probe_key" "$probe_cert"
+    fixture_tls
 
     legacy_names=(
       31885558214-1-rollback-drill
@@ -1099,11 +1138,11 @@ PY
     }
     legacy_index=0
     for name in "${legacy_names[@]}"; do
-      install -d -m 700 "$state_root/$name"
-      printf 'legacy immutable-runtime bytes: %s\n' "$name" \
-        >"$state_root/$name/opaque.bin"
-      chmod 600 "$state_root/$name/opaque.bin"
-      touch -d "@$((1700000000 + legacy_index)).123456789" \
+      fixture_install_dir 700 "$state_root/$name"
+      fixture_write "$state_root/$name/opaque.bin" 600 <<EOF
+legacy immutable-runtime bytes: $name
+EOF
+      fixture_touch -d "@$((1700000000 + legacy_index)).123456789" \
         "$state_root/$name/opaque.bin" "$state_root/$name"
       legacy_index=$((legacy_index + 1))
     done

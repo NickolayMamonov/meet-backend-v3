@@ -4,12 +4,19 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT_DIR"
 
+prerequisite_missing() {
+  echo "PREREQUISITE_MISSING" >&2
+  exit 77
+}
+
 if [ "$(uname -s)" != Linux ] || [ "$(id -u)" -ne 0 ]; then
   echo "PREREQUISITE_MISSING" >&2
   exit 77
 fi
 
-fixture_root=$(mktemp -d /tmp/meet-retention-fixture.XXXXXX)
+fixture_root=$(mktemp -d /tmp/meet-retention-fixture.XXXXXX 2>/dev/null) ||
+  prerequisite_missing
+chmod 700 "$fixture_root" 2>/dev/null || prerequisite_missing
 state_root=/var/lib/meet-test-vps-deploy
 production_root=/var/lib/meet-retention-production
 production_runtime_root=/var/lib/meet-production
@@ -17,17 +24,18 @@ fake_bin="$fixture_root/bin"
 remote_script="$fixture_root/retention-remote.sh"
 created_fixed_roots=()
 created_fixed_root_identities=()
+owned_root_recorder=record_created_root
 root_identity() {
   stat -c '%d:%i:%f:%u:%g' -- "$1"
 }
 create_owned_root() {
   local path=$1
-  if ! mkdir -m 700 -- "$path"; then
-    echo "PREREQUISITE_MISSING: fixed retention root creation raced or already exists" >&2
-    return 77
+  if ! mkdir -m 700 -- "$path" 2>/dev/null; then
+    prerequisite_missing
   fi
-  chown 0:0 -- "$path"
-  chmod 700 -- "$path"
+  "$owned_root_recorder" "$path"
+  chown 0:0 -- "$path" 2>/dev/null || prerequisite_missing
+  chmod 700 -- "$path" 2>/dev/null || prerequisite_missing
 }
 remove_owned_root() {
   local path=$1
@@ -144,9 +152,29 @@ PY
 }
 record_created_root() {
   local path=$1
-  [ -d "$path" ] && [ ! -L "$path" ]
+  local identity
+  [ -d "$path" ] && [ ! -L "$path" ] || prerequisite_missing
+  identity=$(root_identity "$path" 2>/dev/null) || prerequisite_missing
   created_fixed_roots+=("$path")
-  created_fixed_root_identities+=("$(root_identity "$path")")
+  created_fixed_root_identities+=("$identity")
+}
+fixture_install_dir() {
+  install -d -m "$1" -- "$2" 2>/dev/null || prerequisite_missing
+}
+fixture_write() {
+  local path=$1
+  local mode=$2
+  cat >"$path" 2>/dev/null || prerequisite_missing
+  chmod "$mode" "$path" 2>/dev/null || prerequisite_missing
+}
+fixture_append() {
+  cat >>"$1" 2>/dev/null || prerequisite_missing
+}
+fixture_copy() {
+  cp -- "$1" "$2" 2>/dev/null || prerequisite_missing
+}
+fixture_touch() {
+  touch "$@" 2>/dev/null || prerequisite_missing
 }
 cleanup() {
   local status=$?
@@ -158,14 +186,16 @@ cleanup() {
     expected=${created_fixed_root_identities[$index]}
     if [ -e "$path" ] || [ -L "$path" ]; then
       if [ ! -d "$path" ] || [ -L "$path" ] ||
-        ! actual=$(root_identity "$path") || [ "$actual" != "$expected" ]; then
+        ! actual=$(root_identity "$path" 2>/dev/null) ||
+        [ "$actual" != "$expected" ]; then
         cleanup_status=1
       else
         remove_owned_root "$path" "$expected" || cleanup_status=1
       fi
     fi
   done
-  timeout 30s rm -r -- "$fixture_root" || cleanup_status=1
+  timeout 30s rm -r -- "$fixture_root" >/dev/null 2>&1 ||
+    cleanup_status=1
   [ "$status" -ne 0 ] || [ "$cleanup_status" -eq 0 ] || status=1
   exit "$status"
 }
@@ -194,9 +224,11 @@ done
   probe_root_identities=()
   record_probe_root() {
     local path=$1
-    [ -d "$path" ] && [ ! -L "$path" ]
+    local identity
+    [ -d "$path" ] && [ ! -L "$path" ] || prerequisite_missing
+    identity=$(root_identity "$path" 2>/dev/null) || prerequisite_missing
     probe_roots+=("$path")
-    probe_root_identities+=("$(root_identity "$path")")
+    probe_root_identities+=("$identity")
   }
   probe_cleanup() {
     local index path expected actual
@@ -204,18 +236,19 @@ done
       path=${probe_roots[$index]}
       expected=${probe_root_identities[$index]}
       if [ -e "$path" ] || [ -L "$path" ]; then
-        actual=$(root_identity "$path") || exit 1
+        actual=$(root_identity "$path" 2>/dev/null) || exit 1
         [ "$actual" = "$expected" ] || exit 1
         remove_owned_root "$path" "$expected" || exit 1
       fi
     done
   }
   trap probe_cleanup EXIT
+  owned_root_recorder=record_probe_root
   for path in "$state_root" "$production_root" "$production_runtime_root"; do
     create_owned_root "$path"
-    record_probe_root "$path"
-    printf 'fixed-root-sentinel\n' >"$path/sentinel"
-    chmod 600 "$path/sentinel"
+    fixture_write "$path/sentinel" 600 <<'EOF'
+fixed-root-sentinel
+EOF
   done
   fixed_before=$(
     for path in "$state_root" "$production_root" "$production_runtime_root"; do
@@ -261,29 +294,43 @@ write_owner_marker() {
   local run_key=${name%-final-deploy}
   [ "$run_key" = "$name" ] && run_key=${name%-rollback-drill}
   local state_kind=${name#"$run_key"-}
-  printf '{"schemaVersion":1,"owner":"meet-test-vps-provider","runKey":"%s","stateKind":"%s"}\n' \
-    "$run_key" "$state_kind" >"$state/provider-owner.json"
-  chmod 600 "$state/provider-owner.json"
+  fixture_write "$state/provider-owner.json" 600 <<EOF
+{"schemaVersion":1,"owner":"meet-test-vps-provider","runKey":"$run_key","stateKind":"$state_kind"}
+EOF
 }
 
-install -d -m 700 "$fake_bin"
+fixture_install_dir 700 "$fake_bin"
 create_owned_root "$state_root"
-record_created_root "$state_root"
 create_owned_root "$production_root"
-record_created_root "$production_root"
 create_owned_root "$production_runtime_root"
-record_created_root "$production_runtime_root"
-printf 'fixture\n' >"$production_root/.env.production"
-printf 'services:\n  backend:\n    image: fixture\n' >"$production_root/docker-compose.production.yml"
-printf 'services:\n  backend:\n    image: fixture\n' >"$production_runtime_root/active-compose.yml"
-printf 'services:\n  backend:\n    healthcheck:\n      test: ["CMD", "true"]\n' >"$production_runtime_root/active-runtime.override.yml"
+owned_root_recorder=record_created_root
+fixture_write "$production_root/.env.production" 600 <<'EOF'
+fixture
+EOF
+fixture_write "$production_root/docker-compose.production.yml" 600 <<'EOF'
+services:
+  backend:
+    image: fixture
+EOF
+fixture_write "$production_runtime_root/active-compose.yml" 600 <<'EOF'
+services:
+  backend:
+    image: fixture
+EOF
+fixture_write "$production_runtime_root/active-runtime.override.yml" 600 <<'EOF'
+services:
+  backend:
+    healthcheck:
+      test: ["CMD", "true"]
+EOF
 
 legacy_index=0
 for name in "${legacy_names[@]}"; do
-  install -d -m 700 "$state_root/$name"
-  printf 'legacy synthetic bytes: %s\n' "$name" >"$state_root/$name/opaque.bin"
-  chmod 600 "$state_root/$name/opaque.bin"
-  touch -d "@$((1700000000 + legacy_index)).123456789" \
+  fixture_install_dir 700 "$state_root/$name"
+  fixture_write "$state_root/$name/opaque.bin" 600 <<EOF
+legacy synthetic bytes: $name
+EOF
+  fixture_touch -d "@$((1700000000 + legacy_index)).123456789" \
     "$state_root/$name/opaque.bin" "$state_root/$name"
   legacy_index=$((legacy_index + 1))
 done
@@ -299,7 +346,7 @@ set -e
 grep -Fq 'RECOVERY_REQUIRED' <<<"$legacy_delete_output"
 test "$legacy_before" = "$(legacy_digest)"
 
-cat >"$fake_bin/docker" <<'FAKE_DOCKER'
+fixture_write "$fake_bin/docker" 700 <<'FAKE_DOCKER'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
@@ -334,24 +381,24 @@ case "${1:-}" in
     ;;
 esac
 FAKE_DOCKER
-chmod 700 "$fake_bin/docker"
 
-awk '
+remote_content=$(awk '
   /name: Apply bounded test-VPS deployment retention/ { section=1 }
   section && /<<'\''REMOTE'\''/ { inside=1; next }
   inside && /^          REMOTE$/ { exit }
   inside { sub(/^          /, ""); print }
-' .github/workflows/deploy-test-vps.yml >"$remote_script"
-chmod 700 "$remote_script"
+' .github/workflows/deploy-test-vps.yml 2>/dev/null) ||
+  prerequisite_missing
+fixture_write "$remote_script" 700 <<<"$remote_content"
 
 for index in $(seq 1 12); do
   state="$state_root/${index}-1-final-deploy"
-  install -d -m 700 "$state"
-  printf '{"schemaVersion":1,"runKey":"%s-1","outcome":"committed","providerEnabled":false}\n' \
-    "$index" >"$state/terminal.json"
-  chmod 600 "$state/terminal.json"
+  fixture_install_dir 700 "$state"
+  fixture_write "$state/terminal.json" 600 <<EOF
+{"schemaVersion":1,"runKey":"$index-1","outcome":"committed","providerEnabled":false}
+EOF
   write_owner_marker "$state"
-  touch -d "@$((1800000000 - index)).123456789" "$state"
+  fixture_touch -d "@$((1800000000 - index)).123456789" "$state"
 done
 owned_digest() {
   local path=$1
@@ -375,9 +422,10 @@ test "$protected_before" = "$(owned_digest "$protected_state")"
 smtp_guard="$state_root/2-1-final-deploy"
 smtp_before=$(owned_digest "$smtp_guard")
 smtp_quarantine="$state_root/.provider-state.smtp-guard.tmp"
-install -d -m 700 "$smtp_quarantine"
-printf 'pre-existing smtp quarantine\n' >"$smtp_quarantine/sentinel"
-chmod 600 "$smtp_quarantine/sentinel"
+fixture_install_dir 700 "$smtp_quarantine"
+fixture_write "$smtp_quarantine/sentinel" 600 <<'EOF'
+pre-existing smtp quarantine
+EOF
 smtp_quarantine_before=$(owned_digest "$smtp_quarantine")
 ln -s "$state_root/missing-smtp-transaction-target" \
   "$state_root/.smtp-transaction.current"
@@ -395,31 +443,38 @@ test "$smtp_before" = "$(owned_digest "$smtp_guard")"
 test "$smtp_quarantine_before" = "$(owned_digest "$smtp_quarantine")"
 rm -f -- "$state_root/.smtp-transaction.current"
 rm -r -- "$smtp_quarantine"
-install -d -m 700 "$state_root/12-1-final-deploy/protected-input"
-install -d -m 700 "$state_root/12-1-final-deploy/provider-runtime"
-printf 'services:\n  backend:\n    volumes: []\n' \
-  >"$state_root/12-1-final-deploy/target-runtime.override.yml"
-install -d -m 700 "$state_root/12-1-final-deploy-shadow"
-install -d -m 700 "$state_root/14-1-final-deploy"
-printf '{"schemaVersion":1,"runKey":"14-1","outcome":"committed","providerEnabled":false}\n' \
-  >"$state_root/14-1-final-deploy/terminal.json"
-chmod 600 "$state_root/14-1-final-deploy/terminal.json"
+fixture_install_dir 700 "$state_root/12-1-final-deploy/protected-input"
+fixture_install_dir 700 "$state_root/12-1-final-deploy/provider-runtime"
+fixture_write "$state_root/12-1-final-deploy/target-runtime.override.yml" 600 <<'EOF'
+services:
+  backend:
+    volumes: []
+EOF
+fixture_install_dir 700 "$state_root/12-1-final-deploy-shadow"
+fixture_install_dir 700 "$state_root/14-1-final-deploy"
+fixture_write "$state_root/14-1-final-deploy/terminal.json" 600 <<'EOF'
+{"schemaVersion":1,"runKey":"14-1","outcome":"committed","providerEnabled":false}
+EOF
 write_owner_marker "$state_root/14-1-final-deploy"
-printf 'unknown\n' >"$state_root/14-1-final-deploy/unknown.txt"
-touch -d '@1799999980.123456789' "$state_root/14-1-final-deploy"
-install -d -m 700 "$state_root/17-1-final-deploy"
-printf '{"schemaVersion":1,"runKey":"17-1","outcome":"committed","providerEnabled":false}\n' \
-  >"$state_root/17-1-final-deploy/terminal.json"
-chmod 600 "$state_root/17-1-final-deploy/terminal.json"
+fixture_write "$state_root/14-1-final-deploy/unknown.txt" 600 <<'EOF'
+unknown
+EOF
+fixture_touch -d '@1799999980.123456789' "$state_root/14-1-final-deploy"
+fixture_install_dir 700 "$state_root/17-1-final-deploy"
+fixture_write "$state_root/17-1-final-deploy/terminal.json" 600 <<'EOF'
+{"schemaVersion":1,"runKey":"17-1","outcome":"committed","providerEnabled":false}
+EOF
 write_owner_marker "$state_root/17-1-final-deploy"
-printf 'unknown-before-race\n' >"$state_root/17-1-final-deploy/unknown-before-race.txt"
-touch -d '@1799999970.123456789' "$state_root/17-1-final-deploy"
+fixture_write "$state_root/17-1-final-deploy/unknown-before-race.txt" 600 <<'EOF'
+unknown-before-race
+EOF
+fixture_touch -d '@1799999970.123456789' "$state_root/17-1-final-deploy"
 
 tooling_root="$production_root/.test-vps-tooling-1-1"
-install -d -m 700 "$tooling_root/scripts"
-cp scripts/test-vps-provider-credential.py \
+fixture_install_dir 700 "$tooling_root/scripts"
+fixture_copy scripts/test-vps-provider-credential.py \
   "$tooling_root/scripts/provider-credential-real.py"
-cat >"$tooling_root/scripts/test-vps-provider-credential.py" <<EOF
+fixture_write "$tooling_root/scripts/test-vps-provider-credential.py" 700 <<EOF
 #!/usr/bin/env python3
 import pathlib
 import runpy
@@ -439,7 +494,6 @@ if arguments and arguments[0] == "retention-delete":
 module = runpy.run_path("$tooling_root/scripts/provider-credential-real.py")
 raise SystemExit(module["main"](arguments))
 EOF
-chmod 700 "$tooling_root/scripts/test-vps-provider-credential.py"
 PATH="$fake_bin:$PATH" bash "$remote_script" \
   "$production_root" 1 1 "$tooling_root"
 
@@ -468,9 +522,10 @@ grep -Fq 'RECOVERY_REQUIRED' <<<"$symlink_output"
 rm -f -- "$state_root/13-1-final-deploy"
 
 unresolved_state="$state_root/19-1-final-deploy"
-install -d -m 700 "$unresolved_state"
-printf 'pre-marker-snapshot\n' >"$unresolved_state/config.env.production"
-chmod 600 "$unresolved_state/config.env.production"
+fixture_install_dir 700 "$unresolved_state"
+fixture_write "$unresolved_state/config.env.production" 600 <<'EOF'
+pre-marker-snapshot
+EOF
 set +e
 unresolved_output=$(bash "$remote_script" \
   "$production_root" 1 1 "$production_root/.missing-tooling" 2>&1)
@@ -482,14 +537,14 @@ grep -Fq 'RECOVERY_REQUIRED' <<<"$unresolved_output"
 rm -r -- "$unresolved_state"
 
 hard_state="$state_root/18-1-final-deploy"
-install -d -m 700 "$hard_state"
+fixture_install_dir 700 "$hard_state"
 hard_witness="$fixture_root/operator-owned-terminal.json"
-printf '{"schemaVersion":1,"runKey":"18-1","outcome":"committed","providerEnabled":false}\n' \
-  >"$hard_witness"
+fixture_write "$hard_witness" 600 <<'EOF'
+{"schemaVersion":1,"runKey":"18-1","outcome":"committed","providerEnabled":false}
+EOF
 rm -f -- "$hard_state/terminal.json"
 ln "$hard_witness" "$hard_state/terminal.json"
-touch -d '@1799999960.123456789' "$hard_state"
-chmod 600 "$hard_witness"
+fixture_touch -d '@1799999960.123456789' "$hard_state"
 set +e
 hard_output=$(python3 scripts/test-vps-provider-credential.py \
   retention-delete --state-root "$state_root" \
@@ -504,28 +559,27 @@ grep -Fq 'RECOVERY_REQUIRED' <<<"$hard_output"
 rm -r -- "$hard_state" "$hard_witness"
 
 hang_bin="$fixture_root/hang-bin"
-install -d -m 700 "$hang_bin"
+fixture_install_dir 700 "$hang_bin"
 real_timeout=$(command -v timeout)
-cat >"$hang_bin/timeout" <<EOF
+fixture_write "$hang_bin/timeout" 700 <<EOF
 #!/usr/bin/env bash
 if [ "\${2:-}" = docker ]; then
   exit 124
 fi
 exec "$real_timeout" "\$@"
 EOF
-chmod 700 "$hang_bin/timeout"
 state="$state_root/16-1-final-deploy"
-install -d -m 700 "$state"
-printf '{"schemaVersion":1,"runKey":"16-1","outcome":"committed","providerEnabled":false}\n' \
-  >"$state/terminal.json"
-chmod 600 "$state/terminal.json"
+fixture_install_dir 700 "$state"
+fixture_write "$state/terminal.json" 600 <<'EOF'
+{"schemaVersion":1,"runKey":"16-1","outcome":"committed","providerEnabled":false}
+EOF
 write_owner_marker "$state"
-touch -d '@1799999980.123456789' "$state"
+fixture_touch -d '@1799999980.123456789' "$state"
 tooling_root="$production_root/.test-vps-tooling-1-1"
-install -d -m 700 "$tooling_root/scripts"
-cp scripts/test-vps-provider-credential.py \
+fixture_install_dir 700 "$tooling_root/scripts"
+fixture_copy scripts/test-vps-provider-credential.py \
   "$tooling_root/scripts/provider-credential-real.py"
-cat >"$tooling_root/scripts/test-vps-provider-credential.py" <<EOF
+fixture_write "$tooling_root/scripts/test-vps-provider-credential.py" 700 <<EOF
 #!/usr/bin/env python3
 import runpy
 import sys
@@ -533,7 +587,6 @@ import sys
 module = runpy.run_path("$tooling_root/scripts/provider-credential-real.py")
 raise SystemExit(module["main"](sys.argv[1:]))
 EOF
-chmod 700 "$tooling_root/scripts/test-vps-provider-credential.py"
 set +e
 timeout_output=$(PATH="$hang_bin:$fake_bin:$PATH" bash "$remote_script" \
   "$production_root" 1 1 "$tooling_root" 2>&1)
@@ -549,17 +602,17 @@ PATH="$fake_bin:$PATH" bash "$remote_script" \
 [ ! -e "$tooling_root" ]
 
 state="$state_root/15-1-final-deploy"
-install -d -m 700 "$state"
-printf '{"schemaVersion":1,"runKey":"15-1","outcome":"committed","providerEnabled":false}\n' \
-  >"$state/terminal.json"
-chmod 600 "$state/terminal.json"
+fixture_install_dir 700 "$state"
+fixture_write "$state/terminal.json" 600 <<'EOF'
+{"schemaVersion":1,"runKey":"15-1","outcome":"committed","providerEnabled":false}
+EOF
 write_owner_marker "$state"
-touch -d '@1799999970.123456789' "$state"
+fixture_touch -d '@1799999970.123456789' "$state"
 tooling_root="$production_root/.test-vps-tooling-1-1"
-install -d -m 700 "$tooling_root/scripts"
-cp scripts/test-vps-provider-credential.py \
+fixture_install_dir 700 "$tooling_root/scripts"
+fixture_copy scripts/test-vps-provider-credential.py \
   "$tooling_root/scripts/provider-credential-real.py"
-cat >"$tooling_root/scripts/test-vps-provider-credential.py" <<EOF
+fixture_write "$tooling_root/scripts/test-vps-provider-credential.py" 700 <<EOF
 #!/usr/bin/env python3
 import runpy
 import sys
@@ -567,7 +620,6 @@ import sys
 module = runpy.run_path("$tooling_root/scripts/provider-credential-real.py")
 raise SystemExit(module["main"](sys.argv[1:]))
 EOF
-chmod 700 "$tooling_root/scripts/test-vps-provider-credential.py"
 PATH="$fake_bin:$PATH" bash "$remote_script" \
   "$production_root" 1 1 "$tooling_root"
 [ ! -e "$state_root/15-1-final-deploy" ]
