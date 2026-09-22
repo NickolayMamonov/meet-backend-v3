@@ -30,10 +30,27 @@ transport_record_loaded_id() {
   done
   transport_loaded_ids+=("$id")
 }
+transport_images_absent() {
+  local id inspect_output
+  for id in "${transport_loaded_ids[@]}"; do
+    if inspect_output=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
+      "$transport_real_docker" image inspect "$id" 2>&1); then
+      return 1
+    fi
+    inspect_output=${inspect_output,,}
+    case "$inspect_output" in
+      *"no such image"*|*"not found"*) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
 transport_cleanup_body() {
   local status=$1
   local cleanup_status=0
   local -a remove_ids=()
+  local images_clean=true
+  local map_clean=true
   if [ "$transport_loaded" = true ]; then
     if [ "${#transport_loaded_ids[@]}" -gt 0 ]; then
       remove_ids+=("${transport_loaded_ids[@]}")
@@ -46,17 +63,24 @@ transport_cleanup_body() {
       if ! timeout 60s env DOCKER_HOST="$transport_target_host" \
         "$transport_real_docker" image rm "${remove_ids[@]}" >/dev/null 2>&1; then
         cleanup_status=1
+        images_clean=false
+      elif ! transport_images_absent; then
+        cleanup_status=1
+        images_clean=false
       fi
     fi
     if [ -n "$transport_map_dir" ]; then
       if ! timeout 30s rm -r -- "$transport_map_dir" >/dev/null 2>&1; then
         cleanup_status=1
+        map_clean=false
       fi
     fi
-    transport_loaded=false
-    transport_loaded_ids=()
-    transport_map_dir=
-    transport_postgres_run_owned=false
+    if [ "$images_clean" = true ] && [ "$map_clean" = true ]; then
+      transport_loaded=false
+      transport_loaded_ids=()
+      transport_map_dir=
+      transport_postgres_run_owned=false
+    fi
   fi
   [ "$status" -ne 0 ] || [ "$cleanup_status" -eq 0 ] || status=1
   return "$status"
@@ -134,27 +158,31 @@ if [ "$filesystem_only" = false ]; then
           timeout 300s env DOCKER_HOST="$transport_target_host" \
             docker load 2>/dev/null
       ) || load_status=$?
+      target_ids_after=$(timeout 30s \
+        env DOCKER_HOST="$transport_target_host" \
+        docker image ls --no-trunc --format '{{.ID}}' 2>/dev/null) ||
+        prerequisite_missing
+      new_ids=()
+      while IFS= read -r candidate_id; do
+        [ -n "$candidate_id" ] || continue
+        [[ "$candidate_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+          prerequisite_missing
+        if ! grep -Fxq "$candidate_id" <<<"$target_ids_before"; then
+          transport_record_loaded_id "$candidate_id"
+          new_ids+=("$candidate_id")
+        fi
+      done <<<"$target_ids_after"
       loaded_id=$(sed -nE \
         's/^Loaded image ID: (sha256:[0-9a-f]{64})$/\1/p' <<<"$load_output")
       if ! [[ "$loaded_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-        target_ids_after=$(timeout 30s \
-          env DOCKER_HOST="$transport_target_host" \
-          docker image ls --no-trunc --format '{{.ID}}' 2>/dev/null) ||
-          prerequisite_missing
-        loaded_id=
-        while IFS= read -r candidate_id; do
-          [[ "$candidate_id" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
-          if ! grep -Fxq "$candidate_id" <<<"$target_ids_before"; then
-            [ -z "$loaded_id" ] || prerequisite_missing
-            loaded_id=$candidate_id
-          fi
-        done <<<"$target_ids_after"
+        [ "${#new_ids[@]}" -eq 1 ] || prerequisite_missing
+        loaded_id=${new_ids[0]}
       fi
       [[ "$loaded_id" =~ ^sha256:[0-9a-f]{64}$ ]] || prerequisite_missing
       if grep -Fxq "$loaded_id" <<<"$target_ids_before"; then
         prerequisite_missing
       fi
-      transport_record_loaded_id "$loaded_id"
+      grep -Fxq "$loaded_id" <<<"$target_ids_after" || prerequisite_missing
       case "$image" in
         "$previous_image") transport_previous_id=$loaded_id ;;
         "$target_image") transport_target_id=$loaded_id ;;
@@ -790,6 +818,8 @@ PY
       if [ "$state_root_created" = true ]; then
         remove_owned_root "$state_root" "$state_root_identity" ||
           cleanup_status=1
+        [ ! -e "$state_root" ] && [ ! -L "$state_root" ] ||
+          cleanup_status=1
       fi
       if [ "$state_parent_created" = true ] &&
         [ "$state_root_created" = true ] &&
@@ -842,9 +872,17 @@ PY
         "$cleanup_capture"
         "$cleanup_network_capture"
         "$probe_log"
-        "$state_root"
         "$matrix_fixture"/"$case_name"-*.out
       )
+      scan_state_evidence() {
+        local search_root=$1 search_pattern=$2
+        timeout 30s grep -r -F -n --binary-files=without-match \
+          --exclude='config.env.production' \
+          --exclude='config.base-compose.yml' \
+          --exclude='config.env.production.identity' \
+          --exclude='config.base-compose.yml.identity' \
+          "$search_pattern" "$search_root" >/dev/null 2>&1
+      }
       for pattern in "${secret_sentinels[@]}"; do
         for file in "${evidence_files[@]}"; do
           [ -e "$file" ] || continue
@@ -856,6 +894,13 @@ PY
             return 2
           fi
         done
+        if [ -e "$state_root" ] &&
+          scan_state_evidence "$state_root" "$pattern"; then
+          return 1
+        else
+          scan_status=$?
+          [ "$scan_status" -eq 1 ] || return 2
+        fi
         if ! container_list=$(timeout 30s docker ps -aq \
           --filter label=com.docker.compose.project=meet-production); then
           return 2
@@ -878,6 +923,20 @@ PY
         done <<<"$container_list"
       done
       return 0
+    }
+    assert_private_state_snapshots() {
+      local state_path=$1 snapshot metadata mode uid gid size
+      for snapshot in \
+        "$state_path/config.env.production" \
+        "$state_path/config.base-compose.yml" \
+        "$state_path/config.env.production.identity" \
+        "$state_path/config.base-compose.yml.identity"; do
+        [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+        metadata=$(stat -c '%a:%u:%g:%s' -- "$snapshot") || return 1
+        IFS=: read -r mode uid gid size <<<"$metadata"
+        [ "$mode" = 600 ] && [ "$uid" = 0 ] && [ "$gid" = 0 ] || return 1
+        [ "$size" -le 1048576 ] || return 1
+      done
     }
 
     if [ -e "$case_root" ] || [ -L "$case_root" ] ||
@@ -1280,6 +1339,7 @@ EOF
         (.providerEnabled | type == "boolean")
       ' "$state_path/terminal.json" >/dev/null
       [ -f "$state_path/provider-owner.json" ]
+      assert_private_state_snapshots "$state_path"
       timeout 30s python3 "$ROOT_DIR/scripts/test-vps-provider-credential.py" \
         retention-list --state-root "$state_root" >/dev/null
     }
