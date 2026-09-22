@@ -199,8 +199,9 @@ if [ "$filesystem_only" = false ]; then
     # The pinned database image is pre-provisioned on the target daemon; this
     # invocation never loads it, so an externally supplied ID is never owned.
     transport_postgres_run_owned=false
-    transport_map_dir=$(mktemp -d /tmp/meet-provider-image-map.XXXXXX)
-    chmod 700 "$transport_map_dir"
+    transport_map_dir=$(mktemp -d /tmp/meet-provider-image-map.XXXXXX 2>/dev/null) ||
+      prerequisite_missing
+    chmod 700 "$transport_map_dir" 2>/dev/null || prerequisite_missing
     cat >"$transport_map_dir/docker" <<'SHIM'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -419,8 +420,12 @@ for image in images:
     )
 PY
 
-  matrix_fixture=$(mktemp -d /var/lib/meet-provider-image.XXXXXX)
-  chmod 700 "$matrix_fixture"
+  matrix_fixture=$(mktemp -d /var/lib/meet-provider-image.XXXXXX 2>/dev/null) ||
+    prerequisite_missing
+  if ! chmod 700 "$matrix_fixture" 2>/dev/null; then
+    timeout 30s rm -r -- "$matrix_fixture" >/dev/null 2>&1 || true
+    prerequisite_missing
+  fi
   matrix_cleanup() {
     local status=$?
     local cleanup_status=0
@@ -1280,8 +1285,11 @@ PY
             kill "$coordinator_pid" 2>/dev/null || true
             return 1
           fi
-          assert_postgres_image "$postgres"
-          verify_case_runtime "$target_id" "$target_revision" "$target_version"
+          if ! assert_postgres_image "$postgres" ||
+            ! verify_case_runtime "$target_id" "$target_revision" "$target_version"; then
+            kill "$coordinator_pid" 2>/dev/null || true
+            return 1
+          fi
           break
         fi
         sleep 1
@@ -1358,8 +1366,12 @@ PY
   [ "$transport_status" -eq 0 ] || exit "$transport_status"
 fi
 
-fixture=$(mktemp -d /var/lib/meet-provider-fixture.XXXXXX)
-chmod 700 "$fixture"
+fixture=$(mktemp -d /var/lib/meet-provider-fixture.XXXXXX 2>/dev/null) ||
+  prerequisite_missing
+if ! chmod 700 "$fixture" 2>/dev/null; then
+  timeout 30s rm -r -- "$fixture" >/dev/null 2>&1 || true
+  prerequisite_missing
+fi
 cleanup() {
   local status=$?
   trap - EXIT
