@@ -1219,8 +1219,6 @@ def _witnessed_unlink(
     entry_fd: int | None = None
 
     def fail_witness() -> None:
-        if witness_fd is not None:
-            os.close(witness_fd)
         _fail("recovery")
 
     try:
