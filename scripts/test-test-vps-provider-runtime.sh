@@ -70,7 +70,8 @@ transport_cleanup_body() {
       fi
     fi
     if [ -n "$transport_map_dir" ]; then
-      if ! timeout 30s rm -r -- "$transport_map_dir" >/dev/null 2>&1; then
+      if ! timeout 30s rm -r -- "$transport_map_dir" >/dev/null 2>&1 ||
+        [ -e "$transport_map_dir" ] || [ -L "$transport_map_dir" ]; then
         cleanup_status=1
         map_clean=false
       fi
@@ -142,7 +143,7 @@ if [ "$filesystem_only" = false ]; then
         prerequisite_missing
       [[ "$source_id" =~ ^sha256:[0-9a-f]{64}$ ]] || prerequisite_missing
       target_ids_before=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
-        docker image ls --no-trunc --format '{{.ID}}' 2>/dev/null) ||
+        docker image ls --all --no-trunc --format '{{.ID}}' 2>/dev/null) ||
         prerequisite_missing
       if grep -Fxq "$source_id" <<<"$target_ids_before"; then
         prerequisite_missing
@@ -160,7 +161,7 @@ if [ "$filesystem_only" = false ]; then
       ) || load_status=$?
       target_ids_after=$(timeout 30s \
         env DOCKER_HOST="$transport_target_host" \
-        docker image ls --no-trunc --format '{{.ID}}' 2>/dev/null) ||
+        docker image ls --all --no-trunc --format '{{.ID}}' 2>/dev/null) ||
         prerequisite_missing
       new_ids=()
       while IFS= read -r candidate_id; do
@@ -881,6 +882,10 @@ PY
           --exclude='config.base-compose.yml' \
           --exclude='config.env.production.identity' \
           --exclude='config.base-compose.yml.identity' \
+          --exclude='config.env.target' \
+          --exclude='config.env.target.identity' \
+          --exclude='config.env.previous' \
+          --exclude='config.env.previous.identity' \
           "$search_pattern" "$search_root" >/dev/null 2>&1
       }
       for pattern in "${secret_sentinels[@]}"; do
@@ -930,7 +935,11 @@ PY
         "$state_path/config.env.production" \
         "$state_path/config.base-compose.yml" \
         "$state_path/config.env.production.identity" \
-        "$state_path/config.base-compose.yml.identity"; do
+        "$state_path/config.base-compose.yml.identity" \
+        "$state_path/config.env.target" \
+        "$state_path/config.env.target.identity" \
+        "$state_path/config.env.previous" \
+        "$state_path/config.env.previous.identity"; do
         [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
         metadata=$(stat -c '%a:%u:%g:%s' -- "$snapshot") || return 1
         IFS=: read -r mode uid gid size <<<"$metadata"

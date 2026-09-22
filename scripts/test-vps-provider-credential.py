@@ -2430,6 +2430,11 @@ def _retention_delete(
             )
             _rename_noreplace(parent_fd, name, quarantine)
             os.fsync(parent_fd)
+            _retention_interlocks_fd(
+                "",
+                parent_fd,
+                allowed_temporary=quarantine,
+            )
             try:
                 os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
