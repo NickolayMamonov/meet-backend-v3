@@ -104,36 +104,40 @@ if [ "$filesystem_only" = false ]; then
     trap transport_cleanup EXIT
     for image in "$previous_image" "$target_image"; do
       timeout 30s env DOCKER_HOST="$transport_source_host" \
-        docker image inspect "$image" --format '{{.Id}}' >/dev/null ||
+        docker image inspect "$image" --format '{{.Id}}' >/dev/null 2>&1 ||
         prerequisite_missing
       if timeout 30s env DOCKER_HOST="$transport_target_host" \
         docker image inspect "$image" --format '{{.Id}}' >/dev/null 2>&1; then
         prerequisite_missing
       fi
       load_output=$(
-        timeout 300s env DOCKER_HOST="$transport_source_host" docker save "$image" |
-          timeout 300s env DOCKER_HOST="$transport_target_host" docker load
+        timeout 300s env DOCKER_HOST="$transport_source_host" \
+          docker save "$image" 2>/dev/null |
+          timeout 300s env DOCKER_HOST="$transport_target_host" \
+            docker load 2>/dev/null
       ) || prerequisite_missing
       loaded_id=$(sed -nE \
         's/^Loaded image ID: (sha256:[0-9a-f]{64})$/\1/p' <<<"$load_output")
       [[ "$loaded_id" =~ ^sha256:[0-9a-f]{64}$ ]] || prerequisite_missing
-      target_id=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
-        docker image inspect "$loaded_id" --format '{{.Id}}') ||
-        prerequisite_missing
-      [ "$loaded_id" = "$target_id" ] || prerequisite_missing
-      source_metadata=$(timeout 30s env DOCKER_HOST="$transport_source_host" \
-        docker image inspect "$image" \
-        --format '{{json .Config}}|{{json .RootFS}}|{{.Architecture}}|{{.Os}}') ||
-        prerequisite_missing
-      target_metadata=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
-        docker image inspect "$loaded_id" \
-        --format '{{json .Config}}|{{json .RootFS}}|{{.Architecture}}|{{.Os}}') ||
-        prerequisite_missing
-      [ "$source_metadata" = "$target_metadata" ] || prerequisite_missing
       case "$image" in
         "$previous_image") transport_previous_id=$loaded_id ;;
         "$target_image") transport_target_id=$loaded_id ;;
       esac
+      target_id=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
+        docker image inspect "$loaded_id" --format '{{.Id}}' 2>/dev/null) ||
+        prerequisite_missing
+      [ "$loaded_id" = "$target_id" ] || prerequisite_missing
+      source_metadata=$(timeout 30s env DOCKER_HOST="$transport_source_host" \
+        docker image inspect "$image" \
+        --format '{{json .Config}}|{{json .RootFS}}|{{.Architecture}}|{{.Os}}' \
+        2>/dev/null) ||
+        prerequisite_missing
+      target_metadata=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
+        docker image inspect "$loaded_id" \
+        --format '{{json .Config}}|{{json .RootFS}}|{{.Architecture}}|{{.Os}}' \
+        2>/dev/null) ||
+        prerequisite_missing
+      [ "$source_metadata" = "$target_metadata" ] || prerequisite_missing
     done
     transport_postgres_ref=$(sed -nE \
       's/^[[:space:]]*image:[[:space:]]*(postgres:16-alpine@sha256:[0-9a-f]{64})[[:space:]]*$/\1/p' \
@@ -252,10 +256,12 @@ SHIM
   timeout 30s docker info >/dev/null 2>&1 || {
     prerequisite_missing
   }
-  previous_id=$(timeout 30s docker image inspect "$previous_image" --format '{{.Id}}') || {
+  previous_id=$(timeout 30s docker image inspect "$previous_image" \
+    --format '{{.Id}}' 2>/dev/null) || {
     prerequisite_missing
   }
-  target_id=$(timeout 30s docker image inspect "$target_image" --format '{{.Id}}') || {
+  target_id=$(timeout 30s docker image inspect "$target_image" \
+    --format '{{.Id}}' 2>/dev/null) || {
     prerequisite_missing
   }
   [[ "$previous_id" =~ ^sha256:[0-9a-f]{64}$ ]] || prerequisite_missing
@@ -291,7 +297,7 @@ if [ "$filesystem_only" = false ]; then
 
   image_label() {
     timeout 30s docker image inspect "$1" \
-      --format "$2"
+      --format "$2" 2>/dev/null
   }
 
   version_supported() {
@@ -351,7 +357,7 @@ PY
     prerequisite_missing
   }
   timeout 30s python3 - "$ROOT_DIR/scripts/test-vps-provider-credential.py" \
-    "$previous_image" "$target_image" <<'PY'
+    "$previous_image" "$target_image" <<'PY' 2>/dev/null
 import json
 import subprocess
 import sys
