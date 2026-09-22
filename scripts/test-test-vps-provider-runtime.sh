@@ -19,16 +19,25 @@ transport_map_dir=
 transport_real_docker=
 transport_previous_id=
 transport_target_id=
+transport_loaded_ids=()
 transport_postgres_ref=
 transport_postgres_id=${MEE2_93_IMAGE_TRANSPORT_POSTGRES_ID:-}
 transport_postgres_run_owned=false
+transport_record_loaded_id() {
+  local id=$1 existing
+  for existing in "${transport_loaded_ids[@]}"; do
+    [ "$existing" = "$id" ] && return
+  done
+  transport_loaded_ids+=("$id")
+}
 transport_cleanup_body() {
   local status=$1
   local cleanup_status=0
   local -a remove_ids=()
   if [ "$transport_loaded" = true ]; then
-    [ -n "$transport_previous_id" ] && remove_ids+=("$transport_previous_id")
-    [ -n "$transport_target_id" ] && remove_ids+=("$transport_target_id")
+    if [ "${#transport_loaded_ids[@]}" -gt 0 ]; then
+      remove_ids+=("${transport_loaded_ids[@]}")
+    fi
     if [ "$transport_postgres_run_owned" = true ] &&
       [ -n "$transport_postgres_id" ]; then
       remove_ids+=("$transport_postgres_id")
@@ -45,6 +54,7 @@ transport_cleanup_body() {
       fi
     fi
     transport_loaded=false
+    transport_loaded_ids=()
     transport_map_dir=
     transport_postgres_run_owned=false
   fi
@@ -103,26 +113,53 @@ if [ "$filesystem_only" = false ]; then
     transport_loaded=true
     trap transport_cleanup EXIT
     for image in "$previous_image" "$target_image"; do
-      timeout 30s env DOCKER_HOST="$transport_source_host" \
-        docker image inspect "$image" --format '{{.Id}}' >/dev/null 2>&1 ||
+      source_id=$(timeout 30s env DOCKER_HOST="$transport_source_host" \
+        docker image inspect "$image" --format '{{.Id}}' 2>/dev/null) ||
         prerequisite_missing
+      [[ "$source_id" =~ ^sha256:[0-9a-f]{64}$ ]] || prerequisite_missing
+      target_ids_before=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
+        docker image ls --no-trunc --format '{{.ID}}' 2>/dev/null) ||
+        prerequisite_missing
+      if grep -Fxq "$source_id" <<<"$target_ids_before"; then
+        prerequisite_missing
+      fi
       if timeout 30s env DOCKER_HOST="$transport_target_host" \
         docker image inspect "$image" --format '{{.Id}}' >/dev/null 2>&1; then
         prerequisite_missing
       fi
+      load_status=0
       load_output=$(
         timeout 300s env DOCKER_HOST="$transport_source_host" \
           docker save "$image" 2>/dev/null |
           timeout 300s env DOCKER_HOST="$transport_target_host" \
             docker load 2>/dev/null
-      ) || prerequisite_missing
+      ) || load_status=$?
       loaded_id=$(sed -nE \
         's/^Loaded image ID: (sha256:[0-9a-f]{64})$/\1/p' <<<"$load_output")
+      if ! [[ "$loaded_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        target_ids_after=$(timeout 30s \
+          env DOCKER_HOST="$transport_target_host" \
+          docker image ls --no-trunc --format '{{.ID}}' 2>/dev/null) ||
+          prerequisite_missing
+        loaded_id=
+        while IFS= read -r candidate_id; do
+          [[ "$candidate_id" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
+          if ! grep -Fxq "$candidate_id" <<<"$target_ids_before"; then
+            [ -z "$loaded_id" ] || prerequisite_missing
+            loaded_id=$candidate_id
+          fi
+        done <<<"$target_ids_after"
+      fi
       [[ "$loaded_id" =~ ^sha256:[0-9a-f]{64}$ ]] || prerequisite_missing
+      if grep -Fxq "$loaded_id" <<<"$target_ids_before"; then
+        prerequisite_missing
+      fi
+      transport_record_loaded_id "$loaded_id"
       case "$image" in
         "$previous_image") transport_previous_id=$loaded_id ;;
         "$target_image") transport_target_id=$loaded_id ;;
       esac
+      [ "$load_status" -eq 0 ] || prerequisite_missing
       target_id=$(timeout 30s env DOCKER_HOST="$transport_target_host" \
         docker image inspect "$loaded_id" --format '{{.Id}}' 2>/dev/null) ||
         prerequisite_missing
@@ -353,9 +390,11 @@ PY
       "$ROOT_DIR/docker-compose.production.yml"
   )
   [ -n "$postgres_image" ] || prerequisite_missing
-  timeout 30s docker image inspect "$postgres_image" >/dev/null 2>&1 || {
+  postgres_expected_id=$(timeout 30s \
+    docker image inspect "$postgres_image" --format '{{.Id}}' 2>/dev/null) ||
     prerequisite_missing
-  }
+  [[ "$postgres_expected_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    prerequisite_missing
   timeout 30s python3 - "$ROOT_DIR/scripts/test-vps-provider-credential.py" \
     "$previous_image" "$target_image" <<'PY' 2>/dev/null
 import json
@@ -486,8 +525,7 @@ sys.exit(125 if overflow else 0)
     create_owned_root() {
       local path=$1
       if ! mkdir -m 700 -- "$path"; then
-        echo "PREREQUISITE_MISSING: fixed runtime root creation raced or already exists" >&2
-        return 77
+        prerequisite_missing
       fi
       chown 0:0 -- "$path"
       chmod 700 -- "$path"
@@ -511,7 +549,8 @@ sys.exit(125 if overflow else 0)
     assert_no_compose_containers() {
       local containers
       containers=$(timeout 30s docker ps -aq \
-        --filter label=com.docker.compose.project=meet-production) || return 1
+        --filter label=com.docker.compose.project=meet-production \
+        2>/dev/null) || return 1
       [ -z "$containers" ]
     }
     remove_owned_root() {
@@ -791,13 +830,10 @@ PY
       exit 77
     fi
     existing_containers=$(timeout 30s docker ps -aq \
-      --filter label=com.docker.compose.project=meet-production) || {
-      echo "PREREQUISITE_MISSING: cannot inspect existing Compose containers" >&2
-      exit 77
-    }
+      --filter label=com.docker.compose.project=meet-production \
+      2>/dev/null) || prerequisite_missing
     if [ -n "$existing_containers" ]; then
-      echo "PREREQUISITE_MISSING: meet-production containers already exist" >&2
-      exit 77
+      prerequisite_missing
     fi
     for resource in meet-production_default meet-production_postgres_data \
       meet-production_uploads_data; do
@@ -896,7 +932,7 @@ networks:
     name: meet-production_default
 EOF
     chmod 600 "$case_root/isolated-network.yml"
-    if timeout 30s python3 - "$probe_port" <<'PY'
+    if timeout 30s python3 - "$probe_port" 2>/dev/null <<'PY'
 import socket
 import sys
 
@@ -1080,7 +1116,7 @@ PY
     }
     assert_internal_network() {
       [ "$(timeout 30s docker network inspect "$network_name" \
-        --format '{{.Internal}}')" = true ]
+        --format '{{.Internal}}' 2>/dev/null)" = true ]
     }
     assert_outbound_blocked() {
       local container=$1
@@ -1098,8 +1134,10 @@ PY
       esac
     }
     : >"$case_log"
-    timeout 30s docker network create --driver bridge --internal "$network_name" \
-      >>"$case_log" 2>&1
+    if ! timeout 30s docker network create --driver bridge --internal "$network_name" \
+      >>"$case_log" 2>&1; then
+      prerequisite_missing
+    fi
     network_created=true
     assert_internal_network
     printf 'network_isolation internal=true name=%s\n' "$network_name" >>"$case_log"
@@ -1110,6 +1148,11 @@ PY
         -f "$case_root/docker-compose.production.yml" \
         -f "$case_root/isolated-network.yml" "$@"
     }
+    assert_postgres_image() {
+      local container=$1
+      [ "$(timeout 30s docker inspect "$container" \
+        --format '{{.Image}}' 2>/dev/null)" = "$postgres_expected_id" ]
+    }
     capture_command "$case_log" compose up -d --wait --no-build --pull never
     check_capture_bound "$case_log"
     backend=$(compose ps -q backend)
@@ -1117,6 +1160,7 @@ PY
     [ -n "$backend" ] && [ -n "$postgres" ]
     [ "$(timeout 30s docker inspect "$backend" --format '{{.Image}}')" = "$previous_id" ]
     [ "$(timeout 30s docker inspect "$postgres" --format '{{.State.Health.Status}}')" = healthy ]
+    assert_postgres_image "$postgres"
     assert_internal_network
     assert_outbound_blocked "$backend"
     capture_command "$probe_log" timeout 1800s python3 "$case_root/probe.py" \
@@ -1239,6 +1283,7 @@ PY
             kill "$coordinator_pid" 2>/dev/null || true
             return 1
           fi
+          assert_postgres_image "$postgres"
           verify_case_runtime "$target_id" "$target_revision" "$target_version"
           break
         fi
@@ -1266,6 +1311,7 @@ PY
     previous_state="$state_root/$rollback_run_key-rollback-drill"
     assert_terminal_state "$previous_state" rolled-back "$provider_enabled"
     verify_case_runtime "$previous_id" "$previous_revision" "$previous_version"
+    assert_postgres_image "$postgres"
     assert_provider_state "$provider_enabled"
     [ "$(grep '^BACKEND_IMAGE=' "$case_root/.env.production")" = \
       "BACKEND_IMAGE=$previous_image" ]
@@ -1289,6 +1335,7 @@ PY
     assert_terminal_state "$target_state" committed "$provider_enabled"
     backend=$(compose ps -q backend)
     [ "$(timeout 30s docker inspect "$backend" --format '{{.Image}}')" = "$target_id" ]
+    assert_postgres_image "$postgres"
     assert_internal_network
     assert_outbound_blocked "$backend"
     verify_case_runtime "$target_id" "$target_revision" "$target_version"
