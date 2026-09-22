@@ -524,11 +524,11 @@ sys.exit(125 if overflow else 0)
     }
     create_owned_root() {
       local path=$1
-      if ! mkdir -m 700 -- "$path"; then
+      if ! mkdir -m 700 -- "$path" 2>/dev/null; then
         prerequisite_missing
       fi
-      chown 0:0 -- "$path"
-      chmod 700 -- "$path"
+      chown 0:0 -- "$path" 2>/dev/null || prerequisite_missing
+      chmod 700 -- "$path" 2>/dev/null || prerequisite_missing
     }
     assert_resource_absent() {
       local kind=$1
@@ -826,8 +826,7 @@ PY
     if [ -e "$case_root" ] || [ -L "$case_root" ] ||
       [ -e "$state_parent" ] || [ -L "$state_parent" ] ||
       [ -e "$state_root" ] || [ -L "$state_root" ]; then
-      echo "PREREQUISITE_MISSING: immutable runtime fixed root already exists" >&2
-      exit 77
+      prerequisite_missing
     fi
     existing_containers=$(timeout 30s docker ps -aq \
       --filter label=com.docker.compose.project=meet-production \
@@ -839,8 +838,7 @@ PY
       meet-production_uploads_data; do
       if ! assert_resource_absent network "$resource" ||
         ! assert_resource_absent volume "$resource"; then
-        echo "PREREQUISITE_MISSING: fixed Compose resource already exists" >&2
-        exit 77
+        prerequisite_missing
       fi
     done
 
@@ -942,8 +940,7 @@ PY
     then
       :
     else
-      echo "PREREQUISITE_MISSING: immutable runtime probe port is unavailable" >&2
-      exit 77
+      prerequisite_missing
     fi
     if [ "$provider_enabled" = true ]; then
       install -d -m 700 "$case_root/credentials"
@@ -2696,11 +2693,17 @@ def replace_quarantine_after_rename(directory_fd, source, destination):
             os.fchown(attacker_fd, 0, 0)
             os.fchmod(attacker_fd, 0o700)
             for child in quarantine_displaced.iterdir():
+                child_info = child.stat()
                 helper._write_private_at(
                     attacker_fd,
                     child.name,
                     child.read_bytes(),
                     0o600,
+                )
+                os.utime(
+                    quarantine_attacker / child.name,
+                    ns=(child_info.st_atime_ns, child_info.st_mtime_ns),
+                    follow_symlinks=False,
                 )
             os.fsync(attacker_fd)
         finally:

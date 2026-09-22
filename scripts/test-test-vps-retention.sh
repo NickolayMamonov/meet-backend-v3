@@ -278,12 +278,17 @@ printf 'services:\n  backend:\n    image: fixture\n' >"$production_root/docker-c
 printf 'services:\n  backend:\n    image: fixture\n' >"$production_runtime_root/active-compose.yml"
 printf 'services:\n  backend:\n    healthcheck:\n      test: ["CMD", "true"]\n' >"$production_runtime_root/active-runtime.override.yml"
 
+legacy_index=0
 for name in "${legacy_names[@]}"; do
   install -d -m 700 "$state_root/$name"
   printf 'legacy synthetic bytes: %s\n' "$name" >"$state_root/$name/opaque.bin"
   chmod 600 "$state_root/$name/opaque.bin"
+  touch -d "@$((1700000000 + legacy_index)).123456789" \
+    "$state_root/$name/opaque.bin" "$state_root/$name"
+  legacy_index=$((legacy_index + 1))
 done
 legacy_before=$(legacy_digest)
+grep -Eq '\|[0-9]+\.[0-9]{9,}$' <<<"$legacy_before"
 set +e
 legacy_delete_output=$(python3 scripts/test-vps-provider-credential.py \
   retention-delete --state-root "$state_root" \
