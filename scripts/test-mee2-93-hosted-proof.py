@@ -576,14 +576,14 @@ def successful_child_witness_contract(helper: Any, fixture: Path) -> None:
             identity, returned = helper._child_witness(directory_fd, name)
             witness_fd = identity.get("_witnessFd")
             if not isinstance(witness_fd, int) or returned != data:
-                raise AssertionError("successful witness contract failed")
+                raise proof.ProofFailure("subject_child_success_data")
             after_acquire = fd_set()
             if after_acquire - baseline != {witness_fd}:
-                raise AssertionError("successful witness did not retain exactly one FD")
+                raise proof.ProofFailure("subject_child_success_fd")
             os.fstat(witness_fd)
             os.close(witness_fd)
             if fd_set() != baseline:
-                raise AssertionError("successful witness close did not restore baseline")
+                raise proof.ProofFailure("subject_child_success_close")
             child.unlink()
     finally:
         os.close(directory_fd)
@@ -820,6 +820,8 @@ def native_descriptor(subject_value: str) -> int:
             failure = proof.failure_observation("subject", "subject_identity")
         elif error.code in ("helper_drift", "helper_load"):
             failure = proof.failure_observation("subject", "subject_helper")
+        elif error.code in proof.FAILURE_CODES:
+            failure = proof.failure_observation("subject", error.code)
         else:
             failure = proof.failure_observation("subject", failure_code)
         print("MEE2_DESCRIPTOR_FAILURE=" + json.dumps(failure, separators=(",", ":"), sort_keys=True))
