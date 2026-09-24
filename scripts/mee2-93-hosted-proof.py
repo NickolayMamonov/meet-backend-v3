@@ -127,6 +127,8 @@ def absolute_dir(path_value: str, *, existing: bool) -> Path:
     path = Path(path_value)
     if not path.is_absolute():
         fail("unsafe_path")
+    if any(part in (".", "..") for part in path.parts):
+        fail("unsafe_path")
     no_symlink_components(path, allow_leaf_missing=not existing)
     if existing:
         if not path.is_dir() or path.is_symlink():
@@ -492,9 +494,35 @@ def image_inspect(ref: str, env: dict[str, str], cwd: Path) -> dict[str, Any]:
     if not isinstance(image_id, str) or not IMAGE_ID.fullmatch(image_id):
         fail("image_identity")
     repo_digests = value.get("RepoDigests")
-    if not isinstance(repo_digests, list) or ref not in repo_digests:
+    if (
+        not isinstance(repo_digests, list)
+        or not any(
+            isinstance(candidate, str) and repo_digest_matches(ref, candidate)
+            for candidate in repo_digests
+        )
+    ):
         fail("image_identity")
     return value
+
+
+def normalized_image_repository(ref: str) -> tuple[str, str]:
+    repository, digest = ref.rsplit("@sha256:", 1)
+    leaf = repository.rsplit("/", 1)[-1]
+    if ":" in leaf:
+        repository = repository.rsplit(":", 1)[0]
+    return repository, digest
+
+
+def repo_digest_matches(ref: str, candidate: str) -> bool:
+    try:
+        candidate_repository, candidate_digest = candidate.rsplit("@sha256:", 1)
+    except ValueError:
+        return False
+    expected_repository, expected_digest = normalized_image_repository(ref)
+    return (
+        candidate_repository == expected_repository
+        and candidate_digest == expected_digest
+    )
 
 
 def pull_images(proof: dict[str, Any], subject: Path, env: dict[str, str]) -> None:
@@ -527,8 +555,8 @@ def pull_images(proof: dict[str, Any], subject: Path, env: dict[str, str]) -> No
         fail("duplicate_image_id")
 
 
-def marker_present(output: bytes, marker: bytes) -> bool:
-    return marker in output
+def marker_count(output: bytes, marker: bytes) -> int:
+    return sum(line.startswith(marker) for line in output.splitlines())
 
 
 def run_subject_suite(
@@ -556,7 +584,9 @@ def run_subject_suite(
         target["status"] = "environment_blocked"
         proof["verdict"] = "environment_blocked"
         fail("suite_prerequisite", environment=True)
-    if result.returncode != 0 or not all(marker_present(result.output, marker) for marker in markers):
+    if result.returncode != 0 or any(
+        marker_count(result.output, marker) != 1 for marker in markers
+    ):
         target["status"] = "failed"
         proof["verdict"] = "failed"
         fail("suite_failed")
@@ -694,6 +724,18 @@ def validate_secret_free(data: bytes) -> None:
     )
     if any(token in lowered for token in forbidden):
         fail("unsafe_evidence")
+
+
+def grant_evidence_read_access(root: Path) -> None:
+    if sorted(item.name for item in root.iterdir()) != ["SHA256SUMS", "proof.json"]:
+        fail("evidence_files")
+    for name in ("proof.json", "SHA256SUMS"):
+        path = root / name
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            fail("evidence_files")
+        os.chmod(path, 0o644)
+    os.chmod(root, 0o755)
 
 
 def validate_descriptor_sticky(proof: dict[str, Any]) -> None:
@@ -894,7 +936,7 @@ def safe_failure_proof(tooling_sha: str, workflow_sha: str, verdict: str = "fail
         },
     }
     proof["cleanup"] = {
-        key: "passed"
+        key: "not_run"
         for key in (
             "processes", "filesystem", "containers", "networks",
             "volumes", "images", "privateCapture",
@@ -1039,6 +1081,7 @@ def run_proof(args: argparse.Namespace) -> int:
         shutil.rmtree(private)
         proof["cleanup"]["privateCapture"] = "passed"
         write_evidence(evidence, proof)
+        grant_evidence_read_access(evidence)
         return 0
     except ProofFailure as error:
         try:
@@ -1054,7 +1097,7 @@ def run_proof(args: argparse.Namespace) -> int:
                     "cleanup_failed" if error.code == "cleanup_residue" else "failed"
                 )
                 validate_descriptor_sticky(proof)
-            if "subject" in locals() and "env" in locals():
+            if "preexisting_images" in locals() and "subject" in locals() and "env" in locals():
                 if "owned_images" not in locals():
                     owned_images = set()
                     if "preexisting_images" in locals():
@@ -1077,6 +1120,8 @@ def run_proof(args: argparse.Namespace) -> int:
                 )
             if "evidence" in locals() and not evidence.exists():
                 write_evidence(evidence, proof)
+            if "evidence" in locals() and evidence.exists():
+                grant_evidence_read_access(evidence)
         except (ProofFailure, OSError, ValueError):
             return 1
         finally:

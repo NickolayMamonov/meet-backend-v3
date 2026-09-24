@@ -23,6 +23,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from typing import Any, Callable
+from unittest import mock
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -37,6 +38,48 @@ SUBJECT_FILES = tuple(proof.SUBJECT_FILES)
 def assert_failure(test: unittest.TestCase, action: Callable[[], Any]) -> None:
     with test.assertRaises(proof.ProofFailure):
         action()
+
+
+def _pid_running(pid: int) -> bool:
+    try:
+        stat_path = Path(f"/proc/{pid}/stat")
+        if stat_path.exists():
+            return stat_path.read_text(encoding="ascii").split()[2] != "Z"
+        os.kill(pid, 0)
+        return True
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return False
+
+
+def child_grandchild_timeout_fixture() -> None:
+    if os.name != "posix" or sys.platform != "linux":
+        return
+    with tempfile.TemporaryDirectory(prefix="mee2-95-timeout-") as directory:
+        pid_file = Path(directory) / "pids"
+        grandchild_source = "import time; time.sleep(30)"
+        child_source = (
+            "import os, pathlib, subprocess, sys, time\n"
+            f"grandchild = subprocess.Popen([sys.executable, '-c', {grandchild_source!r}])\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text("
+            f"f'{{os.getpid()}} {{grandchild.pid}}', encoding='ascii')\n"
+            "time.sleep(30)\n"
+        )
+        result = proof.bounded_run(
+            [sys.executable, "-c", child_source],
+            cwd=HERE,
+            timeout_seconds=0.8,
+            env={"PATH": os.defpath},
+        )
+        if not result.timed_out:
+            raise AssertionError("child-grandchild fixture did not time out")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if pid_file.exists():
+                pids = [int(value) for value in pid_file.read_text().split()]
+                if all(not _pid_running(pid) for pid in pids):
+                    return
+            time.sleep(0.05)
+        raise AssertionError("child-grandchild process tree survived timeout")
 
 
 def passing_proof() -> dict[str, Any]:
@@ -123,6 +166,25 @@ class HostedProofContractTests(unittest.TestCase):
                 ),
             )
 
+    def test_sibling_parent_alias_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subject = root / "subject"
+            tooling = root / "tooling"
+            other = root / "other"
+            subject.mkdir()
+            tooling.mkdir()
+            other.mkdir()
+            assert_failure(
+                self,
+                lambda: proof.validate_roots(
+                    str(subject),
+                    str(tooling),
+                    str(other / ".." / "subject" / "private"),
+                    str(root / "evidence"),
+                ),
+            )
+
     def test_startup_override(self) -> None:
         previous = os.environ.get("PYTHONPATH")
         os.environ["PYTHONPATH"] = "forbidden"
@@ -145,8 +207,41 @@ class HostedProofContractTests(unittest.TestCase):
         )
 
     def test_missing_or_duplicate_marker(self) -> None:
-        self.assertFalse(proof.marker_present(b"marker=one\n", b"marker=two"))
-        self.assertTrue(proof.marker_present(b"marker=one\n", b"marker=one"))
+        self.assertEqual(proof.marker_count(b"marker=one\n", b"marker=two"), 0)
+        self.assertEqual(proof.marker_count(b"marker=one\n", b"marker=one"), 1)
+
+    def test_duplicate_required_marker(self) -> None:
+        self.assertEqual(
+            proof.marker_count(b"required value\nrequired duplicate\n", b"required"),
+            2,
+        )
+
+    def test_duplicate_required_marker_rejected(self) -> None:
+        value = proof.initial_evidence("a" * 40, "b" * 40)
+        with mock.patch.object(
+            proof,
+            "bounded_run",
+            return_value=proof.RunResult(0, b"required\nrequired\n"),
+        ):
+            assert_failure(
+                self,
+                lambda: proof.run_subject_suite(
+                    value,
+                    suite="retention",
+                    argv=["fixture"],
+                    subject=HERE,
+                    env={"PATH": os.defpath},
+                    timeout_seconds=1,
+                    markers=(b"required",),
+                ),
+            )
+
+    def test_normalized_postgres_repo_digest(self) -> None:
+        ref = proof.IMAGES["postgres"]
+        digest = ref.rsplit("@", 1)[1]
+        self.assertTrue(proof.repo_digest_matches(ref, f"postgres@{digest}"))
+        self.assertFalse(proof.repo_digest_matches(ref, f"wrong-repository@{digest}"))
+        self.assertFalse(proof.repo_digest_matches(ref, "postgres@sha256:" + "0" * 64))
 
     def test_literal_cleanup_separator(self) -> None:
         subject = subprocess.run(
@@ -164,6 +259,7 @@ class HostedProofContractTests(unittest.TestCase):
         proof.validate_proof(value)
 
     def test_timeout_child_tree(self) -> None:
+        child_grandchild_timeout_fixture()
         result = proof.bounded_run(
             [sys.executable, "-c", "import time; time.sleep(3)"],
             cwd=HERE,
@@ -171,6 +267,11 @@ class HostedProofContractTests(unittest.TestCase):
             env={"PATH": os.defpath},
         )
         self.assertTrue(result.timed_out)
+
+    def test_pre_initialization_failure_cleanup_not_run(self) -> None:
+        value = proof.safe_failure_proof("a" * 40, "b" * 40)
+        self.assertTrue(all(status == "not_run" for status in value["cleanup"].values()))
+        proof.validate_proof(value)
 
     def test_capture_overflow(self) -> None:
         result = proof.bounded_run(
@@ -226,6 +327,14 @@ class HostedProofContractTests(unittest.TestCase):
                 "a" * 40,
             )
 
+    def test_evidence_read_access_is_limited_to_sanitized_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "evidence"
+            proof.write_evidence(root, passing_proof())
+            proof.grant_evidence_read_access(root)
+            self.assertEqual(sorted(item.name for item in root.iterdir()), ["SHA256SUMS", "proof.json"])
+            proof.validate_evidence_root(str(root))
+
     def test_foreign_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -273,6 +382,12 @@ class HostedProofContractTests(unittest.TestCase):
             "scripts/test-mee2-93-hosted-proof.py",
         ):
             self.assertIn(path, workflow)
+        mode = subprocess.check_output(
+            ["git", "ls-files", "-s", "scripts/prove-mee2-93-hosted.sh"],
+            text=True,
+            timeout=30,
+        ).split()[0]
+        self.assertEqual(mode, "100755")
 
     def test_descriptor_growth_fails_verdict(self) -> None:
         value = passing_proof()
@@ -624,6 +739,7 @@ def native_descriptor(subject_value: str) -> int:
     try:
         if os.name != "posix" or sys.platform != "linux" or os.geteuid() != 0:
             raise proof.ProofFailure("linux_prerequisite", environment=True)
+        child_grandchild_timeout_fixture()
         subject = proof.absolute_dir(subject_value, existing=True)
         proof.subject_identity(subject)
         helper_path = subject / "scripts/test-vps-provider-credential.py"
