@@ -1,8 +1,8 @@
 {
   "version": 1,
   "subject": {
-    "commit": "72f652f0c06f080629a5deaf769eb3bb71694510",
-    "tree": "661aa949d72b346af5a02c452d2803e49a4ccb6c",
+    "commit": "7a484811f73518d07728cbf37f51f584a0c56893",
+    "tree": "0e84469e8fda0025d9c738cc094d2afa37df0918",
     "files": [
       {
         "path": "scripts/test-test-vps-retention.sh",
@@ -10,11 +10,11 @@
       },
       {
         "path": "scripts/test-test-vps-provider-runtime.sh",
-        "sha256": "62f556be1a830e8c88f52d07f9a64d68df9fca27e94f23c1e769677b412938d9"
+        "sha256": "bd1ebff5f15e42241c52388251bec04fd4ffdc9a30941a8549fa0edb38cf1f9b"
       },
       {
         "path": "scripts/test-vps-provider-credential.py",
-        "sha256": "bdf5d27e1631bdde47ccc09cd6f681ba2557773d11d4300f27788c957b7508da"
+        "sha256": "17f46f8f6d402ad0a086e27c22dce0b0a0d49e576d6b689938388840d990e946"
       },
       {
         "path": "scripts/test-test-vps-provider-credential.py",

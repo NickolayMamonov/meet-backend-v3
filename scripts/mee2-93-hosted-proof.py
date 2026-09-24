@@ -36,7 +36,7 @@ SUBJECT_SHA = INVENTORY["subject"]["commit"]
 SUBJECT_TREE = INVENTORY["subject"]["tree"]
 SUBJECT_FILES = tuple(INVENTORY["subject"]["files"])
 IMAGES = dict(INVENTORY["images"])
-PLAN_SHA = "b98e15ab10c3f25d88485112ecb16d7104ec29ebe30e527417dd4c2645473d58"
+PLAN_SHA = "5ae9aa42c861ff23dca6cf1de8949c2109f4f6510e166e827dc8ee0eccee7084"
 SUPPLIED_MANIFEST_SHA = "a32f030a2c7aca9e1e7210b15c3ebda09d7e0684dfab365ccfa2a6d02ef44907"
 MAX_CAPTURE = 8 * 1024 * 1024
 MAX_PROOF = 256 * 1024
@@ -89,6 +89,7 @@ class RunResult:
     output: bytes
     timed_out: bool = False
     overflow: bool = False
+    cleanup_failed: bool = False
 
 
 def fail(code: str, *, environment: bool = False, timeout: bool = False) -> None:
@@ -227,6 +228,45 @@ def clean_child_env() -> dict[str, str]:
     }
 
 
+def _linux_session_members(session_id: int, process_group: int) -> set[int] | None:
+    if sys.platform != "linux":
+        return None
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    members: set[int] = set()
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError):
+            return None
+        closing_paren = stat_text.rfind(")")
+        if closing_paren < 0:
+            return None
+        fields = stat_text[closing_paren + 2 :].split()
+        if len(fields) < 4:
+            return None
+        try:
+            state = fields[0]
+            candidate_group = int(fields[2])
+            candidate_session = int(fields[3])
+        except ValueError:
+            return None
+        if (
+            state != "Z"
+            and candidate_group == process_group
+            and candidate_session == session_id
+        ):
+            members.add(pid)
+    return members
+
+
 def bounded_run(
     argv: list[str],
     *,
@@ -271,6 +311,21 @@ def bounded_run(
                 timed_out=True,
                 overflow=len(output) > MAX_CAPTURE,
             )
+    process_group: int | None = None
+    session_id: int | None = None
+    try:
+        process_group = os.getpgid(process.pid)
+        session_id = os.getsid(process.pid)
+    except OSError:
+        pass
+
+    def session_members() -> set[int] | None:
+        if process_group is None or session_id is None:
+            return None
+        if sys.platform == "linux":
+            return _linux_session_members(session_id, process_group)
+        return None
+
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     selector.register(process.stderr, selectors.EVENT_READ)
@@ -281,36 +336,67 @@ def bounded_run(
     deadline = time.monotonic() + timeout_seconds
     terminated_at: float | None = None
     forced = False
+    cleanup_failed = False
 
     def terminate(force: bool = False) -> None:
-        nonlocal terminated_at, forced
+        nonlocal cleanup_failed, terminated_at, forced
         try:
             if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+                members = session_members()
+                if members is None:
+                    if (
+                        process_group is None
+                        or session_id is None
+                        or process.poll() is not None
+                        or os.getpgid(process.pid) != process_group
+                        or os.getsid(process.pid) != session_id
+                    ):
+                        cleanup_failed = True
+                        if terminated_at is None:
+                            terminated_at = time.monotonic()
+                        forced = forced or force
+                        return
+                elif not members:
+                    return
+                assert process_group is not None
+                os.killpg(process_group, signal.SIGKILL if force else signal.SIGTERM)
             else:
                 if process.poll() is not None:
                     return
                 (process.kill if force else process.terminate)()
         except (OSError, ProcessLookupError):
-            pass
+            cleanup_failed = True
+            if terminated_at is None:
+                terminated_at = time.monotonic()
+            forced = forced or force
+            return
         if terminated_at is None:
             terminated_at = time.monotonic()
         forced = forced or force
 
-    while selector.get_map():
+    while True:
         now = time.monotonic()
-        if now >= deadline and process.poll() is None:
+        if now >= deadline and not timed_out:
             timed_out = True
+            terminate()
+        if overflow and terminated_at is None:
             terminate()
         if terminated_at is not None and not forced and now - terminated_at >= 5:
             terminate(force=True)
         if terminated_at is not None and now - terminated_at >= 10:
-            for key in list(selector.get_map().values()):
-                try:
-                    selector.unregister(key.fileobj)
-                except Exception:
-                    pass
             break
+        if not selector.get_map():
+            members = session_members()
+            if process.poll() is not None:
+                if members is None:
+                    cleanup_failed = True
+                    break
+                if not members:
+                    break
+                if terminated_at is None:
+                    terminate()
+            time.sleep(0.05)
+            continue
         events = selector.select(0.10)
         for key, _ in events:
             try:
@@ -329,8 +415,37 @@ def bounded_run(
                 terminate()
             elif not overflow:
                 retained.extend(chunk)
-    returncode = process.wait(timeout=10)
-    return RunResult(returncode, bytes(retained), timed_out, overflow)
+    selector.close()
+    if process.poll() is None and terminated_at is None:
+        timed_out = True
+        terminate(force=True)
+    try:
+        returncode = process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        cleanup_failed = True
+        terminate(force=True)
+        try:
+            returncode = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            returncode = process.returncode
+    members = session_members()
+    if members is None:
+        cleanup_failed = True
+    elif members:
+        terminate(force=True)
+        deadline_after_kill = time.monotonic() + 5
+        while members and time.monotonic() < deadline_after_kill:
+            time.sleep(0.05)
+            members = session_members()
+        if members is None or members:
+            cleanup_failed = True
+    return RunResult(
+        returncode,
+        bytes(retained),
+        timed_out,
+        overflow,
+        cleanup_failed,
+    )
 
 
 def git_value(repo: Path, *args: str) -> str:
@@ -451,7 +566,7 @@ def os_release() -> tuple[str, str]:
 
 def command_version(argv: list[str], env: dict[str, str], cwd: Path) -> str:
     result = bounded_run(argv, cwd=cwd, timeout_seconds=30, env=env)
-    if result.returncode != 0 or result.timed_out or result.overflow:
+    if result.returncode != 0 or result.timed_out or result.overflow or result.cleanup_failed:
         return "unavailable"
     first = result.output.decode("utf-8", "replace").splitlines()
     match = re.search(r"\b[0-9]+(?:\.[0-9]+){1,3}\b", first[0] if first else "")
@@ -479,39 +594,45 @@ def collect_runtime(subject: Path, env: dict[str, str]) -> dict[str, Any]:
 
 
 def parse_descriptor_result(output: bytes) -> dict[str, dict[str, Any]] | None:
-    for line in output.decode("utf-8", "replace").splitlines():
-        prefix = "MEE2_DESCRIPTOR_RESULT="
-        if not line.startswith(prefix):
-            continue
-        try:
-            value = json.loads(line[len(prefix):])
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(value, dict) or set(value) != set(DESCRIPTOR_KEYS):
-            return None
-        try:
-            validate_descriptor_records(value)
-        except ProofFailure:
-            return None
-        return value
-    return None
+    prefix = "MEE2_DESCRIPTOR_RESULT="
+    lines = [
+        line
+        for line in output.decode("utf-8", "replace").splitlines()
+        if line.startswith(prefix)
+    ]
+    if len(lines) != 1:
+        return None
+    try:
+        value = json.loads(lines[0][len(prefix):])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict) or set(value) != set(DESCRIPTOR_KEYS):
+        return None
+    try:
+        validate_descriptor_records(value)
+    except ProofFailure:
+        return None
+    return value
 
 
 def parse_descriptor_failure(output: bytes) -> dict[str, str] | None:
     prefix = "MEE2_DESCRIPTOR_FAILURE="
-    for line in output.decode("utf-8", "replace").splitlines():
-        if not line.startswith(prefix):
-            continue
-        try:
-            value = json.loads(line[len(prefix):])
-        except json.JSONDecodeError:
-            return None
-        try:
-            exact_keys(value, ("stage", "code"))
-            return failure_observation(value["stage"], value["code"])
-        except ProofFailure:
-            return None
-    return None
+    lines = [
+        line
+        for line in output.decode("utf-8", "replace").splitlines()
+        if line.startswith(prefix)
+    ]
+    if len(lines) != 1:
+        return None
+    try:
+        value = json.loads(lines[0][len(prefix):])
+    except json.JSONDecodeError:
+        return None
+    try:
+        exact_keys(value, ("stage", "code"))
+        return failure_observation(value["stage"], value["code"])
+    except ProofFailure:
+        return None
 
 
 def validate_descriptor_records(value: Any) -> None:
@@ -531,11 +652,32 @@ def apply_descriptor_result(proof: dict[str, Any], value: dict[str, dict[str, An
     validate_descriptor_records(value)
     suite = proof["suites"]["filesystem"]
     suite["descriptorFailures"] = value
-    suite["cases"]["descriptor_stability"] = (
-        "passed" if all(item["status"] == "passed" for item in value.values()) else "failed"
+    passed = all(
+        item["status"] == "passed"
+        and item["iterations"] == 100
+        and item["maxFdGrowthBeforeRescue"] == 0
+        for item in value.values()
     )
-    if suite["cases"]["descriptor_stability"] != "passed":
+    suite["cases"]["descriptor_stability"] = "passed" if passed else "failed"
+    if not passed:
         suite["status"] = "failed"
+        proof["verdict"] = "failed"
+
+
+def descriptor_result_is_passing(
+    proof: dict[str, Any],
+    result: RunResult,
+) -> bool:
+    suite = proof["suites"]["filesystem"]
+    return (
+        result.returncode == 0
+        and not result.timed_out
+        and not result.overflow
+        and not result.cleanup_failed
+        and proof["verdict"] == "incomplete"
+        and suite["status"] != "failed"
+        and suite["cases"]["descriptor_stability"] == "passed"
+    )
 
 
 def image_inspect(ref: str, env: dict[str, str], cwd: Path) -> dict[str, Any]:
@@ -545,7 +687,7 @@ def image_inspect(ref: str, env: dict[str, str], cwd: Path) -> dict[str, Any]:
         timeout_seconds=30,
         env=env,
     )
-    if result.returncode != 0 or result.timed_out or result.overflow:
+    if result.returncode != 0 or result.timed_out or result.overflow or result.cleanup_failed:
         fail("image_unavailable", environment=True)
     try:
         payload = json.loads(result.output.decode("utf-8"))
@@ -597,7 +739,7 @@ def pull_images(proof: dict[str, Any], subject: Path, env: dict[str, str]) -> No
             timeout_seconds=300,
             env=env,
         )
-        if pulled.returncode != 0 or pulled.timed_out or pulled.overflow:
+        if pulled.returncode != 0 or pulled.timed_out or pulled.overflow or pulled.cleanup_failed:
             fail("image_pull", environment=True)
         inspected = image_inspect(ref, env, subject)
         image_id = inspected["Id"]
@@ -635,6 +777,10 @@ def run_subject_suite(
 ) -> None:
     result = bounded_run(argv, cwd=subject, timeout_seconds=timeout_seconds, env=env)
     target = proof["suites"][suite]
+    if result.cleanup_failed:
+        target["status"] = "failed"
+        proof["verdict"] = "cleanup_failed"
+        fail("cleanup_residue")
     if result.timed_out:
         target["status"] = "timeout"
         proof["verdict"] = "timeout"
@@ -719,7 +865,7 @@ def maybe_image_id(ref: str, env: dict[str, str], cwd: Path) -> str | None:
         timeout_seconds=30,
         env=env,
     )
-    if result.returncode != 0 or result.timed_out or result.overflow:
+    if result.returncode != 0 or result.timed_out or result.overflow or result.cleanup_failed:
         return None
     value = result.output.decode("ascii", "ignore").strip()
     return value if IMAGE_ID.fullmatch(value) else None
@@ -735,7 +881,7 @@ def cleanup_owned_images(
             timeout_seconds=60,
             env=env,
         )
-        if removed.returncode != 0 or removed.timed_out or removed.overflow:
+        if removed.returncode != 0 or removed.timed_out or removed.overflow or removed.cleanup_failed:
             return False
         if maybe_image_id(image_id, env, subject) is not None:
             return False
@@ -754,7 +900,7 @@ def docker_cleanup_ok(subject: Path, env: dict[str, str]) -> bool:
     )
     for argv in checks:
         result = bounded_run(argv, cwd=subject, timeout_seconds=30, env=env)
-        if result.returncode != 0 or result.timed_out or result.overflow:
+        if result.returncode != 0 or result.timed_out or result.overflow or result.cleanup_failed:
             return False
         if result.output.strip():
             return False
@@ -773,7 +919,7 @@ def assert_docker_clean_before(subject: Path, env: dict[str, str]) -> None:
     )
     for argv in checks:
         result = bounded_run(argv, cwd=subject, timeout_seconds=30, env=env)
-        if result.returncode != 0 or result.timed_out or result.overflow:
+        if result.returncode != 0 or result.timed_out or result.overflow or result.cleanup_failed:
             fail("docker_prerequisite", environment=True)
         if result.output.strip():
             fail("foreign_resource")
@@ -1060,12 +1206,14 @@ def run_proof(args: argparse.Namespace) -> int:
         descriptor_failure = parse_descriptor_failure(descriptor.output)
         if descriptor_failure is not None and descriptor_failure["stage"] != "none":
             proof["failure"] = descriptor_failure
-        if descriptor_value is None:
+        if descriptor_value is None or descriptor_failure is None:
             fail("descriptor_coverage")
         apply_descriptor_result(proof, descriptor_value)
-        if descriptor.returncode != 0 or descriptor.timed_out or descriptor.overflow:
+        if not descriptor_result_is_passing(proof, descriptor):
             proof["suites"]["filesystem"]["status"] = (
-                "timeout" if descriptor.timed_out else "failed"
+                "timeout" if descriptor.timed_out else
+                "environment_blocked" if descriptor.returncode == 77 else
+                "failed"
             )
             environment_blocked = descriptor.returncode == 77 or all(
                 item["status"] == "environment_blocked"
@@ -1073,10 +1221,14 @@ def run_proof(args: argparse.Namespace) -> int:
             )
             if environment_blocked:
                 proof["suites"]["filesystem"]["status"] = "environment_blocked"
-            proof["verdict"] = (
-                "timeout" if descriptor.timed_out else
-                "environment_blocked" if environment_blocked else "failed"
-            )
+            if descriptor.cleanup_failed:
+                proof["verdict"] = "cleanup_failed"
+            elif descriptor.timed_out:
+                proof["verdict"] = "timeout"
+            elif environment_blocked:
+                proof["verdict"] = "environment_blocked"
+            elif proof["verdict"] == "incomplete":
+                proof["verdict"] = "failed"
             fail(
                 "descriptor_failed",
                 environment=environment_blocked,
@@ -1151,6 +1303,8 @@ def run_proof(args: argparse.Namespace) -> int:
             proof["cleanup"]["volumes"] = "failed"
             proof["verdict"] = "cleanup_failed"
             fail("docker_cleanup")
+        if not descriptor_result_is_passing(proof, descriptor):
+            fail("descriptor_failed")
         proof["cleanup"] = {
             key: "passed"
             for key in (
@@ -1164,6 +1318,8 @@ def run_proof(args: argparse.Namespace) -> int:
         phase = "evidence"
         write_evidence(evidence, proof)
         grant_evidence_read_access(evidence)
+        if proof["verdict"] != "pass":
+            fail("descriptor_failed")
         return 0
     except ProofFailure as error:
         try:
@@ -1177,9 +1333,12 @@ def run_proof(args: argparse.Namespace) -> int:
                 if proof["failure"]["stage"] == "none":
                     proof["failure"] = failure_for_phase(phase, error)
                 proof["verdict"] = (
+                    "cleanup_failed"
+                    if error.code == "cleanup_residue"
+                    or proof["verdict"] == "cleanup_failed" else
                     "environment_blocked" if error.environment else
                     "timeout" if error.timeout else
-                    "cleanup_failed" if error.code == "cleanup_residue" else "failed"
+                    "failed"
                 )
                 validate_descriptor_sticky(proof)
             if "preexisting_images" in locals() and "subject" in locals() and "env" in locals():

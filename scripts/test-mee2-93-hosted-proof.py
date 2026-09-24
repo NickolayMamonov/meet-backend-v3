@@ -85,6 +85,46 @@ def child_grandchild_timeout_fixture() -> None:
         raise AssertionError("child-grandchild process tree survived timeout")
 
 
+def orphaned_pipe_timeout_fixture() -> None:
+    if os.name != "posix" or sys.platform != "linux":
+        return
+    with tempfile.TemporaryDirectory(prefix="mee2-95-orphaned-pipe-") as directory:
+        pid_file = Path(directory) / "pids"
+        child_source = (
+            "import os, pathlib, signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "child_pid = os.fork()\n"
+            "if child_pid == 0:\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    grandchild_pid = os.fork()\n"
+            "    if grandchild_pid == 0:\n"
+            "        time.sleep(60)\n"
+            "    else:\n"
+            f"        pathlib.Path({str(pid_file)!r}).write_text(\n"
+            "            str(os.getpid()) + ' ' + str(grandchild_pid), encoding='ascii')\n"
+            "        time.sleep(60)\n"
+            "else:\n"
+            "    time.sleep(0.1)\n"
+            "    os._exit(0)\n"
+        )
+        result = proof.bounded_run(
+            [sys.executable, "-c", child_source],
+            cwd=HERE,
+            timeout_seconds=0.5,
+            env={"PATH": os.defpath},
+        )
+        if result.returncode != 0 or not result.timed_out or result.cleanup_failed:
+            raise AssertionError("orphaned pipe was not bounded and cleaned")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if pid_file.exists():
+                pids = [int(value) for value in pid_file.read_text().split()]
+                if all(not _pid_running(pid) for pid in pids):
+                    return
+            time.sleep(0.05)
+        raise AssertionError("orphaned pipe descendants survived cleanup")
+
+
 def passing_proof() -> dict[str, Any]:
     value = proof.initial_evidence("a" * 40, "b" * 40)
     value["images"]["predecessor"]["imageId"] = "sha256:" + "a" * 64
@@ -238,6 +278,43 @@ class HostedProofContractTests(unittest.TestCase):
                     markers=(b"required",),
                 ),
             )
+
+    def test_duplicate_descriptor_markers_rejected(self) -> None:
+        records = json.dumps(
+            passing_proof()["suites"]["filesystem"]["descriptorFailures"],
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        result_marker = f"MEE2_DESCRIPTOR_RESULT={records}\n".encode()
+        failure_marker = (
+            b'MEE2_DESCRIPTOR_FAILURE={"code":"descriptor_coverage","stage":"descriptor"}\n'
+        )
+        self.assertIsNone(proof.parse_descriptor_result(result_marker + result_marker))
+        self.assertIsNone(
+            proof.parse_descriptor_result(result_marker + b"MEE2_DESCRIPTOR_RESULT={}\n")
+        )
+        self.assertIsNone(proof.parse_descriptor_failure(failure_marker + failure_marker))
+
+    def test_descriptor_growth_rejects_zero_exit_contract(self) -> None:
+        value = passing_proof()
+        records = value["suites"]["filesystem"]["descriptorFailures"]
+        records["transferred_missing"]["maxFdGrowthBeforeRescue"] = 1
+        proof.apply_descriptor_result(value, records)
+        self.assertFalse(
+            proof.descriptor_result_is_passing(value, proof.RunResult(0, b""))
+        )
+        self.assertEqual(value["verdict"], "failed")
+
+    def test_retention_boundary_requires_owner_and_terminal_witnesses(self) -> None:
+        with self.assertRaises(AssertionError):
+            required_retention_witnesses({"terminal.json": object()}, "provider-owner.json")
+        self.assertEqual(
+            required_retention_witnesses(
+                {"provider-owner.json": object(), "terminal.json": object()},
+                "provider-owner.json",
+            ),
+            ("provider-owner.json", "terminal.json"),
+        )
 
     def test_normalized_postgres_repo_digest(self) -> None:
         ref = proof.IMAGES["postgres"]
@@ -403,6 +480,17 @@ class HostedProofContractTests(unittest.TestCase):
             timeout=30,
         ).split()[0]
         self.assertEqual(mode, "100755")
+
+    def test_timeout_orphaned_pipe_tree(self) -> None:
+        if os.name != "posix" or sys.platform != "linux":
+            return
+        result = subprocess.run(
+            [sys.executable, str(HERE / "test-mee2-93-hosted-proof.py"), "--orphaned-pipe-fixture"],
+            cwd=HERE,
+            capture_output=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0)
 
     def test_descriptor_growth_fails_verdict(self) -> None:
         value = passing_proof()
@@ -678,6 +766,16 @@ def retention_state(helper: Any, fixture: Path, index: int) -> tuple[Path, Path,
     return state_root, state, marker, terminal
 
 
+def required_retention_witnesses(
+    witnesses: dict[str, Any],
+    owner_marker: str,
+) -> tuple[str, str]:
+    required = (owner_marker, "terminal.json")
+    if any(name not in witnesses for name in required):
+        raise AssertionError("retention witness boundary missing owner or terminal")
+    return required
+
+
 def retention_loop(helper: Any, fixture: Path) -> tuple[str, int, int]:
     max_growth = 0
     failed = False
@@ -695,8 +793,9 @@ def retention_loop(helper: Any, fixture: Path) -> tuple[str, int, int]:
             ):
                 caller = frame.f_back
                 witnesses = caller.f_locals.get("witnesses") if caller else None
-                if not isinstance(witnesses, dict) or "terminal.json" not in witnesses:
+                if not isinstance(witnesses, dict):
                     raise AssertionError("witness acquisition boundary missing")
+                required = required_retention_witnesses(witnesses, helper.OWNER_MARKER)
                 seen["boundary"] = True
                 for identity, _ in witnesses.values():
                     fd = identity.get("_witnessFd")
@@ -769,6 +868,7 @@ def native_descriptor(subject_value: str) -> int:
         if os.name != "posix" or sys.platform != "linux" or os.geteuid() != 0:
             raise proof.ProofFailure("linux_prerequisite", environment=True)
         child_grandchild_timeout_fixture()
+        orphaned_pipe_timeout_fixture()
         failure_stage = "subject"
         subject = proof.absolute_dir(subject_value, existing=True)
         proof.subject_identity(subject)
@@ -820,10 +920,6 @@ def native_descriptor(subject_value: str) -> int:
             safe_remove(fixture)
         proof.subject_identity(subject)
     except proof.ProofFailure as error:
-        status = "environment_blocked" if error.environment else "failed"
-        for key in results:
-            if results[key]["status"] == "not_run":
-                results[key]["status"] = status
         if error.environment:
             failure = proof.failure_observation(failure_stage, "environment")
         elif failure_stage == "descriptor":
@@ -840,9 +936,6 @@ def native_descriptor(subject_value: str) -> int:
         print("MEE2_DESCRIPTOR_RESULT=" + json.dumps(results, separators=(",", ":"), sort_keys=True))
         return 77 if error.environment else 1
     except (AssertionError, OSError, ValueError, ImportError):
-        for key in results:
-            if results[key]["status"] == "not_run":
-                results[key]["status"] = "failed"
         code = "timeout_tree" if failure_stage == "descriptor" else failure_code
         failure = proof.failure_observation(failure_stage, code)
         print("MEE2_DESCRIPTOR_FAILURE=" + json.dumps(failure, separators=(",", ":"), sort_keys=True))
@@ -856,6 +949,9 @@ def native_descriptor(subject_value: str) -> int:
 
 
 def main() -> int:
+    if "--orphaned-pipe-fixture" in sys.argv:
+        orphaned_pipe_timeout_fixture()
+        return 0
     if "--linux-runtime" in sys.argv:
         subject_index = sys.argv.index("--subject")
         if subject_index + 1 >= len(sys.argv):
