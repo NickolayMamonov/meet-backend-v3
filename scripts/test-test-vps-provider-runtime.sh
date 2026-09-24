@@ -2419,6 +2419,63 @@ def valid_retention_state(name):
     os.utime(path, ns=(1_700_000_001_987_654_321,) * 2)
     return path
 
+def open_fd_count():
+    return len(os.listdir("/proc/self/fd"))
+
+def assert_witness_descriptor_cleanup():
+    root = fixture / "witness-fd-regression"
+    root.mkdir(mode=0o700)
+    os.chown(root, 0, 0)
+    entry = root / "entry"
+    entry.write_bytes(b"witness descriptor regression")
+    os.chown(entry, 0, 0)
+    os.chmod(entry, 0o600)
+    directory_fd = os.open(
+        root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        baseline = open_fd_count()
+        identity, data = helper._child_witness(directory_fd, "entry")
+        assert open_fd_count() == baseline + 1
+        expect_provider_error(
+            lambda: helper._witnessed_unlink(
+                directory_fd,
+                "entry",
+                expected_identity=identity,
+                expected_data=data,
+                uid=0,
+                gid=0,
+                mode=0o640,
+                link_count=1,
+            ),
+            "RECOVERY_REQUIRED",
+        )
+        assert open_fd_count() == baseline
+
+        identity, data = helper._child_witness(directory_fd, "entry")
+        assert open_fd_count() == baseline + 1
+        os.unlink("entry", dir_fd=directory_fd)
+        expect_provider_error(
+            lambda: helper._witnessed_unlink(
+                directory_fd,
+                "entry",
+                expected_identity=identity,
+                expected_data=data,
+                uid=0,
+                gid=0,
+                mode=0o600,
+                link_count=1,
+            ),
+            "RECOVERY_REQUIRED",
+        )
+        assert open_fd_count() == baseline
+    finally:
+        os.close(directory_fd)
+        shutil.rmtree(root)
+
+assert_witness_descriptor_cleanup()
+
 def assert_direct_retention_refusal(path, **kwargs):
     before = retention_snapshot(path)
     quarantine = retention_root / (".provider-state." + path.name + ".tmp")

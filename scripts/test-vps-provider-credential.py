@@ -1218,7 +1218,23 @@ def _witnessed_unlink(
     )
     entry_fd: int | None = None
 
+    def close_owned(fd: int | None) -> None:
+        # Early witness failures occur before the main mutation finally block.
+        # Cleanup must preserve RECOVERY_REQUIRED even if an injected race
+        # already invalidated one descriptor.
+        if fd is None:
+            return
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
     def fail_witness() -> None:
+        nonlocal entry_fd, witness_fd
+        close_owned(entry_fd)
+        close_owned(witness_fd)
+        entry_fd = None
+        witness_fd = None
         _fail("recovery")
 
     try:
@@ -1373,10 +1389,8 @@ def _witnessed_unlink(
             return
         _fail("recovery")
     finally:
-        if entry_fd is not None:
-            os.close(entry_fd)
-        if witness_fd is not None:
-            os.close(witness_fd)
+        close_owned(entry_fd)
+        close_owned(witness_fd)
 
 
 def _remove_created_destination(
