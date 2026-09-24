@@ -259,6 +259,48 @@ class HostedProofContractTests(unittest.TestCase):
             2,
         )
 
+    def test_immutable_failure_code_is_allowlisted_progress_only(self) -> None:
+        disabled = b"image_runtime case=disabled previous_id=x\n"
+        disabled_cleanup = b"image_runtime_cleanup case=disabled containers=0\n"
+        enabled = b"image_runtime case=enabled previous_id=x\n"
+        enabled_cleanup = b"image_runtime_cleanup case=enabled containers=0\n"
+        self.assertEqual(
+            proof.immutable_failure_code(b""),
+            "immutable_disabled_runtime",
+        )
+        self.assertEqual(
+            proof.immutable_failure_code(disabled),
+            "immutable_disabled_cleanup",
+        )
+        self.assertEqual(
+            proof.immutable_failure_code(disabled + disabled_cleanup),
+            "immutable_enabled_runtime",
+        )
+        self.assertEqual(
+            proof.immutable_failure_code(disabled + disabled_cleanup + enabled),
+            "immutable_enabled_cleanup",
+        )
+        self.assertEqual(
+            proof.immutable_failure_code(
+                disabled + disabled_cleanup + enabled + enabled_cleanup
+            ),
+            "immutable_filesystem_tail",
+        )
+        self.assertEqual(
+            proof.immutable_failure_code(disabled + disabled),
+            "immutable_marker_contract",
+        )
+        self.assertEqual(
+            proof.failure_for_phase(
+                "immutable_runtime",
+                proof.ProofFailure("immutable_enabled_runtime"),
+            ),
+            {
+                "stage": "immutable_runtime",
+                "code": "immutable_enabled_runtime",
+            },
+        )
+
     def test_duplicate_required_marker_rejected(self) -> None:
         value = proof.initial_evidence("a" * 40, "b" * 40)
         with mock.patch.object(

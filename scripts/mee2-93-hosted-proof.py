@@ -65,7 +65,10 @@ FAILURE_CODES = frozenset(
      "subject_child_success_close",
      "subject_retention_success", "subject_retention_admission",
      "subject_witness_loop", "subject_retention_loop", "subject_suite",
-     "image_identity", "cleanup", "evidence")
+     "image_identity", "immutable_disabled_runtime",
+     "immutable_disabled_cleanup", "immutable_enabled_runtime",
+     "immutable_enabled_cleanup", "immutable_filesystem_tail",
+     "immutable_marker_contract", "cleanup", "evidence")
 )
 DESCRIPTOR_KEYS = (
     "transferred_missing",
@@ -113,8 +116,12 @@ def failure_for_phase(phase: str, error: ProofFailure) -> dict[str, str]:
         code = "unsafe_input"
     elif phase == "descriptor":
         code = "descriptor_coverage"
-    elif phase in ("images", "filesystem", "retention", "immutable_runtime"):
-        code = "image_identity" if phase == "images" else "subject_suite"
+    elif phase == "images":
+        code = "image_identity"
+    elif phase == "immutable_runtime" and error.code in FAILURE_CODES:
+        code = error.code
+    elif phase in ("filesystem", "retention", "immutable_runtime"):
+        code = "subject_suite"
     elif phase == "cleanup":
         code = "cleanup"
     elif phase == "evidence":
@@ -765,6 +772,22 @@ def marker_count(output: bytes, marker: bytes) -> int:
     return sum(line.startswith(marker) for line in output.splitlines())
 
 
+def immutable_failure_code(output: bytes) -> str:
+    ordered = (
+        (b"image_runtime case=disabled", "immutable_disabled_runtime"),
+        (b"image_runtime_cleanup case=disabled", "immutable_disabled_cleanup"),
+        (b"image_runtime case=enabled", "immutable_enabled_runtime"),
+        (b"image_runtime_cleanup case=enabled", "immutable_enabled_cleanup"),
+    )
+    counts = tuple(marker_count(output, marker) for marker, _ in ordered)
+    if any(count > 1 for count in counts):
+        return "immutable_marker_contract"
+    for count, (_, code) in zip(counts, ordered, strict=True):
+        if count != 1:
+            return code
+    return "immutable_filesystem_tail"
+
+
 def run_subject_suite(
     proof: dict[str, Any],
     *,
@@ -799,7 +822,11 @@ def run_subject_suite(
     ):
         target["status"] = "failed"
         proof["verdict"] = "failed"
-        fail("suite_failed")
+        fail(
+            immutable_failure_code(result.output)
+            if suite == "immutableRuntime"
+            else "suite_failed"
+        )
     target["status"] = "passed"
     for group in target["cases"]:
         target["cases"][group] = "passed"
