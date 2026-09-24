@@ -274,7 +274,17 @@ class HostedProofContractTests(unittest.TestCase):
     def test_pre_initialization_failure_cleanup_not_run(self) -> None:
         value = proof.safe_failure_proof("a" * 40, "b" * 40)
         self.assertTrue(all(status == "not_run" for status in value["cleanup"].values()))
+        self.assertEqual(value["failure"], {"stage": "none", "code": "none"})
         proof.validate_proof(value)
+
+    def test_failure_observation_is_allowlisted(self) -> None:
+        self.assertEqual(
+            proof.failure_observation("descriptor", "timeout_tree"),
+            {"stage": "descriptor", "code": "timeout_tree"},
+        )
+        value = passing_proof()
+        value["failure"] = {"stage": "descriptor", "code": "raw-output"}
+        assert_failure(self, lambda: proof.validate_proof(value))
 
     def test_capture_overflow(self) -> None:
         result = proof.bounded_run(
@@ -741,10 +751,12 @@ def native_descriptor(subject_value: str) -> int:
         }
         for key in proof.DESCRIPTOR_KEYS
     }
+    failure_stage = "descriptor"
     try:
         if os.name != "posix" or sys.platform != "linux" or os.geteuid() != 0:
             raise proof.ProofFailure("linux_prerequisite", environment=True)
         child_grandchild_timeout_fixture()
+        failure_stage = "subject"
         subject = proof.absolute_dir(subject_value, existing=True)
         proof.subject_identity(subject)
         helper_path = subject / "scripts/test-vps-provider-credential.py"
@@ -793,14 +805,31 @@ def native_descriptor(subject_value: str) -> int:
         for key in results:
             if results[key]["status"] == "not_run":
                 results[key]["status"] = status
+        if error.environment:
+            failure = proof.failure_observation(failure_stage, "environment")
+        elif failure_stage == "descriptor":
+            failure = proof.failure_observation("descriptor", "descriptor_coverage")
+        elif error.code in ("subject_sha", "subject_tree", "subject_file"):
+            failure = proof.failure_observation("subject", "subject_identity")
+        elif error.code in ("helper_drift", "helper_load"):
+            failure = proof.failure_observation("subject", "subject_helper")
+        else:
+            failure = proof.failure_observation("subject", "subject_descriptor")
+        print("MEE2_DESCRIPTOR_FAILURE=" + json.dumps(failure, separators=(",", ":"), sort_keys=True))
         print("MEE2_DESCRIPTOR_RESULT=" + json.dumps(results, separators=(",", ":"), sort_keys=True))
         return 77 if error.environment else 1
     except (AssertionError, OSError, ValueError, ImportError):
         for key in results:
             if results[key]["status"] == "not_run":
                 results[key]["status"] = "failed"
+        code = "timeout_tree" if failure_stage == "descriptor" else "subject_descriptor"
+        failure = proof.failure_observation(failure_stage, code)
+        print("MEE2_DESCRIPTOR_FAILURE=" + json.dumps(failure, separators=(",", ":"), sort_keys=True))
         print("MEE2_DESCRIPTOR_RESULT=" + json.dumps(results, separators=(",", ":"), sort_keys=True))
         return 1
+    print("MEE2_DESCRIPTOR_FAILURE=" + json.dumps(
+        proof.failure_observation(), separators=(",", ":"), sort_keys=True
+    ))
     print("MEE2_DESCRIPTOR_RESULT=" + json.dumps(results, separators=(",", ":"), sort_keys=True))
     return 0 if all(item["status"] == "passed" for item in results.values()) else 1
 

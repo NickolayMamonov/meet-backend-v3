@@ -52,6 +52,16 @@ VERDICTS = frozenset(
     ("pass", "failed", "environment_blocked", "timeout", "unsafe_evidence",
      "cleanup_failed", "incomplete")
 )
+FAILURE_STAGES = frozenset(
+    ("none", "startup", "descriptor", "subject", "images", "filesystem",
+     "retention", "immutable_runtime", "cleanup", "evidence")
+)
+FAILURE_CODES = frozenset(
+    ("none", "environment", "unsafe_input", "descriptor_coverage",
+     "timeout_tree", "subject_identity", "subject_helper",
+     "subject_descriptor", "subject_suite", "image_identity", "cleanup",
+     "evidence")
+)
 DESCRIPTOR_KEYS = (
     "transferred_missing",
     "transferred_replaced_regular",
@@ -78,6 +88,34 @@ class RunResult:
 
 def fail(code: str, *, environment: bool = False, timeout: bool = False) -> None:
     raise ProofFailure(code, environment=environment, timeout=timeout)
+
+
+def failure_observation(stage: str = "none", code: str = "none") -> dict[str, str]:
+    if stage not in FAILURE_STAGES or code not in FAILURE_CODES:
+        fail("schema")
+    if (stage == "none") != (code == "none"):
+        fail("schema")
+    return {"stage": stage, "code": code}
+
+
+def failure_for_phase(phase: str, error: ProofFailure) -> dict[str, str]:
+    if error.environment:
+        code = "environment"
+    elif error.timeout:
+        code = "subject_suite"
+    elif phase == "startup":
+        code = "unsafe_input"
+    elif phase == "descriptor":
+        code = "descriptor_coverage"
+    elif phase in ("images", "filesystem", "retention", "immutable_runtime"):
+        code = "image_identity" if phase == "images" else "subject_suite"
+    elif phase == "cleanup":
+        code = "cleanup"
+    elif phase == "evidence":
+        code = "evidence"
+    else:
+        code = "subject_descriptor"
+    return failure_observation(phase, code)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -389,6 +427,7 @@ def initial_evidence(tooling_sha: str, workflow_sha: str) -> dict[str, Any]:
                 "volumes", "images", "privateCapture",
             )
         },
+        "failure": failure_observation(),
         "verdict": "incomplete",
     }
 
@@ -450,6 +489,23 @@ def parse_descriptor_result(output: bytes) -> dict[str, dict[str, Any]] | None:
         except ProofFailure:
             return None
         return value
+    return None
+
+
+def parse_descriptor_failure(output: bytes) -> dict[str, str] | None:
+    prefix = "MEE2_DESCRIPTOR_FAILURE="
+    for line in output.decode("utf-8", "replace").splitlines():
+        if not line.startswith(prefix):
+            continue
+        try:
+            value = json.loads(line[len(prefix):])
+        except json.JSONDecodeError:
+            return None
+        try:
+            exact_keys(value, ("stage", "code"))
+            return failure_observation(value["stage"], value["code"])
+        except ProofFailure:
+            return None
     return None
 
 
@@ -770,7 +826,11 @@ def write_evidence(root: Path, proof: dict[str, Any]) -> None:
 
 
 def validate_proof(proof: Any) -> None:
-    exact_keys(proof, ("schemaVersion", "identity", "runtime", "images", "suites", "cleanup", "verdict"))
+    exact_keys(
+        proof,
+        ("schemaVersion", "identity", "runtime", "images", "suites",
+         "cleanup", "failure", "verdict"),
+    )
     if proof["schemaVersion"] != 1:
         fail("schema")
     identity = proof["identity"]
@@ -844,6 +904,9 @@ def validate_proof(proof: Any) -> None:
     ))
     if any(value not in CLEANUP_STATUSES for value in proof["cleanup"].values()):
         fail("schema")
+    failure = proof["failure"]
+    exact_keys(failure, ("stage", "code"))
+    failure_observation(failure["stage"], failure["code"])
     if proof["verdict"] not in VERDICTS:
         fail("schema")
     descriptor_growth = any(
@@ -954,6 +1017,7 @@ def run_proof(args: argparse.Namespace) -> int:
     workflow_sha = args.workflow_sha
     if not HEX40.fullmatch(tooling_sha) or not HEX40.fullmatch(workflow_sha):
         return 2
+    phase = "startup"
     try:
         subject, tooling, private, evidence = validate_roots(
             args.subject, args.tooling, args.private_root, args.evidence_root
@@ -980,6 +1044,7 @@ def run_proof(args: argparse.Namespace) -> int:
         test_script = tooling / "scripts" / "test-mee2-93-hosted-proof.py"
         if not test_script.is_file() or test_script.is_symlink():
             fail("tooling_missing")
+        phase = "descriptor"
         descriptor = bounded_run(
             ["python3", "-B", str(test_script), "--linux-runtime", "--subject", str(subject)],
             cwd=tooling,
@@ -987,6 +1052,9 @@ def run_proof(args: argparse.Namespace) -> int:
             env=env,
         )
         descriptor_value = parse_descriptor_result(descriptor.output)
+        descriptor_failure = parse_descriptor_failure(descriptor.output)
+        if descriptor_failure is not None and descriptor_failure["stage"] != "none":
+            proof["failure"] = descriptor_failure
         if descriptor_value is None:
             fail("descriptor_coverage")
         apply_descriptor_result(proof, descriptor_value)
@@ -1009,6 +1077,7 @@ def run_proof(args: argparse.Namespace) -> int:
                 environment=environment_blocked,
                 timeout=descriptor.timed_out,
             )
+        phase = "images"
         owned_images: set[str] = set()
         assert_docker_clean_before(subject, env)
         preexisting_images = {
@@ -1021,6 +1090,7 @@ def run_proof(args: argparse.Namespace) -> int:
             for name in IMAGES
             if preexisting_images[name] is None and proof["images"][name]["imageId"] is not None
         }
+        phase = "filesystem"
         run_subject_suite(
             proof,
             suite="filesystem",
@@ -1030,6 +1100,7 @@ def run_proof(args: argparse.Namespace) -> int:
             timeout_seconds=900,
             markers=(b"provider filesystem fixture passed:",),
         )
+        phase = "retention"
         run_subject_suite(
             proof,
             suite="retention",
@@ -1039,6 +1110,7 @@ def run_proof(args: argparse.Namespace) -> int:
             timeout_seconds=900,
             markers=(b"retention fixture passed:",),
         )
+        phase = "immutable_runtime"
         run_subject_suite(
             proof,
             suite="immutableRuntime",
@@ -1057,6 +1129,7 @@ def run_proof(args: argparse.Namespace) -> int:
                 b"image_runtime_cleanup case=enabled",
             ),
         )
+        phase = "cleanup"
         subject_identity(subject)
         validate_descriptor_sticky(proof)
         if not check_fixed_cleanup():
@@ -1083,6 +1156,7 @@ def run_proof(args: argparse.Namespace) -> int:
         proof["verdict"] = "pass"
         shutil.rmtree(private)
         proof["cleanup"]["privateCapture"] = "passed"
+        phase = "evidence"
         write_evidence(evidence, proof)
         grant_evidence_read_access(evidence)
         return 0
@@ -1093,7 +1167,10 @@ def run_proof(args: argparse.Namespace) -> int:
                     "environment_blocked" if error.environment else
                     "timeout" if error.timeout else "failed"
                 ))
+                proof["failure"] = failure_for_phase(phase, error)
             else:
+                if proof["failure"]["stage"] == "none":
+                    proof["failure"] = failure_for_phase(phase, error)
                 proof["verdict"] = (
                     "environment_blocked" if error.environment else
                     "timeout" if error.timeout else
