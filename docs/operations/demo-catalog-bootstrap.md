@@ -1,7 +1,7 @@
 # Demo catalog bootstrap runbook
 
 MEE2-50 adds an operator-triggered, disabled-by-default catalog bootstrap.
-The reviewed catalog is `closed-beta-demo`, manifest `2026-08-15.v1`, and the
+The reviewed catalog is `closed-beta-demo`, manifest `2027-09-13.v1`, and the
 schema change is additive migration V9. The endpoint is available only when
 `DEMO_CATALOG_BOOTSTRAP_ENABLED=true`; it never runs at startup.
 
@@ -40,6 +40,8 @@ curl --fail-with-body --silent --show-error \
   "${BASE_URL}/admin/demo-catalog/bootstrap"
 ```
 
+For the current reviewed bundle use `2027-09-13` and
+`2027-09-13T00:00:00Z`; this finite validity boundary is not a rolling clock.
 Use an explicitly reviewed ISO date and UTC validity instant. The service does
 not calculate a new schedule from current time. Starts must be strictly after
 both the injected/current server time and the supplied validity boundary.
