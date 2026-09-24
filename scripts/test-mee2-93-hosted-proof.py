@@ -578,8 +578,11 @@ def successful_child_witness_contract(helper: Any, fixture: Path) -> None:
             if not isinstance(witness_fd, int) or returned != data:
                 raise proof.ProofFailure("subject_child_success_data")
             after_acquire = fd_set()
-            if after_acquire - baseline != {witness_fd}:
-                raise proof.ProofFailure("subject_child_success_fd")
+            delta = after_acquire - baseline
+            if witness_fd not in delta:
+                raise proof.ProofFailure("subject_child_success_fd_missing")
+            if delta != {witness_fd}:
+                raise proof.ProofFailure("subject_child_success_fd_extra")
             os.fstat(witness_fd)
             os.close(witness_fd)
             if fd_set() != baseline:

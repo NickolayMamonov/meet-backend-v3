@@ -61,6 +61,7 @@ FAILURE_CODES = frozenset(
      "timeout_tree", "subject_identity", "subject_helper",
      "subject_descriptor", "subject_child_admission", "subject_child_success",
      "subject_child_success_data", "subject_child_success_fd",
+     "subject_child_success_fd_missing", "subject_child_success_fd_extra",
      "subject_child_success_close",
      "subject_retention_success", "subject_retention_admission",
      "subject_witness_loop", "subject_retention_loop", "subject_suite",
