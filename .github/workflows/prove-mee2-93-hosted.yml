@@ -21,7 +21,7 @@ jobs:
     permissions:
       contents: read
     env:
-      SUBJECT_SHA: 7a484811f73518d07728cbf37f51f584a0c56893
+      SUBJECT_SHA: 1982ece0bf9a41ac794223e5b976c858488a095b
       TOOLING_SHA: ${{ github.event.pull_request.head.sha }}
       WORKFLOW_SHA: ${{ github.sha }}
       SUBJECT: ${{ github.workspace }}/subject
@@ -39,7 +39,7 @@ jobs:
       - name: Checkout exact MEE2-93 subject
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 7a484811f73518d07728cbf37f51f584a0c56893
+          ref: 1982ece0bf9a41ac794223e5b976c858488a095b
           path: subject
           fetch-depth: 0
           persist-credentials: false
