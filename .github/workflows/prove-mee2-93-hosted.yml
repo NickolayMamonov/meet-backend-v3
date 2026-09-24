@@ -104,7 +104,7 @@ jobs:
           [[ "$PROOF_STATUS" =~ ^[0-9]+$ ]]
           [[ "$VALIDATE_STATUS" =~ ^[0-9]+$ ]]
           [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
-          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
           {
             echo "## MEE2-93 hosted proof receipt"
             echo
@@ -114,7 +114,7 @@ jobs:
             echo "- Subject: $SUBJECT_SHA"
             echo "- Workflow: $WORKFLOW_SHA"
             echo "- Artifact ID: $ARTIFACT_ID"
-            echo "- Artifact digest: $ARTIFACT_DIGEST"
+            echo "- Artifact digest: sha256:$ARTIFACT_DIGEST"
             echo "- Proof status: $PROOF_STATUS"
             echo "- Evidence validation status: $VALIDATE_STATUS"
           } >>"$GITHUB_STEP_SUMMARY"

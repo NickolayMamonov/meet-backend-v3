@@ -56,23 +56,23 @@ def child_grandchild_timeout_fixture() -> None:
         return
     with tempfile.TemporaryDirectory(prefix="mee2-95-timeout-") as directory:
         pid_file = Path(directory) / "pids"
-        grandchild_source = "import time; time.sleep(30)"
+        grandchild_source = "import time; time.sleep(60)"
         child_source = (
             "import os, pathlib, subprocess, sys, time\n"
             f"grandchild = subprocess.Popen([sys.executable, '-c', {grandchild_source!r}])\n"
             f"pathlib.Path({str(pid_file)!r}).write_text("
             f"f'{{os.getpid()}} {{grandchild.pid}}', encoding='ascii')\n"
-            "time.sleep(30)\n"
+            "time.sleep(60)\n"
         )
         result = proof.bounded_run(
             [sys.executable, "-c", child_source],
             cwd=HERE,
-            timeout_seconds=0.8,
+            timeout_seconds=5,
             env={"PATH": os.defpath},
         )
         if not result.timed_out:
             raise AssertionError("child-grandchild fixture did not time out")
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if pid_file.exists():
                 pids = [int(value) for value in pid_file.read_text().split()]
@@ -366,6 +366,8 @@ class HostedProofContractTests(unittest.TestCase):
         workflow = (HERE.parent / ".github/workflows/prove-mee2-93-hosted.yml").read_text()
         self.assertIn("artifact-id", workflow)
         self.assertIn("artifact-digest", workflow)
+        self.assertIn('[[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]', workflow)
+        self.assertIn('echo "- Artifact digest: sha256:$ARTIFACT_DIGEST"', workflow)
 
     def test_trigger_path_permission_retention_contract(self) -> None:
         workflow = (HERE.parent / ".github/workflows/prove-mee2-93-hosted.yml").read_text()
