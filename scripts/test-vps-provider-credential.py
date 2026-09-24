@@ -368,6 +368,19 @@ def _witness_identity(value: dict[str, int]) -> dict[str, int]:
     }
 
 
+def _close_owned_witnesses(
+    witnesses: Iterable[tuple[dict[str, int], bytes]],
+) -> None:
+    for identity, _ in witnesses:
+        witness_fd = identity.pop("_witnessFd", None)
+        if witness_fd is None:
+            continue
+        try:
+            os.close(witness_fd)
+        except OSError:
+            pass
+
+
 def _validate_credential(data: bytes) -> None:
     if len(data) > MAX_CREDENTIAL_BYTES:
         _fail("credential")
@@ -2376,6 +2389,7 @@ def _retention_delete(
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
             dir_fd=parent_fd,
         )
+        witnesses: dict[str, tuple[dict[str, int], bytes]] = {}
         try:
             if not _same_inode(os.fstat(state_fd), state_info):
                 _fail("recovery")
@@ -2394,7 +2408,6 @@ def _retention_delete(
                 _fail("recovery")
             if OWNER_MARKER not in names or "terminal.json" not in names:
                 _fail("recovery")
-            witnesses: dict[str, tuple[dict[str, int], bytes]] = {}
             for child in names:
                 child_info = os.stat(child, dir_fd=state_fd, follow_symlinks=False)
                 if (
@@ -2499,6 +2512,7 @@ def _retention_delete(
             os.rmdir(quarantine, dir_fd=parent_fd)
             os.fsync(parent_fd)
         finally:
+            _close_owned_witnesses(witnesses.values())
             os.close(state_fd)
     finally:
         os.close(parent_fd)

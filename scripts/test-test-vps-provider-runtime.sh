@@ -2685,6 +2685,35 @@ def expect_fault(action):
         return
     raise AssertionError("fault injection unexpectedly succeeded")
 
+def assert_retention_witness_descriptor_cleanup():
+    state = valid_retention_state("103-1-final-deploy")
+    baseline = open_fd_count()
+    original_interlocks = helper._retention_interlocks_fd
+    calls = [0]
+
+    def fail_after_witness_acquisition(root, state_root_fd, **kwargs):
+        calls[0] += 1
+        if calls[0] == 2:
+            raise OSError(5, "retention interlock fault")
+        return original_interlocks(root, state_root_fd, **kwargs)
+
+    helper._retention_interlocks_fd = fail_after_witness_acquisition
+    try:
+        expect_fault(
+            lambda: helper._retention_delete(
+                str(retention_root),
+                str(state),
+            )
+        )
+    finally:
+        helper._retention_interlocks_fd = original_interlocks
+    assert calls[0] == 2
+    assert open_fd_count() == baseline
+    assert state.exists()
+    shutil.rmtree(state)
+
+assert_retention_witness_descriptor_cleanup()
+
 def cleanup_fault_state(state):
     quarantine = retention_root / (".provider-state." + state.name + ".tmp")
     if state.exists():
