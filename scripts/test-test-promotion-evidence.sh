@@ -250,7 +250,7 @@ jq \
   def populated_probe:
     .admission = {
       mode:"closed-beta-demo",stateSha256:$state,
-      catalogName:"closed-beta-demo",manifestVersion:"2026-08-15.v1",
+      catalogName:"closed-beta-demo",manifestVersion:"2027-09-13.v1",
       recoveryProofSha256:$recovery,stableProofSha256:$stable,
       publicProjectionSha256:$public,
       routes:{

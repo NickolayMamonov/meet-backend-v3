@@ -6,7 +6,7 @@
   ],
   "populated": {
     "catalogName": "closed-beta-demo",
-    "manifestVersion": "2026-08-15.v1",
+    "manifestVersion": "2027-09-13.v1",
     "recoveryProof": {
       "schema": "meet-backend/closed-beta-database-proof/v1",
       "sha256": "c1a83c4d33e5c4d1772b27bc770471e99a6fb1ac2827c16c9787ecef073d2979"
@@ -16,11 +16,11 @@
       "serialization": "psql-jsonb-text-with-trailing-lf",
       "fixture": "scripts/fixtures/test-vps-beta-demo/canonical-stable-proof.json",
       "byteLength": 6867,
-      "sha256": "0e6ef8d48515b3041000166a5506df2a72c11c4e702d7d28960f54d1c204080e"
+      "sha256": "6507c415b8a6b5bd42e297b8f1816b48c07b2ee4dcc0011594741a5eb2e6f9e2"
     },
     "schedule": {
-      "anchorDate": "2026-09-14",
-      "validThrough": "2026-09-14T00:00:00+00:00"
+      "anchorDate": "2027-09-13",
+      "validThrough": "2027-09-13T00:00:00+00:00"
     },
     "roots": {
       "tags": 6,

@@ -32,7 +32,7 @@ class DemoCatalogAdminEnabledMvcTest : IntegrationTestSupport() {
                     """
                     {
                       "catalogName":"closed-beta-demo",
-                      "manifestVersion":"2026-08-15.v1",
+                      "manifestVersion":"2027-09-13.v1",
                       "scheduleAnchorDate":"2099-01-01",
                       "catalogValidThrough":"2098-12-01T00:00:00Z",
                       "roots":{
