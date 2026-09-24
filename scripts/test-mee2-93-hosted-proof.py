@@ -427,10 +427,19 @@ class HostedProofContractTests(unittest.TestCase):
 def fd_set() -> set[int]:
     scan_fd = os.open("/proc/self/fd", os.O_RDONLY | os.O_DIRECTORY)
     try:
+        scan_info = os.fstat(scan_fd)
         result: set[int] = set()
         for name in os.listdir(scan_fd):
-            if name.isdigit() and int(name) != scan_fd:
-                result.add(int(name))
+            if not name.isdigit() or int(name) == scan_fd:
+                continue
+            fd = int(name)
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                continue
+            if (info.st_dev, info.st_ino) == (scan_info.st_dev, scan_info.st_ino):
+                continue
+            result.add(fd)
         return result
     finally:
         os.close(scan_fd)
