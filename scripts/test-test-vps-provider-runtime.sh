@@ -1266,8 +1266,45 @@ EOF
       [ "$(timeout 30s docker inspect "$container" \
         --format '{{.Image}}' 2>/dev/null)" = "$postgres_expected_id" ]
     }
+    classify_previous_compose_failure() {
+      local failure_code=previous_compose_state_unavailable
+      local failed_backend failed_postgres backend_state postgres_state
+      if failed_postgres=$(compose ps --all -q postgres 2>/dev/null) &&
+        failed_backend=$(compose ps --all -q backend 2>/dev/null); then
+        if [ -z "$failed_postgres" ]; then
+          failure_code=previous_postgres_missing
+        elif ! postgres_state=$(timeout 30s docker inspect "$failed_postgres" \
+          --format '{{.State.Status}}:{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+          2>/dev/null); then
+          failure_code=previous_compose_state_unavailable
+        elif [ "${postgres_state%%:*}" != running ]; then
+          failure_code=previous_postgres_not_running
+        elif [ "${postgres_state#*:}" != healthy ]; then
+          failure_code=previous_postgres_unhealthy
+        elif [ -z "$failed_backend" ]; then
+          failure_code=previous_backend_missing
+        elif ! backend_state=$(timeout 30s docker inspect "$failed_backend" \
+          --format '{{.State.Status}}:{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+          2>/dev/null); then
+          failure_code=previous_compose_state_unavailable
+        elif [ "${backend_state%%:*}" != running ]; then
+          failure_code=previous_backend_not_running
+        elif [ "${backend_state#*:}" != healthy ]; then
+          failure_code=previous_backend_unhealthy
+        else
+          failure_code=previous_compose_wait_failed
+        fi
+      fi
+      printf 'image_runtime_failure case=%s code=%s\n' \
+        "$case_name" "$failure_code"
+    }
     runtime_stage fixture_ready
-    capture_command "$case_log" compose up -d --wait --no-build --pull never
+    if capture_command "$case_log" compose up -d --wait --no-build --pull never; then
+      runtime_stage previous_compose_up_completed
+    else
+      classify_previous_compose_failure
+      return 1
+    fi
     check_capture_bound "$case_log"
     backend=$(compose ps -q backend)
     postgres=$(compose ps -q postgres)
