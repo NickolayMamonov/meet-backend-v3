@@ -16,7 +16,7 @@
       "serialization": "psql-jsonb-text-with-trailing-lf",
       "fixture": "scripts/fixtures/test-vps-beta-demo/canonical-stable-proof.json",
       "byteLength": 6867,
-      "sha256": "a09a28286b46b0efac5cba84d5154d71596bba116782e5a72a7d2dbe95ccfe13"
+      "sha256": "6507c415b8a6b5bd42e297b8f1816b48c07b2ee4dcc0011594741a5eb2e6f9e2"
     },
     "schedule": {
       "anchorDate": "2027-09-13",

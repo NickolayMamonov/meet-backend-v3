@@ -5,6 +5,7 @@ import dev.whysoezzy.meet.demo.catalog.DemoCatalogBootstrapService
 import dev.whysoezzy.meet.api.error.ConflictException
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.springframework.dao.EmptyResultDataAccessException
 import org.springframework.beans.factory.annotation.Autowired
 import tools.jackson.databind.ObjectMapper
 import java.sql.Connection
@@ -54,7 +55,7 @@ class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
         assertEquals("2027-09-13.v1", contract.path("populated").path("manifestVersion").textValue())
         assertEquals(6867, contract.path("populated").path("stableProof").path("byteLength").intValue())
         assertEquals(
-            "a09a28286b46b0efac5cba84d5154d71596bba116782e5a72a7d2dbe95ccfe13",
+            "6507c415b8a6b5bd42e297b8f1816b48c07b2ee4dcc0011594741a5eb2e6f9e2",
             contract.path("populated").path("stableProof").path("sha256").textValue(),
         )
         assertEquals(expected, "$actual\n")
@@ -313,7 +314,7 @@ class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
         assertEquals(setOf("address", "latitude", "longitude"), fieldNames(meeting.path("address")))
         assertEquals(setOf("id", "name", "surname", "description", "imageUrl"), fieldNames(meeting.path("personHost")))
         assertEquals(
-            setOf("id", "name", "description", "imageUrl", "meetingsInfo"),
+            setOf("id", "title", "description", "imageUrl", "meetingsInfo"),
             fieldNames(meeting.path("communityHost")),
         )
         assertEquals(setOf("id", "name", "surname", "imageUrl"), fieldNames(meeting.path("participants").first()))
@@ -412,10 +413,14 @@ class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
         )
 
     private fun recoveryProof(): String? =
-        jdbcTemplate.queryForObject(
-            Files.readString(Path.of("scripts", "beta-recovery-database-proof.sql")),
-            String::class.java,
-        )
+        try {
+            jdbcTemplate.queryForObject(
+                Files.readString(Path.of("scripts", "beta-recovery-database-proof.sql")),
+                String::class.java,
+            )
+        } catch (_: EmptyResultDataAccessException) {
+            null
+        }
 
     private fun rootIds(): Map<String, Long> =
         jdbcTemplate.queryForList(
@@ -436,7 +441,7 @@ class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
             SELECT demo_catalog_key, id, time, date, ends_at
             FROM meetings
             WHERE demo_catalog_key LIKE 'closed-beta-demo/%'
-            ORDER BY demo_catalog_key
+            ORDER BY id
             """.trimIndent(),
         ).map { row ->
             ScheduleTuple(

@@ -8,7 +8,7 @@
   "renewal": {
     "task": "MEE2-94",
     "manifestVersion": "2027-09-13.v1",
-    "admissionContractSha256": "9649d9f922a4f3a98fcc65ac5152937c900ce19f2589e22909d1058e08b2699a",
+    "admissionContractSha256": "c5fd3e24776012a422111d1eccc17270a2049ed9a3c705a4e3710e5c318bd6d6",
     "note": "Contract data renewed from the reviewed 2027 edition; historical filter provenance above is unchanged."
   },
   "cases": [
