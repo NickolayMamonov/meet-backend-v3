@@ -59,8 +59,10 @@ FAILURE_STAGES = frozenset(
 FAILURE_CODES = frozenset(
     ("none", "environment", "unsafe_input", "descriptor_coverage",
      "timeout_tree", "subject_identity", "subject_helper",
-     "subject_descriptor", "subject_suite", "image_identity", "cleanup",
-     "evidence")
+     "subject_descriptor", "subject_child_admission", "subject_child_success",
+     "subject_retention_success", "subject_retention_admission",
+     "subject_witness_loop", "subject_retention_loop", "subject_suite",
+     "image_identity", "cleanup", "evidence")
 )
 DESCRIPTOR_KEYS = (
     "transferred_missing",

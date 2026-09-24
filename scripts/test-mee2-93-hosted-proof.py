@@ -752,6 +752,7 @@ def native_descriptor(subject_value: str) -> int:
         for key in proof.DESCRIPTOR_KEYS
     }
     failure_stage = "descriptor"
+    failure_code = "subject_identity"
     try:
         if os.name != "posix" or sys.platform != "linux" or os.geteuid() != 0:
             raise proof.ProofFailure("linux_prerequisite", environment=True)
@@ -776,10 +777,15 @@ def native_descriptor(subject_value: str) -> int:
         fixture.mkdir(mode=0o700)
         os.chown(fixture, 0, 0)
         try:
+            failure_code = "subject_child_admission"
             child_admission_rejections(helper, fixture)
+            failure_code = "subject_child_success"
             successful_child_witness_contract(helper, fixture)
+            failure_code = "subject_retention_success"
             successful_retention_delete(helper, fixture)
+            failure_code = "subject_retention_admission"
             admission_rejection_contract(helper, fixture)
+            failure_code = "subject_witness_loop"
             for key, kind in (
                 ("transferred_missing", "missing"),
                 ("transferred_replaced_regular", "regular"),
@@ -791,6 +797,7 @@ def native_descriptor(subject_value: str) -> int:
                     "iterations": iterations,
                     "maxFdGrowthBeforeRescue": growth,
                 }
+            failure_code = "subject_retention_loop"
             status, iterations, growth = retention_loop(helper, fixture)
             results["retention_post_acquisition"] = {
                 "status": status,
@@ -814,7 +821,7 @@ def native_descriptor(subject_value: str) -> int:
         elif error.code in ("helper_drift", "helper_load"):
             failure = proof.failure_observation("subject", "subject_helper")
         else:
-            failure = proof.failure_observation("subject", "subject_descriptor")
+            failure = proof.failure_observation("subject", failure_code)
         print("MEE2_DESCRIPTOR_FAILURE=" + json.dumps(failure, separators=(",", ":"), sort_keys=True))
         print("MEE2_DESCRIPTOR_RESULT=" + json.dumps(results, separators=(",", ":"), sort_keys=True))
         return 77 if error.environment else 1
@@ -822,7 +829,7 @@ def native_descriptor(subject_value: str) -> int:
         for key in results:
             if results[key]["status"] == "not_run":
                 results[key]["status"] = "failed"
-        code = "timeout_tree" if failure_stage == "descriptor" else "subject_descriptor"
+        code = "timeout_tree" if failure_stage == "descriptor" else failure_code
         failure = proof.failure_observation(failure_stage, code)
         print("MEE2_DESCRIPTOR_FAILURE=" + json.dumps(failure, separators=(",", ":"), sort_keys=True))
         print("MEE2_DESCRIPTOR_RESULT=" + json.dumps(results, separators=(",", ":"), sort_keys=True))
