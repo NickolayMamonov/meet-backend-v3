@@ -1,0 +1,131 @@
+name: MEE2-93 hosted proof
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - .github/workflows/prove-mee2-93-hosted.yml
+      - scripts/mee2-93-hosted-cases.json
+      - scripts/mee2-93-hosted-proof.py
+      - scripts/prove-mee2-93-hosted.sh
+      - scripts/test-mee2-93-hosted-proof.py
+
+permissions:
+  contents: read
+
+jobs:
+  hosted-proof:
+    name: Exact MEE2-93 hosted proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    env:
+      SUBJECT_SHA: c5841d67bb2d9e782c00135846557728bc37a8ef
+      TOOLING_SHA: ${{ github.event.pull_request.head.sha }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      SUBJECT: ${{ github.workspace }}/subject
+      TOOLING: ${{ github.workspace }}/tooling
+
+    steps:
+      - name: Checkout PR-head tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: tooling
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout exact MEE2-93 subject
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: c5841d67bb2d9e782c00135846557728bc37a8ef
+          path: subject
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run exact proof
+        id: proof
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          private_root="$RUNNER_TEMP/mee2-93-private"
+          evidence_root="$RUNNER_TEMP/mee2-93-evidence"
+          sudo timeout --signal=TERM --kill-after=60s 12600s \
+            bash "$TOOLING/scripts/prove-mee2-93-hosted.sh" \
+            --subject "$SUBJECT" \
+            --tooling "$TOOLING" \
+            --private-root "$private_root" \
+            --evidence-root "$evidence_root" \
+            --tooling-sha "$TOOLING_SHA" \
+            --workflow-sha "$WORKFLOW_SHA"
+          status=$?
+          printf 'status=%s\n' "$status" >>"$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Validate closed evidence
+        id: validate
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          evidence_root="$RUNNER_TEMP/mee2-93-evidence"
+          timeout 30s python3 -B \
+            "$TOOLING/scripts/mee2-93-hosted-proof.py" \
+            validate --evidence-root "$evidence_root"
+          status=$?
+          printf 'status=%s\n' "$status" >>"$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload sanitized proof
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mee2-93-hosted-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/mee2-93-evidence/proof.json
+            ${{ runner.temp }}/mee2-93-evidence/SHA256SUMS
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Publish sanitized receipt
+        if: always()
+        shell: bash
+        env:
+          PROOF_STATUS: ${{ steps.proof.outputs.status }}
+          VALIDATE_STATUS: ${{ steps.validate.outputs.status }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$PROOF_STATUS" =~ ^[0-9]+$ ]]
+          [[ "$VALIDATE_STATUS" =~ ^[0-9]+$ ]]
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          {
+            echo "## MEE2-93 hosted proof receipt"
+            echo
+            echo "- Run: $GITHUB_RUN_ID"
+            echo "- Attempt: $GITHUB_RUN_ATTEMPT"
+            echo "- Tooling: $TOOLING_SHA"
+            echo "- Subject: $SUBJECT_SHA"
+            echo "- Workflow: $WORKFLOW_SHA"
+            echo "- Artifact ID: $ARTIFACT_ID"
+            echo "- Artifact digest: sha256:$ARTIFACT_DIGEST"
+            echo "- Proof status: $PROOF_STATUS"
+            echo "- Evidence validation status: $VALIDATE_STATUS"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce proof verdict
+        if: always()
+        shell: bash
+        env:
+          PROOF_STATUS: ${{ steps.proof.outputs.status }}
+          VALIDATE_STATUS: ${{ steps.validate.outputs.status }}
+        run: |
+          set -euo pipefail
+          [ "$PROOF_STATUS" = 0 ]
+          [ "$VALIDATE_STATUS" = 0 ]
