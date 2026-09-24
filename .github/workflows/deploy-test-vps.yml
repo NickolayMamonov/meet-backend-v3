@@ -650,9 +650,17 @@ jobs:
 
           delete_owned_state() {
             local path=$1
+            local -a delete_args=(retention-delete --state-root "$state_root"
+              --retention-state "$path")
+            local ref protected
+            for ref in "${protected_refs[@]}"; do
+              delete_args+=(--protected-path "$ref")
+            done
+            for protected in "${protected_states[@]}"; do
+              delete_args+=(--protected-state "$protected")
+            done
             timeout 30s python3 "$tooling/scripts/test-vps-provider-credential.py" \
-              retention-delete --state-root "$state_root" \
-              --retention-state "$path" >/dev/null
+              "${delete_args[@]}" >/dev/null
           }
 
           mapfile -t state_paths < <(
@@ -667,25 +675,46 @@ jobs:
               sort -nr |
               cut -d' ' -f2-
           )
+          provider_args=(retention-list --state-root "$state_root")
+          for ref in "${protected_refs[@]}"; do
+            provider_args+=(--protected-path "$ref")
+          done
+          for path in "${protected_states[@]}"; do
+            provider_args+=(--protected-state "$path")
+          done
+          if ! owned_json=$(timeout 30s python3 \
+            "$tooling/scripts/test-vps-provider-credential.py" \
+            "${provider_args[@]}"); then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
+          if ! owned_state_names_json=$(jq -e -c '
+            if type == "object" and .schemaVersion == 1 and
+              .outcome == "retention-safe" and
+              (.ownedStates | type == "array") and
+              all(.ownedStates[];
+                type == "string" and
+                test("^[0-9]+-[0-9]+-(rollback-drill|final-deploy)$")
+              ) and
+              ((.ownedStates | unique | length) == (.ownedStates | length))
+            then .ownedStates
+            else error("invalid retention admission")
+            end
+          ' <<<"$owned_json"); then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
+          if ! owned_state_names_text=$(jq -r '.[]' <<<"$owned_state_names_json"); then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
+          owned_state_names=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && owned_state_names+=("$name")
+          done <<<"$owned_state_names_text"
           states=()
           for path in "${state_paths[@]}"; do
             name=${path#"$state_root/"}
-            case "$name" in
-              *-final-deploy) state_run_key=${name%-final-deploy} ;;
-              *-rollback-drill) state_run_key=${name%-rollback-drill} ;;
-              *) continue ;;
-            esac
-            terminal="$path/terminal.json"
-            jq -e --arg run_key "$state_run_key" '
-              type == "object" and
-              (keys | sort) == ["outcome","providerEnabled","runKey","schemaVersion"] and
-              .schemaVersion == 1 and .runKey == $run_key and
-              (.outcome == "committed" or .outcome == "rolled-back") and
-              (.providerEnabled | type == "boolean")
-            ' "$terminal" >/dev/null 2>&1 || {
-              retention_unresolved=true
-              continue
-            }
             if find "$path" -xdev -type l -print -quit | grep -q .; then
               protected_states+=("$path")
               continue
@@ -707,21 +736,26 @@ jobs:
                   continue
                 }
             fi
-            states+=("$path")
+            for owned_name in "${owned_state_names[@]}"; do
+              if [ "$name" = "$owned_name" ]; then
+                states+=("$path")
+                break
+              fi
+            done
           done
-          provider_args=(retention-check --state-root "$state_root")
+          provider_args=(retention-list --state-root "$state_root")
           for ref in "${protected_refs[@]}"; do
             provider_args+=(--protected-path "$ref")
           done
           for path in "${protected_states[@]}"; do
             provider_args+=(--protected-state "$path")
           done
-          if [ "$retention_unresolved" != false ]; then
+          timeout 30s python3 "$tooling/scripts/test-vps-provider-credential.py" \
+            "${provider_args[@]}" >/dev/null || {
             echo "RECOVERY_REQUIRED" >&2
             exit 1
-          fi
-          if ! timeout 30s python3 "$tooling/scripts/test-vps-provider-credential.py" \
-            "${provider_args[@]}" >/dev/null 2>&1; then
+          }
+          if [ "$retention_unresolved" != false ]; then
             echo "RECOVERY_REQUIRED" >&2
             exit 1
           fi

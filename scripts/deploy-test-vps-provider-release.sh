@@ -654,8 +654,11 @@ timeout 30s python3 "$provider_helper" retention-check \
   --state-root "$state_root" >/dev/null ||
   fail "RECOVERY_REQUIRED"
 
-[ ! -e "$state" ] || fail "run state already exists"
-install -d -m 700 "$state"
+timeout 30s python3 "$provider_helper" state-publish \
+  --state-root "$state_root" \
+  --run-key "$run_key" \
+  --state-kind "$state_suffix" >/dev/null ||
+  fail "RECOVERY_REQUIRED"
 
 compose() {
   timeout 30s bash -c '
