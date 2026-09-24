@@ -57,7 +57,8 @@ def child_grandchild_timeout_fixture() -> None:
     with tempfile.TemporaryDirectory(prefix="mee2-95-timeout-") as directory:
         pid_file = Path(directory) / "pids"
         child_source = (
-            "import os, pathlib, time\n"
+            "import os, pathlib, signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             "grandchild_pid = os.fork()\n"
             "if grandchild_pid == 0:\n"
             "    time.sleep(60)\n"
@@ -69,7 +70,7 @@ def child_grandchild_timeout_fixture() -> None:
         result = proof.bounded_run(
             [sys.executable, "-c", child_source],
             cwd=HERE,
-            timeout_seconds=5,
+            timeout_seconds=1,
             env={"PATH": os.defpath},
         )
         if not result.timed_out:
