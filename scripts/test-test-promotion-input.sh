@@ -21,6 +21,10 @@ jq -e '
   .baselineFilterSha256 == "8cf493135a2c60a14a866e9e2ee69a62cbb522e6f6c189139b24dc0ab75a1bee" and
   .scalarPath == "jobs.deploy.steps[].run" and
   .generationCommand == "jq -n with the complete promotion arguments and baseline inline filter | jq -S ." and
+  .renewal.task == "MEE2-94" and
+  .renewal.manifestVersion == "2027-09-13.v1" and
+  .renewal.admissionContractSha256 == "9649d9f922a4f3a98fcc65ac5152937c900ce19f2589e22909d1058e08b2699a" and
+  .renewal.note == "Contract data renewed from the reviewed 2027 edition; historical filter provenance above is unchanged." and
   .cases == [
     "empty-closed-same",
     "closed-beta-demo-same",

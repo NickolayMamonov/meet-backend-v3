@@ -12,7 +12,7 @@ class DemoCatalogManifestValidatorTest {
         val manifest = BetaDemoCatalog.manifest
         validator.validate(manifest, setOf("api.whysoezzy.online"))
         assertEquals("closed-beta-demo", manifest.catalogName)
-        assertEquals("2026-08-15.v1", manifest.manifestVersion)
+        assertEquals("2027-09-13.v1", manifest.manifestVersion)
         assertEquals(6, manifest.tags.size)
         assertEquals(6, manifest.users.size)
         assertEquals(3, manifest.communities.size)
@@ -42,7 +42,7 @@ class DemoCatalogManifestValidatorTest {
         }
         assertThrows<IllegalArgumentException> {
             validator.validate(
-                BetaDemoCatalog.manifest.copy(manifestVersion = "2026-08-15.v2"),
+                BetaDemoCatalog.manifest.copy(manifestVersion = "2027-09-13.v2"),
                 setOf("api.whysoezzy.online"),
             )
         }
