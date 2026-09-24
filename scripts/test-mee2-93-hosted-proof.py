@@ -260,14 +260,33 @@ class HostedProofContractTests(unittest.TestCase):
         )
 
     def test_immutable_failure_code_is_allowlisted_progress_only(self) -> None:
-        disabled = b"image_runtime case=disabled previous_id=x\n"
+        disabled_stages = b"".join(
+            (
+                f"image_runtime_stage case=disabled stage={stage}\n"
+            ).encode("ascii")
+            for stage in proof.IMMUTABLE_STAGES
+        )
+        enabled_stages = b"".join(
+            (
+                f"image_runtime_stage case=enabled stage={stage}\n"
+            ).encode("ascii")
+            for stage in proof.IMMUTABLE_STAGES
+        )
+        disabled = disabled_stages + b"image_runtime case=disabled previous_id=x\n"
         disabled_cleanup = b"image_runtime_cleanup case=disabled containers=0\n"
-        enabled = b"image_runtime case=enabled previous_id=x\n"
+        enabled = enabled_stages + b"image_runtime case=enabled previous_id=x\n"
         enabled_cleanup = b"image_runtime_cleanup case=enabled containers=0\n"
         self.assertEqual(
             proof.immutable_failure_code(b""),
             "immutable_disabled_runtime",
         )
+        for index, stage in enumerate(proof.IMMUTABLE_STAGES, start=1):
+            self.assertEqual(
+                proof.immutable_failure_code(
+                    b"".join(disabled_stages.splitlines(keepends=True)[:index])
+                ),
+                f"immutable_disabled_{stage}",
+            )
         self.assertEqual(
             proof.immutable_failure_code(disabled),
             "immutable_disabled_cleanup",
@@ -299,6 +318,41 @@ class HostedProofContractTests(unittest.TestCase):
                 "stage": "immutable_runtime",
                 "code": "immutable_enabled_runtime",
             },
+        )
+
+    def test_immutable_stage_unknown_is_marker_contract(self) -> None:
+        self.assertEqual(
+            proof.immutable_failure_code(
+                b"image_runtime_stage case=disabled stage=raw-output\n"
+            ),
+            "immutable_marker_contract",
+        )
+        self.assertEqual(
+            proof.immutable_failure_code(
+                b"image_runtime_stage case=other stage=fixture_ready\n"
+            ),
+            "immutable_marker_contract",
+        )
+
+    def test_immutable_stage_duplicate_is_marker_contract(self) -> None:
+        marker = b"image_runtime_stage case=disabled stage=fixture_ready\n"
+        self.assertEqual(
+            proof.immutable_failure_code(marker + marker),
+            "immutable_marker_contract",
+        )
+
+    def test_immutable_stage_out_of_order_is_marker_contract(self) -> None:
+        self.assertEqual(
+            proof.immutable_failure_code(
+                b"image_runtime_stage case=disabled stage=previous_compose_ready\n"
+            ),
+            "immutable_marker_contract",
+        )
+        self.assertEqual(
+            proof.immutable_failure_code(
+                b"image_runtime_stage case=enabled stage=fixture_ready\n"
+            ),
+            "immutable_marker_contract",
         )
 
     def test_duplicate_required_marker_rejected(self) -> None:

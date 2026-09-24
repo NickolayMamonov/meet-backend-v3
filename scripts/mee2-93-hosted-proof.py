@@ -36,8 +36,8 @@ SUBJECT_SHA = INVENTORY["subject"]["commit"]
 SUBJECT_TREE = INVENTORY["subject"]["tree"]
 SUBJECT_FILES = tuple(INVENTORY["subject"]["files"])
 IMAGES = dict(INVENTORY["images"])
-PLAN_SHA = "c7664c61c580028a993fba1a3f8ccb82b4355937a77627a805c57d7ac3db914e"
-SUPPLIED_MANIFEST_SHA = "002404ef9b55cb9165e616f405bb461daded67b9c1796e0e9cae4eed2ce3c6aa"
+PLAN_SHA = "6044d1f2e587896d04d145c2234302d5f870bb2a008cd4d79e9c36414d50353c"
+SUPPLIED_MANIFEST_SHA = "5af4eaf8a560ebd8806fe06ebef34f2c026b3569586029ce804d7de77b589380"
 MAX_CAPTURE = 8 * 1024 * 1024
 MAX_PROOF = 256 * 1024
 MAX_ARCHIVE_MEMBER = 256 * 1024
@@ -66,6 +66,14 @@ FAILURE_CODES = frozenset(
      "subject_retention_success", "subject_retention_admission",
      "subject_witness_loop", "subject_retention_loop", "subject_suite",
      "image_identity", "immutable_disabled_runtime",
+     "immutable_disabled_fixture_ready",
+     "immutable_disabled_previous_compose_ready",
+     "immutable_disabled_previous_network_ready",
+     "immutable_disabled_probe_ready",
+     "immutable_disabled_rollback_started",
+     "immutable_disabled_rollback_completed",
+     "immutable_disabled_deploy_started",
+     "immutable_disabled_deploy_completed",
      "immutable_disabled_cleanup", "immutable_enabled_runtime",
      "immutable_enabled_cleanup", "immutable_filesystem_tail",
      "immutable_marker_contract", "cleanup", "evidence")
@@ -76,6 +84,20 @@ DESCRIPTOR_KEYS = (
     "transferred_replaced_symlink",
     "retention_post_acquisition",
 )
+IMMUTABLE_CASES = ("disabled", "enabled")
+IMMUTABLE_STAGES = (
+    "fixture_ready",
+    "previous_compose_ready",
+    "previous_network_ready",
+    "probe_ready",
+    "rollback_started",
+    "rollback_completed",
+    "deploy_started",
+    "deploy_completed",
+)
+IMMUTABLE_DISABLED_STAGE_CODES = {
+    stage: f"immutable_disabled_{stage}" for stage in IMMUTABLE_STAGES
+}
 
 
 class ProofFailure(Exception):
@@ -772,6 +794,39 @@ def marker_count(output: bytes, marker: bytes) -> int:
     return sum(line.startswith(marker) for line in output.splitlines())
 
 
+def immutable_stage_progress(output: bytes) -> dict[str, tuple[str, ...]] | None:
+    progress: dict[str, list[str]] = {case: [] for case in IMMUTABLE_CASES}
+    prefix = b"image_runtime_stage "
+    enabled_started = False
+    for line in output.splitlines():
+        if not line.startswith(prefix):
+            continue
+        match = None
+        for case in IMMUTABLE_CASES:
+            for stage in IMMUTABLE_STAGES:
+                if line == (
+                    f"image_runtime_stage case={case} stage={stage}".encode("ascii")
+                ):
+                    match = (case, stage)
+                    break
+            if match is not None:
+                break
+        if match is None:
+            return None
+        case, stage = match
+        if case == "enabled":
+            enabled_started = True
+        elif enabled_started:
+            return None
+        observed = progress[case]
+        if len(observed) >= len(IMMUTABLE_STAGES):
+            return None
+        if stage != IMMUTABLE_STAGES[len(observed)]:
+            return None
+        observed.append(stage)
+    return {case: tuple(stages) for case, stages in progress.items()}
+
+
 def immutable_failure_code(output: bytes) -> str:
     ordered = (
         (b"image_runtime case=disabled", "immutable_disabled_runtime"),
@@ -782,7 +837,30 @@ def immutable_failure_code(output: bytes) -> str:
     counts = tuple(marker_count(output, marker) for marker, _ in ordered)
     if any(count > 1 for count in counts):
         return "immutable_marker_contract"
-    for count, (_, code) in zip(counts, ordered, strict=True):
+    progress = immutable_stage_progress(output)
+    if progress is None:
+        return "immutable_marker_contract"
+    disabled_runtime, disabled_cleanup, enabled_runtime, enabled_cleanup = counts
+    if (
+        (disabled_runtime == 1
+         and progress["disabled"] != IMMUTABLE_STAGES)
+        or (disabled_cleanup == 1 and disabled_runtime != 1)
+        or (progress["enabled"]
+            and (disabled_runtime != 1 or disabled_cleanup != 1))
+        or (enabled_runtime == 1
+            and (
+                progress["enabled"] != IMMUTABLE_STAGES
+                or disabled_runtime != 1
+                or disabled_cleanup != 1
+            ))
+        or (enabled_cleanup == 1 and enabled_runtime != 1)
+    ):
+        return "immutable_marker_contract"
+    if disabled_runtime != 1:
+        if progress["disabled"]:
+            return IMMUTABLE_DISABLED_STAGE_CODES[progress["disabled"][-1]]
+        return "immutable_disabled_runtime"
+    for count, (_, code) in zip(counts[1:], ordered[1:], strict=True):
         if count != 1:
             return code
     return "immutable_filesystem_tail"
