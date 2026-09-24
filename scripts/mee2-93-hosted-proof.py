@@ -237,28 +237,37 @@ def bounded_run(
     timed_out = False
     deadline = time.monotonic() + timeout_seconds
     terminated_at: float | None = None
+    forced = False
 
     def terminate(force: bool = False) -> None:
-        nonlocal terminated_at
-        if process.poll() is not None:
-            return
+        nonlocal terminated_at, forced
         try:
             if os.name == "posix":
                 os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
             else:
+                if process.poll() is not None:
+                    return
                 (process.kill if force else process.terminate)()
         except (OSError, ProcessLookupError):
             pass
         if terminated_at is None:
             terminated_at = time.monotonic()
+        forced = forced or force
 
     while selector.get_map():
         now = time.monotonic()
         if now >= deadline and process.poll() is None:
             timed_out = True
             terminate()
-        if terminated_at is not None and now - terminated_at >= 5 and process.poll() is None:
+        if terminated_at is not None and not forced and now - terminated_at >= 5:
             terminate(force=True)
+        if terminated_at is not None and now - terminated_at >= 10:
+            for key in list(selector.get_map().values()):
+                try:
+                    selector.unregister(key.fileobj)
+                except Exception:
+                    pass
+            break
         events = selector.select(0.10)
         for key, _ in events:
             try:
@@ -277,12 +286,6 @@ def bounded_run(
                 terminate()
             elif not overflow:
                 retained.extend(chunk)
-        if process.poll() is not None and not events:
-            for key in list(selector.get_map().values()):
-                try:
-                    selector.unregister(key.fileobj)
-                except Exception:
-                    pass
     returncode = process.wait(timeout=10)
     return RunResult(returncode, bytes(retained), timed_out, overflow)
 
