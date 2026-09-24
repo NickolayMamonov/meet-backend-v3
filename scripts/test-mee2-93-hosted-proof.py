@@ -56,13 +56,15 @@ def child_grandchild_timeout_fixture() -> None:
         return
     with tempfile.TemporaryDirectory(prefix="mee2-95-timeout-") as directory:
         pid_file = Path(directory) / "pids"
-        grandchild_source = "import time; time.sleep(60)"
         child_source = (
-            "import os, pathlib, subprocess, sys, time\n"
-            f"grandchild = subprocess.Popen([sys.executable, '-c', {grandchild_source!r}])\n"
-            f"pathlib.Path({str(pid_file)!r}).write_text("
-            f"f'{{os.getpid()}} {{grandchild.pid}}', encoding='ascii')\n"
-            "time.sleep(60)\n"
+            "import os, pathlib, time\n"
+            "grandchild_pid = os.fork()\n"
+            "if grandchild_pid == 0:\n"
+            "    time.sleep(60)\n"
+            "else:\n"
+            f"    pathlib.Path({str(pid_file)!r}).write_text("
+            "str(os.getpid()) + ' ' + str(grandchild_pid), encoding='ascii')\n"
+            "    time.sleep(60)\n"
         )
         result = proof.bounded_run(
             [sys.executable, "-c", child_source],
