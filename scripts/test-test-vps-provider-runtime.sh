@@ -510,6 +510,10 @@ PY
     local cleanup_network_capture="$matrix_fixture/$case_name-cleanup-network.out"
     local previous_state target_state legacy_before legacy_after
 
+    runtime_stage() {
+      printf 'image_runtime_stage case=%s stage=%s\n' "$case_name" "$1"
+    }
+
     capture_command() {
       local output=$1
       shift
@@ -1262,6 +1266,7 @@ EOF
       [ "$(timeout 30s docker inspect "$container" \
         --format '{{.Image}}' 2>/dev/null)" = "$postgres_expected_id" ]
     }
+    runtime_stage fixture_ready
     capture_command "$case_log" compose up -d --wait --no-build --pull never
     check_capture_bound "$case_log"
     backend=$(compose ps -q backend)
@@ -1270,8 +1275,10 @@ EOF
     [ "$(timeout 30s docker inspect "$backend" --format '{{.Image}}')" = "$previous_id" ]
     [ "$(timeout 30s docker inspect "$postgres" --format '{{.State.Health.Status}}')" = healthy ]
     assert_postgres_image "$postgres"
+    runtime_stage previous_compose_ready
     assert_internal_network
     assert_outbound_blocked "$backend"
+    runtime_stage previous_network_ready
     capture_command "$probe_log" timeout 1800s python3 "$case_root/probe.py" \
       "$probe_port" "$app_port" "$probe_cert" "$probe_key" &
     probe_pid=$!
@@ -1290,6 +1297,7 @@ EOF
       sleep 1
     done
     [ "$probe_ready" = true ]
+    runtime_stage probe_ready
 
     verify_case_runtime() {
       local expected_id=$1
@@ -1410,6 +1418,7 @@ EOF
       return "$coordinator_status"
     }
 
+    runtime_stage rollback_started
     set +e
     run_rollback_drill
     rollback_status=$?
@@ -1430,7 +1439,9 @@ EOF
       "BACKEND_IMAGE=$previous_image" ]
     legacy_after=$(legacy_digest)
     [ "$legacy_before" = "$legacy_after" ]
+    runtime_stage rollback_completed
 
+    runtime_stage deploy_started
     set +e
     capture_command "$deploy_capture" run_coordinator \
       "$target_image" "$target_revision" \
@@ -1458,6 +1469,7 @@ EOF
     legacy_after=$(legacy_digest)
     [ "$legacy_before" = "$legacy_after" ]
     scan_case_secrets
+    runtime_stage deploy_completed
     printf 'image_runtime case=%s previous_id=%s target_id=%s cleanup=pending\n' \
       "$case_name" "$previous_id" "$target_id"
   )
