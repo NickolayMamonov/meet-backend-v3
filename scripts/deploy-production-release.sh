@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
 SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
+# shellcheck source=beta-backup-runtime-gate.sh
+source "$SCRIPTS_DIR/beta-backup-runtime-gate.sh"
 COMPOSE=("$SCRIPTS_DIR/production-compose.sh")
 STATE_DIR=/var/lib/meet-production
 ACTIVE_COMPOSE="$STATE_DIR/active-compose.yml"
@@ -22,6 +24,7 @@ test "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.ope
 test "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = "$VERSION"
 test "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = "https://github.com/NickolayMamonov/meet-backend-v3"
 test "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = "10001:10001"
+beta_backup_runtime_require_operation "$IMAGE" production-deploy
 
 STATE_NAMES=(previous-image previous-image-id previous-version previous-revision previous-uid
   previous-gid previous-upload-volume previous-config.sha256

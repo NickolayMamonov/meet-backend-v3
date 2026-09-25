@@ -1,0 +1,31 @@
+name: Closed-beta backup monitor
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: closed-beta-recurring-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    if: vars.BETA_RECURRING_ACTIVATED == 'true'
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-monitor
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Monitor committed authority
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/master
+          echo "monitor activation requires separately approved private authority and incident destination"

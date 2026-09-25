@@ -230,6 +230,9 @@ jobs:
             scripts/update-production-release.sh
             scripts/deploy-test-vps-release.sh
             scripts/deploy-test-vps-provider-release.sh
+            scripts/beta-backup-policy.sh
+            scripts/check-beta-backup-safety.sh
+            scripts/beta-backup-runtime-gate.sh
             scripts/test-vps-provider-credential.py
           )
           for file in "${files[@]}"; do

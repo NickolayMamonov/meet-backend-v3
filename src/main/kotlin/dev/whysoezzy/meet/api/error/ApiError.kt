@@ -34,6 +34,8 @@ class ServiceUnavailableException(message: String) :
     ApiException(HttpStatus.SERVICE_UNAVAILABLE, "SMS_UNAVAILABLE", message)
 class PushUnavailableException(message: String = "Push service is temporarily unavailable") :
     ApiException(HttpStatus.SERVICE_UNAVAILABLE, "PUSH_UNAVAILABLE", message)
+class BackupSafetyBlockedException(message: String = "Backup safety policy blocks this operation") :
+    ApiException(HttpStatus.SERVICE_UNAVAILABLE, "BACKUP_SAFETY_BLOCKED", message)
 class EmailOtpRateLimitedException :
     ApiException(
         HttpStatus.TOO_MANY_REQUESTS,

@@ -1,0 +1,96 @@
+name: Closed-beta recurring backups
+
+on:
+  schedule:
+    - cron: "17 1,13 * * *"
+    - cron: "47 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      drill:
+        description: Run the protected weekly drill
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: closed-beta-recurring-${{ github.event.schedule || inputs.drill || 'capture' }}
+  cancel-in-progress: false
+
+jobs:
+  admission:
+    runs-on: ubuntu-24.04
+    if: vars.BETA_RECURRING_ACTIVATED == 'true'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Verify recurring custody admission
+        env:
+          RUN_REF: ${{ github.ref }}
+          DEFAULT_REF: refs/heads/master
+          SCHEDULER_SHA: ${{ github.sha }}
+          ENVIRONMENT: ${{ (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true') && 'closed-beta-recurring-restore' || 'closed-beta-recurring-capture' }}
+        run: |
+          set -euo pipefail
+          checkout_sha=$(git rev-parse HEAD)
+          ci_sha=${{ github.sha }}
+          scripts/authorize-beta-recurring.sh \
+            --event "${{ github.event_name }}" \
+            --run-ref "$RUN_REF" \
+            --default-ref "$DEFAULT_REF" \
+            --scheduler-sha "$SCHEDULER_SHA" \
+            --checkout-sha "$checkout_sha" \
+            --ci-sha "$ci_sha" \
+            --environment "$ENVIRONMENT"
+
+  capture:
+    needs: admission
+    if: vars.BETA_RECURRING_ACTIVATED == 'true' && github.event.schedule != '47 3 * * 1' && inputs.drill != 'true'
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-capture
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Capture scheduled point
+        env:
+          SLOT: ${{ github.run_id }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/master
+          echo "capture activation requires separately approved VPS and storage credentials"
+          scripts/run-beta-recurring-capture.sh \
+            --output "$RUNNER_TEMP/recurring-point" \
+            --slot "$SLOT" \
+            --captured-at "$(date -u +%s)" \
+            --source-revision "$SOURCE_REVISION" \
+            --runtime-revision "$SOURCE_REVISION" \
+            --contract-digest "$(sha256sum scripts/run-beta-recurring-capture.sh | awk '{print $1}')" \
+            --proof-digest "$(sha256sum scripts/authorize-beta-recurring.sh | awk '{print $1}')"
+
+  protected-drill:
+    needs: admission
+    if: vars.BETA_RECURRING_ACTIVATED == 'true' && (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true')
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-restore
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Require protected reviewer custody
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/master
+          test "${{ vars.BETA_RESTORE_PREVENT_SELF_REVIEW || 'true' }}" = true
+          test "${{ vars.BETA_RESTORE_ADMIN_BYPASS || 'false' }}" = false
+          echo "protected recurring restore requires environment reviewer approval and exact-version selection"

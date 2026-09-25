@@ -48,6 +48,10 @@ services:
       APP_JWT_SECRET: ${APP_JWT_SECRET:?APP_JWT_SECRET is required}
       APP_STORAGE_UPLOAD_DIR: /data/uploads
       APP_STORAGE_BASE_URL: ${APP_STORAGE_BASE_URL:?APP_STORAGE_BASE_URL is required}
+      APP_BACKUP_SAFETY_ENABLED: ${APP_BACKUP_SAFETY_ENABLED:-false}
+      APP_BACKUP_SAFETY_ENROLLED: ${APP_BACKUP_SAFETY_ENROLLED:-false}
+      APP_BACKUP_SAFETY_ENVIRONMENT: ${APP_BACKUP_SAFETY_ENVIRONMENT:-closed-beta}
+      APP_BACKUP_SAFETY_STATUS_PATH: /var/lib/meet-production/beta-backup-control/status.json
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,6 +59,10 @@ services:
       - "127.0.0.1:${APP_PORT:-8080}:8080"
     volumes:
       - uploads_data:/data/uploads
+      - type: bind
+        source: ${BACKUP_CONTROL_ROOT:-/var/lib/meet-production/beta-backup-control}
+        target: /var/lib/meet-production/beta-backup-control
+        read_only: true
     user: "10001:10001"
     tmpfs:
       - /tmp
@@ -74,6 +82,8 @@ services:
     mem_limit: ${BACKEND_MEMORY_LIMIT:-768m}
     restart: unless-stopped
     logging: *bounded-logging
+    labels:
+      org.opencontainers.image.backup-safety-gate: "v1"
 
 volumes:
   postgres_data:

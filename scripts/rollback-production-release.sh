@@ -4,8 +4,11 @@ set -euo pipefail
 ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
 SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
+# shellcheck source=beta-backup-runtime-gate.sh
+source "$SCRIPTS_DIR/beta-backup-runtime-gate.sh"
 COMPOSE=("$SCRIPTS_DIR/production-compose.sh")
 STATE_DIR=/var/lib/meet-production
+beta_backup_runtime_require_operation "" production-rollback
 
 for name in previous-image previous-image-id previous-version previous-revision previous-uid previous-gid previous-upload-volume previous-config.sha256 previous-compose.yml previous-runtime.override.yml previous-compose.sha256 previous-runtime.sha256 previous-compose-config-hash; do
   test -s "$STATE_DIR/$name" || { echo "missing rollback state: $name" >&2; exit 1; }

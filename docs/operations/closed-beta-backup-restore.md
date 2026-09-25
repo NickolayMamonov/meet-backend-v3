@@ -180,3 +180,31 @@ contract digests, equality proofs, mount contract, volume absence, probes,
 observed recovery-point age, and dispatch-to-post-probe RTO of at most
 7200 seconds. This is not recurring automation or an ongoing RPO guarantee;
 recurring backup belongs to MEE2-63.
+
+## Recurring custody and local safety
+
+The recurring control is intentionally separate from this manual proof. Scheduled
+capture and the weekly protected drill run only from the registered `master`
+scheduler ref and use dedicated `closed-beta-recurring-*` environments. The
+manual `closed-beta-restore` environment remains dev-only and its authorization
+contract is unchanged. Protected recurring restore requires an authorized
+reviewer, prevents self-review, and does not permit an administrator bypass.
+
+The backend does not contact storage providers for admission. A restricted
+monitor delivers a sanitized, replay-protected status file to
+`/var/lib/meet-production/beta-backup-control`; the application reads the
+directory-mounted file locally. Missing or invalid status, an observation older
+than 30 minutes, or a restore-verified capture at least 14 days old blocks only
+documented unsafe mutators with `503 BACKUP_SAFETY_BLOCKED`. Ordinary reads,
+authentication, user writes, capture, isolated drills, and separately reviewed
+exact-operation recovery remain available. A capture age of at least 24 hours
+is a measured breach and at least 30 hours is an alert; neither threshold is
+fabricated by copying or drilling a point.
+
+Recurring storage is private, encrypted, versioned and manifest-last. The
+newest verified point is pinned until replaced, normal points are retained for
+30 days, and all object versions, multipart parts and control metadata count
+toward the configured byte budget. Ambiguous writer outcomes retain the lock;
+there is no timed stale-owner takeover. Provider capability, credentials,
+budget, environment registration, host enrollment and live activation require
+separate approval and are not implied by this repository contract.
