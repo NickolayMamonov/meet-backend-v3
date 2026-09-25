@@ -259,7 +259,7 @@ class BetaRecoveryDatabaseProofPostgresTest : IntegrationTestSupport() {
         )
 
     private fun assertCanonicalAndSafe(proof: JsonNode) {
-        assertEquals("meet-backend/closed-beta-database-proof/v1", proof.path("schema").textValue())
+        assertEquals("meet-backend/closed-beta-database-proof/v2", proof.path("schema").textValue())
         assertTrue(proof.path("valid").booleanValue())
         assertEquals(
             listOf(
@@ -270,6 +270,7 @@ class BetaRecoveryDatabaseProofPostgresTest : IntegrationTestSupport() {
                 "indexes",
                 "mediaReferences",
                 "relationships",
+                "realCatalog",
                 "schema",
                 "tables",
             ),
@@ -283,7 +284,8 @@ class BetaRecoveryDatabaseProofPostgresTest : IntegrationTestSupport() {
         assertTrue(proof.path("schemaChecks").path("requiredTablesAndColumns").booleanValue())
         assertTrue(proof.path("schemaChecks").path("exactRequiredTableCount").booleanValue())
         assertTrue(proof.path("schemaChecks").path("requiredConstraints").booleanValue())
-        assertTrue(proof.path("flyway").path("orderedV1ToV9").booleanValue())
+        assertTrue(proof.path("flyway").path("orderedV1ToV11").booleanValue())
+        assertTrue(proof.path("validity").path("realCatalog").booleanValue())
     }
 
     private fun assertProofRejected() {

@@ -3,12 +3,14 @@ package dev.whysoezzy.meet.service
 import dev.whysoezzy.meet.api.error.ConflictException
 import dev.whysoezzy.meet.api.error.NotFoundException
 import dev.whysoezzy.meet.api.dto.*
+import dev.whysoezzy.meet.catalog.RealCatalogAdvisoryLock
 import dev.whysoezzy.meet.domain.entity.Meeting
 import dev.whysoezzy.meet.domain.entity.MeetingCapacityExceededException
 import dev.whysoezzy.meet.domain.entity.MeetingStatus
 import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import mu.KotlinLogging
+import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.data.domain.PageRequest
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
@@ -17,10 +19,11 @@ import java.time.Clock
 private val logger = KotlinLogging.logger {}
 
 @Service
-class MeetingService(
+class MeetingService @Autowired constructor(
     private val meetingRepository: MeetingRepository,
     private val userRepository: UserRepository,
     private val clock: Clock,
+    private val realCatalogAdvisoryLock: RealCatalogAdvisoryLock? = null,
 ) {
 
     @Transactional(readOnly = true)
@@ -50,7 +53,7 @@ class MeetingService(
         )
 
         return (upcoming + popular + laterUpcoming)
-            .map { it.toDto(currentUserId) }
+            .map { it.toDto(currentUserId, currentTime) }
     }
 
     @Transactional(readOnly = true)
@@ -63,7 +66,7 @@ class MeetingService(
             currentTime,
             PageRequest.of(0, 20),
         )
-            .map { it.toDto(currentUserId) }
+            .map { it.toDto(currentUserId, currentTime) }
     }
 
     @Transactional(readOnly = true)
@@ -86,14 +89,15 @@ class MeetingService(
             )
         }
 
-        return meetings.map { it.toDto(currentUserId) }
+        return meetings.map { it.toDto(currentUserId, currentTime) }
     }
 
     @Transactional(readOnly = true)
     fun searchMeetings(query: String, currentUserId: Long?): List<MeetingDto> {
         logger.info { "Searching meetings" }
-        return meetingRepository.searchDiscoveryMeetings(query, MeetingStatus.ACTIVE, clock.millis())
-            .map { it.toDto(currentUserId) }
+        val currentTime = clock.millis()
+        return meetingRepository.searchDiscoveryMeetings(query, MeetingStatus.ACTIVE, currentTime)
+            .map { it.toDto(currentUserId, currentTime) }
     }
 
     @Transactional(readOnly = true)
@@ -108,12 +112,22 @@ class MeetingService(
     fun joinMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId joining meeting: $meetingId" }
 
-        val user = userRepository.findWithLockById(userId)
-            ?: throw NotFoundException("User not found")
         val meeting = meetingRepository.findById(meetingId)
             .orElseThrow { NotFoundException("Meeting not found") }
+        if (meeting.realCatalogKey != null &&
+            !(realCatalogAdvisoryLock?.tryAcquire() ?: true)
+        ) {
+            throw ConflictException("Real catalog is busy")
+        }
+        val user = userRepository.findWithLockById(userId)
+            ?: throw NotFoundException("User not found")
 
         if (!meeting.isActive()) throw ConflictException("Meeting is not active")
+        if (meeting.realCatalogKey != null &&
+            !meetingRepository.isFreshForParticipation(meetingId, clock.millis())
+        ) {
+            throw ConflictException("Meeting is not available for new participation")
+        }
         if (meetingRepository.isUserParticipant(meetingId, userId))
             throw ConflictException("User already joined this meeting")
 
@@ -129,10 +143,15 @@ class MeetingService(
     fun leaveMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId leaving meeting: $meetingId" }
 
-        val user = userRepository.findWithLockById(userId)
-            ?: throw NotFoundException("User not found")
         val meeting = meetingRepository.findById(meetingId)
             .orElseThrow { NotFoundException("Meeting not found") }
+        if (meeting.realCatalogKey != null &&
+            !(realCatalogAdvisoryLock?.tryAcquire() ?: true)
+        ) {
+            throw ConflictException("Real catalog is busy")
+        }
+        val user = userRepository.findWithLockById(userId)
+            ?: throw NotFoundException("User not found")
 
         if (!meetingRepository.isUserParticipant(meetingId, userId))
             throw ConflictException("User is not a participant")
@@ -169,7 +188,7 @@ class MeetingService(
 
     // ==================== Маппинг ====================
 
-    private fun Meeting.toDto(currentUserId: Long?): MeetingDto {
+    private fun Meeting.toDto(currentUserId: Long?, discoveryNow: Long? = null): MeetingDto {
         return MeetingDto(
             id = id!!,
             imageUrl = imageUrl,
@@ -190,12 +209,17 @@ class MeetingService(
                 )
             },
             communityHost = communityHost?.let { community ->
+                val relatedMeetings = if (discoveryNow != null) {
+                        meetingRepository.findDiscoverySiblings(community.id!!, discoveryNow)
+                    } else {
+                        community.getActiveMeetings()
+                    }
                 CommunityHostDto(
                     id = community.id!!,
                     title = community.name,
                     description = community.description,
                     imageUrl = community.imageUrl,
-                    meetingsInfo = community.getActiveMeetings().take(5).map { m ->
+                    meetingsInfo = relatedMeetings.take(5).map { m ->
                         MeetingInfoDto(m.id!!, m.title, m.imageUrl, m.date)
                     }
                 )

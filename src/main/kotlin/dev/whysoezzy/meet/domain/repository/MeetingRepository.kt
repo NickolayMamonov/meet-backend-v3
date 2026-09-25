@@ -12,14 +12,22 @@ import org.springframework.stereotype.Repository
 @Repository
 interface MeetingRepository : JpaRepository<Meeting, Long> {
     fun findAllByDemoCatalogKeyIn(keys: Collection<String>): List<Meeting>
+    fun findAllByRealCatalogKey(catalogKey: String): List<Meeting>
+    fun findByRealCatalogKeyAndRealCatalogItemKey(catalogKey: String, itemKey: String): Meeting?
 
     @Query(
         """
-        SELECT m FROM Meeting m
-        WHERE m.status = :status
-          AND COALESCE(m.endsAt, m.time) >= :now
+        SELECT m.* FROM meetings m
+        LEFT JOIN real_catalog_state state ON state.catalog_key = m.real_catalog_key
+        WHERE m.status = :#{#status.name()}
+          AND COALESCE(m.ends_at, m.time) >= :now
+          AND (
+            m.real_catalog_key IS NULL
+            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+          )
         ORDER BY m.time ASC, m.id ASC
         """,
+        nativeQuery = true,
     )
     fun findDiscoveryMeetings(
         @Param("status") status: MeetingStatus,
@@ -29,12 +37,18 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
 
     @Query(
         """
-        SELECT m FROM Meeting m
-        WHERE m.status = :status
-          AND COALESCE(m.endsAt, m.time) >= :now
-          AND m.id NOT IN :excludedIds
+        SELECT m.* FROM meetings m
+        LEFT JOIN real_catalog_state state ON state.catalog_key = m.real_catalog_key
+        WHERE m.status = :#{#status.name()}
+          AND COALESCE(m.ends_at, m.time) >= :now
+          AND m.id NOT IN (:excludedIds)
+          AND (
+            m.real_catalog_key IS NULL
+            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+          )
         ORDER BY m.time ASC, m.id ASC
         """,
+        nativeQuery = true,
     )
     fun findDiscoveryMeetingsExcluding(
         @Param("status") status: MeetingStatus,
@@ -45,13 +59,19 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
 
     @Query(
         """
-        SELECT m FROM Meeting m
-        JOIN m.tags t
-        WHERE m.status = :status
-          AND t.id = :tagId
-          AND COALESCE(m.endsAt, m.time) >= :now
+        SELECT m.* FROM meetings m
+        JOIN meeting_tags mt ON mt.meeting_id = m.id
+        LEFT JOIN real_catalog_state state ON state.catalog_key = m.real_catalog_key
+        WHERE m.status = :#{#status.name()}
+          AND mt.tag_id = :tagId
+          AND COALESCE(m.ends_at, m.time) >= :now
+          AND (
+            m.real_catalog_key IS NULL
+            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+          )
         ORDER BY m.time ASC, m.id ASC
         """,
+        nativeQuery = true,
     )
     fun findDiscoveryMeetingsByTag(
         @Param("tagId") tagId: Long,
@@ -62,16 +82,22 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
 
     @Query(
         """
-        SELECT m FROM Meeting m
-        WHERE m.status = :status
-          AND COALESCE(m.endsAt, m.time) >= :now
+        SELECT m.* FROM meetings m
+        LEFT JOIN real_catalog_state state ON state.catalog_key = m.real_catalog_key
+        WHERE m.status = :#{#status.name()}
+          AND COALESCE(m.ends_at, m.time) >= :now
           AND (
             LOWER(m.title) LIKE LOWER(CONCAT('%', :query, '%'))
             OR LOWER(m.description) LIKE LOWER(CONCAT('%', :query, '%'))
             OR LOWER(m.address) LIKE LOWER(CONCAT('%', :query, '%'))
           )
+          AND (
+            m.real_catalog_key IS NULL
+            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+          )
         ORDER BY m.time ASC, m.id ASC
         """,
+        nativeQuery = true,
     )
     fun searchDiscoveryMeetings(
         @Param("query") query: String,
@@ -81,13 +107,19 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
 
     @Query(
         """
-        SELECT m FROM Meeting m
-        LEFT JOIN m.participants p
-        WHERE m.status = :status
-          AND COALESCE(m.endsAt, m.time) >= :now
+        SELECT m.* FROM meetings m
+        LEFT JOIN meeting_participants p ON p.meeting_id = m.id
+        LEFT JOIN real_catalog_state state ON state.catalog_key = m.real_catalog_key
+        WHERE m.status = :#{#status.name()}
+          AND COALESCE(m.ends_at, m.time) >= :now
+          AND (
+            m.real_catalog_key IS NULL
+            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+          )
         GROUP BY m.id
-        ORDER BY COUNT(p.id) DESC, m.time ASC, m.id ASC
+        ORDER BY COUNT(p.user_id) DESC, m.time ASC, m.id ASC
         """,
+        nativeQuery = true,
     )
     fun findPopularDiscoveryMeetings(
         @Param("status") status: MeetingStatus,
@@ -97,14 +129,20 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
 
     @Query(
         """
-        SELECT m FROM Meeting m
-        LEFT JOIN m.participants p
-        WHERE m.status = :status
-          AND COALESCE(m.endsAt, m.time) >= :now
-          AND m.id NOT IN :excludedIds
+        SELECT m.* FROM meetings m
+        LEFT JOIN meeting_participants p ON p.meeting_id = m.id
+        LEFT JOIN real_catalog_state state ON state.catalog_key = m.real_catalog_key
+        WHERE m.status = :#{#status.name()}
+          AND COALESCE(m.ends_at, m.time) >= :now
+          AND m.id NOT IN (:excludedIds)
+          AND (
+            m.real_catalog_key IS NULL
+            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+          )
         GROUP BY m.id
-        ORDER BY COUNT(p.id) DESC, m.time ASC, m.id ASC
+        ORDER BY COUNT(p.user_id) DESC, m.time ASC, m.id ASC
         """,
+        nativeQuery = true,
     )
     fun findPopularDiscoveryMeetingsExcluding(
         @Param("status") status: MeetingStatus,
@@ -134,6 +172,52 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
     fun isUserParticipant(
         @Param("meetingId") meetingId: Long,
         @Param("userId") userId: Long,
+    ): Boolean
+
+    @Query(
+        value = """
+            SELECT m.* FROM meetings m
+            WHERE m.community_host_id = :communityId
+              AND m.status = 'ACTIVE'
+              AND (
+                m.real_catalog_key IS NULL
+                OR (
+                    m.real_catalog_active = TRUE
+                    AND EXISTS (
+                        SELECT 1 FROM real_catalog_state state
+                        WHERE state.catalog_key = m.real_catalog_key
+                          AND state.discoverable_until > to_timestamp(:now / 1000.0)
+                    )
+                )
+              )
+            ORDER BY m.time ASC, m.id ASC
+        """,
+        nativeQuery = true,
+    )
+    fun findDiscoverySiblings(
+        @Param("communityId") communityId: Long,
+        @Param("now") now: Long,
+    ): List<Meeting>
+
+    @Query(
+        value = """
+            SELECT CASE WHEN COUNT(*) > 0 THEN TRUE ELSE FALSE END
+            FROM meetings m
+            LEFT JOIN real_catalog_state state ON state.catalog_key = m.real_catalog_key
+            WHERE m.id = :meetingId
+              AND (
+                m.real_catalog_key IS NULL
+                OR (
+                    m.real_catalog_active = TRUE
+                    AND state.discoverable_until > to_timestamp(:now / 1000.0)
+                )
+              )
+        """,
+        nativeQuery = true,
+    )
+    fun isFreshForParticipation(
+        @Param("meetingId") meetingId: Long,
+        @Param("now") now: Long,
     ): Boolean
 
     /** Поиск существующего внешнего события для идемпотентного upsert. */

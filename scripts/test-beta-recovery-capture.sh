@@ -148,7 +148,7 @@ elif [ "${args[${#args[@]}-2]:-}" = -f ] && [ "${args[${#args[@]}-1]:-}" = - ]; 
   printf '%s\n' "$consumer" >>"$events"
   jq -cn --arg consumer "$consumer" --argjson argv "$argv_json" \
     '{consumer:$consumer,argv:$argv}' >>"$log"
-  printf '{"schema":"meet-backend/closed-beta-database-proof/v1","valid":true}\n'
+  printf '{"schema":"meet-backend/closed-beta-database-proof/v2","valid":true}\n'
 else
   echo "unexpected psql fixture argv" >&2
   exit 92

@@ -8,7 +8,7 @@
     "catalogName": "closed-beta-demo",
     "manifestVersion": "2026-08-15.v1",
     "recoveryProof": {
-      "schema": "meet-backend/closed-beta-database-proof/v1",
+      "schema": "meet-backend/closed-beta-database-proof/v2",
       "sha256": "c1a83c4d33e5c4d1772b27bc770471e99a6fb1ac2827c16c9787ecef073d2979"
     },
     "stableProof": {

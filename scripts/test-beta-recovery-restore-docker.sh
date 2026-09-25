@@ -287,9 +287,9 @@ done
 docker exec "$container" psql -X -qAt -U restore_user -d restore_db -v ON_ERROR_STOP=1 -c \
   "SELECT jsonb_build_object(
      'rows', jsonb_build_object('users', 1),
-     'schema', 'meet-backend/closed-beta-database-proof/v1'
+     'schema', 'meet-backend/closed-beta-database-proof/v2'
    )::jsonb;" >"$work/postgres-jsonb.raw"
-jq -cnS '{schema:"meet-backend/closed-beta-database-proof/v1",rows:{users:1}}' \
+jq -cnS '{schema:"meet-backend/closed-beta-database-proof/v2",rows:{users:1}}' \
   >"$work/postgres-jsonb.expected"
 if cmp -- "$work/postgres-jsonb.raw" "$work/postgres-jsonb.expected"; then
   echo "PostgreSQL JSONB text unexpectedly matched canonical bytes" >&2
@@ -299,7 +299,7 @@ jq -e -cS -s '
   if length == 1 and
      (.[0] | type) == "object" and
      (.[0].schema | type) == "string" and
-     .[0].schema == "meet-backend/closed-beta-database-proof/v1"
+     .[0].schema == "meet-backend/closed-beta-database-proof/v2"
   then .[0]
   else error("database proof must be one valid object")
   end
