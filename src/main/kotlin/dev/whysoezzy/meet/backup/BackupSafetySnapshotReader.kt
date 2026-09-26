@@ -20,8 +20,9 @@ open class BackupSafetySnapshotReader(
 ) {
     fun validateEnrollmentMount() {
         val root = controlRoot()
-        require(Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS))
-        require(!Files.isSymbolicLink(root))
+        validateRootForRead(root)
+        require(properties.mountIdentity.matches(MOUNT_IDENTITY_PATTERN))
+        require(readMountIdentity(root) == properties.mountIdentity)
         val mode = runCatching {
             Files.getPosixFilePermissions(root).toMode()
         }.getOrNull()
@@ -96,8 +97,19 @@ open class BackupSafetySnapshotReader(
 
     private fun validateRootForRead() {
         val root = controlRoot()
+        validateRootForRead(root)
+    }
+
+    private fun validateRootForRead(root: Path) {
         require(Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS))
         require(!Files.isSymbolicLink(root))
+        if (properties.enrolled) {
+            require(properties.mountIdentity.matches(MOUNT_IDENTITY_PATTERN))
+            require(readMountIdentity(root) == properties.mountIdentity)
+            require(readMode(root) == properties.controlRootMode.toInt(8))
+            require(readUnixOwner(root, "uid") == properties.controlRootUid)
+            require(readUnixOwner(root, "gid") == properties.controlRootGid)
+        }
     }
 
     private fun readMode(path: Path): Int =
@@ -105,6 +117,19 @@ open class BackupSafetySnapshotReader(
 
     private fun readUnixOwner(path: Path, field: String): Long =
         (Files.readAttributes(path, "unix:$field", LinkOption.NOFOLLOW_LINKS)[field] as Number).toLong()
+
+    private fun readMountIdentity(path: Path): String {
+        val attributes = Files.readAttributes(
+            path,
+            "unix:dev,ino,mode,uid,gid",
+            LinkOption.NOFOLLOW_LINKS,
+        )
+        val mode = (attributes["mode"] as Number).toLong() and 0xFFF
+        return listOf("dev", "ino").map { (attributes[it] as Number).toLong() }
+            .plus(mode)
+            .plus(listOf("uid", "gid").map { (attributes[it] as Number).toLong() })
+            .joinToString(":")
+    }
 
     private fun controlRoot(): Path = Path.of(properties.statusPath).toAbsolutePath().normalize().parent
         ?: throw IllegalArgumentException("status path has no parent")
@@ -173,6 +198,7 @@ open class BackupSafetySnapshotReader(
         const val MAX_BYTES = 64 * 1024L
         const val CONTROL_FILE_MODE = 640
         const val WATERMARK_SCHEMA = "meet-backend/beta-backup-watermark/v1"
+        val MOUNT_IDENTITY_PATTERN = Regex("^[0-9]+:[0-9]+:[0-7]{3,4}:[0-9]+:[0-9]+$")
         val TOP_LEVEL_FIELDS = setOf(
             "schema",
             "environment",

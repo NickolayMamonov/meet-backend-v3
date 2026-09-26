@@ -23,6 +23,15 @@ mkdir -p "$tmp/storage"
   --captured-at 1790000000 --owner test >/dev/null || fail "durable publish failed"
 [ -s "$tmp/storage/points/slot-1790000000/point.json" ] ||
   fail "manifest-last descriptor was not published"
+cp -r "$tmp/point" "$tmp/partial-point"
+printf '{"schema":"meet-backend/closed-beta-database-proof/v1"}\n' \
+  >"$tmp/partial-point/capture-database-proof.json"
+if "$root/scripts/run-beta-backup-storage.sh" publish --source "$tmp/partial-point" \
+  --storage-root "$tmp/storage" --point-id slot-1790000001 --slot 1790000001 \
+  --captured-at 1790000000 --owner test >/dev/null 2>&1; then
+  fail "incomplete capture proof pair was accepted"
+fi
+rm -rf "$tmp/partial-point"
 if "$root/scripts/run-beta-backup-storage.sh" publish --source "$tmp/point" \
   --storage-root "$tmp/storage" --point-id slot-1790000000 --slot 1790000000 \
   --captured-at 1790000000 --owner test >/dev/null 2>&1; then

@@ -206,4 +206,28 @@ if BETA_RECURRING_REQUIRE_APPROVAL=true \
     --post-approval-file "$post_approval" >/dev/null 2>&1; then
   fail "post-approval custody drift remained admissible"
 fi
+capture_tool="$root/scripts/run-beta-recurring-capture-command.sh"
+restore_tool="$root/scripts/run-beta-recurring-restore-command.sh"
+"$root/scripts/validate-beta-recurring-tooling.sh" \
+  --role capture --path "$capture_tool" \
+  --allowlist "$root/scripts/fixtures/beta-recurring/tooling-allowlist.json" >/dev/null ||
+  fail "capture tooling allowlist rejected the reviewed adapter"
+"$root/scripts/validate-beta-recurring-tooling.sh" \
+  --role restore --path "$restore_tool" \
+  --allowlist "$root/scripts/fixtures/beta-recurring/tooling-allowlist.json" >/dev/null ||
+  fail "restore tooling allowlist rejected the reviewed adapter"
+cp "$root/scripts/fixtures/beta-recurring/tooling-allowlist.json" "$tmp/forged-allowlist.json"
+sed -i '0,/5b5c6f5aaacd4dc975f2053e508eb3927fc3eda1d764d352717f0b6947182959/s//0000000000000000000000000000000000000000000000000000000000000000/' \
+  "$tmp/forged-allowlist.json"
+if "$root/scripts/validate-beta-recurring-tooling.sh" \
+  --role capture --path "$capture_tool" --allowlist "$tmp/forged-allowlist.json" \
+  >/dev/null 2>&1; then
+  fail "forged tooling digest was accepted"
+fi
+workflow="$root/.github/workflows/beta-recurring-backups.yml"
+! grep -Eq 'BETA_RECURRING_CAPTURE_COMMAND|BETA_RECURRING_RESTORE_COMMAND|BETA_RESTORE_|BETA_RECURRING_ADMIN_BYPASS|BETA_RECURRING_PREVENT_SELF_REVIEW' "$workflow" ||
+  fail "workflow retained mutable command or protection inputs"
+grep -Fq 'post-probe:' "$workflow" || fail "post-probe job is missing"
+grep -Fq 'needs: [protected-drill, pre-probe, admission]' "$workflow" ||
+  fail "post-probe DAG does not wait for admission and pre-probe"
 printf 'test-beta-recurring-backups.sh: passed\n'

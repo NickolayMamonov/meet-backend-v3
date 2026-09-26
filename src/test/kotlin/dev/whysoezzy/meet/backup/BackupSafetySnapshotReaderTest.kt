@@ -38,6 +38,53 @@ class BackupSafetySnapshotReaderTest {
     }
 
     @Test
+    fun `rejects an enrolled replacement mount with a changed device or inode`() {
+        val directory = Files.createTempDirectory("backup-safety-mount")
+        val path = directory.resolve("status.json")
+        val attrs = runCatching {
+            Files.readAttributes(directory, "unix:dev,ino,mode,uid,gid")
+        }.getOrNull() ?: return
+        val mode = (attrs["mode"] as Number).toLong() and 0xFFF
+        val identity = listOf("dev", "ino").map { (attrs[it] as Number).toLong() }
+            .plus(mode)
+            .plus(listOf("uid", "gid").map { (attrs[it] as Number).toLong() })
+            .joinToString(":")
+        val properties = BackupSafetyProperties(
+            enabled = true,
+            enrolled = true,
+            environment = "closed-beta",
+            statusPath = path.toString(),
+            controlRootMode = mode.toString(8),
+            controlRootUid = (attrs["uid"] as Number).toLong(),
+            controlRootGid = (attrs["gid"] as Number).toLong(),
+            mountIdentity = identity,
+        )
+        val digest = "a".repeat(64)
+        val status = """{"authorityDigest":"$digest","authorityGeneration":1,"capture":{"capturedAt":1000,"id":"point-1","state":"VALID"},"environment":"closed-beta","observedAt":1100,"schema":"meet-backend/beta-backup-status/v1","verified":{"capturedAt":1000,"id":"point-1","state":"VALID"}}"""
+        Files.writeString(path, status)
+        val statusDigest = MessageDigest.getInstance("SHA-256")
+            .digest(status.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        Files.writeString(
+            directory.resolve("watermark.json"),
+            """{"authorityGeneration":1,"observedAt":1100,"schema":"meet-backend/beta-backup-watermark/v1","statusDigest":"$statusDigest"}""",
+        )
+        Files.move(directory, directory.resolveSibling("${directory.fileName}-moved"))
+        val replacement = Files.createTempDirectory("backup-safety-mount-replacement")
+        Files.writeString(replacement.resolve("status.json"), status)
+        Files.writeString(
+            replacement.resolve("watermark.json"),
+            """{"authorityGeneration":1,"observedAt":1100,"schema":"meet-backend/beta-backup-watermark/v1","statusDigest":"$statusDigest"}""",
+        )
+        Files.move(
+            replacement,
+            directory,
+        )
+        val reader = BackupSafetySnapshotReader(jacksonObjectMapper(), properties)
+        assertThrows<BackupSafetySnapshotReadException> { reader.read() }
+    }
+
+    @Test
     fun `rejects unknown fields duplicate keys and symlink status`() {
         val directory = Files.createTempDirectory("backup-safety-reader")
         val path = directory.resolve("status.json")

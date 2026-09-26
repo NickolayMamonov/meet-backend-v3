@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME [--policy-file PATH --ci-result-file PATH --actor LOGIN --reviewer LOGIN --approval-file PATH --post-approval-file PATH --reviewer-id ID]" >&2
+  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME [--policy-file PATH --post-policy-file PATH --ci-result-file PATH --actor LOGIN --reviewer LOGIN --approval-file PATH --post-approval-file PATH --reviewer-id ID]" >&2
   exit 2
 }
 
@@ -12,7 +12,7 @@ fail() {
 }
 
 event='' run_ref='' default_ref='' scheduler_sha='' checkout_sha='' ci_sha=''
-environment='' policy_file='' ci_result_file='' actor='' reviewer=''
+environment='' policy_file='' post_policy_file='' ci_result_file='' actor='' reviewer=''
 approval_file='' post_approval_file='' reviewer_id=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -24,6 +24,7 @@ while [ "$#" -gt 0 ]; do
     --ci-sha) [ "$#" -ge 2 ] || usage; ci_sha=$2; shift 2 ;;
     --environment) [ "$#" -ge 2 ] || usage; environment=$2; shift 2 ;;
     --policy-file) [ "$#" -ge 2 ] || usage; policy_file=$2; shift 2 ;;
+    --post-policy-file) [ "$#" -ge 2 ] || usage; post_policy_file=$2; shift 2 ;;
     --ci-result-file) [ "$#" -ge 2 ] || usage; ci_result_file=$2; shift 2 ;;
     --actor) [ "$#" -ge 2 ] || usage; actor=$2; shift 2 ;;
     --reviewer) [ "$#" -ge 2 ] || usage; reviewer=$2; shift 2 ;;
@@ -92,15 +93,15 @@ if [ -n "$policy_file" ] || [ -n "$ci_result_file" ]; then
   validate_policy "$policy_file"
   validate_ci "$ci_result_file"
   [[ "$actor" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail actor
-  if [ "$environment" = closed-beta-recurring-restore ]; then
+  if [ "$environment" = closed-beta-recurring-restore ] && [ -n "$reviewer" ]; then
     [[ "$reviewer" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail reviewer_missing
     [ "$reviewer" != "$actor" ] || fail self_review
   fi
 fi
 validate_approval() {
-  local file=$1 policy_digest protection_digest
+  local file=$1 policy_digest protection_digest policy_source=${post_policy_file:-$policy_file}
   [ -f "$file" ] && [ ! -L "$file" ] || fail approval_missing
-  policy_digest=$(sha256sum "$policy_file" | awk '{print $1}')
+  policy_digest=$(sha256sum "$policy_source" | awk '{print $1}')
   jq -e --arg environment "$environment" --arg reviewer "$reviewer" \
     --arg reviewer_id "$reviewer_id" --arg actor "$actor" \
     --arg branch "$run_ref" --arg policy "$policy_digest" '
@@ -125,15 +126,20 @@ validate_approval() {
     fail approval_drift
 }
 if [ "$environment" = closed-beta-recurring-restore ] &&
-  { [ "${BETA_RECURRING_REQUIRE_APPROVAL:-false}" = true ] || [ -n "$approval_file" ] || [ -n "$post_approval_file" ]; }; then
-  [ -n "$approval_file" ] && [ -n "$post_approval_file" ] || fail approval_required
+  { [ -n "$approval_file" ] || [ -n "$post_approval_file" ]; }; then
+  [ -n "$approval_file" ] || fail approval_required
+  [ -n "$post_policy_file" ] || fail post_policy_required
+  validate_policy "$post_policy_file"
+  jq -cS . "$policy_file" >"$policy_file.canonical"
+  jq -cS . "$post_policy_file" >"$post_policy_file.canonical"
+  cmp -s "$policy_file.canonical" "$post_policy_file.canonical" || fail policy_changed_after_approval
   validate_approval "$approval_file"
-  validate_approval "$post_approval_file"
-  cmp -s "$approval_file" "$post_approval_file" || fail approval_changed
+  if [ -n "$post_approval_file" ]; then
+    validate_approval "$post_approval_file"
+    cmp -s "$approval_file" "$post_approval_file" || fail approval_changed
+  fi
 fi
-if [ "${BETA_RECURRING_REQUIRE_POLICY:-false}" = true ]; then
-  [ -n "$policy_file" ] && [ -n "$ci_result_file" ] || fail policy_evidence_required
-fi
+[ -n "$policy_file" ] && [ -n "$ci_result_file" ] || fail policy_evidence_required
 
 printf 'recurring_authorized=true environment=%s run_ref=%s scheduler_sha=%s checkout_sha=%s ci_sha=%s policy_validated=%s\n' \
   "$environment" "$run_ref" "$scheduler_sha" "$checkout_sha" "$ci_sha" \

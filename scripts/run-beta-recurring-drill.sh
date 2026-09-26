@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --storage-root DIR --point-id ID --receipt PATH --restore-command PATH --restore-output DIR --identity-file PATH --capture-revision SHA --restore-revision SHA --reviewer-id ID --protection-file PATH --protection-digest DIGEST" >&2
+  echo "usage: $0 [--storage-root DIR] --point-id ID --receipt PATH --restore-command PATH --restore-output DIR --identity-file PATH --capture-revision SHA --restore-revision SHA --reviewer-id ID --protection-file PATH --protection-digest DIGEST" >&2
   exit 2
 }
 
@@ -25,11 +25,13 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-for path in "$root" "$receipt" "$restore_command" "$restore_output" "$identity" "$protection_file"; do
+for path in "$receipt" "$restore_command" "$restore_output" "$identity" "$protection_file"; do
   [[ "$path" = /* && "$path" != *..* && "$path" != *$'\n'* ]] || usage
 done
+[ -z "$root" ] || [[ "$root" = /* && "$root" != *..* && "$root" != *$'\n'* ]] || usage
 [[ "$point_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || usage
-[[ "$capture_revision" =~ ^[0-9a-f]{40}$ && "$restore_revision" =~ ^[0-9a-f]{40}$ ]] || usage
+[[ -z "$capture_revision" || "$capture_revision" =~ ^[0-9a-f]{40}$ ]] || usage
+[[ "$restore_revision" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$reviewer_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] || usage
 [[ "$protection_digest" =~ ^[0-9a-f]{64}$ ]] || usage
 [ -x "$restore_command" ] && [ ! -L "$restore_command" ] || {
@@ -54,12 +56,42 @@ command -v timeout >/dev/null 2>&1 || exit 1
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=beta-backup-storage.sh
 source "$script_dir/beta-backup-storage.sh"
-beta_storage_require_local_root "$root" >/dev/null
-point="$root/points/$point_id"
+root_owned=false
+if [ -z "$root" ]; then
+  beta_storage_require_config
+  root=$(mktemp -d)
+  root_owned=true
+  beta_storage_require_local_root "$root" >/dev/null
+  point="$root/points/$point_id"
+  mkdir -p "$point"
+  remote_scratch="$root/.remote"
+  mkdir -p "$remote_scratch"
+  beta_storage_remote_get_json "points/$point_id/point.json" \
+    "$remote_scratch/point.json"
+  beta_storage_remote_validate_descriptor "$point_id" \
+    "$remote_scratch/point.json" "$remote_scratch"
+  cp -- "$remote_scratch/point.json" "$point/point.json"
+  cp -- "$remote_scratch/manifest.json" "$point/recovery-point.json"
+  cp -- "$remote_scratch/database.age" "$point/postgres.dump.age"
+  cp -- "$remote_scratch/uploads.age" "$point/uploads.tar.gz.age"
+  for proof in capture-database-proof.json capture-media-proof.json; do
+    proof_version=$(beta_storage_remote_latest_version "points/$point_id/$proof") ||
+      { echo 'BACKUP_CUSTODY_BLOCKED:restore_proof_unavailable' >&2; exit 1; }
+    beta_storage_provider_get '' "points/$point_id/$proof" "$proof_version" \
+      "$point/$proof" >/dev/null
+  done
+else
+  beta_storage_require_local_root "$root" >/dev/null
+  point="$root/points/$point_id"
+fi
 beta_storage_local_validate_point_dir "$point" "$point_id" || {
   echo 'BACKUP_CUSTODY_BLOCKED:point_unavailable' >&2
   exit 1
 }
+if [ -z "$capture_revision" ]; then
+  capture_revision=$(jq -er '.capture.sourceRevision' "$point/recovery-point.json")
+fi
+[[ "$capture_revision" =~ ^[0-9a-f]{40}$ ]] || usage
 
 jq -e --arg reviewer "$reviewer_id" --arg digest "$protection_digest" '
   type=="object" and
@@ -103,7 +135,19 @@ restore_parent=$(dirname -- "$restore_output")
   exit 1
 }
 proof_tmp=$(mktemp "$restore_parent/.restore-proof.XXXXXX")
-trap 'rm -f -- "$proof_tmp"' EXIT HUP INT TERM
+cleanup_drill() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  rm -f -- "$proof_tmp" "$identity" || status=1
+  if [ "${root_owned:-false}" = true ]; then
+    rm -rf -- "$root" || status=1
+  fi
+  if [ "$status" -ne 0 ]; then
+    rm -rf -- "$restore_output" || status=1
+  fi
+  exit "$status"
+}
+trap cleanup_drill EXIT HUP INT TERM
 timeout --foreground --signal=TERM 1800s "$restore_command" \
   --point-dir "$point" --identity-file "$identity" --output-dir "$restore_output" \
   --capture-revision "$capture_revision" --restore-revision "$restore_revision" \

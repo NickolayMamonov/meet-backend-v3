@@ -4,6 +4,7 @@ import dev.whysoezzy.meet.api.error.BackupSafetyBlockedException
 import dev.whysoezzy.meet.config.BackupSafetyProperties
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import tools.jackson.module.kotlin.jacksonObjectMapper
 import java.nio.file.Files
 import java.time.Clock
@@ -14,16 +15,12 @@ import java.security.MessageDigest
 class BackupSafetyGateTest {
     @Test
     fun `admits healthy observation while capture RPO breach remains a monitoring concern`() {
+        assumeTrue(posixAttributesSupported())
         val directory = Files.createTempDirectory("backup-safety-gate")
         val path = directory.resolve("status.json")
         Files.writeString(path, status(observedAt = 1_000_000, captureAt = 800_000, verifiedAt = 999_000))
         writeWatermark(path, 1, 1_000_000)
-        val properties = BackupSafetyProperties(
-            enabled = true,
-            enrolled = true,
-            environment = "closed-beta",
-            statusPath = path.toString(),
-        )
+        val properties = propertiesFor(directory, path)
         BackupSafetyGate(
             properties,
             BackupSafetySnapshotReader(jacksonObjectMapper(), properties),
@@ -33,14 +30,10 @@ class BackupSafetyGateTest {
 
     @Test
     fun `blocks stale verified capture and stale local observation independently`() {
+        assumeTrue(posixAttributesSupported())
         val directory = Files.createTempDirectory("backup-safety-gate")
         val path = directory.resolve("status.json")
-        val properties = BackupSafetyProperties(
-            enabled = true,
-            enrolled = true,
-            environment = "closed-beta",
-            statusPath = path.toString(),
-        )
+        val properties = propertiesFor(directory, path)
         Files.writeString(path, status(observedAt = 1_000_000, captureAt = 1_000_000, verifiedAt = 1_000_000 - 14 * 24 * 60 * 60))
         writeWatermark(path, 1, 1_000_000)
         assertThrows<BackupSafetyBlockedException> {
@@ -75,4 +68,41 @@ class BackupSafetyGateTest {
             """{"authorityGeneration":$generation,"observedAt":$observedAt,"schema":"meet-backend/beta-backup-watermark/v1","statusDigest":"$digest"}""",
         )
     }
+
+    private fun propertiesFor(
+        directory: java.nio.file.Path,
+        path: java.nio.file.Path,
+    ): BackupSafetyProperties {
+        val attrs = runCatching {
+            Files.readAttributes(directory, "unix:dev,ino,mode,uid,gid")
+        }.getOrNull() ?: return BackupSafetyProperties(
+            enabled = true,
+            enrolled = false,
+            environment = "closed-beta",
+            statusPath = path.toString(),
+        )
+        val mode = (attrs["mode"] as Number).toLong() and 0xFFF
+        val identity = listOf("dev", "ino").map { (attrs[it] as Number).toLong() }
+            .plus(mode)
+            .plus(listOf("uid", "gid").map { (attrs[it] as Number).toLong() })
+            .joinToString(":")
+        return BackupSafetyProperties(
+            enabled = true,
+            enrolled = true,
+            environment = "closed-beta",
+            statusPath = path.toString(),
+            controlRootMode = mode.toString(8),
+            controlRootUid = (attrs["uid"] as Number).toLong(),
+            controlRootGid = (attrs["gid"] as Number).toLong(),
+            mountIdentity = identity,
+        )
+    }
+
+    private fun posixAttributesSupported(): Boolean =
+        runCatching {
+            Files.readAttributes(
+                Files.createTempDirectory("backup-safety-probe"),
+                "unix:dev,ino,mode,uid,gid",
+            )
+        }.isSuccess
 }

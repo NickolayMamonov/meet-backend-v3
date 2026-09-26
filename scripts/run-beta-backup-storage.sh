@@ -123,23 +123,31 @@ case "$operation" in
         *) usage ;;
       esac
     done
-    [ -n "$root" ] || root=$(local_root)
-    beta_storage_require_local_root "$root" >/dev/null
-    beta_storage_publish_local "$source_dir" "$root" "$point_id" "$slot" "$captured_at" "$owner"
+    if [ -n "$root" ]; then
+      beta_storage_require_local_root "$root" >/dev/null
+      beta_storage_publish_local "$source_dir" "$root" "$point_id" "$slot" "$captured_at" "$owner"
+    else
+      beta_storage_publish_remote "$source_dir" "$point_id" "$slot" "$captured_at" "$owner"
+    fi
     ;;
   promote)
-    receipt='' root='' owner=${BETA_BACKUP_OWNER:-operator}
+    receipt='' receipt_key='' root='' owner=${BETA_BACKUP_OWNER:-operator}
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --receipt) [ "$#" -ge 2 ] || usage; receipt=$2; shift 2 ;;
+        --receipt-key) [ "$#" -ge 2 ] || usage; receipt_key=$2; shift 2 ;;
         --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
         --owner) [ "$#" -ge 2 ] || usage; owner=$2; shift 2 ;;
         *) usage ;;
       esac
     done
-    [ -n "$root" ] || root=$(local_root)
-    beta_storage_require_local_root "$root" >/dev/null
-    beta_storage_promote_local "$receipt" "$root" "$owner"
+    if [ -n "$root" ]; then
+      beta_storage_require_local_root "$root" >/dev/null
+      beta_storage_promote_local "$receipt" "$root" "$owner"
+    else
+      [ -n "$receipt" ] || [ -n "$receipt_key" ] || usage
+      beta_storage_promote_remote "$receipt" "$receipt_key" "$owner"
+    fi
     ;;
   prune)
     root='' now='' owner=${BETA_BACKUP_OWNER:-operator}
@@ -151,28 +159,32 @@ case "$operation" in
         *) usage ;;
       esac
     done
-    [ -n "$root" ] || root=$(local_root)
     [ -n "$now" ] || usage
-    beta_storage_require_local_root "$root" >/dev/null
-    if [ "${APP_BACKUP_SAFETY_ENABLED:-false}" = true ] ||
-      [ -n "${APP_BACKUP_SAFETY_ENV_FILE:-}" ]; then
-      # shellcheck source=beta-backup-runtime-gate.sh
-      source "$script_dir/beta-backup-runtime-gate.sh"
-      beta_backup_runtime_require_operation "" storage-prune \
-        "${APP_BACKUP_SAFETY_ENV_FILE:-}"
+    # Prune is destructive and always requires a complete A3 admission.
+    # shellcheck source=beta-backup-runtime-gate.sh
+    source "$script_dir/beta-backup-runtime-gate.sh"
+    beta_backup_runtime_require_operation "" storage-prune \
+      "${APP_BACKUP_SAFETY_ENV_FILE:-}"
+    if [ -n "$root" ]; then
+      beta_storage_require_local_root "$root" >/dev/null
+      beta_storage_prune_local "$root" "$now" "$owner"
+    else
+      beta_storage_prune_remote "$now" "$owner"
     fi
-    beta_storage_prune_local "$root" "$now" "$owner"
     ;;
   reconcile)
     root=''
     if [ "$#" -eq 2 ] && [ "$1" = --storage-root ]; then
       root=$2
-    else
+    elif [ "$#" -ne 0 ]; then
       usage
     fi
-    [ -n "$root" ] || root=$(local_root)
-    beta_storage_require_local_root "$root" >/dev/null
-    beta_storage_reconcile_local "$root"
+    if [ -n "$root" ]; then
+      beta_storage_require_local_root "$root" >/dev/null
+      beta_storage_reconcile_local "$root"
+    else
+      beta_storage_reconcile_remote
+    fi
     ;;
   *) usage ;;
 esac
