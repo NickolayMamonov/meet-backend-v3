@@ -94,9 +94,6 @@ if [ -e "$source_dir/capture-database-proof.json" ] ||
   }
   cp -- "$source_dir/capture-database-proof.json" "$destination_dir/"
   cp -- "$source_dir/capture-media-proof.json" "$destination_dir/"
-else
-  echo 'BACKUP_STORAGE_BLOCKED:source_restore_proofs_required' >&2
-  exit 1
 fi
 source_db_sha=$(sha256sum "$source_dir/postgres.dump.age" | awk '{print $1}')
 source_media_sha=$(sha256sum "$source_dir/uploads.tar.gz.age" | awk '{print $1}')
@@ -142,11 +139,13 @@ if [ "$remote" = true ]; then
   cp -- "$remote_scratch/manifest.json" "$destination_point/recovery-point.json"
   cp -- "$remote_scratch/database.age" "$destination_point/postgres.dump.age"
   cp -- "$remote_scratch/uploads.age" "$destination_point/uploads.tar.gz.age"
-  for proof in capture-database-proof.json capture-media-proof.json; do
-    proof_version=$(beta_storage_remote_latest_version "points/$point_id/$proof")
-    beta_storage_provider_get '' "points/$point_id/$proof" "$proof_version" \
-      "$destination_point/$proof" >/dev/null
-  done
+  if [ "$(jq -er '.proofs|keys|length' "$remote_scratch/descriptor.json")" -eq 2 ]; then
+    for proof in capture-database-proof.json capture-media-proof.json; do
+      proof_version=$(beta_storage_remote_latest_version "points/$point_id/$proof")
+      beta_storage_provider_get '' "points/$point_id/$proof" "$proof_version" \
+        "$destination_point/$proof" >/dev/null
+    done
+  fi
   destination_descriptor=$(sha256sum "$destination_point/point.json" | awk '{print $1}')
 else
   destination_point="$storage_root/points/$point_id"

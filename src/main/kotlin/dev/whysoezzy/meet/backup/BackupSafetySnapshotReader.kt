@@ -196,7 +196,7 @@ open class BackupSafetySnapshotReader(
 
     private companion object {
         const val MAX_BYTES = 64 * 1024L
-        const val CONTROL_FILE_MODE = 640
+        const val CONTROL_FILE_MODE = 0x1A0
         const val WATERMARK_SCHEMA = "meet-backend/beta-backup-watermark/v1"
         val MOUNT_IDENTITY_PATTERN = Regex("^[0-9]+:[0-9]+:[0-7]{3,4}:[0-9]+:[0-9]+$")
         val TOP_LEVEL_FIELDS = setOf(
@@ -214,14 +214,14 @@ open class BackupSafetySnapshotReader(
 }
 
 private fun Set<PosixFilePermission>.toMode(): Int {
-    fun has(permission: PosixFilePermission) = if (contains(permission)) 1 else 0
-    return has(PosixFilePermission.OWNER_READ) * 400 +
-        has(PosixFilePermission.OWNER_WRITE) * 200 +
-        has(PosixFilePermission.OWNER_EXECUTE) * 100 +
-        has(PosixFilePermission.GROUP_READ) * 40 +
-        has(PosixFilePermission.GROUP_WRITE) * 20 +
-        has(PosixFilePermission.GROUP_EXECUTE) * 10 +
-        has(PosixFilePermission.OTHERS_READ) * 4 +
-        has(PosixFilePermission.OTHERS_WRITE) * 2 +
-        has(PosixFilePermission.OTHERS_EXECUTE)
+    fun has(permission: PosixFilePermission, mask: Int) = if (contains(permission)) mask else 0
+    return has(PosixFilePermission.OWNER_READ, 0x100) +
+        has(PosixFilePermission.OWNER_WRITE, 0x080) +
+        has(PosixFilePermission.OWNER_EXECUTE, 0x040) +
+        has(PosixFilePermission.GROUP_READ, 0x020) +
+        has(PosixFilePermission.GROUP_WRITE, 0x010) +
+        has(PosixFilePermission.GROUP_EXECUTE, 0x008) +
+        has(PosixFilePermission.OTHERS_READ, 0x004) +
+        has(PosixFilePermission.OTHERS_WRITE, 0x002) +
+        has(PosixFilePermission.OTHERS_EXECUTE, 0x001)
 }
