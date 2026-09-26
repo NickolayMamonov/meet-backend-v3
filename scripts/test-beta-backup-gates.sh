@@ -14,13 +14,13 @@ cat >"$tmp/control/status.json" <<EOF
 EOF
 status_digest=$(sha256sum "$tmp/control/status.json" | awk '{print $1}')
 chmod 640 "$tmp/control/status.json"
-chmod 640 "$tmp/control/watermark.json" 2>/dev/null || true
 mount_identity=$(stat -c '%d:%i:%a:%u:%g' "$tmp/control")
 mount_uid=$(stat -c '%u' "$tmp/control")
 mount_gid=$(stat -c '%g' "$tmp/control")
 jq -cnS --arg digest "$status_digest" \
   '{schema:"meet-backend/beta-backup-watermark/v1",authorityGeneration:1,
     observedAt:1790001000,statusDigest:$digest}' >"$tmp/control/watermark.json"
+chmod 640 "$tmp/control/watermark.json"
 cat >"$tmp/.env.production" <<EOF
 APP_BACKUP_SAFETY_ENABLED=true
 APP_BACKUP_SAFETY_ENROLLED=true
