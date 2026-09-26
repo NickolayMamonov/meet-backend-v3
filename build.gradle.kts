@@ -115,10 +115,6 @@ tasks.register<Test>("postgresTest") {
     group = "verification"
     testClassesDirs = sourceSets["test"].output.classesDirs
     classpath = sourceSets["test"].runtimeClasspath
-    testLogging {
-        showStandardStreams = true
-        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
-    }
     useJUnitPlatform {
         includeTags("postgres")
     }
