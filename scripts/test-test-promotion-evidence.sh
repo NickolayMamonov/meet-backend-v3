@@ -9,6 +9,17 @@ TMP=$(mktemp -d)
 export -n TMP
 trap 'rm -r -- "$TMP"' EXIT HUP INT TERM
 
+CONTRACT=${TEST_VPS_ADMISSION_CONTRACT:-$ROOT_DIR/scripts/test-vps-admission-contract.json}
+if jq -e '.populated.recoveryProof.status == "pending-authorized-v11-capture"' "$CONTRACT" >/dev/null; then
+  CONTRACT="$TMP/test-vps-admission-contract-fixture.json"
+  jq '
+    .populated.recoveryProof.status = "test-fixture" |
+    .populated.recoveryProof.sha256 =
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  ' "$ROOT_DIR/scripts/test-vps-admission-contract.json" >"$CONTRACT"
+fi
+export TEST_VPS_ADMISSION_CONTRACT="$CONTRACT"
+
 SOURCE=0123456789abcdef0123456789abcdef01234567
 TREE=89abcdef0123456789abcdef0123456789abcdef
 ROOT_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -29,7 +40,6 @@ VALID_HEX=$(printf 'a%.0s' {1..64})
 SHORT_HEX=$(printf 'a%.0s' {1..63})
 LONG_HEX=$(printf 'a%.0s' {1..65})
 NONHEX="${VALID_HEX%?}g"
-CONTRACT=$ROOT_DIR/scripts/test-vps-admission-contract.json
 RECOVERY_PROOF=$(jq -r '.populated.recoveryProof.sha256' "$CONTRACT")
 STABLE_PROOF=$(jq -r '.populated.stableProof.sha256' "$CONTRACT")
 POPULATED_MEETINGS=$(jq -r '.populated.roots.meetings' "$CONTRACT")

@@ -45,11 +45,19 @@ class CommunityService @Autowired constructor(
     fun subscribeToCommunity(communityId: Long, userId: Long) {
         logger.info { "User $userId subscribing to community: $communityId" }
 
-        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
-            throw ConflictException("Real catalog is busy")
+        val realCatalogKey = communityRepository.findRealCatalogKeyById(communityId)
+        var community: Community
+        if (realCatalogKey != null) {
+            if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
+                throw ConflictException("Real catalog is busy")
+            }
+            community = communityRepository.findById(communityId)
+                .orElseThrow { NotFoundException("Community not found") }
+        } else {
+            communityRepository.lockRealCatalogKeyById(communityId)
+            community = communityRepository.findById(communityId)
+                .orElseThrow { NotFoundException("Community not found") }
         }
-        val community = communityRepository.findById(communityId)
-            .orElseThrow { NotFoundException("Community not found") }
         if (community.realCatalogKey != null &&
             !communityRepository.isFreshForParticipation(communityId, clock.millis())
         ) {
@@ -69,11 +77,19 @@ class CommunityService @Autowired constructor(
     fun unsubscribeFromCommunity(communityId: Long, userId: Long) {
         logger.info { "User $userId unsubscribing from community: $communityId" }
 
-        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
-            throw ConflictException("Real catalog is busy")
+        val realCatalogKey = communityRepository.findRealCatalogKeyById(communityId)
+        var community: Community
+        if (realCatalogKey != null) {
+            if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
+                throw ConflictException("Real catalog is busy")
+            }
+            community = communityRepository.findById(communityId)
+                .orElseThrow { NotFoundException("Community not found") }
+        } else {
+            communityRepository.lockRealCatalogKeyById(communityId)
+            community = communityRepository.findById(communityId)
+                .orElseThrow { NotFoundException("Community not found") }
         }
-        val community = communityRepository.findById(communityId)
-            .orElseThrow { NotFoundException("Community not found") }
         val user = userRepository.findById(userId)
             .orElseThrow { NotFoundException("User not found") }
 

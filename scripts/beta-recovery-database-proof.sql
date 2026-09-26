@@ -644,13 +644,82 @@ real_catalog_checks AS (
                 OR meeting_row.source_external_id <> 'closed-beta-real:' || meeting_row.real_catalog_item_key)
         ) AS source_identity_violations,
         (SELECT count(*) FROM real_catalog_revisions revision_row
-         LEFT JOIN real_catalog_revisions predecessor ON predecessor.digest = revision_row.predecessor_digest
+         LEFT JOIN real_catalog_revisions predecessor
+           ON predecessor.digest = revision_row.predecessor_digest
          WHERE revision_row.intent = 'CORRECT'
-           AND predecessor.digest IS NOT NULL
-           AND (revision_row.discoverable_until > predecessor.discoverable_until
-                OR revision_row.invitation_at <> predecessor.invitation_at
-                OR revision_row.window_end_at <> predecessor.window_end_at
-                OR revision_row.review_at <> predecessor.review_at)) AS correction_violations
+           AND (
+               predecessor.digest IS NULL
+               OR predecessor.catalog_key <> revision_row.catalog_key
+               OR revision_row.discoverable_until > predecessor.discoverable_until
+               OR revision_row.invitation_at <> predecessor.invitation_at
+               OR revision_row.window_end_at <> predecessor.window_end_at
+               OR revision_row.review_at <> predecessor.review_at
+               OR revision_row.next_review_at <> predecessor.next_review_at
+               OR jsonb_typeof(revision_row.resolved_snapshot::jsonb) <> 'object'
+               OR jsonb_typeof(predecessor.resolved_snapshot::jsonb) <> 'object'
+               OR jsonb_typeof((revision_row.resolved_snapshot::jsonb)->'communities') <> 'array'
+               OR jsonb_typeof((predecessor.resolved_snapshot::jsonb)->'communities') <> 'array'
+               OR jsonb_typeof((revision_row.resolved_snapshot::jsonb)->'meetings') <> 'array'
+               OR jsonb_typeof((predecessor.resolved_snapshot::jsonb)->'meetings') <> 'array'
+               OR EXISTS (
+                   SELECT 1
+                   FROM jsonb_array_elements((predecessor.resolved_snapshot::jsonb)->'communities') prior_item
+                   WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'communities') current_item
+                       WHERE current_item->>'kind' = prior_item->>'kind'
+                         AND current_item->>'logicalKey' = prior_item->>'logicalKey'
+                   )
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'communities') current_item
+                   WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements((predecessor.resolved_snapshot::jsonb)->'communities') prior_item
+                       WHERE prior_item->>'kind' = current_item->>'kind'
+                         AND prior_item->>'logicalKey' = current_item->>'logicalKey'
+                   )
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM jsonb_array_elements((predecessor.resolved_snapshot::jsonb)->'communities') prior_item
+                   JOIN LATERAL jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'communities') current_item
+                     ON current_item->>'kind' = prior_item->>'kind'
+                    AND current_item->>'logicalKey' = prior_item->>'logicalKey'
+                   WHERE prior_item->>'membership' = 'RETIRED'
+                     AND current_item->>'membership' = 'ACTIVE'
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM jsonb_array_elements((predecessor.resolved_snapshot::jsonb)->'meetings') prior_item
+                   WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'meetings') current_item
+                       WHERE current_item->>'kind' = prior_item->>'kind'
+                         AND current_item->>'logicalKey' = prior_item->>'logicalKey'
+                   )
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'meetings') current_item
+                   WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements((predecessor.resolved_snapshot::jsonb)->'meetings') prior_item
+                       WHERE prior_item->>'kind' = current_item->>'kind'
+                         AND prior_item->>'logicalKey' = current_item->>'logicalKey'
+                   )
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM jsonb_array_elements((predecessor.resolved_snapshot::jsonb)->'meetings') prior_item
+                   JOIN LATERAL jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'meetings') current_item
+                     ON current_item->>'kind' = prior_item->>'kind'
+                    AND current_item->>'logicalKey' = prior_item->>'logicalKey'
+                   WHERE prior_item->>'membership' = 'RETIRED'
+                     AND current_item->>'membership' = 'ACTIVE'
+               )
+           )) AS correction_violations
 ),
 catalog_commitments AS (
     SELECT

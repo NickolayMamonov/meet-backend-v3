@@ -112,11 +112,19 @@ class MeetingService @Autowired constructor(
     fun joinMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId joining meeting: $meetingId" }
 
-        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
-            throw ConflictException("Real catalog is busy")
+        val realCatalogKey = meetingRepository.findRealCatalogKeyById(meetingId)
+        var meeting: Meeting
+        if (realCatalogKey != null) {
+            if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
+                throw ConflictException("Real catalog is busy")
+            }
+            meeting = meetingRepository.findById(meetingId)
+                .orElseThrow { NotFoundException("Meeting not found") }
+        } else {
+            meetingRepository.lockRealCatalogKeyById(meetingId)
+            meeting = meetingRepository.findById(meetingId)
+                .orElseThrow { NotFoundException("Meeting not found") }
         }
-        val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { NotFoundException("Meeting not found") }
         val user = userRepository.findWithLockById(userId)
             ?: throw NotFoundException("User not found")
 
@@ -141,11 +149,19 @@ class MeetingService @Autowired constructor(
     fun leaveMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId leaving meeting: $meetingId" }
 
-        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
-            throw ConflictException("Real catalog is busy")
+        val realCatalogKey = meetingRepository.findRealCatalogKeyById(meetingId)
+        var meeting: Meeting
+        if (realCatalogKey != null) {
+            if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
+                throw ConflictException("Real catalog is busy")
+            }
+            meeting = meetingRepository.findById(meetingId)
+                .orElseThrow { NotFoundException("Meeting not found") }
+        } else {
+            meetingRepository.lockRealCatalogKeyById(meetingId)
+            meeting = meetingRepository.findById(meetingId)
+                .orElseThrow { NotFoundException("Meeting not found") }
         }
-        val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { NotFoundException("Meeting not found") }
         val user = userRepository.findWithLockById(userId)
             ?: throw NotFoundException("User not found")
 

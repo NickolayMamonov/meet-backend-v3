@@ -16,6 +16,17 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
     fun findByRealCatalogKeyAndRealCatalogItemKey(catalogKey: String, itemKey: String): Meeting?
 
     @Query(
+        "SELECT m.realCatalogKey FROM Meeting m WHERE m.id = :meetingId",
+    )
+    fun findRealCatalogKeyById(@Param("meetingId") meetingId: Long): String?
+
+    @Query(
+        value = "SELECT real_catalog_key FROM meetings WHERE id = :meetingId FOR UPDATE",
+        nativeQuery = true,
+    )
+    fun lockRealCatalogKeyById(@Param("meetingId") meetingId: Long): String?
+
+    @Query(
         """
         SELECT m.* FROM meetings m
         LEFT JOIN real_catalog_state state ON state.catalog_key = m.real_catalog_key

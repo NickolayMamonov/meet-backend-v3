@@ -195,4 +195,9 @@ ordered migration history and 21-table baseline, and commits catalog roots and
 relationship edges without publishing row values. V1, V2, mixed-schema, unknown
 schema, and proof-digest mismatches fail closed. The V2 admission digest is
 target-specific and must be refreshed from the authorized V11 capture before
-population; the checked-in contract is not live recovery evidence.
+population. The checked-in admission contract therefore records
+`status=pending-authorized-v11-capture` and a null digest until the accountable
+operator supplies the target-bound capture and isolated-restore evidence. Any
+populated-target probe fails closed while that status is present. The
+`test-fixture` status used by shell fixture tests is synthetic evidence only
+and cannot authorize a target mutation.

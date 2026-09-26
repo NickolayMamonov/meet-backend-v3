@@ -58,3 +58,8 @@ An unknown or mixed v1/v2 schema, proof mismatch, failed restore, ownership
 drift, stale generation, source identity collision, or uncertain apply outcome
 blocks progression. Routine rollback is a new approved compensating manifest;
 full restore is separately authorized disaster recovery.
+
+The repository admission contract intentionally has no target-bound V11 digest
+until that authorized capture exists. It fails closed with
+`pending-authorized-v11-capture`; the test-only `test-fixture` contract path
+does not constitute recovery or deployment evidence.

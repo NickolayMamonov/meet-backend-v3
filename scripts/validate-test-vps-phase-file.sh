@@ -63,13 +63,16 @@ size=$(stat -c '%s' "$output") || fail "phase size cannot be read"
 canonical=$(realpath -e -- "$output") || fail "phase path cannot be canonicalized"
 case "$canonical" in "$state_dir/$phase.json") ;; *) fail "phase path escaped state directory" ;; esac
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-contract="$script_dir/test-vps-admission-contract.json"
+contract="${TEST_VPS_ADMISSION_CONTRACT:-$script_dir/test-vps-admission-contract.json}"
 [ -f "$contract" ] && [ ! -L "$contract" ] && [ -r "$contract" ] ||
   fail "admission contract is unavailable"
 jq -e '
   type == "object" and (keys | sort) == ["populated","schema","stateModes"] and
   .schema == "meet-backend/test-vps-admission-contract/v1" and
-  (.stateModes | sort) == ["closed-beta-demo","empty-closed"]
+  (.stateModes | sort) == ["closed-beta-demo","empty-closed"] and
+  .populated.recoveryProof.schema == "meet-backend/closed-beta-database-proof/v2" and
+  (.populated.recoveryProof.status |
+    IN("authorized","pending-authorized-v11-capture","test-fixture"))
 ' "$contract" >/dev/null || fail "admission contract is invalid"
 jq -e --slurpfile contract "$contract" --arg phase "$phase" \
   --arg expected_image "$expected_image" \
@@ -124,6 +127,10 @@ jq -e --slurpfile contract "$contract" --arg phase "$phase" \
        .mode == $state_mode and .stateSha256 == null) and
        .database.totalRows == 0 and .http.meetingsCount == 0
      else (.admission | type == "object" and
+       ($contract[0].populated.recoveryProof.status == "authorized" or
+        $contract[0].populated.recoveryProof.status == "test-fixture") and
+       ($contract[0].populated.recoveryProof.sha256 | type == "string" and
+        test("^[0-9a-f]{64}$")) and
        (keys | sort) == [
          "catalogName","manifestVersion","mode","publicProjectionSha256",
          "recoveryProofSha256","routes","stableProofSha256","stateSha256"

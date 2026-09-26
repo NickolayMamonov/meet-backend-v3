@@ -6,6 +6,7 @@ import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import org.springframework.stereotype.Component
 import java.time.Clock
 
@@ -20,6 +21,10 @@ class RealCatalogManifestValidator(
         }
         require(manifest.schemaVersion == SCHEMA_VERSION) { "Unsupported real catalog schema version" }
         require(manifest.catalogKey == CATALOG_KEY) { "Invalid real catalog key" }
+        validateMillisecondPrecision(manifest.invitationAt, "invitation")
+        validateMillisecondPrecision(manifest.windowEndAt, "window end")
+        validateMillisecondPrecision(manifest.reviewAt, "review")
+        validateMillisecondPrecision(manifest.nextReviewAt, "next review")
         key(manifest.revisionLabel, "revision label")
         key(manifest.ownerRole, "owner role", 80)
         require(manifest.invitationAt < manifest.windowEndAt) { "Invitation window must be positive" }
@@ -81,8 +86,14 @@ class RealCatalogManifestValidator(
         require(item.description.isNotBlank()) { "Invalid meeting description" }
         validateUrl(item.imageUrl, "meeting image")
         require(item.endAt == null || item.endAt.isAfter(item.startAt)) { "Meeting end must be after start" }
-        ZoneId.of(item.sourceZone)
+        val zone = runCatching { ZoneId.of(item.sourceZone) }
+            .getOrElse { throw IllegalArgumentException("Invalid meeting source zone") }
+        validateMillisecondPrecision(item.startAt, "meeting start")
+        item.endAt?.let { validateMillisecondPrecision(it, "meeting end") }
         require(item.dateLabel.isNotBlank() && item.dateLabel.length <= 50) { "Invalid meeting date label" }
+        require(item.startAt.atZone(zone).format(DATE_LABEL_FORMATTER) == item.dateLabel) {
+            "Meeting date label does not match source zone"
+        }
         require(item.address.isNotBlank()) { "Invalid meeting address" }
         require(item.latitude in -90.0..90.0 && item.longitude in -180.0..180.0) { "Invalid meeting coordinates" }
         require(item.capacity > 0) { "Meeting capacity must be positive" }
@@ -99,6 +110,7 @@ class RealCatalogManifestValidator(
 
     private fun validateSource(source: RealCatalogSource) {
         validateUrl(source.publicUrl, "source URL")
+        validateMillisecondPrecision(source.checkedAt, "source checked-at")
         require(source.basis.isNotBlank() && source.basis.length <= 160) { "Invalid rights basis" }
         require(source.evidenceRef.matches(OPAQUE_REF)) { "Invalid evidence reference" }
         require(source.attribution.isNotBlank() && source.attribution.length <= 160) {
@@ -107,7 +119,14 @@ class RealCatalogManifestValidator(
         require(source.retentionPermission.isNotBlank() && source.retentionPermission.length <= 160) {
             "Invalid retention permission"
         }
-        source.discoveryUseCutoff?.let { require(!it.isBefore(source.checkedAt)) { "Invalid discovery cutoff" } }
+        source.discoveryUseCutoff?.let {
+            validateMillisecondPrecision(it, "source discovery cutoff")
+            require(!it.isBefore(source.checkedAt)) { "Invalid discovery cutoff" }
+        }
+    }
+
+    private fun validateMillisecondPrecision(value: Instant, label: String) {
+        require(value.nano % 1_000_000 == 0) { "$label must use millisecond precision" }
     }
 
     private fun validateUrl(value: String, label: String) {
@@ -143,6 +162,7 @@ class RealCatalogManifestValidator(
         const val MAX_BYTES = 1_048_576
         const val MAX_MEETINGS = 100
         const val MAX_COMMUNITIES = 50
+        private val DATE_LABEL_FORMATTER = DateTimeFormatter.ofPattern("dd.MM.uuuu")
         private val OPAQUE_REF = Regex("^[A-Za-z0-9._:/-]{1,160}$")
     }
 }

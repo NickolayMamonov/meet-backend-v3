@@ -4,11 +4,21 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 FILTER=${PROMOTION_INPUT_FILTER:-$ROOT_DIR/scripts/build-test-promotion-input.jq}
 BUILDER=$ROOT_DIR/scripts/build-test-promotion-evidence.sh
-CONTRACT=$ROOT_DIR/scripts/test-vps-admission-contract.json
 FIXTURES=$ROOT_DIR/scripts/fixtures/test-promotion-input
 TMP=$(mktemp -d)
 export -n TMP
 trap 'rm -r -- "$TMP"' EXIT HUP INT TERM
+
+CONTRACT=${TEST_VPS_ADMISSION_CONTRACT:-$ROOT_DIR/scripts/test-vps-admission-contract.json}
+if jq -e '.populated.recoveryProof.status == "pending-authorized-v11-capture"' "$CONTRACT" >/dev/null; then
+  CONTRACT="$TMP/test-vps-admission-contract-fixture.json"
+  jq '
+    .populated.recoveryProof.status = "test-fixture" |
+    .populated.recoveryProof.sha256 =
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  ' "$ROOT_DIR/scripts/test-vps-admission-contract.json" >"$CONTRACT"
+fi
+export TEST_VPS_ADMISSION_CONTRACT="$CONTRACT"
 
 [ -r "$FILTER" ] && [ -x "$BUILDER" ] && [ -r "$CONTRACT" ]
 [ -r "$FIXTURES/provenance.json" ]

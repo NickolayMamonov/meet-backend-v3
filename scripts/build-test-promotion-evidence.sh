@@ -110,6 +110,8 @@ validate_success_input() {
         ]) and
         .catalogName == $contract.populated.catalogName and
         .manifestVersion == $contract.populated.manifestVersion and
+        ($contract.populated.recoveryProof.status == "authorized" or
+         $contract.populated.recoveryProof.status == "test-fixture") and
         (.stateSha256 | hex_digest) and
         .recoveryProofSha256 == $contract.populated.recoveryProof.sha256 and
         .stableProofSha256 == $contract.populated.stableProof.sha256 and
@@ -446,7 +448,7 @@ validate_success_evidence() {
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-admission_contract="$script_dir/test-vps-admission-contract.json"
+admission_contract="${TEST_VPS_ADMISSION_CONTRACT:-$script_dir/test-vps-admission-contract.json}"
 [ -f "$admission_contract" ] && [ ! -L "$admission_contract" ] &&
   [ -r "$admission_contract" ] || fail "admission contract is unavailable"
 jq -e '
@@ -458,7 +460,13 @@ jq -e '
     .catalogName == "closed-beta-demo" and
     .manifestVersion == "2026-08-15.v1" and
     (.recoveryProof | type == "object" and
-      (keys | sort) == ["schema","sha256"]) and
+      (keys | sort) == ["schema","sha256","status"] and
+      .schema == "meet-backend/closed-beta-database-proof/v2" and
+      (.status | IN("authorized","pending-authorized-v11-capture","test-fixture")) and
+      (if .status == "pending-authorized-v11-capture"
+       then .sha256 == null
+       else (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+       end)) and
     (.stableProof | type == "object" and
       (keys | sort) == ["byteLength","fixture","schema","serialization","sha256"]))
 ' "$admission_contract" >/dev/null ||

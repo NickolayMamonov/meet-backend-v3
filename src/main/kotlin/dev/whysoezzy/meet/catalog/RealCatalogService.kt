@@ -359,9 +359,11 @@ class RealCatalogService(
             manifest.communities.filter { it.membership == RealCatalogMembership.ACTIVE }
                 .flatMap { provenanceSources(it.source, it.provenance) }
                 .mapNotNull { it.discoveryUseCutoff }
+                .forEach(::add)
             manifest.meetings.filter { it.membership == RealCatalogMembership.ACTIVE }
                 .flatMap { provenanceSources(it.source, it.provenance) }
                 .mapNotNull { it.discoveryUseCutoff }
+                .forEach(::add)
         }
         return cutoffs.minOrNull() ?: windowEnd
     }

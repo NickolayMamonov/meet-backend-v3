@@ -6,6 +6,10 @@ import org.springframework.dao.DataAccessException
 import org.springframework.beans.factory.annotation.Autowired
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.ObjectMapper
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.sql.Timestamp
+import java.time.Instant
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.test.assertEquals
@@ -244,6 +248,209 @@ class BetaRecoveryDatabaseProofPostgresTest : IntegrationTestSupport() {
             jdbcTemplate.update("DELETE FROM users WHERE email = 'empty-media-reference@example.test'")
         }
     }
+
+    @Test
+    fun `database proof accepts expired corrected and all retired real catalog state`() {
+        val fixture = fixture()
+        installRealCatalog(
+            fixture = fixture,
+            currentMembership = "RETIRED",
+            predecessorMembership = "ACTIVE",
+            currentIntent = "CORRECT",
+            cutoff = Instant.parse("2026-09-20T00:00:00Z"),
+        )
+
+        val result = proof()
+        assertCanonicalAndSafe(result)
+        assertTrue(result.path("validity").path("realCatalog").booleanValue())
+        assertEquals(2, result.path("realCatalog").path("revisionRows").intValue())
+        assertEquals(0, result.path("realCatalog").path("correctionViolations").intValue())
+        assertEquals(1, result.path("realCatalog").path("stateRows").intValue())
+    }
+
+    @Test
+    fun `database proof rejects correction reactivation and equal count snapshot substitutions`() {
+        val fixture = fixture()
+        installRealCatalog(
+            fixture = fixture,
+            currentMembership = "RETIRED",
+            predecessorMembership = "ACTIVE",
+            currentIntent = "CORRECT",
+            cutoff = Instant.parse("2026-09-20T00:00:00Z"),
+        )
+
+        jdbcTemplate.update(
+            """
+            UPDATE real_catalog_revisions
+            SET resolved_snapshot = replace(resolved_snapshot, '"membership":"RETIRED"', '"membership":"ACTIVE"')
+            WHERE digest = ?
+            """.trimIndent(),
+            currentDigest(),
+        )
+        assertProofRejected()
+
+        jdbcTemplate.update(
+            "UPDATE real_catalog_revisions SET resolved_snapshot = ? WHERE digest = ?",
+            resolvedSnapshot(
+                fixture.community.id!! + 1000,
+                fixture.meeting.id!!,
+                "RETIRED",
+            ),
+            currentDigest(),
+        )
+        assertProofRejected()
+    }
+
+    @Test
+    fun `database proof rejects substituted meeting community edge`() {
+        val fixture = fixture()
+        installRealCatalog(
+            fixture = fixture,
+            currentMembership = "RETIRED",
+            predecessorMembership = "ACTIVE",
+            currentIntent = "CORRECT",
+            cutoff = Instant.parse("2026-09-20T00:00:00Z"),
+        )
+
+        jdbcTemplate.update(
+            "UPDATE real_catalog_revisions SET resolved_snapshot = ? WHERE digest = ?",
+            resolvedSnapshot(
+                fixture.community.id!!,
+                fixture.meeting.id!!,
+                "RETIRED",
+                meetingCommunityKey = "substituted-community",
+            ),
+            currentDigest(),
+        )
+        assertProofRejected()
+    }
+
+    private fun installRealCatalog(
+        fixture: ApiFixture,
+        currentMembership: String,
+        predecessorMembership: String,
+        currentIntent: String,
+        cutoff: Instant,
+    ) {
+        val invitation = Instant.parse("2026-09-01T00:00:00Z")
+        val windowEnd = Instant.parse("2026-10-01T00:00:00Z")
+        val review = Instant.parse("2026-09-20T00:00:00Z")
+        val nextReview = review.plusSeconds(7 * 24 * 60 * 60)
+        val predecessorBytes = "predecessor".toByteArray(StandardCharsets.UTF_8)
+        val currentBytes = "current".toByteArray(StandardCharsets.UTF_8)
+        val predecessorDigest = sha256(predecessorBytes)
+        val currentDigest = sha256(currentBytes)
+
+        jdbcTemplate.update(
+            """
+            INSERT INTO real_catalog_revisions (
+                digest, catalog_key, revision_label, schema_version, intent, predecessor_digest,
+                manifest_bytes, resolved_snapshot, invitation_at, window_end_at, review_at,
+                next_review_at, discoverable_until, content_approval_ref, mutation_approval_ref,
+                recovery_point_ref, applied_at, generation
+            ) VALUES (?, 'closed-beta-real', 'recovery-predecessor', 'v1', 'INITIAL', NULL, ?,
+                ?, ?, ?, ?, ?, ?, 'content', 'mutation', 'recovery', ?, 1)
+            """.trimIndent(),
+            predecessorDigest,
+            predecessorBytes,
+            resolvedSnapshot(fixture.community.id!!, fixture.meeting.id!!, predecessorMembership),
+            Timestamp.from(invitation),
+            Timestamp.from(windowEnd),
+            Timestamp.from(review),
+            Timestamp.from(nextReview),
+            Timestamp.from(cutoff),
+            Timestamp.from(review),
+        )
+        jdbcTemplate.update(
+            """
+            INSERT INTO real_catalog_revisions (
+                digest, catalog_key, revision_label, schema_version, intent, predecessor_digest,
+                manifest_bytes, resolved_snapshot, invitation_at, window_end_at, review_at,
+                next_review_at, discoverable_until, content_approval_ref, mutation_approval_ref,
+                recovery_point_ref, applied_at, generation
+            ) VALUES (?, 'closed-beta-real', 'recovery-correction', 'v1', ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, 'content', 'mutation', 'recovery', ?, 2)
+            """.trimIndent(),
+            currentDigest,
+            currentIntent,
+            predecessorDigest,
+            currentBytes,
+            resolvedSnapshot(fixture.community.id!!, fixture.meeting.id!!, currentMembership),
+            Timestamp.from(invitation),
+            Timestamp.from(windowEnd),
+            Timestamp.from(review),
+            Timestamp.from(nextReview),
+            Timestamp.from(cutoff),
+            Timestamp.from(review.plusSeconds(1)),
+        )
+        jdbcTemplate.update(
+            """
+            INSERT INTO real_catalog_state (
+                catalog_key, current_digest, generation, current_intent, invitation_at,
+                window_end_at, review_at, next_review_at, discoverable_until, owner_role
+            ) VALUES ('closed-beta-real', ?, 2, ?, ?, ?, ?, ?, ?, 'project-operator')
+            """.trimIndent(),
+            currentDigest,
+            currentIntent,
+            Timestamp.from(invitation),
+            Timestamp.from(windowEnd),
+            Timestamp.from(review),
+            Timestamp.from(nextReview),
+            Timestamp.from(cutoff),
+        )
+        jdbcTemplate.update(
+            """
+            UPDATE communities
+            SET real_catalog_key = 'closed-beta-real',
+                real_catalog_item_key = 'community-one',
+                real_catalog_active = false,
+                real_catalog_fingerprint = ?
+            WHERE id = ?
+            """.trimIndent(),
+            "a".repeat(64),
+            fixture.community.id,
+        )
+        jdbcTemplate.update(
+            """
+            UPDATE meetings
+            SET time = ?, ends_at = ?, real_catalog_key = 'closed-beta-real',
+                real_catalog_item_key = 'meeting-one', real_catalog_active = false,
+                real_catalog_fingerprint = ?, source = 'MANUAL',
+                source_external_id = 'closed-beta-real:meeting-one'
+            WHERE id = ?
+            """.trimIndent(),
+            Instant.parse("2026-10-02T10:00:00Z").toEpochMilli(),
+            Instant.parse("2026-10-02T12:00:00Z").toEpochMilli(),
+            "a".repeat(64),
+            fixture.meeting.id,
+        )
+    }
+
+    private fun resolvedSnapshot(
+        communityId: Long,
+        meetingId: Long,
+        meetingMembership: String,
+        meetingCommunityKey: String = "community-one",
+    ): String =
+        """
+        {"communities":[{"kind":"COMMUNITY","logicalKey":"community-one","entityId":$communityId,
+        "membership":"$meetingMembership","fingerprint":"${"a".repeat(64)}"}],
+        "meetings":[{"kind":"MEETING","logicalKey":"meeting-one","entityId":$meetingId,
+        "membership":"$meetingMembership","fingerprint":"${"a".repeat(64)}",
+        "communityKey":"$meetingCommunityKey"}]}
+        """.trimIndent().replace("\n", "")
+
+    private fun currentDigest(): String =
+        requireNotNull(
+            jdbcTemplate.queryForObject(
+                "SELECT current_digest FROM real_catalog_state WHERE catalog_key = 'closed-beta-real'",
+                String::class.java,
+            ),
+        )
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it) }
 
     @Autowired
     private lateinit var applicationContext: org.springframework.context.ApplicationContext

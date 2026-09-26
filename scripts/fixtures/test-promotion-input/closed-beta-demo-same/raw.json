@@ -19,7 +19,7 @@
           "catalogName": "closed-beta-demo",
           "manifestVersion": "2026-08-15.v1",
           "stateSha256": "8888888888888888888888888888888888888888888888888888888888888888",
-          "recoveryProofSha256": "c1a83c4d33e5c4d1772b27bc770471e99a6fb1ac2827c16c9787ecef073d2979",
+          "recoveryProofSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
           "stableProofSha256": "0e6ef8d48515b3041000166a5506df2a72c11c4e702d7d28960f54d1c204080e",
           "publicProjectionSha256": "9999999999999999999999999999999999999999999999999999999999999999",
           "routes": {
@@ -143,7 +143,7 @@
           "catalogName": "closed-beta-demo",
           "manifestVersion": "2026-08-15.v1",
           "stateSha256": "8888888888888888888888888888888888888888888888888888888888888888",
-          "recoveryProofSha256": "c1a83c4d33e5c4d1772b27bc770471e99a6fb1ac2827c16c9787ecef073d2979",
+          "recoveryProofSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
           "stableProofSha256": "0e6ef8d48515b3041000166a5506df2a72c11c4e702d7d28960f54d1c204080e",
           "publicProjectionSha256": "9999999999999999999999999999999999999999999999999999999999999999",
           "routes": {
@@ -267,7 +267,7 @@
           "catalogName": "closed-beta-demo",
           "manifestVersion": "2026-08-15.v1",
           "stateSha256": "8888888888888888888888888888888888888888888888888888888888888888",
-          "recoveryProofSha256": "c1a83c4d33e5c4d1772b27bc770471e99a6fb1ac2827c16c9787ecef073d2979",
+          "recoveryProofSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
           "stableProofSha256": "0e6ef8d48515b3041000166a5506df2a72c11c4e702d7d28960f54d1c204080e",
           "publicProjectionSha256": "9999999999999999999999999999999999999999999999999999999999999999",
           "routes": {

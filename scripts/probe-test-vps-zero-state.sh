@@ -128,7 +128,7 @@ done
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=/dev/null
 source "$script_dir/test-vps-runtime-invariants.sh"
-contract="$script_dir/test-vps-admission-contract.json"
+contract="${TEST_VPS_ADMISSION_CONTRACT:-$script_dir/test-vps-admission-contract.json}"
 stable_sql="$script_dir/test-vps-beta-demo-stable-proof.sql"
 public_sql="$script_dir/test-vps-beta-demo-public-proof.sql"
 [ -r "$contract" ] && [ -r "$stable_sql" ] && [ -r "$public_sql" ] ||
@@ -138,6 +138,9 @@ jq -e '
   (.stateModes | sort) == ["closed-beta-demo","empty-closed"] and
   .populated.catalogName == "closed-beta-demo" and
   .populated.manifestVersion == "2026-08-15.v1" and
+  .populated.recoveryProof.schema == "meet-backend/closed-beta-database-proof/v2" and
+  (.populated.recoveryProof.status |
+    IN("authorized","pending-authorized-v11-capture","test-fixture")) and
   .populated.stableProof.byteLength == 6867
 ' "$contract" >/dev/null || fail "admission proof contract is invalid"
 populated_meetings=$(jq -er \
@@ -302,7 +305,13 @@ if [ "$state_mode" = closed-beta-demo ]; then
   [ -f "$fixture" ] && [ ! -L "$fixture" ] || fail "stable proof fixture is unavailable"
   stable_size=$(jq -er '.populated.stableProof.byteLength' "$contract")
   stable_digest=$(jq -er '.populated.stableProof.sha256' "$contract")
-  recovery_digest=$(jq -er '.populated.recoveryProof.sha256' "$contract")
+  recovery_digest=$(jq -er '
+    .populated.recoveryProof
+    | select(.status == "authorized" or .status == "test-fixture")
+    | .sha256
+    | select(type == "string" and test("^[0-9a-f]{64}$"))
+  ' "$contract") ||
+    fail "target-bound V11 recovery proof digest is pending authorized capture"
   test "$(wc -c <"$fixture" | tr -d ' ')" = "$stable_size" ||
     fail "stable proof fixture size differs"
   test "$(sha256sum "$fixture" | awk '{print $1}')" = "$stable_digest" ||

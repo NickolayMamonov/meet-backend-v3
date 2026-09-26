@@ -55,6 +55,36 @@ class RealCatalogManifestValidatorTest {
         }
     }
 
+    @Test
+    fun `rejects a date label that does not match the source zone`() {
+        assertThrows<IllegalArgumentException> {
+            validator.validate(
+                manifest(
+                    meetings = listOf(
+                        manifest().meetings.single().copy(dateLabel = "25.10.2026"),
+                    ),
+                ),
+                "{}".toByteArray(),
+            )
+        }
+    }
+
+    @Test
+    fun `rejects sub-millisecond instants`() {
+        assertThrows<IllegalArgumentException> {
+            validator.validate(
+                manifest(
+                    meetings = listOf(
+                        manifest().meetings.single().copy(
+                            startAt = now.plus(Duration.ofDays(31)).plusNanos(1),
+                        ),
+                    ),
+                ),
+                "{}".toByteArray(),
+            )
+        }
+    }
+
     private fun manifest(
         intent: RealCatalogIntent = RealCatalogIntent.INITIAL,
         communities: List<RealCatalogCommunity> = listOf(

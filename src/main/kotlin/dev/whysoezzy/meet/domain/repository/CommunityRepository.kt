@@ -13,6 +13,17 @@ interface CommunityRepository : JpaRepository<Community, Long> {
     fun findByRealCatalogKeyAndRealCatalogItemKey(catalogKey: String, itemKey: String): Community?
 
     @Query(
+        "SELECT c.realCatalogKey FROM Community c WHERE c.id = :communityId",
+    )
+    fun findRealCatalogKeyById(@Param("communityId") communityId: Long): String?
+
+    @Query(
+        value = "SELECT real_catalog_key FROM communities WHERE id = :communityId FOR UPDATE",
+        nativeQuery = true,
+    )
+    fun lockRealCatalogKeyById(@Param("communityId") communityId: Long): String?
+
+    @Query(
         value = """
             SELECT c.* FROM communities c
             LEFT JOIN real_catalog_state state ON state.catalog_key = c.real_catalog_key
