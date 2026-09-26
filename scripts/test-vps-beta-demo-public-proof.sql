@@ -215,7 +215,13 @@ validity AS (
                OR m.external_url IS DISTINCT FROM e.external_url OR m.is_online <> e.is_online
                OR host.demo_catalog_key IS DISTINCT FROM e.person_host_key
                OR community.demo_catalog_key IS DISTINCT FROM e.community_host_key
-               OR COALESCE(m.ends_at, m.time) < (extract(epoch FROM CURRENT_TIMESTAMP) * 1000)::bigint
+               OR COALESCE(m.ends_at, m.time) < (
+                   extract(epoch FROM (
+                       SELECT catalog_valid_through
+                       FROM demo_catalog_state
+                       WHERE catalog_name = 'closed-beta-demo'
+                   )) * 1000
+               )::bigint
                OR COALESCE((
                    SELECT array_agg(t.demo_catalog_key ORDER BY t.demo_catalog_key)::text[]
                    FROM meeting_tags r JOIN tags t ON t.id = r.tag_id

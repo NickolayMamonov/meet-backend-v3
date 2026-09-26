@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.domain.entity
 
+import dev.whysoezzy.meet.catalog.RealCatalogStateEntity
 import jakarta.persistence.*
 import java.time.LocalDateTime
 
@@ -87,6 +88,22 @@ class Meeting(
 
     @Column(name = "demo_catalog_key", length = 160, updatable = false)
     var demoCatalogKey: String? = null,
+
+    @Column(name = "real_catalog_key", length = 80)
+    var realCatalogKey: String? = null,
+
+    @Column(name = "real_catalog_item_key", length = 120)
+    var realCatalogItemKey: String? = null,
+
+    @Column(name = "real_catalog_active")
+    var realCatalogActive: Boolean? = null,
+
+    @Column(name = "real_catalog_fingerprint", length = 64)
+    var realCatalogFingerprint: String? = null,
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "real_catalog_key", insertable = false, updatable = false)
+    var realCatalogState: RealCatalogStateEntity? = null,
     
 ) : BaseEntity() {
     

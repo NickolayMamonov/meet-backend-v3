@@ -13,7 +13,8 @@ expected_tables(table_name) AS (
         ('meetings'), ('meeting_tags'), ('meeting_participants'),
         ('ad_blocks'), ('ad_block_communities'), ('ad_block_users'),
         ('otp_codes'), ('refresh_tokens'), ('ingestion_runs'),
-        ('otp_rate_limit_attempts'), ('auth_identities'), ('demo_catalog_state')
+        ('otp_rate_limit_attempts'), ('auth_identities'), ('demo_catalog_state'),
+        ('real_catalog_revisions'), ('real_catalog_state')
 ),
 expected_indexes(index_name, unique_index, predicate_pattern, key_columns) AS (
     VALUES
@@ -31,7 +32,14 @@ expected_indexes(index_name, unique_index, predicate_pattern, key_columns) AS (
         ('uq_tags_demo_catalog_key', true, 'demo_catalog_key[[:space:]]+IS[[:space:]]+NOT[[:space:]]+NULL',
          ARRAY['demo_catalog_key']::text[]),
         ('uq_ad_blocks_demo_catalog_key', true, 'demo_catalog_key[[:space:]]+IS[[:space:]]+NOT[[:space:]]+NULL',
-         ARRAY['demo_catalog_key']::text[])
+         ARRAY['demo_catalog_key']::text[]),
+        ('uq_meetings_real_catalog_item', true, 'real_catalog_key[[:space:]]+IS[[:space:]]+NOT[[:space:]]+NULL',
+         ARRAY['real_catalog_key', 'real_catalog_item_key']::text[]),
+        ('uq_communities_real_catalog_item', true, 'real_catalog_key[[:space:]]+IS[[:space:]]+NOT[[:space:]]+NULL',
+         ARRAY['real_catalog_key', 'real_catalog_item_key']::text[]),
+        ('idx_real_catalog_state_cutoff', false, '', ARRAY['discoverable_until', 'catalog_key']::text[]),
+        ('idx_meetings_real_catalog_discovery', false, '', ARRAY['real_catalog_key', 'real_catalog_active', 'status', '"time"', 'id']::text[]),
+        ('idx_communities_real_catalog_discovery', false, '', ARRAY['real_catalog_key', 'real_catalog_active', 'id']::text[])
 ),
 expected_constraints(constraint_name) AS (
     VALUES
@@ -76,7 +84,20 @@ expected_constraints(constraint_name) AS (
         ('ck_meetings_demo_catalog_key_nonblank'),
         ('ck_tags_demo_catalog_key_nonblank'),
         ('ck_ad_blocks_demo_catalog_key_nonblank'),
-        ('demo_catalog_state_pkey')
+        ('demo_catalog_state_pkey'),
+        ('real_catalog_revisions_pkey'), ('real_catalog_state_pkey'),
+        ('uq_real_catalog_revision_label'),
+        ('fk_real_catalog_revision_predecessor'),
+        ('fk_real_catalog_state_revision'),
+        ('fk_meetings_real_catalog_state'), ('fk_communities_real_catalog_state'),
+        ('ck_real_catalog_revision_digest'), ('ck_real_catalog_revision_intent'),
+        ('ck_real_catalog_revision_generation'), ('ck_real_catalog_revision_window'),
+        ('ck_real_catalog_revision_review'), ('ck_real_catalog_revision_next_review'),
+        ('ck_real_catalog_revision_cutoff'),
+        ('ck_real_catalog_state_intent'), ('ck_real_catalog_state_generation'),
+        ('ck_real_catalog_state_window'), ('ck_real_catalog_state_review'),
+        ('ck_real_catalog_state_next_review'), ('ck_real_catalog_state_cutoff'),
+        ('ck_meetings_real_catalog_ownership'), ('ck_communities_real_catalog_ownership')
 ),
 table_counts AS (
     SELECT jsonb_build_object(
@@ -95,6 +116,8 @@ table_counts AS (
         'otp_codes', (SELECT count(*) FROM otp_codes),
         'otp_rate_limit_attempts', (SELECT count(*) FROM otp_rate_limit_attempts),
         'refresh_tokens', (SELECT count(*) FROM refresh_tokens),
+        'real_catalog_revisions', (SELECT count(*) FROM real_catalog_revisions),
+        'real_catalog_state', (SELECT count(*) FROM real_catalog_state),
         'tags', (SELECT count(*) FROM tags),
         'user_interests', (SELECT count(*) FROM user_interests),
         'user_social_media', (SELECT count(*) FROM user_social_media),
@@ -107,7 +130,7 @@ schema_checks AS (
          JOIN information_schema.tables actual
            ON actual.table_schema = current_schema()
           AND actual.table_name = expected.table_name
-          AND actual.table_type = 'BASE TABLE') = 19
+          AND actual.table_type = 'BASE TABLE') = 21
         AND (SELECT count(*)
              FROM information_schema.columns
              WHERE table_schema = current_schema()
@@ -148,7 +171,35 @@ schema_checks AS (
              FROM information_schema.columns
              WHERE table_schema = current_schema()
                AND table_name = 'meetings'
-               AND column_name = 'ends_at') = 1 AS required_tables_and_columns,
+               AND column_name = 'ends_at') = 1
+        AND (SELECT count(*)
+             FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'real_catalog_revisions'
+               AND column_name IN (
+                   'digest', 'catalog_key', 'revision_label', 'schema_version', 'intent',
+                   'predecessor_digest', 'manifest_bytes', 'resolved_snapshot',
+                   'invitation_at', 'window_end_at', 'review_at', 'next_review_at',
+                   'discoverable_until', 'content_approval_ref', 'mutation_approval_ref',
+                   'recovery_point_ref', 'applied_at', 'generation'
+               )) = 18
+        AND (SELECT count(*)
+             FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'real_catalog_state'
+               AND column_name IN (
+                   'catalog_key', 'current_digest', 'generation', 'current_intent',
+                   'invitation_at', 'window_end_at', 'review_at', 'next_review_at',
+                   'discoverable_until', 'owner_role'
+               )) = 10
+        AND (SELECT count(*)
+             FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name IN ('meetings', 'communities')
+               AND column_name IN (
+                   'real_catalog_key', 'real_catalog_item_key',
+                   'real_catalog_active', 'real_catalog_fingerprint'
+               )) = 8 AS required_tables_and_columns,
         (SELECT count(*)
          FROM information_schema.tables
          WHERE table_schema = current_schema()
@@ -158,7 +209,7 @@ schema_checks AS (
                'push_installations',
                'meeting_reminder_claims',
                'meeting_reminder_targets'
-           )) = 19 AS exact_required_table_count,
+           )) = 21 AS exact_required_table_count,
         (SELECT count(*)
          FROM expected_indexes expected
          JOIN pg_class index_class
@@ -215,15 +266,15 @@ schema_checks AS (
 ),
 flyway_check AS (
     SELECT COALESCE((
-        count(*) FILTER (WHERE success AND version::int <= 9) = 9
-        AND count(*) FILTER (WHERE NOT success AND version::int <= 9) = 0
+        count(*) FILTER (WHERE success AND version::int <= 11) = 11
+        AND count(*) FILTER (WHERE NOT success AND version::int <= 11) = 0
         AND array_agg(version ORDER BY installed_rank)
-            FILTER (WHERE success AND version::int <= 9) =
-                ARRAY['1', '2', '3', '4', '5', '6', '7', '8', '9']::varchar[]
+            FILTER (WHERE success AND version::int <= 11) =
+                ARRAY['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11']::varchar[]
         AND array_agg(installed_rank ORDER BY installed_rank)
-            FILTER (WHERE success AND version::int <= 9) =
-                ARRAY[1, 2, 3, 4, 5, 6, 7, 8, 9]::integer[]
-        AND count(*) FILTER (WHERE success AND version::int <= 9 AND type = 'SQL') = 9
+            FILTER (WHERE success AND version::int <= 11) =
+                ARRAY[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]::integer[]
+        AND count(*) FILTER (WHERE success AND version::int <= 11 AND type = 'SQL') = 11
     ), false) AS valid
     FROM flyway_schema_history
 ),
@@ -414,6 +465,259 @@ media_checks AS (
         SELECT image_url FROM meetings
     ) media_refs
 ),
+real_catalog_checks AS (
+    SELECT
+        (SELECT count(*) FROM real_catalog_state) AS state_rows,
+        (SELECT count(*) FROM real_catalog_revisions) AS revision_rows,
+        (SELECT count(*) FROM real_catalog_revisions revision_row
+         WHERE encode(digest(revision_row.manifest_bytes, 'sha256'), 'hex') <> revision_row.digest) AS manifest_hash_violations,
+        (SELECT count(*) FROM real_catalog_revisions revision_row
+         LEFT JOIN real_catalog_revisions predecessor
+           ON predecessor.digest = revision_row.predecessor_digest
+         WHERE revision_row.predecessor_digest IS NOT NULL
+           AND (predecessor.digest IS NULL
+                OR predecessor.catalog_key <> revision_row.catalog_key
+                OR predecessor.generation >= revision_row.generation)) AS predecessor_violations,
+        (SELECT count(*) FROM real_catalog_state state_row
+         LEFT JOIN real_catalog_revisions revision_row ON revision_row.digest = state_row.current_digest
+         WHERE revision_row.digest IS NULL
+            OR revision_row.catalog_key <> state_row.catalog_key
+            OR revision_row.generation <> state_row.generation
+            OR revision_row.intent::text <> state_row.current_intent
+            OR revision_row.discoverable_until <> state_row.discoverable_until
+            OR revision_row.invitation_at <> state_row.invitation_at
+            OR revision_row.window_end_at <> state_row.window_end_at
+            OR revision_row.review_at <> state_row.review_at
+            OR state_row.next_review_at <> state_row.review_at + INTERVAL '7 days') AS state_violations,
+        (SELECT count(*) FROM real_catalog_revisions revision_row
+         WHERE jsonb_typeof(revision_row.resolved_snapshot::jsonb) <> 'object'
+            OR jsonb_typeof((revision_row.resolved_snapshot::jsonb)->'communities') <> 'array'
+            OR jsonb_typeof((revision_row.resolved_snapshot::jsonb)->'meetings') <> 'array'
+            OR CASE WHEN jsonb_typeof((revision_row.resolved_snapshot::jsonb)->'communities') = 'array'
+                THEN jsonb_array_length((revision_row.resolved_snapshot::jsonb)->'communities') > 50
+                ELSE false
+            END
+            OR CASE WHEN jsonb_typeof((revision_row.resolved_snapshot::jsonb)->'meetings') = 'array'
+                THEN jsonb_array_length((revision_row.resolved_snapshot::jsonb)->'meetings') > 100
+                ELSE false
+            END
+            OR CASE WHEN jsonb_typeof((revision_row.resolved_snapshot::jsonb)->'communities') = 'array'
+                THEN EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'communities') item
+                WHERE jsonb_typeof(item) <> 'object'
+                   OR NOT (item ?& ARRAY['kind', 'logicalKey', 'entityId', 'membership', 'fingerprint'])
+                   OR EXISTS (
+                       SELECT 1
+                       FROM jsonb_object_keys(item) field_name
+                       WHERE field_name NOT IN ('kind', 'logicalKey', 'entityId', 'membership', 'fingerprint')
+                   )
+                   OR item->>'kind' <> 'COMMUNITY'
+                   OR jsonb_typeof(item->'logicalKey') <> 'string'
+                   OR COALESCE(item->>'membership', '') NOT IN ('ACTIVE', 'RETIRED')
+                   OR COALESCE(jsonb_typeof(item->'entityId'), '') NOT IN ('number', 'null')
+                   OR COALESCE(item->>'fingerprint', '') !~ '^[0-9a-f]{64}$'
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'communities') item
+                    GROUP BY item->>'kind', item->>'logicalKey'
+                    HAVING count(*) > 1
+                )
+                ELSE false
+            END
+            OR CASE WHEN jsonb_typeof((revision_row.resolved_snapshot::jsonb)->'meetings') = 'array'
+                THEN EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'meetings') item
+                WHERE jsonb_typeof(item) <> 'object'
+                   OR NOT (item ?& ARRAY['kind', 'logicalKey', 'entityId', 'membership', 'fingerprint', 'communityKey'])
+                   OR EXISTS (
+                       SELECT 1
+                       FROM jsonb_object_keys(item) field_name
+                       WHERE field_name NOT IN ('kind', 'logicalKey', 'entityId', 'membership', 'fingerprint', 'communityKey')
+                   )
+                   OR item->>'kind' <> 'MEETING'
+                   OR jsonb_typeof(item->'logicalKey') <> 'string'
+                   OR COALESCE(item->>'membership', '') NOT IN ('ACTIVE', 'RETIRED')
+                   OR COALESCE(jsonb_typeof(item->'entityId'), '') NOT IN ('number', 'null')
+                   OR COALESCE(item->>'fingerprint', '') !~ '^[0-9a-f]{64}$'
+                   OR COALESCE(jsonb_typeof(item->'communityKey'), '') NOT IN ('string', 'null')
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'meetings') item
+                    GROUP BY item->>'kind', item->>'logicalKey'
+                    HAVING count(*) > 1
+                )
+                ELSE false
+            END) AS snapshot_violations,
+        (SELECT count(*)
+         FROM (
+             SELECT 1
+             FROM real_catalog_state state_row
+             JOIN real_catalog_revisions revision_row
+               ON revision_row.digest = state_row.current_digest
+             JOIN communities community_row
+               ON community_row.real_catalog_key = state_row.catalog_key
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'communities') item
+                 WHERE item->>'kind' = 'COMMUNITY'
+                   AND item->>'logicalKey' = community_row.real_catalog_item_key
+                   AND item->>'entityId' = community_row.id::text
+                   AND item->>'membership' = CASE WHEN community_row.real_catalog_active
+                                                   THEN 'ACTIVE' ELSE 'RETIRED' END
+                   AND item->>'fingerprint' = community_row.real_catalog_fingerprint
+             )
+             UNION ALL
+             SELECT 1
+             FROM real_catalog_state state_row
+             JOIN real_catalog_revisions revision_row
+               ON revision_row.digest = state_row.current_digest
+             JOIN meetings meeting_row
+               ON meeting_row.real_catalog_key = state_row.catalog_key
+             LEFT JOIN communities community_row
+               ON community_row.id = meeting_row.community_host_id
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'meetings') item
+                 WHERE item->>'kind' = 'MEETING'
+                   AND item->>'logicalKey' = meeting_row.real_catalog_item_key
+                   AND item->>'entityId' = meeting_row.id::text
+                   AND item->>'membership' = CASE WHEN meeting_row.real_catalog_active
+                                                   THEN 'ACTIVE' ELSE 'RETIRED' END
+                   AND item->>'fingerprint' = meeting_row.real_catalog_fingerprint
+                   AND item->>'communityKey' IS NOT DISTINCT FROM community_row.real_catalog_item_key
+             )
+             UNION ALL
+             SELECT 1
+             FROM real_catalog_state state_row
+             JOIN real_catalog_revisions revision_row
+               ON revision_row.digest = state_row.current_digest
+             CROSS JOIN LATERAL jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'communities') item
+             WHERE item->>'kind' = 'COMMUNITY'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM communities community_row
+                   WHERE community_row.real_catalog_key = state_row.catalog_key
+                     AND community_row.real_catalog_item_key = item->>'logicalKey'
+               )
+             UNION ALL
+             SELECT 1
+             FROM real_catalog_state state_row
+             JOIN real_catalog_revisions revision_row
+               ON revision_row.digest = state_row.current_digest
+             CROSS JOIN LATERAL jsonb_array_elements((revision_row.resolved_snapshot::jsonb)->'meetings') item
+             WHERE item->>'kind' = 'MEETING'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM meetings meeting_row
+                   WHERE meeting_row.real_catalog_key = state_row.catalog_key
+                     AND meeting_row.real_catalog_item_key = item->>'logicalKey'
+               )
+         ) linkage_violations) AS snapshot_root_linkage_violations,
+        (SELECT count(*) FROM meetings meeting_row
+         LEFT JOIN real_catalog_state state_row ON state_row.catalog_key = meeting_row.real_catalog_key
+         LEFT JOIN communities community_row ON community_row.id = meeting_row.community_host_id
+         WHERE meeting_row.real_catalog_key IS NOT NULL
+           AND (state_row.catalog_key IS NULL
+                OR meeting_row.demo_catalog_key IS NOT NULL
+                OR meeting_row.real_catalog_item_key IS NULL
+                OR meeting_row.real_catalog_active IS NULL
+                OR meeting_row.real_catalog_fingerprint !~ '^[0-9a-f]{64}$'
+                OR community_row.id IS NULL
+                OR community_row.real_catalog_key <> meeting_row.real_catalog_key
+                OR (meeting_row.real_catalog_active AND NOT COALESCE(community_row.real_catalog_active, false)))) AS meeting_ownership_violations,
+        (SELECT count(*) FROM communities community_row
+         LEFT JOIN real_catalog_state state_row ON state_row.catalog_key = community_row.real_catalog_key
+         WHERE community_row.real_catalog_key IS NOT NULL
+           AND (state_row.catalog_key IS NULL
+                OR community_row.demo_catalog_key IS NOT NULL
+                OR community_row.real_catalog_item_key IS NULL
+                OR community_row.real_catalog_active IS NULL
+                OR community_row.real_catalog_fingerprint !~ '^[0-9a-f]{64}$')) AS community_ownership_violations,
+        (SELECT count(*) FROM meetings meeting_row
+         WHERE meeting_row.real_catalog_key IS NOT NULL
+           AND (meeting_row.source::text <> 'MANUAL'
+                OR meeting_row.source_external_id IS NULL
+                OR meeting_row.source_external_id <> 'closed-beta-real:' || meeting_row.real_catalog_item_key)
+        ) AS source_identity_violations,
+        (SELECT count(*) FROM real_catalog_revisions revision_row
+         LEFT JOIN real_catalog_revisions predecessor ON predecessor.digest = revision_row.predecessor_digest
+         WHERE revision_row.intent = 'CORRECT'
+           AND predecessor.digest IS NOT NULL
+           AND (revision_row.discoverable_until > predecessor.discoverable_until
+                OR revision_row.invitation_at <> predecessor.invitation_at
+                OR revision_row.window_end_at <> predecessor.window_end_at
+                OR revision_row.review_at <> predecessor.review_at)) AS correction_violations
+),
+catalog_commitments AS (
+    SELECT
+        encode(digest(COALESCE((
+            SELECT string_agg(
+                jsonb_build_array(
+                    jsonb_build_object('type', 'int8', 'value', meeting_row.id),
+                    jsonb_build_object('type', 'text', 'length', length(meeting_row.real_catalog_key), 'value', meeting_row.real_catalog_key),
+                    jsonb_build_object('type', 'text', 'length', length(meeting_row.real_catalog_item_key), 'value', meeting_row.real_catalog_item_key),
+                    jsonb_build_object('type', 'bool', 'value', meeting_row.real_catalog_active),
+                    jsonb_build_object('type', 'text', 'length', length(meeting_row.real_catalog_fingerprint), 'value', meeting_row.real_catalog_fingerprint),
+                    jsonb_build_object('type', 'enum', 'length', length(meeting_row.source::text), 'value', meeting_row.source::text),
+                    jsonb_build_object('type', 'text', 'length', length(meeting_row.source_external_id), 'value', meeting_row.source_external_id),
+                    jsonb_build_object('type', 'int8', 'value', meeting_row.community_host_id)
+                )::text,
+                E'\n' ORDER BY meeting_row.id
+            )
+            FROM meetings meeting_row
+            WHERE meeting_row.real_catalog_key IS NOT NULL
+        ), ''), 'sha256'), 'hex') AS meeting_roots_sha256,
+        encode(digest(COALESCE((
+            SELECT string_agg(
+                jsonb_build_array(
+                    jsonb_build_object('type', 'int8', 'value', community_row.id),
+                    jsonb_build_object('type', 'text', 'length', length(community_row.real_catalog_key), 'value', community_row.real_catalog_key),
+                    jsonb_build_object('type', 'text', 'length', length(community_row.real_catalog_item_key), 'value', community_row.real_catalog_item_key),
+                    jsonb_build_object('type', 'bool', 'value', community_row.real_catalog_active),
+                    jsonb_build_object('type', 'text', 'length', length(community_row.real_catalog_fingerprint), 'value', community_row.real_catalog_fingerprint)
+                )::text,
+                E'\n' ORDER BY community_row.id
+            )
+            FROM communities community_row
+            WHERE community_row.real_catalog_key IS NOT NULL
+        ), ''), 'sha256'), 'hex') AS community_roots_sha256,
+        encode(digest(COALESCE((
+            SELECT string_agg(edge_value, E'\n' ORDER BY edge_value)
+            FROM (
+                SELECT jsonb_build_array(
+                    jsonb_build_object('type', 'text', 'length', length('community-tag'), 'value', 'community-tag'),
+                    jsonb_build_object('type', 'int8', 'value', community_id),
+                    jsonb_build_object('type', 'int8', 'value', tag_id)
+                )::text AS edge_value
+                FROM community_tags
+                UNION ALL
+                SELECT jsonb_build_array(
+                    jsonb_build_object('type', 'text', 'length', length('community-subscriber'), 'value', 'community-subscriber'),
+                    jsonb_build_object('type', 'int8', 'value', community_id),
+                    jsonb_build_object('type', 'int8', 'value', user_id)
+                )::text
+                FROM community_subscribers
+                UNION ALL
+                SELECT jsonb_build_array(
+                    jsonb_build_object('type', 'text', 'length', length('meeting-tag'), 'value', 'meeting-tag'),
+                    jsonb_build_object('type', 'int8', 'value', meeting_id),
+                    jsonb_build_object('type', 'int8', 'value', tag_id)
+                )::text
+                FROM meeting_tags
+                UNION ALL
+                SELECT jsonb_build_array(
+                    jsonb_build_object('type', 'text', 'length', length('meeting-participant'), 'value', 'meeting-participant'),
+                    jsonb_build_object('type', 'int8', 'value', meeting_id),
+                    jsonb_build_object('type', 'int8', 'value', user_id)
+                )::text
+                FROM meeting_participants
+            ) edges
+        ), ''), 'sha256'), 'hex') AS relationship_edges_sha256
+),
 validity AS (
     SELECT
         (SELECT valid FROM flyway_check) AS flyway,
@@ -449,17 +753,29 @@ validity AS (
                          AND owned_ad_blocks = 3)
                     )
              FROM demo_checks) AS demo_catalog,
-        (SELECT null_required_references + unsafe_managed_references = 0 FROM media_checks) AS media_references
+        (SELECT null_required_references + unsafe_managed_references = 0 FROM media_checks) AS media_references,
+        (SELECT state_rows <= 1
+                    AND (state_rows > 0 OR revision_rows = 0)
+                    AND manifest_hash_violations = 0
+                    AND predecessor_violations = 0
+                    AND state_violations = 0
+                    AND snapshot_violations = 0
+                    AND snapshot_root_linkage_violations = 0
+                    AND meeting_ownership_violations = 0
+                    AND community_ownership_violations = 0
+                    AND source_identity_violations = 0
+                    AND correction_violations = 0
+                FROM real_catalog_checks) AS real_catalog
 ),
 validity_summary AS (
     SELECT validity.*,
         flyway AND schema AND tables AND indexes AND constraints AND relationships AND auth AND
-            demo_catalog AND media_references AS valid
+            demo_catalog AND media_references AND real_catalog AS valid
     FROM validity
 ),
 proof_document AS (
     SELECT jsonb_build_object(
-        'schema', 'meet-backend/closed-beta-database-proof/v1',
+        'schema', 'meet-backend/closed-beta-database-proof/v2',
         'valid', (SELECT valid FROM validity_summary),
         'validity', jsonb_build_object(
             'flyway', (SELECT flyway FROM validity),
@@ -470,15 +786,16 @@ proof_document AS (
             'relationships', (SELECT relationships FROM validity),
             'auth', (SELECT auth FROM validity),
             'demoCatalog', (SELECT demo_catalog FROM validity),
-            'mediaReferences', (SELECT media_references FROM validity)
+            'mediaReferences', (SELECT media_references FROM validity),
+            'realCatalog', (SELECT real_catalog FROM validity)
         ),
         'flyway', jsonb_build_object(
             'successfulVersionCount', (SELECT count(*) FROM flyway_schema_history WHERE success),
-            'orderedV1ToV9', (SELECT valid FROM flyway_check)
+            'orderedV1ToV11', (SELECT valid FROM flyway_check)
         ),
         'schemaChecks', jsonb_build_object(
             'requiredTablesAndColumns', (SELECT required_tables_and_columns FROM schema_checks),
-            'requiredTableCount', 19,
+            'requiredTableCount', 21,
             'exactRequiredTableCount', (SELECT exact_required_table_count FROM schema_checks),
             'requiredIndexes', (SELECT required_indexes FROM schema_checks),
             'requiredConstraints', (SELECT required_constraints FROM schema_checks),
@@ -486,6 +803,22 @@ proof_document AS (
             'legacyPlaintextColumnsAbsent', (SELECT legacy_plaintext_columns_absent FROM schema_checks)
         ),
         'rows', (SELECT value FROM table_counts),
+        'realCatalog', jsonb_build_object(
+            'stateRows', (SELECT state_rows FROM real_catalog_checks),
+            'revisionRows', (SELECT revision_rows FROM real_catalog_checks),
+            'manifestHashViolations', (SELECT manifest_hash_violations FROM real_catalog_checks),
+            'predecessorViolations', (SELECT predecessor_violations FROM real_catalog_checks),
+            'stateViolations', (SELECT state_violations FROM real_catalog_checks),
+            'snapshotViolations', (SELECT snapshot_violations FROM real_catalog_checks),
+            'snapshotRootLinkageViolations', (SELECT snapshot_root_linkage_violations FROM real_catalog_checks),
+            'meetingOwnershipViolations', (SELECT meeting_ownership_violations FROM real_catalog_checks),
+            'communityOwnershipViolations', (SELECT community_ownership_violations FROM real_catalog_checks),
+            'sourceIdentityViolations', (SELECT source_identity_violations FROM real_catalog_checks),
+            'correctionViolations', (SELECT correction_violations FROM real_catalog_checks),
+            'meetingRootsSha256', (SELECT meeting_roots_sha256 FROM catalog_commitments),
+            'communityRootsSha256', (SELECT community_roots_sha256 FROM catalog_commitments),
+            'relationshipEdgesSha256', (SELECT relationship_edges_sha256 FROM catalog_commitments)
+        ),
         'relationships', jsonb_build_object(
             'userInterests', (SELECT count(*) FROM user_interests),
             'communityTags', (SELECT count(*) FROM community_tags),

@@ -3,26 +3,33 @@ package dev.whysoezzy.meet.service
 import dev.whysoezzy.meet.api.error.ConflictException
 import dev.whysoezzy.meet.api.error.NotFoundException
 import dev.whysoezzy.meet.api.dto.*
+import dev.whysoezzy.meet.catalog.RealCatalogAdvisoryLock
 import dev.whysoezzy.meet.domain.entity.Community
 import dev.whysoezzy.meet.domain.repository.CommunityRepository
+import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import mu.KotlinLogging
+import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.data.domain.PageRequest
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
+import java.time.Clock
 
 private val logger = KotlinLogging.logger {}
 
 @Service
-class CommunityService(
+class CommunityService @Autowired constructor(
     private val communityRepository: CommunityRepository,
-    private val userRepository: UserRepository
+    private val userRepository: UserRepository,
+    private val meetingRepository: MeetingRepository,
+    private val clock: Clock,
+    private val realCatalogAdvisoryLock: RealCatalogAdvisoryLock? = null,
 ) {
 
     @Transactional(readOnly = true)
     fun getRecommendedCommunities(currentUserId: Long?): List<CommunityDto> {
         logger.info { "Fetching recommended communities" }
-        return communityRepository.findAll()
-            .take(20)
+        return communityRepository.findDiscoveryCommunities(clock.millis(), PageRequest.of(0, 20))
             .map { it.toDto(currentUserId) }
     }
 
@@ -38,8 +45,16 @@ class CommunityService(
     fun subscribeToCommunity(communityId: Long, userId: Long) {
         logger.info { "User $userId subscribing to community: $communityId" }
 
+        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
+            throw ConflictException("Real catalog is busy")
+        }
         val community = communityRepository.findById(communityId)
             .orElseThrow { NotFoundException("Community not found") }
+        if (community.realCatalogKey != null &&
+            !communityRepository.isFreshForParticipation(communityId, clock.millis())
+        ) {
+            throw ConflictException("Community is not available for new participation")
+        }
         val user = userRepository.findById(userId)
             .orElseThrow { NotFoundException("User not found") }
 
@@ -54,6 +69,9 @@ class CommunityService(
     fun unsubscribeFromCommunity(communityId: Long, userId: Long) {
         logger.info { "User $userId unsubscribing from community: $communityId" }
 
+        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
+            throw ConflictException("Real catalog is busy")
+        }
         val community = communityRepository.findById(communityId)
             .orElseThrow { NotFoundException("Community not found") }
         val user = userRepository.findById(userId)
@@ -69,7 +87,7 @@ class CommunityService(
     @Transactional(readOnly = true)
     fun searchCommunities(query: String, currentUserId: Long?): List<CommunityDto> {
         logger.info { "Searching communities" }
-        return communityRepository.searchCommunities(query)
+        return communityRepository.searchDiscoveryCommunities(query, clock.millis())
             .map { it.toDto(currentUserId) }
     }
 
@@ -80,7 +98,7 @@ class CommunityService(
         val community = communityRepository.findById(communityId)
             .orElseThrow { NotFoundException("Community not found") }
 
-        return community.getActiveMeetings().map { meeting ->
+        return meetingRepository.findDiscoveryCommunityMeetings(communityId, clock.millis()).map { meeting ->
             MeetingDto(
                 id = meeting.id!!,
                 imageUrl = meeting.imageUrl,
@@ -113,7 +131,10 @@ class CommunityService(
                 meetingStatus = meeting.status.name,
                 isUserInParticipants = currentUserId?.let { uid ->
                     meeting.participants.any { it.id == uid }
-                } ?: false
+                } ?: false,
+                source = meeting.source.name,
+                externalUrl = meeting.externalUrl,
+                isOnline = meeting.isOnline,
             )
         }
     }

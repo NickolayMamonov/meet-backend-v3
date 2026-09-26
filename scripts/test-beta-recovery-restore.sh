@@ -182,11 +182,11 @@ run_restore_fixture() {
   tar --create --gzip --file "$case_dir/uploads.tar.gz" --directory "$fixture/valid" .
   printf encrypted >"$case_dir/artifact/postgres.dump.age"
   printf encrypted >"$case_dir/artifact/uploads.tar.gz.age"
-  jq -cnS '{schema:"meet-backend/closed-beta-database-proof/v1",rows:{users:1}}' \
+  jq -cnS '{schema:"meet-backend/closed-beta-database-proof/v2",rows:{users:1}}' \
     >"$case_dir/database-proof.json"
   printf '%s\n' '{' \
     '  "rows": { "users": 1 },' \
-    '  "schema": "meet-backend/closed-beta-database-proof/v1"' \
+    '  "schema": "meet-backend/closed-beta-database-proof/v2"' \
     '}' >"$case_dir/database-proof.raw.json"
   printf 'avatars/file\n' >"$case_dir/reference-list"
   "$root/scripts/beta-recovery-media-proof.sh" --root "$fixture/valid" \
@@ -273,16 +273,17 @@ run_restore_fixture() {
     proof-malformed) printf '{malformed\n' >"$case_dir/database-proof.raw.json" ;;
     proof-multiple)
       printf '%s\n' \
-        '{"schema":"meet-backend/closed-beta-database-proof/v1","rows":{"users":1}}' \
-        '{"schema":"meet-backend/closed-beta-database-proof/v1","rows":{"users":1}}' \
+        '{"schema":"meet-backend/closed-beta-database-proof/v2","rows":{"users":1}}' \
+        '{"schema":"meet-backend/closed-beta-database-proof/v2","rows":{"users":1}}' \
         >"$case_dir/database-proof.raw.json"
       ;;
     proof-scalar) printf 'null\n' >"$case_dir/database-proof.raw.json" ;;
-    proof-array) printf '[{"schema":"meet-backend/closed-beta-database-proof/v1","rows":{"users":1}}]\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-array) printf '[{"schema":"meet-backend/closed-beta-database-proof/v2","rows":{"users":1}}]\n' >"$case_dir/database-proof.raw.json" ;;
     proof-missing-schema) printf '{"rows":{"users":1}}\n' >"$case_dir/database-proof.raw.json" ;;
     proof-non-string-schema) printf '{"schema":123,"rows":{"users":1}}\n' >"$case_dir/database-proof.raw.json" ;;
     proof-unexpected-schema) printf '{"schema":"unexpected","rows":{"users":1}}\n' >"$case_dir/database-proof.raw.json" ;;
-    proof-semantic-mismatch) printf '{"schema":"meet-backend/closed-beta-database-proof/v1","rows":{"users":2}}\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-v1) printf '{"schema":"meet-backend/closed-beta-database-proof/v1","rows":{"users":1}}\n' >"$case_dir/database-proof.raw.json" ;;
+    proof-semantic-mismatch) printf '{"schema":"meet-backend/closed-beta-database-proof/v2","rows":{"users":2}}\n' >"$case_dir/database-proof.raw.json" ;;
     proof-psql-failure) export FAKE_DOCKER_FAIL_PROOF_PSQL=1 ;;
   esac
   if [[ "$behavior" = inspect-* ]]; then

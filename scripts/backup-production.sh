@@ -190,7 +190,7 @@ if [ "${1:-}" = "--beta" ]; then
     "$image" -C /source -czf - . | "$age_binary" -r "$AGE_RECIPIENT" -o "$media_file"
   [ -s "$db_file" ] && [ -s "$media_file" ] || exit 1
   cat "$database_sql" | postgres_psql -X -qAt -f - |
-    jq -cS 'if type=="object" and .schema=="meet-backend/closed-beta-database-proof/v1" then . else error("database proof schema") end' \
+    jq -cS 'if type=="object" and .schema=="meet-backend/closed-beta-database-proof/v2" then . else error("database proof schema") end' \
       >"$temp/database-proof.json"
   cp -- "$temp/database-proof.json" "$beta_dir/capture-database-proof.json"
   cp -- "$temp/media-proof.json" "$beta_dir/capture-media-proof.json"

@@ -61,7 +61,7 @@ printf '%s\n' 'DB_NAME=meet' >"$fixture/release/.env.production"
 printf '%s\n' 'fixture' >"$fixture/release/active"
 printf '%s\n' 'services: {}' >"$fixture/release/docker-compose.production.yml"
 printf '%s\n' 'fixture database proof' >"$fixture/database-proof.json"
-jq -cnS '{schema:"meet-backend/closed-beta-database-proof/v1",rows:{users:1}}' \
+jq -cnS '{schema:"meet-backend/closed-beta-database-proof/v2",rows:{users:1}}' \
   >"$fixture/database-proof.json"
 printf '%s\n' 'avatars/file' >"$fixture/reference-list"
 if [ "$(uname -s)" = Linux ]; then

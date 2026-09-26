@@ -165,7 +165,7 @@ mode-0700 directory before any Docker command. Missing, empty, malformed,
 wrong-mode, wrong-key, or failed-second-decrypt inputs remove the identity and
 private plaintext without Docker activity or successful restore evidence.
 
-Dump listing, restore, the read-only V1-V9 database proof, uploads aggregate,
+Dump listing, restore, the read-only version-bound database proof, uploads aggregate,
 and every managed media reference must match. Always-run cleanup removes the
 identity, decrypted data, references, container with `--volumes`, captured
 anonymous volume, and internal network. Docker proves all three are absent
@@ -180,3 +180,19 @@ contract digests, equality proofs, mount contract, volume absence, probes,
 observed recovery-point age, and dispatch-to-post-probe RTO of at most
 7200 seconds. This is not recurring automation or an ongoing RPO guarantee;
 recurring backup belongs to MEE2-63.
+
+## Recovery proof version matrix
+
+The pre-migration V9/V10 recovery point uses the exact v1 SQL source at
+`aada20363d3d7d77530f35ff84df3853dec8587a:scripts/beta-recovery-database-proof.sql`
+(source-file SHA-256
+`9121c0db3e097000d0eb37cec8ec8ff0ba06c4ee1e64b14725222550ab67a461`).
+That source is not used against a V11 database.
+
+The V11 path uses the current `scripts/beta-recovery-database-proof.sql`, which
+emits `meet-backend/closed-beta-database-proof/v2`, requires the exact V1–V11
+ordered migration history and 21-table baseline, and commits catalog roots and
+relationship edges without publishing row values. V1, V2, mixed-schema, unknown
+schema, and proof-digest mismatches fail closed. The V2 admission digest is
+target-specific and must be refreshed from the authorized V11 capture before
+population; the checked-in contract is not live recovery evidence.

@@ -13,7 +13,7 @@ runtime=$tmp/capture-runtime.json
 for file in postgres.dump.age uploads.tar.gz.age; do
   dd if=/dev/zero of="$tmp/$file" bs=1 count=1 status=none
 done
-jq -cn '{schema:"meet-backend/closed-beta-database-proof/v1",rows:{users:1}}' >"$db_proof"
+jq -cn '{schema:"meet-backend/closed-beta-database-proof/v2",rows:{users:1}}' >"$db_proof"
 jq -cn --arg hash "$hash" '
   {schema:"meet-backend/beta-recovery-media-proof/v1",files:1,bytes:1,
    canonicalDigest:$hash,referencesTotal:1,referencesResolved:true}

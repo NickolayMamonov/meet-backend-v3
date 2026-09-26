@@ -265,7 +265,7 @@ jq -e --arg id "$recovery_id" '.schema=="meet-backend/beta-recovery-capture/v1" 
   .proofs.database.name=="capture-database-proof.json" and .proofs.media.name=="capture-media-proof.json" and
   (.proofs[] | (.sha256|type=="string" and test("^[0-9a-f]{64}$")))' "$state/private/capture-result.json" >/dev/null || fail "capture result malformed"
 for proof in capture-database-proof.json capture-media-proof.json; do [ "$(wc -l <"$state/private/$proof" | tr -d '[:space:]')" = 1 ] || fail "capture proof is not compact"; done
-jq -e '.schema=="meet-backend/closed-beta-database-proof/v1"' "$state/private/capture-database-proof.json" >/dev/null || fail "database proof malformed"
+jq -e '.schema=="meet-backend/closed-beta-database-proof/v2"' "$state/private/capture-database-proof.json" >/dev/null || fail "database proof malformed"
 jq -e '.schema=="meet-backend/beta-recovery-media-proof/v1" and .referencesResolved==true' "$state/private/capture-media-proof.json" >/dev/null || fail "media proof malformed"
 publish_file(){ local name=$1 source=$2 tmp; [ ! -e "$output/$name" ] || fail "capture output exists"; tmp=$(mktemp "$output/.capture-output.XXXXXX"); cp -- "$source" "$tmp"; chmod 600 "$tmp"; chown "$expected_uid:$expected_gid" "$tmp"; mv -n -- "$tmp" "$output/$name"; [ ! -e "$tmp" ] || fail "capture output publication raced"; published+=("$name"); }
 for file in postgres.dump.age uploads.tar.gz.age capture-database-proof.json capture-media-proof.json capture-result.json capture-runtime.json post-capture.json; do publish_file "$file" "$state/private/$file"; done

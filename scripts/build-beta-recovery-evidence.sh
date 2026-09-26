@@ -101,7 +101,7 @@ safe_json() {
 
 validate_database_proof() {
   safe_json "$1"
-  jq -e '.schema == "meet-backend/closed-beta-database-proof/v1"' "$1" >/dev/null ||
+  jq -e '.schema == "meet-backend/closed-beta-database-proof/v2"' "$1" >/dev/null ||
     fail "database proof schema is invalid"
 }
 

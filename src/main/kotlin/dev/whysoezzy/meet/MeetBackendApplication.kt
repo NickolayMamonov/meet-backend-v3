@@ -11,6 +11,7 @@ import dev.whysoezzy.meet.config.OtpProperties
 import dev.whysoezzy.meet.config.OtpRateLimitProperties
 import dev.whysoezzy.meet.config.OtpVerificationProperties
 import dev.whysoezzy.meet.config.PushProperties
+import dev.whysoezzy.meet.config.RealCatalogProperties
 import dev.whysoezzy.meet.config.RuntimeConfigurationInitializer
 import dev.whysoezzy.meet.config.SmsProperties
 import org.springframework.boot.security.autoconfigure.UserDetailsServiceAutoConfiguration
@@ -32,6 +33,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
     OtpVerificationProperties::class,
     PushProperties::class,
     SmsProperties::class,
+    RealCatalogProperties::class,
 )
 class MeetBackendApplication
 

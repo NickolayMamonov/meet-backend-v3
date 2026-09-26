@@ -542,7 +542,7 @@ jq -cS '.mediaProof' "$manifest" >"$media_expected"
 regular "$db_expected" && regular "$media_expected" || fail "manifest proof extraction failed"
 [ -n "$expected_db" ] && regular "$expected_db" || expected_db=$db_expected
 [ -n "$expected_media" ] && regular "$expected_media" || expected_media=$media_expected
-jq -e '.schema=="meet-backend/closed-beta-database-proof/v1"' "$expected_db" >/dev/null || fail "expected database proof contract is invalid"
+jq -e '.schema=="meet-backend/closed-beta-database-proof/v2"' "$expected_db" >/dev/null || fail "expected database proof contract is invalid"
 jq -e '.schema=="meet-backend/beta-recovery-media-proof/v1" and .referencesResolved==true' "$expected_media" >/dev/null || fail "expected media proof contract is invalid"
 jq -e --slurpfile d "$expected_db" --slurpfile m "$expected_media" '.databaseProof==$d[0] and .mediaProof==$m[0]' "$manifest" >/dev/null || fail "expected proofs are not bound by artifact manifest"
 dbsize=$(wc -c <"$artifact/postgres.dump.age" | tr -d '[:space:]'); usize=$(wc -c <"$artifact/uploads.tar.gz.age" | tr -d '[:space:]')
@@ -796,7 +796,7 @@ jq -e -cS -s '
   if length == 1 and
      (.[0] | type) == "object" and
      (.[0].schema | type) == "string" and
-     .[0].schema == "meet-backend/closed-beta-database-proof/v1"
+     .[0].schema == "meet-backend/closed-beta-database-proof/v2"
   then .[0]
   else error("database proof must be one valid object")
   end
