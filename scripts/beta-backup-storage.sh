@@ -522,7 +522,8 @@ beta_storage_publish_remote() {
     return 0
   fi
   rm -f -- "$existing_head" "$existing_descriptor"
-  local txid="publish-$point_id-$(date -u +%s)"
+  local txid
+  txid="publish-$point_id-$(date -u +%s)"
   beta_storage_remote_writer_acquire publish "$owner" "$txid"
   local cleanup=true release_allowed=true scratch
   scratch=$(mktemp -d)
@@ -659,8 +660,7 @@ beta_storage_remote_validate_descriptor() {
   beta_storage_provider_get '' "points/$point_id/recovery-point.json" \
     "$(jq -er '.versions.manifest' "$descriptor")" "$manifest" >/dev/null
   beta_storage_validate_point "$manifest" || beta_storage_fail manifest_invalid
-  [ "$(sha256sum "$manifest" | awk '{print $1}')" =
-    "$(jq -er '.descriptorDigest' "$descriptor")" ] ||
+  [ "$(sha256sum "$manifest" | awk '{print $1}')" = "$(jq -er '.descriptorDigest' "$descriptor")" ] ||
     beta_storage_fail descriptor_manifest_mismatch
   [ "$(jq -er '.pointId' "$manifest")" = "$point_id" ] ||
     beta_storage_fail descriptor_point_mismatch
@@ -707,14 +707,15 @@ beta_storage_promote_remote() {
   beta_storage_validate_receipt "$receipt" || {
     rm -rf "$scratch"; beta_storage_fail receipt_invalid;
   }
-  local point_id receipt_id txid="promote-$(date -u +%s)" descriptor="$scratch/point.json"
+  local point_id receipt_id txid descriptor
+  txid="promote-$(date -u +%s)"
+  descriptor="$scratch/point.json"
   point_id=$(jq -er '.pointId' "$receipt")
   receipt_id=$(jq -er '.receiptId' "$receipt")
   cp -- "$(dirname "$receipt")/$receipt_id.proof.json" "$scratch/$receipt_id.proof.json"
   beta_storage_remote_get_json "points/$point_id/point.json" "$descriptor"
   beta_storage_remote_validate_descriptor "$point_id" "$descriptor" "$scratch"
-  [ "$(sha256sum "$descriptor" | awk '{print $1}')" =
-    "$(jq -er '.pointDescriptorDigest' "$receipt")" ] ||
+  [ "$(sha256sum "$descriptor" | awk '{print $1}')" = "$(jq -er '.pointDescriptorDigest' "$receipt")" ] ||
     { rm -rf "$scratch"; beta_storage_fail descriptor_binding; }
   jq -e --arg id "$point_id" --argjson captured "$(jq -er '.captureAt' "$receipt")" \
     --arg command "$(jq -er '.captureCommandDigest' "$receipt")" \
@@ -726,7 +727,7 @@ beta_storage_promote_remote() {
   beta_storage_provider_put_conditional '' "receipts/$point_id/$receipt_id.json" "$receipt" '' true >/dev/null
   beta_storage_provider_put_conditional '' "receipts/$point_id/$receipt_id.proof.json" \
     "$scratch/$receipt_id.proof.json" '' true >/dev/null
-  local head="$scratch/verified-head.json" generation=0 old old_at=-1
+  local head="$scratch/verified-head.json" generation=0 old_at=-1
   local head_meta="$scratch/verified-head.meta.json" head_etag='' head_version=''
   if beta_storage_remote_head control/verified-head.json "$head_meta"; then
     head_etag=$(jq -er '.ETag' "$head_meta")
@@ -938,10 +939,8 @@ beta_storage_local_validate_point_dir() {
       proof_kind=${proof_spec%%:*}
       proof_file=${proof_spec#*:}
       [ -f "$directory/$proof_file" ] && [ ! -L "$directory/$proof_file" ] || return 1
-      [ "$(wc -c <"$directory/$proof_file")" =
-        "$(jq -er ".proofs.$proof_kind.length" "$directory/point.json")" ] || return 1
-      [ "$(sha256sum "$directory/$proof_file" | awk '{print $1}')" =
-        "$(jq -er ".proofs.$proof_kind.sha256" "$directory/point.json")" ] || return 1
+      [ "$(wc -c <"$directory/$proof_file")" = "$(jq -er ".proofs.$proof_kind.length" "$directory/point.json")" ] || return 1
+      [ "$(sha256sum "$directory/$proof_file" | awk '{print $1}')" = "$(jq -er ".proofs.$proof_kind.sha256" "$directory/point.json")" ] || return 1
       beta_storage_validate_capture_proof "$proof_kind" "$directory/$proof_file" || return 1
     done
   fi

@@ -11,6 +11,7 @@ import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
 import java.security.MessageDigest
+import java.nio.file.attribute.PosixFilePermission
 
 class BackupSafetyGateTest {
     @Test
@@ -60,12 +61,20 @@ class BackupSafetyGateTest {
     }
 
     private fun writeWatermark(path: java.nio.file.Path, generation: Long, observedAt: Long) {
+        Files.setPosixFilePermissions(
+            path,
+            setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.GROUP_READ),
+        )
         val digest = MessageDigest.getInstance("SHA-256")
             .digest(Files.readAllBytes(path))
             .joinToString("") { "%02x".format(it) }
         Files.writeString(
             path.parent.resolve("watermark.json"),
             """{"authorityGeneration":$generation,"observedAt":$observedAt,"schema":"meet-backend/beta-backup-watermark/v1","statusDigest":"$digest"}""",
+        )
+        Files.setPosixFilePermissions(
+            path.parent.resolve("watermark.json"),
+            setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.GROUP_READ),
         )
     }
 

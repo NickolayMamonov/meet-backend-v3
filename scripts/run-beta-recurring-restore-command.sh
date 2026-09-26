@@ -48,12 +48,10 @@ install -m 600 "$point/uploads.tar.gz.age" "$artifact/uploads.tar.gz.age"
 
 captured=$(jq -er '.capture.capturedAt' "$point/recovery-point.json")
 source_revision=$(jq -er '.capture.sourceRevision' "$point/recovery-point.json")
-runtime_revision=$(jq -er '.runtimeRevision' "$point/recovery-point.json")
 [ "$capture_revision" = "$source_revision" ] || {
   echo 'BACKUP_CUSTODY_BLOCKED:capture_revision_mismatch' >&2
   exit 1
 }
-command_digest=$(jq -er '.captureCommandDigest' "$point/recovery-point.json")
 contract_digest=$(jq -er '.contractDigest' "$point/recovery-point.json")
 proof_contract_digest=$(jq -er '.proofDigest' "$point/recovery-point.json")
 database_proof="$point/capture-database-proof.json"
