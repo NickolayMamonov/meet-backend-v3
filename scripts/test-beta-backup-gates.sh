@@ -29,8 +29,12 @@ if BETA_BACKUP_STATUS_PATH="$tmp/stale.json" BETA_BACKUP_ENVIRONMENT=closed-beta
   >/dev/null 2>&1; then
   fail "stale verified state admitted standalone update"
 fi
-for file in configure-test-vps-yandex-smtp.sh update-production-release.sh rollback-production-release.sh; do
-  grep -Fq 'beta_backup_runtime_require_operation' "$root/scripts/$file" ||
-    fail "$file lacks independent safety admission"
-done
+grep -Fq 'beta_backup_runtime_require_operation' "$root/scripts/configure-test-vps-yandex-smtp.sh" ||
+  fail "SMTP tool lacks independent safety admission"
+grep -Fq 'production-config-digest.sh' "$root/scripts/update-production-release.sh" ||
+  fail "standalone update lacks the pre-mutation digest boundary"
+grep -Fq 'beta_backup_runtime_require_operation' "$root/scripts/production-config-digest.sh" ||
+  fail "standalone update digest boundary lacks safety admission"
+grep -Fq 'beta_backup_runtime_require_operation' "$root/scripts/rollback-production-release.sh" ||
+  fail "standalone rollback lacks independent safety admission"
 printf 'test-beta-backup-gates.sh: passed\n'

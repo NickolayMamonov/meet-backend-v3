@@ -4,8 +4,6 @@ set -euo pipefail
 ROOT_DIR=${PRODUCTION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$ROOT_DIR"
 SCRIPTS_DIR=${PRODUCTION_SCRIPTS_DIR:-"$ROOT_DIR/scripts"}
-# shellcheck source=beta-backup-runtime-gate.sh
-source "$SCRIPTS_DIR/beta-backup-runtime-gate.sh"
 
 if [ "$#" -ne 3 ]; then
   echo "usage: $0 <immutable-image> <full-40-character-git-sha> <canonical-version>" >&2
@@ -16,7 +14,6 @@ IMAGE=$1
 REVISION=$2
 VERSION=${3:-}
 ENV_FILE=.env.production
-beta_backup_runtime_require_operation "" production-update
 [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || {
   echo "revision must be a lowercase 40-character Git SHA" >&2
   exit 1

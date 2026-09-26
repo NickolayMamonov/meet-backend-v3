@@ -579,8 +579,15 @@ verify_production_env_settings "$root/.env.production" ||
   fail "PROVIDER_STATE_INVALID"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=beta-backup-runtime-gate.sh
-source "$script_dir/beta-backup-runtime-gate.sh"
+if [ -f "$script_dir/beta-backup-runtime-gate.sh" ]; then
+  # shellcheck source=beta-backup-runtime-gate.sh
+  source "$script_dir/beta-backup-runtime-gate.sh"
+else
+  beta_backup_runtime_require_operation() {
+    [ "${BETA_BACKUP_SAFETY_ENABLED:-false}" != true ] ||
+      fail "backup safety helper is unavailable"
+  }
+fi
 compose_script=$script_dir/production-compose.sh
 update_script=$script_dir/update-production-release.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
