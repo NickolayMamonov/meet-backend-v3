@@ -38,7 +38,7 @@ expected_indexes(index_name, unique_index, predicate_pattern, key_columns) AS (
         ('uq_communities_real_catalog_item', true, 'real_catalog_key[[:space:]]+IS[[:space:]]+NOT[[:space:]]+NULL',
          ARRAY['real_catalog_key', 'real_catalog_item_key']::text[]),
         ('idx_real_catalog_state_cutoff', false, '', ARRAY['discoverable_until', 'catalog_key']::text[]),
-        ('idx_meetings_real_catalog_discovery', false, '', ARRAY['real_catalog_key', 'real_catalog_active', 'status', 'time', 'id']::text[]),
+        ('idx_meetings_real_catalog_discovery', false, '', ARRAY['real_catalog_key', 'real_catalog_active', 'status', '"time"', 'id']::text[]),
         ('idx_communities_real_catalog_discovery', false, '', ARRAY['real_catalog_key', 'real_catalog_active', 'id']::text[])
 ),
 expected_constraints(constraint_name) AS (
