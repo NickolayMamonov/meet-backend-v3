@@ -45,13 +45,11 @@ class CommunityService @Autowired constructor(
     fun subscribeToCommunity(communityId: Long, userId: Long) {
         logger.info { "User $userId subscribing to community: $communityId" }
 
-        val community = communityRepository.findById(communityId)
-            .orElseThrow { NotFoundException("Community not found") }
-        if (community.realCatalogKey != null &&
-            !(realCatalogAdvisoryLock?.tryAcquire() ?: true)
-        ) {
+        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
             throw ConflictException("Real catalog is busy")
         }
+        val community = communityRepository.findById(communityId)
+            .orElseThrow { NotFoundException("Community not found") }
         if (community.realCatalogKey != null &&
             !communityRepository.isFreshForParticipation(communityId, clock.millis())
         ) {
@@ -71,13 +69,11 @@ class CommunityService @Autowired constructor(
     fun unsubscribeFromCommunity(communityId: Long, userId: Long) {
         logger.info { "User $userId unsubscribing from community: $communityId" }
 
-        val community = communityRepository.findById(communityId)
-            .orElseThrow { NotFoundException("Community not found") }
-        if (community.realCatalogKey != null &&
-            !(realCatalogAdvisoryLock?.tryAcquire() ?: true)
-        ) {
+        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
             throw ConflictException("Real catalog is busy")
         }
+        val community = communityRepository.findById(communityId)
+            .orElseThrow { NotFoundException("Community not found") }
         val user = userRepository.findById(userId)
             .orElseThrow { NotFoundException("User not found") }
 
@@ -102,7 +98,7 @@ class CommunityService @Autowired constructor(
         val community = communityRepository.findById(communityId)
             .orElseThrow { NotFoundException("Community not found") }
 
-        return meetingRepository.findDiscoverySiblings(communityId, clock.millis()).map { meeting ->
+        return meetingRepository.findDiscoveryCommunityMeetings(communityId, clock.millis()).map { meeting ->
             MeetingDto(
                 id = meeting.id!!,
                 imageUrl = meeting.imageUrl,

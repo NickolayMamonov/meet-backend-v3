@@ -50,6 +50,7 @@ app:
     enabled: ${REAL_CATALOG_ENABLED:false}
     target-environment: ${REAL_CATALOG_TARGET_ENVIRONMENT:}
     approved-media-hosts: ${REAL_CATALOG_APPROVED_MEDIA_HOSTS:}
+    attestation-secret: ${REAL_CATALOG_ATTESTATION_SECRET:}
     max-request-bytes: ${REAL_CATALOG_MAX_REQUEST_BYTES:16384}
 
   geocoder:

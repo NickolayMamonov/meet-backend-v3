@@ -18,7 +18,11 @@ interface CommunityRepository : JpaRepository<Community, Long> {
             LEFT JOIN real_catalog_state state ON state.catalog_key = c.real_catalog_key
             WHERE (
                 c.real_catalog_key IS NULL
-                OR (c.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+                OR (
+                    c.real_catalog_active = TRUE
+                    AND state.invitation_at <= to_timestamp(:now / 1000.0)
+                    AND state.discoverable_until > to_timestamp(:now / 1000.0)
+                )
             )
             ORDER BY c.id ASC
         """,
@@ -44,7 +48,11 @@ interface CommunityRepository : JpaRepository<Community, Long> {
             )
             AND (
                 c.real_catalog_key IS NULL
-                OR (c.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+                OR (
+                    c.real_catalog_active = TRUE
+                    AND state.invitation_at <= to_timestamp(:now / 1000.0)
+                    AND state.discoverable_until > to_timestamp(:now / 1000.0)
+                )
             )
             ORDER BY c.id ASC
         """,
@@ -62,6 +70,7 @@ interface CommunityRepository : JpaRepository<Community, Long> {
                 c.real_catalog_key IS NULL
                 OR (
                     c.real_catalog_active = TRUE
+                    AND state.invitation_at <= to_timestamp(:now / 1000.0)
                     AND state.discoverable_until > to_timestamp(:now / 1000.0)
                 )
               )

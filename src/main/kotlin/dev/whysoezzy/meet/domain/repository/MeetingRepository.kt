@@ -23,7 +23,11 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
           AND COALESCE(m.ends_at, m.time) >= :now
           AND (
             m.real_catalog_key IS NULL
-            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+            OR (
+                m.real_catalog_active = TRUE
+                AND state.invitation_at <= to_timestamp(:now / 1000.0)
+                AND state.discoverable_until > to_timestamp(:now / 1000.0)
+            )
           )
         ORDER BY m.time ASC, m.id ASC
         """,
@@ -44,7 +48,11 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
           AND m.id NOT IN (:excludedIds)
           AND (
             m.real_catalog_key IS NULL
-            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+            OR (
+                m.real_catalog_active = TRUE
+                AND state.invitation_at <= to_timestamp(:now / 1000.0)
+                AND state.discoverable_until > to_timestamp(:now / 1000.0)
+            )
           )
         ORDER BY m.time ASC, m.id ASC
         """,
@@ -67,7 +75,11 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
           AND COALESCE(m.ends_at, m.time) >= :now
           AND (
             m.real_catalog_key IS NULL
-            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+            OR (
+                m.real_catalog_active = TRUE
+                AND state.invitation_at <= to_timestamp(:now / 1000.0)
+                AND state.discoverable_until > to_timestamp(:now / 1000.0)
+            )
           )
         ORDER BY m.time ASC, m.id ASC
         """,
@@ -93,7 +105,11 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
           )
           AND (
             m.real_catalog_key IS NULL
-            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+            OR (
+                m.real_catalog_active = TRUE
+                AND state.invitation_at <= to_timestamp(:now / 1000.0)
+                AND state.discoverable_until > to_timestamp(:now / 1000.0)
+            )
           )
         ORDER BY m.time ASC, m.id ASC
         """,
@@ -114,7 +130,11 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
           AND COALESCE(m.ends_at, m.time) >= :now
           AND (
             m.real_catalog_key IS NULL
-            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+            OR (
+                m.real_catalog_active = TRUE
+                AND state.invitation_at <= to_timestamp(:now / 1000.0)
+                AND state.discoverable_until > to_timestamp(:now / 1000.0)
+            )
           )
         GROUP BY m.id
         ORDER BY COUNT(p.user_id) DESC, m.time ASC, m.id ASC
@@ -137,7 +157,11 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
           AND m.id NOT IN (:excludedIds)
           AND (
             m.real_catalog_key IS NULL
-            OR (m.real_catalog_active = TRUE AND state.discoverable_until > to_timestamp(:now / 1000.0))
+            OR (
+                m.real_catalog_active = TRUE
+                AND state.invitation_at <= to_timestamp(:now / 1000.0)
+                AND state.discoverable_until > to_timestamp(:now / 1000.0)
+            )
           )
         GROUP BY m.id
         ORDER BY COUNT(p.user_id) DESC, m.time ASC, m.id ASC
@@ -186,6 +210,34 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
                     AND EXISTS (
                         SELECT 1 FROM real_catalog_state state
                         WHERE state.catalog_key = m.real_catalog_key
+                          AND state.invitation_at <= to_timestamp(:now / 1000.0)
+                          AND state.discoverable_until > to_timestamp(:now / 1000.0)
+                    )
+                )
+              )
+            ORDER BY m.time ASC, m.id ASC
+            LIMIT 5
+        """,
+        nativeQuery = true,
+    )
+    fun findDiscoverySiblings(
+        @Param("communityId") communityId: Long,
+        @Param("now") now: Long,
+    ): List<Meeting>
+
+    @Query(
+        value = """
+            SELECT m.* FROM meetings m
+            WHERE m.community_host_id = :communityId
+              AND m.status = 'ACTIVE'
+              AND (
+                m.real_catalog_key IS NULL
+                OR (
+                    m.real_catalog_active = TRUE
+                    AND EXISTS (
+                        SELECT 1 FROM real_catalog_state state
+                        WHERE state.catalog_key = m.real_catalog_key
+                          AND state.invitation_at <= to_timestamp(:now / 1000.0)
                           AND state.discoverable_until > to_timestamp(:now / 1000.0)
                     )
                 )
@@ -194,7 +246,7 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
         """,
         nativeQuery = true,
     )
-    fun findDiscoverySiblings(
+    fun findDiscoveryCommunityMeetings(
         @Param("communityId") communityId: Long,
         @Param("now") now: Long,
     ): List<Meeting>
@@ -209,6 +261,7 @@ interface MeetingRepository : JpaRepository<Meeting, Long> {
                 m.real_catalog_key IS NULL
                 OR (
                     m.real_catalog_active = TRUE
+                    AND state.invitation_at <= to_timestamp(:now / 1000.0)
                     AND state.discoverable_until > to_timestamp(:now / 1000.0)
                 )
               )

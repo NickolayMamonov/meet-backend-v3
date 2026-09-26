@@ -112,13 +112,11 @@ class MeetingService @Autowired constructor(
     fun joinMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId joining meeting: $meetingId" }
 
-        val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { NotFoundException("Meeting not found") }
-        if (meeting.realCatalogKey != null &&
-            !(realCatalogAdvisoryLock?.tryAcquire() ?: true)
-        ) {
+        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
             throw ConflictException("Real catalog is busy")
         }
+        val meeting = meetingRepository.findById(meetingId)
+            .orElseThrow { NotFoundException("Meeting not found") }
         val user = userRepository.findWithLockById(userId)
             ?: throw NotFoundException("User not found")
 
@@ -143,13 +141,11 @@ class MeetingService @Autowired constructor(
     fun leaveMeeting(meetingId: Long, userId: Long) {
         logger.info { "User $userId leaving meeting: $meetingId" }
 
-        val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { NotFoundException("Meeting not found") }
-        if (meeting.realCatalogKey != null &&
-            !(realCatalogAdvisoryLock?.tryAcquire() ?: true)
-        ) {
+        if (!(realCatalogAdvisoryLock?.tryAcquire() ?: true)) {
             throw ConflictException("Real catalog is busy")
         }
+        val meeting = meetingRepository.findById(meetingId)
+            .orElseThrow { NotFoundException("Meeting not found") }
         val user = userRepository.findWithLockById(userId)
             ?: throw NotFoundException("User not found")
 
@@ -219,7 +215,7 @@ class MeetingService @Autowired constructor(
                     title = community.name,
                     description = community.description,
                     imageUrl = community.imageUrl,
-                    meetingsInfo = relatedMeetings.take(5).map { m ->
+                    meetingsInfo = (if (discoveryNow != null) relatedMeetings else relatedMeetings.take(5)).map { m ->
                         MeetingInfoDto(m.id!!, m.title, m.imageUrl, m.date)
                     }
                 )

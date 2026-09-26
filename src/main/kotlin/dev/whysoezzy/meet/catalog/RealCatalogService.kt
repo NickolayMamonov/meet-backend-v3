@@ -51,18 +51,21 @@ class RealCatalogService(
                 state.discoverableUntil,
                 changed = false,
                 existing = currentRoots(loaded.manifest.catalogKey),
+                target = currentRoots(loaded.manifest.catalogKey),
             )
         }
         state?.let(::checkOwnedState)
         validateTransition(loaded.manifest, state, request.expectedGeneration, now)
         val cutoff = deriveCutoff(loaded.manifest, state, now)
+        val existing = state?.let { currentRoots(loaded.manifest.catalogKey) } ?: emptyMap()
         return response(
             loaded.manifest,
             loaded.digest,
             state?.generation ?: 0,
             cutoff,
             changed = state?.currentDigest != loaded.digest,
-            existing = state?.let { currentRoots(loaded.manifest.catalogKey) } ?: emptyMap(),
+            existing = existing,
+            target = plannedRoots(existing, loaded.manifest),
         )
     }
 
@@ -70,16 +73,57 @@ class RealCatalogService(
     fun apply(request: RealCatalogApplyRequest): RealCatalogOperationResponse {
         if (!properties.enabled) throw NotFoundException("Real catalog is disabled")
         if (properties.targetEnvironment.isBlank()) throw ConflictException("Real catalog target is not configured")
-        validateApprovalRef(request.contentApprovalRef, "content approval")
-        validateApprovalRef(request.mutationAuthorizationRef, "mutation authorization")
-        validateApprovalRef(request.recoveryPointRef, "recovery point")
 
         val loaded = load(request.revision, request.digest)
         validateApprovedMediaHosts(loaded.manifest)
+        val now = clock.instant()
+        val verifier = RealCatalogAttestationVerifier(properties.attestationSecret)
+        verifier.verify(
+            request.contentApprovalRef,
+            RealCatalogAttestationVerifier.CONTENT,
+            loaded.manifest.catalogKey,
+            loaded.digest,
+            loaded.manifest.intent,
+            properties.targetEnvironment,
+            now,
+        ).also {
+            if (it.recoveryPointId != null || it.recoveryProofSchema != null || it.recoveryProofDigest != null) {
+                throw ConflictException("Content approval binding conflict")
+            }
+        }
+        val recovery = verifier.verify(
+            request.recoveryPointRef,
+            RealCatalogAttestationVerifier.RECOVERY,
+            loaded.manifest.catalogKey,
+            loaded.digest,
+            loaded.manifest.intent,
+            properties.targetEnvironment,
+            now,
+        )
+        if (recovery.recoveryPointId == null ||
+            recovery.recoveryProofSchema != RealCatalogAttestationVerifier.RECOVERY_PROOF_SCHEMA ||
+            recovery.recoveryProofDigest.isNullOrBlank()
+        ) {
+            throw ConflictException("Recovery attestation binding conflict")
+        }
+        val mutation = verifier.verify(
+            request.mutationAuthorizationRef,
+            RealCatalogAttestationVerifier.MUTATION,
+            loaded.manifest.catalogKey,
+            loaded.digest,
+            loaded.manifest.intent,
+            properties.targetEnvironment,
+            now,
+        )
+        if (mutation.recoveryPointId != recovery.recoveryPointId ||
+            mutation.recoveryProofSchema != recovery.recoveryProofSchema ||
+            mutation.recoveryProofDigest != recovery.recoveryProofDigest
+        ) {
+            throw ConflictException("Mutation authorization binding conflict")
+        }
         if (!advisoryLock.tryAcquire()) throw ConflictException("Real catalog is busy")
         val manifest = loaded.manifest
         var state = stateRepository.findById(manifest.catalogKey).orElse(null)
-        val now = clock.instant()
 
         if (state?.currentDigest == loaded.digest) {
             checkOwnedState(state)
@@ -90,12 +134,28 @@ class RealCatalogService(
                 state.discoverableUntil,
                 changed = false,
                 existing = currentRoots(manifest.catalogKey),
+                target = currentRoots(manifest.catalogKey),
             )
         }
 
         state?.let(::checkOwnedState)
         validateTransition(manifest, state, request.expectedGeneration, now)
         val cutoff = deriveCutoff(manifest, state, now)
+        val oldCommunities = communityRepository.findAllByRealCatalogKey(manifest.catalogKey)
+            .associateBy { it.realCatalogItemKey!! }
+        val oldMeetings = meetingRepository.findAllByRealCatalogKey(manifest.catalogKey)
+            .associateBy { it.realCatalogItemKey!! }
+        if (oldCommunities.keys.union(manifest.communities.map { it.logicalKey }.toSet()).size >
+            RealCatalogManifestValidator.MAX_COMMUNITIES
+        ) {
+            throw ConflictException("Resolved catalog has too many communities")
+        }
+        if (oldMeetings.keys.union(manifest.meetings.map { it.logicalKey }.toSet()).size >
+            RealCatalogManifestValidator.MAX_MEETINGS
+        ) {
+            throw ConflictException("Resolved catalog has too many meetings")
+        }
+        val priorRoots = currentRoots(manifest.catalogKey)
         val nextGeneration = (state?.generation ?: 0) + 1
         if (state == null) {
             state = RealCatalogStateEntity(
@@ -146,10 +206,6 @@ class RealCatalogService(
         revisionRepository.save(revision)
         revisionRepository.flush()
 
-        val oldCommunities = communityRepository.findAllByRealCatalogKey(manifest.catalogKey)
-            .associateBy { it.realCatalogItemKey!! }
-        val oldMeetings = meetingRepository.findAllByRealCatalogKey(manifest.catalogKey)
-            .associateBy { it.realCatalogItemKey!! }
         val communities = oldCommunities.toMutableMap()
         val meetings = oldMeetings.toMutableMap()
 
@@ -166,9 +222,11 @@ class RealCatalogService(
             meetingRepository.save(meeting)
         }
 
-        oldCommunities.filterKeys { it !in manifest.communities.map { item -> item.logicalKey }.toSet() }
+        val manifestCommunityKeys = manifest.communities.map { it.logicalKey }.toSet()
+        val manifestMeetingKeys = manifest.meetings.map { it.logicalKey }.toSet()
+        oldCommunities.filterKeys { it !in manifestCommunityKeys }
             .values.forEach { it.realCatalogActive = false }
-        oldMeetings.filterKeys { it !in manifest.meetings.map { item -> item.logicalKey }.toSet() }
+        oldMeetings.filterKeys { it !in manifestMeetingKeys }
             .values.forEach { it.realCatalogActive = false }
 
         meetings.values.filter { it.realCatalogActive == true }.forEach {
@@ -189,7 +247,16 @@ class RealCatalogService(
         revision.resolvedSnapshot = objectMapper.writeValueAsString(snapshot)
         revisionRepository.save(revision)
         revisionRepository.flush()
-        return response(manifest, loaded.digest, nextGeneration, cutoff, true, currentRoots(manifest.catalogKey))
+        val targetRoots = currentRoots(manifest.catalogKey)
+        return response(
+            manifest,
+            loaded.digest,
+            nextGeneration,
+            cutoff,
+            changed = true,
+            existing = priorRoots,
+            target = targetRoots,
+        )
     }
 
     private fun load(revision: String, expectedDigest: String): RealCatalogLoadedManifest {
@@ -290,12 +357,28 @@ class RealCatalogService(
             add(windowEnd)
             add(reviewAt.plus(Duration.ofDays(7)))
             manifest.communities.filter { it.membership == RealCatalogMembership.ACTIVE }
-                .mapNotNullTo(this) { it.source.discoveryUseCutoff }
+                .flatMap { provenanceSources(it.source, it.provenance) }
+                .mapNotNull { it.discoveryUseCutoff }
             manifest.meetings.filter { it.membership == RealCatalogMembership.ACTIVE }
-                .mapNotNullTo(this) { it.source.discoveryUseCutoff }
+                .flatMap { provenanceSources(it.source, it.provenance) }
+                .mapNotNull { it.discoveryUseCutoff }
         }
         return cutoffs.minOrNull() ?: windowEnd
     }
+
+    private fun provenanceSources(
+        source: RealCatalogSource,
+        provenance: RealCatalogFieldProvenance,
+    ): List<RealCatalogSource> =
+        listOfNotNull(
+            source,
+            provenance.title,
+            provenance.description,
+            provenance.image,
+            provenance.organizer,
+            provenance.schedule,
+            provenance.location,
+        )
 
     private fun applyCommunity(
         manifest: RealCatalogManifest,
@@ -374,6 +457,18 @@ class RealCatalogService(
 
     private fun tag(text: String): Tag = tagRepository.findByText(text) ?: tagRepository.save(Tag(text))
 
+    private data class RootSummary(
+        val kind: String,
+        val logicalKey: String,
+        val entityId: Long?,
+        val active: Boolean,
+        val fingerprint: String,
+        val communityKey: String? = null,
+    ) {
+        val responseKey: String
+            get() = "${kind.lowercase()}:$logicalKey"
+    }
+
     private fun checkOwnedState(state: RealCatalogStateEntity) {
         val revision = revisionRepository.findById(state.currentDigest)
             .orElseThrow { ConflictException("Catalog ownership drift") }
@@ -387,10 +482,18 @@ class RealCatalogService(
         val snapshot = runCatching {
             objectMapper.readValue(revision.resolvedSnapshot, RealCatalogResolvedSnapshot::class.java)
         }.getOrElse { throw ConflictException("Catalog ownership drift") }
+        if (snapshot.communities.map { "community:${it.logicalKey}" }.distinct().size != snapshot.communities.size ||
+            snapshot.meetings.map { "meeting:${it.logicalKey}" }.distinct().size != snapshot.meetings.size
+        ) {
+            throw ConflictException("Catalog ownership drift")
+        }
         val communities = communityRepository.findAllByRealCatalogKey(state.catalogKey)
             .associateBy { it.realCatalogItemKey }
         val meetings = meetingRepository.findAllByRealCatalogKey(state.catalogKey)
             .associateBy { it.realCatalogItemKey }
+        if (communities.keys.any { it == null } || meetings.keys.any { it == null }) {
+            throw ConflictException("Catalog ownership drift")
+        }
         if (communities.size != snapshot.communities.size || meetings.size != snapshot.meetings.size) {
             throw ConflictException("Catalog ownership drift")
         }
@@ -398,9 +501,15 @@ class RealCatalogService(
             val actual = communities[expected.logicalKey]
                 ?: throw ConflictException("Catalog ownership drift")
             if (actual.id != expected.entityId ||
+                actual.realCatalogKey != state.catalogKey ||
+                actual.realCatalogItemKey != expected.logicalKey ||
                 actual.realCatalogActive != (expected.membership == RealCatalogMembership.ACTIVE) ||
-                actual.realCatalogFingerprint != expected.fingerprint
+                actual.demoCatalogKey != null ||
+                actual.realCatalogFingerprint != fingerprint(actual)
             ) {
+                throw ConflictException("Catalog ownership drift")
+            }
+            if (actual.realCatalogFingerprint != expected.fingerprint) {
                 throw ConflictException("Catalog ownership drift")
             }
         }
@@ -408,18 +517,84 @@ class RealCatalogService(
             val actual = meetings[expected.logicalKey]
                 ?: throw ConflictException("Catalog ownership drift")
             if (actual.id != expected.entityId ||
+                actual.realCatalogKey != state.catalogKey ||
+                actual.realCatalogItemKey != expected.logicalKey ||
                 actual.realCatalogActive != (expected.membership == RealCatalogMembership.ACTIVE) ||
-                actual.realCatalogFingerprint != expected.fingerprint ||
+                actual.demoCatalogKey != null ||
+                actual.source != EventSource.MANUAL ||
+                actual.sourceExternalId != "closed-beta-real:${expected.logicalKey}" ||
+                actual.personHost != null ||
+                actual.realCatalogFingerprint != fingerprint(actual) ||
                 actual.communityHost?.realCatalogItemKey != expected.communityKey
             ) {
+                throw ConflictException("Catalog ownership drift")
+            }
+            if (actual.realCatalogFingerprint != expected.fingerprint) {
                 throw ConflictException("Catalog ownership drift")
             }
         }
     }
 
-    private fun currentRoots(catalogKey: String): Map<String, Boolean> =
-        (communityRepository.findAllByRealCatalogKey(catalogKey).mapNotNull { it.realCatalogItemKey?.let { key -> "community:$key" to (it.realCatalogActive == true) } } +
-            meetingRepository.findAllByRealCatalogKey(catalogKey).mapNotNull { it.realCatalogItemKey?.let { key -> "meeting:$key" to (it.realCatalogActive == true) } }).toMap()
+    private fun currentRoots(catalogKey: String): Map<String, RootSummary> {
+        val communities = communityRepository.findAllByRealCatalogKey(catalogKey).associateBy {
+            it.realCatalogItemKey ?: throw ConflictException("Catalog ownership drift")
+        }
+        val meetings = meetingRepository.findAllByRealCatalogKey(catalogKey).associateBy {
+            it.realCatalogItemKey ?: throw ConflictException("Catalog ownership drift")
+        }
+        return (
+            communities.values.map {
+                RootSummary(
+                    kind = "COMMUNITY",
+                    logicalKey = it.realCatalogItemKey!!,
+                    entityId = it.id,
+                    active = it.realCatalogActive == true,
+                    fingerprint = fingerprint(it),
+                )
+            } +
+                meetings.values.map {
+                    RootSummary(
+                        kind = "MEETING",
+                        logicalKey = it.realCatalogItemKey!!,
+                        entityId = it.id,
+                        active = it.realCatalogActive == true,
+                        fingerprint = fingerprint(it),
+                        communityKey = it.communityHost?.realCatalogItemKey,
+                    )
+                }
+            ).associateBy { it.responseKey }
+    }
+
+    private fun plannedRoots(
+        existing: Map<String, RootSummary>,
+        manifest: RealCatalogManifest,
+    ): Map<String, RootSummary> {
+        val planned = existing.mapValues { (_, value) -> value.copy(active = false) }.toMutableMap()
+        manifest.communities.forEach { item ->
+            val old = existing["community:${item.logicalKey}"]
+            val root = RootSummary(
+                kind = "COMMUNITY",
+                logicalKey = item.logicalKey,
+                entityId = old?.entityId,
+                active = item.membership == RealCatalogMembership.ACTIVE,
+                fingerprint = fingerprint(item),
+            )
+            planned[root.responseKey] = root
+        }
+        manifest.meetings.forEach { item ->
+            val old = existing["meeting:${item.logicalKey}"]
+            val root = RootSummary(
+                kind = "MEETING",
+                logicalKey = item.logicalKey,
+                entityId = old?.entityId,
+                active = item.membership == RealCatalogMembership.ACTIVE,
+                fingerprint = fingerprint(item),
+                communityKey = item.communityKey,
+            )
+            planned[root.responseKey] = root
+        }
+        return planned
+    }
 
     private fun response(
         manifest: RealCatalogManifest,
@@ -427,21 +602,22 @@ class RealCatalogService(
         generation: Long,
         cutoff: Instant,
         changed: Boolean,
-        existing: Map<String, Boolean>,
+        existing: Map<String, RootSummary>,
+        target: Map<String, RootSummary>,
     ) = RealCatalogOperationResponse(
         catalogKey = manifest.catalogKey,
         digest = digest,
         generation = generation,
         changed = changed,
-        activeCommunities = manifest.communities.count { it.membership == RealCatalogMembership.ACTIVE },
-        activeMeetings = manifest.meetings.count { it.membership == RealCatalogMembership.ACTIVE },
-        retiredCommunities = manifest.communities.count { it.membership == RealCatalogMembership.RETIRED } +
-            existing.count { it.key.startsWith("community:") && !it.value },
-        retiredMeetings = manifest.meetings.count { it.membership == RealCatalogMembership.RETIRED } +
-            existing.count { it.key.startsWith("meeting:") && !it.value },
+        activeCommunities = target.values.count { it.kind == "COMMUNITY" && it.active },
+        activeMeetings = target.values.count { it.kind == "MEETING" && it.active },
+        retiredCommunities = target.values.count { it.kind == "COMMUNITY" && !it.active },
+        retiredMeetings = target.values.count { it.kind == "MEETING" && !it.active },
         discoverableUntil = cutoff.toString(),
-        changedKeys = (manifest.communities.map { "community:${it.logicalKey}" } + manifest.meetings.map { "meeting:${it.logicalKey}" })
-            .distinct().take(100),
+        changedKeys = (existing.keys + target.keys)
+            .distinct()
+            .filter { existing[it] != target[it] }
+            .take(100),
         conflicts = emptyList(),
     )
 
@@ -463,20 +639,40 @@ class RealCatalogService(
     )
 
     private fun fingerprint(value: Any): String {
-        val canonical = when (value) {
+        val fields = when (value) {
             is RealCatalogCommunity -> listOf(
                 "community", value.logicalKey, value.name, value.description, value.imageUrl,
-                value.tags.sorted().joinToString(","), value.membership.name,
+                value.tags.sorted().joinToString(","), RealCatalogManifestValidator.CATALOG_KEY,
+                (value.membership == RealCatalogMembership.ACTIVE).toString(), "",
             )
             is RealCatalogMeeting -> listOf(
                 "meeting", value.logicalKey, value.title, value.description, value.imageUrl,
                 value.startAt.toEpochMilli().toString(), value.endAt?.toEpochMilli()?.toString() ?: "",
-                value.sourceZone, value.dateLabel, value.address, value.latitude.toString(), value.longitude.toString(),
+                value.dateLabel, value.address, value.latitude.toString(), value.longitude.toString(),
                 value.capacity.toString(), value.isOnline.toString(), value.status.name,
-                value.tags.sorted().joinToString(","), value.communityKey, value.externalUrl ?: "", value.membership.name,
+                value.tags.sorted().joinToString(","), value.communityKey, value.externalUrl ?: "",
+                EventSource.MANUAL.name, "closed-beta-real:${value.logicalKey}", "null-person-host",
+                RealCatalogManifestValidator.CATALOG_KEY,
+                (value.membership == RealCatalogMembership.ACTIVE).toString(), "",
+            )
+            is Community -> listOf(
+                "community", value.realCatalogItemKey ?: "", value.name, value.description, value.imageUrl,
+                value.tags.map { it.text }.sorted().joinToString(","),
+                value.realCatalogKey ?: "", value.realCatalogActive.toString(), value.demoCatalogKey ?: "",
+            )
+            is Meeting -> listOf(
+                "meeting", value.realCatalogItemKey ?: "", value.title, value.description, value.imageUrl,
+                value.time.toString(), value.endsAt?.toString() ?: "", value.date, value.address,
+                value.latitude.toString(), value.longitude.toString(), value.capacity.toString(),
+                value.isOnline.toString(), value.status.name,
+                value.tags.map { it.text }.sorted().joinToString(","),
+                value.communityHost?.realCatalogItemKey ?: "", value.externalUrl ?: "",
+                value.source.name, value.sourceExternalId ?: "", value.personHost?.id?.toString() ?: "null-person-host",
+                value.realCatalogKey ?: "", value.realCatalogActive.toString(), value.demoCatalogKey ?: "",
             )
             else -> error("Unsupported catalog fingerprint")
-        }.joinToString("") { "${it.length}:$it;" }
+        }
+        val canonical = fields.joinToString("") { "${it.length}:$it;" }
         return MessageDigest.getInstance("SHA-256")
             .digest(canonical.toByteArray(StandardCharsets.UTF_8))
             .joinToString("") { "%02x".format(it) }

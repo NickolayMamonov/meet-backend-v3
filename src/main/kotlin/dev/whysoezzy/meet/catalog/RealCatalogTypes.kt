@@ -49,7 +49,7 @@ data class RealCatalogMeeting(
     val longitude: Double,
     val capacity: Int,
     val isOnline: Boolean,
-    val status: MeetingStatus = MeetingStatus.ACTIVE,
+    val status: MeetingStatus,
     val tags: List<String>,
     val communityKey: String,
     val externalUrl: String?,
