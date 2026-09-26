@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.demo.catalog
 
+import dev.whysoezzy.meet.backup.BackupSafetyGate
 import dev.whysoezzy.meet.config.DemoCatalogProperties
 import dev.whysoezzy.meet.domain.entity.AdBlock
 import dev.whysoezzy.meet.domain.entity.Community
@@ -38,12 +39,14 @@ class DemoCatalogBootstrapService(
     private val validator: DemoCatalogManifestValidator,
     private val failureInjector: DemoCatalogFailureInjector,
     private val clock: Clock,
+    private val safetyGate: BackupSafetyGate = BackupSafetyGate.disabled(),
 ) {
     private val manifest = BetaDemoCatalog.manifest
     private val compiler = DemoCatalogScheduleCompiler(clock)
 
     @Transactional
     fun bootstrap(command: DemoCatalogBootstrapCommand): DemoCatalogBootstrapResult {
+        safetyGate.requireAdmitted("demo catalog bootstrap")
         if (!advisoryLock.tryAcquire()) throw ConflictException("Demo catalog is busy")
         val state = stateRepository.findById(manifest.catalogName).orElse(null)
         if (

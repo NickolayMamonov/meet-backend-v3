@@ -579,6 +579,15 @@ verify_production_env_settings "$root/.env.production" ||
   fail "PROVIDER_STATE_INVALID"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [ -f "$script_dir/beta-backup-runtime-gate.sh" ]; then
+  # shellcheck source=beta-backup-runtime-gate.sh
+  source "$script_dir/beta-backup-runtime-gate.sh"
+else
+  beta_backup_runtime_require_operation() {
+    [ "${APP_BACKUP_SAFETY_ENABLED:-false}" != true ] ||
+      fail "backup safety helper is unavailable"
+  }
+fi
 compose_script=$script_dir/production-compose.sh
 update_script=$script_dir/update-production-release.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
@@ -641,6 +650,8 @@ if [ "$closed_beta_safety" = true ]; then
   [ -f "$safety_hook" ] && [ ! -L "$safety_hook" ] && [ -x "$safety_hook" ] ||
     fail "closed-beta safety hook is unavailable"
 fi
+beta_backup_runtime_require_operation "$image" test-vps-provider-deploy \
+  "$root/.env.production"
 
 # This is intentionally an existence/type-only interlock.  SMTP tooling owns
 # parsing, recovery, terminal publication, and cleanup of every object class.

@@ -1,0 +1,15 @@
+{
+  "schema": "meet-backend/beta-recurring-tooling-allowlist/v1",
+  "tools": [
+    {
+      "role": "capture",
+      "path": "scripts/run-beta-recurring-capture-command.sh",
+      "sha256": "5b5c6f5aaacd4dc975f2053e508eb3927fc3eda1d764d352717f0b6947182959"
+    },
+    {
+      "role": "restore",
+      "path": "scripts/run-beta-recurring-restore-command.sh",
+      "sha256": "7cccf4cf44d5d65d0e1932cc008fa1edf0143f3281fd90ef6e7901b0f896c1f9"
+    }
+  ]
+}

@@ -1,0 +1,422 @@
+name: Closed-beta recurring backups
+
+on:
+  schedule:
+    - cron: "17 1,13 * * *"
+    - cron: "47 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      drill:
+        description: Run the protected weekly drill
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+concurrency:
+  group: closed-beta-recurring-${{ github.event.schedule || inputs.drill || 'capture' }}
+  cancel-in-progress: false
+
+env:
+  SCHEDULER_REF: refs/heads/master
+
+jobs:
+  admission:
+    runs-on: ubuntu-24.04
+    if: vars.BETA_RECURRING_ACTIVATED == 'true'
+    outputs:
+      checkout_sha: ${{ steps.authorize.outputs.checkout_sha }}
+      environment: ${{ steps.authorize.outputs.environment }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Validate registered custody and CI provenance
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_REF: ${{ github.ref }}
+          SCHEDULER_SHA: ${{ github.sha }}
+          ENVIRONMENT: ${{ (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true') && 'closed-beta-recurring-restore' || 'closed-beta-recurring-capture' }}
+          ACTOR: ${{ github.actor }}
+        id: authorize
+        run: |
+          set -euo pipefail
+          test "$RUN_REF" = "$SCHEDULER_REF"
+          checkout_sha=$(timeout --foreground 30s git ls-remote \
+            "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/dev | awk '{print $1}')
+          test "$checkout_sha" != "$SCHEDULER_SHA"
+          policy_file="$RUNNER_TEMP/recurring-policy.json"
+          ci_file="$RUNNER_TEMP/recurring-ci.json"
+          scripts/query-beta-recurring-policy.sh --output "$policy_file"
+          scripts/query-beta-recurring-ci.sh --sha "$checkout_sha" --output "$ci_file"
+          scripts/authorize-beta-recurring.sh \
+            --event "${{ github.event_name }}" \
+            --run-ref "$RUN_REF" \
+            --default-ref "$SCHEDULER_REF" \
+            --scheduler-sha "$SCHEDULER_SHA" \
+            --checkout-sha "$checkout_sha" \
+            --ci-sha "$checkout_sha" \
+            --environment "$ENVIRONMENT" \
+            --policy-file "$policy_file" \
+            --ci-result-file "$ci_file" \
+            --actor "$ACTOR"
+          {
+            printf 'checkout_sha=%s\n' "$checkout_sha"
+            printf 'environment=%s\n' "$ENVIRONMENT"
+          } >>"$GITHUB_OUTPUT"
+
+  capture:
+    needs: admission
+    if: vars.BETA_RECURRING_ACTIVATED == 'true' && github.event.schedule != '47 3 * * 1' && inputs.drill != 'true'
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-capture
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - name: Capture and publish scheduled point
+        env:
+          AGE_RECIPIENT: ${{ vars.BETA_RECURRING_AGE_RECIPIENT }}
+          BETA_RECURRING_PRODUCTION_ROOT: ${{ secrets.BETA_RECURRING_PRODUCTION_ROOT }}
+          BETA_RECURRING_PUBLIC_URL: ${{ vars.BETA_RECURRING_PUBLIC_URL }}
+          BETA_RECURRING_AGE_RECIPIENT: ${{ vars.BETA_RECURRING_AGE_RECIPIENT }}
+          BETA_RECURRING_AGE_BINARY: ${{ runner.temp }}/age/age
+          BETA_RECURRING_AGE_SHA256: ${{ vars.BETA_RECURRING_AGE_SHA256 }}
+          BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}
+          BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
+          BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
+          BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+          SLOT: ""
+          SOURCE_REVISION: ${{ github.sha }}
+          RUNTIME_REVISION: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "$SCHEDULER_REF"
+          test -n "$AGE_RECIPIENT" -a -n "$BETA_RECURRING_PRODUCTION_ROOT" \
+            -a -n "$BETA_RECURRING_PUBLIC_URL" -a -n "$BETA_BACKUP_BUCKET" \
+            -a -n "$BETA_BACKUP_REGION" -a -n "$BETA_BACKUP_ENDPOINT" \
+            -a -n "$BETA_BACKUP_BYTE_BUDGET"
+          capture_command="$GITHUB_WORKSPACE/scripts/run-beta-recurring-capture-command.sh"
+          scripts/validate-beta-recurring-tooling.sh \
+            --role capture --path "$capture_command" \
+            --allowlist "$GITHUB_WORKSPACE/scripts/fixtures/beta-recurring/tooling-allowlist.json"
+          scripts/authorize-beta-recovery.sh validate-age-recipient "$AGE_RECIPIENT"
+          scripts/install-beta-recovery-age.sh "$RUNNER_TEMP/age"
+          printf '%s\n' "$AGE_RECIPIENT" >"$RUNNER_TEMP/age-recipient"
+          chmod 600 "$RUNNER_TEMP/age-recipient"
+          SLOT="$(date -u +%y%m%d%H%M)"
+          scripts/run-beta-recurring-capture.sh \
+            --output "$RUNNER_TEMP/recurring-point" \
+            --slot "$SLOT" \
+            --captured-at "$(date -u +%s)" \
+            --source-revision "$SOURCE_REVISION" \
+            --runtime-revision "$RUNTIME_REVISION" \
+            --contract-digest "$(sha256sum scripts/run-beta-recurring-capture.sh | awk '{print $1}')" \
+            --proof-digest "$(sha256sum scripts/authorize-beta-recurring.sh | awk '{print $1}')" \
+            --capture-command "$capture_command" \
+            --capture-output "$RUNNER_TEMP/capture-source" \
+            --age-binary "$RUNNER_TEMP/age/age" \
+            --age-recipient-file "$RUNNER_TEMP/age-recipient"
+
+  pre-probe:
+    needs: admission
+    if: vars.BETA_RECURRING_ACTIVATED == 'true' && (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true')
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-probe
+    env:
+      HOST: ${{ vars.BETA_RECURRING_HOST }}
+      PORT: ${{ vars.BETA_RECURRING_PORT }}
+      SSH_USER: ${{ vars.BETA_RECURRING_SSH_USER }}
+      HOST_FINGERPRINT: ${{ vars.BETA_RECURRING_HOST_FINGERPRINT }}
+      PATH_ON_HOST: ${{ vars.BETA_RECURRING_RELEASE_ROOT }}
+      PUBLIC_URL: ${{ vars.BETA_RECURRING_PUBLIC_URL }}
+      SSH_PRIVATE_KEY: ${{ secrets.BETA_RECURRING_SSH_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - name: Run isolated pre-probe
+        run: |
+          set -euo pipefail
+          scripts/run-beta-recovery-remote-probe.sh \
+            --phase pre --host "$HOST" --port "$PORT" --ssh-user "$SSH_USER" \
+            --host-fingerprint "$HOST_FINGERPRINT" --release-root "$PATH_ON_HOST" \
+            --public-url "$PUBLIC_URL" --source-sha "${{ needs.admission.outputs.checkout_sha }}" \
+            --recovery-id "recurring-${{ github.run_id }}" \
+            --output "$RUNNER_TEMP/pre-probe.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: beta-recurring-pre-probe-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/pre-probe.json
+
+  protected-drill:
+    needs: [admission, pre-probe]
+    if: vars.BETA_RECURRING_ACTIVATED == 'true' && (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true')
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-restore
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - name: Run exact-version protected drill
+        env:
+          POINT_ID: ${{ vars.BETA_RECURRING_DRILL_POINT_ID }}
+          RESTORE_IDENTITY: ${{ secrets.BETA_RECURRING_RESTORE_IDENTITY }}
+          APPROVAL_METADATA: ${{ secrets.BETA_RECURRING_APPROVAL_METADATA }}
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+          BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}
+          BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
+          BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
+          BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "$SCHEDULER_REF"
+          test -n "$POINT_ID" -a -n "$RESTORE_IDENTITY" -a -n "$APPROVAL_METADATA" \
+            -a -n "$BETA_BACKUP_BUCKET" -a -n "$BETA_BACKUP_REGION" \
+            -a -n "$BETA_BACKUP_ENDPOINT" -a -n "$BETA_BACKUP_BYTE_BUDGET"
+          restore_command="$GITHUB_WORKSPACE/scripts/run-beta-recurring-restore-command.sh"
+          scripts/validate-beta-recurring-tooling.sh \
+            --role restore --path "$restore_command" \
+            --allowlist "$GITHUB_WORKSPACE/scripts/fixtures/beta-recurring/tooling-allowlist.json"
+          scripts/run-beta-backup-storage.sh reconcile
+          policy_file="$RUNNER_TEMP/recurring-policy.json"
+          post_policy_file="$RUNNER_TEMP/recurring-post-policy.json"
+          ci_file="$RUNNER_TEMP/recurring-ci.json"
+          approval_file="$RUNNER_TEMP/recurring-approval.json"
+          scripts/query-beta-recurring-policy.sh --output "$policy_file"
+          scripts/query-beta-recurring-ci.sh --sha "$CHECKOUT_SHA" --output "$ci_file"
+          printf '%s' "$APPROVAL_METADATA" >"$approval_file"
+          chmod 600 "$approval_file"
+          scripts/query-beta-recurring-policy.sh --output "$post_policy_file"
+          reviewer_login=$(jq -er '.reviewerLogin' "$approval_file")
+          reviewer_id=$(jq -er '.reviewerId' "$approval_file")
+          jq -e --arg reviewer "$reviewer_id" '
+            [.environments[] | select(.name=="closed-beta-recurring-restore") |
+              select(.reviewerRequired==true and .preventSelfReview==true and
+                .adminBypassAllowed==false and
+                ([.reviewerIds[] | tostring] | index($reviewer) != null))] |
+            length == 1
+          ' "$post_policy_file" >/dev/null
+          scripts/authorize-beta-recurring.sh \
+            --event "${{ github.event_name }}" --run-ref "$GITHUB_REF" \
+            --default-ref "$SCHEDULER_REF" --scheduler-sha "${{ github.sha }}" \
+            --checkout-sha "$CHECKOUT_SHA" --ci-sha "$CHECKOUT_SHA" \
+            --environment closed-beta-recurring-restore \
+            --run-id "${{ github.run_id }}" \
+            --policy-file "$policy_file" --ci-result-file "$ci_file" \
+            --post-policy-file "$post_policy_file" \
+            --actor "$GITHUB_ACTOR" --reviewer "$reviewer_login" \
+            --reviewer-id "$reviewer_id" --approval-file "$approval_file"
+          protection_body="$RUNNER_TEMP/recurring-restore-protection-body.json"
+          protection_file="$RUNNER_TEMP/recurring-restore-protection.json"
+          jq -cS --arg reviewer "$reviewer_id" '{
+            schema:"meet-backend/beta-recurring-restore-protection/v1",
+            environment:"closed-beta-recurring-restore",
+            branchPolicy:(.environments[] |
+              select(.name=="closed-beta-recurring-restore") | .branchPolicy),
+            reviewerId:$reviewer,reviewerRequired:true,
+            preventSelfReview:true,adminBypassAllowed:false
+          }' "$post_policy_file" >"$protection_body"
+          protection_digest=$(sha256sum "$protection_body" | awk '{print $1}')
+          jq --arg digest "$protection_digest" \
+            '. + {protectionDigest:$digest}' "$protection_body" >"$protection_file"
+          identity_file="$RUNNER_TEMP/restore-identity"
+          install -m 600 /dev/null "$identity_file"
+          printf '%s\n' "$RESTORE_IDENTITY" >"$identity_file"
+          unset RESTORE_IDENTITY APPROVAL_METADATA
+          restore_output="$RUNNER_TEMP/restore-output"
+          mkdir -p "$restore_output"
+          receipt="$RUNNER_TEMP/protected-receipt.json"
+          scripts/run-beta-recurring-drill.sh \
+            --point-id "$POINT_ID" --receipt "$receipt" \
+            --restore-command "$restore_command" --restore-output "$restore_output" \
+            --identity-file "$identity_file" \
+            --restore-revision "$CHECKOUT_SHA" --reviewer-id "$reviewer_id" \
+            --protection-file "$protection_file" \
+            --protection-digest "$protection_digest"
+          rm -f -- "$identity_file"
+          test -s "$receipt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: beta-recurring-restore-receipt-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/protected-receipt.json
+            ${{ runner.temp }}/protected-receipt.proof.json
+
+  post-probe:
+    needs: [protected-drill, pre-probe, admission]
+    if: always() && vars.BETA_RECURRING_ACTIVATED == 'true' &&
+      (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true') &&
+      needs.protected-drill.result == 'success'
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-probe
+    env:
+      HOST: ${{ vars.BETA_RECURRING_HOST }}
+      PORT: ${{ vars.BETA_RECURRING_PORT }}
+      SSH_USER: ${{ vars.BETA_RECURRING_SSH_USER }}
+      HOST_FINGERPRINT: ${{ vars.BETA_RECURRING_HOST_FINGERPRINT }}
+      PATH_ON_HOST: ${{ vars.BETA_RECURRING_RELEASE_ROOT }}
+      PUBLIC_URL: ${{ vars.BETA_RECURRING_PUBLIC_URL }}
+      SSH_PRIVATE_KEY: ${{ secrets.BETA_RECURRING_SSH_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recurring-pre-probe-${{ github.run_id }}
+          path: ${{ runner.temp }}/pre-probe
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recurring-restore-receipt-${{ github.run_id }}
+          path: ${{ runner.temp }}/probe-receipt
+      - name: Run isolated post-probe
+        run: |
+          set -euo pipefail
+          scripts/run-beta-recovery-remote-probe.sh \
+            --phase post --host "$HOST" --port "$PORT" --ssh-user "$SSH_USER" \
+            --host-fingerprint "$HOST_FINGERPRINT" --release-root "$PATH_ON_HOST" \
+            --public-url "$PUBLIC_URL" --source-sha "${{ needs.admission.outputs.checkout_sha }}" \
+            --recovery-id "recurring-${{ github.run_id }}" \
+            --output "$RUNNER_TEMP/post-probe.json"
+          for probe in "$RUNNER_TEMP/pre-probe/pre-probe.json" \
+            "$RUNNER_TEMP/post-probe.json"; do
+            jq -e '.schema=="meet-backend/test-vps-recovery-runtime/v1" and
+              .healthy==true and .runtime.health=="healthy" and
+              .runtime.uploadsMount=="volume" and .https.meetingsStatus=="200" and
+              .https.actuatorStatus=="404" and .https.httpRedirectHttps==true and
+              .https.meetingsJson==true' "$probe" >/dev/null
+          done
+          test "$(jq -cS '{schema,healthy,runtime,https}' \
+            "$RUNNER_TEMP/pre-probe/pre-probe.json")" = \
+            "$(jq -cS '{schema,healthy,runtime,https}' \
+              "$RUNNER_TEMP/post-probe.json")"
+          scripts/bind-beta-recurring-probes.sh \
+            --receipt "$RUNNER_TEMP/probe-receipt/protected-receipt.json" \
+            --pre-probe "$RUNNER_TEMP/pre-probe/pre-probe.json" \
+            --post-probe "$RUNNER_TEMP/post-probe.json" \
+            --output "$RUNNER_TEMP/probe-binding.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: beta-recurring-post-probe-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/post-probe.json
+            ${{ runner.temp }}/probe-binding.json
+
+  promote:
+    needs: [protected-drill, post-probe, admission]
+    if: vars.BETA_RECURRING_ACTIVATED == 'true' && (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true') &&
+      needs.protected-drill.result == 'success' && needs.post-probe.result == 'success'
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-promote
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recurring-restore-receipt-${{ github.run_id }}
+          path: ${{ runner.temp }}/protected-receipt
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recurring-post-probe-${{ github.run_id }}
+          path: ${{ runner.temp }}/post-probe
+      - name: Promote verified receipt
+        env:
+          BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}
+          BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
+          BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
+          BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/protected-receipt/protected-receipt.json"
+          test -s "$receipt"
+          test -s "$RUNNER_TEMP/post-probe/probe-binding.json"
+          scripts/run-beta-backup-storage.sh promote \
+            --receipt "$receipt" --probe-binding \
+            "$RUNNER_TEMP/post-probe/probe-binding.json" --owner promote
+
+  prune:
+    needs: [promote, admission]
+    if: vars.BETA_RECURRING_ACTIVATED == 'true' && (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true')
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-prune
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - name: Prune retained points
+        env:
+          BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}
+          BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
+          BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
+          BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+        run: |
+          set -euo pipefail
+          scripts/run-beta-backup-storage.sh prune \
+            --now "$(date -u +%s)" --owner prune

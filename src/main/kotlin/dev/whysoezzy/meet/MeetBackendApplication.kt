@@ -1,6 +1,7 @@
 package dev.whysoezzy.meet
 
 import dev.whysoezzy.meet.config.AdminProperties
+import dev.whysoezzy.meet.config.BackupSafetyProperties
 import dev.whysoezzy.meet.config.ClientIpProperties
 import dev.whysoezzy.meet.config.DemoCatalogProperties
 import dev.whysoezzy.meet.config.EmailProperties
@@ -21,6 +22,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 @SpringBootApplication(exclude = [UserDetailsServiceAutoConfiguration::class])
 @EnableConfigurationProperties(
     AdminProperties::class,
+    BackupSafetyProperties::class,
     ClientIpProperties::class,
     DemoCatalogProperties::class,
     EmailProperties::class,

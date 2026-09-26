@@ -194,6 +194,9 @@ jobs:
             scripts/update-production-release.sh
             scripts/deploy-production-release.sh
             scripts/rollback-production-release.sh
+            scripts/beta-backup-policy.sh
+            scripts/check-beta-backup-safety.sh
+            scripts/beta-backup-runtime-gate.sh
           )
           for file in "${tooling_files[@]}"; do
             mkdir -p "$tooling_root/$(dirname "$file")"
@@ -237,7 +240,8 @@ jobs:
           for script in production-compose.sh production-config-digest.sh \
             prepare-production-release.sh backup-production.sh \
             update-production-release.sh deploy-production-release.sh \
-            rollback-production-release.sh; do
+            rollback-production-release.sh beta-backup-policy.sh \
+            check-beta-backup-safety.sh beta-backup-runtime-gate.sh; do
             test -x "$stage/scripts/$script"
           done
           test -s "$stage/docker-compose.production.yml"
@@ -272,7 +276,8 @@ jobs:
           for script in production-compose.sh production-config-digest.sh \
             prepare-production-release.sh backup-production.sh \
             update-production-release.sh deploy-production-release.sh \
-            rollback-production-release.sh; do
+            rollback-production-release.sh beta-backup-policy.sh \
+            check-beta-backup-safety.sh beta-backup-runtime-gate.sh; do
             test -x "$tooling_root/scripts/$script"
           done
           test -s "$tooling_root/docker-compose.production.yml"

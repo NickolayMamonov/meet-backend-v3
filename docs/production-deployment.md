@@ -215,6 +215,32 @@ with the captured Compose/runtime definition while changing only
 keep that exact runtime definition active. The next normal deployment removes
 them and returns to the repository Compose file and `10001:10001`.
 
+### Backup safety admission
+
+An enrolled closed-beta runtime mounts the root-owned directory
+`/var/lib/meet-production/beta-backup-control` read-only into the backend. The
+application reads an atomic sanitized snapshot from that directory; it never
+reads storage credentials or calls the provider. The image must carry the
+`org.opencontainers.image.backup-safety-gate=v1` capability label and the
+enrollment properties must agree with the mount.
+
+Before any new production update, rollback, deployment, catalog mutation,
+automated ingestion or operator pruning, the operation must pass the local
+snapshot gate. The gate independently checks the snapshot observation age
+(greater than 30 minutes blocks) and the newest restore-verified capture age
+(at least 14 days blocks). A missing, malformed, future or replayed snapshot
+fails closed with `BACKUP_SAFETY_BLOCKED`; the gate is evaluated before
+configuration replacement, container stop, ownership changes or runtime
+selection. Existing authenticated owned compensation may complete its
+recorded pre-state cleanup after expiry, but it cannot authorize new work.
+
+The independent Yandex SMTP workflow has the same admission boundary for both
+`apply` and `rollback_last`. Its startup reconciliation may finish only an
+authenticated transaction that recorded admission and exact pre-state before
+live effects. Legacy, foreign and ambiguous journals do not bypass a fresh
+gate. Keep the exact remote helper checksum list and the existing shared lock
+when staging or updating this tooling.
+
 If credentials or any other config changed after release preparation, automatic
 deploy and rollback intentionally abort. The scripts never copy an older secret
 file over `.env.production`; preserve rotated credentials, explicitly verify the

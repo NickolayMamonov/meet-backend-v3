@@ -12,6 +12,9 @@ RUNTIME_HASH=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 mkdir -p "$TMP/bin" "$TMP/root" "$TMP/state" "$TMP/tooling"
 cp -- "$VERIFY" "$TMP/tooling/verify-test-vps-closed-beta-state.sh"
 chmod +x "$TMP/tooling/verify-test-vps-closed-beta-state.sh"
+cp -- "$ROOT_DIR/scripts/beta-backup-runtime-gate.sh" "$TMP/tooling/beta-backup-runtime-gate.sh"
+cp -- "$ROOT_DIR/scripts/beta-backup-policy.sh" "$TMP/tooling/beta-backup-policy.sh"
+chmod +x "$TMP/tooling/beta-backup-runtime-gate.sh" "$TMP/tooling/beta-backup-policy.sh"
 VERIFY=$TMP/tooling/verify-test-vps-closed-beta-state.sh
 printf 'BACKEND_IMAGE=%s\nBACKEND_REVISION=%s\nBACKEND_VERSION=%s\n' "$IMAGE" "$REVISION" "$VERSION" >"$TMP/root/.env.production"
 printf 'services:\n  backend:\n' >"$TMP/root/docker-compose.production.yml"

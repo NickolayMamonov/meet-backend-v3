@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.ingestion
 
+import dev.whysoezzy.meet.backup.BackupSafetyGate
 import dev.whysoezzy.meet.domain.entity.EventSource
 import dev.whysoezzy.meet.domain.entity.IngestionRun
 import dev.whysoezzy.meet.domain.entity.IngestionStatus
@@ -19,14 +20,19 @@ class IngestionService(
     private val upsertService: MeetingUpsertService,
     private val ingestionRunRepository: IngestionRunRepository,
     private val meetingRepository: MeetingRepository,
+    private val safetyGate: BackupSafetyGate = BackupSafetyGate.disabled(),
 ) {
     /** Прогнать все зарегистрированные источники. */
-    fun runAll(): List<IngestionRun> = providers.toList().map { runProvider(it) }
+    fun runAll(): List<IngestionRun> {
+        safetyGate.requireAdmitted("ingestion")
+        return providers.toList().map { runProvider(it) }
+    }
 
 
 
     /** Прогон одного источника: изоляция ошибок + запись в журнал. */
     fun runProvider(provider: EventProvider): IngestionRun {
+        safetyGate.requireAdmitted("provider ingestion")
         val run = IngestionRun(source = provider.source(), status = IngestionStatus.RUNNING)
         ingestionRunRepository.save(run)
 
@@ -60,7 +66,9 @@ class IngestionService(
     }
 
     @Transactional
-    fun purgeBySource(source: EventSource): Int =
-        meetingRepository.deleteBySource(source)
+    fun purgeBySource(source: EventSource): Int {
+        safetyGate.requireAdmitted("purge")
+        return meetingRepository.deleteBySource(source)
+    }
 
 }
