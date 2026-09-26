@@ -143,7 +143,7 @@ jq -cnS --arg capture "$capture" --arg restore "$restore" \
     pointDescriptorDigest:$descriptor,protectionDigest:$protection,
     identityCustody:"restore-only",
     isolated:true,databaseProbe:true,mediaProbe:true,cleanup:true,
-    preFingerprint:$fingerprint,postFingerprint:$fingerprint}' >"$proof"
+    preFingerprint:$fingerprint,postFingerprint:("f"+$fingerprint[1:])}' >"$proof"
 EOF
 chmod 755 "$tmp/restore-command.sh"
 printf 'private restore identity\n' >"$tmp/identity"
@@ -167,6 +167,25 @@ drill_receipt="$tmp/protected-receipt.json"
 jq -e '.schema=="meet-backend/beta-backup-receipt/v2" and
   .pointDescriptorDigest and .captureAt==1790000000' "$drill_receipt" >/dev/null ||
   fail "provenance-bound receipt was not emitted"
+probe_pre="$tmp/pre-runtime-probe.json"
+probe_post="$tmp/post-runtime-probe.json"
+jq -cnS '{
+  schema:"meet-backend/test-vps-recovery-runtime/v1",healthy:true,
+  runtime:{imageId:"image",configHash:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    health:"healthy",uploadsMount:"volume"},
+  https:{meetingsStatus:"200",actuatorStatus:"404",httpRedirectHttps:true,meetingsJson:true}
+}' >"$probe_pre"
+cp -- "$probe_pre" "$probe_post"
+printf '\n' >>"$probe_post"
+"$root/scripts/bind-beta-recurring-probes.sh" \
+  --receipt "$drill_receipt" --pre-probe "$probe_pre" --post-probe "$probe_post" \
+  --output "$tmp/probe-binding.json" >/dev/null ||
+  fail "exact pre/post probe binding was rejected"
+jq -e --arg receipt "$(jq -er '.receiptId' "$drill_receipt")" '
+  .schema=="meet-backend/beta-recurring-probe-binding/v1" and
+  .receiptId==$receipt and .preProbeDigest != .postProbeDigest and
+  .preFingerprint != .postFingerprint' "$tmp/probe-binding.json" >/dev/null ||
+  fail "probe binding did not preserve distinct artifact versions"
 if "$root/scripts/run-beta-recurring-drill.sh" \
   --storage-root "$tmp/storage" --point-id slot-1790000000 --receipt "$tmp/invalid-receipt" \
   --proof-file "$tmp/supplied-proof" >/dev/null 2>&1; then
@@ -179,30 +198,41 @@ if "$root/scripts/authorize-beta-recurring.sh" \
   --ci-result-file "$ci" --actor scheduler --reviewer scheduler >/dev/null 2>&1; then
   fail "restore self-review remained admissible"
 fi
-policy_digest=$(sha256sum "$policy" | awk '{print $1}')
+policy_digest=$(jq -cS . "$policy" | sha256sum | awk '{print $1}')
 approval_body="$tmp/approval-body.json"
 approval="$tmp/approval.json"
 post_approval="$tmp/post-approval.json"
 jq -cnS --arg policy "$policy_digest" \
+  --arg evidence "$(jq -er '.environments[] | select(.name=="closed-beta-recurring-restore") | .apiEvidenceDigest' "$policy")" \
   '{schema:"meet-backend/beta-backup-custody-approval/v1",
     environment:"closed-beta-recurring-restore",branchPolicy:"refs/heads/master",
-    reviewerLogin:"reviewer",reviewerId:"reviewer-1",reviewerRequired:true,
+    reviewerLogin:"reviewer",reviewerId:"123",reviewerRequired:true,
     preventSelfReview:true,adminBypassAllowed:false,policyDigest:$policy,
-    approvalRunId:"run-1",approvedAt:1790000000}' >"$approval_body"
+    apiEvidenceDigest:$evidence,approvalRunId:"1",approvedAt:1790000000}' >"$approval_body"
 approval_protection_digest=$(sha256sum "$approval_body" | awk '{print $1}')
-jq --arg digest "$approval_protection_digest" '. + {protectionDigest:$digest}' \
+jq -cS --arg digest "$approval_protection_digest" '. + {protectionDigest:$digest}' \
   "$approval_body" >"$approval"
-jq '.approvalRunId="run-2" | del(.protectionDigest)' "$approval" >"$tmp/post-body.json"
+jq -cS '.approvalRunId="2" | del(.protectionDigest)' "$approval" >"$tmp/post-body.json"
 post_protection_digest=$(sha256sum "$tmp/post-body.json" | awk '{print $1}')
-jq --arg digest "$post_protection_digest" '. + {protectionDigest:$digest}' \
+jq -cS --arg digest "$post_protection_digest" '. + {protectionDigest:$digest}' \
   "$tmp/post-body.json" >"$post_approval"
+if ! BETA_RECURRING_REQUIRE_APPROVAL=true \
+  "$root/scripts/authorize-beta-recurring.sh" \
+    --event workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master \
+    --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
+    --environment closed-beta-recurring-restore --run-id 1 --policy-file "$policy" \
+    --ci-result-file "$ci" --post-policy-file "$policy" \
+    --actor scheduler --reviewer reviewer \
+    --reviewer-id 123 --approval-file "$approval"; then
+  fail "authenticated approval metadata was rejected"
+fi
 if BETA_RECURRING_REQUIRE_APPROVAL=true \
   "$root/scripts/authorize-beta-recurring.sh" \
     --event workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master \
     --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
-    --environment closed-beta-recurring-restore --policy-file "$policy" \
+    --environment closed-beta-recurring-restore --run-id run-1 --policy-file "$policy" \
     --ci-result-file "$ci" --actor scheduler --reviewer reviewer \
-    --reviewer-id reviewer-1 --approval-file "$approval" \
+    --reviewer-id 123 --approval-file "$approval" \
     --post-approval-file "$post_approval" >/dev/null 2>&1; then
   fail "post-approval custody drift remained admissible"
 fi
@@ -230,4 +260,8 @@ workflow="$root/.github/workflows/beta-recurring-backups.yml"
 grep -Fq 'post-probe:' "$workflow" || fail "post-probe job is missing"
 grep -Fq 'needs: [protected-drill, pre-probe, admission]' "$workflow" ||
   fail "post-probe DAG does not wait for admission and pre-probe"
+grep -Fq 'bind-beta-recurring-probes.sh' "$workflow" ||
+  fail "post-probe artifacts are not bound"
+! grep -Fq 'cmp -- "$RUNNER_TEMP/pre-probe/pre-probe.json"' "$workflow" ||
+  fail "post-probe still relies on duplicated whole-file fingerprints"
 printf 'test-beta-recurring-backups.sh: passed\n'

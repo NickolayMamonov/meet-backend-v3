@@ -140,11 +140,14 @@ if [ "$remote" = true ]; then
   cp -- "$remote_scratch/database.age" "$destination_point/postgres.dump.age"
   cp -- "$remote_scratch/uploads.age" "$destination_point/uploads.tar.gz.age"
   if [ "$(jq -er '.proofs|keys|length' "$remote_scratch/descriptor.json")" -eq 2 ]; then
-    for proof in capture-database-proof.json capture-media-proof.json; do
-      proof_version=$(beta_storage_remote_latest_version "points/$point_id/$proof")
-      beta_storage_provider_get '' "points/$point_id/$proof" "$proof_version" \
-        "$destination_point/$proof" >/dev/null
-    done
+    beta_storage_provider_get '' "points/$point_id/capture-database-proof.json" \
+      "$(jq -er '.proofs.database.versionId' "$remote_scratch/descriptor.json")" \
+      "$destination_point/capture-database-proof.json" \
+      "$(jq -er '.proofs.database.sha256' "$remote_scratch/descriptor.json")" >/dev/null
+    beta_storage_provider_get '' "points/$point_id/capture-media-proof.json" \
+      "$(jq -er '.proofs.media.versionId' "$remote_scratch/descriptor.json")" \
+      "$destination_point/capture-media-proof.json" \
+      "$(jq -er '.proofs.media.sha256' "$remote_scratch/descriptor.json")" >/dev/null
   fi
   destination_descriptor=$(sha256sum "$destination_point/point.json" | awk '{print $1}')
 else
@@ -186,7 +189,7 @@ jq -e --arg capture "$capture_revision" --arg restore "$restore_revision" \
   .databaseProbe==true and .mediaProbe==true and .cleanup==true and
   (.preFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
   (.postFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
-  .preFingerprint==.postFingerprint
+  .preFingerprint != .postFingerprint
 ' "$proof_output" >/dev/null || {
   echo 'BACKUP_CUSTODY_BLOCKED:destination_restore_proof_invalid' >&2; exit 1;
 }

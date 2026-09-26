@@ -9,7 +9,7 @@
     {
       "role": "restore",
       "path": "scripts/run-beta-recurring-restore-command.sh",
-      "sha256": "3c83aced4f4fad2fd551bab54162a34102b09a2d68af3a16b25e4b57e12c4a46"
+      "sha256": "7cccf4cf44d5d65d0e1932cc008fa1edf0143f3281fd90ef6e7901b0f896c1f9"
     }
   ]
 }

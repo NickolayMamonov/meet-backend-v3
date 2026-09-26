@@ -2,12 +2,12 @@
   "adminBypassAllowed": false,
   "defaultBranch": "refs/heads/master",
   "environments": [
-    {"name":"closed-beta-recurring-capture","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["mutex","point_write"]},
-    {"name":"closed-beta-recurring-probe","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["probe_read"]},
-    {"name":"closed-beta-recurring-restore","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["identity","point_read"]},
-    {"name":"closed-beta-recurring-promote","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["head_write","mutex","receipt_write"]},
-    {"name":"closed-beta-recurring-prune","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["delete","inventory","mutex","snapshot_read"]},
-    {"name":"closed-beta-recurring-monitor","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["authority_read","heartbeat_write","incident_write","snapshot_write"]}
+    {"name":"closed-beta-recurring-capture","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["mutex","point_write"],"reviewerIds":[],"reviewerRequired":false,"preventSelfReview":false,"apiEvidenceDigest":"1111111111111111111111111111111111111111111111111111111111111111"},
+    {"name":"closed-beta-recurring-probe","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["probe_read"],"reviewerIds":[],"reviewerRequired":false,"preventSelfReview":false,"apiEvidenceDigest":"2222222222222222222222222222222222222222222222222222222222222222"},
+    {"name":"closed-beta-recurring-restore","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["identity","point_read"],"reviewerIds":[123],"reviewerRequired":true,"preventSelfReview":true,"apiEvidenceDigest":"3333333333333333333333333333333333333333333333333333333333333333"},
+    {"name":"closed-beta-recurring-promote","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["head_write","mutex","receipt_write"],"reviewerIds":[],"reviewerRequired":false,"preventSelfReview":false,"apiEvidenceDigest":"4444444444444444444444444444444444444444444444444444444444444444"},
+    {"name":"closed-beta-recurring-prune","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["delete","inventory","mutex","snapshot_read"],"reviewerIds":[],"reviewerRequired":false,"preventSelfReview":false,"apiEvidenceDigest":"5555555555555555555555555555555555555555555555555555555555555555"},
+    {"name":"closed-beta-recurring-monitor","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["authority_read","heartbeat_write","incident_write","snapshot_write"],"reviewerIds":[],"reviewerRequired":false,"preventSelfReview":false,"apiEvidenceDigest":"6666666666666666666666666666666666666666666666666666666666666666"}
   ],
   "preventSelfReview": true,
   "registered": true,

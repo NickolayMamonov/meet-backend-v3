@@ -74,12 +74,16 @@ if [ -z "$root" ]; then
   cp -- "$remote_scratch/manifest.json" "$point/recovery-point.json"
   cp -- "$remote_scratch/database.age" "$point/postgres.dump.age"
   cp -- "$remote_scratch/uploads.age" "$point/uploads.tar.gz.age"
-  for proof in capture-database-proof.json capture-media-proof.json; do
-    proof_version=$(beta_storage_remote_latest_version "points/$point_id/$proof") ||
-      { echo 'BACKUP_CUSTODY_BLOCKED:restore_proof_unavailable' >&2; exit 1; }
-    beta_storage_provider_get '' "points/$point_id/$proof" "$proof_version" \
-      "$point/$proof" >/dev/null
-  done
+  if [ "$(jq -er '.proofs|keys|length' "$remote_scratch/point.json")" -eq 2 ]; then
+    beta_storage_provider_get '' "points/$point_id/capture-database-proof.json" \
+      "$(jq -er '.proofs.database.versionId' "$remote_scratch/point.json")" \
+      "$point/capture-database-proof.json" \
+      "$(jq -er '.proofs.database.sha256' "$remote_scratch/point.json")" >/dev/null
+    beta_storage_provider_get '' "points/$point_id/capture-media-proof.json" \
+      "$(jq -er '.proofs.media.versionId' "$remote_scratch/point.json")" \
+      "$point/capture-media-proof.json" \
+      "$(jq -er '.proofs.media.sha256' "$remote_scratch/point.json")" >/dev/null
+  fi
 else
   beta_storage_require_local_root "$root" >/dev/null
   point="$root/points/$point_id"
@@ -176,7 +180,7 @@ jq -e --arg capture "$capture_revision" --arg restore "$restore_revision" \
   (.databaseProbe==true and .mediaProbe==true) and
   (.preFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
   (.postFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
-  .preFingerprint==.postFingerprint and
+  .preFingerprint != .postFingerprint and
   (.capturedAt|type=="number" and floor==. and .>=0)
 ' "$proof_tmp" >/dev/null || {
   echo 'BACKUP_CUSTODY_BLOCKED:restore_proof_invalid' >&2

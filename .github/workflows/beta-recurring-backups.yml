@@ -224,27 +224,33 @@ jobs:
           scripts/query-beta-recurring-policy.sh --output "$post_policy_file"
           reviewer_login=$(jq -er '.reviewerLogin' "$approval_file")
           reviewer_id=$(jq -er '.reviewerId' "$approval_file")
-          jq -e '.environment=="closed-beta-recurring-restore" and
-            .reviewerRequired==true and .preventSelfReview==true and
-            .adminBypassAllowed==false' "$approval_file" >/dev/null
+          jq -e --arg reviewer "$reviewer_id" '
+            [.environments[] | select(.name=="closed-beta-recurring-restore") |
+              select(.reviewerRequired==true and .preventSelfReview==true and
+                .adminBypassAllowed==false and
+                ([.reviewerIds[] | tostring] | index($reviewer) != null))] |
+            length == 1
+          ' "$post_policy_file" >/dev/null
           scripts/authorize-beta-recurring.sh \
             --event "${{ github.event_name }}" --run-ref "$GITHUB_REF" \
             --default-ref "$SCHEDULER_REF" --scheduler-sha "${{ github.sha }}" \
             --checkout-sha "$CHECKOUT_SHA" --ci-sha "$CHECKOUT_SHA" \
             --environment closed-beta-recurring-restore \
+            --run-id "${{ github.run_id }}" \
             --policy-file "$policy_file" --ci-result-file "$ci_file" \
             --post-policy-file "$post_policy_file" \
             --actor "$GITHUB_ACTOR" --reviewer "$reviewer_login" \
             --reviewer-id "$reviewer_id" --approval-file "$approval_file"
           protection_body="$RUNNER_TEMP/recurring-restore-protection-body.json"
           protection_file="$RUNNER_TEMP/recurring-restore-protection.json"
-          jq -cS '{
+          jq -cS --arg reviewer "$reviewer_id" '{
             schema:"meet-backend/beta-recurring-restore-protection/v1",
-            environment:.environment,branchPolicy:.branchPolicy,
-            reviewerId:.reviewerId,reviewerRequired:.reviewerRequired,
-            preventSelfReview:.preventSelfReview,
-            adminBypassAllowed:.adminBypassAllowed
-          }' "$approval_file" >"$protection_body"
+            environment:"closed-beta-recurring-restore",
+            branchPolicy:(.environments[] |
+              select(.name=="closed-beta-recurring-restore") | .branchPolicy),
+            reviewerId:$reviewer,reviewerRequired:true,
+            preventSelfReview:true,adminBypassAllowed:false
+          }' "$post_policy_file" >"$protection_body"
           protection_digest=$(sha256sum "$protection_body" | awk '{print $1}')
           jq --arg digest "$protection_digest" \
             '. + {protectionDigest:$digest}' "$protection_body" >"$protection_file"
@@ -305,6 +311,10 @@ jobs:
         with:
           name: beta-recurring-pre-probe-${{ github.run_id }}
           path: ${{ runner.temp }}/pre-probe
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recurring-restore-receipt-${{ github.run_id }}
+          path: ${{ runner.temp }}/probe-receipt
       - name: Run isolated post-probe
         run: |
           set -euo pipefail
@@ -314,13 +324,31 @@ jobs:
             --public-url "$PUBLIC_URL" --source-sha "${{ needs.admission.outputs.checkout_sha }}" \
             --recovery-id "recurring-${{ github.run_id }}" \
             --output "$RUNNER_TEMP/post-probe.json"
-          cmp -- "$RUNNER_TEMP/pre-probe/pre-probe.json" "$RUNNER_TEMP/post-probe.json"
+          for probe in "$RUNNER_TEMP/pre-probe/pre-probe.json" \
+            "$RUNNER_TEMP/post-probe.json"; do
+            jq -e '.schema=="meet-backend/test-vps-recovery-runtime/v1" and
+              .healthy==true and .runtime.health=="healthy" and
+              .runtime.uploadsMount=="volume" and .https.meetingsStatus=="200" and
+              .https.actuatorStatus=="404" and .https.httpRedirectHttps==true and
+              .https.meetingsJson==true' "$probe" >/dev/null
+          done
+          test "$(jq -cS '{schema,healthy,runtime,https}' \
+            "$RUNNER_TEMP/pre-probe/pre-probe.json")" = \
+            "$(jq -cS '{schema,healthy,runtime,https}' \
+              "$RUNNER_TEMP/post-probe.json")"
+          scripts/bind-beta-recurring-probes.sh \
+            --receipt "$RUNNER_TEMP/probe-receipt/protected-receipt.json" \
+            --pre-probe "$RUNNER_TEMP/pre-probe/pre-probe.json" \
+            --post-probe "$RUNNER_TEMP/post-probe.json" \
+            --output "$RUNNER_TEMP/probe-binding.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: beta-recurring-post-probe-${{ github.run_id }}
           retention-days: 30
           if-no-files-found: error
-          path: ${{ runner.temp }}/post-probe.json
+          path: |
+            ${{ runner.temp }}/post-probe.json
+            ${{ runner.temp }}/probe-binding.json
 
   promote:
     needs: [protected-drill, post-probe, admission]
@@ -345,6 +373,10 @@ jobs:
         with:
           name: beta-recurring-restore-receipt-${{ github.run_id }}
           path: ${{ runner.temp }}/protected-receipt
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: beta-recurring-post-probe-${{ github.run_id }}
+          path: ${{ runner.temp }}/post-probe
       - name: Promote verified receipt
         env:
           BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}
@@ -355,8 +387,10 @@ jobs:
           set -euo pipefail
           receipt="$RUNNER_TEMP/protected-receipt/protected-receipt.json"
           test -s "$receipt"
+          test -s "$RUNNER_TEMP/post-probe/probe-binding.json"
           scripts/run-beta-backup-storage.sh promote \
-            --receipt "$receipt" --owner promote
+            --receipt "$receipt" --probe-binding \
+            "$RUNNER_TEMP/post-probe/probe-binding.json" --owner promote
 
   prune:
     needs: [promote, admission]

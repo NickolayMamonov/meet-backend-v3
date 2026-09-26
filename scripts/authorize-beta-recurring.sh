@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME [--policy-file PATH --post-policy-file PATH --ci-result-file PATH --actor LOGIN --reviewer LOGIN --approval-file PATH --post-approval-file PATH --reviewer-id ID]" >&2
+  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME [--run-id ID --policy-file PATH --post-policy-file PATH --ci-result-file PATH --actor LOGIN --reviewer LOGIN --approval-file PATH --post-approval-file PATH --reviewer-id ID]" >&2
   exit 2
 }
 
@@ -13,7 +13,7 @@ fail() {
 
 event='' run_ref='' default_ref='' scheduler_sha='' checkout_sha='' ci_sha=''
 environment='' policy_file='' post_policy_file='' ci_result_file='' actor='' reviewer=''
-approval_file='' post_approval_file='' reviewer_id=''
+approval_file='' post_approval_file='' reviewer_id='' run_id=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --event) [ "$#" -ge 2 ] || usage; event=$2; shift 2 ;;
@@ -23,6 +23,7 @@ while [ "$#" -gt 0 ]; do
     --checkout-sha) [ "$#" -ge 2 ] || usage; checkout_sha=$2; shift 2 ;;
     --ci-sha) [ "$#" -ge 2 ] || usage; ci_sha=$2; shift 2 ;;
     --environment) [ "$#" -ge 2 ] || usage; environment=$2; shift 2 ;;
+    --run-id) [ "$#" -ge 2 ] || usage; run_id=$2; shift 2 ;;
     --policy-file) [ "$#" -ge 2 ] || usage; policy_file=$2; shift 2 ;;
     --post-policy-file) [ "$#" -ge 2 ] || usage; post_policy_file=$2; shift 2 ;;
     --ci-result-file) [ "$#" -ge 2 ] || usage; ci_result_file=$2; shift 2 ;;
@@ -56,10 +57,18 @@ validate_policy() {
     .workflowPath==".github/workflows/beta-recurring-backups.yml" and
     .adminBypassAllowed==false and .preventSelfReview==true and
     (.reviewerRequired==true or $environment != "closed-beta-recurring-restore") and
-    ([.environments[] | select(.name==$environment and
-      .branchPolicy==$run_ref and .adminBypassAllowed==false)] | length)==1 and
     ([.environments[] | select(.name==$environment) |
-      .capabilities] | length)==1
+      select(.branchPolicy==$run_ref) |
+      select(.adminBypassAllowed==false) |
+      select((.apiEvidenceDigest|type=="string" and test("^[0-9a-f]{64}$"))) |
+      select((.reviewerIds|type=="array" and
+        all(.[]; type=="number" and floor==. and .>0))) |
+      select(if $environment=="closed-beta-recurring-restore"
+        then .reviewerRequired==true and .preventSelfReview==true and
+          (.reviewerIds|length>=1)
+        else .reviewerRequired==false and .preventSelfReview==false
+        end)] | length)==1 and
+    ([.environments[] | select(.name==$environment) | .capabilities] | length)==1
   ' "$policy" >/dev/null || fail policy_drift
   local expected
   case "$environment" in
@@ -96,26 +105,38 @@ if [ -n "$policy_file" ] || [ -n "$ci_result_file" ]; then
   if [ "$environment" = closed-beta-recurring-restore ] && [ -n "$reviewer" ]; then
     [[ "$reviewer" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail reviewer_missing
     [ "$reviewer" != "$actor" ] || fail self_review
+    [ -n "$reviewer_id" ] || fail reviewer_id_missing
+    [[ "$reviewer_id" =~ ^[0-9]+$ ]] || fail reviewer_id_invalid
+    jq -e --arg environment "$environment" --arg reviewer "$reviewer_id" \
+      '[.environments[] | select(.name==$environment) |
+        .reviewerIds[] | select((tostring) == $reviewer)] | length == 1' \
+      "$policy_file" >/dev/null || fail reviewer_not_authenticated
   fi
 fi
 validate_approval() {
   local file=$1 policy_digest protection_digest policy_source=${post_policy_file:-$policy_file}
   [ -f "$file" ] && [ ! -L "$file" ] || fail approval_missing
-  policy_digest=$(sha256sum "$policy_source" | awk '{print $1}')
+  [[ "$run_id" =~ ^[0-9]+$ ]] || fail approval_run_missing
+  policy_digest=$(jq -cS . "$policy_source" | sha256sum | awk '{print $1}')
+  local api_evidence_digest
+  api_evidence_digest=$(jq -er --arg environment "$environment" \
+    '[.environments[] | select(.name==$environment) | .apiEvidenceDigest] | .[0]' \
+    "$policy_source")
   jq -e --arg environment "$environment" --arg reviewer "$reviewer" \
     --arg reviewer_id "$reviewer_id" --arg actor "$actor" \
-    --arg branch "$run_ref" --arg policy "$policy_digest" '
+    --arg branch "$run_ref" --arg policy "$policy_digest" \
+    --arg evidence "$api_evidence_digest" --arg run "$run_id" '
     type=="object" and
-    (keys|sort)==["adminBypassAllowed","approvedAt","approvalRunId","branchPolicy",
+    (keys|sort)==["adminBypassAllowed","apiEvidenceDigest","approvalRunId","approvedAt","branchPolicy",
       "environment","policyDigest","preventSelfReview","protectionDigest",
       "reviewerId","reviewerLogin","reviewerRequired","schema"] and
     .schema=="meet-backend/beta-backup-custody-approval/v1" and
     .environment==$environment and .branchPolicy==$branch and
     .reviewerLogin==$reviewer and
-    (if $reviewer_id=="" then (.reviewerId|type=="string" and length>0)
-     else .reviewerId==$reviewer_id end) and
+    .reviewerId==$reviewer_id and
     .reviewerRequired==true and .preventSelfReview==true and
-    .adminBypassAllowed==false and .policyDigest==$policy and
+    .adminBypassAllowed==false and .apiEvidenceDigest==$evidence and
+    .policyDigest==$policy and .approvalRunId==$run and
     (.protectionDigest|type=="string" and test("^[0-9a-f]{64}$")) and
     (.approvalRunId|type=="string" and test("^[A-Za-z0-9._:-]{1,128}$")) and
     (.approvedAt|type=="number" and floor==. and .>=0)

@@ -49,7 +49,7 @@ jq -cnS --arg descriptor "$descriptor_digest" \
     identityCustody:"restore-only",isolated:true,databaseProbe:true,
     mediaProbe:true,cleanup:true,
     preFingerprint:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    postFingerprint:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}' \
+    postFingerprint:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}' \
   >"$tmp/receipt-1.proof.json"
 proof_digest=$(sha256sum "$tmp/receipt-1.proof.json" | awk '{print $1}')
 jq -cnS --arg descriptor "$descriptor_digest" --arg command "$capture_command_digest" \

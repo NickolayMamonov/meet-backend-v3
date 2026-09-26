@@ -131,13 +131,14 @@ case "$operation" in
     fi
     ;;
   promote)
-    receipt='' receipt_key='' root='' owner=${BETA_BACKUP_OWNER:-operator}
+    receipt='' receipt_key='' root='' owner=${BETA_BACKUP_OWNER:-operator} probe_binding=''
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --receipt) [ "$#" -ge 2 ] || usage; receipt=$2; shift 2 ;;
         --receipt-key) [ "$#" -ge 2 ] || usage; receipt_key=$2; shift 2 ;;
         --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
         --owner) [ "$#" -ge 2 ] || usage; owner=$2; shift 2 ;;
+        --probe-binding) [ "$#" -ge 2 ] || usage; probe_binding=$2; shift 2 ;;
         *) usage ;;
       esac
     done
@@ -146,7 +147,7 @@ case "$operation" in
       beta_storage_promote_local "$receipt" "$root" "$owner"
     else
       [ -n "$receipt" ] || [ -n "$receipt_key" ] || usage
-      beta_storage_promote_remote "$receipt" "$receipt_key" "$owner"
+      beta_storage_promote_remote "$receipt" "$receipt_key" "$owner" "$probe_binding"
     fi
     ;;
   prune)

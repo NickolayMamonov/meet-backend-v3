@@ -29,8 +29,15 @@ done
 [ -f "$point/recovery-point.json" ] && [ ! -L "$point/recovery-point.json" ] || usage
 [ -f "$point/postgres.dump.age" ] && [ ! -L "$point/postgres.dump.age" ] || usage
 [ -f "$point/uploads.tar.gz.age" ] && [ ! -L "$point/uploads.tar.gz.age" ] || usage
-[ -f "$point/capture-database-proof.json" ] && [ ! -L "$point/capture-database-proof.json" ] || usage
-[ -f "$point/capture-media-proof.json" ] && [ ! -L "$point/capture-media-proof.json" ] || usage
+capture_proofs=false
+if [ -e "$point/capture-database-proof.json" ] ||
+  [ -e "$point/capture-media-proof.json" ]; then
+  [ -f "$point/capture-database-proof.json" ] &&
+    [ ! -L "$point/capture-database-proof.json" ] || usage
+  [ -f "$point/capture-media-proof.json" ] &&
+    [ ! -L "$point/capture-media-proof.json" ] || usage
+  capture_proofs=true
+fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 tmp=$(mktemp -d)
@@ -60,11 +67,19 @@ db_size=$(wc -c <"$artifact/postgres.dump.age" | tr -d '[:space:]')
 media_size=$(wc -c <"$artifact/uploads.tar.gz.age" | tr -d '[:space:]')
 db_sha=$(sha256sum "$artifact/postgres.dump.age" | awk '{print $1}')
 media_sha=$(sha256sum "$artifact/uploads.tar.gz.age" | awk '{print $1}')
-media_files=$(jq -er '.files' "$media_proof")
-media_bytes=$(jq -er '.bytes' "$media_proof")
-media_digest=$(jq -er '.canonicalDigest' "$media_proof")
-db_proof_digest=$(sha256sum "$database_proof" | awk '{print $1}')
-media_proof_digest=$(sha256sum "$media_proof" | awk '{print $1}')
+if [ "$capture_proofs" = true ]; then
+  media_files=$(jq -er '.files' "$media_proof")
+  media_bytes=$(jq -er '.bytes' "$media_proof")
+  media_digest=$(jq -er '.canonicalDigest' "$media_proof")
+  db_proof_digest=$(sha256sum "$database_proof" | awk '{print $1}')
+  media_proof_digest=$(sha256sum "$media_proof" | awk '{print $1}')
+else
+  media_files=0
+  media_bytes=0
+  media_digest=$(printf '%s' absent-proof | sha256sum | awk '{print $1}')
+  db_proof_digest=$(printf '%s' absent-database-proof | sha256sum | awk '{print $1}')
+  media_proof_digest=$(printf '%s' absent-media-proof | sha256sum | awk '{print $1}')
+fi
 workflow_digest=$(sha256sum "$script_dir/../.github/workflows/prove-beta-backup-restore.yml" |
   awk '{print $1}')
 tooling_digest=$(for file in \
@@ -88,12 +103,13 @@ jq -cnS --arg id "recurring-$captured" --arg source "$source_revision" \
   --arg dbproof "$db_proof_digest" --arg mediaproof "$media_proof_digest" \
   --argjson run "$captured" --argjson dbsize "$db_size" --argjson mediasize "$media_size" \
   --argjson files "$media_files" --argjson bytes "$media_bytes" --arg digest "$media_digest" \
-  --slurpfile databaseProof "$database_proof" --slurpfile mediaProof "$media_proof" '
+  --argjson databaseProof "$(if [ "$capture_proofs" = true ]; then jq -c . "$database_proof"; else echo null; fi)" \
+  --argjson mediaProof "$(if [ "$capture_proofs" = true ]; then jq -c . "$media_proof"; else echo null; fi)" '
   {schema:"meet-backend/beta-recovery-manifest/v1",artifactId:null,
    artifactName:("beta-recovery-recurring-"+($run|tostring)),capturedAt:$captured,
    captureRuntime:{revision:$source},contracts:{database:$database,media:$media,
-     tooling:$tooling,workflow:$workflow},databaseProof:$databaseProof[0],
-   mediaProof:$mediaProof[0],observedAgeSeconds:0,recoveryId:("recurring-"+($run|tostring)),
+     tooling:$tooling,workflow:$workflow},databaseProof:$databaseProof,
+   mediaProof:$mediaProof,observedAgeSeconds:0,recoveryId:("recurring-"+($run|tostring)),
    recoveryPointTime:$captured,repository:$repository,retentionDays:30,runId:$run,
    sourceSha:$source,
    artifactFiles:[
@@ -121,17 +137,24 @@ mkdir -m 700 "$core_output"
   --temp-root "$tmp"
 test -s "$core_output/restored-database-proof.json"
 test -s "$core_output/restored-media-proof.json"
-fingerprint=$(sha256sum "$core_output/restored-database-proof.json" \
+pre_fingerprint=$( {
+  sha256sum "$point/recovery-point.json" "$point/point.json" \
+    "$artifact/postgres.dump.age" "$artifact/uploads.tar.gz.age"
+  if [ "$capture_proofs" = true ]; then
+    sha256sum "$database_proof" "$media_proof"
+  fi
+} | sha256sum | awk '{print $1}')
+post_fingerprint=$(sha256sum "$core_output/restored-database-proof.json" \
   "$core_output/restored-media-proof.json" | sha256sum | awk '{print $1}')
 descriptor_digest=$(sha256sum "$point/point.json" | awk '{print $1}')
 captured=$(jq -er '.capture.capturedAt' "$point/recovery-point.json")
 jq -cnS --arg capture "$capture_revision" --arg restore "$restore_revision" \
   --arg descriptor "$descriptor_digest" --arg protection "$protection_digest" \
-  --arg fingerprint "$fingerprint" --argjson captured "$captured" \
+  --arg pre "$pre_fingerprint" --arg post "$post_fingerprint" \
+  --argjson captured "$captured" \
   '{schema:"meet-backend/beta-recurring-restore-proof/v2",
     captureRevision:$capture,restoreRevision:$restore,capturedAt:$captured,
     pointDescriptorDigest:$descriptor,protectionDigest:$protection,
     identityCustody:"restore-only",isolated:true,databaseProbe:true,
-    mediaProbe:true,cleanup:true,preFingerprint:$fingerprint,
-    postFingerprint:$fingerprint}' >"$proof_output"
+    mediaProbe:true,cleanup:true,preFingerprint:$pre,postFingerprint:$post}' >"$proof_output"
 chmod 600 "$proof_output"

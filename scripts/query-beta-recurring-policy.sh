@@ -55,6 +55,7 @@ for index in "${!names[@]}"; do
   api_get "branches-${names[$index]}" \
     "/repos/$GITHUB_REPOSITORY/environments/$encoded/deployment-branch-policies"
   jq -e '
+    .can_admins_bypass == false and
     .deployment_branch_policy.custom_branch_policies==true and
     .deployment_branch_policy.protected_branches==false
   ' "$tmp/environment-${names[$index]}" >/dev/null ||
@@ -64,15 +65,42 @@ for index in "${!names[@]}"; do
     "$tmp/branches-${names[$index]}" >/dev/null ||
     { echo 'BACKUP_CUSTODY_BLOCKED:environment_master_policy' >&2; exit 1; }
   if [ "${names[$index]}" = restore ]; then
-    jq -e '[.protection_rules[] | select(.type=="required_reviewers") |
-      select((.reviewers|length)>=1)] | length==1' \
-      "$tmp/environment-${names[$index]}" >/dev/null ||
+    jq -e '
+      [.protection_rules[] | select(.type=="required_reviewers") |
+        select(.prevent_self_review == true) |
+        select((.reviewers|type=="array" and length>=1)) |
+        select(all(.reviewers[];
+          ((.reviewer.id // .id) | type=="number" and floor==. and . > 0)))] |
+      length == 1
+    ' "$tmp/environment-${names[$index]}" >/dev/null ||
       { echo 'BACKUP_CUSTODY_BLOCKED:restore_reviewer_policy' >&2; exit 1; }
+    reviewer_required=true
+    prevent_self_review=true
+    reviewer_ids=$(jq -cS '
+      [.protection_rules[] | select(.type=="required_reviewers")][0].reviewers |
+      map((.reviewer.id // .id)) | sort
+    ' "$tmp/environment-${names[$index]}")
+  else
+    reviewer_required=false
+    prevent_self_review=false
+    reviewer_ids='[]'
   fi
+  evidence_digest=$(jq -cS -n \
+    --slurpfile environment "$tmp/environment-${names[$index]}" \
+    --slurpfile branches "$tmp/branches-${names[$index]}" \
+    '$environment[0] as $environment | $branches[0] as $branches |
+      {environment:$environment,branches:$branches}' |
+    sha256sum | awk '{print $1}')
   environments=$(jq -cn --argjson values "$environments" --arg name "$name" \
     --argjson caps "${capabilities[$index]}" \
+    --argjson reviewers "$reviewer_ids" \
+    --argjson reviewerRequired "$reviewer_required" \
+    --argjson preventSelfReview "$prevent_self_review" \
+    --arg evidence "$evidence_digest" \
     '$values + [{name:$name,branchPolicy:"refs/heads/master",
-      adminBypassAllowed:false,capabilities:$caps}]')
+      adminBypassAllowed:false,capabilities:$caps,
+      reviewerIds:$reviewers,reviewerRequired:$reviewerRequired,
+      preventSelfReview:$preventSelfReview,apiEvidenceDigest:$evidence}]')
 done
 
 # These values are part of the recurring custody contract. They are derived
