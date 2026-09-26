@@ -69,7 +69,7 @@ beta_storage_validate_point() {
   [ "$(wc -c <"$manifest")" -le 1048576 ] || return 1
   jq -e '
     type == "object" and
-    (keys | sort) == ["capture","contractDigest","pointId","proofDigest","runtimeRevision","schema","slotId"] and
+    (keys | sort) == ["capture","captureCommandDigest","captureEvidenceDigest","contractDigest","pointId","proofDigest","runtimeRevision","schema","slotId"] and
     .schema == "meet-backend/beta-recovery-point/v2" and
     (.pointId | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
     (.slotId | type == "string" and test("^[0-9]{10}$")) and
@@ -77,6 +77,8 @@ beta_storage_validate_point() {
       (.capturedAt | type == "number" and floor == . and . >= 0) and
       (.sourceRevision | type == "string" and test("^[0-9a-f]{40}$"))) and
     (.runtimeRevision | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.captureCommandDigest | type == "string" and test("^[0-9a-f]{64}$")) and
+    (.captureEvidenceDigest | type == "string" and test("^[0-9a-f]{64}$")) and
     (.contractDigest | type == "string" and test("^[0-9a-f]{64}$")) and
     (.proofDigest | type == "string" and test("^[0-9a-f]{64}$"))
   ' "$manifest" >/dev/null
@@ -166,6 +168,123 @@ beta_storage_aws_list_versions() {
   beta_storage_fail pagination_limit
 }
 
+beta_storage_local_provider_put() {
+  local root=$1 key=$2 source=$3
+  beta_storage_require_local_root "$root" >/dev/null
+  beta_storage_key "$key" >/dev/null
+  [ -f "$source" ] && [ ! -L "$source" ] && [ -s "$source" ] ||
+    beta_storage_fail provider_source_invalid
+  local sha version destination
+  sha=$(sha256sum "$source" | awk '{print $1}')
+  version="local-$sha"
+  destination="$root/provider/$key/versions/$version"
+  mkdir -p "$(dirname -- "$destination")"
+  [ ! -L "$root/provider" ] && [ ! -L "$(dirname -- "$destination")" ] ||
+    beta_storage_fail provider_path_symlink
+  if [ -e "$destination" ]; then
+    cmp -s "$source" "$destination" || beta_storage_fail provider_version_conflict
+  else
+    install -m 600 "$source" "$destination"
+  fi
+  jq -cnS --arg version "$version" --arg sha "$sha" \
+    --argjson length "$(wc -c <"$source")" \
+    '{versionId:$version,sha256:$sha,length:$length}'
+}
+
+beta_storage_local_provider_get() {
+  local root=$1 key=$2 version=$3 destination=$4 expected_sha=${5:-}
+  beta_storage_require_local_root "$root" >/dev/null
+  beta_storage_key "$key" >/dev/null
+  [[ "$version" =~ ^local-[0-9a-f]{64}$ ]] || beta_storage_fail provider_version_invalid
+  local source="$root/provider/$key/versions/$version"
+  [ -f "$source" ] && [ ! -L "$source" ] || beta_storage_fail provider_object_missing
+  install -m 600 "$source" "$destination"
+  [ "$(sha256sum "$source" | awk '{print $1}')" = \
+    "$(sha256sum "$destination" | awk '{print $1}')" ] ||
+    beta_storage_fail provider_integrity_mismatch
+  [ -z "$expected_sha" ] ||
+    [ "$(sha256sum "$destination" | awk '{print $1}')" = "$expected_sha" ] ||
+    beta_storage_fail provider_integrity_mismatch
+}
+
+beta_storage_local_provider_delete() {
+  local root=$1 key=$2 version=$3
+  beta_storage_require_local_root "$root" >/dev/null
+  beta_storage_key "$key" >/dev/null
+  [[ "$version" =~ ^local-[0-9a-f]{64}$ ]] || beta_storage_fail provider_version_invalid
+  local source="$root/provider/$key/versions/$version"
+  [ ! -e "$source" ] && [ ! -L "$source" ] && return 0
+  [ -f "$source" ] && [ ! -L "$source" ] || beta_storage_fail provider_object_invalid
+  rm -f -- "$source"
+}
+
+beta_storage_local_provider_list() {
+  local root=$1
+  beta_storage_require_local_root "$root" >/dev/null
+  local provider_root="$root/provider"
+  [ ! -e "$provider_root" ] && { printf '[]\n'; return 0; }
+  [ -d "$provider_root" ] && [ ! -L "$provider_root" ] || beta_storage_fail provider_root_invalid
+  local file relative key version bytes sha
+  while IFS= read -r -d '' file; do
+    relative=${file#"$provider_root"/}
+    [[ "$relative" == */versions/local-* ]] || beta_storage_fail provider_layout_invalid
+    key=${relative%/versions/*}
+    version=${relative##*/}
+    bytes=$(wc -c <"$file")
+    sha=$(sha256sum "$file" | awk '{print $1}')
+    jq -cnS --arg key "$key" --arg version "$version" --arg sha "$sha" \
+      --argjson bytes "$bytes" \
+      '{key:$key,versionId:$version,bytes:$bytes,sha256:$sha}'
+  done < <(find "$provider_root" -type f -name 'local-*' -print0 | sort -z)
+}
+
+beta_storage_provider_put() {
+  local root=$1 key=$2 source=$3
+  if [ -n "$root" ]; then
+    beta_storage_local_provider_put "$root" "$key" "$source"
+    return
+  fi
+  beta_storage_require_config
+  [ -f "$source" ] && [ ! -L "$source" ] && [ -s "$source" ] ||
+    beta_storage_fail provider_source_invalid
+  local sha output version
+  sha=$(sha256sum "$source" | awk '{print $1}')
+  output=$(beta_storage_aws put-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
+    --body "$source" --metadata "sha256=$sha") || beta_storage_fail provider_put_failed
+  version=$(jq -er '.VersionId // empty' <<<"$output") || beta_storage_fail provider_version_missing
+  [[ "$version" != null && -n "$version" ]] || beta_storage_fail provider_version_missing
+  jq -cnS --arg version "$version" --arg sha "$sha" \
+    --argjson length "$(wc -c <"$source")" \
+    '{versionId:$version,sha256:$sha,length:$length}'
+}
+
+beta_storage_provider_get() {
+  local root=$1 key=$2 version=$3 destination=$4 expected_sha=${5:-}
+  if [ -n "$root" ]; then
+    beta_storage_local_provider_get "$root" "$key" "$version" "$destination" "$expected_sha"
+    return
+  fi
+  beta_storage_require_config
+  beta_storage_aws get-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
+    --version-id "$version" "$destination" >/dev/null ||
+    beta_storage_fail provider_get_failed
+  [ -z "$expected_sha" ] ||
+    [ "$(sha256sum "$destination" | awk '{print $1}')" = "$expected_sha" ] ||
+    beta_storage_fail provider_integrity_mismatch
+}
+
+beta_storage_provider_delete() {
+  local root=$1 key=$2 version=$3
+  if [ -n "$root" ]; then
+    beta_storage_local_provider_delete "$root" "$key" "$version"
+    return
+  fi
+  beta_storage_require_config
+  beta_storage_aws delete-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
+    --version-id "$version" >/dev/null ||
+    beta_storage_fail provider_delete_failed
+}
+
 beta_storage_local_read_json() {
   local file=$1
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
@@ -227,10 +346,15 @@ beta_storage_local_validate_point_dir() {
   [ -s "$directory/postgres.dump.age" ] && [ -s "$directory/uploads.tar.gz.age" ] || return 1
   beta_storage_validate_point "$directory/recovery-point.json" || return 1
   jq -e --arg id "$point_id" '
-    type=="object" and (keys|sort)==["capture","ciphertexts","contractDigest",
-    "descriptorDigest","pointId","proofDigest","runtimeRevision","slotId","schema"] and
+    type=="object" and (keys|sort)==["capture","captureCommandDigest","captureEvidenceDigest",
+    "ciphertexts","contractDigest","descriptorDigest","pointId","proofDigest",
+    "runtimeRevision","slotId","schema","versions"] and
     .schema=="meet-backend/beta-backup-descriptor/v2" and .pointId==$id and
     (.descriptorDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.captureCommandDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.captureEvidenceDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.versions|type=="object" and (keys|sort)==["database","manifest","uploads"] and
+      all(.[]; type=="string" and test("^[A-Za-z0-9._:-]{1,160}$"))) and
     (.ciphertexts|type=="object" and (keys|sort)==["database","uploads"]) and
     ([.ciphertexts.database,.ciphertexts.uploads][] |
       type=="object" and (keys|sort)==["length","sha256"] and
@@ -239,6 +363,10 @@ beta_storage_local_validate_point_dir() {
   ' "$directory/point.json" >/dev/null
   [ "$(sha256sum "$directory/recovery-point.json" | awk '{print $1}')" = \
     "$(jq -er '.descriptorDigest' "$directory/point.json")" ] || return 1
+  [ "$(jq -er '.captureCommandDigest' "$directory/recovery-point.json")" = \
+    "$(jq -er '.captureCommandDigest' "$directory/point.json")" ] || return 1
+  [ "$(jq -er '.captureEvidenceDigest' "$directory/recovery-point.json")" = \
+    "$(jq -er '.captureEvidenceDigest' "$directory/point.json")" ] || return 1
   [ "$(wc -c <"$directory/postgres.dump.age")" = \
     "$(jq -er '.ciphertexts.database.length' "$directory/point.json")" ] || return 1
   [ "$(wc -c <"$directory/uploads.tar.gz.age")" = \
@@ -295,18 +423,27 @@ beta_storage_publish_local() {
   db_sha=$(sha256sum "$point_dir/postgres.dump.age" | awk '{print $1}')
   media_sha=$(sha256sum "$point_dir/uploads.tar.gz.age" | awk '{print $1}')
   manifest_digest=$(sha256sum "$source/recovery-point.json" | awk '{print $1}')
+  local capture_command_digest capture_evidence_digest
+  capture_command_digest=$(jq -er '.captureCommandDigest' "$source/recovery-point.json")
+  capture_evidence_digest=$(jq -er '.captureEvidenceDigest' "$source/recovery-point.json")
   jq -cnS --arg id "$point_id" --arg slot "$slot" --argjson captured "$captured_at" \
     --arg runtime "$(jq -er '.runtimeRevision' "$source/recovery-point.json")" \
     --arg contract "$(jq -er '.contractDigest' "$source/recovery-point.json")" \
     --arg proof "$(jq -er '.proofDigest' "$source/recovery-point.json")" \
+    --arg command "$capture_command_digest" --arg evidence "$capture_evidence_digest" \
     --arg capture "$(jq -er '.capture.capturedAt' "$source/recovery-point.json")" \
     --arg dbsha "$db_sha" --arg mediasha "$media_sha" --argjson dblen "$db_len" \
     --argjson medielen "$media_len" --arg manifest "$manifest_digest" \
+    --arg dbversion "local-$db_sha" --arg mediaversion "local-$media_sha" \
+    --arg manifestversion "local-$manifest_digest" \
     '{schema:"meet-backend/beta-backup-descriptor/v2",pointId:$id,slotId:$slot,
       capture:{capturedAt:($capture|tonumber)},runtimeRevision:$runtime,
+      captureCommandDigest:$command,captureEvidenceDigest:$evidence,
       contractDigest:$contract,proofDigest:$proof,
       ciphertexts:{database:{length:$dblen,sha256:$dbsha},
-        uploads:{length:$medielen,sha256:$mediasha}},descriptorDigest:$manifest}' |
+        uploads:{length:$medielen,sha256:$mediasha}},
+      versions:{database:$dbversion,manifest:$manifestversion,uploads:$mediaversion},
+      descriptorDigest:$manifest}' |
     beta_storage_local_atomic_json "$point_dir/point.json"
   local head_generation=0
   [ -f "$root/control/capture-head.json" ] &&
@@ -328,27 +465,69 @@ beta_storage_validate_receipt() {
   beta_storage_require_jq
   [ -f "$receipt" ] && [ ! -L "$receipt" ] || return 1
   jq -e '
-    type=="object" and (keys|sort)==["captureRevision","pointId","proofDigest",
-      "receiptId","restoreRevision","schema","verifiedCapturedAt"] and
-    .schema=="meet-backend/beta-backup-receipt/v1" and
+    type=="object" and (keys|sort)==["captureAt","captureCommandDigest","captureRevision",
+      "pointDescriptorDigest","pointId","proofDigest","protectionDigest","receiptId",
+      "restoreRevision","schema","verifiedCapturedAt"] and
+    .schema=="meet-backend/beta-backup-receipt/v2" and
     (.receiptId|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
     (.pointId|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
     (.captureRevision|type=="string" and test("^[0-9a-f]{40}$")) and
     (.restoreRevision|type=="string" and test("^[0-9a-f]{40}$")) and
+    (.captureCommandDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.pointDescriptorDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.protectionDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.captureAt|type=="number" and floor==. and .>=0) and
     (.proofDigest|type=="string" and test("^[0-9a-f]{64}$")) and
     (.verifiedCapturedAt|type=="number" and floor==. and .>=0)
   ' "$receipt" >/dev/null
+  local proof_path
+  proof_path="$(dirname -- "$receipt")/$(jq -er '.receiptId' "$receipt").proof.json"
+  [ -f "$proof_path" ] && [ ! -L "$proof_path" ] || return 1
+  [ "$(sha256sum "$proof_path" | awk '{print $1}')" = \
+    "$(jq -er '.proofDigest' "$receipt")" ] || return 1
+  jq -e --arg capture "$(jq -er '.captureRevision' "$receipt")" \
+    --arg restore "$(jq -er '.restoreRevision' "$receipt")" \
+    --arg descriptor "$(jq -er '.pointDescriptorDigest' "$receipt")" \
+    --arg protection "$(jq -er '.protectionDigest' "$receipt")" \
+    --argjson captured "$(jq -er '.captureAt' "$receipt")" '
+    type=="object" and
+    (keys|sort)==["captureRevision","capturedAt","cleanup","databaseProbe",
+      "identityCustody","isolated","mediaProbe","pointDescriptorDigest",
+      "postFingerprint","preFingerprint","protectionDigest","restoreRevision",
+      "schema"] and
+    .schema=="meet-backend/beta-recurring-restore-proof/v2" and
+    .captureRevision==$capture and .restoreRevision==$restore and
+    .capturedAt==$captured and .pointDescriptorDigest==$descriptor and
+    .protectionDigest==$protection and .identityCustody=="restore-only" and
+    .isolated==true and .databaseProbe==true and .mediaProbe==true and
+    .cleanup==true and
+    (.preFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.postFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
+    .preFingerprint==.postFingerprint
+  ' "$proof_path" >/dev/null
 }
 
 beta_storage_promote_local() {
   local receipt=$1 root=$2 owner=$3
   beta_storage_validate_receipt "$receipt" || beta_storage_fail receipt_invalid
-  local point_id receipt_id verified_at
+  local point_id receipt_id verified_at descriptor_digest capture_at
   point_id=$(jq -er '.pointId' "$receipt")
   receipt_id=$(jq -er '.receiptId' "$receipt")
   verified_at=$(jq -er '.verifiedCapturedAt' "$receipt")
+  capture_at=$(jq -er '.captureAt' "$receipt")
+  descriptor_digest=$(sha256sum "$root/points/$point_id/point.json" | awk '{print $1}')
   beta_storage_local_validate_point_dir "$root/points/$point_id" "$point_id" ||
     beta_storage_fail point_unavailable
+  [ "$(jq -er '.pointDescriptorDigest' "$receipt")" = "$descriptor_digest" ] ||
+    beta_storage_fail receipt_descriptor_mismatch
+  [ "$capture_at" = "$(jq -er '.capture.capturedAt' "$root/points/$point_id/recovery-point.json")" ] ||
+    beta_storage_fail receipt_capture_time_mismatch
+  [ "$(jq -er '.captureRevision' "$receipt")" = \
+    "$(jq -er '.capture.sourceRevision' "$root/points/$point_id/recovery-point.json")" ] ||
+    beta_storage_fail receipt_capture_revision_mismatch
+  [ "$(jq -er '.captureCommandDigest' "$receipt")" = \
+    "$(jq -er '.captureCommandDigest' "$root/points/$point_id/recovery-point.json")" ] ||
+    beta_storage_fail receipt_capture_provenance_mismatch
   beta_storage_local_acquire "$root" promote "$owner" "promote-$receipt_id"
   local receipt_dir="$root/receipts/$point_id"
   if [ "$(uname -s)" = Linux ]; then
@@ -357,12 +536,17 @@ beta_storage_promote_local() {
     mkdir -p "$receipt_dir"
   fi
   install -m 600 "$receipt" "$receipt_dir/$receipt_id.json"
-  local old_at=-1 old_id='' old_receipt='' old_gen=0
+  local proof_path destination_proof old_at=-1 old_id='' old_receipt='' old_gen=0
+  proof_path="$(dirname -- "$receipt")/$(jq -er '.receiptId' "$receipt").proof.json"
   if [ -f "$root/control/verified-head.json" ]; then
     old_at=$(jq -er '.verifiedCapturedAt' "$root/control/verified-head.json") || old_at=-1
     old_id=$(jq -er '.pointId' "$root/control/verified-head.json") || old_id=
     old_receipt=$(jq -er '.receiptId' "$root/control/verified-head.json") || old_receipt=
     old_gen=$(jq -er '.generation' "$root/control/verified-head.json") || old_gen=0
+  fi
+  destination_proof="$receipt_dir/$receipt_id.proof.json"
+  if [ "$proof_path" != "$destination_proof" ]; then
+    install -m 600 "$proof_path" "$destination_proof"
   fi
   if (( verified_at < old_at )); then
     beta_storage_local_release "$root"

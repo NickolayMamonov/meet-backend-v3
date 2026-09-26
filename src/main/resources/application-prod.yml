@@ -38,6 +38,9 @@ app:
       status-path: ${APP_BACKUP_SAFETY_STATUS_PATH:/var/lib/meet-production/beta-backup-control/status.json}
       watermark-path: ${APP_BACKUP_SAFETY_WATERMARK_PATH:/var/lib/meet-production/beta-backup-control/watermark.json}
       control-root-mode: ${APP_BACKUP_SAFETY_CONTROL_ROOT_MODE:750}
+      control-root-uid: ${APP_BACKUP_SAFETY_CONTROL_ROOT_UID:0}
+      control-root-gid: ${APP_BACKUP_SAFETY_CONTROL_ROOT_GID:10001}
+      mount-identity: ${APP_BACKUP_SAFETY_MOUNT_IDENTITY:}
 
 management:
   endpoints:

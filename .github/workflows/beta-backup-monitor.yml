@@ -29,15 +29,27 @@ jobs:
           STORAGE_ROOT: ${{ secrets.BETA_BACKUP_STORAGE_ROOT }}
           RECEIVER_ROOT: ${{ secrets.BETA_BACKUP_RECEIVER_ROOT }}
           INCIDENT_STATE: ${{ secrets.BETA_BACKUP_INCIDENT_STATE }}
+          INCIDENT_COMMAND: ${{ vars.BETA_BACKUP_INCIDENT_COMMAND }}
           DEADMANS_URL: ${{ secrets.BETA_BACKUP_DEADMAN_URL }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/master
-          test -n "$STORAGE_ROOT" -a -n "$RECEIVER_ROOT" -a -n "$INCIDENT_STATE"
+          test -n "$STORAGE_ROOT" -a -n "$RECEIVER_ROOT" -a -n "$INCIDENT_STATE" \
+            -a -n "$INCIDENT_COMMAND" -a -n "$DEADMANS_URL"
+          case "$INCIDENT_COMMAND" in
+            "$GITHUB_WORKSPACE/"*) ;;
+            scripts/*) INCIDENT_COMMAND="$GITHUB_WORKSPACE/$INCIDENT_COMMAND" ;;
+            *) echo 'BACKUP_INCIDENT_BLOCKED:private_incident_command_path' >&2; exit 1 ;;
+          esac
+          [ -x "$INCIDENT_COMMAND" ] && [ ! -L "$INCIDENT_COMMAND" ] || {
+              echo 'BACKUP_INCIDENT_BLOCKED:private_incident_command_required' >&2
+              exit 1
+            }
           scripts/run-beta-backup-monitor.sh \
             --storage-root "$STORAGE_ROOT" \
             --environment closed-beta \
             --now "$(date -u +%s)" \
             --receiver-root "$RECEIVER_ROOT" \
             --incident-state "$INCIDENT_STATE" \
+            --incident-command "$INCIDENT_COMMAND" \
             --deadman-url "$DEADMANS_URL"

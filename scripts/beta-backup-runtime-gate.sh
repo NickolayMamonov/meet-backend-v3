@@ -35,10 +35,26 @@ beta_backup_runtime_resolve_config() {
   APP_BACKUP_SAFETY_ENVIRONMENT=${APP_BACKUP_SAFETY_ENVIRONMENT:-closed-beta}
   APP_BACKUP_SAFETY_STATUS_PATH=${APP_BACKUP_SAFETY_STATUS_PATH:-/var/lib/meet-production/beta-backup-control/status.json}
   APP_BACKUP_SAFETY_WATERMARK_PATH=${APP_BACKUP_SAFETY_WATERMARK_PATH:-${APP_BACKUP_SAFETY_STATUS_PATH%/*}/watermark.json}
+  APP_BACKUP_SAFETY_MOUNT_IDENTITY=${APP_BACKUP_SAFETY_MOUNT_IDENTITY:-}
+  APP_BACKUP_SAFETY_CONTROL_ROOT_UID=${APP_BACKUP_SAFETY_CONTROL_ROOT_UID:-0}
+  APP_BACKUP_SAFETY_CONTROL_ROOT_GID=${APP_BACKUP_SAFETY_CONTROL_ROOT_GID:-10001}
   [ "${APP_BACKUP_SAFETY_SNAPSHOT_MAX_AGE_SECONDS:-1800}" = 1800 ] ||
     { echo "BACKUP_SAFETY_BLOCKED: snapshot threshold is not the fixed policy" >&2; return 1; }
   [ "${APP_BACKUP_SAFETY_VERIFIED_MAX_AGE_SECONDS:-1209600}" = 1209600 ] ||
     { echo "BACKUP_SAFETY_BLOCKED: verification threshold is not the fixed policy" >&2; return 1; }
+  [[ "$APP_BACKUP_SAFETY_ENABLED" =~ ^(true|false)$ ]] ||
+    { echo "BACKUP_SAFETY_BLOCKED: enabled enrollment flag is invalid" >&2; return 1; }
+  [[ "$APP_BACKUP_SAFETY_ENROLLED" =~ ^(true|false)$ ]] ||
+    { echo "BACKUP_SAFETY_BLOCKED: enrolled enrollment flag is invalid" >&2; return 1; }
+  [[ "$APP_BACKUP_SAFETY_CONTROL_ROOT_UID" =~ ^[0-9]+$ &&
+    "$APP_BACKUP_SAFETY_CONTROL_ROOT_GID" =~ ^[0-9]+$ ]] ||
+    { echo "BACKUP_SAFETY_BLOCKED: mount owner is invalid" >&2; return 1; }
+  if [ "$APP_BACKUP_SAFETY_ENROLLED" = true ]; then
+    [ "$APP_BACKUP_SAFETY_ENABLED" = true ] ||
+      { echo "BACKUP_SAFETY_BLOCKED: enrolled runtime is disabled" >&2; return 1; }
+    [[ "$APP_BACKUP_SAFETY_MOUNT_IDENTITY" =~ ^[0-9]+:[0-9]+:[0-7]{3,4}:[0-9]+:[0-9]+$ ]] ||
+      { echo "BACKUP_SAFETY_BLOCKED: complete mount identity is unavailable" >&2; return 1; }
+  fi
 }
 
 beta_backup_runtime_require_mount() {
@@ -47,20 +63,41 @@ beta_backup_runtime_require_mount() {
     echo "BACKUP_SAFETY_BLOCKED: control mount is unavailable" >&2
     return 1
   }
+  local mount_identity
+  mount_identity=$(stat -c '%d:%i:%a:%u:%g' "$root" 2>/dev/null) ||
+    { echo "BACKUP_SAFETY_BLOCKED: control mount identity is unavailable" >&2; return 1; }
   if [ "$(uname -s)" = Linux ]; then
+    [ "$mount_identity" = "$APP_BACKUP_SAFETY_MOUNT_IDENTITY" ] ||
+      { echo "BACKUP_SAFETY_BLOCKED: control mount identity changed" >&2; return 1; }
     [ "$(stat -c '%a' "$root" 2>/dev/null)" = 750 ] ||
       { echo "BACKUP_SAFETY_BLOCKED: control mount mode is invalid" >&2; return 1; }
+    [ "$(stat -c '%u' "$root" 2>/dev/null)" = "$APP_BACKUP_SAFETY_CONTROL_ROOT_UID" ] ||
+      { echo "BACKUP_SAFETY_BLOCKED: control mount owner is invalid" >&2; return 1; }
+    [ "$(stat -c '%g' "$root" 2>/dev/null)" = "$APP_BACKUP_SAFETY_CONTROL_ROOT_GID" ] ||
+      { echo "BACKUP_SAFETY_BLOCKED: control mount group is invalid" >&2; return 1; }
   fi
+  [ "$(dirname -- "$APP_BACKUP_SAFETY_WATERMARK_PATH")" = "$root" ] ||
+    { echo "BACKUP_SAFETY_BLOCKED: watermark is outside the control mount" >&2; return 1; }
   [ -f "$status_path" ] && [ ! -L "$status_path" ] ||
     { echo "BACKUP_SAFETY_BLOCKED: control status is unavailable" >&2; return 1; }
-  local watermark=${APP_BACKUP_SAFETY_WATERMARK_PATH:-${root}/watermark.json}
+  local watermark=$APP_BACKUP_SAFETY_WATERMARK_PATH
   [ -f "$watermark" ] && [ ! -L "$watermark" ] ||
     { echo "BACKUP_SAFETY_BLOCKED: control watermark is unavailable" >&2; return 1; }
+  if [ "$(uname -s)" = Linux ]; then
+    [ "$(stat -c '%a:%u:%g' "$status_path" 2>/dev/null)" = "640:$APP_BACKUP_SAFETY_CONTROL_ROOT_UID:$APP_BACKUP_SAFETY_CONTROL_ROOT_GID" ] ||
+      { echo "BACKUP_SAFETY_BLOCKED: control status ownership is invalid" >&2; return 1; }
+    [ "$(stat -c '%a:%u:%g' "$watermark" 2>/dev/null)" = "640:$APP_BACKUP_SAFETY_CONTROL_ROOT_UID:$APP_BACKUP_SAFETY_CONTROL_ROOT_GID" ] ||
+      { echo "BACKUP_SAFETY_BLOCKED: control watermark ownership is invalid" >&2; return 1; }
+  fi
 }
 
 beta_backup_runtime_require_operation() {
   local image=${1:-} operation=${2:-operation} env_file=${3:-${APP_BACKUP_SAFETY_ENV_FILE:-}}
   beta_backup_runtime_resolve_config "$env_file"
+  if [ "$APP_BACKUP_SAFETY_ENROLLED" = true ] && [ "$APP_BACKUP_SAFETY_ENABLED" != true ]; then
+    echo "BACKUP_SAFETY_BLOCKED: enrolled runtime is disabled" >&2
+    return 1
+  fi
   [ "$APP_BACKUP_SAFETY_ENABLED" = true ] || return 0
   [ "$APP_BACKUP_SAFETY_ENROLLED" = true ] ||
     { echo "BACKUP_SAFETY_BLOCKED: enrollment is unavailable for $operation" >&2; return 1; }
@@ -90,10 +127,10 @@ beta_backup_runtime_admission_fingerprints() {
   local status_digest mount_digest enrollment_digest verified_at
   status_digest=$(sha256sum "$status_path" | awk '{print $1}')
   mount_digest=$(stat -c '%d:%i:%a:%u:%g' "$control_root" | sha256sum | awk '{print $1}')
-  enrollment_digest=$(printf '%s\0%s\0%s\0%s\0%s' \
+  enrollment_digest=$(printf '%s\0%s\0%s\0%s\0%s\0%s' \
     "$APP_BACKUP_SAFETY_ENABLED" "$APP_BACKUP_SAFETY_ENROLLED" \
     "$APP_BACKUP_SAFETY_ENVIRONMENT" "$APP_BACKUP_SAFETY_STATUS_PATH" \
-    "$APP_BACKUP_SAFETY_WATERMARK_PATH" |
+    "$APP_BACKUP_SAFETY_WATERMARK_PATH" "$APP_BACKUP_SAFETY_MOUNT_IDENTITY" |
     sha256sum | awk '{print $1}')
   verified_at=$(jq -er '.verified.capturedAt' "$status_path")
   printf '%s %s %s %s %s\n' \
@@ -143,10 +180,10 @@ beta_backup_runtime_revalidate_fingerprints() {
   current_status=$(sha256sum "$APP_BACKUP_SAFETY_STATUS_PATH" | awk '{print $1}')
   current_observed=$(jq -er '.observedAt' "$APP_BACKUP_SAFETY_STATUS_PATH")
   current_verified=$(jq -er '.verified.capturedAt' "$APP_BACKUP_SAFETY_STATUS_PATH")
-  current_enrollment=$(printf '%s\0%s\0%s\0%s\0%s' \
+  current_enrollment=$(printf '%s\0%s\0%s\0%s\0%s\0%s' \
     "$APP_BACKUP_SAFETY_ENABLED" "$APP_BACKUP_SAFETY_ENROLLED" \
     "$APP_BACKUP_SAFETY_ENVIRONMENT" "$APP_BACKUP_SAFETY_STATUS_PATH" \
-    "$APP_BACKUP_SAFETY_WATERMARK_PATH" |
+    "$APP_BACKUP_SAFETY_WATERMARK_PATH" "$APP_BACKUP_SAFETY_MOUNT_IDENTITY" |
     sha256sum | awk '{print $1}')
   [ "$enrollment" = "$current_enrollment" ] &&
     [ "$mount" = "$current_mount" ] &&

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME [--policy-file PATH --ci-result-file PATH --actor LOGIN --reviewer LOGIN]" >&2
+  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME [--policy-file PATH --ci-result-file PATH --actor LOGIN --reviewer LOGIN --approval-file PATH --post-approval-file PATH --reviewer-id ID]" >&2
   exit 2
 }
 
@@ -13,6 +13,7 @@ fail() {
 
 event='' run_ref='' default_ref='' scheduler_sha='' checkout_sha='' ci_sha=''
 environment='' policy_file='' ci_result_file='' actor='' reviewer=''
+approval_file='' post_approval_file='' reviewer_id=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --event) [ "$#" -ge 2 ] || usage; event=$2; shift 2 ;;
@@ -26,6 +27,9 @@ while [ "$#" -gt 0 ]; do
     --ci-result-file) [ "$#" -ge 2 ] || usage; ci_result_file=$2; shift 2 ;;
     --actor) [ "$#" -ge 2 ] || usage; actor=$2; shift 2 ;;
     --reviewer) [ "$#" -ge 2 ] || usage; reviewer=$2; shift 2 ;;
+    --approval-file) [ "$#" -ge 2 ] || usage; approval_file=$2; shift 2 ;;
+    --post-approval-file) [ "$#" -ge 2 ] || usage; post_approval_file=$2; shift 2 ;;
+    --reviewer-id) [ "$#" -ge 2 ] || usage; reviewer_id=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -92,6 +96,40 @@ if [ -n "$policy_file" ] || [ -n "$ci_result_file" ]; then
     [[ "$reviewer" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail reviewer_missing
     [ "$reviewer" != "$actor" ] || fail self_review
   fi
+fi
+validate_approval() {
+  local file=$1 policy_digest protection_digest
+  [ -f "$file" ] && [ ! -L "$file" ] || fail approval_missing
+  policy_digest=$(sha256sum "$policy_file" | awk '{print $1}')
+  jq -e --arg environment "$environment" --arg reviewer "$reviewer" \
+    --arg reviewer_id "$reviewer_id" --arg actor "$actor" \
+    --arg branch "$run_ref" --arg policy "$policy_digest" '
+    type=="object" and
+    (keys|sort)==["adminBypassAllowed","approvedAt","approvalRunId","branchPolicy",
+      "environment","policyDigest","preventSelfReview","protectionDigest",
+      "reviewerId","reviewerLogin","reviewerRequired","schema"] and
+    .schema=="meet-backend/beta-backup-custody-approval/v1" and
+    .environment==$environment and .branchPolicy==$branch and
+    .reviewerLogin==$reviewer and
+    (if $reviewer_id=="" then (.reviewerId|type=="string" and length>0)
+     else .reviewerId==$reviewer_id end) and
+    .reviewerRequired==true and .preventSelfReview==true and
+    .adminBypassAllowed==false and .policyDigest==$policy and
+    (.protectionDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.approvalRunId|type=="string" and test("^[A-Za-z0-9._:-]{1,128}$")) and
+    (.approvedAt|type=="number" and floor==. and .>=0)
+  ' "$file" >/dev/null || fail approval_drift
+  protection_digest=$(jq -cS 'del(.protectionDigest)' "$file" |
+    sha256sum | awk '{print $1}') || fail approval_drift
+  [ "$protection_digest" = "$(jq -er '.protectionDigest' "$file")" ] ||
+    fail approval_drift
+}
+if [ "$environment" = closed-beta-recurring-restore ] &&
+  { [ "${BETA_RECURRING_REQUIRE_APPROVAL:-false}" = true ] || [ -n "$approval_file" ] || [ -n "$post_approval_file" ]; }; then
+  [ -n "$approval_file" ] && [ -n "$post_approval_file" ] || fail approval_required
+  validate_approval "$approval_file"
+  validate_approval "$post_approval_file"
+  cmp -s "$approval_file" "$post_approval_file" || fail approval_changed
 fi
 if [ "${BETA_RECURRING_REQUIRE_POLICY:-false}" = true ]; then
   [ -n "$policy_file" ] && [ -n "$ci_result_file" ] || fail policy_evidence_required

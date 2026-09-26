@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 validate-point|inventory|capability|publish|promote|prune|reconcile ..." >&2
+  echo "usage: $0 validate-point|inventory|capability|provider-put|provider-get|provider-delete|provider-list|publish|promote|prune|reconcile ..." >&2
   exit 2
 }
 
@@ -52,6 +52,62 @@ case "$operation" in
         exit 1
       }
       printf 'storage_capability=reachable bucket_versioning=Enabled\n'
+    fi
+    ;;
+  provider-put)
+    key='' source='' root=${BETA_BACKUP_STORAGE_ROOT:-}
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
+        --key) [ "$#" -ge 2 ] || usage; key=$2; shift 2 ;;
+        --file) [ "$#" -ge 2 ] || usage; source=$2; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    [ -n "$key" ] && [ -n "$source" ] || usage
+    result=$(beta_storage_provider_put "$root" "$key" "$source")
+    printf 'storage_provider_put=%s\n' "$result"
+    ;;
+  provider-get)
+    key='' version='' destination='' expected_sha='' root=${BETA_BACKUP_STORAGE_ROOT:-}
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
+        --key) [ "$#" -ge 2 ] || usage; key=$2; shift 2 ;;
+        --version) [ "$#" -ge 2 ] || usage; version=$2; shift 2 ;;
+        --output) [ "$#" -ge 2 ] || usage; destination=$2; shift 2 ;;
+        --sha256) [ "$#" -ge 2 ] || usage; expected_sha=$2; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    [ -n "$key" ] && [ -n "$version" ] && [ -n "$destination" ] || usage
+    [[ -z "$expected_sha" || "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || usage
+    beta_storage_provider_get "$root" "$key" "$version" "$destination" "$expected_sha"
+    printf 'storage_provider_get=verified key=%s version=%s\n' "$key" "$version"
+    ;;
+  provider-delete)
+    key='' version='' root=${BETA_BACKUP_STORAGE_ROOT:-}
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
+        --key) [ "$#" -ge 2 ] || usage; key=$2; shift 2 ;;
+        --version) [ "$#" -ge 2 ] || usage; version=$2; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    [ -n "$key" ] && [ -n "$version" ] || usage
+    beta_storage_provider_delete "$root" "$key" "$version"
+    printf 'storage_provider_delete=committed key=%s version=%s\n' "$key" "$version"
+    ;;
+  provider-list)
+    root=${BETA_BACKUP_STORAGE_ROOT:-}
+    if [ "$#" -eq 2 ] && [ "$1" = --storage-root ]; then root=$2; else [ "$#" -eq 0 ] || usage; fi
+    if [ -n "$root" ]; then
+      beta_storage_local_provider_list "$root" | jq -s .
+    else
+      beta_storage_aws_list_versions | jq -s '
+        map(.Versions[]? | {key:.Key,versionId:.VersionId,bytes:(.Size // 0),
+          sha256:(.Metadata.sha256 // null)})'
     fi
     ;;
   publish)

@@ -315,6 +315,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-beta-recovery-workflow.sh"
           timeout 900s bash "$TOOLING_SCRIPTS/test-beta-recurring-backups.sh"
           timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-storage.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-migration.sh"
           timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-snapshot.sh"
           timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-gates.sh"
           bash "$TOOLING_SCRIPTS/test-beta-recovery-ssh-host-key.sh"
