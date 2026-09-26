@@ -40,7 +40,7 @@ class BetaRecoveryProofDiagnosticsPostgresTest : IntegrationTestSupport() {
         val diagnosticSql = Files.readString(Path.of("scripts", "beta-recovery-database-proof.sql"))
             .replace(
                 "SELECT proof::text\nFROM proof_document\nWHERE (SELECT valid FROM validity_summary);",
-                "SELECT jsonb_build_object('proof', proof, 'validity', (SELECT row_to_json(validity_summary)))::text FROM proof_document;",
+                "SELECT jsonb_build_object('proof', proof, 'validity', (SELECT row_to_json(v) FROM validity_summary v))::text FROM proof_document;",
             )
         val diagnostic = requireNotNull(jdbcTemplate.queryForObject(diagnosticSql, String::class.java))
         error(objectMapper.readTree(diagnostic).toPrettyString())
