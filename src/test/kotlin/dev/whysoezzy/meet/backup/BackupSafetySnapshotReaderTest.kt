@@ -45,9 +45,13 @@ class BackupSafetySnapshotReaderTest {
             Files.readAttributes(directory, "unix:dev,ino,mode,uid,gid")
         }.getOrNull() ?: return
         val mode = (attrs["mode"] as Number).toLong() and 0xFFF
-        val identity = listOf("dev", "ino").map { (attrs[it] as Number).toLong() }
-            .plus(mode)
-            .plus(listOf("uid", "gid").map { (attrs[it] as Number).toLong() })
+        val identity = listOf(
+            (attrs["dev"] as Number).toLong().toString(),
+            (attrs["ino"] as Number).toLong().toString(),
+            mode.toString(8),
+            (attrs["uid"] as Number).toLong().toString(),
+            (attrs["gid"] as Number).toLong().toString(),
+        )
             .joinToString(":")
         val properties = BackupSafetyProperties(
             enabled = true,

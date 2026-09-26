@@ -23,16 +23,6 @@ class BackupSafetyGateTest {
         writeWatermark(path, 1, 1_000_000)
         val properties = propertiesFor(directory, path)
         val reader = BackupSafetySnapshotReader(jacksonObjectMapper(), properties)
-        val rootAttrs = Files.readAttributes(directory, "unix:mode,uid,gid")
-        val statusAttrs = Files.readAttributes(path, "unix:mode,uid,gid")
-        val watermarkAttrs = Files.readAttributes(directory.resolve("watermark.json"), "unix:mode,uid,gid")
-        System.err.println(
-            "backup-safety-fixture root=${rootAttrs["mode"]}:${rootAttrs["uid"]}:${rootAttrs["gid"]}" +
-                " status=${statusAttrs["mode"]}:${statusAttrs["uid"]}:${statusAttrs["gid"]}" +
-                " watermark=${watermarkAttrs["mode"]}:${watermarkAttrs["uid"]}:${watermarkAttrs["gid"]}" +
-                " configured=${properties.controlRootMode}:${properties.controlRootUid}:${properties.controlRootGid}" +
-                " identity=${properties.mountIdentity}",
-        )
         reader.validateEnrollmentMount()
         reader.read()
         BackupSafetyGate(
@@ -104,9 +94,13 @@ class BackupSafetyGateTest {
             statusPath = path.toString(),
         )
         val mode = (attrs["mode"] as Number).toLong() and 0xFFF
-        val identity = listOf("dev", "ino").map { (attrs[it] as Number).toLong() }
-            .plus(mode)
-            .plus(listOf("uid", "gid").map { (attrs[it] as Number).toLong() })
+        val identity = listOf(
+            (attrs["dev"] as Number).toLong().toString(),
+            (attrs["ino"] as Number).toLong().toString(),
+            mode.toString(8),
+            (attrs["uid"] as Number).toLong().toString(),
+            (attrs["gid"] as Number).toLong().toString(),
+        )
             .joinToString(":")
         return BackupSafetyProperties(
             enabled = true,

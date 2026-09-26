@@ -125,9 +125,13 @@ open class BackupSafetySnapshotReader(
             LinkOption.NOFOLLOW_LINKS,
         )
         val mode = (attributes["mode"] as Number).toLong() and 0xFFF
-        return listOf("dev", "ino").map { (attributes[it] as Number).toLong() }
-            .plus(mode)
-            .plus(listOf("uid", "gid").map { (attributes[it] as Number).toLong() })
+        return listOf(
+            (attributes["dev"] as Number).toLong().toString(),
+            (attributes["ino"] as Number).toLong().toString(),
+            mode.toString(8),
+            (attributes["uid"] as Number).toLong().toString(),
+            (attributes["gid"] as Number).toLong().toString(),
+        )
             .joinToString(":")
     }
 
