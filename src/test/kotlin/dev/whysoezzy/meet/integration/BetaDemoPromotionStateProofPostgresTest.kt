@@ -5,19 +5,26 @@ import dev.whysoezzy.meet.demo.catalog.DemoCatalogBootstrapService
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.boot.test.context.TestConfiguration
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Import
+import org.springframework.context.annotation.Primary
 import tools.jackson.databind.ObjectMapper
 import java.sql.Connection
 import javax.sql.DataSource
+import java.time.Clock
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneOffset
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
+@Import(BetaDemoPromotionStateProofPostgresTest.StableDemoClockConfiguration::class)
 class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
     private val objectMapper = ObjectMapper()
 
@@ -26,6 +33,14 @@ class BetaDemoPromotionStateProofPostgresTest : IntegrationTestSupport() {
 
     @Autowired
     private lateinit var dataSource: DataSource
+
+    @TestConfiguration(proxyBeanMethods = false)
+    class StableDemoClockConfiguration {
+        @Bean
+        @Primary
+        fun stableDemoClock(): Clock =
+            Clock.fixed(Instant.parse("2026-08-15T00:00:00Z"), ZoneOffset.UTC)
+    }
 
     @BeforeEach
     fun clearDatabase() {
