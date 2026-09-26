@@ -37,6 +37,8 @@ test -f "$ENV_FILE" || {
   echo "$ENV_FILE is missing; upgrades must never recreate it" >&2
   exit 1
 }
+source "$SCRIPTS_DIR/beta-backup-runtime-gate.sh"
+beta_backup_runtime_require_operation "" production-update "$ENV_FILE"
 [ "$(grep -c '^BACKEND_IMAGE=' "$ENV_FILE")" -eq 1 ]
 [ "$(grep -c '^BACKEND_VERSION=' "$ENV_FILE")" -eq 1 ]
 [ "$(grep -c '^BACKEND_REVISION=' "$ENV_FILE")" -eq 1 ]

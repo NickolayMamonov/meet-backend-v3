@@ -59,14 +59,13 @@ for command_name in docker jq sha256sum; do command -v "$command_name" >/dev/nul
 [ -d "$(dirname -- "$output")" ] || fail "output directory is unavailable"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-if [ "${BETA_BACKUP_SAFETY_ENABLED:-false}" = true ]; then
-  if [ -f "$script_dir/beta-backup-runtime-gate.sh" ]; then
-    # shellcheck source=beta-backup-runtime-gate.sh
-    source "$script_dir/beta-backup-runtime-gate.sh"
-    beta_backup_runtime_require_operation "$expected_image" "test-vps-$phase"
-  else
-    fail "backup safety helper is unavailable"
-  fi
+if [ -f "$script_dir/beta-backup-runtime-gate.sh" ]; then
+  # shellcheck source=beta-backup-runtime-gate.sh
+  source "$script_dir/beta-backup-runtime-gate.sh"
+  beta_backup_runtime_require_operation "$expected_image" "test-vps-$phase" \
+    "$root/.env.production"
+else
+  fail "backup safety helper is unavailable"
 fi
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
 [ -r "$runtime_helper" ] || fail "runtime invariant helper is unavailable"

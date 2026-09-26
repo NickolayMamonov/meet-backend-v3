@@ -15,38 +15,64 @@ on:
 permissions:
   contents: read
   actions: read
+  deployments: read
 
 concurrency:
   group: closed-beta-recurring-${{ github.event.schedule || inputs.drill || 'capture' }}
   cancel-in-progress: false
 
+env:
+  SCHEDULER_REF: refs/heads/master
+
 jobs:
   admission:
     runs-on: ubuntu-24.04
     if: vars.BETA_RECURRING_ACTIVATED == 'true'
+    outputs:
+      checkout_sha: ${{ steps.authorize.outputs.checkout_sha }}
+      environment: ${{ steps.authorize.outputs.environment }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: master
-          fetch-depth: 0
-      - name: Verify recurring custody admission
+          fetch-depth: 1
+      - name: Validate registered custody and CI provenance
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           RUN_REF: ${{ github.ref }}
-          DEFAULT_REF: refs/heads/master
           SCHEDULER_SHA: ${{ github.sha }}
           ENVIRONMENT: ${{ (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true') && 'closed-beta-recurring-restore' || 'closed-beta-recurring-capture' }}
+          ACTOR: ${{ github.actor }}
+          BETA_RECURRING_PREVENT_SELF_REVIEW: ${{ vars.BETA_RECURRING_PREVENT_SELF_REVIEW || 'false' }}
+          BETA_RECURRING_ADMIN_BYPASS: ${{ vars.BETA_RECURRING_ADMIN_BYPASS || 'true' }}
+        id: authorize
         run: |
           set -euo pipefail
-          checkout_sha=$(git rev-parse HEAD)
-          ci_sha=${{ github.sha }}
-          scripts/authorize-beta-recurring.sh \
-            --event "${{ github.event_name }}" \
-            --run-ref "$RUN_REF" \
-            --default-ref "$DEFAULT_REF" \
-            --scheduler-sha "$SCHEDULER_SHA" \
-            --checkout-sha "$checkout_sha" \
-            --ci-sha "$ci_sha" \
-            --environment "$ENVIRONMENT"
+          test "$RUN_REF" = "$SCHEDULER_REF"
+          checkout_sha=$(timeout --foreground 30s git ls-remote \
+            "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/dev | awk '{print $1}')
+          test "$checkout_sha" != "$SCHEDULER_SHA"
+          policy_file="$RUNNER_TEMP/recurring-policy.json"
+          ci_file="$RUNNER_TEMP/recurring-ci.json"
+          scripts/query-beta-recurring-policy.sh --output "$policy_file"
+          scripts/query-beta-recurring-ci.sh --sha "$checkout_sha" --output "$ci_file"
+          BETA_RECURRING_REQUIRE_POLICY=true \
+            scripts/authorize-beta-recurring.sh \
+              --event "${{ github.event_name }}" \
+              --run-ref "$RUN_REF" \
+              --default-ref "$SCHEDULER_REF" \
+              --scheduler-sha "$SCHEDULER_SHA" \
+              --checkout-sha "$checkout_sha" \
+              --ci-sha "$checkout_sha" \
+              --environment "$ENVIRONMENT" \
+              --policy-file "$policy_file" \
+              --ci-result-file "$ci_file" \
+              --actor "$ACTOR" \
+              --reviewer "${{ vars.BETA_RECURRING_REVIEWER || '' }}"
+          {
+            printf 'checkout_sha=%s\n' "$checkout_sha"
+            printf 'environment=%s\n' "$ENVIRONMENT"
+          } >>"$GITHUB_OUTPUT"
 
   capture:
     needs: admission
@@ -58,23 +84,36 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: master
-          fetch-depth: 0
-      - name: Capture scheduled point
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - name: Capture and publish scheduled point
         env:
           SLOT: ${{ github.run_id }}
           SOURCE_REVISION: ${{ github.sha }}
+          RUNTIME_REVISION: ${{ needs.admission.outputs.checkout_sha }}
+          CIPHERTEXT_ROOT: ${{ secrets.BETA_RECURRING_CIPHERTEXT_ROOT }}
+          STORAGE_ROOT: ${{ secrets.BETA_BACKUP_STORAGE_ROOT }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = refs/heads/master
-          echo "capture activation requires separately approved VPS and storage credentials"
+          test "$GITHUB_REF" = "$SCHEDULER_REF"
+          test -n "$CIPHERTEXT_ROOT" -a -n "$STORAGE_ROOT"
           scripts/run-beta-recurring-capture.sh \
             --output "$RUNNER_TEMP/recurring-point" \
             --slot "$SLOT" \
             --captured-at "$(date -u +%s)" \
             --source-revision "$SOURCE_REVISION" \
-            --runtime-revision "$SOURCE_REVISION" \
+            --runtime-revision "$RUNTIME_REVISION" \
             --contract-digest "$(sha256sum scripts/run-beta-recurring-capture.sh | awk '{print $1}')" \
-            --proof-digest "$(sha256sum scripts/authorize-beta-recurring.sh | awk '{print $1}')"
+            --proof-digest "$(sha256sum scripts/authorize-beta-recurring.sh | awk '{print $1}')" \
+            --postgres-ciphertext "$CIPHERTEXT_ROOT/postgres.dump.age" \
+            --media-ciphertext "$CIPHERTEXT_ROOT/uploads.tar.gz.age" \
+            --storage-root "$STORAGE_ROOT"
 
   protected-drill:
     needs: admission
@@ -86,11 +125,90 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: master
-          fetch-depth: 0
-      - name: Require protected reviewer custody
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = refs/heads/master
-          test "${{ vars.BETA_RESTORE_PREVENT_SELF_REVIEW || 'true' }}" = true
-          test "${{ vars.BETA_RESTORE_ADMIN_BYPASS || 'false' }}" = false
-          echo "protected recurring restore requires environment reviewer approval and exact-version selection"
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - name: Run exact-version protected drill
+        env:
+          STORAGE_ROOT: ${{ secrets.BETA_BACKUP_STORAGE_ROOT }}
+          POINT_ID: ${{ vars.BETA_RECURRING_DRILL_POINT_ID }}
+          RECEIPT: ${{ secrets.BETA_BACKUP_STORAGE_ROOT }}/receipts/${{ vars.BETA_RECURRING_DRILL_POINT_ID }}/protected-receipt.json
+          PROOF_FILE: ${{ secrets.BETA_RECURRING_DRILL_PROOF_FILE }}
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "$SCHEDULER_REF"
+          test "${{ vars.BETA_RESTORE_PREVENT_SELF_REVIEW || 'false' }}" = true
+          test "${{ vars.BETA_RESTORE_ADMIN_BYPASS || 'true' }}" = false
+          test -n "$STORAGE_ROOT" -a -n "$POINT_ID"
+          test -n "$PROOF_FILE"
+          scripts/run-beta-backup-storage.sh reconcile --storage-root "$STORAGE_ROOT"
+          test -d "$STORAGE_ROOT/points/$POINT_ID"
+          test -s "$STORAGE_ROOT/points/$POINT_ID/point.json"
+          test -x scripts/run-beta-recurring-drill.sh
+          scripts/run-beta-recurring-drill.sh --storage-root "$STORAGE_ROOT" \
+            --point-id "$POINT_ID" --receipt "$RECEIPT" \
+            --proof-file "$PROOF_FILE" \
+            --capture-revision "$(jq -er '.capture.sourceRevision' \
+              "$STORAGE_ROOT/points/$POINT_ID/recovery-point.json")" \
+            --restore-revision "$CHECKOUT_SHA"
+
+  promote:
+    needs: [protected-drill, admission]
+    if: vars.BETA_RECURRING_ACTIVATED == 'true' && (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true')
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-promote
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - name: Promote verified receipt
+        env:
+          STORAGE_ROOT: ${{ secrets.BETA_BACKUP_STORAGE_ROOT }}
+          RECEIPT: ${{ secrets.BETA_BACKUP_STORAGE_ROOT }}/${{ vars.BETA_RECURRING_DRILL_RECEIPT_RELATIVE_PATH }}
+        run: |
+          set -euo pipefail
+          test -s "$RECEIPT" -a -n "$STORAGE_ROOT"
+          scripts/run-beta-backup-storage.sh promote --storage-root "$STORAGE_ROOT" \
+            --receipt "$RECEIPT" --owner promote
+
+  prune:
+    needs: [promote, admission]
+    if: vars.BETA_RECURRING_ACTIVATED == 'true' && (github.event.schedule == '47 3 * * 1' || inputs.drill == 'true')
+    runs-on: ubuntu-24.04
+    environment:
+      name: closed-beta-recurring-prune
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - name: Prune retained points
+        env:
+          STORAGE_ROOT: ${{ secrets.BETA_BACKUP_STORAGE_ROOT }}
+        run: |
+          set -euo pipefail
+          test -n "$STORAGE_ROOT"
+          scripts/run-beta-backup-storage.sh prune --storage-root "$STORAGE_ROOT" \
+            --now "$(date -u +%s)" --owner prune

@@ -18,12 +18,22 @@ class BackupSafetyGate(
             "backup safety enrollment cannot be enabled while enforcement is disabled"
         }
         if (properties.enabled && properties.enrolled) {
+            require(properties.snapshotMaxAgeSeconds == SNAPSHOT_MAX_AGE_SECONDS) {
+                "backup safety snapshot threshold is fixed"
+            }
+            require(properties.verifiedMaxAgeSeconds == VERIFIED_MAX_AGE_SECONDS) {
+                "backup safety verification threshold is fixed"
+            }
             require(properties.environment.matches(Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"))) {
                 "backup safety environment is invalid"
             }
             require(java.nio.file.Path.of(properties.statusPath).isAbsolute) {
                 "backup safety status path must be absolute"
             }
+            require(java.nio.file.Path.of(properties.resolvedWatermarkPath()).isAbsolute) {
+                "backup safety watermark path must be absolute"
+            }
+            reader.validateEnrollmentMount()
         }
     }
 
@@ -59,6 +69,9 @@ class BackupSafetyGate(
     }
 
     companion object {
+        const val SNAPSHOT_MAX_AGE_SECONDS = 1_800L
+        const val VERIFIED_MAX_AGE_SECONDS = 14L * 24L * 60L * 60L
+
         fun disabled(): BackupSafetyGate = BackupSafetyGate(
             BackupSafetyProperties(),
             object : BackupSafetySnapshotReader(

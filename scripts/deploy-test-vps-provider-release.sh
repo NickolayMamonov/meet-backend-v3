@@ -584,7 +584,7 @@ if [ -f "$script_dir/beta-backup-runtime-gate.sh" ]; then
   source "$script_dir/beta-backup-runtime-gate.sh"
 else
   beta_backup_runtime_require_operation() {
-    [ "${BETA_BACKUP_SAFETY_ENABLED:-false}" != true ] ||
+    [ "${APP_BACKUP_SAFETY_ENABLED:-false}" != true ] ||
       fail "backup safety helper is unavailable"
   }
 fi
@@ -650,7 +650,8 @@ if [ "$closed_beta_safety" = true ]; then
   [ -f "$safety_hook" ] && [ ! -L "$safety_hook" ] && [ -x "$safety_hook" ] ||
     fail "closed-beta safety hook is unavailable"
 fi
-beta_backup_runtime_require_operation "$image" test-vps-provider-deploy
+beta_backup_runtime_require_operation "$image" test-vps-provider-deploy \
+  "$root/.env.production"
 
 # This is intentionally an existence/type-only interlock.  SMTP tooling owns
 # parsing, recovery, terminal publication, and cleanup of every object class.

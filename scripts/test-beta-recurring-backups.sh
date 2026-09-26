@@ -9,11 +9,27 @@ trap 'rm -rf -- "$tmp"' EXIT
 good_master=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 good_tooling=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 good_ci=cccccccccccccccccccccccccccccccccccccccc
+dd if=/dev/zero of="$tmp/postgres.dump.age" bs=1 count=16 status=none
+dd if=/dev/zero of="$tmp/uploads.tar.gz.age" bs=1 count=16 status=none
+policy="$tmp/policy.json"
+ci="$tmp/ci.json"
+cp "$root/scripts/fixtures/beta-recurring/policy-valid.json" "$policy"
+sed -e "s/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB/$good_tooling/g" \
+  -e "s/CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC/$good_ci/g" \
+  "$root/scripts/fixtures/beta-recurring/ci-success.json" >"$ci"
 "$root/scripts/authorize-beta-recurring.sh" \
   --event schedule --run-ref refs/heads/master --default-ref refs/heads/master \
   --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
-  --environment closed-beta-recurring-capture >/dev/null ||
+  --environment closed-beta-recurring-capture --policy-file "$policy" \
+  --ci-result-file "$ci" --actor scheduler >/dev/null ||
   fail "authorized master capture was rejected"
+if "$root/scripts/authorize-beta-recurring.sh" \
+  --event workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master \
+  --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
+  --environment closed-beta-recurring-restore --policy-file "$policy" \
+  --ci-result-file "$ci" --actor scheduler --reviewer scheduler >/dev/null 2>&1; then
+  fail "self-review was accepted"
+fi
 if "$root/scripts/authorize-beta-recurring.sh" \
   --event schedule --run-ref refs/heads/dev --default-ref refs/heads/master \
   --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
@@ -30,14 +46,20 @@ fi
   --output "$tmp/point" --slot 1790000000 --captured-at 1790000000 \
   --source-revision "$good_master" --runtime-revision "$good_tooling" \
   --contract-digest "$(printf contract | sha256sum | awk '{print $1}')" \
-  --proof-digest "$(printf proof | sha256sum | awk '{print $1}')" >/dev/null ||
+  --proof-digest "$(printf proof | sha256sum | awk '{print $1}')" \
+  --postgres-ciphertext "$tmp/postgres.dump.age" \
+  --media-ciphertext "$tmp/uploads.tar.gz.age" \
+  --storage-root "$tmp/storage" >/dev/null ||
   fail "capture manifest was not committed"
-[ -f "$tmp/point/recovery-point.json" ] && [ -f "$tmp/point/point.json" ] ||
+[ -f "$tmp/point/recovery-point.json" ] && [ -f "$tmp/storage/points/slot-1790000000/point.json" ] ||
   fail "capture descriptor is incomplete"
 grep -Fq 'manifest_last=true' <("$root/scripts/run-beta-recurring-capture.sh" \
   --output "$tmp/point-2" --slot 1790000001 --captured-at 1790000001 \
   --source-revision "$good_master" --runtime-revision "$good_tooling" \
   --contract-digest "$(printf contract | sha256sum | awk '{print $1}')" \
-  --proof-digest "$(printf proof | sha256sum | awk '{print $1}')") ||
+  --proof-digest "$(printf proof | sha256sum | awk '{print $1}')" \
+  --postgres-ciphertext "$tmp/postgres.dump.age" \
+  --media-ciphertext "$tmp/uploads.tar.gz.age" \
+  --storage-root "$tmp/storage") ||
   fail "capture did not report manifest-last"
 printf 'test-beta-recurring-backups.sh: passed\n'

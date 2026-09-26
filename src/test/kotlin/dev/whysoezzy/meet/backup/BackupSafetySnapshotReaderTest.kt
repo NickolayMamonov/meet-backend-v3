@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import tools.jackson.module.kotlin.jacksonObjectMapper
 import java.nio.file.Files
+import java.security.MessageDigest
 import kotlin.test.assertEquals
 
 class BackupSafetySnapshotReaderTest {
@@ -16,6 +17,13 @@ class BackupSafetySnapshotReaderTest {
         Files.writeString(
             path,
             """{"authorityDigest":"$digest","authorityGeneration":4,"capture":{"capturedAt":1000,"id":"point-1","state":"VALID"},"environment":"closed-beta","observedAt":1100,"schema":"meet-backend/beta-backup-status/v1","verified":{"capturedAt":900,"id":"point-0","state":"VALID"}}""",
+        )
+        val statusDigest = MessageDigest.getInstance("SHA-256")
+            .digest(Files.readAllBytes(path))
+            .joinToString("") { "%02x".format(it) }
+        Files.writeString(
+            directory.resolve("watermark.json"),
+            """{"authorityGeneration":4,"observedAt":1100,"schema":"meet-backend/beta-backup-watermark/v1","statusDigest":"$statusDigest"}""",
         )
         val reader = BackupSafetySnapshotReader(
             jacksonObjectMapper(),

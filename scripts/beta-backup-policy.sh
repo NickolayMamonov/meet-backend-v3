@@ -19,7 +19,7 @@ beta_backup_require_jq() {
 }
 
 beta_backup_validate_status() {
-  local file=$1 now=$2 environment=$3
+  local file=$1 now=$2 environment=$3 watermark=${4-}
   beta_backup_require_jq
   [[ "$now" =~ ^[0-9]+$ ]] || beta_backup_fail 'clock_invalid'
   [[ "$environment" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
@@ -52,11 +52,26 @@ beta_backup_validate_status() {
   (( observed <= now )) || beta_backup_fail 'snapshot_future'
   (( now - observed <= beta_backup_snapshot_block_seconds )) ||
     beta_backup_fail 'snapshot_stale'
+  if [ -n "$watermark" ]; then
+    [ -f "$watermark" ] && [ ! -L "$watermark" ] ||
+      beta_backup_fail 'watermark_missing'
+    local status_digest
+    status_digest=$(sha256sum "$file" | awk '{print $1}')
+    jq -e --arg digest "$status_digest" --argjson generation "$(jq -er '.authorityGeneration' "$file")" \
+      --argjson observed "$observed" '
+        type == "object" and
+        (keys | sort) == ["authorityGeneration","observedAt","schema","statusDigest"] and
+        .schema == "meet-backend/beta-backup-watermark/v1" and
+        .authorityGeneration == $generation and .observedAt == $observed and
+        .statusDigest == $digest and (.statusDigest | test("^[0-9a-f]{64}$"))
+      ' "$watermark" >/dev/null || beta_backup_fail 'watermark_mismatch'
+  fi
 }
 
 beta_backup_require_admission() {
-  local file=$1 now=$2 environment=$3
-  beta_backup_validate_status "$file" "$now" "$environment"
+  local file=$1 now=$2 environment=$3 watermark
+  watermark=${4:-${file%/*}/watermark.json}
+  beta_backup_validate_status "$file" "$now" "$environment" "$watermark"
   jq -e '.verified.state == "VALID"' "$file" >/dev/null ||
     beta_backup_fail 'verified_missing'
   local verified

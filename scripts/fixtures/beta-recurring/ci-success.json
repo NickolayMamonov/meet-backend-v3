@@ -1,0 +1,7 @@
+{
+  "conclusion": "success",
+  "ref": "refs/heads/dev",
+  "sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "sourceSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "workflowPath": ".github/workflows/ci.yml"
+}

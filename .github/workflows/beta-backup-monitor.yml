@@ -23,9 +23,21 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: master
-          fetch-depth: 0
-      - name: Monitor committed authority
+          fetch-depth: 1
+      - name: Deliver authenticated authority snapshot
+        env:
+          STORAGE_ROOT: ${{ secrets.BETA_BACKUP_STORAGE_ROOT }}
+          RECEIVER_ROOT: ${{ secrets.BETA_BACKUP_RECEIVER_ROOT }}
+          INCIDENT_STATE: ${{ secrets.BETA_BACKUP_INCIDENT_STATE }}
+          DEADMANS_URL: ${{ secrets.BETA_BACKUP_DEADMAN_URL }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/master
-          echo "monitor activation requires separately approved private authority and incident destination"
+          test -n "$STORAGE_ROOT" -a -n "$RECEIVER_ROOT" -a -n "$INCIDENT_STATE"
+          scripts/run-beta-backup-monitor.sh \
+            --storage-root "$STORAGE_ROOT" \
+            --environment closed-beta \
+            --now "$(date -u +%s)" \
+            --receiver-root "$RECEIVER_ROOT" \
+            --incident-state "$INCIDENT_STATE" \
+            --deadman-url "$DEADMANS_URL"

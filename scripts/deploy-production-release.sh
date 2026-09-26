@@ -24,7 +24,7 @@ test "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.ope
 test "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = "$VERSION"
 test "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = "https://github.com/NickolayMamonov/meet-backend-v3"
 test "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = "10001:10001"
-beta_backup_runtime_require_operation "$IMAGE" production-deploy
+beta_backup_runtime_require_operation "$IMAGE" production-deploy "$ROOT_DIR/.env.production"
 
 STATE_NAMES=(previous-image previous-image-id previous-version previous-revision previous-uid
   previous-gid previous-upload-volume previous-config.sha256

@@ -2,11 +2,17 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME" >&2
+  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME [--policy-file PATH --ci-result-file PATH --actor LOGIN --reviewer LOGIN]" >&2
   exit 2
 }
 
-event='' run_ref='' default_ref='' scheduler_sha='' checkout_sha='' ci_sha='' environment=''
+fail() {
+  echo "BACKUP_CUSTODY_BLOCKED:$1" >&2
+  exit 1
+}
+
+event='' run_ref='' default_ref='' scheduler_sha='' checkout_sha='' ci_sha=''
+environment='' policy_file='' ci_result_file='' actor='' reviewer=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --event) [ "$#" -ge 2 ] || usage; event=$2; shift 2 ;;
@@ -16,20 +22,81 @@ while [ "$#" -gt 0 ]; do
     --checkout-sha) [ "$#" -ge 2 ] || usage; checkout_sha=$2; shift 2 ;;
     --ci-sha) [ "$#" -ge 2 ] || usage; ci_sha=$2; shift 2 ;;
     --environment) [ "$#" -ge 2 ] || usage; environment=$2; shift 2 ;;
+    --policy-file) [ "$#" -ge 2 ] || usage; policy_file=$2; shift 2 ;;
+    --ci-result-file) [ "$#" -ge 2 ] || usage; ci_result_file=$2; shift 2 ;;
+    --actor) [ "$#" -ge 2 ] || usage; actor=$2; shift 2 ;;
+    --reviewer) [ "$#" -ge 2 ] || usage; reviewer=$2; shift 2 ;;
     *) usage ;;
   esac
 done
 case "$event" in schedule|workflow_dispatch) ;; *) usage ;; esac
-[ "$run_ref" = refs/heads/master ] && [ "$default_ref" = refs/heads/master ] || {
-  echo "recurring scheduler must run from the authorized master ref" >&2; exit 1;
-}
+[ "$run_ref" = refs/heads/master ] && [ "$default_ref" = refs/heads/master ] ||
+  fail scheduler_ref
 for sha in "$scheduler_sha" "$checkout_sha" "$ci_sha"; do
-  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "revision is invalid" >&2; exit 1; }
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail revision
 done
 [[ "$environment" =~ ^closed-beta-recurring-(capture|probe|restore|promote|prune|monitor)$ ]] ||
-  { echo "recurring environment is invalid" >&2; exit 1; }
-[ "$scheduler_sha" != "$checkout_sha" ] || {
-  echo "scheduler and detached tooling revisions must remain distinct evidence" >&2; exit 1;
+  fail environment
+[ "$scheduler_sha" != "$checkout_sha" ] || fail revision_collision
+
+validate_policy() {
+  local policy=$1
+  command -v jq >/dev/null 2>&1 || fail jq_unavailable
+  [ -f "$policy" ] && [ ! -L "$policy" ] || fail policy_missing
+  jq -e --arg environment "$environment" --arg run_ref "$run_ref" '
+    type=="object" and
+    (keys|sort)==["adminBypassAllowed","defaultBranch","environments",
+      "preventSelfReview","registered","reviewerRequired","workflowPath"] and
+    .registered==true and .defaultBranch=="refs/heads/master" and
+    .workflowPath==".github/workflows/beta-recurring-backups.yml" and
+    .adminBypassAllowed==false and .preventSelfReview==true and
+    (.reviewerRequired==true or $environment != "closed-beta-recurring-restore") and
+    ([.environments[] | select(.name==$environment and
+      .branchPolicy==$run_ref and .adminBypassAllowed==false)] | length)==1 and
+    ([.environments[] | select(.name==$environment) |
+      .capabilities] | length)==1
+  ' "$policy" >/dev/null || fail policy_drift
+  local expected
+  case "$environment" in
+    closed-beta-recurring-capture) expected='["mutex","point_write"]' ;;
+    closed-beta-recurring-probe) expected='["probe_read"]' ;;
+    closed-beta-recurring-restore) expected='["identity","point_read"]' ;;
+    closed-beta-recurring-promote) expected='["head_write","mutex","receipt_write"]' ;;
+    closed-beta-recurring-prune) expected='["delete","inventory","mutex","snapshot_read"]' ;;
+    closed-beta-recurring-monitor) expected='["authority_read","heartbeat_write","incident_write","snapshot_write"]' ;;
+  esac
+  jq -e --arg environment "$environment" --argjson expected "$expected" \
+    '([.environments[] | select(.name==$environment) | .capabilities] | .[0]) == $expected' \
+    "$policy" >/dev/null || fail role_capability_drift
 }
-printf 'recurring_authorized=true environment=%s run_ref=%s scheduler_sha=%s checkout_sha=%s ci_sha=%s\n' \
-  "$environment" "$run_ref" "$scheduler_sha" "$checkout_sha" "$ci_sha"
+
+validate_ci() {
+  local result=$1
+  command -v jq >/dev/null 2>&1 || fail jq_unavailable
+  [ -f "$result" ] && [ ! -L "$result" ] || fail ci_evidence_missing
+  jq -e --arg checkout "$checkout_sha" --arg ci "$ci_sha" '
+    type=="object" and
+    (keys|sort)==["conclusion","ref","sha","sourceSha","workflowPath"] and
+    .conclusion=="success" and .ref=="refs/heads/dev" and
+    .sourceSha==$checkout and .sha==$ci and
+    .workflowPath==".github/workflows/ci.yml"
+  ' "$result" >/dev/null || fail ci_provenance
+}
+
+if [ -n "$policy_file" ] || [ -n "$ci_result_file" ]; then
+  [ -n "$policy_file" ] && [ -n "$ci_result_file" ] || usage
+  validate_policy "$policy_file"
+  validate_ci "$ci_result_file"
+  [[ "$actor" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail actor
+  if [ "$environment" = closed-beta-recurring-restore ]; then
+    [[ "$reviewer" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail reviewer_missing
+    [ "$reviewer" != "$actor" ] || fail self_review
+  fi
+fi
+if [ "${BETA_RECURRING_REQUIRE_POLICY:-false}" = true ]; then
+  [ -n "$policy_file" ] && [ -n "$ci_result_file" ] || fail policy_evidence_required
+fi
+
+printf 'recurring_authorized=true environment=%s run_ref=%s scheduler_sha=%s checkout_sha=%s ci_sha=%s policy_validated=%s\n' \
+  "$environment" "$run_ref" "$scheduler_sha" "$checkout_sha" "$ci_sha" \
+  "$([ -n "$policy_file" ] && echo true || echo false)"

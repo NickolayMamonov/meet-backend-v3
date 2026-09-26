@@ -9,6 +9,7 @@ import tools.jackson.databind.ObjectMapper
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermission
 
 class BackupSafetySnapshotReadException(message: String) : RuntimeException(message)
 
@@ -17,9 +18,36 @@ open class BackupSafetySnapshotReader(
     private val objectMapper: ObjectMapper,
     private val properties: BackupSafetyProperties,
 ) {
+    fun validateEnrollmentMount() {
+        val root = controlRoot()
+        require(Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS))
+        require(!Files.isSymbolicLink(root))
+        val mode = runCatching {
+            Files.getPosixFilePermissions(root).toMode()
+        }.getOrNull()
+        if (mode != null) {
+            require(mode == properties.controlRootMode.toInt(8))
+        }
+        val status = Path.of(properties.statusPath)
+        val watermark = Path.of(properties.resolvedWatermarkPath())
+        require(Files.isRegularFile(status, LinkOption.NOFOLLOW_LINKS))
+        require(Files.isRegularFile(watermark, LinkOption.NOFOLLOW_LINKS))
+        if (mode != null) {
+            require(readMode(status) == CONTROL_FILE_MODE)
+            require(readMode(watermark) == CONTROL_FILE_MODE)
+            require(readUnixOwner(root, "uid") == properties.controlRootUid)
+            require(readUnixOwner(root, "gid") == properties.controlRootGid)
+            require(readUnixOwner(status, "uid") == properties.controlRootUid)
+            require(readUnixOwner(status, "gid") == properties.controlRootGid)
+            require(readUnixOwner(watermark, "uid") == properties.controlRootUid)
+            require(readUnixOwner(watermark, "gid") == properties.controlRootGid)
+        }
+    }
+
     fun read(): BackupSafetySnapshot {
         val path = Path.of(properties.statusPath)
         val bytes = try {
+            validateRootForRead()
             require(Files.isRegularFile(path) && !Files.isSymbolicLink(path)) { "status file is unavailable" }
             require(Files.size(path) <= MAX_BYTES) { "status file is too large" }
             Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)
@@ -27,6 +55,14 @@ open class BackupSafetySnapshotReader(
                 .also { require(it.size <= MAX_BYTES) { "status file is too large" } }
         } catch (_: Exception) {
             throw BackupSafetySnapshotReadException("status file is unavailable")
+        }
+        val watermarkBytes = try {
+            val watermarkPath = Path.of(properties.resolvedWatermarkPath())
+            require(Files.isRegularFile(watermarkPath) && !Files.isSymbolicLink(watermarkPath))
+            require(Files.size(watermarkPath) <= MAX_BYTES)
+            Files.readAllBytes(watermarkPath)
+        } catch (_: Exception) {
+            throw BackupSafetySnapshotReadException("watermark is unavailable")
         }
         try {
             val reader = objectMapper.reader(
@@ -51,11 +87,46 @@ open class BackupSafetySnapshotReader(
             require(snapshot.authorityDigest.matches(Regex(BackupSafetySnapshot.DIGEST_PATTERN)))
             validateEvidence(snapshot.capture, snapshot.observedAtEpochSeconds)
             validateEvidence(snapshot.verified, snapshot.observedAtEpochSeconds)
+            validateWatermark(watermarkBytes, snapshot, bytes)
             return snapshot
         } catch (_: Exception) {
             throw BackupSafetySnapshotReadException("status schema is invalid")
         }
     }
+
+    private fun validateRootForRead() {
+        val root = controlRoot()
+        require(Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS))
+        require(!Files.isSymbolicLink(root))
+    }
+
+    private fun readMode(path: Path): Int =
+        Files.getPosixFilePermissions(path).toMode()
+
+    private fun readUnixOwner(path: Path, field: String): Long =
+        (Files.readAttributes(path, "unix:$field", LinkOption.NOFOLLOW_LINKS)[field] as Number).toLong()
+
+    private fun controlRoot(): Path = Path.of(properties.statusPath).toAbsolutePath().normalize().parent
+        ?: throw IllegalArgumentException("status path has no parent")
+
+    private fun validateWatermark(bytes: ByteArray, snapshot: BackupSafetySnapshot, statusBytes: ByteArray) {
+        val root = objectMapper.reader(
+            DeserializationFeature.FAIL_ON_TRAILING_TOKENS,
+        ).with(StreamReadFeature.STRICT_DUPLICATE_DETECTION).readTree(bytes)
+        require(root.isObject)
+        require(root.propertyNames().asSequence().toSet() == WATERMARK_FIELDS)
+        require(root.path("schema").textValue() == WATERMARK_SCHEMA)
+        require(root.path("authorityGeneration").isIntegralNumber)
+        require(root.path("observedAt").isIntegralNumber)
+        require(root.path("statusDigest").textValue()?.matches(Regex(BackupSafetySnapshot.DIGEST_PATTERN)) == true)
+        require(root.path("authorityGeneration").longValue() == snapshot.authorityGeneration)
+        require(root.path("observedAt").longValue() == snapshot.observedAtEpochSeconds)
+        require(root.path("statusDigest").textValue() == sha256(statusBytes))
+    }
+
+    private fun sha256(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it) }
 
     private fun evidence(root: JsonNode, name: String): BackupEvidence {
         val node = root.get(name)
@@ -100,6 +171,8 @@ open class BackupSafetySnapshotReader(
 
     private companion object {
         const val MAX_BYTES = 64 * 1024L
+        const val CONTROL_FILE_MODE = 640
+        const val WATERMARK_SCHEMA = "meet-backend/beta-backup-watermark/v1"
         val TOP_LEVEL_FIELDS = setOf(
             "schema",
             "environment",
@@ -109,6 +182,20 @@ open class BackupSafetySnapshotReader(
             "authorityGeneration",
             "authorityDigest",
         )
+        val WATERMARK_FIELDS = setOf("authorityGeneration", "observedAt", "schema", "statusDigest")
         val EVIDENCE_FIELDS = setOf("state", "id", "capturedAt")
     }
+}
+
+private fun Set<PosixFilePermission>.toMode(): Int {
+    fun has(permission: PosixFilePermission) = if (contains(permission)) 1 else 0
+    return has(PosixFilePermission.OWNER_READ) * 400 +
+        has(PosixFilePermission.OWNER_WRITE) * 200 +
+        has(PosixFilePermission.OWNER_EXECUTE) * 100 +
+        has(PosixFilePermission.GROUP_READ) * 40 +
+        has(PosixFilePermission.GROUP_WRITE) * 20 +
+        has(PosixFilePermission.GROUP_EXECUTE) * 10 +
+        has(PosixFilePermission.OTHERS_READ) * 4 +
+        has(PosixFilePermission.OTHERS_WRITE) * 2 +
+        has(PosixFilePermission.OTHERS_EXECUTE)
 }

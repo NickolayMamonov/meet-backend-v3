@@ -36,8 +36,8 @@ app:
       enrolled: ${APP_BACKUP_SAFETY_ENROLLED:false}
       environment: ${APP_BACKUP_SAFETY_ENVIRONMENT:}
       status-path: ${APP_BACKUP_SAFETY_STATUS_PATH:/var/lib/meet-production/beta-backup-control/status.json}
-      snapshot-max-age-seconds: ${APP_BACKUP_SAFETY_SNAPSHOT_MAX_AGE_SECONDS:1800}
-      verified-max-age-seconds: ${APP_BACKUP_SAFETY_VERIFIED_MAX_AGE_SECONDS:1209600}
+      watermark-path: ${APP_BACKUP_SAFETY_WATERMARK_PATH:/var/lib/meet-production/beta-backup-control/watermark.json}
+      control-root-mode: ${APP_BACKUP_SAFETY_CONTROL_ROOT_MODE:750}
 
 management:
   endpoints:

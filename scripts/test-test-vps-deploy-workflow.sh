@@ -5,6 +5,7 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT_DIR"
 workflow=.github/workflows/deploy-test-vps.yml
 deploy=scripts/deploy-test-vps-release.sh
+update=scripts/update-production-release.sh
 runtime=scripts/test-vps-runtime-invariants.sh
 provider_deploy=scripts/deploy-test-vps-provider-release.sh
 provider_helper=scripts/test-vps-provider-credential.py
@@ -17,6 +18,7 @@ closed_beta_fixture=scripts/test-test-vps-closed-beta-deploy.sh
 baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
 
 [ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ] &&
+  [ -f "$update" ] &&
   [ -f "$provider_deploy" ] && [ -f "$provider_helper" ] &&
   [ -f "$provider_tests" ] && [ -f "$provider_runtime" ] &&
   [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
@@ -26,6 +28,7 @@ deploy_text=$(<"$deploy")
 runtime_text=$(<"$runtime")
 provider_deploy_text=$(<"$provider_deploy")
 provider_helper_text=$(<"$provider_helper")
+update_text=$(<"$update")
 # shellcheck source=scripts/deploy-test-vps-release.sh
 source "$deploy"
 
@@ -79,6 +82,11 @@ for text in \
   'index=10' \
   'retention=applied'; do
   require "$text" "$workflow_text" "test VPS workflow"
+done
+for text in \
+  'source "$SCRIPTS_DIR/beta-backup-runtime-gate.sh"' \
+  'beta_backup_runtime_require_operation "" production-update "$ENV_FILE"'; do
+  require "$text" "$update_text" "standalone production update gate"
 done
 
 for text in \
@@ -184,8 +192,7 @@ for frozen in \
   .github/workflows/promote-dev-digest-to-test-vps.yml \
   scripts/deploy-test-vps-release.sh \
   scripts/test-vps-runtime-invariants.sh \
-  scripts/production-compose.sh \
-  scripts/update-production-release.sh; do
+  scripts/production-compose.sh; do
   git diff --quiet "$baseline" -- "$frozen" ||
     { echo "frozen release/promotion file changed: $frozen" >&2; exit 1; }
 done

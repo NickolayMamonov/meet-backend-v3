@@ -7,27 +7,42 @@ tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 digest=$(printf authority | sha256sum | awk '{print $1}')
 now=1790001000
-cat >"$tmp/status.json" <<EOF
+mkdir "$tmp/control"
+chmod 750 "$tmp/control" 2>/dev/null || true
+cat >"$tmp/control/status.json" <<EOF
 {"authorityDigest":"$digest","authorityGeneration":1,"capture":{"capturedAt":1790000000,"id":"point-1","state":"VALID"},"environment":"closed-beta","observedAt":1790001000,"schema":"meet-backend/beta-backup-status/v1","verified":{"capturedAt":1790000000,"id":"point-1","state":"VALID"}}
 EOF
-BETA_BACKUP_STATUS_PATH="$tmp/status.json" BETA_BACKUP_ENVIRONMENT=closed-beta \
-  BETA_BACKUP_NOW_EPOCH="$now" BETA_BACKUP_SAFETY_ENABLED=true \
-  BETA_BACKUP_SAFETY_ENROLLED=true \
-  "$root/scripts/beta-backup-runtime-gate.sh" >/dev/null 2>&1 || true
-if BETA_BACKUP_STATUS_PATH="$tmp/missing.json" BETA_BACKUP_ENVIRONMENT=closed-beta \
-  BETA_BACKUP_NOW_EPOCH="$now" BETA_BACKUP_SAFETY_ENABLED=true \
-  BETA_BACKUP_SAFETY_ENROLLED=true \
-  bash -c "source '$root/scripts/beta-backup-runtime-gate.sh'; beta_backup_runtime_require_operation '' smtp-apply" \
+status_digest=$(sha256sum "$tmp/control/status.json" | awk '{print $1}')
+jq -cnS --arg digest "$status_digest" \
+  '{schema:"meet-backend/beta-backup-watermark/v1",authorityGeneration:1,
+    observedAt:1790001000,statusDigest:$digest}' >"$tmp/control/watermark.json"
+cat >"$tmp/.env.production" <<EOF
+APP_BACKUP_SAFETY_ENABLED=true
+APP_BACKUP_SAFETY_ENROLLED=true
+APP_BACKUP_SAFETY_ENVIRONMENT=closed-beta
+APP_BACKUP_SAFETY_STATUS_PATH=$tmp/control/status.json
+APP_BACKUP_SAFETY_WATERMARK_PATH=$tmp/control/watermark.json
+APP_BACKUP_SAFETY_SNAPSHOT_MAX_AGE_SECONDS=1800
+APP_BACKUP_SAFETY_VERIFIED_MAX_AGE_SECONDS=1209600
+EOF
+if APP_BACKUP_SAFETY_NOW_EPOCH="$now" bash -c \
+  "source '$root/scripts/beta-backup-runtime-gate.sh'; beta_backup_runtime_require_operation '' smtp-apply '$tmp/.env.production'" \
   >/dev/null 2>&1; then
-  fail "missing snapshot admitted SMTP mutation"
+  :
+else
+  fail "healthy documented APP enrollment was denied"
 fi
-sed 's/"capturedAt":1790000000/"capturedAt":1788791400/g' "$tmp/status.json" >"$tmp/stale.json"
-if BETA_BACKUP_STATUS_PATH="$tmp/stale.json" BETA_BACKUP_ENVIRONMENT=closed-beta \
-  BETA_BACKUP_NOW_EPOCH="$now" BETA_BACKUP_SAFETY_ENABLED=true \
-  BETA_BACKUP_SAFETY_ENROLLED=true \
-  bash -c "source '$root/scripts/beta-backup-runtime-gate.sh'; beta_backup_runtime_require_operation '' production-update" \
+if APP_BACKUP_SAFETY_NOW_EPOCH="$now" bash -c \
+  "source '$root/scripts/beta-backup-runtime-gate.sh'; beta_backup_runtime_require_operation '' smtp-apply '$tmp/missing.env'" \
   >/dev/null 2>&1; then
-  fail "stale verified state admitted standalone update"
+  fail "missing enrollment file admitted SMTP mutation"
+fi
+sed 's/1790001000/1789999000/g' "$tmp/control/status.json" >"$tmp/control/stale.json"
+sed "s#status.json#stale.json#" "$tmp/.env.production" >"$tmp/stale.env.production"
+if APP_BACKUP_SAFETY_NOW_EPOCH="$now" bash -c \
+  "source '$root/scripts/beta-backup-runtime-gate.sh'; beta_backup_runtime_require_operation '' production-update '$tmp/stale.env.production'" \
+  >/dev/null 2>&1; then
+  fail "stale snapshot admitted standalone update"
 fi
 grep -Fq 'beta_backup_runtime_require_operation' "$root/scripts/configure-test-vps-yandex-smtp.sh" ||
   fail "SMTP tool lacks independent safety admission"

@@ -1,0 +1,16 @@
+{
+  "adminBypassAllowed": false,
+  "defaultBranch": "refs/heads/master",
+  "environments": [
+    {"name":"closed-beta-recurring-capture","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["mutex","point_write"]},
+    {"name":"closed-beta-recurring-probe","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["probe_read"]},
+    {"name":"closed-beta-recurring-restore","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["identity","point_read"]},
+    {"name":"closed-beta-recurring-promote","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["head_write","mutex","receipt_write"]},
+    {"name":"closed-beta-recurring-prune","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["delete","inventory","mutex","snapshot_read"]},
+    {"name":"closed-beta-recurring-monitor","branchPolicy":"refs/heads/master","adminBypassAllowed":false,"capabilities":["authority_read","heartbeat_write","incident_write","snapshot_write"]}
+  ],
+  "preventSelfReview": true,
+  "registered": true,
+  "reviewerRequired": true,
+  "workflowPath": ".github/workflows/beta-recurring-backups.yml"
+}

@@ -92,6 +92,8 @@ runtime_helper=$script_dir/test-vps-runtime-invariants.sh
 source "$script_dir/beta-backup-runtime-gate.sh"
 # shellcheck source=/dev/null
 source "$runtime_helper"
+beta_backup_runtime_resolve_config "$root/.env.production" ||
+  fail_result precheck_failed 20
 
 state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
 transactions=$state_root/.smtp-transactions
@@ -318,7 +320,7 @@ load_journal() {
   done
   [ "${journal[version]}" = 1 ] || [ "${journal[version]}" = 2 ] || return 1
   if [ "${journal[version]}" = 1 ]; then
-    [ "${BETA_BACKUP_SAFETY_ENABLED:-false}" != true ] || return 1
+    [ "${APP_BACKUP_SAFETY_ENABLED:-false}" != true ] || return 1
   else
     [ "$line_count" -eq "${#journal_allowed[@]}" ] || return 1
     [ "${journal[safety_admitted]}" = true ] || return 1
@@ -685,6 +687,15 @@ recover_transaction() {
   local saved_fail_at=${MEE_SMTP_FAIL_AT:-}
   MEE_SMTP_INTERRUPT_BOUNDARY=
   MEE_SMTP_FAIL_AT=
+  if [ "${journal[version]}" = 2 ]; then
+    beta_backup_runtime_revalidate_fingerprints \
+      "${journal[safety_enrollment_fingerprint]}" \
+      "${journal[safety_mount_fingerprint]}" \
+      "${journal[safety_snapshot_digest]}" \
+      "${journal[safety_observed_at]}" \
+      "${journal[safety_verified_at]}" \
+      "$root/.env.production" || return 1
+  fi
   interrupt_boundary restore
   restore_files || return 1
   if [ -e "$transaction_dir/had-active-compose" ]; then
@@ -1112,7 +1123,7 @@ sync_directory "$transactions" transaction_directory
 
 journal=()
 journal[version]=1
-if [ "${BETA_BACKUP_SAFETY_ENABLED:-false}" = true ]; then
+if [ "${APP_BACKUP_SAFETY_ENABLED:-false}" = true ]; then
   journal[version]=2
   mapfile -t safety_admission_values < <(beta_backup_runtime_admission_fingerprints) ||
     fail_result precheck_failed 20
