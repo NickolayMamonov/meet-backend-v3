@@ -22,9 +22,22 @@ class BackupSafetyGateTest {
         Files.writeString(path, status(observedAt = 1_000_000, captureAt = 800_000, verifiedAt = 999_000))
         writeWatermark(path, 1, 1_000_000)
         val properties = propertiesFor(directory, path)
+        val reader = BackupSafetySnapshotReader(jacksonObjectMapper(), properties)
+        val rootAttrs = Files.readAttributes(directory, "unix:mode,uid,gid")
+        val statusAttrs = Files.readAttributes(path, "unix:mode,uid,gid")
+        val watermarkAttrs = Files.readAttributes(directory.resolve("watermark.json"), "unix:mode,uid,gid")
+        System.err.println(
+            "backup-safety-fixture root=${rootAttrs["mode"]}:${rootAttrs["uid"]}:${rootAttrs["gid"]}" +
+                " status=${statusAttrs["mode"]}:${statusAttrs["uid"]}:${statusAttrs["gid"]}" +
+                " watermark=${watermarkAttrs["mode"]}:${watermarkAttrs["uid"]}:${watermarkAttrs["gid"]}" +
+                " configured=${properties.controlRootMode}:${properties.controlRootUid}:${properties.controlRootGid}" +
+                " identity=${properties.mountIdentity}",
+        )
+        reader.validateEnrollmentMount()
+        reader.read()
         BackupSafetyGate(
             properties,
-            BackupSafetySnapshotReader(jacksonObjectMapper(), properties),
+            reader,
             Clock.fixed(Instant.ofEpochSecond(1_000_000), ZoneOffset.UTC),
         ).requireAdmitted("test")
     }
