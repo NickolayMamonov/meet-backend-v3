@@ -275,6 +275,7 @@ class BetaRecoveryDatabaseProofPostgresTest : IntegrationTestSupport() {
                 "tables",
             ),
             proof.path("validity").propertyNames().asSequence().toList().sorted(),
+            proof.toPrettyString(),
         )
         val serialized = objectMapper.writeValueAsString(proof)
         assertEquals(serialized, proof.toString())
