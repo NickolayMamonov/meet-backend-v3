@@ -47,6 +47,14 @@ if "$root/scripts/run-beta-backup-storage.sh" publish --source "$tmp/point" \
 else
   fail "idempotent publish was rejected"
 fi
+cp -r "$tmp/point" "$tmp/changed-point"
+printf changed >"$tmp/changed-point/postgres.dump.age"
+if "$root/scripts/run-beta-backup-storage.sh" publish --source "$tmp/changed-point" \
+  --storage-root "$tmp/storage" --point-id slot-1790000000 --slot 1790000000 \
+  --captured-at 1790000000 --owner test >/dev/null 2>&1; then
+  fail "changed same-slot replay was accepted"
+fi
+rm -rf "$tmp/changed-point"
 descriptor_digest=$(jq -cS 'del(.descriptorDigest)' \
   "$tmp/storage/points/slot-1790000000/point.json" |
   sha256sum | awk '{print $1}')
@@ -122,7 +130,7 @@ case "${FAKE_AWS_MODE:?}" in
   timeout) exit 124 ;;
   malformed) printf '{}\n'; exit 0 ;;
   notfound)
-    printf 'An error occurred (404) when calling HeadObject operation: Not Found\n' >&2
+    printf 'An error occurred (404) when calling the HeadObject operation: Not Found\n' >&2
     exit 3
     ;;
   multipart)

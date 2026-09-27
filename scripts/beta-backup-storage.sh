@@ -10,6 +10,7 @@ readonly BETA_STORAGE_MULTIPART_THRESHOLD_BYTES=8388608
 readonly BETA_STORAGE_MULTIPART_PART_BYTES=8388608
 readonly BETA_STORAGE_MULTIPART_MAX_PARTS=10000
 readonly BETA_STORAGE_MULTIPART_TOTAL_TIMEOUT_SECONDS=3600
+readonly BETA_STORAGE_CONDITIONAL_PUT_MAX_BYTES=5368709120
 readonly BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES=65536
 
 # This module owns the bounded versioned writer protocol used by recurring
@@ -273,19 +274,19 @@ beta_storage_aws() {
   local operation=${1:-}
   case "$operation" in
     head-object)
-      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An\ error\ occurred\ \((404|NoSuchKey)\)\ when\ calling\ HeadObject\ operation: ]] &&
+      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An[[:space:]]error[[:space:]]occurred[[:space:]]\((404|NoSuchKey)\)[[:space:]]when[[:space:]]calling[[:space:]](the[[:space:]])?HeadObject[[:space:]]operation: ]] &&
         return 3
       ;;
     get-object)
-      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An\ error\ occurred\ \((404|NoSuchKey)\)\ when\ calling\ GetObject\ operation: ]] &&
+      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An[[:space:]]error[[:space:]]occurred[[:space:]]\((404|NoSuchKey)\)[[:space:]]when[[:space:]]calling[[:space:]](the[[:space:]])?GetObject[[:space:]]operation: ]] &&
         return 3
       ;;
     get-bucket-lifecycle-configuration)
-      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An\ error\ occurred\ \(NoSuchLifecycleConfiguration\)\ when\ calling\ GetBucketLifecycleConfiguration\ operation: ]] &&
+      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An[[:space:]]error[[:space:]]occurred[[:space:]]\(NoSuchLifecycleConfiguration\)[[:space:]]when[[:space:]]calling[[:space:]](the[[:space:]])?GetBucketLifecycleConfiguration[[:space:]]operation: ]] &&
         return 3
       ;;
     list-parts)
-      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An\ error\ occurred\ \(NoSuchUpload\)\ when\ calling\ ListParts\ operation: ]] &&
+      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An[[:space:]]error[[:space:]]occurred[[:space:]]\(NoSuchUpload\)[[:space:]]when[[:space:]]calling[[:space:]](the[[:space:]])?ListParts[[:space:]]operation: ]] &&
         return 3
       ;;
   esac
@@ -570,20 +571,28 @@ beta_storage_provider_put_conditional() {
   sha=$(sha256sum "$source" | awk '{print $1}')
   source_length=$(wc -c <"$source" | tr -d '[:space:]')
   if (( source_length > BETA_STORAGE_MULTIPART_THRESHOLD_BYTES )); then
-    [ -z "$if_match" ] || beta_storage_fail multipart_cas_unsupported
     if [ "$if_none_match" = true ]; then
-      local existing_head
-      existing_head=$(mktemp)
-      if beta_storage_remote_head "$key" "$existing_head"; then
-        rm -f -- "$existing_head"
-        beta_storage_fail cas_conflict
-      else
-        local existing_status=$?
-        rm -f -- "$existing_head"
-        [ "$existing_status" -eq 1 ] ||
-          beta_storage_fail provider_existing_object_read_failed
-      fi
+      (( source_length <= BETA_STORAGE_CONDITIONAL_PUT_MAX_BYTES )) ||
+        beta_storage_fail conditional_object_too_large
+      output=$(beta_storage_aws_mutation put-object --bucket "$BETA_BACKUP_BUCKET" \
+        --key "$key" --body "$source" --metadata "sha256=$sha" \
+        --if-none-match '*') ||
+        beta_storage_fail provider_conditional_write_failed
+      version=$(jq -er '.VersionId // empty' <<<"$output") ||
+        beta_storage_fail provider_version_missing
+      local verify
+      verify=$(mktemp)
+      beta_storage_provider_get '' "$key" "$version" "$verify" "$sha" || {
+        rm -f -- "$verify"
+        beta_storage_fail provider_put_unverified
+      }
+      rm -f -- "$verify"
+      jq -cnS --arg version "$version" --arg sha "$sha" \
+        --argjson length "$source_length" \
+        '{versionId:$version,sha256:$sha,length:$length}'
+      return
     fi
+    [ -z "$if_match" ] || beta_storage_fail multipart_cas_unsupported
     output=$(beta_storage_provider_put_multipart '' "$key" "$source") ||
       beta_storage_fail provider_multipart_failed
     version=$(jq -er '.versionId // empty' <<<"$output") ||
@@ -619,6 +628,75 @@ beta_storage_provider_put_conditional() {
   jq -cnS --arg version "$version" --arg sha "$sha" \
     --argjson length "$(wc -c <"$source")" \
     '{versionId:$version,sha256:$sha,length:$length}'
+}
+
+beta_storage_source_matches_descriptor() {
+  local source=$1 descriptor=$2
+  local manifest_sha db_sha media_sha db_len media_len
+  manifest_sha=$(sha256sum "$source/recovery-point.json" | awk '{print $1}')
+  db_sha=$(sha256sum "$source/postgres.dump.age" | awk '{print $1}')
+  media_sha=$(sha256sum "$source/uploads.tar.gz.age" | awk '{print $1}')
+  db_len=$(wc -c <"$source/postgres.dump.age" | tr -d '[:space:]')
+  media_len=$(wc -c <"$source/uploads.tar.gz.age" | tr -d '[:space:]')
+  jq -e --arg point "$(jq -er '.pointId' "$source/recovery-point.json")" \
+    --arg slot "$(jq -er '.slotId' "$source/recovery-point.json")" \
+    --arg source_revision "$(jq -er '.capture.sourceRevision' "$source/recovery-point.json")" \
+    --arg runtime "$(jq -er '.runtimeRevision' "$source/recovery-point.json")" \
+    --arg contract "$(jq -er '.contractDigest' "$source/recovery-point.json")" \
+    --arg proof "$(jq -er '.proofDigest' "$source/recovery-point.json")" \
+    --arg command "$(jq -er '.captureCommandDigest' "$source/recovery-point.json")" \
+    --arg evidence "$(jq -er '.captureEvidenceDigest' "$source/recovery-point.json")" \
+    --arg manifest "$manifest_sha" --arg db_sha "$db_sha" --arg media_sha "$media_sha" \
+    --argjson captured "$(jq -er '.capture.capturedAt' "$source/recovery-point.json")" \
+    --argjson db_len "$db_len" --argjson media_len "$media_len" '
+    .schema=="meet-backend/beta-backup-descriptor/v2" and
+    .pointId==$point and .slotId==$slot and
+    .capture.capturedAt==$captured and
+    .capture.sourceRevision==$source_revision and
+    .runtimeRevision==$runtime and .contractDigest==$contract and
+    .proofDigest==$proof and .captureCommandDigest==$command and
+    .captureEvidenceDigest==$evidence and .manifestDigest==$manifest and
+    .ciphertexts.database.length==$db_len and
+    .ciphertexts.database.sha256==$db_sha and
+    .ciphertexts.uploads.length==$media_len and
+    .ciphertexts.uploads.sha256==$media_sha
+  ' "$descriptor" >/dev/null || return 1
+  if [ -e "$source/capture-database-proof.json" ] ||
+    [ -e "$source/capture-media-proof.json" ]; then
+    [ -f "$source/capture-database-proof.json" ] &&
+      [ -f "$source/capture-media-proof.json" ] || return 1
+    local database_sha media_proof_sha database_len media_proof_len
+    database_sha=$(sha256sum "$source/capture-database-proof.json" | awk '{print $1}')
+    media_proof_sha=$(sha256sum "$source/capture-media-proof.json" | awk '{print $1}')
+    database_len=$(wc -c <"$source/capture-database-proof.json" | tr -d '[:space:]')
+    media_proof_len=$(wc -c <"$source/capture-media-proof.json" | tr -d '[:space:]')
+    jq -e --arg db_sha "$database_sha" --arg media_sha "$media_proof_sha" \
+      --argjson db_len "$database_len" --argjson media_len "$media_proof_len" \
+      '.proofs|keys|sort==["database","media"] and
+       .database.sha256==$db_sha and .database.length==$db_len and
+       .media.sha256==$media_sha and .media.length==$media_len' \
+      "$descriptor" >/dev/null || return 1
+  else
+    jq -e '.proofs|keys|length==0' "$descriptor" >/dev/null || return 1
+  fi
+}
+
+beta_storage_source_matches_local_point() {
+  local source=$1 directory=$2
+  cmp -s "$source/recovery-point.json" "$directory/recovery-point.json" &&
+    cmp -s "$source/postgres.dump.age" "$directory/postgres.dump.age" &&
+    cmp -s "$source/uploads.tar.gz.age" "$directory/uploads.tar.gz.age" || return 1
+  if [ -e "$source/capture-database-proof.json" ] ||
+    [ -e "$source/capture-media-proof.json" ]; then
+    [ -f "$source/capture-database-proof.json" ] &&
+      [ -f "$source/capture-media-proof.json" ] &&
+      cmp -s "$source/capture-database-proof.json" "$directory/capture-database-proof.json" &&
+      cmp -s "$source/capture-media-proof.json" "$directory/capture-media-proof.json" ||
+      return 1
+  else
+    [ ! -e "$directory/capture-database-proof.json" ] &&
+      [ ! -e "$directory/capture-media-proof.json" ] || return 1
+  fi
 }
 
 beta_storage_capture_reservation() {
@@ -1049,14 +1127,19 @@ beta_storage_publish_remote() {
     [ -s "$source/$name" ] && [ ! -L "$source/$name" ] ||
       beta_storage_fail ciphertext_missing
   done
-  local existing_head="$source/.remote-point-head.json" existing_descriptor="$source/.remote-point.json"
+  local existing_head="$source/.remote-point-head.json"
+  local existing_descriptor="$source/.remote-point.json" duplicate_scratch
   if beta_storage_remote_head "points/$point_id/point.json" "$existing_head"; then
     beta_storage_remote_get_json "points/$point_id/point.json" "$existing_descriptor" \
       "$(jq -er '.VersionId' "$existing_head")"
-    jq -e --arg id "$point_id" --arg slot "$slot" --argjson captured "$captured_at" \
-      '.schema=="meet-backend/beta-backup-descriptor/v2" and .pointId==$id and
-       .slotId==$slot and .capture.capturedAt==$captured' "$existing_descriptor" >/dev/null ||
+    duplicate_scratch=$(mktemp -d)
+    if ! beta_storage_remote_validate_descriptor "$point_id" "$existing_descriptor" \
+      "$duplicate_scratch" false ||
+      ! beta_storage_source_matches_descriptor "$source" "$existing_descriptor"; then
+      rm -rf -- "$duplicate_scratch" "$existing_head" "$existing_descriptor"
       beta_storage_fail duplicate_point_conflict
+    fi
+    rm -rf -- "$duplicate_scratch"
     rm -f -- "$existing_head" "$existing_descriptor"
     printf 'storage_publish=idempotent point_id=%s\n' "$point_id"
     return 0
@@ -1613,19 +1696,25 @@ beta_storage_promote_remote() {
   ' "$provenance" >/dev/null || beta_storage_fail promotion_provenance_invalid
   [ "$(jq -er '.reviewerId' "$provenance")" = "$(jq -er '.reviewerId' "$receipt")" ] ||
     beta_storage_fail promotion_reviewer_mismatch
-  local point_id receipt_id descriptor
+  local point_id receipt_id descriptor proof_source proof_digest
   point_id=$(jq -er '.pointId' "$receipt")
   receipt_id=$(jq -er '.receiptId' "$receipt")
   if [ -z "$receipt_key" ]; then
-    cp -- "$(dirname "$receipt")/$receipt_id.proof.json" "$scratch/$receipt_id.proof.json"
+    proof_source="$(dirname "$receipt")/$receipt_id.proof.json"
+    [ -s "$proof_source" ] || proof_source="$(dirname "$receipt")/$(basename "$receipt" .json).proof.json"
+    cp -- "$proof_source" "$scratch/$receipt_id.proof.json"
   fi
   local proof="$scratch/$receipt_id.proof.json"
   [ -s "$proof" ] || beta_storage_fail receipt_proof_missing
+  proof_digest=$(sha256sum "$proof" | awk '{print $1}')
+  [ "$proof_digest" = "$(jq -er '.proofDigest' "$receipt")" ] ||
+    beta_storage_fail receipt_proof_binding
   if [ -n "$probe_binding" ]; then
     [ -f "$probe_binding" ] && [ ! -L "$probe_binding" ] || beta_storage_fail probe_binding_missing
     beta_storage_require_unique_json "$probe_binding" ||
       beta_storage_fail probe_binding_ambiguous
     jq -e --arg receipt "$receipt_id" --arg point "$point_id" \
+      --arg proofDigest "$proof_digest" \
       --arg descriptor "$(jq -er '.pointDescriptorDigest' "$receipt")" '
       type=="object" and
       (keys|sort)==["pointDescriptorDigest","pointId","postProbeDigest",
@@ -1643,7 +1732,7 @@ beta_storage_promote_remote() {
       (.postRuntimeFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
       .preRuntimeFingerprint == .postRuntimeFingerprint and
       (.restoreProofDigest|type=="string" and test("^[0-9a-f]{64}$")) and
-      .restoreProofDigest == $receipt and
+      .restoreProofDigest == $proofDigest and
       (.restorePreFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
       (.restorePostFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
       .restorePreFingerprint == .restorePostFingerprint
@@ -2353,6 +2442,8 @@ beta_storage_publish_local() {
   [ ! -e "$point_dir" ] || {
     beta_storage_local_validate_point_dir "$point_dir" "$point_id" ||
       beta_storage_fail duplicate_point_conflict
+    beta_storage_source_matches_local_point "$source" "$point_dir" ||
+      beta_storage_fail duplicate_point_conflict
     printf 'storage_publish=idempotent point_id=%s\n' "$point_id"
     return 0
   }
@@ -2473,6 +2564,8 @@ beta_storage_validate_receipt() {
   ' "$receipt" >/dev/null
   local proof_path
   proof_path="$(dirname -- "$receipt")/$(jq -er '.receiptId' "$receipt").proof.json"
+  [ -f "$proof_path" ] && [ ! -L "$proof_path" ] ||
+    proof_path="$(dirname -- "$receipt")/$(basename "$receipt" .json).proof.json"
   [ -f "$proof_path" ] && [ ! -L "$proof_path" ] || return 1
   beta_storage_require_unique_json "$proof_path" || return 1
   [ "$(sha256sum "$proof_path" | awk '{print $1}')" = \

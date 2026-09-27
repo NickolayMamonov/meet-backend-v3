@@ -203,6 +203,7 @@ BETA_BACKUP_TEST_FIXTURE=true "$root/scripts/run-beta-recurring-drill.sh" \
   --restore-revision "$good_tooling" --reviewer-id reviewer-1 \
   --protection-file "$protection" --protection-digest "$protection_digest" ||
   fail "generated protected restore proof was rejected"
+rm -f -- "$tmp/$(jq -er '.receiptId' "$drill_receipt").proof.json"
 if "$root/scripts/run-beta-recurring-drill.sh" \
   --storage-root "$tmp/storage" --point-id slot-1790000000 --receipt "$tmp/forged-command-receipt" \
   --restore-command "$tmp/restore-command.sh" --restore-output "$tmp/forged-output" \

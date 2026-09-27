@@ -55,6 +55,8 @@ descriptor=$(jq -er '.pointDescriptorDigest' "$receipt")
 point=$(jq -er '.pointId' "$receipt")
 receipt_id=$(jq -er '.receiptId' "$receipt")
 restore_proof="$(dirname "$receipt")/$receipt_id.proof.json"
+[ -f "$restore_proof" ] && [ ! -L "$restore_proof" ] ||
+  restore_proof="$(dirname "$receipt")/$(basename "$receipt" .json).proof.json"
 jq -e '
   .schema=="meet-backend/beta-recurring-restore-proof/v2" and
   (.preFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
