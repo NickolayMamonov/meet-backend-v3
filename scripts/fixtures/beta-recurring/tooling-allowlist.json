@@ -1,5 +1,12 @@
 {
   "schema": "meet-backend/beta-recurring-tooling-allowlist/v1",
+  "awsCli": {
+    "publisher": "amazon-aws",
+    "platform": "linux-x86_64",
+    "version": "2.27.53",
+    "archiveUrl": "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.27.53.zip",
+    "sha256": "f7e69d8bce3b48518c6d1096312807259de526243dd35f2ca0b9285fa37d54eb"
+  },
   "tools": [
     {
       "role": "capture",

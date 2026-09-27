@@ -20,6 +20,26 @@ beta_storage_require_jq() {
   command -v jq >/dev/null 2>&1 || beta_storage_fail jq_unavailable
 }
 
+beta_storage_require_unique_json() {
+  local file=$1
+  command -v python3 >/dev/null 2>&1 || beta_storage_fail strict_json_unavailable
+  timeout --foreground 5s python3 - "$file" <<'PY'
+import json
+import sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    json.load(stream, object_pairs_hook=reject_duplicates)
+PY
+}
+
 beta_storage_require_local_root() {
   local root=${1:-${BETA_BACKUP_STORAGE_ROOT:-}}
   [ -n "$root" ] && [[ "$root" = /* && "$root" != *..* && "$root" != *$'\n'* ]] ||
@@ -100,6 +120,7 @@ beta_storage_validate_point() {
   beta_storage_require_jq
   [ -f "$manifest" ] && [ ! -L "$manifest" ] || return 1
   [ "$(wc -c <"$manifest")" -le 1048576 ] || return 1
+  beta_storage_require_unique_json "$manifest" || return 1
   jq -e '
     type == "object" and
     (keys | sort) == ["capture","captureCommandDigest","captureEvidenceDigest","contractDigest","pointId","proofDigest","runtimeRevision","schema","slotId"] and
@@ -374,9 +395,45 @@ beta_storage_provider_put_conditional() {
     beta_storage_fail provider_conditional_write_failed
   version=$(jq -er '.VersionId // empty' <<<"$output") ||
     beta_storage_fail provider_version_missing
+  local verify
+  verify=$(mktemp)
+  beta_storage_provider_get '' "$key" "$version" "$verify" "$sha" || {
+    rm -f -- "$verify"
+    beta_storage_fail provider_put_unverified
+  }
+  rm -f -- "$verify"
   jq -cnS --arg version "$version" --arg sha "$sha" \
     --argjson length "$(wc -c <"$source")" \
     '{versionId:$version,sha256:$sha,length:$length}'
+}
+
+beta_storage_object_max_bytes() {
+  local key=$1
+  case "$key" in
+    control/*) printf '65536\n' ;;
+    points/*/point.json|points/*/recovery-point.json|points/*/capture-*.json)
+      printf '1048576\n' ;;
+    receipts/*) printf '1048576\n' ;;
+    points/*/*.age) printf '%s\n' "$BETA_BACKUP_BYTE_BUDGET" ;;
+    *) printf '%s\n' "$BETA_BACKUP_BYTE_BUDGET" ;;
+  esac
+}
+
+beta_storage_remote_version_metadata() {
+  local key=$1 version=$2 output=$3 size limit
+  beta_storage_key "$key" >/dev/null
+  [[ "$version" =~ ^[A-Za-z0-9._:-]{1,160}$ ]] ||
+    beta_storage_fail provider_version_invalid
+  beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
+    --version-id "$version" >"$output" ||
+    beta_storage_fail provider_head_failed
+  limit=$(beta_storage_object_max_bytes "$key")
+  jq -e --arg version "$version" '
+    type=="object" and .VersionId==$version and
+    (.ContentLength|type=="number" and floor==. and .>=0)
+  ' "$output" >/dev/null || beta_storage_fail provider_head_invalid
+  size=$(jq -er '.ContentLength' "$output")
+  (( size <= limit )) || beta_storage_fail provider_object_too_large
 }
 
 beta_storage_provider_get() {
@@ -386,12 +443,39 @@ beta_storage_provider_get() {
     return
   fi
   beta_storage_require_config
+  local metadata content_length actual_length
+  metadata=$(mktemp)
+  beta_storage_remote_version_metadata "$key" "$version" "$metadata" || {
+    rm -f -- "$metadata"
+    return 1
+  }
+  content_length=$(jq -er '.ContentLength' "$metadata")
   beta_storage_aws_read get-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
     --version-id "$version" "$destination" >/dev/null ||
-    beta_storage_fail provider_get_failed
+    { rm -f -- "$metadata"; beta_storage_fail provider_get_failed; }
+  actual_length=$(wc -c <"$destination")
+  rm -f -- "$metadata"
+  [ "$actual_length" = "$content_length" ] ||
+    beta_storage_fail provider_length_mismatch
   [ -z "$expected_sha" ] ||
     [ "$(sha256sum "$destination" | awk '{print $1}')" = "$expected_sha" ] ||
     beta_storage_fail provider_integrity_mismatch
+}
+
+beta_storage_remote_validate_object_metadata() {
+  local key=$1 version=$2 expected_length=$3 expected_sha=$4 metadata
+  metadata=$(mktemp)
+  beta_storage_remote_version_metadata "$key" "$version" "$metadata" || {
+    rm -f -- "$metadata"
+    return 1
+  }
+  jq -e --argjson length "$expected_length" --arg sha "$expected_sha" '
+    .ContentLength==$length and .Metadata.sha256==$sha
+  ' "$metadata" >/dev/null || {
+    rm -f -- "$metadata"
+    beta_storage_fail provider_metadata_mismatch
+  }
+  rm -f -- "$metadata"
 }
 
 beta_storage_provider_delete() {
@@ -423,6 +507,7 @@ beta_storage_remote_get_json() {
   local key=$1 output=$2 version=${3:-}
   [ -n "$version" ] || beta_storage_fail version_required
   beta_storage_provider_get '' "$key" "$version" "$output" >/dev/null
+  beta_storage_require_unique_json "$output" || beta_storage_fail duplicate_json_key
 }
 
 beta_storage_remote_writer_acquire() {
@@ -566,10 +651,14 @@ beta_storage_remote_inventory_total() {
   local budget=${1:-${BETA_BACKUP_BYTE_BUDGET:-0}} additional=${2:-0} response parts
   [[ "$budget" =~ ^[0-9]+$ ]] || beta_storage_fail budget_invalid
   [[ "$additional" =~ ^[0-9]+$ ]] || beta_storage_fail reservation_invalid
+  (( budget <= 9223372036854775807 &&
+    additional <= 9223372036854775807 )) ||
+    beta_storage_fail budget_overflow
   response=$(beta_storage_aws_list_versions | jq -s '
     [.[].Versions[]? | (.Size // 0)] | add // 0') ||
     beta_storage_fail inventory_unavailable
   [[ "$response" =~ ^[0-9]+$ ]] || beta_storage_fail inventory_invalid
+  (( response <= 9223372036854775807 )) || beta_storage_fail budget_overflow
   local key_marker='' upload_id_marker='' page=0 multipart_bytes=0
   while (( page < BETA_STORAGE_MAX_PAGES )); do
     page=$((page + 1))
@@ -593,8 +682,9 @@ beta_storage_remote_inventory_total() {
         beta_storage_fail multipart_parts_incomplete
       part_bytes=$(jq -r '[.Parts[]?.Size // 0] | add // 0' <<<"$part_page")
       [[ "$part_bytes" =~ ^[0-9]+$ ]] || beta_storage_fail multipart_parts_invalid
+      (( part_bytes <= 9223372036854775807 - multipart_bytes )) ||
+        beta_storage_fail budget_overflow
       multipart_bytes=$((multipart_bytes + part_bytes))
-      (( multipart_bytes >= part_bytes )) || beta_storage_fail budget_overflow
     done < <(jq -r '.Uploads[]? | [.Key,.UploadId]|@tsv' <<<"$parts")
     [ "$(jq -er '.IsTruncated // false' <<<"$parts")" = true ] || break
     key_marker=$(jq -er '.NextKeyMarker // empty' <<<"$parts")
@@ -603,8 +693,12 @@ beta_storage_remote_inventory_total() {
       beta_storage_fail multipart_pagination_invalid
   done
   (( page < BETA_STORAGE_MAX_PAGES )) || beta_storage_fail multipart_pagination_limit
-  local total=$((response + multipart_bytes + additional))
-  (( total >= response && total >= multipart_bytes )) || beta_storage_fail budget_overflow
+  (( multipart_bytes <= 9223372036854775807 - response )) ||
+    beta_storage_fail budget_overflow
+  local total=$((response + multipart_bytes))
+  (( additional <= 9223372036854775807 - total )) ||
+    beta_storage_fail budget_overflow
+  total=$((total + additional))
   (( total <= budget )) || beta_storage_fail budget_exceeded
   printf '%s\n' "$total"
 }
@@ -656,6 +750,9 @@ beta_storage_publish_remote() {
   local intent_digest
   intent_digest=$(printf '%s\0%s\0%s\0%s' "$point_id" "$slot" \
     "$captured_at" "$reserve" | sha256sum | awk '{print $1}')
+  local writer_control_reserve=$((2 * 65536))
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
+    "$((reserve + writer_control_reserve))" >/dev/null
   beta_storage_remote_writer_acquire publish "$owner" "$txid" \
     "$reserve" "$intent_digest"
   local cleanup=true release_allowed=true scratch
@@ -680,7 +777,7 @@ beta_storage_publish_remote() {
   }
   trap cleanup_remote_publish RETURN
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$reserve" >/dev/null
+    "$((reserve + writer_control_reserve))" >/dev/null
   local db_json media_json manifest_json db_version media_version manifest_version
   db_json=$(beta_storage_provider_put_conditional '' "points/$point_id/postgres.dump.age" \
     "$source/postgres.dump.age" '' true)
@@ -780,6 +877,8 @@ beta_storage_publish_remote() {
     "$committed_head_version"
   cmp -s "$head" "$scratch/committed-head.json" ||
     beta_storage_fail capture_head_commit_ambiguous
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
+    "$writer_control_reserve" >/dev/null
   cleanup=false
   beta_storage_remote_writer_release "$owner" "$txid"
   trap - RETURN
@@ -790,7 +889,8 @@ beta_storage_publish_remote() {
 }
 
 beta_storage_remote_validate_descriptor() {
-  local point_id=$1 descriptor=$2 scratch=$3
+  local point_id=$1 descriptor=$2 scratch=$3 verify_payloads=${4:-true}
+  beta_storage_require_unique_json "$descriptor" || beta_storage_fail duplicate_json_key
   jq -e --arg id "$point_id" '
     type=="object" and
     (keys|sort)==["capture","captureCommandDigest","captureEvidenceDigest",
@@ -841,16 +941,31 @@ beta_storage_remote_validate_descriptor() {
     .contractDigest==$contract and .proofDigest==$proof and
     .captureCommandDigest==$command and .captureEvidenceDigest==$evidence
   ' "$descriptor" >/dev/null || beta_storage_fail descriptor_provenance_mismatch
-  beta_storage_provider_get '' "points/$point_id/postgres.dump.age" \
-    "$(jq -er '.versions.database' "$descriptor")" "$db" \
-    "$(jq -er '.ciphertexts.database.sha256' "$descriptor")" >/dev/null
-  beta_storage_provider_get '' "points/$point_id/uploads.tar.gz.age" \
-    "$(jq -er '.versions.uploads' "$descriptor")" "$media" \
-    "$(jq -er '.ciphertexts.uploads.sha256' "$descriptor")" >/dev/null
-  [ "$(wc -c <"$db")" = "$(jq -er '.ciphertexts.database.length' "$descriptor")" ] ||
-    beta_storage_fail descriptor_database_length
-  [ "$(wc -c <"$media")" = "$(jq -er '.ciphertexts.uploads.length' "$descriptor")" ] ||
-    beta_storage_fail descriptor_uploads_length
+  if [ "$verify_payloads" = true ]; then
+    beta_storage_provider_get '' "points/$point_id/postgres.dump.age" \
+      "$(jq -er '.versions.database' "$descriptor")" "$db" \
+      "$(jq -er '.ciphertexts.database.sha256' "$descriptor")" >/dev/null
+    beta_storage_provider_get '' "points/$point_id/uploads.tar.gz.age" \
+      "$(jq -er '.versions.uploads' "$descriptor")" "$media" \
+      "$(jq -er '.ciphertexts.uploads.sha256' "$descriptor")" >/dev/null
+  else
+    beta_storage_remote_validate_object_metadata \
+      "points/$point_id/postgres.dump.age" \
+      "$(jq -er '.versions.database' "$descriptor")" \
+      "$(jq -er '.ciphertexts.database.length' "$descriptor")" \
+      "$(jq -er '.ciphertexts.database.sha256' "$descriptor")"
+    beta_storage_remote_validate_object_metadata \
+      "points/$point_id/uploads.tar.gz.age" \
+      "$(jq -er '.versions.uploads' "$descriptor")" \
+      "$(jq -er '.ciphertexts.uploads.length' "$descriptor")" \
+      "$(jq -er '.ciphertexts.uploads.sha256' "$descriptor")"
+  fi
+  if [ "$verify_payloads" = true ]; then
+    [ "$(wc -c <"$db")" = "$(jq -er '.ciphertexts.database.length' "$descriptor")" ] ||
+      beta_storage_fail descriptor_database_length
+    [ "$(wc -c <"$media")" = "$(jq -er '.ciphertexts.uploads.length' "$descriptor")" ] ||
+      beta_storage_fail descriptor_uploads_length
+  fi
   if [ "$(jq -er '.proofs|keys|length' "$descriptor")" -eq 2 ]; then
     local dbproof="$scratch/database-proof.json" mediaproof="$scratch/media-proof.json"
     beta_storage_provider_get '' "points/$point_id/capture-database-proof.json" \
@@ -884,7 +999,7 @@ beta_storage_remote_require_safety() {
     beta_storage_fail safety_snapshot_invalid
 }
 
-beta_storage_remote_build_status() {
+beta_storage_remote_build_status_once() {
   local output=$1 environment=$2 now=$3 scratch
   beta_storage_require_config
   scratch=$(mktemp -d)
@@ -930,7 +1045,7 @@ beta_storage_remote_build_status() {
       descriptor="$scratch/$kind-descriptor.json"
       beta_storage_remote_get_json "points/$point/point.json" "$descriptor" \
         "$descriptor_version"
-      beta_storage_remote_validate_descriptor "$point" "$descriptor" "$scratch"
+      beta_storage_remote_validate_descriptor "$point" "$descriptor" "$scratch" false
       [ "$(beta_storage_descriptor_digest "$descriptor")" = \
         "$(jq -er '.descriptorDigest' "$body")" ] ||
         beta_storage_fail capture_descriptor_binding
@@ -962,7 +1077,7 @@ beta_storage_remote_build_status() {
       descriptor="$scratch/$kind-descriptor.json"
       beta_storage_remote_get_json "points/$point/point.json" "$descriptor" \
         "$descriptor_version"
-      beta_storage_remote_validate_descriptor "$point" "$descriptor" "$scratch"
+      beta_storage_remote_validate_descriptor "$point" "$descriptor" "$scratch" false
       [ "$(beta_storage_descriptor_digest "$descriptor")" = \
         "$(jq -er '.descriptorDigest' "$body")" ] ||
         beta_storage_fail verified_descriptor_binding
@@ -1005,6 +1120,28 @@ beta_storage_remote_build_status() {
     verified_status=$?
     [ "$verified_status" -eq 1 ] || beta_storage_fail authority_read_failed
   fi
+  local authority_changed=false final_meta head_status
+  for kind in capture verified; do
+    final_meta="$scratch/$kind-head-final.meta"
+    if [ -f "$scratch/$kind-head.meta" ]; then
+      if beta_storage_remote_head "control/$kind-head.json" "$final_meta"; then
+        cmp -s "$scratch/$kind-head.meta" "$final_meta" || authority_changed=true
+      else
+        head_status=$?
+        [ "$head_status" -eq 1 ] || beta_storage_fail authority_read_failed
+        authority_changed=true
+      fi
+    elif beta_storage_remote_head "control/$kind-head.json" "$final_meta"; then
+      authority_changed=true
+    else
+      head_status=$?
+      [ "$head_status" -eq 1 ] || beta_storage_fail authority_read_failed
+    fi
+  done
+  [ "$authority_changed" = false ] || {
+    cleanup_status
+    return 75
+  }
   local authority_digest
   authority_digest=$(
     for file in "${authority_files[@]}"; do
@@ -1024,6 +1161,16 @@ beta_storage_remote_build_status() {
         capturedAt:(if $verifiedAt==null then null else $verifiedAt end)}}' |
     install -m 600 /dev/stdin "$output"
   cleanup_status
+}
+
+beta_storage_remote_build_status() {
+  local output=$1 environment=$2 now=$3 attempt status
+  for attempt in 1 2; do
+    beta_storage_remote_build_status_once "$output" "$environment" "$now" && return 0
+    status=$?
+    [ "$status" -eq 75 ] || return "$status"
+  done
+  beta_storage_fail authority_changed
 }
 
 beta_storage_promote_remote() {
@@ -1103,6 +1250,8 @@ beta_storage_promote_remote() {
   [ -s "$proof" ] || beta_storage_fail receipt_proof_missing
   if [ -n "$probe_binding" ]; then
     [ -f "$probe_binding" ] && [ ! -L "$probe_binding" ] || beta_storage_fail probe_binding_missing
+    beta_storage_require_unique_json "$probe_binding" ||
+      beta_storage_fail probe_binding_ambiguous
     jq -e --arg receipt "$receipt_id" --arg point "$point_id" \
       --arg descriptor "$(jq -er '.pointDescriptorDigest' "$receipt")" '
       type=="object" and
@@ -1184,11 +1333,14 @@ beta_storage_promote_remote() {
     fi
   fi
 
-  txid="promote-$receipt_id"
   local reserve intent_digest
   reserve=$(( $(wc -c <"$receipt") + $(wc -c <"$proof") + 12 * 65536 ))
   intent_digest=$(printf '%s\0%s\0%s' "$point_id" "$receipt_id" "$reserve" |
     sha256sum | awk '{print $1}')
+  local writer_control_reserve=$((2 * 65536))
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
+    "$((reserve + writer_control_reserve))" >/dev/null
+  txid="promote-$receipt_id"
   beta_storage_remote_writer_acquire promote "$owner" "$txid" \
     "$reserve" "$intent_digest"
   acquired=true
@@ -1215,7 +1367,7 @@ beta_storage_promote_remote() {
     [ "$?" -eq 1 ] || beta_storage_fail proof_read_failed
   fi
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$reserve" >/dev/null
+    "$((reserve + writer_control_reserve))" >/dev/null
   : "${receipt_version:=}"
   : "${proof_version:=}"
   if [ "$receipt_present" = false ]; then
@@ -1270,6 +1422,8 @@ beta_storage_promote_remote() {
     "$committed_head_version"
   cmp -s "$head" "$scratch/committed-head.json" ||
     beta_storage_fail verified_head_commit_ambiguous
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
+    "$writer_control_reserve" >/dev/null
   printf 'storage_promote=provider_committed point_id=%s receipt_id=%s\n' \
     "$point_id" "$receipt_id"
 }
@@ -1284,6 +1438,23 @@ beta_storage_remote_delete_version() {
     { rm -f "$head"; beta_storage_fail deletion_version_mismatch; }
   rm -f "$head"
   beta_storage_provider_delete '' "$key" "$version"
+  if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
+    --version-id "$version" >"$head"; then
+    rm -f "$head"
+    beta_storage_fail deletion_not_confirmed
+  else
+    local status=$?
+    rm -f "$head"
+    [ "$status" -eq 3 ] || beta_storage_fail deletion_verification_failed
+  fi
+}
+
+beta_storage_remote_multipart_eligible() {
+  local key=$1 initiated=$2 now=$3 initiated_at
+  [[ "$key" == points/* || "$key" == receipts/* ]] || return 1
+  [ -n "$initiated" ] || return 1
+  initiated_at=$(date -u -d "$initiated" +%s 2>/dev/null) || return 1
+  (( initiated_at <= now - 3600 ))
 }
 
 beta_storage_prune_remote() {
@@ -1296,6 +1467,9 @@ beta_storage_prune_remote() {
   local intent_digest
   intent_digest=$(printf '%s\0%s\0%s' prune "$now" "$BETA_BACKUP_BYTE_BUDGET" |
     sha256sum | awk '{print $1}')
+  local writer_control_reserve=$((2 * 65536))
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
+    "$writer_control_reserve" >/dev/null
   beta_storage_remote_writer_acquire prune "$owner" "prune-$now" 0 "$intent_digest"
   local release=true head='' seen='' ambiguous_marker
   ambiguous_marker=$(mktemp)
@@ -1411,12 +1585,22 @@ beta_storage_prune_remote() {
     fi
     jq -e 'type=="object" and (.Uploads|type=="array")' <<<"$multipart" >/dev/null ||
       beta_storage_fail multipart_inventory_invalid
-    while IFS=$'\t' read -r upload_key upload_id; do
+    while IFS=$'\t' read -r upload_key upload_id initiated; do
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
+      beta_storage_remote_multipart_eligible "$upload_key" "$initiated" "$now" ||
+        continue
       beta_storage_aws_mutation abort-multipart-upload --bucket "$BETA_BACKUP_BUCKET" \
         --key "$upload_key" --upload-id "$upload_id" >/dev/null ||
         beta_storage_fail multipart_abort_failed
-    done < <(jq -r '.Uploads[]? | [.Key,.UploadId]|@tsv' <<<"$multipart")
+      if beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
+        --key "$upload_key" --upload-id "$upload_id" --max-parts 1000 >/dev/null; then
+        beta_storage_fail multipart_abort_not_confirmed
+      else
+        local abort_status=$?
+        [ "$abort_status" -eq 3 ] ||
+          beta_storage_fail multipart_abort_verification_failed
+      fi
+    done < <(jq -r '.Uploads[]? | [.Key,.UploadId,.Initiated // ""]|@tsv' <<<"$multipart")
     [ "$(jq -er '.IsTruncated // false' <<<"$multipart")" = true ] || break
     key_marker=$(jq -er '.NextKeyMarker // empty' <<<"$multipart")
     upload_id_marker=$(jq -er '.NextUploadIdMarker // empty' <<<"$multipart")
@@ -1425,7 +1609,8 @@ beta_storage_prune_remote() {
   done
   (( multipart_page < BETA_STORAGE_MAX_PAGES )) ||
     beta_storage_fail multipart_pagination_limit
-  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" >/dev/null
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
+    "$writer_control_reserve" >/dev/null
   rm -f "$head" "$head.meta" "$seen"
   beta_storage_remote_writer_release "$owner" "prune-$now"
   release=false
@@ -1464,6 +1649,7 @@ beta_storage_local_read_json() {
   local file=$1
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
   [ "$(wc -c <"$file")" -le 65536 ] || return 1
+  beta_storage_require_unique_json "$file" || return 1
   jq -e . "$file" >/dev/null
 }
 
@@ -1520,6 +1706,7 @@ beta_storage_local_validate_point_dir() {
   done
   [ -s "$directory/postgres.dump.age" ] && [ -s "$directory/uploads.tar.gz.age" ] || return 1
   beta_storage_validate_point "$directory/recovery-point.json" || return 1
+  beta_storage_require_unique_json "$directory/point.json" || return 1
   jq -e --arg id "$point_id" '
     type=="object" and (keys|sort)==["capture","captureCommandDigest","captureEvidenceDigest",
     "ciphertexts","contractDigest","descriptorDigest","manifestDigest","pointId",
@@ -1702,6 +1889,7 @@ beta_storage_validate_receipt() {
   local receipt=$1
   beta_storage_require_jq
   [ -f "$receipt" ] && [ ! -L "$receipt" ] || return 1
+  beta_storage_require_unique_json "$receipt" || return 1
   jq -e '
     type=="object" and (keys|sort)==["captureAt","captureCommandDigest","captureRevision",
       "pointDescriptorDigest","pointId","proofDigest","protectionDigest","receiptId",
@@ -1722,6 +1910,7 @@ beta_storage_validate_receipt() {
   local proof_path
   proof_path="$(dirname -- "$receipt")/$(jq -er '.receiptId' "$receipt").proof.json"
   [ -f "$proof_path" ] && [ ! -L "$proof_path" ] || return 1
+  beta_storage_require_unique_json "$proof_path" || return 1
   [ "$(sha256sum "$proof_path" | awk '{print $1}')" = \
     "$(jq -er '.proofDigest' "$receipt")" ] || return 1
   jq -e --arg capture "$(jq -er '.captureRevision' "$receipt")" \

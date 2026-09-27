@@ -131,12 +131,14 @@ rm -f -- "$tmp/storage/control/capture-head.json" "$tmp/storage/control/verified
 BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000001 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
-  --deadman-url https://deadman.invalid >/dev/null ||
+  --deadman-url https://deadman.invalid --deadman-provider curl \
+  --deadman-method POST --deadman-timeout 30 >/dev/null ||
   fail "monitor delivery failed"
 if PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000001 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident-arbitrary.json" --incident-command "$tmp/incident.sh" \
-  --deadman-url https://deadman.invalid >/dev/null 2>&1; then
+  --deadman-url https://deadman.invalid --deadman-provider curl \
+  --deadman-method POST --deadman-timeout 30 >/dev/null 2>&1; then
   fail "arbitrary incident command was admitted outside fixture mode"
 fi
 [ "$(jq -er '.schema' "$tmp/receiver/status.json")" = meet-backend/beta-backup-status/v1 ] ||
@@ -145,7 +147,8 @@ incident_deliveries=$(jq -er '.deliveryCount' "$tmp/incident.json")
 BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000002 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
-  --deadman-url https://deadman.invalid >/dev/null ||
+  --deadman-url https://deadman.invalid --deadman-provider curl \
+  --deadman-method POST --deadman-timeout 30 >/dev/null ||
   fail "monitor replay delivery failed"
 [ "$(jq -er '.deliveryCount' "$tmp/incident.json")" = "$incident_deliveries" ] ||
   fail "active incident was delivered more than once"
@@ -154,7 +157,8 @@ cp -- "$tmp/verified-head.saved" "$tmp/storage/control/verified-head.json"
 BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000003 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
-  --deadman-url https://deadman.invalid >/dev/null ||
+  --deadman-url https://deadman.invalid --deadman-provider curl \
+  --deadman-method POST --deadman-timeout 30 >/dev/null ||
   fail "monitor recovery delivery failed"
 [ "$(jq -er '.state' "$tmp/incident.json")" = recovered ] &&
   [ "$(jq -er '.recoveryCount' "$tmp/incident.json")" -eq 1 ] ||
@@ -162,7 +166,8 @@ BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-m
 if BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000004 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
-  --deadman-url '' >/dev/null 2>&1; then
+  --deadman-url '' --deadman-provider curl --deadman-method POST \
+  --deadman-timeout 30 >/dev/null 2>&1; then
   fail "missing mandatory dead-man heartbeat was admitted"
 fi
 cat >"$tmp/inventory.json" <<'EOF'

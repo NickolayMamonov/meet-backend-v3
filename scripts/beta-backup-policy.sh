@@ -18,6 +18,27 @@ beta_backup_require_jq() {
   command -v jq >/dev/null 2>&1 || beta_backup_fail 'jq_unavailable'
 }
 
+beta_backup_require_unique_json() {
+  local file=$1
+  command -v python3 >/dev/null 2>&1 ||
+    beta_backup_fail 'strict_json_unavailable'
+  timeout --foreground 5s python3 - "$file" <<'PY'
+import json
+import sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    json.load(stream, object_pairs_hook=reject_duplicates)
+PY
+}
+
 beta_backup_validate_status() {
   local file=$1 now=$2 environment=$3 watermark=${4-}
   beta_backup_require_jq
@@ -26,6 +47,8 @@ beta_backup_validate_status() {
     beta_backup_fail 'environment_invalid'
   [ -f "$file" ] && [ ! -L "$file" ] || beta_backup_fail 'snapshot_missing'
   [ "$(wc -c <"$file")" -le 65536 ] || beta_backup_fail 'snapshot_oversize'
+  beta_backup_require_unique_json "$file" ||
+    beta_backup_fail 'snapshot_ambiguous'
   jq -e --arg environment "$environment" '
     type == "object" and
     (keys | sort) == ["authorityDigest","authorityGeneration","capture","environment","observedAt","schema","verified"] and
@@ -55,6 +78,8 @@ beta_backup_validate_status() {
   if [ -n "$watermark" ]; then
     [ -f "$watermark" ] && [ ! -L "$watermark" ] ||
       beta_backup_fail 'watermark_missing'
+    beta_backup_require_unique_json "$watermark" ||
+      beta_backup_fail 'watermark_ambiguous'
     local status_digest
     status_digest=$(sha256sum "$file" | awk '{print $1}')
     jq -e --arg digest "$status_digest" --argjson generation "$(jq -er '.authorityGeneration' "$file")" \

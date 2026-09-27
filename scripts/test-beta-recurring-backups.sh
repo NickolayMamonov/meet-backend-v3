@@ -115,6 +115,10 @@ jq -e '.versions.database and .versions.uploads and .versions.manifest and
   "${capture_args[@]}" --output "$tmp/point-replay" --capture-output "$tmp/source-replay" \
   >/dev/null || fail "successful slot replay was rejected"
 
+"$root/scripts/run-beta-recurring-drill.sh" --validate-only \
+  --storage-root "$tmp/storage" --point-id slot-1790000000 >/dev/null ||
+  fail "validated point selection was rejected"
+
 cat >"$tmp/restore-command.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail

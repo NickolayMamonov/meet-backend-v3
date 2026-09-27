@@ -46,9 +46,13 @@ jobs:
           INCIDENT_REPOSITORY: ${{ vars.BETA_BACKUP_INCIDENT_REPOSITORY }}
           INCIDENT_LABEL: ${{ vars.BETA_BACKUP_INCIDENT_ISSUE_LABEL }}
           DEADMANS_URL: ${{ secrets.BETA_BACKUP_DEADMAN_URL }}
+          DEADMANS_PROVIDER: ${{ vars.BETA_BACKUP_DEADMAN_PROVIDER }}
+          DEADMANS_METHOD: ${{ vars.BETA_BACKUP_DEADMAN_METHOD }}
+          DEADMANS_TIMEOUT: ${{ vars.BETA_BACKUP_DEADMAN_TIMEOUT_SECONDS }}
           AWS_CLI_VERSION: ${{ vars.BETA_BACKUP_AWS_CLI_VERSION }}
           AWS_CLI_ARCHIVE_URL: ${{ vars.BETA_BACKUP_AWS_CLI_ARCHIVE_URL }}
           AWS_CLI_SHA256: ${{ vars.BETA_BACKUP_AWS_CLI_SHA256 }}
+          BETA_RECURRING_TOOLING_ALLOWLIST: ${{ github.workspace }}/scripts/fixtures/beta-recurring/tooling-allowlist.json
           RECEIVER_KEY_FILE: ${{ runner.temp }}/receiver-key
         run: |
           set -euo pipefail
@@ -56,7 +60,9 @@ jobs:
           test -n "$BETA_BACKUP_BUCKET" -a -n "$BETA_BACKUP_REGION" \
             -a -n "$BETA_BACKUP_ENDPOINT" -a -n "$BETA_BACKUP_BYTE_BUDGET" \
             -a -n "$RECEIVER_HOST" -a -n "$RECEIVER_USER" \
-            -a -n "$RECEIVER_PRIVATE_KEY" -a -n "$DEADMANS_URL"
+            -a -n "$RECEIVER_PRIVATE_KEY" -a -n "$DEADMANS_URL" \
+            -a -n "$DEADMANS_PROVIDER" -a -n "$DEADMANS_METHOD" \
+            -a -n "$DEADMANS_TIMEOUT"
           scripts/install-beta-backup-aws.sh
           AWS_BIN="$HOME/.local/aws-cli-v${AWS_CLI_VERSION}/aws/dist/aws"
           export AWS_BIN BETA_BACKUP_AWS_SHA256="$AWS_CLI_SHA256"
@@ -83,4 +89,7 @@ jobs:
             --receiver-known-hosts "$RECEIVER_KNOWN_HOSTS" \
             --incident-state-key "$INCIDENT_STATE_KEY" \
             --incident-command "$INCIDENT_COMMAND" \
-            --deadman-url "$DEADMANS_URL"
+            --deadman-url "$DEADMANS_URL" \
+            --deadman-provider "$DEADMANS_PROVIDER" \
+            --deadman-method "$DEADMANS_METHOD" \
+            --deadman-timeout "$DEADMANS_TIMEOUT"

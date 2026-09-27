@@ -27,6 +27,7 @@ env:
   AWS_CLI_VERSION: ${{ vars.BETA_BACKUP_AWS_CLI_VERSION }}
   AWS_CLI_ARCHIVE_URL: ${{ vars.BETA_BACKUP_AWS_CLI_ARCHIVE_URL }}
   AWS_CLI_SHA256: ${{ vars.BETA_BACKUP_AWS_CLI_SHA256 }}
+  BETA_RECURRING_TOOLING_ALLOWLIST: ${{ github.workspace }}/scripts/fixtures/beta-recurring/tooling-allowlist.json
 
 jobs:
   admission:
@@ -223,7 +224,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "$SCHEDULER_REF"
-          test -n "$POINT_ID" -a -n "$RESTORE_IDENTITY" -a -n "$APPROVAL_METADATA" \
+          test -n "$POINT_ID" -a -n "$APPROVAL_METADATA" \
             -a -n "$BETA_BACKUP_BUCKET" -a -n "$BETA_BACKUP_REGION" \
             -a -n "$BETA_BACKUP_ENDPOINT" -a -n "$BETA_BACKUP_BYTE_BUDGET"
           scripts/install-beta-backup-aws.sh
@@ -280,6 +281,9 @@ jobs:
           protection_digest=$(sha256sum "$protection_body" | awk '{print $1}')
           jq --arg digest "$protection_digest" \
             '. + {protectionDigest:$digest}' "$protection_body" >"$protection_file"
+          scripts/run-beta-recurring-drill.sh --validate-only \
+            --point-id "$POINT_ID"
+          test -n "$RESTORE_IDENTITY"
           identity_file="$RUNNER_TEMP/restore-identity"
           install -m 600 /dev/null "$identity_file"
           printf '%s\n' "$RESTORE_IDENTITY" >"$identity_file"
@@ -432,7 +436,9 @@ jobs:
           export BETA_RECURRING_POLICY_DIGEST="$policy_digest"
           scripts/query-beta-recurring-promotion.sh --run-id "$GITHUB_RUN_ID" \
             --reviewer-id "$(jq -er '.reviewerId' "$receipt")" \
-            --receipt "$receipt" --output "$RUNNER_TEMP/promotion-evidence.json"
+            --receipt "$receipt" \
+            --probe-binding "$RUNNER_TEMP/post-probe/probe-binding.json" \
+            --output "$RUNNER_TEMP/promotion-evidence.json"
           scripts/run-beta-backup-storage.sh promote \
             --receipt "$receipt" --probe-binding \
             "$RUNNER_TEMP/post-probe/probe-binding.json" \

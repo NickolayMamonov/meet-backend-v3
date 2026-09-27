@@ -99,11 +99,15 @@ compose_script=$script_dir/production-compose.sh
 update_script=$script_dir/update-production-release.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
 safety_hook=$script_dir/verify-test-vps-closed-beta-state.sh
+runtime_gate=$script_dir/beta-backup-runtime-gate.sh
 [ -x "$compose_script" ] || fail "reviewed Compose wrapper is unavailable"
 [ -x "$update_script" ] || fail "reviewed release updater is unavailable"
 [ -r "$runtime_helper" ] || fail "runtime invariant helper is unavailable"
+[ -r "$runtime_gate" ] || fail "backup safety runtime gate is unavailable"
 # shellcheck source=/dev/null
 source "$runtime_helper"
+# shellcheck source=beta-backup-runtime-gate.sh
+source "$runtime_gate"
 
 state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
 active_compose=/var/lib/meet-production/active-compose.yml
@@ -299,6 +303,9 @@ on_exit() {
 }
 trap on_exit EXIT
 
+beta_backup_runtime_require_operation "$image" test-vps-deploy \
+  "${APP_BACKUP_SAFETY_ENV_FILE:-}" ||
+  fail "backup safety admission denied deployment"
 mutation_started=true
 install -m 600 "$base_compose" "$active_compose"
 install -m 600 "$state/target-runtime.override.yml" "$active_runtime"

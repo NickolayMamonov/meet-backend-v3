@@ -2,14 +2,16 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 [--storage-root DIR] --point-id ID --receipt PATH --restore-command PATH --restore-output DIR --identity-file PATH --capture-revision SHA --restore-revision SHA --reviewer-id ID --protection-file PATH --protection-digest DIGEST" >&2
+  echo "usage: $0 [--validate-only] [--storage-root DIR] --point-id ID [--receipt PATH --restore-command PATH --restore-output DIR --identity-file PATH --capture-revision SHA --restore-revision SHA --reviewer-id ID --protection-file PATH --protection-digest DIGEST]" >&2
   exit 2
 }
 
 root='' point_id='' receipt='' restore_command='' restore_output='' identity=''
 capture_revision='' restore_revision='' reviewer_id='' protection_file='' protection_digest=''
+validate_only=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --validate-only) validate_only=true; shift ;;
     --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
     --point-id) [ "$#" -ge 2 ] || usage; point_id=$2; shift 2 ;;
     --receipt) [ "$#" -ge 2 ] || usage; receipt=$2; shift 2 ;;
@@ -25,33 +27,21 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-for path in "$receipt" "$restore_command" "$restore_output" "$identity" "$protection_file"; do
-  [[ "$path" = /* && "$path" != *..* && "$path" != *$'\n'* ]] || usage
-done
 [ -z "$root" ] || [[ "$root" = /* && "$root" != *..* && "$root" != *$'\n'* ]] || usage
 [[ "$point_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || usage
-[[ -z "$capture_revision" || "$capture_revision" =~ ^[0-9a-f]{40}$ ]] || usage
-[[ "$restore_revision" =~ ^[0-9a-f]{40}$ ]] || usage
-[[ "$reviewer_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] || usage
-[[ "$protection_digest" =~ ^[0-9a-f]{64}$ ]] || usage
-[ -x "$restore_command" ] && [ ! -L "$restore_command" ] || {
-  echo 'BACKUP_CUSTODY_BLOCKED:restore_command_unavailable' >&2
-  exit 1
-}
-[ -f "$identity" ] && [ ! -L "$identity" ] || {
-  echo 'BACKUP_CUSTODY_BLOCKED:restore_identity_unavailable' >&2
-  exit 1
-}
-[ -s "$identity" ] || {
-  echo 'BACKUP_CUSTODY_BLOCKED:restore_identity_empty' >&2
-  exit 1
-}
-[ -f "$protection_file" ] && [ ! -L "$protection_file" ] || {
-  echo 'BACKUP_CUSTODY_BLOCKED:protection_metadata_unavailable' >&2
-  exit 1
-}
+if [ "$validate_only" = false ]; then
+  for path in "$receipt" "$restore_command" "$restore_output" "$identity" "$protection_file"; do
+    [[ "$path" = /* && "$path" != *..* && "$path" != *$'\n'* ]] || usage
+  done
+  [[ -z "$capture_revision" || "$capture_revision" =~ ^[0-9a-f]{40}$ ]] || usage
+  [[ "$restore_revision" =~ ^[0-9a-f]{40}$ ]] || usage
+  [[ "$reviewer_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] || usage
+  [[ "$protection_digest" =~ ^[0-9a-f]{64}$ ]] || usage
+fi
 command -v jq >/dev/null 2>&1 || exit 1
-command -v timeout >/dev/null 2>&1 || exit 1
+if [ "$validate_only" = false ]; then
+  command -v timeout >/dev/null 2>&1 || exit 1
+fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=beta-backup-storage.sh
@@ -66,10 +56,39 @@ if [ -z "$root" ]; then
   mkdir -p "$point"
   remote_scratch="$root/.remote"
   mkdir -p "$remote_scratch"
+  capture_head_meta="$remote_scratch/capture-head.meta"
+  capture_head="$remote_scratch/capture-head.json"
+  beta_storage_remote_head control/capture-head.json "$capture_head_meta" || {
+    echo 'BACKUP_CUSTODY_BLOCKED:capture_head_unavailable' >&2
+    exit 1
+  }
+  beta_storage_remote_get_json control/capture-head.json "$capture_head" \
+    "$(jq -er '.VersionId' "$capture_head_meta")"
+  jq -e '
+    type=="object" and
+    (keys|sort)==["capturedAt","descriptorDigest","descriptorVersion",
+      "generation","pointId","schema"] and
+    .schema=="meet-backend/beta-backup-head/v2" and
+    (.pointId|type=="string") and (.descriptorVersion|type=="string" and length>0) and
+    (.descriptorDigest|type=="string" and test("^[0-9a-f]{64}$"))
+  ' "$capture_head" >/dev/null || {
+    echo 'BACKUP_CUSTODY_BLOCKED:capture_head_invalid' >&2
+    exit 1
+  }
+  [ "$(jq -er '.pointId' "$capture_head")" = "$point_id" ] || {
+    echo 'BACKUP_CUSTODY_BLOCKED:capture_point_mismatch' >&2
+    exit 1
+  }
   beta_storage_remote_get_json "points/$point_id/point.json" \
-    "$remote_scratch/point.json"
+    "$remote_scratch/point.json" \
+    "$(jq -er '.descriptorVersion' "$capture_head")"
   beta_storage_remote_validate_descriptor "$point_id" \
     "$remote_scratch/point.json" "$remote_scratch"
+  [ "$(beta_storage_descriptor_digest "$remote_scratch/point.json")" = \
+    "$(jq -er '.descriptorDigest' "$capture_head")" ] || {
+    echo 'BACKUP_CUSTODY_BLOCKED:capture_descriptor_binding' >&2
+    exit 1
+  }
   cp -- "$remote_scratch/point.json" "$point/point.json"
   cp -- "$remote_scratch/manifest.json" "$point/recovery-point.json"
   cp -- "$remote_scratch/database.age" "$point/postgres.dump.age"
@@ -90,6 +109,27 @@ else
 fi
 beta_storage_local_validate_point_dir "$point" "$point_id" || {
   echo 'BACKUP_CUSTODY_BLOCKED:point_unavailable' >&2
+  exit 1
+}
+if [ "$validate_only" = true ]; then
+  printf 'recurring_point_valid=true point_id=%s\n' "$point_id"
+  [ "$root_owned" = true ] && rm -rf -- "$root"
+  exit 0
+fi
+[ -x "$restore_command" ] && [ ! -L "$restore_command" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:restore_command_unavailable' >&2
+  exit 1
+}
+[ -f "$identity" ] && [ ! -L "$identity" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:restore_identity_unavailable' >&2
+  exit 1
+}
+[ -s "$identity" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:restore_identity_empty' >&2
+  exit 1
+}
+[ -f "$protection_file" ] && [ ! -L "$protection_file" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:protection_metadata_unavailable' >&2
   exit 1
 }
 if [ -z "$capture_revision" ]; then

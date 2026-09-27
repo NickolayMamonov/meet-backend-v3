@@ -33,6 +33,33 @@ done
 }
 command -v curl >/dev/null 2>&1 || exit 1
 command -v jq >/dev/null 2>&1 || exit 1
+command -v python3 >/dev/null 2>&1 || exit 1
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
+require_unique_json() {
+  local file=$1
+  timeout --foreground 5s python3 - "$file" <<'PY'
+import json
+import sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    json.load(stream, object_pairs_hook=reject_duplicates)
+PY
+}
+require_unique_json "$state_file" || {
+  echo 'BACKUP_INCIDENT_BLOCKED:state_ambiguous' >&2; exit 1;
+}
+require_unique_json "$event_file" || {
+  echo 'BACKUP_INCIDENT_BLOCKED:event_ambiguous' >&2; exit 1;
+}
 jq -e '
   type=="object" and
   (keys|sort)==["dedupeKey","deliveryCount","environment","firstSeenAt",
@@ -84,7 +111,7 @@ api() {
       -H 'X-GitHub-Api-Version: 2022-11-28' "$repo_url$path" >"$output" ||
       { rm -f "$output"; echo 'BACKUP_INCIDENT_BLOCKED:github_api_failed' >&2; exit 1; }
   fi
-  jq -e . "$output" >/dev/null || {
+  require_unique_json "$output" && jq -e . "$output" >/dev/null || {
     rm -f "$output"; echo 'BACKUP_INCIDENT_BLOCKED:github_api_invalid' >&2; exit 1;
   }
   printf '%s\n' "$output"
@@ -111,12 +138,28 @@ if ! jq -e --arg name "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
   rm -f "$created_label"
 fi
 dedupe=$(jq -er '.dedupeKey' "$event_file")
-issues=$(api GET '/issues?state=all&per_page=100')
+issue_page=1
+issue_pages=()
+while (( issue_page <= 10 )); do
+  page_file=$(api GET "/issues?state=all&per_page=100&page=$issue_page")
+  jq -e 'type=="array"' "$page_file" >/dev/null || {
+    echo 'BACKUP_INCIDENT_BLOCKED:issue_page_invalid' >&2; exit 1;
+  }
+  issue_pages+=("$page_file")
+  page_count=$(jq -er 'length' "$page_file")
+  (( page_count < 100 )) && break
+  issue_page=$((issue_page + 1))
+done
+(( issue_page <= 10 )) || {
+  echo 'BACKUP_INCIDENT_BLOCKED:issue_pagination_limit' >&2; exit 1;
+}
+issues="$tmp/issues.json"
+jq -s 'add' "${issue_pages[@]}" >"$issues"
 issue=$(jq -c --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" --arg dedupe "$dedupe" '
   [.[] | select(.pull_request|not) |
     select(any(.labels[]?; .name==$label)) |
     select(.body|contains($dedupe))] |
-  sort_by(.number) | last // empty
+  sort_by(.updated_at,.number) | last // empty
 ' "$issues")
 # Do not copy state or provider responses to an issue. The issue body contains
 # only fixed reason codes, opaque IDs and the event's dedupe key.
@@ -132,6 +175,16 @@ payload=$(jq -cn --arg body "$body" --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LAB
   '{title:"Closed-beta backup incident",body:$body,labels:[$label]}')
 if [ -n "$issue" ]; then
   number=$(jq -er '.number' <<<"$issue")
+  if [ "$(jq -er '.state' <<<"$issue")" != open ]; then
+    reopened=$(api PATCH "/issues/$number" \
+      "$(jq -cn '{state:"open"}')")
+    jq -e '.state=="open" and (.number|type=="number" and .>0)' "$reopened" >/dev/null || {
+      rm -f "$reopened"
+      echo 'BACKUP_INCIDENT_BLOCKED:issue_reopen_invalid' >&2
+      exit 1
+    }
+    rm -f "$reopened"
+  fi
   comment=$(api POST "/issues/$number/comments" \
     "$(jq -cn --arg body "$body" '{body:$body}')")
   jq -e '(.id|type=="number" and .>0)' "$comment" >/dev/null || {
@@ -149,6 +202,6 @@ else
   }
   rm -f "$created_issue"
 fi
-rm -f "$repo" "$labels" "$issues"
+rm -f "$repo" "$labels" "$issues" "${issue_pages[@]}"
 printf 'incident_delivery=private_repository_verified event=%s\n' \
   "$(jq -er '.event' "$event_file")"

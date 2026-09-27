@@ -2,13 +2,14 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 [--storage-root DIR] --environment NAME --now EPOCH [--receiver-root DIR|--receiver-host HOST --receiver-user USER --receiver-ssh-config PATH --receiver-known-hosts PATH] --incident-state PATH|--incident-state-key KEY --incident-command PATH --deadman-url URL" >&2
+  echo "usage: $0 [--storage-root DIR] --environment NAME --now EPOCH [--receiver-root DIR|--receiver-host HOST --receiver-user USER --receiver-ssh-config PATH --receiver-known-hosts PATH] --incident-state PATH|--incident-state-key KEY --incident-command PATH --deadman-url URL --deadman-provider curl --deadman-method METHOD --deadman-timeout SECONDS" >&2
   exit 2
 }
 
 storage_root='' environment='' now='' receiver_root=''
 receiver_host='' receiver_user='' receiver_ssh_config='' receiver_known_hosts=''
 incident_state='' incident_state_key='' incident_command='' deadman_url=''
+deadman_provider='' deadman_method='' deadman_timeout=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --storage-root) [ "$#" -ge 2 ] || usage; storage_root=$2; shift 2 ;;
@@ -23,6 +24,9 @@ while [ "$#" -gt 0 ]; do
     --incident-state-key) [ "$#" -ge 2 ] || usage; incident_state_key=$2; shift 2 ;;
     --incident-command) [ "$#" -ge 2 ] || usage; incident_command=$2; shift 2 ;;
     --deadman-url) [ "$#" -ge 2 ] || usage; deadman_url=$2; shift 2 ;;
+    --deadman-provider) [ "$#" -ge 2 ] || usage; deadman_provider=$2; shift 2 ;;
+    --deadman-method) [ "$#" -ge 2 ] || usage; deadman_method=$2; shift 2 ;;
+    --deadman-timeout) [ "$#" -ge 2 ] || usage; deadman_timeout=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -30,6 +34,9 @@ done
 [[ "$environment" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ &&
   "$now" =~ ^[0-9]+$ ]] || usage
 [[ "$deadman_url" =~ ^https://[^[:space:]]+$ ]] || usage
+[ "$deadman_provider" = curl ] || usage
+[[ "$deadman_method" =~ ^(GET|HEAD|POST)$ ]] || usage
+[[ "$deadman_timeout" =~ ^[1-9][0-9]?$ ]] || usage
 for path in "$incident_command" "$incident_state"; do
   [ -z "$path" ] || [[ "$path" = /* && "$path" != *..* && "$path" != *$'\n'* ]] || usage
 done
@@ -65,6 +72,7 @@ validate_incident_state() {
   local file=$1
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
   [ "$(wc -c <"$file")" -le 65536 ] || return 1
+  beta_storage_require_unique_json "$file" || return 1
   jq -e '
     type=="object" and
     (keys|sort)==["dedupeKey","deliveryCount","environment","firstSeenAt",
@@ -102,6 +110,10 @@ if [ -n "$storage_root" ]; then
   for kind in capture verified; do
     head="$storage_root/control/$kind-head.json"
     if [ -f "$head" ] && [ ! -L "$head" ]; then
+      beta_storage_require_unique_json "$head" || {
+        echo 'BACKUP_INCIDENT_BLOCKED:local_authority_ambiguous' >&2
+        exit 1
+      }
       candidate=$(jq -er '.pointId' "$head") || candidate=
       if [ -n "$candidate" ] && captured=$(point_capture "$candidate"); then
         if [ "$kind" = capture ]; then
@@ -130,15 +142,22 @@ if [ -n "$storage_root" ]; then
     (( value > generation )) && generation=$value
   done
 else
-  beta_storage_remote_build_status "$status_tmp" "$environment" "$now"
-  capture_state=$(jq -er '.capture.state' "$status_tmp")
-  capture_id=$(jq -er '.capture.id // "null"' "$status_tmp")
-  capture_at=$(jq -er '.capture.capturedAt // null' "$status_tmp")
-  verified_state=$(jq -er '.verified.state' "$status_tmp")
-  verified_id=$(jq -er '.verified.id // "null"' "$status_tmp")
-  verified_at=$(jq -er '.verified.capturedAt // null' "$status_tmp")
-  authority_digest=$(jq -er '.authorityDigest' "$status_tmp")
-  generation=$(jq -er '.authorityGeneration' "$status_tmp")
+  remote_authority_failed=false
+  if beta_storage_remote_build_status "$status_tmp" "$environment" "$now"; then
+    capture_state=$(jq -er '.capture.state' "$status_tmp")
+    capture_id=$(jq -er '.capture.id // "null"' "$status_tmp")
+    capture_at=$(jq -er '.capture.capturedAt // null' "$status_tmp")
+    verified_state=$(jq -er '.verified.state' "$status_tmp")
+    verified_id=$(jq -er '.verified.id // "null"' "$status_tmp")
+    verified_at=$(jq -er '.verified.capturedAt // null' "$status_tmp")
+    authority_digest=$(jq -er '.authorityDigest' "$status_tmp")
+    generation=$(jq -er '.authorityGeneration' "$status_tmp")
+  else
+    remote_authority_failed=true
+    capture_state=INVALID capture_id=null capture_at=null
+    verified_state=INVALID verified_id=null verified_at=null generation=0
+    authority_digest=$(printf 'storage_authority_unavailable' | sha256sum | awk '{print $1}')
+  fi
 fi
 
 if [ ! -s "$status_tmp" ]; then
@@ -156,6 +175,7 @@ if [ ! -s "$status_tmp" ]; then
 fi
 
 reasons=()
+[ "${remote_authority_failed:-false}" = true ] && reasons+=(storage_authority_unavailable)
 [ "$capture_state" = VALID ] || reasons+=(capture_missing_or_invalid)
 [ "$capture_state" = VALID ] && (( now - capture_at >= 86400 )) &&
   reasons+=(capture_older_than_24h)
@@ -265,8 +285,15 @@ else
   fi
 fi
 
-curl --fail --silent --show-error --connect-timeout 5 --max-time 30 \
-  --max-redirs 0 --request POST --data-binary '' "$deadman_url" >/dev/null 2>/dev/null ||
+if [ "${remote_authority_failed:-false}" = true ]; then
+  echo 'BACKUP_SAFETY_BLOCKED:storage_authority_unavailable' >&2
+  exit 1
+fi
+deadman_args=(--fail --silent --show-error --connect-timeout 5
+  --max-time "$deadman_timeout" --max-redirs 0 --request "$deadman_method")
+[ "$deadman_method" = GET ] || [ "$deadman_method" = HEAD ] ||
+  deadman_args+=(--data-binary '')
+"$deadman_provider" "${deadman_args[@]}" "$deadman_url" >/dev/null 2>/dev/null ||
   { echo 'BACKUP_SAFETY_BLOCKED:deadman_failed' >&2; exit 1; }
 printf 'monitor_status=delivered incident=%s event=%s heartbeat=sent\n' \
   "$([ "${#reasons[@]}" -gt 0 ] && echo true || echo false)" "$event"
