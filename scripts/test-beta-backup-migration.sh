@@ -40,7 +40,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ -s "$identity" ] && [ -d "$output" ] && [ -z "$(find "$output" -mindepth 1 -print -quit)" ]
-descriptor=$(sha256sum "$point/point.json" | awk '{print $1}')
+descriptor=$(jq -cS 'del(.descriptorDigest)' "$point/point.json" |
+  sha256sum | awk '{print $1}')
 captured=$(jq -er '.capture.capturedAt' "$point/recovery-point.json")
 fingerprint=$(printf isolated | sha256sum | awk '{print $1}')
 jq -cnS --arg capture "$capture" --arg restore "$restore" \

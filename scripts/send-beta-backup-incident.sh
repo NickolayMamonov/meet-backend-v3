@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 --event-file PATH --state-file PATH" >&2
+  exit 2
+}
+
+event_file='' state_file=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --event-file) [ "$#" -ge 2 ] || usage; event_file=$2; shift 2 ;;
+    --state-file) [ "$#" -ge 2 ] || usage; state_file=$2; shift 2 ;;
+    *) usage ;;
+  esac
+done
+for file in "$event_file" "$state_file"; do
+  [[ "$file" = /* && "$file" != *..* && "$file" != *$'\n'* ]] || usage
+  [ -f "$file" ] && [ ! -L "$file" ] || {
+    echo 'BACKUP_INCIDENT_BLOCKED:incident_input_missing' >&2
+    exit 1
+  }
+done
+: "${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
+: "${GITHUB_API_URL:=https://api.github.com}"
+: "${BETA_BACKUP_INCIDENT_REPOSITORY:?BETA_BACKUP_INCIDENT_REPOSITORY is required}"
+: "${BETA_BACKUP_INCIDENT_ISSUE_LABEL:?BETA_BACKUP_INCIDENT_ISSUE_LABEL is required}"
+[[ "$BETA_BACKUP_INCIDENT_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+  echo 'BACKUP_INCIDENT_BLOCKED:repository_invalid' >&2; exit 1;
+}
+[[ "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" =~ ^[A-Za-z0-9_.:-]{1,50}$ ]] || {
+  echo 'BACKUP_INCIDENT_BLOCKED:label_invalid' >&2; exit 1;
+}
+command -v curl >/dev/null 2>&1 || exit 1
+command -v jq >/dev/null 2>&1 || exit 1
+jq -e '
+  type=="object" and
+  (keys|sort)==["dedupeKey","deliveryCount","environment","firstSeenAt",
+    "incidentId","lastSeenAt","recoveryCount","schema","state"] and
+  .schema=="meet-backend/beta-backup-incident/v2" and
+  (.state=="active" or .state=="recovered") and
+  (.dedupeKey|type=="string" and test("^[0-9a-f]{64}$")) and
+  (.incidentId|type=="string" and test("^[A-Za-z0-9._:-]{1,64}$")) and
+  (.environment|type=="string" and test("^[A-Za-z0-9._-]{1,64}$")) and
+  (.deliveryCount|type=="number" and floor==. and .>=0) and
+  (.recoveryCount|type=="number" and floor==. and .>=0) and
+  (.firstSeenAt|type=="number" and floor==. and .>=0) and
+  (.lastSeenAt|type=="number" and floor==.) and
+  .lastSeenAt >= .firstSeenAt
+' "$state_file" >/dev/null || {
+  echo 'BACKUP_INCIDENT_BLOCKED:state_invalid' >&2; exit 1;
+}
+jq -e '
+  type=="object" and
+  (keys|sort)==["dedupeKey","event","environment","incidentId",
+    "observedAt","privateDestinationRequired","reasons","schema"] and
+  .schema=="meet-backend/beta-backup-incident-event/v1" and
+  .privateDestinationRequired==true and
+  (.event=="active" or .event=="recovered") and
+  (.dedupeKey|type=="string" and test("^[0-9a-f]{64}$")) and
+  (.incidentId|type=="string" and test("^[A-Za-z0-9._:-]{1,64}$")) and
+  (.environment|type=="string" and test("^[A-Za-z0-9._-]{1,64}$")) and
+  (.reasons|type=="array" and all(.[]; type=="string" and
+    test("^[a-z][a-z0-9_]{1,63}$"))) and
+  (.observedAt|type=="number" and floor==. and .>=0)
+' "$event_file" >/dev/null || {
+  echo 'BACKUP_INCIDENT_BLOCKED:event_invalid' >&2; exit 1;
+}
+repo_url="$GITHUB_API_URL/repos/$BETA_BACKUP_INCIDENT_REPOSITORY"
+api() {
+  local method=$1 path=$2 data=${3:-} output
+  output=$(mktemp)
+  if [ -n "$data" ]; then
+    curl --fail --silent --show-error --connect-timeout 5 --max-time 30 \
+      --request "$method" --data-binary "$data" \
+      -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' "$repo_url$path" >"$output" ||
+      { rm -f "$output"; echo 'BACKUP_INCIDENT_BLOCKED:github_api_failed' >&2; exit 1; }
+  else
+    curl --fail --silent --show-error --connect-timeout 5 --max-time 30 \
+      -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' "$repo_url$path" >"$output" ||
+      { rm -f "$output"; echo 'BACKUP_INCIDENT_BLOCKED:github_api_failed' >&2; exit 1; }
+  fi
+  jq -e . "$output" >/dev/null || {
+    rm -f "$output"; echo 'BACKUP_INCIDENT_BLOCKED:github_api_invalid' >&2; exit 1;
+  }
+  printf '%s\n' "$output"
+}
+repo=$(api GET '')
+jq -e --arg repo "$BETA_BACKUP_INCIDENT_REPOSITORY" '
+  .full_name==$repo and .private==true and .has_issues==true and
+  .permissions.issues==true
+' "$repo" >/dev/null || {
+  rm -f "$repo"; echo 'BACKUP_INCIDENT_BLOCKED:private_repository_invalid' >&2; exit 1;
+}
+label=$(jq -cn --arg name "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
+  '{name:$name,color:"b60205",description:"closed-beta backup incident"}')
+labels=$(api GET '/labels')
+if ! jq -e --arg name "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
+  'any(.[]; .name==$name)' "$labels" >/dev/null; then
+  created_label=$(api POST '/labels' "$label")
+  jq -e --arg name "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
+    '.name==$name and (.id|type=="number" and .>0)' "$created_label" >/dev/null || {
+    rm -f "$created_label"
+    echo 'BACKUP_INCIDENT_BLOCKED:label_create_invalid' >&2
+    exit 1
+  }
+  rm -f "$created_label"
+fi
+dedupe=$(jq -er '.dedupeKey' "$event_file")
+issues=$(api GET '/issues?state=all&per_page=100')
+issue=$(jq -c --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" --arg dedupe "$dedupe" '
+  [.[] | select(.pull_request|not) |
+    select(any(.labels[]?; .name==$label)) |
+    select(.body|contains($dedupe))] |
+  sort_by(.number) | last // empty
+' "$issues")
+# Do not copy state or provider responses to an issue. The issue body contains
+# only fixed reason codes, opaque IDs and the event's dedupe key.
+body=$(jq -r --arg dedupe "$dedupe" --arg event "$(jq -er '.event' "$event_file")" \
+  --arg environment "$(jq -er '.environment' "$event_file")" \
+  --arg id "$(jq -er '.incidentId' "$event_file")" \
+  --arg reasons "$(jq -r '.reasons|join(",")' "$event_file")" \
+  --arg observed "$(jq -er '.observedAt' "$event_file")" \
+  '"Closed-beta backup incident\n\nEnvironment: "+$environment+
+   "\nEvent: "+$event+"\nIncident: "+$id+"\nDedupe: "+$dedupe+
+   "\nReasons: "+$reasons+"\nObservedAt: "+$observed' <<<"{}")
+payload=$(jq -cn --arg body "$body" --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
+  '{title:"Closed-beta backup incident",body:$body,labels:[$label]}')
+if [ -n "$issue" ]; then
+  number=$(jq -er '.number' <<<"$issue")
+  comment=$(api POST "/issues/$number/comments" \
+    "$(jq -cn --arg body "$body" '{body:$body}')")
+  jq -e '(.id|type=="number" and .>0)' "$comment" >/dev/null || {
+    rm -f "$comment"
+    echo 'BACKUP_INCIDENT_BLOCKED:comment_response_invalid' >&2
+    exit 1
+  }
+  rm -f "$comment"
+else
+  created_issue=$(api POST '/issues' "$payload")
+  jq -e '(.number|type=="number" and .>0)' "$created_issue" >/dev/null || {
+    rm -f "$created_issue"
+    echo 'BACKUP_INCIDENT_BLOCKED:issue_response_invalid' >&2
+    exit 1
+  }
+  rm -f "$created_issue"
+fi
+rm -f "$repo" "$labels" "$issues"
+printf 'incident_delivery=private_repository_verified event=%s\n' \
+  "$(jq -er '.event' "$event_file")"

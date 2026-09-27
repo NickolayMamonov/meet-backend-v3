@@ -23,6 +23,14 @@ mkdir -p "$tmp/storage"
   --captured-at 1790000000 --owner test >/dev/null || fail "durable publish failed"
 [ -s "$tmp/storage/points/slot-1790000000/point.json" ] ||
   fail "manifest-last descriptor was not published"
+descriptor_digest=$(jq -cS 'del(.descriptorDigest)' \
+  "$tmp/storage/points/slot-1790000000/point.json" |
+  sha256sum | awk '{print $1}')
+jq -e --arg descriptor "$descriptor_digest" \
+  '.descriptorDigest==$descriptor and
+   (.manifestDigest|type=="string" and test("^[0-9a-f]{64}$"))' \
+  "$tmp/storage/points/slot-1790000000/point.json" >/dev/null ||
+  fail "descriptor digest binding is not canonical"
 cp -r "$tmp/point" "$tmp/partial-point"
 printf '{"schema":"meet-backend/closed-beta-database-proof/v1"}\n' \
   >"$tmp/partial-point/capture-database-proof.json"
@@ -39,7 +47,9 @@ if "$root/scripts/run-beta-backup-storage.sh" publish --source "$tmp/point" \
 else
   fail "idempotent publish was rejected"
 fi
-descriptor_digest=$(sha256sum "$tmp/storage/points/slot-1790000000/point.json" | awk '{print $1}')
+descriptor_digest=$(jq -cS 'del(.descriptorDigest)' \
+  "$tmp/storage/points/slot-1790000000/point.json" |
+  sha256sum | awk '{print $1}')
 jq -cnS --arg descriptor "$descriptor_digest" \
   '{schema:"meet-backend/beta-recurring-restore-proof/v2",
     captureRevision:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -59,7 +69,7 @@ jq -cnS --arg descriptor "$descriptor_digest" --arg command "$capture_command_di
     restoreRevision:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     captureAt:1790000000,captureCommandDigest:$command,pointDescriptorDigest:$descriptor,
     protectionDigest:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    proofDigest:$proof,
+    reviewerId:"reviewer-1",proofDigest:$proof,
     verifiedCapturedAt:1790000000}' >"$tmp/receipt.json"
 "$root/scripts/run-beta-backup-storage.sh" promote --storage-root "$tmp/storage" \
   --receipt "$tmp/receipt.json" --owner test >/dev/null || fail "promotion failed"
@@ -118,15 +128,21 @@ chmod 755 "$tmp/incident.sh" "$tmp/curl"
 cp -- "$tmp/storage/control/capture-head.json" "$tmp/capture-head.saved"
 cp -- "$tmp/storage/control/verified-head.json" "$tmp/verified-head.saved"
 rm -f -- "$tmp/storage/control/capture-head.json" "$tmp/storage/control/verified-head.json"
-PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
+BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000001 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
   --deadman-url https://deadman.invalid >/dev/null ||
   fail "monitor delivery failed"
+if PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
+  --environment closed-beta --now 1790000001 --receiver-root "$tmp/receiver" \
+  --incident-state "$tmp/incident-arbitrary.json" --incident-command "$tmp/incident.sh" \
+  --deadman-url https://deadman.invalid >/dev/null 2>&1; then
+  fail "arbitrary incident command was admitted outside fixture mode"
+fi
 [ "$(jq -er '.schema' "$tmp/receiver/status.json")" = meet-backend/beta-backup-status/v1 ] ||
   fail "monitor status was not received"
 incident_deliveries=$(jq -er '.deliveryCount' "$tmp/incident.json")
-PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
+BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000002 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
   --deadman-url https://deadman.invalid >/dev/null ||
@@ -135,7 +151,7 @@ PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tm
   fail "active incident was delivered more than once"
 cp -- "$tmp/capture-head.saved" "$tmp/storage/control/capture-head.json"
 cp -- "$tmp/verified-head.saved" "$tmp/storage/control/verified-head.json"
-PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
+BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000003 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
   --deadman-url https://deadman.invalid >/dev/null ||
@@ -143,7 +159,7 @@ PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tm
 [ "$(jq -er '.state' "$tmp/incident.json")" = recovered ] &&
   [ "$(jq -er '.recoveryCount' "$tmp/incident.json")" -eq 1 ] ||
   fail "monitor recovery transition was not persisted"
-if PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
+if BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000004 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
   --deadman-url '' >/dev/null 2>&1; then
@@ -156,5 +172,9 @@ EOF
   fail "version accounting is incorrect"
 if "$root/scripts/run-beta-backup-storage.sh" inventory --file "$tmp/inventory.json" --budget 39 >/dev/null 2>&1; then
   fail "budget overflow was accepted"
+fi
+if "$root/scripts/run-beta-backup-storage.sh" prune --now 1820000000 \
+  --owner test >/dev/null 2>&1; then
+  fail "remote prune without A3 snapshot was accepted"
 fi
 printf 'test-beta-backup-storage.sh: passed\n'

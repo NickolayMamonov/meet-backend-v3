@@ -23,6 +23,10 @@ concurrency:
 
 env:
   SCHEDULER_REF: refs/heads/master
+  AWS_EC2_METADATA_DISABLED: "true"
+  AWS_CLI_VERSION: ${{ vars.BETA_BACKUP_AWS_CLI_VERSION }}
+  AWS_CLI_ARCHIVE_URL: ${{ vars.BETA_BACKUP_AWS_CLI_ARCHIVE_URL }}
+  AWS_CLI_SHA256: ${{ vars.BETA_BACKUP_AWS_CLI_SHA256 }}
 
 jobs:
   admission:
@@ -100,6 +104,9 @@ jobs:
           BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
           BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
           BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+          BETA_RECURRING_CAPTURE_AWS_ACCESS_KEY_ID: ${{ secrets.BETA_RECURRING_CAPTURE_AWS_ACCESS_KEY_ID }}
+          BETA_RECURRING_CAPTURE_AWS_SECRET_ACCESS_KEY: ${{ secrets.BETA_RECURRING_CAPTURE_AWS_SECRET_ACCESS_KEY }}
+          BETA_RECURRING_CAPTURE_AWS_SESSION_TOKEN: ${{ secrets.BETA_RECURRING_CAPTURE_AWS_SESSION_TOKEN }}
           SLOT: ""
           SOURCE_REVISION: ${{ github.sha }}
           RUNTIME_REVISION: ${{ needs.admission.outputs.checkout_sha }}
@@ -110,6 +117,14 @@ jobs:
             -a -n "$BETA_RECURRING_PUBLIC_URL" -a -n "$BETA_BACKUP_BUCKET" \
             -a -n "$BETA_BACKUP_REGION" -a -n "$BETA_BACKUP_ENDPOINT" \
             -a -n "$BETA_BACKUP_BYTE_BUDGET"
+          scripts/install-beta-backup-aws.sh
+          export AWS_BIN="$HOME/.local/aws-cli-v${AWS_CLI_VERSION}/aws/dist/aws"
+          export BETA_BACKUP_AWS_SHA256="$AWS_CLI_SHA256"
+          export BETA_BACKUP_AWS_VERSION="$AWS_CLI_VERSION"
+          export BETA_BACKUP_SCOPED_CREDENTIALS=true
+          export AWS_ACCESS_KEY_ID="$BETA_RECURRING_CAPTURE_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$BETA_RECURRING_CAPTURE_AWS_SECRET_ACCESS_KEY"
+          export AWS_SESSION_TOKEN="$BETA_RECURRING_CAPTURE_AWS_SESSION_TOKEN"
           capture_command="$GITHUB_WORKSPACE/scripts/run-beta-recurring-capture-command.sh"
           scripts/validate-beta-recurring-tooling.sh \
             --role capture --path "$capture_command" \
@@ -202,12 +217,23 @@ jobs:
           BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
           BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
           BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+          BETA_RECURRING_RESTORE_AWS_ACCESS_KEY_ID: ${{ secrets.BETA_RECURRING_RESTORE_AWS_ACCESS_KEY_ID }}
+          BETA_RECURRING_RESTORE_AWS_SECRET_ACCESS_KEY: ${{ secrets.BETA_RECURRING_RESTORE_AWS_SECRET_ACCESS_KEY }}
+          BETA_RECURRING_RESTORE_AWS_SESSION_TOKEN: ${{ secrets.BETA_RECURRING_RESTORE_AWS_SESSION_TOKEN }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "$SCHEDULER_REF"
           test -n "$POINT_ID" -a -n "$RESTORE_IDENTITY" -a -n "$APPROVAL_METADATA" \
             -a -n "$BETA_BACKUP_BUCKET" -a -n "$BETA_BACKUP_REGION" \
             -a -n "$BETA_BACKUP_ENDPOINT" -a -n "$BETA_BACKUP_BYTE_BUDGET"
+          scripts/install-beta-backup-aws.sh
+          export AWS_BIN="$HOME/.local/aws-cli-v${AWS_CLI_VERSION}/aws/dist/aws"
+          export BETA_BACKUP_AWS_SHA256="$AWS_CLI_SHA256"
+          export BETA_BACKUP_AWS_VERSION="$AWS_CLI_VERSION"
+          export BETA_BACKUP_SCOPED_CREDENTIALS=true
+          export AWS_ACCESS_KEY_ID="$BETA_RECURRING_RESTORE_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$BETA_RECURRING_RESTORE_AWS_SECRET_ACCESS_KEY"
+          export AWS_SESSION_TOKEN="$BETA_RECURRING_RESTORE_AWS_SESSION_TOKEN"
           restore_command="$GITHUB_WORKSPACE/scripts/run-beta-recurring-restore-command.sh"
           scripts/validate-beta-recurring-tooling.sh \
             --role restore --path "$restore_command" \
@@ -383,14 +409,34 @@ jobs:
           BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
           BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
           BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+          BETA_RECURRING_PROMOTE_AWS_ACCESS_KEY_ID: ${{ secrets.BETA_RECURRING_PROMOTE_AWS_ACCESS_KEY_ID }}
+          BETA_RECURRING_PROMOTE_AWS_SECRET_ACCESS_KEY: ${{ secrets.BETA_RECURRING_PROMOTE_AWS_SECRET_ACCESS_KEY }}
+          BETA_RECURRING_PROMOTE_AWS_SESSION_TOKEN: ${{ secrets.BETA_RECURRING_PROMOTE_AWS_SESSION_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           receipt="$RUNNER_TEMP/protected-receipt/protected-receipt.json"
           test -s "$receipt"
           test -s "$RUNNER_TEMP/post-probe/probe-binding.json"
+          scripts/install-beta-backup-aws.sh
+          export AWS_BIN="$HOME/.local/aws-cli-v${AWS_CLI_VERSION}/aws/dist/aws"
+          export BETA_BACKUP_AWS_SHA256="$AWS_CLI_SHA256"
+          export BETA_BACKUP_AWS_VERSION="$AWS_CLI_VERSION"
+          export BETA_BACKUP_SCOPED_CREDENTIALS=true
+          export AWS_ACCESS_KEY_ID="$BETA_RECURRING_PROMOTE_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$BETA_RECURRING_PROMOTE_AWS_SECRET_ACCESS_KEY"
+          export AWS_SESSION_TOKEN="$BETA_RECURRING_PROMOTE_AWS_SESSION_TOKEN"
+          policy="$RUNNER_TEMP/recurring-policy.json"
+          scripts/query-beta-recurring-policy.sh --output "$policy"
+          policy_digest="$(jq -cS . "$policy" | sha256sum | awk '{print $1}')"
+          export BETA_RECURRING_POLICY_DIGEST="$policy_digest"
+          scripts/query-beta-recurring-promotion.sh --run-id "$GITHUB_RUN_ID" \
+            --reviewer-id "$(jq -er '.reviewerId' "$receipt")" \
+            --receipt "$receipt" --output "$RUNNER_TEMP/promotion-evidence.json"
           scripts/run-beta-backup-storage.sh promote \
             --receipt "$receipt" --probe-binding \
-            "$RUNNER_TEMP/post-probe/probe-binding.json" --owner promote
+            "$RUNNER_TEMP/post-probe/probe-binding.json" \
+            --provenance "$RUNNER_TEMP/promotion-evidence.json" --owner promote
 
   prune:
     needs: [promote, admission]
@@ -416,7 +462,45 @@ jobs:
           BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
           BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
           BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+          BETA_RECURRING_PRUNE_AWS_ACCESS_KEY_ID: ${{ secrets.BETA_RECURRING_PRUNE_AWS_ACCESS_KEY_ID }}
+          BETA_RECURRING_PRUNE_AWS_SECRET_ACCESS_KEY: ${{ secrets.BETA_RECURRING_PRUNE_AWS_SECRET_ACCESS_KEY }}
+          BETA_RECURRING_PRUNE_AWS_SESSION_TOKEN: ${{ secrets.BETA_RECURRING_PRUNE_AWS_SESSION_TOKEN }}
+          RECEIVER_HOST: ${{ vars.BETA_RECURRING_HOST }}
+          RECEIVER_USER: ${{ vars.BETA_RECURRING_SSH_USER }}
+          RECEIVER_PRIVATE_KEY: ${{ secrets.BETA_RECURRING_SSH_PRIVATE_KEY }}
+          RECEIVER_HOST_KNOWN_KEY: ${{ vars.BETA_RECURRING_HOST_KNOWN_KEY }}
+          SSH_KEY_FILE: ${{ runner.temp }}/prune-key
+          SSH_CONFIG: ${{ runner.temp }}/prune-ssh-config
+          KNOWN_HOSTS: ${{ runner.temp }}/prune-known-hosts
+          SAFETY_STATUS: ${{ runner.temp }}/backup-status.json
+          SAFETY_WATERMARK: ${{ runner.temp }}/backup-watermark.json
         run: |
           set -euo pipefail
+          scripts/install-beta-backup-aws.sh
+          export AWS_BIN="$HOME/.local/aws-cli-v${AWS_CLI_VERSION}/aws/dist/aws"
+          export BETA_BACKUP_AWS_SHA256="$AWS_CLI_SHA256"
+          export BETA_BACKUP_AWS_VERSION="$AWS_CLI_VERSION"
+          export BETA_BACKUP_SCOPED_CREDENTIALS=true
+          export AWS_ACCESS_KEY_ID="$BETA_RECURRING_PRUNE_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$BETA_RECURRING_PRUNE_AWS_SECRET_ACCESS_KEY"
+          export AWS_SESSION_TOKEN="$BETA_RECURRING_PRUNE_AWS_SESSION_TOKEN"
+          install -m 600 /dev/null "$SSH_KEY_FILE" "$SSH_CONFIG" "$KNOWN_HOSTS"
+          printf '%s\n' "$RECEIVER_PRIVATE_KEY" >"$SSH_KEY_FILE"
+          printf '%s\n' "$RECEIVER_HOST_KNOWN_KEY" >"$KNOWN_HOSTS"
+          printf 'Host test-vps\n  HostName %s\n  User %s\n  IdentityFile %s\n' \
+            "$RECEIVER_HOST" "$RECEIVER_USER" "$SSH_KEY_FILE" >"$SSH_CONFIG"
+          timeout --foreground 60s ssh -F "$SSH_CONFIG" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$KNOWN_HOSTS" test-vps \
+            /usr/local/libexec/meet-beta-backup-read-status \
+            >"$SAFETY_STATUS"
+          timeout --foreground 60s ssh -F "$SSH_CONFIG" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$KNOWN_HOSTS" test-vps \
+            /usr/local/libexec/meet-beta-backup-read-watermark \
+            >"$SAFETY_WATERMARK"
           scripts/run-beta-backup-storage.sh prune \
-            --now "$(date -u +%s)" --owner prune
+            --now "$(date -u +%s)" --owner prune \
+            --safety-status "$SAFETY_STATUS" \
+            --safety-watermark "$SAFETY_WATERMARK" \
+            --safety-environment closed-beta

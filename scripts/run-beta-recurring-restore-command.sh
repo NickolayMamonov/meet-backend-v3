@@ -146,7 +146,7 @@ pre_fingerprint=$( {
 } | sha256sum | awk '{print $1}')
 post_fingerprint=$(sha256sum "$core_output/restored-database-proof.json" \
   "$core_output/restored-media-proof.json" | sha256sum | awk '{print $1}')
-descriptor_digest=$(sha256sum "$point/point.json" | awk '{print $1}')
+descriptor_digest=$(beta_storage_descriptor_digest "$point/point.json")
 captured=$(jq -er '.capture.capturedAt' "$point/recovery-point.json")
 jq -cnS --arg capture "$capture_revision" --arg restore "$restore_revision" \
   --arg descriptor "$descriptor_digest" --arg protection "$protection_digest" \

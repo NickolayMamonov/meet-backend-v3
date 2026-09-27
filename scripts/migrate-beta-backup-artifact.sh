@@ -127,8 +127,11 @@ publish_args=(publish --source "$destination_dir" --point-id "$point_id" --slot 
 "$script_dir/run-beta-backup-storage.sh" "${publish_args[@]}"
 if [ "$remote" = true ]; then
   remote_scratch=$(mktemp -d "$destination_dir/.remote-migration.XXXXXX")
+  beta_storage_remote_head "points/$point_id/point.json" \
+    "$remote_scratch/descriptor.meta"
   beta_storage_remote_get_json "points/$point_id/point.json" \
-    "$remote_scratch/descriptor.json"
+    "$remote_scratch/descriptor.json" \
+    "$(jq -er '.VersionId' "$remote_scratch/descriptor.meta")"
   beta_storage_remote_validate_descriptor "$point_id" \
     "$remote_scratch/descriptor.json" "$remote_scratch" || {
       echo 'BACKUP_STORAGE_BLOCKED:destination_integrity_failed' >&2; exit 1;
@@ -149,13 +152,15 @@ if [ "$remote" = true ]; then
       "$destination_point/capture-media-proof.json" \
       "$(jq -er '.proofs.media.sha256' "$remote_scratch/descriptor.json")" >/dev/null
   fi
-  destination_descriptor=$(sha256sum "$destination_point/point.json" | awk '{print $1}')
+  destination_descriptor=$(beta_storage_descriptor_digest \
+    "$destination_point/point.json")
 else
   destination_point="$storage_root/points/$point_id"
   beta_storage_local_validate_point_dir "$destination_point" "$point_id" || {
     echo 'BACKUP_STORAGE_BLOCKED:destination_integrity_failed' >&2; exit 1;
   }
-  destination_descriptor=$(sha256sum "$destination_point/point.json" | awk '{print $1}')
+  destination_descriptor=$(beta_storage_descriptor_digest \
+    "$destination_point/point.json")
 fi
 
 mkdir -p "$restore_output" "$(dirname -- "$proof_output")"

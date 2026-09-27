@@ -131,7 +131,8 @@ case "$operation" in
     fi
     ;;
   promote)
-    receipt='' receipt_key='' root='' owner=${BETA_BACKUP_OWNER:-operator} probe_binding=''
+    receipt='' receipt_key='' root='' owner=${BETA_BACKUP_OWNER:-operator}
+    probe_binding='' provenance=''
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --receipt) [ "$#" -ge 2 ] || usage; receipt=$2; shift 2 ;;
@@ -139,6 +140,7 @@ case "$operation" in
         --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
         --owner) [ "$#" -ge 2 ] || usage; owner=$2; shift 2 ;;
         --probe-binding) [ "$#" -ge 2 ] || usage; probe_binding=$2; shift 2 ;;
+        --provenance) [ "$#" -ge 2 ] || usage; provenance=$2; shift 2 ;;
         *) usage ;;
       esac
     done
@@ -147,30 +149,35 @@ case "$operation" in
       beta_storage_promote_local "$receipt" "$root" "$owner"
     else
       [ -n "$receipt" ] || [ -n "$receipt_key" ] || usage
-      beta_storage_promote_remote "$receipt" "$receipt_key" "$owner" "$probe_binding"
+      beta_storage_promote_remote "$receipt" "$receipt_key" "$owner" \
+        "$probe_binding" "$provenance"
     fi
     ;;
   prune)
     root='' now='' owner=${BETA_BACKUP_OWNER:-operator}
+    safety_status='' safety_watermark='' safety_environment=closed-beta
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
         --now) [ "$#" -ge 2 ] || usage; now=$2; shift 2 ;;
         --owner) [ "$#" -ge 2 ] || usage; owner=$2; shift 2 ;;
+        --safety-status) [ "$#" -ge 2 ] || usage; safety_status=$2; shift 2 ;;
+        --safety-watermark) [ "$#" -ge 2 ] || usage; safety_watermark=$2; shift 2 ;;
+        --safety-environment) [ "$#" -ge 2 ] || usage; safety_environment=$2; shift 2 ;;
         *) usage ;;
       esac
     done
     [ -n "$now" ] || usage
-    # Prune is destructive and always requires a complete A3 admission.
-    # shellcheck source=beta-backup-runtime-gate.sh
-    source "$script_dir/beta-backup-runtime-gate.sh"
-    beta_backup_runtime_require_operation "" storage-prune \
-      "${APP_BACKUP_SAFETY_ENV_FILE:-}"
     if [ -n "$root" ]; then
       beta_storage_require_local_root "$root" >/dev/null
       beta_storage_prune_local "$root" "$now" "$owner"
     else
-      beta_storage_prune_remote "$now" "$owner"
+      [ -n "$safety_status" ] && [ -n "$safety_watermark" ] || {
+        echo 'BACKUP_SAFETY_BLOCKED:safety_snapshot_required' >&2
+        exit 1
+      }
+      beta_storage_prune_remote "$now" "$owner" "$safety_status" \
+        "$safety_watermark" "$safety_environment"
     fi
     ;;
   reconcile)

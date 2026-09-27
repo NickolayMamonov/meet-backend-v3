@@ -116,7 +116,7 @@ jq -e --arg reviewer "$reviewer_id" --arg digest "$protection_digest" '
   exit 1
 }
 
-descriptor_digest=$(sha256sum "$point/point.json" | awk '{print $1}')
+descriptor_digest=$(beta_storage_descriptor_digest "$point/point.json")
 capture_at=$(jq -er '.capture.capturedAt' "$point/recovery-point.json")
 capture_source=$(jq -er '.capture.sourceRevision' "$point/recovery-point.json")
 [ "$capture_revision" = "$capture_source" ] || {
@@ -195,13 +195,14 @@ jq -cnS --arg id "$receipt_id" --arg point "$point_id" \
   --arg capture "$capture_revision" --arg restore "$restore_revision" \
   --arg proof "$proof_digest" --arg descriptor "$descriptor_digest" \
   --arg protection "$protection_digest" \
+  --arg reviewer_id "$reviewer_id" \
   --arg command "$(jq -er '.captureCommandDigest' "$point/recovery-point.json")" \
   --argjson capture_at "$capture_at" --argjson verified "$capture_at" \
   '{schema:"meet-backend/beta-backup-receipt/v2",receiptId:$id,pointId:$point,
     captureAt:$capture_at,verifiedCapturedAt:$verified,captureRevision:$capture,
     restoreRevision:$restore,captureCommandDigest:$command,
     pointDescriptorDigest:$descriptor,protectionDigest:$protection,
-    proofDigest:$proof}' >"$receipt"
+    reviewerId:$reviewer_id,proofDigest:$proof}' >"$receipt"
 chmod 600 "$receipt"
 beta_storage_validate_receipt "$receipt" || {
   echo 'BACKUP_CUSTODY_BLOCKED:receipt_invalid' >&2
