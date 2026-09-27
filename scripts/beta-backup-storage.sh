@@ -12,6 +12,7 @@ readonly BETA_STORAGE_MULTIPART_MAX_PARTS=10000
 readonly BETA_STORAGE_MULTIPART_TOTAL_TIMEOUT_SECONDS=3600
 readonly BETA_STORAGE_CONDITIONAL_PUT_MAX_BYTES=5368709120
 readonly BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES=65536
+readonly BETA_STORAGE_MAX_VERSION_ID_BYTES=1024
 
 # This module owns the bounded versioned writer protocol used by recurring
 # backups. A local storage root is a deterministic fixture adapter only;
@@ -130,6 +131,19 @@ beta_storage_key() {
   [[ "$key" != *..* && "$key" != *//* ]] ||
     { beta_storage_fail key_invalid; return 1; }
   printf '%s\n' "$key"
+}
+
+beta_storage_require_version_id() {
+  local version=${1:-} bytes
+  bytes=$(printf '%s' "$version" | wc -c | tr -d '[:space:]')
+  if ! { [ "$bytes" -ge 1 ] && [ "$bytes" -le "$BETA_STORAGE_MAX_VERSION_ID_BYTES" ]; }; then
+    beta_storage_fail provider_version_invalid
+    return 1
+  fi
+  if printf '%s' "$version" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    beta_storage_fail provider_version_invalid
+    return 1
+  fi
 }
 
 beta_storage_validate_point() {
@@ -351,15 +365,25 @@ beta_storage_aws_list_versions() {
     jq -e '
       type=="object" and (.Versions|type=="array") and
       (.DeleteMarkers|type=="array") and
+      (.IsTruncated|type=="boolean") and
       ((.Versions|length)+(.DeleteMarkers|length)<=1000) and
+      ((.IsTruncated and
+        (.NextKeyMarker|type=="string" and
+          test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+        (.NextVersionIdMarker|type=="string" and utf8bytelength>=1 and
+          utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$"))) or
+       ((.IsTruncated|not) and
+        ((.NextKeyMarker // "")=="" and (.NextVersionIdMarker // "")==""))) and
       all(.Versions[]?;
         (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
-        (.VersionId|type=="string" and test("^[A-Za-z0-9._:-]{1,160}$")) and
+        (.VersionId|type=="string" and utf8bytelength>=1 and
+          utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$")) and
         (.Size|type=="number" and floor==. and .>=0 and
           .<=9223372036854775807)) and
       all(.DeleteMarkers[]?;
         (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
-        (.VersionId|type=="string" and test("^[A-Za-z0-9._:-]{1,160}$"))) and
+        (.VersionId|type=="string" and utf8bytelength>=1 and
+          utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$"))) and
       (([.Versions[]? | "v\(.Key)\u0000\(.VersionId)"] +
         [.DeleteMarkers[]? | "d\(.Key)\u0000\(.VersionId)"]) |
         unique | length ==
@@ -367,7 +391,7 @@ beta_storage_aws_list_versions() {
          [.DeleteMarkers[]? | "d\(.Key)\u0000\(.VersionId)"] | length))
     ' <<<"$response" >/dev/null || beta_storage_fail inventory_invalid
     printf '%s\n' "$response"
-    truncated=$(jq -er '.IsTruncated // false' <<<"$response")
+    truncated=$(jq -er '.IsTruncated' <<<"$response")
     [ "$truncated" = true ] || return 0
     key_marker=$(jq -er '.NextKeyMarker // empty' <<<"$response")
     version_marker=$(jq -er '.NextVersionIdMarker // empty' <<<"$response")
@@ -533,8 +557,30 @@ beta_storage_provider_put_multipart() {
     fi
     upload_id=''
   }
+  multipart_response_ambiguous() {
+    [ -n "${BETA_STORAGE_AMBIGUOUS_MARKER:-}" ] &&
+      : >"$BETA_STORAGE_AMBIGUOUS_MARKER"
+    if [ -n "${BETA_STORAGE_REMOTE_WRITER_TX:-}" ] &&
+      [ -n "$upload_id" ]; then
+      local resource previous_guard
+      resource=$(jq -cn --arg key "$key" --arg upload "$upload_id" \
+        '{kind:"multipart",key:$key,uploadId:$upload}')
+      previous_guard=${BETA_STORAGE_AMBIGUITY_MARKING:-false}
+      BETA_STORAGE_AMBIGUITY_MARKING=true
+      beta_storage_remote_writer_transition ambiguous true \
+        "${BETA_STORAGE_REMOTE_EXPECTED_KEYS:-[]}" "$resource" >/dev/null 2>&1 || true
+      BETA_STORAGE_AMBIGUITY_MARKING=$previous_guard
+    fi
+    printf 'BACKUP_STORAGE_BLOCKED:multipart_response_ambiguous key=%s upload=%s\n' \
+      "$key" "${upload_id:-unknown}" >&2
+  }
   multipart_fail() {
     beta_storage_fail "$1" || true
+    if [ -e "${BETA_STORAGE_AMBIGUOUS_MARKER:-}" ]; then
+      trap - EXIT
+      cleanup_multipart
+      return 1
+    fi
     abort_multipart || true
     trap - EXIT
     cleanup_multipart
@@ -546,9 +592,9 @@ beta_storage_provider_put_multipart() {
     --metadata "sha256=$sha") ||
     multipart_fail multipart_create_failed
   upload_id=$(jq -er '.UploadId // empty' <<<"$create_result") ||
-    multipart_fail multipart_upload_id_missing
+    { multipart_response_ambiguous; multipart_fail multipart_upload_id_missing; }
   [[ "$upload_id" =~ ^[A-Za-z0-9._-]+$ ]] && [ "${#upload_id}" -le 256 ] ||
-    multipart_fail multipart_upload_id_invalid
+    { multipart_response_ambiguous; multipart_fail multipart_upload_id_invalid; }
   while (( offset < length )); do
     (( SECONDS < deadline )) || multipart_fail multipart_deadline
     part_length=$BETA_STORAGE_MULTIPART_PART_BYTES
@@ -565,12 +611,13 @@ beta_storage_provider_put_multipart() {
       --part-number "$part_number" --body "$part_file") ||
       multipart_fail multipart_part_failed
     etag=$(jq -er '.ETag // empty' <<<"$part_result") ||
-      multipart_fail multipart_etag_missing
+      { multipart_response_ambiguous; multipart_fail multipart_etag_missing; }
     [[ "$etag" =~ ^\"?[A-Za-z0-9+/=_-]+\"?$ ]] ||
-      multipart_fail multipart_etag_invalid
+      { multipart_response_ambiguous; multipart_fail multipart_etag_invalid; }
     parts=$(jq -cn --argjson parts "$parts" --arg etag "$etag" \
       --argjson number "$part_number" \
-      '$parts + [{ETag:$etag,PartNumber:$number}]')
+      '$parts + [{ETag:$etag,PartNumber:$number}]') ||
+      { multipart_response_ambiguous; multipart_fail multipart_parts_invalid; }
     offset=$((offset + part_length))
     part_number=$((part_number + 1))
   done
@@ -582,7 +629,7 @@ beta_storage_provider_put_multipart() {
     --multipart-upload "file://$complete_file") ||
     multipart_fail multipart_complete_failed
   version=$(jq -er '.VersionId // empty' <<<"$result") ||
-    multipart_fail provider_version_missing
+    { multipart_response_ambiguous; multipart_fail provider_version_missing; }
   upload_id=''
   trap - EXIT
   cleanup_multipart
@@ -795,8 +842,7 @@ beta_storage_object_max_bytes() {
 beta_storage_remote_version_metadata() {
   local key=$1 version=$2 output=$3 size limit
   beta_storage_key "$key" >/dev/null
-  [[ "$version" =~ ^[A-Za-z0-9._:-]{1,160}$ ]] ||
-    beta_storage_fail provider_version_invalid
+  beta_storage_require_version_id "$version"
   beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
     --version-id "$version" >"$output" ||
     beta_storage_fail provider_head_failed
@@ -868,7 +914,9 @@ beta_storage_remote_head() {
   local key=$1 output=$2 status
   beta_storage_key "$key" >/dev/null
   if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" >"$output"; then
-    jq -e 'type=="object" and (.VersionId|type=="string" and length>0) and
+    jq -e 'type=="object" and (.VersionId|type=="string" and
+      utf8bytelength>=1 and utf8bytelength<=1024 and
+      test("^[^\u0000-\u001F\u007F]+$")) and
       (.ETag|type=="string" and length>0)' "$output" >/dev/null || return 2
     return 0
   fi
@@ -893,6 +941,7 @@ beta_storage_remote_writer_acquire() {
   BETA_STORAGE_REMOTE_WRITER_FENCING=''
   BETA_STORAGE_REMOTE_WRITER_TX=''
   BETA_STORAGE_REMOTE_WRITER_OWNER=''
+  BETA_STORAGE_REMOTE_WRITER_AMBIGUOUS_RESOURCE=''
   head=$(mktemp)
   state=$(mktemp)
   body=$(mktemp)
@@ -904,7 +953,7 @@ beta_storage_remote_writer_acquire() {
     beta_storage_remote_get_json control/writer.json "$state" "$version"
     jq -e '
       type=="object" and
-      ((keys|sort)==["ambiguous","expectedKeys","fencingToken","generation","intentDigest",
+      ((keys|sort)==["ambiguous","ambiguousResource","expectedKeys","fencingToken","generation","intentDigest",
         "phase",
         "leaseUntil","locked","operation","owner","reservationBytes","schema",
         "transactionId"] and .schema=="meet-backend/beta-backup-writer/v3") and
@@ -915,12 +964,18 @@ beta_storage_remote_writer_acquire() {
       (.reservationBytes|type=="number" and floor==. and .>=0) and
       (.intentDigest|type=="string" and test("^[0-9a-f]{64}$")) and
       (.owner|type=="string") and
-      (.transactionId|type=="string")
+      (.transactionId|type=="string") and
+      (.ambiguousResource==null or
+        (.ambiguousResource|type=="object" and
+          (keys|sort)==["key","kind","uploadId"] and .kind=="multipart" and
+          (.key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+          (.uploadId|type=="string" and test("^[A-Za-z0-9._-]{1,256}$"))))
     ' "$state" >/dev/null || beta_storage_fail writer_state_invalid
     [ "$(jq -er '.locked' "$state")" = false ] || beta_storage_fail writer_busy
     jq -e '
       .ambiguous==false and .operation=="idle" and .phase=="idle" and
       .leaseUntil==0 and .reservationBytes==0 and .expectedKeys==[] and
+      .ambiguousResource==null and
       .intentDigest=="0000000000000000000000000000000000000000000000000000000000000000"
     ' "$state" >/dev/null || beta_storage_fail writer_state_not_terminal
     generation=$(jq -er '.generation' "$state")
@@ -945,7 +1000,8 @@ beta_storage_remote_writer_acquire() {
     '{schema:"meet-backend/beta-backup-writer/v3",generation:$generation,
       fencingToken:$fencing,leaseUntil:$lease,locked:true,operation:$operation,
       owner:$owner,transactionId:$tx,ambiguous:false,phase:"acquired",
-      expectedKeys:$expected,reservationBytes:$reservation,intentDigest:$intent}' >"$body"
+      expectedKeys:$expected,ambiguousResource:null,
+      reservationBytes:$reservation,intentDigest:$intent}' >"$body"
   if [ "$if_none" = true ]; then
     if beta_storage_provider_put_conditional '' control/writer.json "$body" '' true >/dev/null; then
       :
@@ -961,6 +1017,7 @@ beta_storage_remote_writer_acquire() {
       BETA_STORAGE_REMOTE_WRITER_FENCING=$(jq -er '.fencingToken' "$state")
       BETA_STORAGE_REMOTE_WRITER_TX=$txid
       BETA_STORAGE_REMOTE_WRITER_OWNER=$owner
+      BETA_STORAGE_REMOTE_WRITER_AMBIGUOUS_RESOURCE=$(jq -c '.ambiguousResource // null' "$state")
       BETA_STORAGE_REMOTE_EXPECTED_KEYS=$(jq -c '.expectedKeys' "$state")
       rm -f -- "$head" "$state" "$body"
       return 0
@@ -984,6 +1041,7 @@ beta_storage_remote_writer_acquire() {
       BETA_STORAGE_REMOTE_WRITER_FENCING=$(jq -er '.fencingToken' "$state")
       BETA_STORAGE_REMOTE_WRITER_TX=$txid
       BETA_STORAGE_REMOTE_WRITER_OWNER=$owner
+      BETA_STORAGE_REMOTE_WRITER_AMBIGUOUS_RESOURCE=$(jq -c '.ambiguousResource // null' "$state")
       BETA_STORAGE_REMOTE_EXPECTED_KEYS=$(jq -c '.expectedKeys' "$state")
       rm -f -- "$head" "$state" "$body"
       return 0
@@ -997,21 +1055,31 @@ beta_storage_remote_writer_acquire() {
   BETA_STORAGE_REMOTE_WRITER_FENCING=$((fencing + 1))
   BETA_STORAGE_REMOTE_WRITER_TX=$txid
   BETA_STORAGE_REMOTE_WRITER_OWNER=$owner
+  BETA_STORAGE_REMOTE_WRITER_AMBIGUOUS_RESOURCE=null
   BETA_STORAGE_REMOTE_EXPECTED_KEYS=$expected_keys
   rm -f -- "$head" "$state" "$body"
 }
 
 beta_storage_remote_writer_transition() {
   local phase=$1 ambiguous=$2 expected_keys=${3:-${BETA_STORAGE_REMOTE_EXPECTED_KEYS:-[]}}
+  local resource=${4:-${BETA_STORAGE_REMOTE_WRITER_AMBIGUOUS_RESOURCE:-null}}
   local owner=${BETA_STORAGE_REMOTE_WRITER_OWNER:-}
   local txid=${BETA_STORAGE_REMOTE_WRITER_TX:-}
   [ "$ambiguous" = true ] || [ "$ambiguous" = false ] ||
     beta_storage_fail writer_ambiguity_invalid
   [ "$phase" != idle ] || beta_storage_fail writer_phase_invalid
+  [ "$ambiguous" = true ] || resource=null
   [ -n "$owner" ] && [ -n "$txid" ] || beta_storage_fail stale_owner
   jq -e 'type=="array" and all(.[]; type=="string" and
     test("^(points|receipts|control)/[A-Za-z0-9._/-]+$"))' <<<"$expected_keys" >/dev/null ||
     beta_storage_fail expected_keys_invalid
+  jq -e --argjson resource "$resource" '
+    $resource==null or
+    ($resource|type=="object" and (keys|sort)==["key","kind","uploadId"] and
+      .kind=="multipart" and
+      (.key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+      (.uploadId|type=="string" and test("^[A-Za-z0-9._-]{1,256}$")))
+  ' <<<null >/dev/null || beta_storage_fail ambiguous_resource_invalid
   local head state body current_etag generation fencing
   head=$(mktemp)
   state=$(mktemp)
@@ -1037,13 +1105,15 @@ beta_storage_remote_writer_transition() {
     --arg owner "$owner" --arg tx "$txid" --arg phase "$phase" \
     --arg intent "$(jq -er '.intentDigest' "$state")" \
     --argjson ambiguous "$ambiguous" --argjson expected "$expected_keys" \
+    --argjson resource "$resource" \
     --argjson reservation "$(jq -er '.reservationBytes' "$state")" \
     --argjson generation "$((generation + 1))" --argjson fencing "$fencing" \
     --argjson lease "$(jq -er '.leaseUntil' "$state")" \
     '{schema:"meet-backend/beta-backup-writer/v3",generation:$generation,
       fencingToken:$fencing,leaseUntil:$lease,locked:true,operation:$operation,
       owner:$owner,transactionId:$tx,ambiguous:$ambiguous,phase:$phase,
-      expectedKeys:$expected,reservationBytes:$reservation,intentDigest:$intent}' >"$body"
+      expectedKeys:$expected,ambiguousResource:$resource,
+      reservationBytes:$reservation,intentDigest:$intent}' >"$body"
   local previous_guard=${BETA_STORAGE_WRITER_STATE_MUTATION:-false}
   BETA_STORAGE_WRITER_STATE_MUTATION=true
   if ! beta_storage_provider_put_conditional '' control/writer.json "$body" \
@@ -1057,6 +1127,7 @@ beta_storage_remote_writer_transition() {
     { rm -f -- "$head" "$state" "$body"; beta_storage_fail writer_state_unreadable; }
   BETA_STORAGE_REMOTE_WRITER_ETAG=$(jq -er '.ETag' "$head")
   BETA_STORAGE_REMOTE_EXPECTED_KEYS=$expected_keys
+  BETA_STORAGE_REMOTE_WRITER_AMBIGUOUS_RESOURCE=$resource
   rm -f -- "$head" "$state" "$body"
 }
 
@@ -1085,7 +1156,7 @@ beta_storage_remote_writer_release() {
     '{schema:"meet-backend/beta-backup-writer/v3",generation:$generation,
       fencingToken:$fencing,leaseUntil:0,locked:false,operation:"idle",
       owner:$owner,transactionId:$tx,ambiguous:false,phase:"idle",
-      expectedKeys:[],
+      expectedKeys:[],ambiguousResource:null,
       reservationBytes:0,intentDigest:"0000000000000000000000000000000000000000000000000000000000000000"}' >"$body"
   local previous_guard=${BETA_STORAGE_WRITER_STATE_MUTATION:-false}
   BETA_STORAGE_WRITER_STATE_MUTATION=true
@@ -1100,6 +1171,7 @@ beta_storage_remote_writer_release() {
   BETA_STORAGE_REMOTE_WRITER_TX=''
   BETA_STORAGE_REMOTE_WRITER_OWNER=''
   BETA_STORAGE_REMOTE_WRITER_FENCING=''
+  BETA_STORAGE_REMOTE_WRITER_AMBIGUOUS_RESOURCE=''
   BETA_STORAGE_REMOTE_EXPECTED_KEYS=''
   rm -f -- "$head" "$state" "$body"
 }
@@ -1130,6 +1202,14 @@ beta_storage_remote_inventory_total() {
     fi
     jq -e '
       type=="object" and (.Uploads|type=="array") and
+      (.Uploads|length<=1000) and (.IsTruncated|type=="boolean") and
+      ((.IsTruncated and
+        (.NextKeyMarker|type=="string" and
+          test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+        (.NextUploadIdMarker|type=="string" and
+          test("^[A-Za-z0-9._:-]{1,256}$"))) or
+       ((.IsTruncated|not) and
+        ((.NextKeyMarker // "")=="" and (.NextUploadIdMarker // "")==""))) and
       all(.Uploads[]?;
         (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
         (.UploadId|type=="string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
@@ -1142,7 +1222,8 @@ beta_storage_remote_inventory_total() {
         beta_storage_fail multipart_parts_unavailable
       jq -e '
         type=="object" and (.Parts|type=="array") and
-        ((.IsTruncated // false)==false) and
+        (.IsTruncated|type=="boolean") and (.IsTruncated==false) and
+        ((.NextPartNumberMarker // "")=="") and
         all(.Parts[]?;
           (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
           (.Size|type=="number" and floor==. and .>=0 and
@@ -1430,17 +1511,20 @@ beta_storage_remote_validate_descriptor() {
     (.descriptorDigest|type=="string" and test("^[0-9a-f]{64}$")) and
     (.manifestDigest|type=="string" and test("^[0-9a-f]{64}$")) and
     (.versions|type=="object" and (keys|sort)==["database","manifest","uploads"] and
-      all(.[]; type=="string" and test("^[A-Za-z0-9._:-]{1,160}$"))) and
+      all(.[]; type=="string" and utf8bytelength>=1 and
+        utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$"))) and
     (.proofs|type=="object" and ((keys|sort)==[] or
       ((keys|sort)==["database","media"] and
        (.database|type=="object" and (keys|sort)==["length","sha256","versionId"] and
         (.length|type=="number" and floor==. and .>0) and
         (.sha256|type=="string" and test("^[0-9a-f]{64}$")) and
-        (.versionId|type=="string" and test("^[A-Za-z0-9._:-]{1,160}$"))) and
+        (.versionId|type=="string" and utf8bytelength>=1 and
+          utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$"))) and
        (.media|type=="object" and (keys|sort)==["length","sha256","versionId"] and
         (.length|type=="number" and floor==. and .>0) and
         (.sha256|type=="string" and test("^[0-9a-f]{64}$")) and
-        (.versionId|type=="string" and test("^[A-Za-z0-9._:-]{1,160}$")))))) and
+        (.versionId|type=="string" and utf8bytelength>=1 and
+          utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$")))))) and
     ([.ciphertexts.database,.ciphertexts.uploads][] |
       type=="object" and (keys|sort)==["length","sha256"] and
       (.length|type=="number" and floor==. and .>0) and
@@ -2143,10 +2227,12 @@ beta_storage_prune_remote() {
   inventory=$(beta_storage_aws_list_versions | jq -s '.')
   jq -e 'type=="array" and all(.[]; type=="object" and
     all(.Versions[]?; (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
-      (.VersionId|type=="string" and length>0) and
+      (.VersionId|type=="string" and utf8bytelength>=1 and
+        utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$")) and
       (.Size|type=="number" and floor==. and .>=0)) and
     all(.DeleteMarkers[]?; (.Key|type=="string") and
-      (.VersionId|type=="string" and length>0)))' <<<"$inventory" >/dev/null ||
+      (.VersionId|type=="string" and utf8bytelength>=1 and
+        utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$")))' <<<"$inventory" >/dev/null ||
     beta_storage_fail inventory_invalid
   seen=$(mktemp)
   deleted_point_ids=$(mktemp)
@@ -2258,6 +2344,14 @@ beta_storage_prune_remote() {
     fi
     jq -e '
       type=="object" and (.Uploads|type=="array") and
+      (.Uploads|length<=1000) and (.IsTruncated|type=="boolean") and
+      ((.IsTruncated and
+        (.NextKeyMarker|type=="string" and
+          test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+        (.NextUploadIdMarker|type=="string" and
+          test("^[A-Za-z0-9._:-]{1,256}$"))) or
+       ((.IsTruncated|not) and
+        ((.NextKeyMarker // "")=="" and (.NextUploadIdMarker // "")==""))) and
       all(.Uploads[]?;
         (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
         (.UploadId|type=="string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
@@ -2274,7 +2368,8 @@ beta_storage_prune_remote() {
         beta_storage_fail multipart_parts_unavailable
       jq -e '
         type=="object" and (.Parts|type=="array") and
-        ((.IsTruncated // false)==false) and
+        (.IsTruncated|type=="boolean") and (.IsTruncated==false) and
+        ((.NextPartNumberMarker // "")=="") and
         all(.Parts[]?;
           (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
           (.Size|type=="number" and floor==. and .>=0 and
@@ -2380,7 +2475,7 @@ beta_storage_reconcile_remote() {
     "$(jq -er '.VersionId' "$writer_meta")"
   jq -e '
     type=="object" and
-    (keys|sort)==["ambiguous","expectedKeys","fencingToken","generation",
+    (keys|sort)==["ambiguous","ambiguousResource","expectedKeys","fencingToken","generation",
       "intentDigest","leaseUntil","locked","operation","owner","phase",
       "reservationBytes","schema","transactionId"] and
     .schema=="meet-backend/beta-backup-writer/v3" and
@@ -2394,7 +2489,12 @@ beta_storage_reconcile_remote() {
     (.reservationBytes|type=="number" and floor==. and .>=0) and
     (.intentDigest|type=="string" and test("^[0-9a-f]{64}$")) and
     (.owner|type=="string" and length>0) and
-    (.transactionId|type=="string" and length>0)
+    (.transactionId|type=="string" and length>0) and
+    (.ambiguousResource==null or
+      (.ambiguousResource|type=="object" and
+        (keys|sort)==["key","kind","uploadId"] and .kind=="multipart" and
+        (.key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+        (.uploadId|type=="string" and test("^[A-Za-z0-9._-]{1,256}$"))))
   ' "$writer_state" >/dev/null || {
     rm -f -- "$writer_meta" "$writer_state"
     beta_storage_fail writer_state_invalid
@@ -2411,6 +2511,7 @@ beta_storage_reconcile_remote() {
     BETA_STORAGE_REMOTE_WRITER_FENCING=$(jq -er '.fencingToken' "$writer_state")
     BETA_STORAGE_REMOTE_WRITER_TX=$txid
     BETA_STORAGE_REMOTE_WRITER_OWNER=$owner
+    BETA_STORAGE_REMOTE_WRITER_AMBIGUOUS_RESOURCE=$(jq -c '.ambiguousResource // null' "$writer_state")
     BETA_STORAGE_REMOTE_EXPECTED_KEYS=$expected_keys
     if [ "$operation" = publish ]; then
       point_id=$(jq -r 'map(select(startswith("points/"))) |
@@ -2477,7 +2578,7 @@ beta_storage_reconcile_remote() {
   jq -e '
     .locked==false and .ambiguous==false and .operation=="idle" and
     .phase=="idle" and .leaseUntil==0 and .reservationBytes==0 and
-    .expectedKeys==[] and
+    .expectedKeys==[] and .ambiguousResource==null and
     .intentDigest=="0000000000000000000000000000000000000000000000000000000000000000"
   ' "$writer_state" >/dev/null ||
     { rm -f -- "$writer_meta" "$writer_state"; beta_storage_fail writer_state_not_terminal; }
@@ -2487,7 +2588,8 @@ beta_storage_reconcile_remote() {
     beta_storage_fail inventory_unavailable
   jq -e 'type=="array" and all(.[]; type=="object" and
     all(.Versions[]?; (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
-      (.VersionId|type=="string" and length>0) and
+      (.VersionId|type=="string" and utf8bytelength>=1 and
+        utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$")) and
       (.Size|type=="number" and floor==. and .>=0)))' <<<"$inventory" >/dev/null ||
     beta_storage_fail inventory_invalid
   while IFS=$'\t' read -r receipt_key; do
@@ -2587,7 +2689,8 @@ beta_storage_local_validate_point_dir() {
     (.captureCommandDigest|type=="string" and test("^[0-9a-f]{64}$")) and
     (.captureEvidenceDigest|type=="string" and test("^[0-9a-f]{64}$")) and
     (.versions|type=="object" and (keys|sort)==["database","manifest","uploads"] and
-      all(.[]; type=="string" and test("^[A-Za-z0-9._:-]{1,160}$"))) and
+      all(.[]; type=="string" and utf8bytelength>=1 and
+        utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$"))) and
     (.proofs|type=="object" and ((keys|sort)==[] or (keys|sort)==["database","media"])) and
     (.ciphertexts|type=="object" and (keys|sort)==["database","uploads"]) and
     ([.ciphertexts.database,.ciphertexts.uploads][] |

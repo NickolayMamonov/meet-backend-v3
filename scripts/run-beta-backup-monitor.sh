@@ -226,7 +226,7 @@ if [ "${#reasons[@]}" -gt 0 ]; then
   old_dedupe=
   [ "$old_state" = active ] && old_dedupe=$(jq -er '.dedupeKey' "$state_file") || true
   if [ "$old_state" != active ]; then
-    incident_id="incident-$(printf '%s' "$dedupe_key" | cut -c1-32)"
+    incident_id="incident-$(printf '%s' "$dedupe_key" | cut -c1-32)-$now"
     first_seen=$now
     delivery_count=1
     event=active

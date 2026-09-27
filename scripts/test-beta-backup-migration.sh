@@ -69,10 +69,15 @@ cat >"$tmp/curl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 output=''
+headers=''
+write_out=''
 url=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output) output=$2; shift 2 ;;
+    --dump-header) headers=$2; shift 2 ;;
+    --write-out) write_out=$2; shift 2 ;;
+    --max-redirs) shift 2 ;;
     --location|--fail|--silent|--show-error|--connect-timeout|--max-time|--max-filesize|-H)
       [ "$1" = --location ] || [ "$1" = --fail ] || [ "$1" = --silent ] ||
         [ "$1" = --show-error ] || { [ "$#" -ge 2 ] && shift; }
@@ -80,12 +85,22 @@ while [ "$#" -gt 0 ]; do
     *) url=$1; shift ;;
   esac
 done
+if [ -n "$headers" ]; then
+  printf 'HTTP/1.1 200 OK\r\n\r\n' >"$headers"
+fi
+response=''
 case "$url" in
-  */actions/runs/123) cat "$CURL_FIXTURE/run.json" ;;
-  */actions/artifacts/456) cat "$CURL_FIXTURE/artifact.json" ;;
-  */actions/artifacts/456/zip) cat "$CURL_FIXTURE/source.zip" ;;
+  */actions/runs/123) response=$CURL_FIXTURE/run.json ;;
+  */actions/artifacts/456) response=$CURL_FIXTURE/artifact.json ;;
+  */actions/artifacts/456/zip) response=$CURL_FIXTURE/source.zip ;;
   *) exit 1 ;;
 esac
+if [ -n "$output" ]; then
+  cp -- "$response" "$output"
+else
+  cat "$response"
+fi
+[ -z "$write_out" ] || printf '200'
 EOF
 chmod 755 "$tmp/curl"
 mkdir -p "$tmp/api/source-files" "$tmp/bin"
@@ -113,10 +128,20 @@ sed -i "s/REPLACE_DIGEST/sha256:$zip_digest/" "$tmp/api/artifact.json"
 export CURL_FIXTURE="$tmp/api"
 export GITHUB_TOKEN=fixture
 export GITHUB_REPOSITORY=test/repository
-export GITHUB_API_URL=https://api.example.test
+export GITHUB_API_URL=https://api.github.com
 manifest_before=$(sha256sum "$source_dir/recovery-point.json" | awk '{print $1}')
 db_before=$(sha256sum "$source_dir/postgres.dump.age" | awk '{print $1}')
 media_before=$(sha256sum "$source_dir/uploads.tar.gz.age" | awk '{print $1}')
+if GITHUB_API_URL=https://api.example.test PATH="$tmp:$tmp/bin:$PATH" \
+  "$root/scripts/migrate-beta-backup-artifact.sh" \
+  --source "$source_dir" --destination "$destination_dir" \
+  --manifest "$source_dir/recovery-point.json" --storage-root "$storage_root" \
+  --restore-command "$tmp/restore-command.sh" --restore-output "$restore_output" \
+  --identity-file "$tmp/identity" --capture-revision "$source_revision" \
+  --restore-revision "$restore_revision" --proof-output "$proof" \
+  --source-artifact-id 456 --source-run-id 123 >/dev/null 2>&1; then
+  fail "migration accepted a non-GitHub API origin"
+fi
 PATH="$tmp:$tmp/bin:$PATH" "$root/scripts/migrate-beta-backup-artifact.sh" \
   --source "$source_dir" --destination "$destination_dir" \
   --manifest "$source_dir/recovery-point.json" --storage-root "$storage_root" \

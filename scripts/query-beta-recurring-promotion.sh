@@ -72,14 +72,32 @@ api_get() {
     { echo 'BACKUP_CUSTODY_BLOCKED:promotion_api_invalid' >&2; exit 1; }
 }
 api_download() {
-  local name=$1 path=$2
-  curl --fail --silent --show-error --max-redirs 0 --connect-timeout 5 --max-time 60 \
-    --max-filesize 67108864 \
+  local name=$1 path=$2 headers="$tmp/$1.headers" status location
+  if ! status=$(curl --silent --show-error --max-redirs 0 \
+    --connect-timeout 5 --max-time 60 --max-filesize 67108864 \
+    --dump-header "$headers" --output "$tmp/$name" --write-out '%{http_code}' \
     -H "Authorization: Bearer $GITHUB_TOKEN" \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "$api$path" >"$tmp/$name" 2>"$tmp/$name.error" ||
+    "$api$path" 2>"$tmp/$name.error"); then
     { echo 'BACKUP_CUSTODY_BLOCKED:promotion_artifact_unavailable' >&2; exit 1; }
+  fi
+  case "$status" in
+    2[0-9][0-9]) ;;
+    3[0-9][0-9])
+      location=$(awk 'BEGIN { IGNORECASE=1 }
+        /^Location:[[:space:]]*/ {
+          sub(/^[^:]*:[[:space:]]*/, ""); print; exit
+        }' "$headers" | tr -d '\r')
+      [[ "$location" =~ ^https://([A-Za-z0-9.-]+\.blob\.core\.windows\.net|pipelines\.actions\.githubusercontent\.com)/[^[:space:]]+$ ]] ||
+        { echo 'BACKUP_CUSTODY_BLOCKED:promotion_artifact_redirect_invalid' >&2; exit 1; }
+      curl --fail --silent --show-error --max-redirs 0 \
+        --connect-timeout 5 --max-time 60 --max-filesize 67108864 \
+        "$location" >"$tmp/$name" 2>"$tmp/$name.error" ||
+        { echo 'BACKUP_CUSTODY_BLOCKED:promotion_artifact_unavailable' >&2; exit 1; }
+      ;;
+    *) echo 'BACKUP_CUSTODY_BLOCKED:promotion_artifact_unavailable' >&2; exit 1 ;;
+  esac
   [ "$(wc -c <"$tmp/$name")" -le 67108864 ] ||
     { echo 'BACKUP_CUSTODY_BLOCKED:promotion_artifact_too_large' >&2; exit 1; }
 }

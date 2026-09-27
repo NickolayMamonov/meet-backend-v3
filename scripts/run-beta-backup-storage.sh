@@ -78,7 +78,7 @@ case "$operation" in
     fi
     ;;
   provider-put)
-    key='' source='' root=${BETA_BACKUP_STORAGE_ROOT:-}
+    key='' source='' root=''
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
@@ -88,6 +88,11 @@ case "$operation" in
       esac
     done
     [ -n "$key" ] && [ -n "$source" ] || usage
+    [ -n "$root" ] || {
+      echo 'BACKUP_STORAGE_BLOCKED:generic_remote_write_forbidden' >&2
+      exit 1
+    }
+    beta_storage_require_local_root "$root" >/dev/null
     result=$(beta_storage_provider_put "$root" "$key" "$source")
     printf 'storage_provider_put=%s\n' "$result"
     ;;
@@ -109,7 +114,7 @@ case "$operation" in
     printf 'storage_provider_get=verified key=%s version=%s\n' "$key" "$version"
     ;;
   provider-delete)
-    key='' version='' root=${BETA_BACKUP_STORAGE_ROOT:-}
+    key='' version='' root=''
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --storage-root) [ "$#" -ge 2 ] || usage; root=$2; shift 2 ;;
@@ -119,6 +124,11 @@ case "$operation" in
       esac
     done
     [ -n "$key" ] && [ -n "$version" ] || usage
+    [ -n "$root" ] || {
+      echo 'BACKUP_STORAGE_BLOCKED:generic_remote_delete_forbidden' >&2
+      exit 1
+    }
+    beta_storage_require_local_root "$root" >/dev/null
     beta_storage_provider_delete "$root" "$key" "$version"
     printf 'storage_provider_delete=committed key=%s version=%s\n' "$key" "$version"
     ;;

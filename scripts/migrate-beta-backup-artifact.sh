@@ -71,6 +71,10 @@ command -v timeout >/dev/null 2>&1 || exit 1
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 api=${GITHUB_API_URL:-https://api.github.com}
+[ "$api" = https://api.github.com ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:source_api_origin_invalid' >&2
+  exit 1
+}
 source_tmp=$(mktemp -d)
 cleanup_source_auth() {
   local status=$?
@@ -110,15 +114,33 @@ jq -e --argjson artifact "$source_artifact_id" --argjson run "$source_run_id" '
 ' "$source_tmp/source-artifact.json" >/dev/null || {
   echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_binding_invalid' >&2; exit 1;
 }
-timeout --foreground 60s curl --fail --silent --show-error --location \
-  --connect-timeout 5 --max-time 60 --max-filesize 67108864 \
+artifact_headers="$source_tmp/source.headers"
+if ! artifact_status=$(timeout --foreground 60s curl --silent --show-error \
+  --max-redirs 0 --connect-timeout 5 --max-time 60 \
+  --max-filesize 67108864 --dump-header "$artifact_headers" \
+  --output "$source_tmp/source.zip" --write-out '%{http_code}' \
   -H "Authorization: Bearer $GITHUB_TOKEN" \
   -H 'Accept: application/vnd.github+json' \
   -H 'X-GitHub-Api-Version: 2022-11-28' \
-  "$api/repos/$GITHUB_REPOSITORY/actions/artifacts/$source_artifact_id/zip" \
-  >"$source_tmp/source.zip" || {
-  echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_unavailable' >&2; exit 1;
-}
+  "$api/repos/$GITHUB_REPOSITORY/actions/artifacts/$source_artifact_id/zip"); then
+  echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_unavailable' >&2; exit 1
+fi
+case "$artifact_status" in
+  2[0-9][0-9]) ;;
+  3[0-9][0-9])
+    artifact_location=$(awk 'BEGIN { IGNORECASE=1 }
+      /^Location:[[:space:]]*/ {
+        sub(/^[^:]*:[[:space:]]*/, ""); print; exit
+      }' "$artifact_headers" | tr -d '\r')
+    [[ "$artifact_location" =~ ^https://([A-Za-z0-9.-]+\.blob\.core\.windows\.net|pipelines\.actions\.githubusercontent\.com)/[^[:space:]]+$ ]] ||
+      { echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_redirect_invalid' >&2; exit 1; }
+    curl --fail --silent --show-error --max-redirs 0 \
+      --connect-timeout 5 --max-time 60 --max-filesize 67108864 \
+      "$artifact_location" >"$source_tmp/source.zip" 2>"$source_tmp/source.zip.error" ||
+      { echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_unavailable' >&2; exit 1; }
+    ;;
+  *) echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_unavailable' >&2; exit 1 ;;
+esac
 downloaded_digest=$(sha256sum "$source_tmp/source.zip" | awk '{print $1}')
 expected_digest=$(jq -er '.digest' "$source_tmp/source-artifact.json")
 [ "sha256:$downloaded_digest" = "$expected_digest" ] || {

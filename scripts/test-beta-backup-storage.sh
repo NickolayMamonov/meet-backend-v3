@@ -121,6 +121,14 @@ cmp -- "$tmp/provider-source" "$tmp/provider-copy" || fail "provider copy differ
 "$root/scripts/run-beta-backup-storage.sh" provider-delete --storage-root "$tmp/storage" \
   --key points/slot-1790000000/provider-fixture --version "$provider_version" >/dev/null ||
   fail "provider delete failed"
+if "$root/scripts/run-beta-backup-storage.sh" provider-put \
+  --key points/remote-forbidden --file "$tmp/provider-source" >/dev/null 2>&1; then
+  fail "generic remote provider write was exposed"
+fi
+if "$root/scripts/run-beta-backup-storage.sh" provider-delete \
+  --key points/remote-forbidden --version local-missing >/dev/null 2>&1; then
+  fail "generic remote provider delete was exposed"
+fi
 "$root/scripts/run-beta-backup-storage.sh" prune --storage-root "$tmp/storage" \
   --now 1820000000 --owner test >/dev/null || fail "pin-safe prune failed"
 [ -d "$tmp/storage/points/slot-1790000000" ] || fail "prune removed the verified pin"
@@ -142,11 +150,18 @@ case "${FAKE_AWS_MODE:?}" in
     ;;
   multipart)
     case " $* " in
+      *' head-object '*)
+        printf '{"VersionId":"version+with/opaque=1","ETag":"etag-1","ContentLength":9437184,"Metadata":{"sha256":"%s"}}\n' \
+          "${FAKE_AWS_SHA:?}"
+        ;;
+      *' get-object '*)
+        cp -- "${FAKE_AWS_SOURCE:?}" "${!#}"
+        ;;
       *' create-multipart-upload '*) printf '{"UploadId":"upload-1"}\n' ;;
       *' upload-part '*)
         printf '{"ETag":"etag-1"}\n'
         ;;
-      *' complete-multipart-upload '*) printf '{"VersionId":"version-1"}\n' ;;
+      *' complete-multipart-upload '*) printf '{"VersionId":"version+with/opaque=1"}\n' ;;
       *) printf '{}\n' ;;
     esac
     ;;
@@ -202,10 +217,18 @@ else
 fi
 dd if=/dev/zero of="$tmp/large-provider-object" bs=1M count=9 status=none
 export FAKE_AWS_MODE=multipart
+export FAKE_AWS_SOURCE="$tmp/large-provider-object"
+FAKE_AWS_SHA=$(sha256sum "$tmp/large-provider-object" | awk '{print $1}')
+export FAKE_AWS_SHA
 multipart_result=$(beta_storage_provider_put '' points/large-provider-object \
   "$tmp/large-provider-object")
-jq -e '.versionId=="version-1" and .length==9437184' <<<"$multipart_result" >/dev/null ||
+jq -e '.versionId=="version+with/opaque=1" and .length==9437184' <<<"$multipart_result" >/dev/null ||
   fail "multipart provider publication result was invalid"
+beta_storage_provider_get '' points/large-provider-object \
+  version+with/opaque=1 "$tmp/opaque-provider-copy" "$FAKE_AWS_SHA" >/dev/null ||
+  fail "opaque provider version ID was rejected"
+cmp -- "$tmp/large-provider-object" "$tmp/opaque-provider-copy" ||
+  fail "opaque provider version copy differs"
 grep -Fq 'create-multipart-upload' "$tmp/aws.log" ||
   fail "multipart create was not invoked"
 grep -Fq 'upload-part' "$tmp/aws.log" ||
