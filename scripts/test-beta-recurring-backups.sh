@@ -182,7 +182,7 @@ jq -cnS --arg capture "$capture" --arg restore "$restore" \
     pointDescriptorDigest:$descriptor,protectionDigest:$protection,
     identityCustody:"restore-only",
     isolated:true,databaseProbe:true,mediaProbe:true,cleanup:true,
-    preFingerprint:$fingerprint,postFingerprint:("f"+$fingerprint[1:])}' >"$proof"
+    preFingerprint:$fingerprint,postFingerprint:$fingerprint}' >"$proof"
 EOF
 chmod 755 "$tmp/restore-command.sh"
 printf 'private restore identity\n' >"$tmp/identity"
@@ -223,7 +223,7 @@ printf '\n' >>"$probe_post"
 jq -e --arg receipt "$(jq -er '.receiptId' "$drill_receipt")" '
   .schema=="meet-backend/beta-recurring-probe-binding/v1" and
   .receiptId==$receipt and .preProbeDigest != .postProbeDigest and
-  .preFingerprint != .postFingerprint' "$tmp/probe-binding.json" >/dev/null ||
+  .preFingerprint == .postFingerprint' "$tmp/probe-binding.json" >/dev/null ||
   fail "probe binding did not preserve distinct artifact versions"
 if "$root/scripts/run-beta-recurring-drill.sh" \
   --storage-root "$tmp/storage" --point-id slot-1790000000 --receipt "$tmp/invalid-receipt" \

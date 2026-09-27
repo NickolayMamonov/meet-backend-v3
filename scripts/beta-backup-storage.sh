@@ -576,6 +576,11 @@ beta_storage_remote_writer_acquire() {
       (.transactionId|type=="string")
     ' "$state" >/dev/null || beta_storage_fail writer_state_invalid
     [ "$(jq -er '.locked' "$state")" = false ] || beta_storage_fail writer_busy
+    jq -e '
+      .ambiguous==false and .operation=="idle" and .phase=="idle" and
+      .leaseUntil==0 and .reservationBytes==0 and .expectedKeys==[] and
+      .intentDigest=="0000000000000000000000000000000000000000000000000000000000000000"
+    ' "$state" >/dev/null || beta_storage_fail writer_state_not_terminal
     generation=$(jq -er '.generation' "$state")
     fencing=$(jq -er '.fencingToken' "$state")
     if_match=$etag
@@ -1405,7 +1410,7 @@ beta_storage_promote_remote() {
       .preProbeVersion==.preProbeDigest and .postProbeVersion==.postProbeDigest and
       (.preFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
       (.postFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
-      .preFingerprint != .postFingerprint
+      .preFingerprint == .postFingerprint
     ' "$probe_binding" >/dev/null || beta_storage_fail probe_binding_invalid
     jq -e --slurpfile binding "$probe_binding" \
       '.[0].preFingerprint == $binding[0].preFingerprint and
@@ -1605,7 +1610,7 @@ beta_storage_remote_multipart_eligible() {
 
 beta_storage_prune_remote() {
   local now=$1 owner=$2 safety_status=$3 safety_watermark=$4 safety_environment=$5
-  local pinned='' head_version
+  local pinned='' capture_pinned='' head_version
   [[ "$now" =~ ^[0-9]+$ ]] || beta_storage_fail clock_invalid
   beta_storage_remote_require_safety "$safety_status" "$safety_watermark" \
     "$safety_environment" "$now"
@@ -1664,16 +1669,23 @@ beta_storage_prune_remote() {
     '.verified.state=="VALID" and .verified.id==$pinned' \
     "$scratch/pinned-status.json" >/dev/null ||
     beta_storage_fail pinned_closure_invalid
+  capture_pinned=$(jq -er '.capture.id // empty' "$scratch/pinned-status.json")
+  [ -n "$capture_pinned" ] || beta_storage_fail capture_head_missing
   local expected_keys
-  expected_keys=$(jq -cn --arg point "$pinned" \
+  expected_keys=$(jq -cn --arg point "$pinned" --arg capture "$capture_pinned" \
     --arg receipt "$(jq -er '.receiptId' "$head")" \
-    '["points/"+$point+"/point.json",
+    '(["points/"+$point+"/point.json",
       "points/"+$point+"/recovery-point.json",
       "points/"+$point+"/postgres.dump.age",
       "points/"+$point+"/uploads.tar.gz.age",
       "receipts/"+$point+"/"+$receipt+".json",
       "receipts/"+$point+"/"+$receipt+".proof.json",
-      "control/verified-head.json"]')
+      "control/verified-head.json",
+      "points/"+$capture+"/point.json",
+      "points/"+$capture+"/recovery-point.json",
+      "points/"+$capture+"/postgres.dump.age",
+      "points/"+$capture+"/uploads.tar.gz.age",
+      "control/capture-head.json"] | unique)')
   beta_storage_remote_writer_transition pruning false "$expected_keys"
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" 0 false >/dev/null
   local inventory key version
@@ -1689,7 +1701,9 @@ beta_storage_prune_remote() {
   while IFS=$'\t' read -r key version; do
     [[ "$key" == points/*/recovery-point.json ]] || continue
     local point_id=${key#points/}; point_id=${point_id%/recovery-point.json}
-    [ "$point_id" = "$pinned" ] && continue
+    if [ "$point_id" = "$pinned" ] || [ "$point_id" = "$capture_pinned" ]; then
+      continue
+    fi
     grep -Fxq -- "$point_id" "$seen" && continue
     printf '%s\n' "$point_id" >>"$seen"
     local manifest
@@ -1738,9 +1752,11 @@ beta_storage_prune_remote() {
         startswith("receipts/"+$id+"/")) | [.Key,.VersionId]|@tsv' <<<"$inventory")
   done <"$orphan_points"
   rm -f -- "$orphan_points"
-  # The current control versions and the fenced writer are authoritative;
-  # older control versions are charged bytes but are not part of the closure.
-  for control_key in control/capture-head.json control/verified-head.json control/writer.json; do
+  # Every control object is budgeted. Retain only its current live version;
+  # this includes incident state, whose historical versions are not authority.
+  local control_key
+  while IFS= read -r control_key; do
+    [ -n "$control_key" ] || continue
     if beta_storage_remote_head "$control_key" "$head.meta"; then
       current_control_version=$(jq -er '.VersionId' "$head.meta")
       while IFS=$'\t' read -r control_version_key control_version; do
@@ -1751,7 +1767,8 @@ beta_storage_prune_remote() {
     else
       [ "$?" -eq 1 ] || beta_storage_fail control_read_failed
     fi
-  done
+  done < <(jq -r '.[].Versions[]? | .Key | select(startswith("control/"))' \
+    <<<"$inventory" | sort -u)
   local multipart key_marker='' upload_id_marker='' multipart_page=0
   while (( multipart_page < BETA_STORAGE_MAX_PAGES )); do
     multipart_page=$((multipart_page + 1))
@@ -1910,9 +1927,12 @@ beta_storage_reconcile_remote() {
     rm -f -- "$writer_meta" "$writer_state"
     beta_storage_fail writer_reconciliation_pending
   fi
-  [ "$(jq -er '.operation' "$writer_state")" = idle ] &&
-    [ "$(jq -er '.reservationBytes' "$writer_state")" = 0 ] &&
-    [ "$(jq -er '.ambiguous' "$writer_state")" = false ] ||
+  jq -e '
+    .locked==false and .ambiguous==false and .operation=="idle" and
+    .phase=="idle" and .leaseUntil==0 and .reservationBytes==0 and
+    .expectedKeys==[] and
+    .intentDigest=="0000000000000000000000000000000000000000000000000000000000000000"
+  ' "$writer_state" >/dev/null ||
     { rm -f -- "$writer_meta" "$writer_state"; beta_storage_fail writer_state_not_terminal; }
   rm -f -- "$writer_meta" "$writer_state"
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" >/dev/null
@@ -2234,7 +2254,7 @@ beta_storage_validate_receipt() {
     .cleanup==true and
     (.preFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
     (.postFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
-    .preFingerprint != .postFingerprint
+    .preFingerprint == .postFingerprint
   ' "$proof_path" >/dev/null
 }
 

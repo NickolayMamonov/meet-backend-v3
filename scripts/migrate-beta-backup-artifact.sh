@@ -8,7 +8,7 @@ usage() {
 
 source_dir='' destination_dir='' manifest='' storage_root=''
 restore_command='' restore_output='' identity='' capture_revision=''
-restore_revision='' proof_output=''
+restore_revision='' proof_output='' source_artifact_id='' source_run_id=''
 remote=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -22,6 +22,8 @@ while [ "$#" -gt 0 ]; do
     --capture-revision) [ "$#" -ge 2 ] || usage; capture_revision=$2; shift 2 ;;
     --restore-revision) [ "$#" -ge 2 ] || usage; restore_revision=$2; shift 2 ;;
     --proof-output) [ "$#" -ge 2 ] || usage; proof_output=$2; shift 2 ;;
+    --source-artifact-id) [ "$#" -ge 2 ] || usage; source_artifact_id=$2; shift 2 ;;
+    --source-run-id) [ "$#" -ge 2 ] || usage; source_run_id=$2; shift 2 ;;
     --remote) remote=true; shift ;;
     *) usage ;;
   esac
@@ -36,6 +38,12 @@ done
 }
 [[ "$capture_revision" =~ ^[0-9a-f]{40}$ &&
   "$restore_revision" =~ ^[0-9a-f]{40}$ ]] || usage
+[[ "$source_artifact_id" =~ ^[1-9][0-9]*$ &&
+  "$source_run_id" =~ ^[1-9][0-9]*$ ]] || usage
+: "${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
+: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+command -v curl >/dev/null 2>&1 || exit 1
+command -v unzip >/dev/null 2>&1 || exit 1
 [ -d "$source_dir" ] && [ ! -L "$source_dir" ] || {
   echo 'BACKUP_STORAGE_BLOCKED:source_unavailable' >&2; exit 1;
 }
@@ -58,6 +66,79 @@ command -v jq >/dev/null 2>&1 || exit 1
 command -v timeout >/dev/null 2>&1 || exit 1
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+api=${GITHUB_API_URL:-https://api.github.com}
+source_tmp=$(mktemp -d)
+cleanup_source_auth() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  rm -rf -- "$source_tmp" || status=1
+  exit "$status"
+}
+trap cleanup_source_auth EXIT HUP INT TERM
+api_get() {
+  local name=$1 path=$2
+  timeout --foreground 30s curl --fail --silent --show-error \
+    --connect-timeout 5 --max-time 30 \
+    -H "Authorization: Bearer $GITHUB_TOKEN" \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "$api$path" >"$source_tmp/$name" ||
+    { echo 'BACKUP_CUSTODY_BLOCKED:source_api_unavailable' >&2; exit 1; }
+  jq -e . "$source_tmp/$name" >/dev/null ||
+    { echo 'BACKUP_CUSTODY_BLOCKED:source_api_invalid' >&2; exit 1; }
+}
+api_get source-run "/repos/$GITHUB_REPOSITORY/actions/runs/$source_run_id"
+api_get source-artifact.json "/repos/$GITHUB_REPOSITORY/actions/artifacts/$source_artifact_id"
+jq -e --arg repo "$GITHUB_REPOSITORY" --argjson run "$source_run_id" \
+  --arg capture "$capture_revision" '
+  .id==$run and .repository.full_name==$repo and
+  .path==".github/workflows/prove-beta-backup-restore.yml" and
+  .head_sha==$capture and .status=="completed" and .conclusion=="success"
+' "$source_tmp/source-run" >/dev/null || {
+  echo 'BACKUP_CUSTODY_BLOCKED:source_run_binding_invalid' >&2; exit 1;
+}
+jq -e --argjson artifact "$source_artifact_id" --argjson run "$source_run_id" '
+  .id==$artifact and .expired==false and
+  .workflow_run.id==$run and .size_in_bytes>0 and
+  (.digest|type=="string" and test("^sha256:[0-9a-f]{64}$")) and
+  (.created_at|type=="string" and length>0) and
+  (.expires_at|type=="string" and length>0)
+' "$source_tmp/source-artifact.json" >/dev/null || {
+  echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_binding_invalid' >&2; exit 1;
+}
+timeout --foreground 60s curl --fail --silent --show-error --location \
+  --connect-timeout 5 --max-time 60 --max-filesize 67108864 \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'X-GitHub-Api-Version: 2022-11-28' \
+  "$api/repos/$GITHUB_REPOSITORY/actions/artifacts/$source_artifact_id/zip" \
+  >"$source_tmp/source.zip" || {
+  echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_unavailable' >&2; exit 1;
+}
+downloaded_digest=$(sha256sum "$source_tmp/source.zip" | awk '{print $1}')
+expected_digest=$(jq -er '.digest' "$source_tmp/source-artifact.json")
+[ "sha256:$downloaded_digest" = "$expected_digest" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_digest_mismatch' >&2; exit 1;
+}
+mkdir "$source_tmp/source-artifact"
+chmod 700 "$source_tmp/source-artifact" 2>/dev/null || true
+unzip -q -o "$source_tmp/source.zip" -d "$source_tmp/source-artifact"
+[ -z "$(find "$source_dir" -type l -print -quit)" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:source_symlink_present' >&2; exit 1;
+}
+[ -z "$(find "$source_tmp/source-artifact" -type l -print -quit)" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_symlink_present' >&2; exit 1;
+}
+source_files=$(find "$source_dir" -type f -printf '%P\n' | sort)
+artifact_files=$(find "$source_tmp/source-artifact" -type f -printf '%P\n' | sort)
+[ "$source_files" = "$artifact_files" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_files_mismatch' >&2; exit 1;
+}
+while IFS= read -r source_file; do
+  cmp -s "$source_dir/$source_file" "$source_tmp/source-artifact/$source_file" || {
+    echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_content_mismatch' >&2; exit 1;
+  }
+done <<<"$source_files"
 # shellcheck source=beta-backup-storage.sh
 source "$script_dir/beta-backup-storage.sh"
 [ "$remote" = true ] && beta_storage_require_config ||
@@ -194,7 +275,7 @@ jq -e --arg capture "$capture_revision" --arg restore "$restore_revision" \
   .databaseProbe==true and .mediaProbe==true and .cleanup==true and
   (.preFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
   (.postFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
-  .preFingerprint != .postFingerprint
+  .preFingerprint == .postFingerprint
 ' "$proof_output" >/dev/null || {
   echo 'BACKUP_CUSTODY_BLOCKED:destination_restore_proof_invalid' >&2; exit 1;
 }

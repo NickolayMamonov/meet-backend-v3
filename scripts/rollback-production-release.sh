@@ -42,6 +42,7 @@ docker volume inspect "$UPLOAD_VOLUME" >/dev/null
 
 HELPER_IMAGE=$(sed -n 's/^BACKEND_IMAGE=//p' .env.production)
 test -n "$HELPER_IMAGE"
+beta_backup_runtime_require_operation "$IMAGE" production-rollback "$ROOT_DIR/.env.production"
 "${COMPOSE[@]}" stop backend
 docker run --rm --user 0:0 --entrypoint chown \
   --mount "type=volume,source=$UPLOAD_VOLUME,target=/data/uploads" \

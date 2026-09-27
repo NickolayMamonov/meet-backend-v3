@@ -15,6 +15,20 @@ import java.nio.file.attribute.PosixFilePermission
 
 class BackupSafetyGateTest {
     @Test
+    fun `enrolled runtime startup does not require an initial snapshot`() {
+        assumeTrue(posixAttributesSupported())
+        val directory = Files.createTempDirectory("backup-safety-startup")
+        val path = directory.resolve("status.json")
+        val properties = propertiesFor(directory, path)
+
+        BackupSafetyGate(
+            properties,
+            BackupSafetySnapshotReader(jacksonObjectMapper(), properties),
+            Clock.systemUTC(),
+        ).validateEnrollmentConfiguration()
+    }
+
+    @Test
     fun `admits healthy observation while capture RPO breach remains a monitoring concern`() {
         assumeTrue(posixAttributesSupported())
         val directory = Files.createTempDirectory("backup-safety-gate")

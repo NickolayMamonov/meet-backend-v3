@@ -59,7 +59,7 @@ jq -cnS --arg descriptor "$descriptor_digest" \
     identityCustody:"restore-only",isolated:true,databaseProbe:true,
     mediaProbe:true,cleanup:true,
     preFingerprint:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    postFingerprint:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}' \
+    postFingerprint:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}' \
   >"$tmp/receipt-1.proof.json"
 proof_digest=$(sha256sum "$tmp/receipt-1.proof.json" | awk '{print $1}')
 jq -cnS --arg descriptor "$descriptor_digest" --arg command "$capture_command_digest" \
@@ -195,6 +195,14 @@ if "$root/scripts/run-beta-backup-storage.sh" prune --now 1820000000 \
 fi
 grep -Fq 'expectedKeys' "$root/scripts/beta-backup-storage.sh" ||
   fail "writer state does not retain expected mutation closure"
+grep -Fq '.operation=="idle" and .phase=="idle"' \
+  "$root/scripts/beta-backup-storage.sh" ||
+  fail "writer acquisition does not require terminal idle state"
+grep -Fq '.leaseUntil==0 and .reservationBytes==0' \
+  "$root/scripts/beta-backup-storage.sh" ||
+  fail "writer acquisition does not require a zero terminal lease"
+grep -Fq 'writer_state_not_terminal' "$root/scripts/beta-backup-storage.sh" ||
+  fail "writer acquisition does not reject malformed unlocked state"
 grep -Fq 'beta_storage_remote_writer_transition ambiguous true' \
   "$root/scripts/beta-backup-storage.sh" ||
   fail "ambiguous mutations are not durably fenced"

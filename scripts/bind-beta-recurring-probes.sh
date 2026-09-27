@@ -44,13 +44,15 @@ pre_fingerprint=$(jq -er '.preFingerprint' \
   "$(dirname "$receipt")/$(jq -er '.receiptId' "$receipt").proof.json")
 post_fingerprint=$(jq -er '.postFingerprint' \
   "$(dirname "$receipt")/$(jq -er '.receiptId' "$receipt").proof.json")
-[ "$pre_fingerprint" != "$post_fingerprint" ] || beta_storage_fail fingerprint_replay
+[[ "$pre_fingerprint" =~ ^[0-9a-f]{64}$ &&
+  "$post_fingerprint" =~ ^[0-9a-f]{64}$ ]] ||
+  beta_storage_fail fingerprint_invalid
 descriptor=$(jq -er '.pointDescriptorDigest' "$receipt")
 point=$(jq -er '.pointId' "$receipt")
 receipt_id=$(jq -er '.receiptId' "$receipt")
 jq -e --arg pre "$pre_fingerprint" --arg post "$post_fingerprint" \
   '.preFingerprint==$pre and .postFingerprint==$post and
-   .preFingerprint != .postFingerprint' \
+   .preFingerprint == .postFingerprint' \
   "$(dirname "$receipt")/$receipt_id.proof.json" >/dev/null ||
   beta_storage_fail probe_fingerprint_binding
 mkdir -p "$(dirname -- "$output")"

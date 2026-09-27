@@ -40,6 +40,8 @@ if [ -e "$point/capture-database-proof.json" ] ||
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=beta-backup-storage.sh
+source "$script_dir/beta-backup-storage.sh"
 tmp=$(mktemp -d)
 cleanup() {
   local status=$?
@@ -137,17 +139,15 @@ mkdir -m 700 "$core_output"
   --temp-root "$tmp"
 test -s "$core_output/restored-database-proof.json"
 test -s "$core_output/restored-media-proof.json"
-pre_fingerprint=$( {
-  sha256sum "$point/recovery-point.json" "$point/point.json" \
-    "$artifact/postgres.dump.age" "$artifact/uploads.tar.gz.age"
-  if [ "$capture_proofs" = true ]; then
-    sha256sum "$database_proof" "$media_proof"
-  fi
-} | sha256sum | awk '{print $1}')
-post_fingerprint=$(sha256sum "$core_output/restored-database-proof.json" \
-  "$core_output/restored-media-proof.json" | sha256sum | awk '{print $1}')
 descriptor_digest=$(beta_storage_descriptor_digest "$point/point.json")
 captured=$(jq -er '.capture.capturedAt' "$point/recovery-point.json")
+runtime_fingerprint() {
+  printf '%s\0%s\0%s\0%s\0%s' \
+    "$capture_revision" "$restore_revision" "$descriptor_digest" \
+    "$protection_digest" "$captured" | sha256sum | awk '{print $1}'
+}
+pre_fingerprint=$(runtime_fingerprint)
+post_fingerprint=$(runtime_fingerprint)
 jq -cnS --arg capture "$capture_revision" --arg restore "$restore_revision" \
   --arg descriptor "$descriptor_digest" --arg protection "$protection_digest" \
   --arg pre "$pre_fingerprint" --arg post "$post_fingerprint" \

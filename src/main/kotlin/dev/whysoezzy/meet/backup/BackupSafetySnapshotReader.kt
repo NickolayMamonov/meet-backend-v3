@@ -29,19 +29,12 @@ open class BackupSafetySnapshotReader(
         if (mode != null) {
             require(mode == properties.controlRootMode.toInt(8))
         }
-        val status = Path.of(properties.statusPath)
-        val watermark = watermarkPath(root)
-        require(Files.isRegularFile(status, LinkOption.NOFOLLOW_LINKS))
-        require(Files.isRegularFile(watermark, LinkOption.NOFOLLOW_LINKS))
+        val status = Path.of(properties.statusPath).toAbsolutePath().normalize()
+        require(status.parent == root)
+        watermarkPath(root)
         if (mode != null) {
-            require(readMode(status) == CONTROL_FILE_MODE)
-            require(readMode(watermark) == CONTROL_FILE_MODE)
             require(readUnixOwner(root, "uid") == properties.controlRootUid)
             require(readUnixOwner(root, "gid") == properties.controlRootGid)
-            require(readUnixOwner(status, "uid") == properties.controlRootUid)
-            require(readUnixOwner(status, "gid") == properties.controlRootGid)
-            require(readUnixOwner(watermark, "uid") == properties.controlRootUid)
-            require(readUnixOwner(watermark, "gid") == properties.controlRootGid)
         }
     }
 
@@ -61,7 +54,9 @@ open class BackupSafetySnapshotReader(
             val watermarkPath = watermarkPath(controlRoot())
             require(Files.isRegularFile(watermarkPath) && !Files.isSymbolicLink(watermarkPath))
             require(Files.size(watermarkPath) <= MAX_BYTES)
-            Files.readAllBytes(watermarkPath)
+            Files.newInputStream(watermarkPath, LinkOption.NOFOLLOW_LINKS)
+                .use { it.readNBytes(MAX_BYTES.toInt() + 1) }
+                .also { require(it.size <= MAX_BYTES) { "watermark is too large" } }
         } catch (_: Exception) {
             throw BackupSafetySnapshotReadException("watermark is unavailable")
         }

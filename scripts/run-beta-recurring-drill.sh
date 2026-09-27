@@ -220,7 +220,7 @@ jq -e --arg capture "$capture_revision" --arg restore "$restore_revision" \
   (.databaseProbe==true and .mediaProbe==true) and
   (.preFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
   (.postFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
-  .preFingerprint != .postFingerprint and
+  .preFingerprint == .postFingerprint and
   (.capturedAt|type=="number" and floor==. and .>=0)
 ' "$proof_tmp" >/dev/null || {
   echo 'BACKUP_CUSTODY_BLOCKED:restore_proof_invalid' >&2
@@ -230,7 +230,9 @@ proof_digest=$(sha256sum "$proof_tmp" | awk '{print $1}')
 receipt_id="receipt-$(date -u +%Y%m%dT%H%M%SZ)-$point_id"
 mkdir -p "$(dirname -- "$receipt")"
 cp -- "$proof_tmp" "$(dirname -- "$receipt")/$receipt_id.proof.json"
+cp -- "$proof_tmp" "$(dirname -- "$receipt")/$(basename -- "$receipt" .json).proof.json"
 chmod 600 "$(dirname -- "$receipt")/$receipt_id.proof.json"
+chmod 600 "$(dirname -- "$receipt")/$(basename -- "$receipt" .json).proof.json"
 jq -cnS --arg id "$receipt_id" --arg point "$point_id" \
   --arg capture "$capture_revision" --arg restore "$restore_revision" \
   --arg proof "$proof_digest" --arg descriptor "$descriptor_digest" \

@@ -218,6 +218,11 @@ cmp -s "$receipt" "$tmp/receipt-artifact/protected-receipt.json" || {
   echo 'BACKUP_CUSTODY_BLOCKED:receipt_artifact_binding_invalid' >&2
   exit 1
 }
+[ "$(sha256sum "$tmp/receipt-artifact/protected-receipt.proof.json" |
+  awk '{print $1}')" = "$(jq -er '.proofDigest' "$receipt")" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:receipt_proof_artifact_binding_invalid' >&2
+  exit 1
+}
 verify_receipt_artifact "$post_zip" "$tmp/post-artifact" "$post_artifact_digest" \
   $'post-probe.json\nprobe-binding.json' || {
   echo 'BACKUP_CUSTODY_BLOCKED:post_probe_artifact_bytes_invalid' >&2

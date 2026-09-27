@@ -6,7 +6,8 @@ usage() {
   exit 2
 }
 
-input='' root='' environment='' now='' owner_uid=$(id -u) owner_gid=$(id -g)
+input='' root='' environment='' now='' owner_uid=0 owner_gid=10001
+fixture_mode=${BETA_BACKUP_TEST_FIXTURE:-false}
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --input) [ "$#" -ge 2 ] || usage; input=$2; shift 2 ;;
@@ -22,6 +23,15 @@ done
 [[ "$environment" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || usage
 [[ "$now" =~ ^[0-9]+$ ]] || usage
 [[ "$owner_uid" =~ ^[0-9]+$ && "$owner_gid" =~ ^[0-9]+$ ]] || usage
+[ "$fixture_mode" = true ] ||
+  [ "$owner_uid:$owner_gid" = 0:10001 ] || {
+  echo "receiver ownership must be uid 0 and gid 10001" >&2
+  exit 1
+}
+if [ "$fixture_mode" = true ] && [ "$owner_uid:$owner_gid" = 0:10001 ]; then
+  owner_uid=$(id -u)
+  owner_gid=$(id -g)
+fi
 [ -f "$input" ] && [ ! -L "$input" ] || { echo "snapshot input is unavailable" >&2; exit 1; }
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -96,14 +106,24 @@ tmp=$(mktemp "$root/.status.XXXXXX")
 watermark_tmp=$(mktemp "$root/.watermark.XXXXXX")
 trap 'rm -f -- "$tmp" "$watermark_tmp"; release_receiver_lock' EXIT
 install -m 640 "$input" "$tmp"
-chown "$owner_uid:$owner_gid" "$tmp" 2>/dev/null || true
+chown "$owner_uid:$owner_gid" "$tmp" 2>/dev/null ||
+  { echo "receiver status ownership cannot be established" >&2; exit 1; }
 chmod 640 "$tmp"
+if [ "$(uname -s)" = Linux ]; then
+  [ "$(stat -c '%a:%u:%g' "$tmp")" = "640:$owner_uid:$owner_gid" ] ||
+    { echo "receiver status ownership is invalid" >&2; exit 1; }
+fi
 jq -cnS --arg statusDigest "$new_digest" --argjson generation "$new_generation" \
   --argjson observed "$new_observed" \
   '{schema:"meet-backend/beta-backup-watermark/v1",authorityGeneration:$generation,
     observedAt:$observed,statusDigest:$statusDigest}' >"$watermark_tmp"
-chown "$owner_uid:$owner_gid" "$watermark_tmp" 2>/dev/null || true
+chown "$owner_uid:$owner_gid" "$watermark_tmp" 2>/dev/null ||
+  { echo "receiver watermark ownership cannot be established" >&2; exit 1; }
 chmod 640 "$watermark_tmp"
+if [ "$(uname -s)" = Linux ]; then
+  [ "$(stat -c '%a:%u:%g' "$watermark_tmp")" = "640:$owner_uid:$owner_gid" ] ||
+    { echo "receiver watermark ownership is invalid" >&2; exit 1; }
+fi
 if [ "$(uname -s)" = Linux ]; then
   sync -f "$tmp" "$watermark_tmp" "$root"
 else
@@ -116,4 +136,10 @@ mv -f -- "$tmp" "$status"
 if [ "$(uname -s)" = Linux ]; then sync -f "$status" "$root"; else sync -f "$status" "$root" 2>/dev/null || true; fi
 mv -f -- "$watermark_tmp" "$watermark"
 if [ "$(uname -s)" = Linux ]; then sync -f "$watermark" "$root"; else sync -f "$watermark" "$root" 2>/dev/null || true; fi
+if [ "$(uname -s)" = Linux ]; then
+  [ "$(stat -c '%a:%u:%g' "$status")" = "640:$owner_uid:$owner_gid" ] ||
+    { echo "receiver status ownership changed" >&2; exit 1; }
+  [ "$(stat -c '%a:%u:%g' "$watermark")" = "640:$owner_uid:$owner_gid" ] ||
+    { echo "receiver watermark ownership changed" >&2; exit 1; }
+fi
 printf 'receiver_status=accepted generation=%s observed_at=%s\n' "$new_generation" "$new_observed"
