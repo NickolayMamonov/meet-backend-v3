@@ -89,6 +89,9 @@ for text in \
   require "$text" "$update_text" "standalone production update gate"
 done
 
+require 'beta_backup_runtime_require_operation "$image" test-vps-deploy' \
+  "$deploy_text" "direct test-VPS deployment gate"
+
 for text in \
   'scripts/deploy-test-vps-provider-release.sh' \
   'scripts/test-vps-provider-credential.py' \
@@ -190,7 +193,6 @@ require 'state=$state_root/$run_key-$state_suffix' "$provider_deploy_text" \
 
 for frozen in \
   .github/workflows/promote-dev-digest-to-test-vps.yml \
-  scripts/deploy-test-vps-release.sh \
   scripts/test-vps-runtime-invariants.sh \
   scripts/production-compose.sh; do
   git diff --quiet "$baseline" -- "$frozen" ||
@@ -633,6 +635,9 @@ state_writer_line=$(awk '/install -d -m 700 "\$state_root"/{print NR; exit}' "$d
 state_directory_line=$(awk '/install -d -m 700 "\$state"/{print NR; exit}' "$provider_deploy")
 provider_retention_line=$(awk '/retention-check/{print NR; exit}' "$provider_deploy")
 mutation_line=$(awk '/mutation_started=true/{print NR; exit}' "$deploy")
+gate_line=$(grep -nF \
+  'beta_backup_runtime_require_operation "$image" test-vps-deploy' "$deploy" |
+  cut -d: -f1 | head -n 1)
 target_line=$(awk '/is_supported_test_vps_version "\$version"/{print NR; exit}' "$deploy")
 predecessor_line=$(awk '/is_supported_test_vps_version "\$previous_version"/{print NR; exit}' "$deploy")
 predecessor_state_line=$(awk '/previous-image"/{print NR; exit}' "$deploy")
@@ -647,6 +652,8 @@ update_line=$(awk '/"\$update_script" "\$image"/{print NR; exit}' "$deploy")
   fail "deployment floor checks are ordered after a protected writer"
 [ "$provider_retention_line" -lt "$state_directory_line" ] ||
   fail "provider retention admission runs after state-directory creation"
+[ -n "$gate_line" ] && [ "$gate_line" -lt "$mutation_line" ] ||
+  fail "direct test-VPS safety admission runs after active mutation"
 
 require 'runtime_check=network' "$runtime_text" "shared runtime helper"
 
