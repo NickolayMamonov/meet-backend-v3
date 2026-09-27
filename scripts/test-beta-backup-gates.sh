@@ -40,6 +40,9 @@ if APP_BACKUP_SAFETY_NOW_EPOCH="$now" bash -c \
 else
   fail "healthy documented APP enrollment was denied"
 fi
+root_env_error=$(env -i PATH="$PATH" APP_BACKUP_SAFETY_NOW_EPOCH="$now" bash -c \
+  "source '$root/scripts/beta-backup-runtime-gate.sh'; beta_backup_runtime_require_operation '' test-vps-deploy '$tmp/.env.production'") ||
+  fail "root environment-only enrollment was denied: $root_env_error"
 if APP_BACKUP_SAFETY_NOW_EPOCH="$now" bash -c \
   "source '$root/scripts/beta-backup-runtime-gate.sh'; beta_backup_runtime_require_operation '' smtp-apply '$tmp/missing.env'" \
   >/dev/null 2>&1; then

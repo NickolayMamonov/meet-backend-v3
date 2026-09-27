@@ -159,6 +159,8 @@ printf '%s\n' "$previous_id" >"$state/previous-image-id"
 printf '%s\n' "$previous_revision" >"$state/previous-revision"
 printf '%s\n' "$previous_version" >"$state/previous-version"
 printf '%s\n' "$previous_runtime_hash" >"$state/previous-runtime-config-hash"
+install -m 600 "$root/.env.production" "$state/previous-env.production"
+sha256sum "$root/.env.production" | awk '{print $1}' >"$state/previous-env.sha256"
 if [ -e "$active_compose" ]; then
   [ -s "$active_compose" ] || fail "active Compose file is empty"
   install -m 600 "$active_compose" "$state/previous-active-compose.yml"
@@ -276,9 +278,26 @@ restore_previous_active_files() {
 
 rollback() {
   restore_previous_active_files
-  PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
-    "$update_script" "$previous_image" "$previous_revision" "$previous_version" \
-    >/dev/null
+  [ -f "$state/previous-env.production" ] && [ ! -L "$state/previous-env.production" ] ||
+    fail "rollback predecessor environment is unavailable"
+  previous_env_sha=$(<"$state/previous-env.sha256")
+  [[ "$previous_env_sha" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "rollback predecessor environment digest is malformed"
+  current_env_sha=$(sha256sum "$root/.env.production" | awk '{print $1}')
+  if [ -f "$state/target-env.sha256" ]; then
+    target_env_sha=$(<"$state/target-env.sha256")
+    [[ "$target_env_sha" =~ ^[0-9a-f]{64}$ ]] ||
+      fail "rollback target environment digest is malformed"
+    [ "$current_env_sha" = "$target_env_sha" ] ||
+      [ "$current_env_sha" = "$previous_env_sha" ] ||
+      fail "rollback target environment changed outside this transaction"
+  else
+    [ "$current_env_sha" = "$previous_env_sha" ] ||
+      fail "rollback predecessor environment changed outside this transaction"
+  fi
+  install -m 600 "$state/previous-env.production" "$root/.env.production"
+  [ "$(sha256sum "$root/.env.production" | awk '{print $1}')" = "$previous_env_sha" ] ||
+    fail "rollback did not restore the predecessor environment"
   compose up -d --no-deps --no-build --pull never --force-recreate \
     --wait --wait-timeout 180 backend >/dev/null
   restored_hash=$(docker inspect "$(compose ps -q backend)" \
@@ -304,13 +323,14 @@ on_exit() {
 trap on_exit EXIT
 
 beta_backup_runtime_require_operation "$image" test-vps-deploy \
-  "${APP_BACKUP_SAFETY_ENV_FILE:-}" ||
+  "$root/.env.production" ||
   fail "backup safety admission denied deployment"
 mutation_started=true
 install -m 600 "$base_compose" "$active_compose"
 install -m 600 "$state/target-runtime.override.yml" "$active_runtime"
 PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
   "$update_script" "$image" "$revision" "$version" >/dev/null
+sha256sum "$root/.env.production" | awk '{print $1}' >"$state/target-env.sha256"
 compose up -d --no-deps --no-build --pull never --force-recreate \
   --wait --wait-timeout 180 backend >/dev/null
 target_hash=$(docker inspect "$(compose ps -q backend)" \

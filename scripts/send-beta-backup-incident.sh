@@ -185,14 +185,9 @@ if [ -n "$issue" ]; then
     }
     rm -f "$reopened"
   fi
-  comment=$(api POST "/issues/$number/comments" \
-    "$(jq -cn --arg body "$body" '{body:$body}')")
-  jq -e '(.id|type=="number" and .>0)' "$comment" >/dev/null || {
-    rm -f "$comment"
-    echo 'BACKUP_INCIDENT_BLOCKED:comment_response_invalid' >&2
-    exit 1
-  }
-  rm -f "$comment"
+  # The issue body is the durable event-id record. An identical dedupe key
+  # means the external delivery already succeeded, so recovery after a lost
+  # provider-state CAS must not append a duplicate comment.
 else
   created_issue=$(api POST '/issues' "$payload")
   jq -e '(.number|type=="number" and .>0)' "$created_issue" >/dev/null || {

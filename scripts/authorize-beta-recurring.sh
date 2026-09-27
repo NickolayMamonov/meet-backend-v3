@@ -102,7 +102,7 @@ if [ -n "$policy_file" ] || [ -n "$ci_result_file" ]; then
   validate_policy "$policy_file"
   validate_ci "$ci_result_file"
   [[ "$actor" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail actor
-  if [ "$environment" = closed-beta-recurring-restore ] && [ -n "$reviewer" ]; then
+  if [ "$environment" = closed-beta-recurring-restore ]; then
     [[ "$reviewer" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail reviewer_missing
     [ "$reviewer" != "$actor" ] || fail self_review
     [ -n "$reviewer_id" ] || fail reviewer_id_missing

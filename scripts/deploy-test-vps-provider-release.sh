@@ -1099,6 +1099,10 @@ rollback() {
     validate_configuration_boundary "$state/config.env.target"
   elif [ "$updater_started" = false ]; then
     validate_configuration_boundary "$state/config.env.production"
+  else
+    (cmp -s "$root/.env.production" "$state/config.env.production" ||
+      cmp -s "$root/.env.production" "$state/config.env.target") ||
+      fail "RECOVERY_REQUIRED"
   fi
   write_provider_marker rolling-back "${durable_disposition:-none}"
   restore_previous_active_files
@@ -1106,9 +1110,10 @@ rollback() {
     validate_configuration_boundary "$state/config.env.target"
   fi
   updater_started=true
-  PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
-    timeout 60s "$update_script" "$previous_image" "$previous_revision" "$previous_version" \
-    >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
+  [ -f "$state/config.env.previous" ] && [ ! -L "$state/config.env.previous" ] ||
+    fail "RECOVERY_REQUIRED"
+  timeout 30s install -m 600 "$state/config.env.previous" \
+    "$root/.env.production" || fail "RECOVERY_REQUIRED"
   cmp -s "$root/.env.production" "$state/config.env.previous" ||
     fail "RECOVERY_REQUIRED"
   printf '%s\n' "$(configuration_file_identity "$root/.env.production")" \

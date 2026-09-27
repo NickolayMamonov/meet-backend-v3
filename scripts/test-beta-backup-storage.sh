@@ -89,6 +89,13 @@ provider_result=$("$root/scripts/run-beta-backup-storage.sh" provider-put \
   --file "$tmp/provider-source")
 provider_version=${provider_result#storage_provider_put=}
 provider_version=$(jq -er '.versionId' <<<"$provider_version")
+for invalid_key in points/../escape points//duplicate unknown-prefix/object; do
+  if "$root/scripts/run-beta-backup-storage.sh" provider-put \
+    --storage-root "$tmp/storage" --key "$invalid_key" \
+    --file "$tmp/provider-source" >/dev/null 2>&1; then
+    fail "invalid provider mutation key was accepted: $invalid_key"
+  fi
+done
 "$root/scripts/run-beta-backup-storage.sh" provider-get --storage-root "$tmp/storage" \
   --key points/slot-1790000000/provider-fixture --version "$provider_version" \
   --output "$tmp/provider-copy" >/dev/null || fail "provider get failed"
@@ -115,6 +122,10 @@ if "$root/scripts/run-beta-backup-storage.sh" reconcile --storage-root "$tmp/sto
   fail "incomplete point was reconciled as clean"
 fi
 rm -r "$tmp/storage/points/incomplete"
+grep -Fq 'control/writer.json' "$root/scripts/beta-backup-storage.sh" ||
+  fail "remote reconciliation does not inspect durable writer state"
+grep -Fq 'writer_reconciliation_pending' "$root/scripts/beta-backup-storage.sh" ||
+  fail "remote reconciliation does not retain pending writer state"
 cat >"$tmp/incident.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail

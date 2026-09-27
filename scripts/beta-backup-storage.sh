@@ -110,8 +110,9 @@ beta_storage_remote() {
 beta_storage_key() {
   local key=${1:-}
   [[ "$key" =~ ^(points|receipts|control)/[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
-    beta_storage_fail key_invalid
-  [[ "$key" != *..* && "$key" != *//* ]] || beta_storage_fail key_invalid
+    { beta_storage_fail key_invalid; return 1; }
+  [[ "$key" != *..* && "$key" != *//* ]] ||
+    { beta_storage_fail key_invalid; return 1; }
   printf '%s\n' "$key"
 }
 
@@ -346,6 +347,7 @@ beta_storage_local_provider_list() {
 
 beta_storage_provider_put() {
   local root=$1 key=$2 source=$3
+  beta_storage_key "$key" >/dev/null || return 1
   if [ -n "$root" ]; then
     beta_storage_local_provider_put "$root" "$key" "$source"
     return
@@ -366,6 +368,7 @@ beta_storage_provider_put() {
 
 beta_storage_provider_put_conditional() {
   local root=$1 key=$2 source=$3 if_match=${4:-} if_none_match=${5:-false}
+  beta_storage_key "$key" >/dev/null || return 1
   [ -z "$if_match" ] || [[ "$if_match" =~ ^\"?[A-Za-z0-9+/=_-]+\"?$ ]] ||
     beta_storage_fail etag_invalid
   if [ -n "$root" ]; then
@@ -480,6 +483,7 @@ beta_storage_remote_validate_object_metadata() {
 
 beta_storage_provider_delete() {
   local root=$1 key=$2 version=$3
+  beta_storage_key "$key" >/dev/null || return 1
   if [ -n "$root" ]; then
     beta_storage_local_provider_delete "$root" "$key" "$version"
     return
@@ -1589,6 +1593,7 @@ beta_storage_prune_remote() {
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
       beta_storage_remote_multipart_eligible "$upload_key" "$initiated" "$now" ||
         continue
+      beta_storage_key "$upload_key" >/dev/null
       beta_storage_aws_mutation abort-multipart-upload --bucket "$BETA_BACKUP_BUCKET" \
         --key "$upload_key" --upload-id "$upload_id" >/dev/null ||
         beta_storage_fail multipart_abort_failed
@@ -1619,8 +1624,52 @@ beta_storage_prune_remote() {
 }
 
 beta_storage_reconcile_remote() {
-  local inventory scratch key version descriptor
+  local inventory scratch key version descriptor writer_meta writer_state
   beta_storage_require_config
+  writer_meta=$(mktemp)
+  writer_state=$(mktemp)
+  if beta_storage_remote_head control/writer.json "$writer_meta"; then
+    :
+  else
+    writer_status=$?
+    rm -f -- "$writer_meta" "$writer_state"
+    [ "$writer_status" -eq 1 ] &&
+      beta_storage_fail writer_state_missing ||
+      beta_storage_fail writer_state_unreadable
+  fi
+  beta_storage_remote_get_json control/writer.json "$writer_state" \
+    "$(jq -er '.VersionId' "$writer_meta")"
+  jq -e '
+    type=="object" and
+    (keys|sort)==["ambiguous","fencingToken","generation","intentDigest",
+      "leaseUntil","locked","operation","owner","reservationBytes","schema",
+      "transactionId"] and .schema=="meet-backend/beta-backup-writer/v3" and
+    (.generation|type=="number" and floor==. and .>=0) and
+    (.fencingToken|type=="number" and floor==. and .>=0) and
+    (.leaseUntil|type=="number" and floor==. and .>=0) and
+    (.locked|type=="boolean") and (.ambiguous|type=="boolean") and
+    (.reservationBytes|type=="number" and floor==. and .>=0) and
+    (.intentDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.owner|type=="string" and length>0) and
+    (.transactionId|type=="string" and length>0)
+  ' "$writer_state" >/dev/null || {
+    rm -f -- "$writer_meta" "$writer_state"
+    beta_storage_fail writer_state_invalid
+  }
+  if [ "$(jq -er '.locked' "$writer_state")" = true ] ||
+    [ "$(jq -er '.ambiguous' "$writer_state")" = true ]; then
+    printf 'storage_reconcile=pending writer_locked=%s ambiguous=%s transaction=%s\n' \
+      "$(jq -er '.locked' "$writer_state")" \
+      "$(jq -er '.ambiguous' "$writer_state")" \
+      "$(jq -er '.transactionId' "$writer_state")"
+    rm -f -- "$writer_meta" "$writer_state"
+    beta_storage_fail writer_reconciliation_pending
+  fi
+  [ "$(jq -er '.operation' "$writer_state")" = idle ] &&
+    [ "$(jq -er '.reservationBytes' "$writer_state")" = 0 ] &&
+    [ "$(jq -er '.ambiguous' "$writer_state")" = false ] ||
+    { rm -f -- "$writer_meta" "$writer_state"; beta_storage_fail writer_state_not_terminal; }
+  rm -f -- "$writer_meta" "$writer_state"
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" >/dev/null
   inventory=$(beta_storage_aws_list_versions | jq -s '.') ||
     beta_storage_fail inventory_unavailable

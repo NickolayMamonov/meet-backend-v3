@@ -98,6 +98,10 @@ trap 'rm -f -- "$status_tmp" "$event_tmp" "$next_state_tmp" "$remote_state_tmp"'
   EXIT HUP INT TERM
 
 if [ -n "$storage_root" ]; then
+  [ "${BETA_BACKUP_TEST_FIXTURE:-false}" = true ] || {
+    echo 'BACKUP_INCIDENT_BLOCKED:local_authority_fixture_only' >&2
+    exit 1
+  }
   beta_storage_require_local_root "$storage_root" >/dev/null
   capture_state=MISSING capture_id=null capture_at=null verified_state=MISSING
   verified_id=null verified_at=null

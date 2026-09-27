@@ -91,6 +91,12 @@ done
 
 require 'beta_backup_runtime_require_operation "$image" test-vps-deploy' \
   "$deploy_text" "direct test-VPS deployment gate"
+require '"$root/.env.production"' \
+  "$deploy_text" "direct test-VPS gate uses the trusted root environment"
+require 'previous-env.production' "$deploy_text" \
+  "direct test-VPS rollback snapshots the predecessor environment"
+require 'target-env.sha256' "$deploy_text" \
+  "direct test-VPS rollback binds the admitted candidate environment"
 
 for text in \
   'scripts/deploy-test-vps-provider-release.sh' \

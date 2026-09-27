@@ -29,6 +29,20 @@ if "$root/scripts/authorize-beta-recurring.sh" \
   fail "self-review was accepted"
 fi
 if "$root/scripts/authorize-beta-recurring.sh" \
+  --event workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master \
+  --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
+  --environment closed-beta-recurring-restore --policy-file "$policy" \
+  --ci-result-file "$ci" --actor scheduler >/dev/null 2>&1; then
+  fail "missing restore reviewer was accepted"
+fi
+if "$root/scripts/authorize-beta-recurring.sh" \
+  --event workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master \
+  --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
+  --environment closed-beta-recurring-restore --policy-file "$policy" \
+  --ci-result-file "$ci" --actor scheduler --reviewer reviewer >/dev/null 2>&1; then
+  fail "missing restore reviewer ID was accepted"
+fi
+if "$root/scripts/authorize-beta-recurring.sh" \
   --event schedule --run-ref refs/heads/dev --default-ref refs/heads/master \
   --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
   --environment closed-beta-recurring-capture >/dev/null 2>&1; then
