@@ -214,6 +214,7 @@ else
 fi
 
 incident_id='' delivery_count=0 recovery_count=0 first_seen=$now event=none
+event_dedupe_key=$dedupe_key
 state_file="$incident_state"
 if [ "$old_state" != none ]; then
   [ -n "$storage_root" ] || state_file="${remote_state_tmp}.json"
@@ -237,7 +238,9 @@ if [ "${#reasons[@]}" -gt 0 ]; then
   state=active
 else
   [ "$old_state" = active ] && {
-    event=recovered; recovery_count=$((recovery_count + 1));
+    event=recovered
+    recovery_count=$((recovery_count + 1))
+    event_dedupe_key=$(jq -er '.dedupeKey' "$state_file")
   }
   incident_id=${incident_id:-recovered}
   state=recovered
@@ -250,10 +253,10 @@ jq -cnS --arg environment "$environment" --arg state "$state" --arg key "$dedupe
     deliveryCount:$deliveries,recoveryCount:$recoveries}' >"$next_state_tmp"
 
 if [ "$event" != none ]; then
-  event_id=$(printf '%s\0%s\0%s' "$incident_id" "$event" "$dedupe_key" |
+  event_id=$(printf '%s\0%s\0%s' "$environment" "$event" "$event_dedupe_key" |
     sha256sum | awk '{print $1}')
   jq -cnS --arg event "$event" --arg environment "$environment" \
-    --arg eventId "$event_id" --arg id "$incident_id" --arg key "$dedupe_key" \
+    --arg eventId "$event_id" --arg id "$incident_id" --arg key "$event_dedupe_key" \
     --argjson reasons "$reason_json" \
     --argjson at "$now" \
     '{schema:"meet-backend/beta-backup-incident-event/v1",event:$event,

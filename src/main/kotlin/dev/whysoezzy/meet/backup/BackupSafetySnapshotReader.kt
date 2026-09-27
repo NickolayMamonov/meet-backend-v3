@@ -39,10 +39,11 @@ open class BackupSafetySnapshotReader(
     }
 
     fun read(): BackupSafetySnapshot {
-        val path = Path.of(properties.statusPath)
+        val path = Path.of(properties.statusPath).toAbsolutePath().normalize()
         val bytes = try {
-            validateRootForRead()
-            require(Files.isRegularFile(path) && !Files.isSymbolicLink(path)) { "status file is unavailable" }
+            val root = controlRoot()
+            validateRootForRead(root)
+            validateControlFile(path, root)
             require(Files.size(path) <= MAX_BYTES) { "status file is too large" }
             Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)
                 .use { it.readNBytes(MAX_BYTES.toInt() + 1) }
@@ -51,8 +52,9 @@ open class BackupSafetySnapshotReader(
             throw BackupSafetySnapshotReadException("status file is unavailable")
         }
         val watermarkBytes = try {
-            val watermarkPath = watermarkPath(controlRoot())
-            require(Files.isRegularFile(watermarkPath) && !Files.isSymbolicLink(watermarkPath))
+            val root = controlRoot()
+            val watermarkPath = watermarkPath(root)
+            validateControlFile(watermarkPath, root)
             require(Files.size(watermarkPath) <= MAX_BYTES)
             Files.newInputStream(watermarkPath, LinkOption.NOFOLLOW_LINKS)
                 .use { it.readNBytes(MAX_BYTES.toInt() + 1) }
@@ -109,6 +111,17 @@ open class BackupSafetySnapshotReader(
 
     private fun readMode(path: Path): Int =
         Files.getPosixFilePermissions(path).toMode()
+
+    private fun validateControlFile(path: Path, root: Path) {
+        require(path.toAbsolutePath().normalize().parent == root)
+        require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
+        require(!Files.isSymbolicLink(path))
+        if (properties.enrolled) {
+            require(readMode(path) == CONTROL_FILE_MODE)
+            require(readUnixOwner(path, "uid") == properties.controlRootUid)
+            require(readUnixOwner(path, "gid") == properties.controlRootGid)
+        }
+    }
 
     private fun readUnixOwner(path: Path, field: String): Long =
         (Files.readAttributes(path, "unix:$field", LinkOption.NOFOLLOW_LINKS)[field] as Number).toLong()

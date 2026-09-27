@@ -13,6 +13,13 @@ cat >"$tmp/point.json" <<EOF
 EOF
 "$root/scripts/run-beta-backup-storage.sh" validate-point --file "$tmp/point.json" >/dev/null ||
   fail "valid point rejected"
+future_capture=$(( $(date +%s) + 3600 ))
+jq --argjson captured "$future_capture" \
+  '.capture.capturedAt=$captured' "$tmp/point.json" >"$tmp/future-point.json"
+if "$root/scripts/run-beta-backup-storage.sh" validate-point \
+  --file "$tmp/future-point.json" >/dev/null 2>&1; then
+  fail "future capture timestamp was accepted"
+fi
 mkdir -p "$tmp/point"
 dd if=/dev/zero of="$tmp/point/postgres.dump.age" bs=1 count=8 status=none
 dd if=/dev/zero of="$tmp/point/uploads.tar.gz.age" bs=1 count=8 status=none
@@ -88,6 +95,14 @@ jq -cnS --arg descriptor "$descriptor_digest" --arg command "$capture_command_di
     verifiedCapturedAt:1790000000}' >"$tmp/receipt.json"
 "$root/scripts/run-beta-backup-storage.sh" promote --storage-root "$tmp/storage" \
   --receipt "$tmp/receipt.json" --owner test >/dev/null || fail "promotion failed"
+future_receipt=$(( $(date +%s) + 3600 ))
+jq --argjson captured "$future_receipt" \
+  '.captureAt=$captured | .verifiedCapturedAt=$captured' \
+  "$tmp/receipt.json" >"$tmp/future-receipt.json"
+if "$root/scripts/run-beta-backup-storage.sh" promote --storage-root "$tmp/storage" \
+  --receipt "$tmp/future-receipt.json" --owner test >/dev/null 2>&1; then
+  fail "future receipt timestamp was accepted"
+fi
 "$root/scripts/run-beta-backup-storage.sh" promote --storage-root "$tmp/storage" \
   --receipt "$tmp/receipt.json" --owner test | grep -Fq 'storage_promote=idempotent' ||
   fail "promotion replay was not idempotent"
@@ -359,6 +374,8 @@ grep -Fq '.leaseUntil==0 and .reservationBytes==0' \
   fail "writer acquisition does not require a zero terminal lease"
 grep -Fq 'writer_state_not_terminal' "$root/scripts/beta-backup-storage.sh" ||
   fail "writer acquisition does not reject malformed unlocked state"
+grep -Fq 'writer_legacy_locked' "$root/scripts/beta-backup-storage.sh" ||
+  fail "legacy writer custody is not explicitly retained"
 grep -Fq 'beta_storage_remote_writer_transition ambiguous true' \
   "$root/scripts/beta-backup-storage.sh" ||
   fail "ambiguous mutations are not durably fenced"

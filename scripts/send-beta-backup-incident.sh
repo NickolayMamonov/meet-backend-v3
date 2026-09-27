@@ -161,10 +161,16 @@ done
 }
 issues="$tmp/issues.json"
 jq -s 'add' "${issue_pages[@]}" >"$issues"
-issue=$(jq -c --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" --arg incident "$incident_id" '
+issue=$(jq -c --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
+  --arg incident "$incident_id" --arg dedupe "$dedupe" \
+  --arg event_id "$(jq -er '.eventId' "$event_file")" \
+  --arg event "$(jq -er '.event' "$event_file")" '
   [.[] | select(.pull_request|not) |
     select(any(.labels[]?; .name==$label)) |
-    select(.body|contains($incident))] |
+    select(($event=="recovered" or .state=="open") and
+      ((.body|contains($incident)) or
+       (.body|contains($dedupe)) or
+       (.body|contains($event_id))))] |
   sort_by(.updated_at,.number) | last // empty
 ' "$issues")
 # Do not copy state or provider responses to an issue. The issue body contains

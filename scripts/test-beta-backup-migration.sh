@@ -142,6 +142,7 @@ if GITHUB_API_URL=https://api.example.test PATH="$tmp:$tmp/bin:$PATH" \
   --source-artifact-id 456 --source-run-id 123 >/dev/null 2>&1; then
   fail "migration accepted a non-GitHub API origin"
 fi
+printf 'migration identity\n' >"$tmp/identity"
 PATH="$tmp:$tmp/bin:$PATH" "$root/scripts/migrate-beta-backup-artifact.sh" \
   --source "$source_dir" --destination "$destination_dir" \
   --manifest "$source_dir/recovery-point.json" --storage-root "$storage_root" \
@@ -152,6 +153,7 @@ PATH="$tmp:$tmp/bin:$PATH" "$root/scripts/migrate-beta-backup-artifact.sh" \
   fail "destination restore migration was rejected"
 cmp -- "$tmp/original-manifest.json" "$source_dir/recovery-point.json" ||
   fail "source manifest changed during migration"
+[ ! -e "$tmp/identity" ] || fail "restore identity was not removed after migration"
 [ "$manifest_before" = "$(sha256sum "$source_dir/recovery-point.json" | awk '{print $1}')" ] &&
   [ "$db_before" = "$(sha256sum "$source_dir/postgres.dump.age" | awk '{print $1}')" ] &&
   [ "$media_before" = "$(sha256sum "$source_dir/uploads.tar.gz.age" | awk '{print $1}')" ] ||

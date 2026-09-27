@@ -147,19 +147,21 @@ beta_storage_require_version_id() {
 }
 
 beta_storage_validate_point() {
-  local manifest=$1
+  local manifest=$1 now
+  now=$(date +%s) || return 1
+  [[ "$now" =~ ^[0-9]+$ ]] || return 1
   beta_storage_require_jq
   [ -f "$manifest" ] && [ ! -L "$manifest" ] || return 1
   [ "$(wc -c <"$manifest")" -le 1048576 ] || return 1
   beta_storage_require_unique_json "$manifest" || return 1
-  jq -e '
+  jq -e --argjson now "$now" '
     type == "object" and
     (keys | sort) == ["capture","captureCommandDigest","captureEvidenceDigest","contractDigest","pointId","proofDigest","runtimeRevision","schema","slotId"] and
     .schema == "meet-backend/beta-recovery-point/v2" and
     (.pointId | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
     (.slotId | type == "string" and test("^[0-9]{10}$")) and
     (.capture | type == "object" and (keys | sort) == ["capturedAt","sourceRevision"] and
-      (.capturedAt | type == "number" and floor == . and . >= 0) and
+      (.capturedAt | type == "number" and floor == . and . >= 0 and . <= $now) and
       (.sourceRevision | type == "string" and test("^[0-9a-f]{40}$"))) and
     (.runtimeRevision | type == "string" and test("^[0-9a-f]{40}$")) and
     (.captureCommandDigest | type == "string" and test("^[0-9a-f]{64}$")) and
@@ -946,12 +948,12 @@ beta_storage_remote_writer_acquire() {
   state=$(mktemp)
   body=$(mktemp)
   trap - RETURN
-  local generation=0 fencing=0 if_match='' if_none=false
+  local generation=0 fencing=0 if_match='' if_none=false legacy=false
   if beta_storage_remote_head control/writer.json "$head"; then
     etag=$(jq -er '.ETag' "$head")
     version=$(jq -er '.VersionId' "$head")
     beta_storage_remote_get_json control/writer.json "$state" "$version"
-    jq -e '
+    if jq -e '
       type=="object" and
       ((keys|sort)==["ambiguous","ambiguousResource","expectedKeys","fencingToken","generation","intentDigest",
         "phase",
@@ -970,14 +972,43 @@ beta_storage_remote_writer_acquire() {
           (keys|sort)==["key","kind","uploadId"] and .kind=="multipart" and
           (.key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
           (.uploadId|type=="string" and test("^[A-Za-z0-9._-]{1,256}$"))))
-    ' "$state" >/dev/null || beta_storage_fail writer_state_invalid
+    ' "$state" >/dev/null; then
+      :
+    elif jq -e '
+      type=="object" and
+      ((keys|sort)==["ambiguous","expectedKeys","fencingToken","generation","intentDigest",
+        "phase","leaseUntil","locked","operation","owner","reservationBytes","schema",
+        "transactionId"] and .schema=="meet-backend/beta-backup-writer/v3") and
+      (.generation|type=="number" and floor==. and .>=0) and
+      (.fencingToken|type=="number" and floor==. and .>=0) and
+      (.leaseUntil|type=="number" and floor==. and .>=0) and
+      (.locked|type=="boolean") and (.ambiguous|type=="boolean") and
+      (.reservationBytes|type=="number" and floor==. and .>=0) and
+      (.intentDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+      (.owner|type=="string") and (.transactionId|type=="string") and
+      (.expectedKeys|type=="array" and
+        all(.[]; type=="string" and
+          test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")))
+    ' "$state" >/dev/null; then
+      legacy=true
+    else
+      beta_storage_fail writer_state_invalid
+    fi
     [ "$(jq -er '.locked' "$state")" = false ] || beta_storage_fail writer_busy
-    jq -e '
-      .ambiguous==false and .operation=="idle" and .phase=="idle" and
-      .leaseUntil==0 and .reservationBytes==0 and .expectedKeys==[] and
-      .ambiguousResource==null and
-      .intentDigest=="0000000000000000000000000000000000000000000000000000000000000000"
-    ' "$state" >/dev/null || beta_storage_fail writer_state_not_terminal
+    if [ "$legacy" = true ]; then
+      jq -e '
+        .ambiguous==false and .operation=="idle" and .phase=="idle" and
+        .leaseUntil==0 and .reservationBytes==0 and .expectedKeys==[] and
+        .intentDigest=="0000000000000000000000000000000000000000000000000000000000000000"
+      ' "$state" >/dev/null || beta_storage_fail writer_state_not_terminal
+    else
+      jq -e '
+        .ambiguous==false and .operation=="idle" and .phase=="idle" and
+        .leaseUntil==0 and .reservationBytes==0 and .expectedKeys==[] and
+        .ambiguousResource==null and
+        .intentDigest=="0000000000000000000000000000000000000000000000000000000000000000"
+      ' "$state" >/dev/null || beta_storage_fail writer_state_not_terminal
+    fi
     generation=$(jq -er '.generation' "$state")
     fencing=$(jq -er '.fencingToken' "$state")
     if_match=$etag
@@ -1958,9 +1989,15 @@ beta_storage_promote_remote() {
   jq -e --arg id "$point_id" --argjson captured "$(jq -er '.captureAt' "$receipt")" \
     --arg command "$(jq -er '.captureCommandDigest' "$receipt")" \
     --arg source "$(jq -er '.capture.sourceRevision' "$scratch/manifest.json")" \
+    --arg receiptRevision "$(jq -er '.captureRevision' "$receipt")" \
     '.pointId==$id and .capture.capturedAt==$captured and
-     .captureCommandDigest==$command and .capture.sourceRevision==$source' \
+     .captureCommandDigest==$command and .capture.sourceRevision==$source and
+     .capture.sourceRevision==$receiptRevision' \
     "$scratch/manifest.json" >/dev/null || beta_storage_fail receipt_provenance_binding
+  jq -e --arg source "$(jq -er '.capture.sourceRevision' "$scratch/manifest.json")" \
+    --argjson captured "$(jq -er '.capture.capturedAt' "$scratch/manifest.json")" \
+    '.captureRevision==$source and .capturedAt==$captured' \
+    "$proof" >/dev/null || beta_storage_fail proof_provenance_binding
 
   local receipt_target="receipts/$point_id/$receipt_id.json"
   local proof_target="receipts/$point_id/$receipt_id.proof.json"
@@ -2374,7 +2411,9 @@ beta_storage_prune_remote() {
           (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
           (.Size|type=="number" and floor==. and .>=0 and
             .<=9223372036854775807) and
-          (.ETag|type=="string" and length>0))
+          (.ETag|type=="string" and length>0)) and
+        ([.Parts[]?.PartNumber] | unique | length ==
+          ([.Parts[]?.PartNumber] | length))
       ' <<<"$part_page" >/dev/null ||
         beta_storage_fail multipart_parts_incomplete
       part_bytes=$(jq -r '[.Parts[]?.Size] | add // 0' <<<"$part_page")
@@ -2473,7 +2512,8 @@ beta_storage_reconcile_remote() {
   fi
   beta_storage_remote_get_json control/writer.json "$writer_state" \
     "$(jq -er '.VersionId' "$writer_meta")"
-  jq -e '
+  local writer_legacy=false
+  if jq -e '
     type=="object" and
     (keys|sort)==["ambiguous","ambiguousResource","expectedKeys","fencingToken","generation",
       "intentDigest","leaseUntil","locked","operation","owner","phase",
@@ -2495,10 +2535,68 @@ beta_storage_reconcile_remote() {
         (keys|sort)==["key","kind","uploadId"] and .kind=="multipart" and
         (.key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
         (.uploadId|type=="string" and test("^[A-Za-z0-9._-]{1,256}$"))))
-  ' "$writer_state" >/dev/null || {
+  ' "$writer_state" >/dev/null; then
+    :
+  elif jq -e '
+    type=="object" and
+    (keys|sort)==["ambiguous","expectedKeys","fencingToken","generation",
+      "intentDigest","leaseUntil","locked","operation","owner","phase",
+      "reservationBytes","schema","transactionId"] and
+    .schema=="meet-backend/beta-backup-writer/v3" and
+    (.generation|type=="number" and floor==. and .>=0) and
+    (.fencingToken|type=="number" and floor==. and .>=0) and
+    (.leaseUntil|type=="number" and floor==. and .>=0) and
+    (.locked|type=="boolean") and (.ambiguous|type=="boolean") and
+    (.reservationBytes|type=="number" and floor==. and .>=0) and
+    (.intentDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.owner|type=="string" and length>0) and
+    (.transactionId|type=="string" and length>0) and
+    (.expectedKeys|type=="array" and
+      all(.[]; type=="string" and
+        test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")))
+  ' "$writer_state" >/dev/null; then
+    writer_legacy=true
+  else
     rm -f -- "$writer_meta" "$writer_state"
     beta_storage_fail writer_state_invalid
-  }
+  fi
+  if [ "$writer_legacy" = true ]; then
+    jq -e '
+      .locked==false and .ambiguous==false and .operation=="idle" and
+      .phase=="idle" and .leaseUntil==0 and .reservationBytes==0 and
+      .expectedKeys==[] and
+      .intentDigest=="0000000000000000000000000000000000000000000000000000000000000000"
+    ' "$writer_state" >/dev/null || {
+      rm -f -- "$writer_meta" "$writer_state"
+      beta_storage_fail writer_legacy_locked
+    }
+    local legacy_etag legacy_generation legacy_fencing legacy_owner legacy_tx legacy_body
+    legacy_etag=$(jq -er '.ETag' "$writer_meta")
+    legacy_generation=$(jq -er '.generation' "$writer_state")
+    legacy_fencing=$(jq -er '.fencingToken' "$writer_state")
+    legacy_owner=$(jq -er '.owner' "$writer_state")
+    legacy_tx=$(jq -er '.transactionId' "$writer_state")
+    legacy_body=$(mktemp)
+    jq -cnS --arg owner "$legacy_owner" --arg tx "$legacy_tx" \
+      --argjson generation "$((legacy_generation + 1))" \
+      --argjson fencing "$legacy_fencing" \
+      '{schema:"meet-backend/beta-backup-writer/v3",generation:$generation,
+        fencingToken:$fencing,leaseUntil:0,locked:false,operation:"idle",
+        owner:$owner,transactionId:$tx,ambiguous:false,phase:"idle",
+        expectedKeys:[],ambiguousResource:null,reservationBytes:0,
+        intentDigest:"0000000000000000000000000000000000000000000000000000000000000000"}' \
+      >"$legacy_body"
+    beta_storage_provider_put_conditional '' control/writer.json "$legacy_body" \
+      "$legacy_etag" false >/dev/null || {
+      rm -f -- "$legacy_body" "$writer_meta" "$writer_state"
+      beta_storage_fail writer_legacy_upgrade_failed
+    }
+    rm -f -- "$legacy_body"
+    beta_storage_remote_head control/writer.json "$writer_meta" ||
+      beta_storage_fail writer_legacy_upgrade_unreadable
+    beta_storage_remote_get_json control/writer.json "$writer_state" \
+      "$(jq -er '.VersionId' "$writer_meta")"
+  fi
   if [ "$(jq -er '.locked' "$writer_state")" = true ] &&
     [ "$(jq -er '.ambiguous' "$writer_state")" = true ]; then
     local operation owner txid expected_keys current_etag point_id
@@ -2545,12 +2643,61 @@ beta_storage_reconcile_remote() {
       point_id=$(jq -r 'map(select(startswith("receipts/"))) |
         .[0] // empty' <<<"$expected_keys" |
         sed -E 's#^receipts/([^/]+)/.*#\1#')
-      if [ -n "$point_id" ] &&
+      local receipt_id receipt_key proof_key descriptor_key
+      receipt_id=$(jq -r 'map(select(startswith("receipts/"))) |
+        .[0] // empty' <<<"$expected_keys" |
+        sed -E 's#^receipts/[^/]+/([^/]+)\.json$#\1#')
+      receipt_key="receipts/$point_id/$receipt_id.json"
+      proof_key="receipts/$point_id/$receipt_id.proof.json"
+      descriptor_key="points/$point_id/point.json"
+      if [ -n "$point_id" ] && [ -n "$receipt_id" ] &&
+        beta_storage_remote_head "$receipt_key" "$scratch/reconcile-receipt.meta" &&
+        beta_storage_remote_get_json "$receipt_key" \
+          "$scratch/reconcile-receipt.json" \
+          "$(jq -er '.VersionId' "$scratch/reconcile-receipt.meta")" &&
+        beta_storage_remote_head "$proof_key" "$scratch/reconcile-proof.meta" &&
+        beta_storage_remote_get_json "$proof_key" \
+          "$scratch/reconcile-proof.json" \
+          "$(jq -er '.VersionId' "$scratch/reconcile-proof.meta")" &&
+        beta_storage_remote_head "$descriptor_key" "$scratch/reconcile-descriptor.meta" &&
+        beta_storage_remote_get_json "$descriptor_key" \
+          "$scratch/reconcile-descriptor.json" \
+          "$(jq -er '.VersionId' "$scratch/reconcile-descriptor.meta")" &&
+        beta_storage_remote_validate_descriptor "$point_id" \
+          "$scratch/reconcile-descriptor.json" "$scratch" false &&
+        beta_storage_remote_head control/verified-head.json \
+          "$scratch/reconcile-head.meta" &&
+        beta_storage_remote_get_json control/verified-head.json \
+          "$scratch/reconcile-head.json" \
+          "$(jq -er '.VersionId' "$scratch/reconcile-head.meta")" &&
         beta_storage_remote_build_status_once \
           "$scratch/reconcile-status.json" closed-beta "$(date -u +%s)" &&
-        jq -e --arg point "$point_id" \
-          '.verified.state=="VALID" and .verified.id==$point' \
-          "$scratch/reconcile-status.json" >/dev/null; then
+        jq -e --arg point "$point_id" --arg receipt "$receipt_id" \
+          --arg descriptorVersion \
+            "$(jq -er '.VersionId' "$scratch/reconcile-descriptor.meta")" \
+          --arg descriptorDigest \
+            "$(beta_storage_descriptor_digest "$scratch/reconcile-descriptor.json")" \
+          --arg receiptVersion \
+            "$(jq -er '.VersionId' "$scratch/reconcile-receipt.meta")" \
+          --arg proofVersion \
+            "$(jq -er '.VersionId' "$scratch/reconcile-proof.meta")" \
+          --arg proofDigest \
+            "$(sha256sum "$scratch/reconcile-proof.json" | awk '{print $1}')" '
+          .schema=="meet-backend/beta-backup-verified-head/v2" and
+          .pointId==$point and .receiptId==$receipt and
+          .descriptorVersion==$descriptorVersion and
+          .descriptorDigest==$descriptorDigest and
+          .receiptVersion==$receiptVersion and
+          .proofVersion==$proofVersion and
+          (.verifiedCapturedAt|type=="number" and floor==.)
+        ' "$scratch/reconcile-head.json" >/dev/null &&
+        jq -e --arg point "$point_id" --arg receipt "$receipt_id" \
+          --arg proofDigest \
+            "$(sha256sum "$scratch/reconcile-proof.json" | awk '{print $1}')" '
+          .pointId==$point and .receiptId==$receipt and
+          .proofDigest==$proofDigest and
+          .schema=="meet-backend/beta-backup-receipt/v2"
+        ' "$scratch/reconcile-receipt.json" >/dev/null; then
         beta_storage_remote_writer_transition reconciled false "$expected_keys" &&
           beta_storage_remote_writer_release "$owner" "$txid" &&
           printf 'storage_reconcile=provider_committed transaction=%s\n' "$txid"
@@ -2878,11 +3025,13 @@ beta_storage_publish_local() {
 }
 
 beta_storage_validate_receipt() {
-  local receipt=$1
+  local receipt=$1 now
+  now=$(date +%s) || return 1
+  [[ "$now" =~ ^[0-9]+$ ]] || return 1
   beta_storage_require_jq
   [ -f "$receipt" ] && [ ! -L "$receipt" ] || return 1
   beta_storage_require_unique_json "$receipt" || return 1
-  jq -e '
+  jq -e --argjson now "$now" '
     type=="object" and (keys|sort)==["captureAt","captureCommandDigest","captureRevision",
       "pointDescriptorDigest","pointId","proofDigest","protectionDigest","receiptId",
       "restoreRevision","reviewerId","schema","verifiedCapturedAt"] and
@@ -2895,9 +3044,9 @@ beta_storage_validate_receipt() {
     (.captureCommandDigest|type=="string" and test("^[0-9a-f]{64}$")) and
     (.pointDescriptorDigest|type=="string" and test("^[0-9a-f]{64}$")) and
     (.protectionDigest|type=="string" and test("^[0-9a-f]{64}$")) and
-    (.captureAt|type=="number" and floor==. and .>=0) and
+    (.captureAt|type=="number" and floor==. and .>=0 and . <= $now) and
     (.proofDigest|type=="string" and test("^[0-9a-f]{64}$")) and
-    (.verifiedCapturedAt|type=="number" and floor==. and .>=0) and
+    (.verifiedCapturedAt|type=="number" and floor==. and .>=0 and . <= $now) and
     .verifiedCapturedAt == .captureAt
   ' "$receipt" >/dev/null
   local proof_path

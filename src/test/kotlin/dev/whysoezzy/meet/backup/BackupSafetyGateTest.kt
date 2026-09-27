@@ -72,6 +72,24 @@ class BackupSafetyGateTest {
         }
     }
 
+    @Test
+    fun `blocks enrolled control files with an unsafe mode`() {
+        assumeTrue(posixAttributesSupported())
+        val directory = Files.createTempDirectory("backup-safety-mode")
+        val path = directory.resolve("status.json")
+        Files.writeString(path, status(observedAt = 1_000_000, captureAt = 999_000, verifiedAt = 999_000))
+        writeWatermark(path, 1, 1_000_000)
+        Files.setPosixFilePermissions(
+            path,
+            setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE),
+        )
+        val properties = propertiesFor(directory, path)
+
+        assertThrows<BackupSafetySnapshotReadException> {
+            BackupSafetySnapshotReader(jacksonObjectMapper(), properties).read()
+        }
+    }
+
     private fun status(observedAt: Long, captureAt: Long, verifiedAt: Long): String {
         val digest = "a".repeat(64)
         return """{"authorityDigest":"$digest","authorityGeneration":1,"capture":{"capturedAt":$captureAt,"id":"point-1","state":"VALID"},"environment":"closed-beta","observedAt":$observedAt,"schema":"meet-backend/beta-backup-status/v1","verified":{"capturedAt":$verifiedAt,"id":"point-1","state":"VALID"}}"""

@@ -69,29 +69,34 @@ command -v unzip >/dev/null 2>&1 || exit 1
 command -v jq >/dev/null 2>&1 || exit 1
 command -v timeout >/dev/null 2>&1 || exit 1
 
+source_tmp=''
+cleanup_source_auth() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  [ -z "$source_tmp" ] || rm -rf -- "$source_tmp" || status=1
+  rm -f -- "$identity" || status=1
+  exit "$status"
+}
+trap cleanup_source_auth EXIT HUP INT TERM
+source_tmp=$(mktemp -d)
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 api=${GITHUB_API_URL:-https://api.github.com}
 [ "$api" = https://api.github.com ] || {
   echo 'BACKUP_CUSTODY_BLOCKED:source_api_origin_invalid' >&2
   exit 1
 }
-source_tmp=$(mktemp -d)
-cleanup_source_auth() {
-  local status=$?
-  trap - EXIT HUP INT TERM
-  rm -rf -- "$source_tmp" || status=1
-  exit "$status"
-}
-trap cleanup_source_auth EXIT HUP INT TERM
 api_get() {
   local name=$1 path=$2
   timeout --foreground 30s curl --fail --silent --show-error \
-    --connect-timeout 5 --max-time 30 \
+    --connect-timeout 5 --max-time 30 --max-filesize 1048576 \
     -H "Authorization: Bearer $GITHUB_TOKEN" \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
     "$api$path" >"$source_tmp/$name" ||
     { echo 'BACKUP_CUSTODY_BLOCKED:source_api_unavailable' >&2; exit 1; }
+  [ "$(wc -c <"$source_tmp/$name")" -le 1048576 ] || {
+    echo 'BACKUP_CUSTODY_BLOCKED:source_api_oversize' >&2; exit 1;
+  }
   jq -e . "$source_tmp/$name" >/dev/null ||
     { echo 'BACKUP_CUSTODY_BLOCKED:source_api_invalid' >&2; exit 1; }
 }
@@ -141,6 +146,9 @@ case "$artifact_status" in
     ;;
   *) echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_unavailable' >&2; exit 1 ;;
 esac
+[ "$(wc -c <"$source_tmp/source.zip")" -le 67108864 ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:source_artifact_oversize' >&2; exit 1;
+}
 downloaded_digest=$(sha256sum "$source_tmp/source.zip" | awk '{print $1}')
 expected_digest=$(jq -er '.digest' "$source_tmp/source-artifact.json")
 [ "sha256:$downloaded_digest" = "$expected_digest" ] || {
