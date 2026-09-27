@@ -52,6 +52,7 @@ PY
 }
 
 api=${GITHUB_API_URL:-https://api.github.com}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
 api_get() {
@@ -83,9 +84,14 @@ api_get run "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id"
 api_get jobs "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100"
 api_get artifacts "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100"
 api_get approvals "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id/approvals"
+api_get environment \
+  "/repos/$GITHUB_REPOSITORY/environments/closed-beta-recurring-restore"
+api_get branches \
+  "/repos/$GITHUB_REPOSITORY/environments/closed-beta-recurring-restore/deployment-branch-policies"
 
 jq -e --arg repo "$GITHUB_REPOSITORY" '
   (.id|type=="number" and .>0) and
+  (.head_sha|type=="string" and test("^[0-9a-f]{40}$")) and
   .path==".github/workflows/beta-recurring-backups.yml" and
   .repository.full_name==$repo and .head_branch=="master" and
   .head_repository.full_name==$repo and .status=="completed" and
@@ -93,6 +99,31 @@ jq -e --arg repo "$GITHUB_REPOSITORY" '
   (.event=="schedule" or .event=="workflow_dispatch")
 ' "$tmp/run" >/dev/null || {
   echo 'BACKUP_CUSTODY_BLOCKED:protected_run_invalid' >&2
+  exit 1
+}
+jq -e '
+  .can_admins_bypass==false and
+  .deployment_branch_policy.custom_branch_policies==true and
+  .deployment_branch_policy.protected_branches==false and
+  ([.protection_rules[] | select(.type=="required_reviewers") |
+    select(.prevent_self_review==true and
+      all(.reviewers[]?; ((.reviewer.id // .id)|type=="number" and .>0)))] | length)==1
+' "$tmp/environment" >/dev/null || {
+  echo 'BACKUP_CUSTODY_BLOCKED:protection_policy_invalid' >&2
+  exit 1
+}
+jq -e '[.branch_policies[] | select(.name=="master")] | length==1 and
+  ([.branch_policies[] | select(.name!="master")] | length)==0' \
+  "$tmp/branches" >/dev/null || {
+  echo 'BACKUP_CUSTODY_BLOCKED:protection_branch_policy_invalid' >&2
+  exit 1
+}
+reviewer_policy_bound=$(jq -e --argjson reviewer "$reviewer_id" '
+  any(.protection_rules[] | select(.type=="required_reviewers") |
+    .reviewers[]?; ((.reviewer.id // .id)|type=="number" and .==$reviewer))
+' "$tmp/environment" 2>/dev/null) || false
+[ "$reviewer_policy_bound" = true ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:reviewer_policy_binding_invalid' >&2
   exit 1
 }
 
@@ -111,6 +142,8 @@ jobs=$(jq -cS --argjson run "$run_id" '
 }
 restore_job_id=$(jq -er '[.[]|select(.name=="protected-drill")][0].id' <<<"$jobs")
 post_job_id=$(jq -er '[.[]|select(.name=="post-probe")][0].id' <<<"$jobs")
+protected_restore=$(jq -er 'any(.[]; .name=="protected-drill" and .conclusion=="success")' <<<"$jobs")
+post_probe_successful=$(jq -er 'any(.[]; .name=="post-probe" and .conclusion=="success")' <<<"$jobs")
 api_get restore_job_artifacts "/repos/$GITHUB_REPOSITORY/actions/jobs/$restore_job_id/artifacts?per_page=100"
 api_get post_job_artifacts "/repos/$GITHUB_REPOSITORY/actions/jobs/$post_job_id/artifacts?per_page=100"
 receipt_artifact=$(jq -cS --arg name "beta-recurring-restore-receipt-$run_id" '
@@ -139,6 +172,7 @@ reviewer_approved=$(jq -e --argjson reviewer "$reviewer_id" '
   exit 1
 }
 receipt_digest=$(sha256sum "$receipt" | awk '{print $1}')
+probe_digest=$(sha256sum "$probe_binding" | awk '{print $1}')
 receipt_artifact_id=$(jq -er '.id' <<<"$receipt_artifact")
 post_artifact_id=$(jq -er '.id' <<<"$post_artifact")
 jq -e --argjson id "$receipt_artifact_id" \
@@ -199,10 +233,23 @@ reviewer_from_receipt=$(jq -er '.reviewerId' "$receipt")
   exit 1
 }
 policy_digest=${BETA_RECURRING_POLICY_DIGEST:-}
+protection_digest=$(
+  jq -cS -n --slurpfile environment "$tmp/environment" \
+    --slurpfile branches "$tmp/branches" \
+    '{environment:$environment[0],branches:$branches[0]}' |
+    sha256sum | awk '{print $1}'
+)
 api_evidence_digest=$(
   jq -cS -n --slurpfile run "$tmp/run" --slurpfile jobs "$tmp/jobs" \
-    --slurpfile artifacts "$tmp/artifacts" \
-    '{run:$run[0],jobs:$jobs[0],artifacts:$artifacts[0]}' |
+    --slurpfile artifacts "$tmp/artifacts" --slurpfile approvals "$tmp/approvals" \
+    --slurpfile restore "$tmp/restore_job_artifacts" \
+    --slurpfile post "$tmp/post_job_artifacts" \
+    --slurpfile environment "$tmp/environment" --slurpfile branches "$tmp/branches" \
+    --arg receipt "$receipt_digest" --arg probe "$probe_digest" \
+    '{run:$run[0],jobs:$jobs[0],artifacts:$artifacts[0],
+      approvals:$approvals[0],restoreJobArtifacts:$restore[0],
+      postProbeJobArtifacts:$post[0],environment:$environment[0],
+      branches:$branches[0],receiptDigest:$receipt,probeBindingDigest:$probe}' |
     sha256sum | awk '{print $1}'
 )
 [[ "$policy_digest" =~ ^[0-9a-f]{64}$ ]] || {
@@ -215,13 +262,19 @@ jq -cnS --argjson run "$run_id" --argjson restore "$restore_job_id" \
   --argjson receiptArtifactId "$receipt_artifact_id" \
   --arg postArtifact "$post_artifact_digest" --arg policy "$policy_digest" \
   --argjson postArtifactId "$post_artifact_id" \
-  --arg evidence "$api_evidence_digest" \
+  --arg evidence "$api_evidence_digest" --arg protection "$protection_digest" \
+  --arg adapterDigest "$(sha256sum "$script_dir/query-beta-recurring-promotion.sh" | awk '{print $1}')" \
+  --arg receiptProtection "$(jq -er '.protectionDigest' "$receipt")" \
+  --argjson protectedRestore "$protected_restore" \
+  --argjson postProbeSuccessful "$post_probe_successful" \
   '{schema:"meet-backend/beta-recurring-promotion-evidence/v1",
     workflowRunId:$run,restoreJobId:$restore,postProbeJobId:$post,
     reviewerId:$reviewer,receiptDigest:$receipt,
     receiptArtifactId:$receiptArtifactId,receiptArtifactDigest:$receiptArtifact,
     postProbeArtifactId:$postArtifactId,postProbeArtifactDigest:$postArtifact,
-    policyDigest:$policy,apiEvidenceDigest:$evidence,
+    policyDigest:$policy,protectionDigest:$protection,
+    receiptProtectionDigest:$receiptProtection,apiEvidenceDigest:$evidence,
+    adapter:"scripts/query-beta-recurring-promotion.sh",adapterDigest:$adapterDigest,
     runRef:"refs/heads/master",environment:"closed-beta-recurring-restore",
-    protectedRestore:true,postProbeSuccessful:true}' |
+    protectedRestore:$protectedRestore,postProbeSuccessful:$postProbeSuccessful}' |
   install -m 600 /dev/stdin "$output"

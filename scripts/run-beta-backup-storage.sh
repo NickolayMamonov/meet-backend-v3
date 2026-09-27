@@ -51,7 +51,27 @@ case "$operation" in
         echo "BACKUP_STORAGE_BLOCKED:versioning_disabled" >&2
         exit 1
       }
-      printf 'storage_capability=reachable bucket_versioning=Enabled\n'
+      lifecycle='{"Rules":[]}'
+      if lifecycle=$(beta_storage_aws_read get-bucket-lifecycle-configuration \
+        --bucket "$BETA_BACKUP_BUCKET"); then
+        :
+      else
+        lifecycle_status=$?
+        [ "$lifecycle_status" -eq 3 ] || {
+          echo "BACKUP_STORAGE_BLOCKED:lifecycle_unavailable" >&2
+          exit 1
+        }
+      fi
+      jq -e 'type=="object" and (.Rules|type=="array") and
+        all(.Rules[]?;
+          (.Status=="Disabled") or
+          ((.Expiration|not) and (.NoncurrentVersionExpiration|not) and
+            (.Transitions|not) and (.NoncurrentVersionTransitions|not)))' \
+        <<<"$lifecycle" >/dev/null || {
+        echo "BACKUP_STORAGE_BLOCKED:lifecycle_policy_unsafe" >&2
+        exit 1
+      }
+      printf 'storage_capability=reachable bucket_versioning=Enabled lifecycle_pins=protected\n'
     fi
     ;;
   provider-put)
@@ -132,7 +152,7 @@ case "$operation" in
     ;;
   promote)
     receipt='' receipt_key='' root='' owner=${BETA_BACKUP_OWNER:-operator}
-    probe_binding='' provenance=''
+    probe_binding='' provenance='' run_id='' reviewer_id=''
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --receipt) [ "$#" -ge 2 ] || usage; receipt=$2; shift 2 ;;
@@ -141,6 +161,8 @@ case "$operation" in
         --owner) [ "$#" -ge 2 ] || usage; owner=$2; shift 2 ;;
         --probe-binding) [ "$#" -ge 2 ] || usage; probe_binding=$2; shift 2 ;;
         --provenance) [ "$#" -ge 2 ] || usage; provenance=$2; shift 2 ;;
+        --run-id) [ "$#" -ge 2 ] || usage; run_id=$2; shift 2 ;;
+        --reviewer-id) [ "$#" -ge 2 ] || usage; reviewer_id=$2; shift 2 ;;
         *) usage ;;
       esac
     done
@@ -148,7 +170,25 @@ case "$operation" in
       beta_storage_require_local_root "$root" >/dev/null
       beta_storage_promote_local "$receipt" "$root" "$owner"
     else
-      [ -n "$receipt" ] || [ -n "$receipt_key" ] || usage
+      [ -n "$receipt" ] || {
+        echo 'BACKUP_STORAGE_BLOCKED:promotion_receipt_required' >&2
+        exit 1
+      }
+      [[ "$run_id" =~ ^[0-9]+$ && "$reviewer_id" =~ ^[0-9]+$ ]] || {
+        echo 'BACKUP_STORAGE_BLOCKED:promotion_api_identity_required' >&2
+        exit 1
+      }
+      [ -z "$provenance" ] || {
+        echo 'BACKUP_STORAGE_BLOCKED:caller_provenance_forbidden' >&2
+        exit 1
+      }
+      promotion_adapter="$script_dir/query-beta-recurring-promotion.sh"
+      provenance=$(mktemp)
+      cleanup_promotion_adapter() { rm -f -- "$provenance"; }
+      trap cleanup_promotion_adapter EXIT HUP INT TERM
+      "$promotion_adapter" --run-id "$run_id" --reviewer-id "$reviewer_id" \
+        --receipt "$receipt" --probe-binding "$probe_binding" \
+        --output "$provenance"
       beta_storage_promote_remote "$receipt" "$receipt_key" "$owner" \
         "$probe_binding" "$provenance"
     fi

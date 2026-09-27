@@ -59,6 +59,10 @@ jobs:
           ci_file="$RUNNER_TEMP/recurring-ci.json"
           scripts/query-beta-recurring-policy.sh --output "$policy_file"
           scripts/query-beta-recurring-ci.sh --sha "$checkout_sha" --output "$ci_file"
+          policy_only=()
+          if [ "$ENVIRONMENT" = closed-beta-recurring-restore ]; then
+            policy_only=(--policy-only)
+          fi
           scripts/authorize-beta-recurring.sh \
             --event "${{ github.event_name }}" \
             --run-ref "$RUN_REF" \
@@ -69,7 +73,7 @@ jobs:
             --environment "$ENVIRONMENT" \
             --policy-file "$policy_file" \
             --ci-result-file "$ci_file" \
-            --actor "$ACTOR"
+            --actor "$ACTOR" "${policy_only[@]}"
           {
             printf 'checkout_sha=%s\n' "$checkout_sha"
             printf 'environment=%s\n' "$ENVIRONMENT"
@@ -434,15 +438,11 @@ jobs:
           scripts/query-beta-recurring-policy.sh --output "$policy"
           policy_digest="$(jq -cS . "$policy" | sha256sum | awk '{print $1}')"
           export BETA_RECURRING_POLICY_DIGEST="$policy_digest"
-          scripts/query-beta-recurring-promotion.sh --run-id "$GITHUB_RUN_ID" \
-            --reviewer-id "$(jq -er '.reviewerId' "$receipt")" \
-            --receipt "$receipt" \
-            --probe-binding "$RUNNER_TEMP/post-probe/probe-binding.json" \
-            --output "$RUNNER_TEMP/promotion-evidence.json"
           scripts/run-beta-backup-storage.sh promote \
             --receipt "$receipt" --probe-binding \
             "$RUNNER_TEMP/post-probe/probe-binding.json" \
-            --provenance "$RUNNER_TEMP/promotion-evidence.json" --owner promote
+            --run-id "$GITHUB_RUN_ID" \
+            --reviewer-id "$(jq -er '.reviewerId' "$receipt")" --owner promote
 
   prune:
     needs: [promote, admission]

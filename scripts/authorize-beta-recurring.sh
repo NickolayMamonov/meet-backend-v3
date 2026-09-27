@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME [--run-id ID --policy-file PATH --post-policy-file PATH --ci-result-file PATH --actor LOGIN --reviewer LOGIN --approval-file PATH --post-approval-file PATH --reviewer-id ID]" >&2
+  echo "usage: $0 --event schedule|workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master --scheduler-sha SHA --checkout-sha SHA --ci-sha SHA --environment NAME [--policy-only --run-id ID --policy-file PATH --post-policy-file PATH --ci-result-file PATH --actor LOGIN --reviewer LOGIN --approval-file PATH --post-approval-file PATH --reviewer-id ID]" >&2
   exit 2
 }
 
@@ -14,6 +14,7 @@ fail() {
 event='' run_ref='' default_ref='' scheduler_sha='' checkout_sha='' ci_sha=''
 environment='' policy_file='' post_policy_file='' ci_result_file='' actor='' reviewer=''
 approval_file='' post_approval_file='' reviewer_id='' run_id=''
+policy_only=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --event) [ "$#" -ge 2 ] || usage; event=$2; shift 2 ;;
@@ -32,6 +33,7 @@ while [ "$#" -gt 0 ]; do
     --approval-file) [ "$#" -ge 2 ] || usage; approval_file=$2; shift 2 ;;
     --post-approval-file) [ "$#" -ge 2 ] || usage; post_approval_file=$2; shift 2 ;;
     --reviewer-id) [ "$#" -ge 2 ] || usage; reviewer_id=$2; shift 2 ;;
+    --policy-only) policy_only=true; shift ;;
     *) usage ;;
   esac
 done
@@ -102,7 +104,11 @@ if [ -n "$policy_file" ] || [ -n "$ci_result_file" ]; then
   validate_policy "$policy_file"
   validate_ci "$ci_result_file"
   [[ "$actor" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail actor
-  if [ "$environment" = closed-beta-recurring-restore ]; then
+  if [ "$policy_only" = true ]; then
+    [ "$environment" = closed-beta-recurring-restore ] || fail policy_only_environment
+    [ -z "$reviewer" ] && [ -z "$reviewer_id" ] && [ -z "$approval_file" ] &&
+      [ -z "$post_approval_file" ] || fail policy_only_arguments
+  elif [ "$environment" = closed-beta-recurring-restore ]; then
     [[ "$reviewer" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail reviewer_missing
     [ "$reviewer" != "$actor" ] || fail self_review
     [ -n "$reviewer_id" ] || fail reviewer_id_missing

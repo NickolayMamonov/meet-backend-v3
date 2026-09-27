@@ -42,6 +42,12 @@ if "$root/scripts/authorize-beta-recurring.sh" \
   --ci-result-file "$ci" --actor scheduler --reviewer reviewer >/dev/null 2>&1; then
   fail "missing restore reviewer ID was accepted"
 fi
+"$root/scripts/authorize-beta-recurring.sh" \
+  --event workflow_dispatch --run-ref refs/heads/master --default-ref refs/heads/master \
+  --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
+  --environment closed-beta-recurring-restore --policy-file "$policy" \
+  --ci-result-file "$ci" --actor scheduler --policy-only >/dev/null ||
+  fail "pre-approval restore policy validation was rejected"
 if "$root/scripts/authorize-beta-recurring.sh" \
   --event schedule --run-ref refs/heads/dev --default-ref refs/heads/master \
   --scheduler-sha "$good_master" --checkout-sha "$good_tooling" --ci-sha "$good_ci" \
@@ -277,6 +283,13 @@ workflow="$root/.github/workflows/beta-recurring-backups.yml"
 ! grep -Eq 'BETA_RECURRING_CAPTURE_COMMAND|BETA_RECURRING_RESTORE_COMMAND|BETA_RESTORE_|BETA_RECURRING_ADMIN_BYPASS|BETA_RECURRING_PREVENT_SELF_REVIEW' "$workflow" ||
   fail "workflow retained mutable command or protection inputs"
 grep -Fq 'post-probe:' "$workflow" || fail "post-probe job is missing"
+grep -Fq -- '--policy-only' "$workflow" ||
+  fail "restore admission does not separate policy validation from reviewer approval"
+grep -Fq 'promotion_api_identity_required' \
+  "$root/scripts/run-beta-backup-storage.sh" ||
+  fail "remote promotion does not require authenticated API identity"
+! grep -Fq -- '--provenance "$RUNNER_TEMP/promotion-evidence.json"' "$workflow" ||
+  fail "workflow still passes caller-supplied promotion provenance"
 grep -Fq 'needs: [protected-drill, pre-probe, admission]' "$workflow" ||
   fail "post-probe DAG does not wait for admission and pre-probe"
 grep -Fq 'bind-beta-recurring-probes.sh' "$workflow" ||

@@ -193,4 +193,17 @@ if "$root/scripts/run-beta-backup-storage.sh" prune --now 1820000000 \
   --owner test >/dev/null 2>&1; then
   fail "remote prune without A3 snapshot was accepted"
 fi
+grep -Fq 'expectedKeys' "$root/scripts/beta-backup-storage.sh" ||
+  fail "writer state does not retain expected mutation closure"
+grep -Fq 'beta_storage_remote_writer_transition ambiguous true' \
+  "$root/scripts/beta-backup-storage.sh" ||
+  fail "ambiguous mutations are not durably fenced"
+grep -Fq 'receipts/$point_id/' "$root/scripts/beta-backup-storage.sh" ||
+  fail "orphan receipt graph cleanup is missing"
+grep -Fq 'pinned_closure_invalid' "$root/scripts/beta-backup-storage.sh" ||
+  fail "prune does not fail closed on invalid pinned closure"
+grep -Fq 'BETA_BACKUP_BYTE_BUDGET" 0 false' "$root/scripts/beta-backup-storage.sh" ||
+  fail "prune cannot inventory an over-budget bucket for reclamation"
+grep -Fq 'lifecycle_pins=protected' "$root/scripts/run-beta-backup-storage.sh" ||
+  fail "capability admission does not prove lifecycle pin protection"
 printf 'test-beta-backup-storage.sh: passed\n'
