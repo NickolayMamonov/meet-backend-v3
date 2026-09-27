@@ -30,7 +30,7 @@ open class BackupSafetySnapshotReader(
             require(mode == properties.controlRootMode.toInt(8))
         }
         val status = Path.of(properties.statusPath)
-        val watermark = Path.of(properties.resolvedWatermarkPath())
+        val watermark = watermarkPath(root)
         require(Files.isRegularFile(status, LinkOption.NOFOLLOW_LINKS))
         require(Files.isRegularFile(watermark, LinkOption.NOFOLLOW_LINKS))
         if (mode != null) {
@@ -58,7 +58,7 @@ open class BackupSafetySnapshotReader(
             throw BackupSafetySnapshotReadException("status file is unavailable")
         }
         val watermarkBytes = try {
-            val watermarkPath = Path.of(properties.resolvedWatermarkPath())
+            val watermarkPath = watermarkPath(controlRoot())
             require(Files.isRegularFile(watermarkPath) && !Files.isSymbolicLink(watermarkPath))
             require(Files.size(watermarkPath) <= MAX_BYTES)
             Files.readAllBytes(watermarkPath)
@@ -137,6 +137,13 @@ open class BackupSafetySnapshotReader(
 
     private fun controlRoot(): Path = Path.of(properties.statusPath).toAbsolutePath().normalize().parent
         ?: throw IllegalArgumentException("status path has no parent")
+
+    private fun watermarkPath(root: Path): Path {
+        val normalizedRoot = root.toAbsolutePath().normalize()
+        val watermark = Path.of(properties.resolvedWatermarkPath()).toAbsolutePath().normalize()
+        require(watermark.parent == normalizedRoot) { "watermark is outside the control mount" }
+        return watermark
+    }
 
     private fun validateWatermark(bytes: ByteArray, snapshot: BackupSafetySnapshot, statusBytes: ByteArray) {
         val root = objectMapper.reader(

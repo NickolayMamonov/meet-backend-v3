@@ -56,4 +56,10 @@ rm -rf -- "$target"
 mkdir -p "$target"
 unzip -q "$archive" -d "$target"
 test -x "$target/aws/dist/aws"
+binary_sha256=$(sha256sum "$target/aws/dist/aws" | awk '{print $1}')
+jq -cnS --arg version "$AWS_CLI_VERSION" --arg archive "$AWS_CLI_SHA256" \
+  --arg binary "$binary_sha256" \
+  '{schema:"meet-backend/beta-backup-aws-install-proof/v1",
+    version:$version,archiveSha256:$archive,binarySha256:$binary}' |
+  install -m 600 /dev/stdin "$target/aws/dist/meet-backup-install-proof.json"
 printf 'aws_cli_installed=true version=%s path=%s\n' "$AWS_CLI_VERSION" "$target/aws/dist/aws"

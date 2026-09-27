@@ -219,7 +219,6 @@ jobs:
       - name: Run exact-version protected drill
         env:
           POINT_ID: ${{ vars.BETA_RECURRING_DRILL_POINT_ID }}
-          RESTORE_IDENTITY: ${{ secrets.BETA_RECURRING_RESTORE_IDENTITY }}
           APPROVAL_METADATA: ${{ secrets.BETA_RECURRING_APPROVAL_METADATA }}
           CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
           BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}
@@ -291,14 +290,44 @@ jobs:
             '. + {protectionDigest:$digest}' "$protection_body" >"$protection_file"
           scripts/run-beta-recurring-drill.sh --validate-only \
             --point-id "$POINT_ID"
+          printf '%s\n' "$reviewer_id" >"$RUNNER_TEMP/recurring-reviewer-id"
+          printf '%s\n' "$protection_digest" >"$RUNNER_TEMP/recurring-protection-digest"
+          chmod 600 "$RUNNER_TEMP/recurring-reviewer-id" \
+            "$RUNNER_TEMP/recurring-protection-digest"
+      - name: Materialize identity after final admission
+        env:
+          POINT_ID: ${{ vars.BETA_RECURRING_DRILL_POINT_ID }}
+          RESTORE_IDENTITY: ${{ secrets.BETA_RECURRING_RESTORE_IDENTITY }}
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+          BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}
+          BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
+          BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
+          BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+          BETA_RECURRING_RESTORE_AWS_ACCESS_KEY_ID: ${{ secrets.BETA_RECURRING_RESTORE_AWS_ACCESS_KEY_ID }}
+          BETA_RECURRING_RESTORE_AWS_SECRET_ACCESS_KEY: ${{ secrets.BETA_RECURRING_RESTORE_AWS_SECRET_ACCESS_KEY }}
+          BETA_RECURRING_RESTORE_AWS_SESSION_TOKEN: ${{ secrets.BETA_RECURRING_RESTORE_AWS_SESSION_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/install-beta-backup-aws.sh
+          export AWS_BIN="$HOME/.local/aws-cli-v${AWS_CLI_VERSION}/aws/dist/aws"
+          export BETA_BACKUP_AWS_SHA256="$AWS_CLI_SHA256"
+          export BETA_BACKUP_AWS_VERSION="$AWS_CLI_VERSION"
+          export BETA_BACKUP_SCOPED_CREDENTIALS=true
+          export AWS_ACCESS_KEY_ID="$BETA_RECURRING_RESTORE_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$BETA_RECURRING_RESTORE_AWS_SECRET_ACCESS_KEY"
+          export AWS_SESSION_TOKEN="$BETA_RECURRING_RESTORE_AWS_SESSION_TOKEN"
           test -n "$RESTORE_IDENTITY"
+          reviewer_id=$(<"$RUNNER_TEMP/recurring-reviewer-id")
+          protection_digest=$(<"$RUNNER_TEMP/recurring-protection-digest")
           identity_file="$RUNNER_TEMP/restore-identity"
           install -m 600 /dev/null "$identity_file"
           printf '%s\n' "$RESTORE_IDENTITY" >"$identity_file"
-          unset RESTORE_IDENTITY APPROVAL_METADATA
+          unset RESTORE_IDENTITY
+          restore_command="$GITHUB_WORKSPACE/scripts/run-beta-recurring-restore-command.sh"
           restore_output="$RUNNER_TEMP/restore-output"
           mkdir -p "$restore_output"
           receipt="$RUNNER_TEMP/protected-receipt.json"
+          protection_file="$RUNNER_TEMP/recurring-restore-protection.json"
           scripts/run-beta-recurring-drill.sh \
             --point-id "$POINT_ID" --receipt "$receipt" \
             --restore-command "$restore_command" --restore-output "$restore_output" \

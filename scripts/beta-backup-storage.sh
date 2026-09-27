@@ -76,13 +76,23 @@ beta_storage_require_config() {
     beta_storage_fail pinned_aws_unavailable
   [[ "${BETA_BACKUP_AWS_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] ||
     beta_storage_fail pinned_aws_digest_missing
-  [ "$(sha256sum "$AWS_BIN" | awk '{print $1}')" = "$BETA_BACKUP_AWS_SHA256" ] ||
-    beta_storage_fail pinned_aws_digest_mismatch
   [[ "${BETA_BACKUP_AWS_VERSION:-}" =~ ^2\.[0-9]+\.[0-9]+$ ]] ||
     beta_storage_fail pinned_aws_version_missing
   "$AWS_BIN" --version 2>/dev/null |
     grep -Fq "aws-cli/$BETA_BACKUP_AWS_VERSION" ||
     beta_storage_fail pinned_aws_version_mismatch
+  local install_proof binary_sha256
+  install_proof="${AWS_BIN%/*}/meet-backup-install-proof.json"
+  [ -f "$install_proof" ] && [ ! -L "$install_proof" ] ||
+    beta_storage_fail pinned_aws_proof_missing
+  binary_sha256=$(sha256sum "$AWS_BIN" | awk '{print $1}')
+  jq -e --arg version "$BETA_BACKUP_AWS_VERSION" \
+    --arg archive "$BETA_BACKUP_AWS_SHA256" --arg binary "$binary_sha256" '
+    type=="object" and
+    (keys|sort)==["archiveSha256","binarySha256","schema","version"] and
+    .schema=="meet-backend/beta-backup-aws-install-proof/v1" and
+    .version==$version and .archiveSha256==$archive and .binarySha256==$binary
+  ' "$install_proof" >/dev/null || beta_storage_fail pinned_aws_proof_invalid
   [[ "${BETA_BACKUP_SCOPED_CREDENTIALS:-}" = true ]] ||
     beta_storage_fail scoped_credentials_missing
   [ -z "${AWS_PROFILE:-}" ] &&
@@ -200,7 +210,7 @@ beta_storage_aws() {
   error=$(mktemp)
   if timeout --foreground --signal=TERM \
       "${BETA_STORAGE_REQUEST_TIMEOUT_SECONDS}s" \
-      "$aws" --no-cli-pager --endpoint-url "$BETA_BACKUP_ENDPOINT" \
+      "$aws" --no-cli-pager --no-paginate --endpoint-url "$BETA_BACKUP_ENDPOINT" \
       --region "$BETA_BACKUP_REGION" \
       --cli-connect-timeout "$BETA_STORAGE_CONNECT_TIMEOUT_SECONDS" \
       --cli-read-timeout "$BETA_STORAGE_READ_TIMEOUT_SECONDS" \
@@ -215,12 +225,25 @@ beta_storage_aws() {
       "$([ "$status" -eq 124 ] && echo provider_timeout || echo provider_unavailable)" >&2
   fi
   rm -f -- "$output" "$error"
-  if [ "$status" -ne 0 ] &&
-    [[ "$BETA_STORAGE_LAST_ERROR" == *404* ||
-      "$BETA_STORAGE_LAST_ERROR" == *NotFound* ||
-      "$BETA_STORAGE_LAST_ERROR" == *NoSuchKey* ]]; then
-    return 3
-  fi
+  local operation=${1:-}
+  case "$operation" in
+    head-object)
+      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An\ error\ occurred\ \((404|NoSuchKey)\)\ when\ calling\ HeadObject\ operation: ]] &&
+        return 3
+      ;;
+    get-object)
+      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An\ error\ occurred\ \((404|NoSuchKey)\)\ when\ calling\ GetObject\ operation: ]] &&
+        return 3
+      ;;
+    get-bucket-lifecycle-configuration)
+      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An\ error\ occurred\ \(NoSuchLifecycleConfiguration\)\ when\ calling\ GetBucketLifecycleConfiguration\ operation: ]] &&
+        return 3
+      ;;
+    list-parts)
+      [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An\ error\ occurred\ \(NoSuchUpload\)\ when\ calling\ ListParts\ operation: ]] &&
+        return 3
+      ;;
+  esac
   return "$status"
 }
 
