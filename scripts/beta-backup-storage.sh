@@ -1233,6 +1233,9 @@ beta_storage_remote_inventory_total() {
     fi
     jq -e '
       type=="object" and (.Uploads|type=="array") and
+      ((keys - ["AbortDate","AbortRuleId","Bucket","CommonPrefixes","Delimiter",
+        "EncodingType","IsTruncated","KeyMarker","MaxUploads","NextKeyMarker",
+        "NextUploadIdMarker","Prefix","UploadIdMarker","Uploads"])|length==0) and
       (.Uploads|length<=1000) and (.IsTruncated|type=="boolean") and
       ((.IsTruncated and
         (.NextKeyMarker|type=="string" and
@@ -1242,20 +1245,33 @@ beta_storage_remote_inventory_total() {
        ((.IsTruncated|not) and
         ((.NextKeyMarker // "")=="" and (.NextUploadIdMarker // "")==""))) and
       all(.Uploads[]?;
+        ((keys - ["ChecksumAlgorithm","ChecksumType","Initiated","Initiator",
+          "Key","Owner","StorageClass","UploadId"])|length==0) and
         (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
         (.UploadId|type=="string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
         (.Initiated|type=="string" and length>0))
     ' <<<"$parts" >/dev/null || beta_storage_fail multipart_inventory_invalid
+    beta_storage_require_unique_json <(printf '%s\n' "$parts") ||
+      beta_storage_fail multipart_inventory_duplicate_json
     while IFS=$'\t' read -r upload_key upload_id; do
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
       part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
         --key "$upload_key" --upload-id "$upload_id" --max-parts 1000) ||
         beta_storage_fail multipart_parts_unavailable
+      beta_storage_require_unique_json <(printf '%s\n' "$part_page") ||
+        beta_storage_fail multipart_parts_duplicate_json
       jq -e '
         type=="object" and (.Parts|type=="array") and
+        ((keys - ["AbortDate","AbortRuleId","Bucket","ChecksumAlgorithm",
+          "ChecksumType","Initiator","IsTruncated","Key","MaxParts",
+          "NextPartNumberMarker","Owner","PartNumberMarker","Parts",
+          "ReplicationStatus","StorageClass","UploadId"])|length==0) and
+        (.Parts|length<=1000) and
         (.IsTruncated|type=="boolean") and (.IsTruncated==false) and
         ((.NextPartNumberMarker // "")=="") and
         all(.Parts[]?;
+          ((keys - ["ChecksumCRC32","ChecksumCRC32C","ChecksumSHA1",
+            "ChecksumSHA256","ETag","LastModified","PartNumber","Size"])|length==0) and
           (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
           (.Size|type=="number" and floor==. and .>=0 and
             .<=9223372036854775807) and
@@ -1544,6 +1560,10 @@ beta_storage_remote_validate_descriptor() {
     (.versions|type=="object" and (keys|sort)==["database","manifest","uploads"] and
       all(.[]; type=="string" and utf8bytelength>=1 and
         utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$"))) and
+    (.capture|type=="object" and (keys|sort)==["capturedAt","sourceRevision"] and
+      (.capturedAt|type=="number" and floor==. and .>=0) and
+      (.sourceRevision|type=="string" and test("^[0-9a-f]{40}$"))) and
+    (.ciphertexts|type=="object" and (keys|sort)==["database","uploads"]) and
     (.proofs|type=="object" and ((keys|sort)==[] or
       ((keys|sort)==["database","media"] and
        (.database|type=="object" and (keys|sort)==["length","sha256","versionId"] and
@@ -2381,6 +2401,9 @@ beta_storage_prune_remote() {
     fi
     jq -e '
       type=="object" and (.Uploads|type=="array") and
+      ((keys - ["AbortDate","AbortRuleId","Bucket","CommonPrefixes","Delimiter",
+        "EncodingType","IsTruncated","KeyMarker","MaxUploads","NextKeyMarker",
+        "NextUploadIdMarker","Prefix","UploadIdMarker","Uploads"])|length==0) and
       (.Uploads|length<=1000) and (.IsTruncated|type=="boolean") and
       ((.IsTruncated and
         (.NextKeyMarker|type=="string" and
@@ -2390,11 +2413,15 @@ beta_storage_prune_remote() {
        ((.IsTruncated|not) and
         ((.NextKeyMarker // "")=="" and (.NextUploadIdMarker // "")==""))) and
       all(.Uploads[]?;
+        ((keys - ["ChecksumAlgorithm","ChecksumType","Initiated","Initiator",
+          "Key","Owner","StorageClass","UploadId"])|length==0) and
         (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
         (.UploadId|type=="string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
         (.Initiated|type=="string" and length>0))
     ' <<<"$multipart" >/dev/null ||
       beta_storage_fail multipart_inventory_invalid
+    beta_storage_require_unique_json <(printf '%s\n' "$multipart") ||
+      beta_storage_fail multipart_inventory_duplicate_json
     while IFS=$'\t' read -r upload_key upload_id initiated; do
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
       beta_storage_remote_multipart_eligible "$upload_key" "$initiated" "$now" ||
@@ -2403,11 +2430,20 @@ beta_storage_prune_remote() {
       part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
         --key "$upload_key" --upload-id "$upload_id" --max-parts 1000) ||
         beta_storage_fail multipart_parts_unavailable
+      beta_storage_require_unique_json <(printf '%s\n' "$part_page") ||
+        beta_storage_fail multipart_parts_duplicate_json
       jq -e '
         type=="object" and (.Parts|type=="array") and
+        ((keys - ["AbortDate","AbortRuleId","Bucket","ChecksumAlgorithm",
+          "ChecksumType","Initiator","IsTruncated","Key","MaxParts",
+          "NextPartNumberMarker","Owner","PartNumberMarker","Parts",
+          "ReplicationStatus","StorageClass","UploadId"])|length==0) and
+        (.Parts|length<=1000) and
         (.IsTruncated|type=="boolean") and (.IsTruncated==false) and
         ((.NextPartNumberMarker // "")=="") and
         all(.Parts[]?;
+          ((keys - ["ChecksumCRC32","ChecksumCRC32C","ChecksumSHA1",
+            "ChecksumSHA256","ETag","LastModified","PartNumber","Size"])|length==0) and
           (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
           (.Size|type=="number" and floor==. and .>=0 and
             .<=9223372036854775807) and
@@ -2632,6 +2668,16 @@ beta_storage_reconcile_remote() {
             "$scratch/reconcile-point.json")" '
           .schema=="meet-backend/beta-backup-head/v2" and
           .pointId==$point and .descriptorDigest==$descriptor
+        ' "$scratch/reconcile-capture.json" >/dev/null &&
+        jq -e \
+          --arg descriptorVersion \
+            "$(jq -er '.VersionId' "$scratch/reconcile-point.meta")" \
+          --argjson captured \
+            "$(jq -er '.capture.capturedAt' "$scratch/reconcile-point.json")" \
+          --argjson now "$(date -u +%s)" '
+          .descriptorVersion==$descriptorVersion and
+          .capturedAt==$captured and
+          (.capturedAt|type=="number" and floor==. and .>=0 and .<=$now)
         ' "$scratch/reconcile-capture.json" >/dev/null; then
         beta_storage_remote_writer_transition reconciled false "$expected_keys" &&
           beta_storage_remote_writer_release "$owner" "$txid" &&

@@ -148,7 +148,11 @@ if [ "$source_schema" = meet-backend/beta-recurring-capture-source/v1 ]; then
     --arg slot "$slot" --argjson captured "$captured_at" \
     --arg source "$source_revision" --arg command "$capture_digest" '
     type=="object" and
-    (keys|sort)==["captureCommandDigest","capturedAt","database","media","schema","slotId","sourceRevision"] and
+    ((keys|sort)==["captureCommandDigest","capturedAt","database","media","schema","slotId","sourceRevision"] or
+      ((keys|sort)==["captureCommandDigest","captureHostFingerprint","captureTransport",
+        "capturedAt","database","media","schema","slotId","sourceRevision"] and
+       .captureTransport=="ssh-host-key-verified-v1" and
+       (.captureHostFingerprint|type=="string" and test("^SHA256:[A-Za-z0-9+/=]+$")))) and
     .schema=="meet-backend/beta-recurring-capture-source/v1" and
     .slotId==$slot and .capturedAt==$captured and .sourceRevision==$source and
     .captureCommandDigest==$command and

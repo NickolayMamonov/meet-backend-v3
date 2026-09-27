@@ -267,13 +267,6 @@ reviewer_from_receipt=$(jq -er '.reviewerId' "$receipt")
   echo 'BACKUP_CUSTODY_BLOCKED:reviewer_binding_mismatch' >&2
   exit 1
 }
-policy_digest=${BETA_RECURRING_POLICY_DIGEST:-}
-protection_digest=$(
-  jq -cS -n --slurpfile environment "$tmp/environment" \
-    --slurpfile branches "$tmp/branches" \
-    '{environment:$environment[0],branches:$branches[0]}' |
-    sha256sum | awk '{print $1}'
-)
 api_evidence_digest=$(
   jq -cS -n --slurpfile run "$tmp/run" --slurpfile jobs "$tmp/jobs" \
     --slurpfile artifacts "$tmp/artifacts" --slurpfile approvals "$tmp/approvals" \
@@ -287,6 +280,24 @@ api_evidence_digest=$(
       branches:$branches[0],receiptDigest:$receipt,probeBindingDigest:$probe}' |
     sha256sum | awk '{print $1}'
 )
+protection_api_evidence_digest=$(
+  jq -cS -n --slurpfile environment "$tmp/environment" \
+    --slurpfile branches "$tmp/branches" \
+    '{environment:$environment[0],branches:$branches[0]}' |
+    sha256sum | awk '{print $1}'
+)
+policy_digest=${BETA_RECURRING_POLICY_DIGEST:-}
+protection_body=$(
+  jq -cS -n --arg reviewer "$reviewer_id" \
+    --arg evidence "$protection_api_evidence_digest" '
+    {schema:"meet-backend/beta-recurring-restore-protection/v2",
+     environment:"closed-beta-recurring-restore",
+     branchPolicy:"refs/heads/master",reviewerId:$reviewer,
+     reviewerRequired:true,preventSelfReview:true,adminBypassAllowed:false,
+     apiEvidenceDigest:$evidence}'
+)
+protection_digest=$(printf '%s' "$protection_body" |
+  sha256sum | awk '{print $1}')
 [[ "$policy_digest" =~ ^[0-9a-f]{64}$ ]] || {
   echo 'BACKUP_CUSTODY_BLOCKED:policy_digest_missing' >&2
   exit 1

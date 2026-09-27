@@ -40,6 +40,19 @@ done
   "$restore_revision" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$source_artifact_id" =~ ^[1-9][0-9]*$ &&
   "$source_run_id" =~ ^[1-9][0-9]*$ ]] || usage
+
+source_tmp=''
+remote_scratch=''
+cleanup_source_auth() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  [ -z "$source_tmp" ] || rm -rf -- "$source_tmp" || status=1
+  [ -z "$remote_scratch" ] || rm -rf -- "$remote_scratch" || status=1
+  [ -z "$identity" ] || rm -f -- "$identity" || status=1
+  exit "$status"
+}
+trap cleanup_source_auth EXIT HUP INT TERM
+
 : "${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 command -v curl >/dev/null 2>&1 || exit 1
@@ -69,15 +82,6 @@ command -v unzip >/dev/null 2>&1 || exit 1
 command -v jq >/dev/null 2>&1 || exit 1
 command -v timeout >/dev/null 2>&1 || exit 1
 
-source_tmp=''
-cleanup_source_auth() {
-  local status=$?
-  trap - EXIT HUP INT TERM
-  [ -z "$source_tmp" ] || rm -rf -- "$source_tmp" || status=1
-  rm -f -- "$identity" || status=1
-  exit "$status"
-}
-trap cleanup_source_auth EXIT HUP INT TERM
 source_tmp=$(mktemp -d)
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 api=${GITHUB_API_URL:-https://api.github.com}
@@ -217,6 +221,7 @@ source_manifest_sha=$manifest_digest
 # The local adapter is deterministic; remote mode commits through the same
 # manifest-last provider publish path and then retrieves exact versions again.
 if [ "$remote" = true ]; then
+  remote_scratch=$(mktemp -d "$destination_dir/.remote-migration.XXXXXX")
   "$script_dir/run-beta-backup-storage.sh" reconcile >/dev/null
   cp -- "$source_dir/postgres.dump.age" "$destination_dir/postgres.dump.age"
   cp -- "$source_dir/uploads.tar.gz.age" "$destination_dir/uploads.tar.gz.age"
@@ -241,7 +246,6 @@ publish_args=(publish --source "$destination_dir" --point-id "$point_id" --slot 
 [ "$remote" = true ] || publish_args+=(--storage-root "$storage_root")
 "$script_dir/run-beta-backup-storage.sh" "${publish_args[@]}"
 if [ "$remote" = true ]; then
-  remote_scratch=$(mktemp -d "$destination_dir/.remote-migration.XXXXXX")
   beta_storage_remote_head "points/$point_id/point.json" \
     "$remote_scratch/descriptor.meta"
   beta_storage_remote_get_json "points/$point_id/point.json" \

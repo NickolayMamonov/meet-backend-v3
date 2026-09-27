@@ -44,9 +44,24 @@ if [ "$validate_only" = false ]; then
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+root_owned=false
+proof_tmp=''
+cleanup_drill() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  [ -z "$proof_tmp" ] || rm -f -- "$proof_tmp" || status=1
+  [ -z "$identity" ] || rm -f -- "$identity" || status=1
+  if [ "${root_owned:-false}" = true ] && [ -n "$root" ]; then
+    rm -rf -- "$root" || status=1
+  fi
+  if [ "$status" -ne 0 ] && [ -n "$restore_output" ]; then
+    rm -rf -- "$restore_output" || status=1
+  fi
+  exit "$status"
+}
+trap cleanup_drill EXIT HUP INT TERM
 # shellcheck source=beta-backup-storage.sh
 source "$script_dir/beta-backup-storage.sh"
-root_owned=false
 if [ -z "$root" ]; then
   beta_storage_require_config
   root=$(mktemp -d)
@@ -148,9 +163,15 @@ fi
 
 jq -e --arg reviewer "$reviewer_id" --arg digest "$protection_digest" '
   type=="object" and
-  (keys|sort)==["adminBypassAllowed","branchPolicy","environment","preventSelfReview",
-    "protectionDigest","reviewerId","reviewerRequired","schema"] and
-  .schema=="meet-backend/beta-recurring-restore-protection/v1" and
+  ((.schema=="meet-backend/beta-recurring-restore-protection/v1" and
+    (keys|sort)==["adminBypassAllowed","branchPolicy","environment",
+      "preventSelfReview","protectionDigest","reviewerId","reviewerRequired",
+      "schema"]) or
+   (.schema=="meet-backend/beta-recurring-restore-protection/v2" and
+    (keys|sort)==["adminBypassAllowed","apiEvidenceDigest","branchPolicy",
+      "environment","preventSelfReview","protectionDigest","reviewerId",
+      "reviewerRequired","schema"] and
+    (.apiEvidenceDigest|type=="string" and test("^[0-9a-f]{64}$")))) and
   .environment=="closed-beta-recurring-restore" and
   .branchPolicy=="refs/heads/master" and
   .reviewerRequired==true and .preventSelfReview==true and
@@ -188,19 +209,6 @@ restore_parent=$(dirname -- "$restore_output")
   exit 1
 }
 proof_tmp=$(mktemp "$restore_parent/.restore-proof.XXXXXX")
-cleanup_drill() {
-  local status=$?
-  trap - EXIT HUP INT TERM
-  rm -f -- "$proof_tmp" "$identity" || status=1
-  if [ "${root_owned:-false}" = true ]; then
-    rm -rf -- "$root" || status=1
-  fi
-  if [ "$status" -ne 0 ]; then
-    rm -rf -- "$restore_output" || status=1
-  fi
-  exit "$status"
-}
-trap cleanup_drill EXIT HUP INT TERM
 timeout --foreground --signal=TERM 1800s "$restore_command" \
   --point-dir "$point" --identity-file "$identity" --output-dir "$restore_output" \
   --capture-revision "$capture_revision" --restore-revision "$restore_revision" \

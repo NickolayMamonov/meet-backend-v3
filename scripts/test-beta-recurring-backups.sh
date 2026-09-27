@@ -189,9 +189,10 @@ printf 'private restore identity\n' >"$tmp/identity"
 protection_body="$tmp/protection-body.json"
 protection="$tmp/protection.json"
 jq -cnS --arg reviewer reviewer-1 \
-  '{schema:"meet-backend/beta-recurring-restore-protection/v1",environment:"closed-beta-recurring-restore",
+  '{schema:"meet-backend/beta-recurring-restore-protection/v2",environment:"closed-beta-recurring-restore",
     branchPolicy:"refs/heads/master",reviewerId:$reviewer,
-    reviewerRequired:true,preventSelfReview:true,adminBypassAllowed:false}' >"$protection_body"
+    reviewerRequired:true,preventSelfReview:true,adminBypassAllowed:false,
+    apiEvidenceDigest:("e" * 64)}' >"$protection_body"
 protection_digest=$(sha256sum "$protection_body" | awk '{print $1}')
 jq --arg digest "$protection_digest" '. + {protectionDigest:$digest}' \
   "$protection_body" >"$protection"
@@ -296,8 +297,11 @@ restore_tool="$root/scripts/run-beta-recurring-restore-command.sh"
   --allowlist "$root/scripts/fixtures/beta-recurring/tooling-allowlist.json" >/dev/null ||
   fail "restore tooling allowlist rejected the reviewed adapter"
 cp "$root/scripts/fixtures/beta-recurring/tooling-allowlist.json" "$tmp/forged-allowlist.json"
-sed -i '0,/5b5c6f5aaacd4dc975f2053e508eb3927fc3eda1d764d352717f0b6947182959/s//0000000000000000000000000000000000000000000000000000000000000000/' \
-  "$tmp/forged-allowlist.json"
+capture_allowlist_digest=$(jq -er \
+  '.tools[] | select(.role=="capture") | .sha256' "$tmp/forged-allowlist.json")
+sed -i "0,/$capture_allowlist_digest/s//$(
+  printf '%064d' 0
+)/" "$tmp/forged-allowlist.json"
 if "$root/scripts/validate-beta-recurring-tooling.sh" \
   --role capture --path "$capture_tool" --allowlist "$tmp/forged-allowlist.json" \
   >/dev/null 2>&1; then
