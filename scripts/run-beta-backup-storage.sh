@@ -41,8 +41,11 @@ case "$operation" in
         { echo "BACKUP_STORAGE_BLOCKED:storage_layout_invalid" >&2; exit 1; }
       printf 'storage_capability=local-versioned-writer conditional_lock=true manifest_last=true\n'
     else
-      beta_storage_aws head-bucket --bucket "$BETA_BACKUP_BUCKET" >/dev/null
-      versioning=$(beta_storage_aws get-bucket-versioning --bucket "$BETA_BACKUP_BUCKET" |
+      beta_storage_aws_read head-bucket --bucket "$BETA_BACKUP_BUCKET" >/dev/null || {
+        echo "BACKUP_STORAGE_BLOCKED:bucket_unavailable" >&2
+        exit 1
+      }
+      versioning=$(beta_storage_aws_read get-bucket-versioning --bucket "$BETA_BACKUP_BUCKET" |
         jq -er '.Status // empty') || {
           echo "BACKUP_STORAGE_BLOCKED:versioning_unavailable" >&2
           exit 1

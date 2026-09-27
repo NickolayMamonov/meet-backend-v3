@@ -206,4 +206,8 @@ grep -Fq 'BETA_BACKUP_BYTE_BUDGET" 0 false' "$root/scripts/beta-backup-storage.s
   fail "prune cannot inventory an over-budget bucket for reclamation"
 grep -Fq 'lifecycle_pins=protected' "$root/scripts/run-beta-backup-storage.sh" ||
   fail "capability admission does not prove lifecycle pin protection"
+grep -Fq 'beta_storage_aws_read head-bucket' "$root/scripts/run-beta-backup-storage.sh" ||
+  fail "capability admission bypasses the bounded head-bucket read"
+grep -Fq 'beta_storage_aws_read get-bucket-versioning' "$root/scripts/run-beta-backup-storage.sh" ||
+  fail "capability admission bypasses the bounded versioning read"
 printf 'test-beta-backup-storage.sh: passed\n'

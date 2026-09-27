@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
   actions: read
+  deployments: read
 
 concurrency:
   group: closed-beta-recurring-monitor
@@ -15,11 +16,56 @@ concurrency:
 
 env:
   AWS_EC2_METADATA_DISABLED: "true"
+  SCHEDULER_REF: refs/heads/master
+  BETA_RECURRING_TOOLING_ALLOWLIST: ${{ github.workspace }}/scripts/fixtures/beta-recurring/tooling-allowlist.json
 
 jobs:
-  monitor:
+  admission:
     if: vars.BETA_RECURRING_ACTIVATED == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      checkout_sha: ${{ steps.authorize.outputs.checkout_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Validate registered custody and CI provenance
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_REF: ${{ github.ref }}
+          SCHEDULER_SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+        id: authorize
+        run: |
+          set -euo pipefail
+          test "$RUN_REF" = "$SCHEDULER_REF"
+          checkout_sha=$(timeout --foreground 30s git ls-remote \
+            "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/dev | awk '{print $1}')
+          test "$checkout_sha" != "$SCHEDULER_SHA"
+          policy_file="$RUNNER_TEMP/monitor-policy.json"
+          ci_file="$RUNNER_TEMP/monitor-ci.json"
+          scripts/query-beta-recurring-policy.sh --output "$policy_file"
+          scripts/query-beta-recurring-ci.sh --sha "$checkout_sha" --output "$ci_file"
+          scripts/authorize-beta-recurring.sh \
+            --event "${{ github.event_name }}" \
+            --run-ref "$RUN_REF" \
+            --default-ref "$SCHEDULER_REF" \
+            --scheduler-sha "$SCHEDULER_SHA" \
+            --checkout-sha "$checkout_sha" \
+            --ci-sha "$checkout_sha" \
+            --environment closed-beta-recurring-monitor \
+            --policy-file "$policy_file" \
+            --ci-result-file "$ci_file" \
+            --actor "$ACTOR"
+          printf 'checkout_sha=%s\n' "$checkout_sha" >>"$GITHUB_OUTPUT"
+
+  monitor:
+    needs: admission
+    if: vars.BETA_RECURRING_ACTIVATED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     environment:
       name: closed-beta-recurring-monitor
     steps:
@@ -27,6 +73,13 @@ jobs:
         with:
           ref: master
           fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
       - name: Deliver authenticated authority snapshot
         env:
           BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}

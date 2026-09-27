@@ -61,6 +61,20 @@ if "$root/scripts/authorize-beta-recurring.sh" \
   fail "changed default branch was accepted"
 fi
 
+grep -Fq 'needs: admission' "$root/.github/workflows/beta-backup-monitor.yml" ||
+  fail "monitor is not downstream of authenticated admission"
+grep -Fq 'git checkout --detach "$CHECKOUT_SHA"' \
+  "$root/.github/workflows/beta-backup-monitor.yml" ||
+  fail "monitor does not select the reviewed tooling revision"
+grep -Fq 'timeout-minutes: 10' "$root/.github/workflows/beta-backup-monitor.yml" ||
+  fail "monitor whole-operation deadline is missing"
+for timeout_line in \
+  'timeout-minutes: 60' \
+  'timeout-minutes: 10'; do
+  grep -Fq "$timeout_line" "$root/.github/workflows/beta-recurring-backups.yml" ||
+    fail "recurring workflow deadline is missing: $timeout_line"
+done
+
 cat >"$tmp/capture-source.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
