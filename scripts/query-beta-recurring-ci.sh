@@ -17,6 +17,10 @@ done
 command -v curl >/dev/null 2>&1 || exit 1
 command -v jq >/dev/null 2>&1 || exit 1
 api=${GITHUB_API_URL:-https://api.github.com}
+[ "$api" = https://api.github.com ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:ci_api_origin_invalid' >&2
+  exit 1
+}
 tmp=$(mktemp)
 trap 'rm -f -- "$tmp" "$tmp.error"' EXIT
 curl --fail --silent --show-error --connect-timeout 5 --max-time 30 \

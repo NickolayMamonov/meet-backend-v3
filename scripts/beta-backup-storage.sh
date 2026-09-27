@@ -348,9 +348,24 @@ beta_storage_aws_list_versions() {
       response=$(beta_storage_aws_read list-object-versions --bucket "$BETA_BACKUP_BUCKET" \
         --max-keys 1000) || beta_storage_fail inventory_unavailable
     fi
-    jq -e 'type=="object" and (.Versions|type=="array") and
-      (.DeleteMarkers|type=="array") and ((.Versions|length)+(.DeleteMarkers|length)<=1000)' \
-      <<<"$response" >/dev/null || beta_storage_fail inventory_invalid
+    jq -e '
+      type=="object" and (.Versions|type=="array") and
+      (.DeleteMarkers|type=="array") and
+      ((.Versions|length)+(.DeleteMarkers|length)<=1000) and
+      all(.Versions[]?;
+        (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+        (.VersionId|type=="string" and test("^[A-Za-z0-9._:-]{1,160}$")) and
+        (.Size|type=="number" and floor==. and .>=0 and
+          .<=9223372036854775807)) and
+      all(.DeleteMarkers[]?;
+        (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+        (.VersionId|type=="string" and test("^[A-Za-z0-9._:-]{1,160}$"))) and
+      (([.Versions[]? | "v\(.Key)\u0000\(.VersionId)"] +
+        [.DeleteMarkers[]? | "d\(.Key)\u0000\(.VersionId)"]) |
+        unique | length ==
+        ([.Versions[]? | "v\(.Key)\u0000\(.VersionId)"] +
+         [.DeleteMarkers[]? | "d\(.Key)\u0000\(.VersionId)"] | length))
+    ' <<<"$response" >/dev/null || beta_storage_fail inventory_invalid
     printf '%s\n' "$response"
     truncated=$(jq -er '.IsTruncated // false' <<<"$response")
     [ "$truncated" = true ] || return 0
@@ -459,11 +474,27 @@ beta_storage_provider_put() {
 }
 
 beta_storage_provider_put_multipart() {
-  local root=$1 key=$2 source=$3
+  local root=$1 key=$2 source=$3 if_none_match=${4:-false}
   [ -z "$root" ] || beta_storage_fail multipart_local_unsupported
   beta_storage_require_config
   [ -f "$source" ] && [ ! -L "$source" ] && [ -s "$source" ] ||
     beta_storage_fail provider_source_invalid
+  [ "$if_none_match" != true ] ||
+    [ -n "${BETA_STORAGE_REMOTE_WRITER_TX:-}" ] ||
+    beta_storage_fail conditional_multipart_writer_required
+  local existing_meta='' existing_status
+  if [ "$if_none_match" = true ]; then
+    existing_meta=$(mktemp)
+    if beta_storage_remote_head "$key" "$existing_meta"; then
+      rm -f -- "$existing_meta"
+      beta_storage_fail cas_conflict
+    else
+      existing_status=$?
+      rm -f -- "$existing_meta"
+      [ "$existing_status" -eq 1 ] ||
+        beta_storage_fail conditional_multipart_head_failed
+    fi
+  fi
   local length sha scratch create_result upload_id part_number=1 offset=0
   local part_length part_file part_result etag parts='[]' complete_file result version
   local deadline=$((SECONDS + BETA_STORAGE_MULTIPART_TOTAL_TIMEOUT_SECONDS))
@@ -478,13 +509,27 @@ beta_storage_provider_put_multipart() {
   abort_multipart() {
     [ -n "$upload_id" ] || return 0
     if ! beta_storage_aws_mutation abort-multipart-upload \
-      --bucket "$BETA_BACKUP_BUCKET" --key "$key" --upload-id "$upload_id" >/dev/null ||
-      beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
-        --key "$key" --upload-id "$upload_id" --max-parts 1000 >/dev/null; then
+      --bucket "$BETA_BACKUP_BUCKET" --key "$key" --upload-id "$upload_id" >/dev/null; then
       [ -n "${BETA_STORAGE_AMBIGUOUS_MARKER:-}" ] &&
         : >"$BETA_STORAGE_AMBIGUOUS_MARKER"
       printf 'BACKUP_STORAGE_BLOCKED:multipart_abort_unconfirmed key=%s\n' "$key" >&2
       return 1
+    fi
+    if beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
+      --key "$key" --upload-id "$upload_id" --max-parts 1000 >/dev/null; then
+      [ -n "${BETA_STORAGE_AMBIGUOUS_MARKER:-}" ] &&
+        : >"$BETA_STORAGE_AMBIGUOUS_MARKER"
+      printf 'BACKUP_STORAGE_BLOCKED:multipart_abort_unconfirmed key=%s\n' "$key" >&2
+      return 1
+    else
+      local abort_status=$?
+      if [ "$abort_status" -ne 3 ]; then
+        [ -n "${BETA_STORAGE_AMBIGUOUS_MARKER:-}" ] &&
+          : >"$BETA_STORAGE_AMBIGUOUS_MARKER"
+        printf 'BACKUP_STORAGE_BLOCKED:multipart_abort_verification_failed key=%s\n' \
+          "$key" >&2
+        return 1
+      fi
     fi
     upload_id=''
   }
@@ -574,11 +619,9 @@ beta_storage_provider_put_conditional() {
     if [ "$if_none_match" = true ]; then
       (( source_length <= BETA_STORAGE_CONDITIONAL_PUT_MAX_BYTES )) ||
         beta_storage_fail conditional_object_too_large
-      output=$(beta_storage_aws_mutation put-object --bucket "$BETA_BACKUP_BUCKET" \
-        --key "$key" --body "$source" --metadata "sha256=$sha" \
-        --if-none-match '*') ||
-        beta_storage_fail provider_conditional_write_failed
-      version=$(jq -er '.VersionId // empty' <<<"$output") ||
+      output=$(beta_storage_provider_put_multipart '' "$key" "$source" true) ||
+        beta_storage_fail provider_multipart_failed
+      version=$(jq -er '.versionId // empty' <<<"$output") ||
         beta_storage_fail provider_version_missing
       local verify
       verify=$(mktemp)
@@ -1085,17 +1128,31 @@ beta_storage_remote_inventory_total() {
       parts=$(beta_storage_aws_read list-multipart-uploads --bucket "$BETA_BACKUP_BUCKET" \
         --max-uploads 1000) || beta_storage_fail multipart_inventory_unavailable
     fi
-    jq -e 'type=="object" and (.Uploads|type=="array")' <<<"$parts" >/dev/null ||
-      beta_storage_fail multipart_inventory_invalid
+    jq -e '
+      type=="object" and (.Uploads|type=="array") and
+      all(.Uploads[]?;
+        (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+        (.UploadId|type=="string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
+        (.Initiated|type=="string" and length>0))
+    ' <<<"$parts" >/dev/null || beta_storage_fail multipart_inventory_invalid
     while IFS=$'\t' read -r upload_key upload_id; do
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
       part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
         --key "$upload_key" --upload-id "$upload_id" --max-parts 1000) ||
         beta_storage_fail multipart_parts_unavailable
-      jq -e 'type=="object" and (.Parts|type=="array") and
-        ((.IsTruncated // false)==false)' <<<"$part_page" >/dev/null ||
+      jq -e '
+        type=="object" and (.Parts|type=="array") and
+        ((.IsTruncated // false)==false) and
+        all(.Parts[]?;
+          (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
+          (.Size|type=="number" and floor==. and .>=0 and
+            .<=9223372036854775807) and
+          (.ETag|type=="string" and length>0)) and
+        ([.Parts[]?.PartNumber] | unique | length ==
+          ([.Parts[]?.PartNumber] | length))
+      ' <<<"$part_page" >/dev/null ||
         beta_storage_fail multipart_parts_incomplete
-      part_bytes=$(jq -r '[.Parts[]?.Size // 0] | add // 0' <<<"$part_page")
+      part_bytes=$(jq -r '[.Parts[]?.Size] | add // 0' <<<"$part_page")
       [[ "$part_bytes" =~ ^[0-9]+$ ]] || beta_storage_fail multipart_parts_invalid
       (( part_bytes <= 9223372036854775807 - multipart_bytes )) ||
         beta_storage_fail budget_overflow
@@ -1455,6 +1512,34 @@ beta_storage_remote_validate_descriptor() {
     beta_storage_validate_capture_proof media "$mediaproof" ||
       beta_storage_fail descriptor_media_proof_invalid
   fi
+}
+
+beta_storage_remote_point_graph_state() {
+  local point_id=$1 inventory=$2 scratch=$3
+  local descriptor_version descriptor_path error index=0
+  while IFS= read -r descriptor_version; do
+    [ -n "$descriptor_version" ] || continue
+    index=$((index + 1))
+    descriptor_path="$scratch/graph-descriptor-$index.json"
+    if error=$(beta_storage_provider_get '' "points/$point_id/point.json" \
+      "$descriptor_version" "$descriptor_path" 2>&1); then
+      :
+    else
+      [[ "$error" =~ BACKUP_STORAGE_BLOCKED:(provider_|inventory_|multipart_|pagination_|budget_) ]] &&
+        return 2
+      continue
+    fi
+    if error=$(beta_storage_remote_validate_descriptor "$point_id" \
+      "$descriptor_path" "$scratch" false 2>&1); then
+      return 0
+    fi
+    [[ "$error" =~ BACKUP_STORAGE_BLOCKED:(provider_|inventory_|multipart_|pagination_|budget_) ]] &&
+      return 2
+  done < <(jq -r --arg point "$point_id" '
+    .[].Versions[]? | select(.Key=="points/"+$point+"/point.json") |
+    .VersionId
+  ' <<<"$inventory")
+  return 1
 }
 
 beta_storage_remote_require_safety() {
@@ -1974,7 +2059,7 @@ beta_storage_prune_remote() {
   beta_storage_remote_require_safety "$safety_status" "$safety_watermark" \
     "$safety_environment" "$now"
   beta_storage_require_config
-  local writer_control_reserve=$((4 * BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES))
+  local writer_control_reserve=$((5 * BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES))
   local intent_digest
   intent_digest=$(printf '%s\0%s\0%s\0%s' prune "$now" "$BETA_BACKUP_BYTE_BUDGET" \
     "$writer_control_reserve" |
@@ -1986,7 +2071,9 @@ beta_storage_prune_remote() {
     "$intent_digest" '["control/verified-head.json"]'
   beta_storage_remote_writer_transition pruning false \
     '["control/verified-head.json"]'
-  local release=true head='' seen='' ambiguous_marker scratch
+  local release=true head='' seen='' deleted_point_ids='' ambiguous_marker scratch
+  local deleted_points=0 deleted_object_versions=0 deleted_object_bytes=0
+  local deleted_multipart_uploads=0 deleted_multipart_bytes=0
   scratch=$(mktemp -d)
   ambiguous_marker=$(mktemp)
   rm -f "$ambiguous_marker"
@@ -2004,7 +2091,8 @@ beta_storage_prune_remote() {
     if [ "$release" = true ]; then
       beta_storage_remote_writer_release "$owner" "prune-$now" || status=1
     fi
-    rm -f -- "$head" "$head.meta" "$seen" "$ambiguous_marker" \
+    rm -f -- "$head" "$head.meta" "$seen" "$deleted_point_ids" \
+      "$ambiguous_marker" \
       "$mutation_started_marker" 2>/dev/null ||
       status=1
     rm -rf -- "$scratch" 2>/dev/null || status=1
@@ -2046,10 +2134,12 @@ beta_storage_prune_remote() {
       "points/"+$capture+"/recovery-point.json",
       "points/"+$capture+"/postgres.dump.age",
       "points/"+$capture+"/uploads.tar.gz.age",
-      "control/capture-head.json"] | unique)')
+      "control/capture-head.json",
+      "control/prune-summary.json"] | unique)')
   beta_storage_remote_writer_transition pruning false "$expected_keys"
-  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" 0 false >/dev/null
-  local inventory key version
+  local inventory key version inventory_before
+  inventory_before=$(beta_storage_remote_inventory_total \
+    "$BETA_BACKUP_BYTE_BUDGET" 0 false)
   inventory=$(beta_storage_aws_list_versions | jq -s '.')
   jq -e 'type=="array" and all(.[]; type=="object" and
     all(.Versions[]?; (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
@@ -2059,6 +2149,18 @@ beta_storage_prune_remote() {
       (.VersionId|type=="string" and length>0)))' <<<"$inventory" >/dev/null ||
     beta_storage_fail inventory_invalid
   seen=$(mktemp)
+  deleted_point_ids=$(mktemp)
+  delete_inventory_version() {
+    local object_key=$1 object_version=$2 object_bytes
+    object_bytes=$(jq -er --arg key "$object_key" --arg version "$object_version" '
+      [.[].Versions[]? | select(.Key==$key and .VersionId==$version) | .Size][0]
+    ' <<<"$inventory") || beta_storage_fail inventory_invalid
+    beta_storage_remote_delete_version "$object_key" "$object_version"
+    (( deleted_object_bytes <= 9223372036854775807 - object_bytes )) ||
+      beta_storage_fail budget_overflow
+    deleted_object_bytes=$((deleted_object_bytes + object_bytes))
+    deleted_object_versions=$((deleted_object_versions + 1))
+  }
   while IFS=$'\t' read -r key version; do
     [[ "$key" == points/*/recovery-point.json ]] || continue
     local point_id=${key#points/}; point_id=${point_id%/recovery-point.json}
@@ -2082,15 +2184,18 @@ beta_storage_prune_remote() {
       while IFS=$'\t' read -r object_key object_version; do
         [[ "$object_key" == "points/$point_id/"* || "$object_key" == "receipts/$point_id/"* ]] ||
           continue
-        beta_storage_remote_delete_version "$object_key" "$object_version"
+        delete_inventory_version "$object_key" "$object_version"
       done < <(jq -r --arg id "$point_id" '.Versions[]? |
         select(.Key|startswith("points/"+$id+"/") or startswith("receipts/"+$id+"/")) |
         [.Key,.VersionId]|@tsv' <<<"$inventory")
+      printf '%s\n' "$point_id" >>"$deleted_point_ids"
+      deleted_points=$((deleted_points + 1))
     fi
     rm -f "$manifest"
   done < <(jq -r '.[].Versions[]? | [.Key,.VersionId]|@tsv' <<<"$inventory")
-  # Remove complete orphan graphs, including receipts left after a failed
-  # manifest-last publication. A point is live only when its manifest exists.
+  # Remove incomplete orphan graphs, including receipts left after a failed
+  # manifest-last publication. A point is live only when one complete
+  # descriptor/manifest/ciphertext/proof closure validates.
   local orphan_points
   orphan_points=$(mktemp)
   jq -r '.[].Versions[]? | .Key |
@@ -2101,16 +2206,24 @@ beta_storage_prune_remote() {
     else empty end' <<<"$inventory" | sort -u >"$orphan_points"
   while IFS= read -r point_id; do
     [ -n "$point_id" ] || continue
-    jq -e --arg id "$point_id" '
-      any(.[].Versions[]?; .Key=="points/"+$id+"/recovery-point.json")
-    ' <<<"$inventory" >/dev/null && continue
+    [ "$point_id" = "$pinned" ] || [ "$point_id" = "$capture_pinned" ] && continue
+    grep -Fxq -- "$point_id" "$deleted_point_ids" && continue
+    if beta_storage_remote_point_graph_state "$point_id" "$inventory" "$scratch"; then
+      continue
+    else
+      local graph_status=$?
+      [ "$graph_status" -eq 1 ] ||
+        beta_storage_fail orphan_graph_unreadable
+    fi
     while IFS=$'\t' read -r object_key object_version; do
       [[ "$object_key" == "points/$point_id/"* ||
         "$object_key" == "receipts/$point_id/"* ]] || continue
-      beta_storage_remote_delete_version "$object_key" "$object_version"
+      delete_inventory_version "$object_key" "$object_version"
     done < <(jq -r --arg id "$point_id" '.[].Versions[]? |
       select(.Key|startswith("points/"+$id+"/") or
         startswith("receipts/"+$id+"/")) | [.Key,.VersionId]|@tsv' <<<"$inventory")
+    printf '%s\n' "$point_id" >>"$deleted_point_ids"
+    deleted_points=$((deleted_points + 1))
   done <"$orphan_points"
   rm -f -- "$orphan_points"
   # Every control object is budgeted. Retain only its current live version;
@@ -2122,7 +2235,7 @@ beta_storage_prune_remote() {
       current_control_version=$(jq -er '.VersionId' "$head.meta")
       while IFS=$'\t' read -r control_version_key control_version; do
         [ "$control_version" = "$current_control_version" ] && continue
-        beta_storage_remote_delete_version "$control_version_key" "$control_version"
+        delete_inventory_version "$control_version_key" "$control_version"
       done < <(jq -r --arg key "$control_key" '.[].Versions[]? |
         select(.Key==$key) | [.Key,.VersionId]|@tsv' <<<"$inventory")
     else
@@ -2143,13 +2256,33 @@ beta_storage_prune_remote() {
         --bucket "$BETA_BACKUP_BUCKET" --max-uploads 1000) ||
         beta_storage_fail multipart_inventory_unavailable
     fi
-    jq -e 'type=="object" and (.Uploads|type=="array")' <<<"$multipart" >/dev/null ||
+    jq -e '
+      type=="object" and (.Uploads|type=="array") and
+      all(.Uploads[]?;
+        (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+        (.UploadId|type=="string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
+        (.Initiated|type=="string" and length>0))
+    ' <<<"$multipart" >/dev/null ||
       beta_storage_fail multipart_inventory_invalid
     while IFS=$'\t' read -r upload_key upload_id initiated; do
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
       beta_storage_remote_multipart_eligible "$upload_key" "$initiated" "$now" ||
         continue
       beta_storage_key "$upload_key" >/dev/null
+      part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
+        --key "$upload_key" --upload-id "$upload_id" --max-parts 1000) ||
+        beta_storage_fail multipart_parts_unavailable
+      jq -e '
+        type=="object" and (.Parts|type=="array") and
+        ((.IsTruncated // false)==false) and
+        all(.Parts[]?;
+          (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
+          (.Size|type=="number" and floor==. and .>=0 and
+            .<=9223372036854775807) and
+          (.ETag|type=="string" and length>0))
+      ' <<<"$part_page" >/dev/null ||
+        beta_storage_fail multipart_parts_incomplete
+      part_bytes=$(jq -r '[.Parts[]?.Size] | add // 0' <<<"$part_page")
       beta_storage_aws_mutation abort-multipart-upload --bucket "$BETA_BACKUP_BUCKET" \
         --key "$upload_key" --upload-id "$upload_id" >/dev/null ||
         beta_storage_fail multipart_abort_failed
@@ -2161,6 +2294,10 @@ beta_storage_prune_remote() {
         [ "$abort_status" -eq 3 ] ||
           beta_storage_fail multipart_abort_verification_failed
       fi
+      (( deleted_multipart_bytes <= 9223372036854775807 - part_bytes )) ||
+        beta_storage_fail budget_overflow
+      deleted_multipart_bytes=$((deleted_multipart_bytes + part_bytes))
+      deleted_multipart_uploads=$((deleted_multipart_uploads + 1))
     done < <(jq -r '.Uploads[]? | [.Key,.UploadId,.Initiated // ""]|@tsv' <<<"$multipart")
     [ "$(jq -er '.IsTruncated // false' <<<"$multipart")" = true ] || break
     key_marker=$(jq -er '.NextKeyMarker // empty' <<<"$multipart")
@@ -2170,9 +2307,54 @@ beta_storage_prune_remote() {
   done
   (( multipart_page < BETA_STORAGE_MAX_PAGES )) ||
     beta_storage_fail multipart_pagination_limit
+  local inventory_after reclaimed_bytes summary summary_result summary_version
+  summary="$scratch/prune-summary.json"
+  local summary_meta summary_current_version summary_status
+  summary_meta="$scratch/prune-summary.meta"
+  if beta_storage_remote_head control/prune-summary.json "$summary_meta"; then
+    summary_current_version=$(jq -er '.VersionId' "$summary_meta")
+    delete_inventory_version control/prune-summary.json "$summary_current_version"
+  else
+    summary_status=$?
+    [ "$summary_status" -eq 1 ] ||
+      beta_storage_fail prune_summary_read_failed
+  fi
+  inventory_after=$(beta_storage_remote_inventory_total \
+    "$BETA_BACKUP_BYTE_BUDGET" 0 false)
+  (( deleted_object_bytes <= 9223372036854775807 - deleted_multipart_bytes )) ||
+    beta_storage_fail budget_overflow
+  reclaimed_bytes=$((deleted_object_bytes + deleted_multipart_bytes))
+  jq -cnS --arg tx "prune-$now" --arg pinned "$pinned" \
+    --arg capture "$capture_pinned" --arg outcome committed \
+    --argjson completed "$now" --argjson age 2592000 \
+    --argjson points "$deleted_points" \
+    --argjson versions "$deleted_object_versions" \
+    --argjson objectBytes "$deleted_object_bytes" \
+    --argjson multipartUploads "$deleted_multipart_uploads" \
+    --argjson multipartBytes "$deleted_multipart_bytes" \
+    --argjson before "$inventory_before" --argjson after "$inventory_after" \
+    --argjson reclaimed "$reclaimed_bytes" \
+    '{
+      schema:"meet-backend/beta-backup-prune-summary/v1",
+      transactionId:$tx,completedAt:$completed,eligibilityAgeSeconds:$age,
+      pinnedPointId:$pinned,capturePinnedPointId:$capture,
+      deletedPoints:$points,deletedObjectVersions:$versions,
+      deletedObjectBytes:$objectBytes,
+      abortedMultipartUploads:$multipartUploads,
+      reclaimedMultipartBytes:$multipartBytes,
+      inventoryBeforeBytes:$before,inventoryAfterBytes:$after,
+      reclaimedBytes:$reclaimed,outcome:$outcome
+    }' >"$summary"
+  summary_result=$(beta_storage_provider_put_conditional '' \
+    control/prune-summary.json "$summary" '' true)
+  summary_version=$(jq -er '.versionId' <<<"$summary_result")
+  beta_storage_remote_get_json control/prune-summary.json \
+    "$scratch/committed-prune-summary.json" "$summary_version"
+  cmp -s "$summary" "$scratch/committed-prune-summary.json" ||
+    beta_storage_fail prune_summary_commit_ambiguous
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
     "$writer_control_reserve" >/dev/null
-  rm -f "$head" "$head.meta" "$seen"
+  rm -f "$head" "$head.meta" "$seen" "$deleted_point_ids"
   beta_storage_remote_writer_release "$owner" "prune-$now"
   release=false
   trap - RETURN

@@ -52,6 +52,10 @@ PY
 }
 
 api=${GITHUB_API_URL:-https://api.github.com}
+[ "$api" = https://api.github.com ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:promotion_api_origin_invalid' >&2
+  exit 1
+}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
@@ -69,7 +73,7 @@ api_get() {
 }
 api_download() {
   local name=$1 path=$2
-  curl --fail --silent --show-error --location --connect-timeout 5 --max-time 60 \
+  curl --fail --silent --show-error --max-redirs 0 --connect-timeout 5 --max-time 60 \
     --max-filesize 67108864 \
     -H "Authorization: Bearer $GITHUB_TOKEN" \
     -H 'Accept: application/vnd.github+json' \

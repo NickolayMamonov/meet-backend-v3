@@ -82,12 +82,13 @@ jq -e '
 }
 jq -e '
   type=="object" and
-  (keys|sort)==["dedupeKey","event","environment","incidentId",
+  (keys|sort)==["dedupeKey","event","eventId","environment","incidentId",
     "observedAt","privateDestinationRequired","reasons","schema"] and
   .schema=="meet-backend/beta-backup-incident-event/v1" and
   .privateDestinationRequired==true and
   (.event=="active" or .event=="recovered") and
   (.dedupeKey|type=="string" and test("^[0-9a-f]{64}$")) and
+  (.eventId|type=="string" and test("^[0-9a-f]{64}$")) and
   (.incidentId|type=="string" and test("^[A-Za-z0-9._:-]{1,64}$")) and
   (.environment|type=="string" and test("^[A-Za-z0-9._-]{1,64}$")) and
   (.reasons|type=="array" and all(.[]; type=="string" and
@@ -169,27 +170,53 @@ issue=$(jq -c --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" --arg incident "$i
 # Do not copy state or provider responses to an issue. The issue body contains
 # only fixed reason codes, opaque IDs and the event's dedupe key.
 body=$(jq -r --arg dedupe "$dedupe" --arg event "$(jq -er '.event' "$event_file")" \
+  --arg event_id "$(jq -er '.eventId' "$event_file")" \
   --arg environment "$(jq -er '.environment' "$event_file")" \
   --arg id "$(jq -er '.incidentId' "$event_file")" \
   --arg reasons "$(jq -r '.reasons|join(",")' "$event_file")" \
   --arg observed "$(jq -er '.observedAt' "$event_file")" \
   '"Closed-beta backup incident\n\nEnvironment: "+$environment+
    "\nEvent: "+$event+"\nIncident: "+$id+"\nDedupe: "+$dedupe+
+   "\nEventId: "+$event_id+
    "\nReasons: "+$reasons+"\nObservedAt: "+$observed' <<<"{}")
 payload=$(jq -cn --arg body "$body" --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
   '{title:"Closed-beta backup incident",body:$body,labels:[$label]}')
 if [ -n "$issue" ]; then
   number=$(jq -er '.number' <<<"$issue")
   if [ "$(jq -er '.event' "$event_file")" = recovered ]; then
-    recovery_comment=$(jq -cn --arg body "$body" \
-      '{body:("Closed-beta backup recovery observed.\n\n"+$body)}')
-    recovery_response=$(api POST "/issues/$number/comments" "$recovery_comment")
-    jq -e '(.id|type=="number" and .>0)' "$recovery_response" >/dev/null || {
-      rm -f "$recovery_response"
-      echo 'BACKUP_INCIDENT_BLOCKED:recovery_comment_invalid' >&2
+    event_id=$(jq -er '.eventId' "$event_file")
+    comment_page=1
+    recovery_seen=false
+    while (( comment_page <= 10 )); do
+      comments=$(api GET \
+        "/issues/$number/comments?state=all&per_page=100&page=$comment_page")
+      jq -e 'type=="array"' "$comments" >/dev/null || {
+        echo 'BACKUP_INCIDENT_BLOCKED:issue_comments_invalid' >&2
+        exit 1
+      }
+      if jq -e --arg event "$event_id" \
+        'any(.[]; (.body // "") | contains($event))' "$comments" >/dev/null; then
+        recovery_seen=true
+      fi
+      comment_count=$(jq -er 'length' "$comments")
+      (( comment_count < 100 )) && break
+      comment_page=$((comment_page + 1))
+    done
+    (( comment_page <= 10 )) || {
+      echo 'BACKUP_INCIDENT_BLOCKED:issue_comment_pagination_limit' >&2
       exit 1
     }
-    rm -f "$recovery_response"
+    if [ "$recovery_seen" = false ]; then
+      recovery_comment=$(jq -cn --arg body "$body" \
+        '{body:("Closed-beta backup recovery observed.\n\n"+$body)}')
+      recovery_response=$(api POST "/issues/$number/comments" "$recovery_comment")
+      jq -e '(.id|type=="number" and .>0)' "$recovery_response" >/dev/null || {
+        rm -f "$recovery_response"
+        echo 'BACKUP_INCIDENT_BLOCKED:recovery_comment_invalid' >&2
+        exit 1
+      }
+      rm -f "$recovery_response"
+    fi
     closed=$(api PATCH "/issues/$number" \
       "$(jq -cn --arg body "$body" '{state:"closed",body:$body}')")
     jq -e '.state=="closed" and (.number|type=="number" and .>0)' "$closed" >/dev/null || {

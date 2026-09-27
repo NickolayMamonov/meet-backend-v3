@@ -16,6 +16,10 @@ command -v curl >/dev/null 2>&1 || exit 1
 command -v jq >/dev/null 2>&1 || exit 1
 
 api=${GITHUB_API_URL:-https://api.github.com}
+[ "$api" = https://api.github.com ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:policy_api_origin_invalid' >&2
+  exit 1
+}
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 api_get() {
