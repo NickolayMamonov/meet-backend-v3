@@ -141,13 +141,23 @@ test -s "$core_output/restored-database-proof.json"
 test -s "$core_output/restored-media-proof.json"
 descriptor_digest=$(beta_storage_descriptor_digest "$point/point.json")
 captured=$(jq -er '.capture.capturedAt' "$point/recovery-point.json")
-runtime_fingerprint() {
-  printf '%s\0%s\0%s\0%s\0%s' \
-    "$capture_revision" "$restore_revision" "$descriptor_digest" \
-    "$protection_digest" "$captured" | sha256sum | awk '{print $1}'
+proof_fingerprint() {
+  jq -cS -n --slurpfile database "$1" --slurpfile media "$2" '
+    {schema:"meet-backend/beta-recurring-restore-state/v1",
+     database:$database[0],media:$media[0]}
+  ' |
+    sha256sum | awk '{print $1}'
 }
-pre_fingerprint=$(runtime_fingerprint)
-post_fingerprint=$(runtime_fingerprint)
+jq -cS '.databaseProof' "$manifest" >"$tmp/expected-database-proof.json"
+jq -cS '.mediaProof' "$manifest" >"$tmp/expected-media-proof.json"
+pre_fingerprint=$(proof_fingerprint \
+  "$tmp/expected-database-proof.json" "$tmp/expected-media-proof.json")
+post_fingerprint=$(proof_fingerprint \
+  "$core_output/restored-database-proof.json" "$core_output/restored-media-proof.json")
+[ "$pre_fingerprint" = "$post_fingerprint" ] || {
+  echo 'BACKUP_CUSTODY_BLOCKED:restore_state_fingerprint_mismatch' >&2
+  exit 1
+}
 jq -cnS --arg capture "$capture_revision" --arg restore "$restore_revision" \
   --arg descriptor "$descriptor_digest" --arg protection "$protection_digest" \
   --arg pre "$pre_fingerprint" --arg post "$post_fingerprint" \

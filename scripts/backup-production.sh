@@ -181,13 +181,24 @@ if [ "${1:-}" = "--beta" ]; then
     capacity_ok "$db_free" "$required" || exit 1
     capacity_ok "$upload_free" "$required" || exit 1
   fi
+  age_encrypt_stream() {
+    local limit=${BETA_BACKUP_CAPTURE_FILE_LIMIT_BYTES:-}
+    if [ -n "$limit" ]; then
+      [[ "$limit" =~ ^[1-9][0-9]*$ ]] || exit 1
+      local blocks=$((limit / 512))
+      (( blocks > 0 )) || exit 1
+      (ulimit -f "$blocks"; "$age_binary" -r "$AGE_RECIPIENT" -o "$1")
+    else
+      "$age_binary" -r "$AGE_RECIPIENT" -o "$1"
+    fi
+  }
   "${COMPOSE[@]}" exec -T postgres sh -c \
     'pg_dump --format=custom -U "$POSTGRES_USER" -d "$POSTGRES_DB"' |
-    "$age_binary" -r "$AGE_RECIPIENT" -o "$db_file"
+    age_encrypt_stream "$db_file"
   validate_upload_archive "$upload_volume" "$image" "$temp/archive.list" "$temp/archive.types"
   docker run --rm --read-only --entrypoint tar \
     --mount "type=volume,source=$upload_volume,target=/source,readonly" \
-    "$image" -C /source -czf - . | "$age_binary" -r "$AGE_RECIPIENT" -o "$media_file"
+    "$image" -C /source -czf - . | age_encrypt_stream "$media_file"
   [ -s "$db_file" ] && [ -s "$media_file" ] || exit 1
   cat "$database_sql" | postgres_psql -X -qAt -f - |
     jq -cS 'if type=="object" and .schema=="meet-backend/closed-beta-database-proof/v1" then . else error("database proof schema") end' \

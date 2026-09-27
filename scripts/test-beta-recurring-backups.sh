@@ -196,13 +196,21 @@ protection_digest=$(sha256sum "$protection_body" | awk '{print $1}')
 jq --arg digest "$protection_digest" '. + {protectionDigest:$digest}' \
   "$protection_body" >"$protection"
 drill_receipt="$tmp/protected-receipt.json"
-"$root/scripts/run-beta-recurring-drill.sh" \
+BETA_BACKUP_TEST_FIXTURE=true "$root/scripts/run-beta-recurring-drill.sh" \
   --storage-root "$tmp/storage" --point-id slot-1790000000 --receipt "$drill_receipt" \
   --restore-command "$tmp/restore-command.sh" --restore-output "$tmp/restore-output" \
   --identity-file "$tmp/identity" --capture-revision "$good_master" \
   --restore-revision "$good_tooling" --reviewer-id reviewer-1 \
   --protection-file "$protection" --protection-digest "$protection_digest" ||
   fail "generated protected restore proof was rejected"
+if "$root/scripts/run-beta-recurring-drill.sh" \
+  --storage-root "$tmp/storage" --point-id slot-1790000000 --receipt "$tmp/forged-command-receipt" \
+  --restore-command "$tmp/restore-command.sh" --restore-output "$tmp/forged-output" \
+  --identity-file "$tmp/identity" --capture-revision "$good_master" \
+  --restore-revision "$good_tooling" --reviewer-id reviewer-1 \
+  --protection-file "$protection" --protection-digest "$protection_digest" >/dev/null 2>&1; then
+  fail "arbitrary standalone restore command was accepted"
+fi
 jq -e '.schema=="meet-backend/beta-backup-receipt/v2" and
   .pointDescriptorDigest and .captureAt==1790000000' "$drill_receipt" >/dev/null ||
   fail "provenance-bound receipt was not emitted"
@@ -215,16 +223,17 @@ jq -cnS '{
   https:{meetingsStatus:"200",actuatorStatus:"404",httpRedirectHttps:true,meetingsJson:true}
 }' >"$probe_pre"
 cp -- "$probe_pre" "$probe_post"
-printf '\n' >>"$probe_post"
 "$root/scripts/bind-beta-recurring-probes.sh" \
   --receipt "$drill_receipt" --pre-probe "$probe_pre" --post-probe "$probe_post" \
   --output "$tmp/probe-binding.json" >/dev/null ||
   fail "exact pre/post probe binding was rejected"
 jq -e --arg receipt "$(jq -er '.receiptId' "$drill_receipt")" '
-  .schema=="meet-backend/beta-recurring-probe-binding/v1" and
-  .receiptId==$receipt and .preProbeDigest != .postProbeDigest and
-  .preFingerprint == .postFingerprint' "$tmp/probe-binding.json" >/dev/null ||
-  fail "probe binding did not preserve distinct artifact versions"
+  .schema=="meet-backend/beta-recurring-probe-binding/v2" and
+  .receiptId==$receipt and .preProbeDigest == .postProbeDigest and
+  .preProbeDigest == .postProbeDigest and
+  .preRuntimeFingerprint == .postRuntimeFingerprint and
+  .restorePreFingerprint == .restorePostFingerprint' "$tmp/probe-binding.json" >/dev/null ||
+  fail "probe binding did not bind measured runtime and restore state"
 if "$root/scripts/run-beta-recurring-drill.sh" \
   --storage-root "$tmp/storage" --point-id slot-1790000000 --receipt "$tmp/invalid-receipt" \
   --proof-file "$tmp/supplied-proof" >/dev/null 2>&1; then

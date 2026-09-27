@@ -30,39 +30,50 @@ source "$script_dir/beta-backup-storage.sh"
 beta_storage_validate_receipt "$receipt" || beta_storage_fail receipt_invalid
 pre_digest=$(sha256sum "$pre_probe" | awk '{print $1}')
 post_digest=$(sha256sum "$post_probe" | awk '{print $1}')
-[ "$pre_digest" != "$post_digest" ] || beta_storage_fail probe_replay
 pre_version=$pre_digest
 post_version=$post_digest
 jq -e '
-  type=="object" and .schema=="meet-backend/test-vps-recovery-runtime/v1" and
+  type=="object" and
+  (keys|sort)==["healthy","https","runtime","schema"] and
+  .schema=="meet-backend/test-vps-recovery-runtime/v1" and
   .healthy==true and .runtime.health=="healthy" and
-  .runtime.uploadsMount=="volume" and .https.meetingsStatus=="200" and
-  .https.actuatorStatus=="404" and .https.httpRedirectHttps==true and
-  .https.meetingsJson==true
+  (.runtime | (keys|sort)==["configHash","health","imageId","uploadsMount"]) and
+  (.runtime.configHash|type=="string" and test("^[0-9a-f]{64}$")) and
+  .runtime.uploadsMount=="volume" and
+  (.https | (keys|sort)==["actuatorStatus","httpRedirectHttps","meetingsJson","meetingsStatus"]) and
+  .https.meetingsStatus=="200" and .https.actuatorStatus=="404" and
+  .https.httpRedirectHttps==true and .https.meetingsJson==true
 ' "$pre_probe" "$post_probe" >/dev/null || beta_storage_fail probe_invalid
-pre_fingerprint=$(jq -er '.preFingerprint' \
-  "$(dirname "$receipt")/$(jq -er '.receiptId' "$receipt").proof.json")
-post_fingerprint=$(jq -er '.postFingerprint' \
-  "$(dirname "$receipt")/$(jq -er '.receiptId' "$receipt").proof.json")
-[[ "$pre_fingerprint" =~ ^[0-9a-f]{64}$ &&
-  "$post_fingerprint" =~ ^[0-9a-f]{64}$ ]] ||
-  beta_storage_fail fingerprint_invalid
+pre_runtime_fingerprint=$(jq -cS '{schema,healthy,runtime,https}' "$pre_probe" |
+  sha256sum | awk '{print $1}')
+post_runtime_fingerprint=$(jq -cS '{schema,healthy,runtime,https}' "$post_probe" |
+  sha256sum | awk '{print $1}')
+[[ "$pre_runtime_fingerprint" =~ ^[0-9a-f]{64}$ &&
+  "$post_runtime_fingerprint" =~ ^[0-9a-f]{64}$ ]] ||
+  beta_storage_fail runtime_fingerprint_invalid
 descriptor=$(jq -er '.pointDescriptorDigest' "$receipt")
 point=$(jq -er '.pointId' "$receipt")
 receipt_id=$(jq -er '.receiptId' "$receipt")
-jq -e --arg pre "$pre_fingerprint" --arg post "$post_fingerprint" \
-  '.preFingerprint==$pre and .postFingerprint==$post and
-   .preFingerprint == .postFingerprint' \
-  "$(dirname "$receipt")/$receipt_id.proof.json" >/dev/null ||
-  beta_storage_fail probe_fingerprint_binding
+restore_proof="$(dirname "$receipt")/$receipt_id.proof.json"
+jq -e '
+  .schema=="meet-backend/beta-recurring-restore-proof/v2" and
+  (.preFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
+  (.postFingerprint|type=="string" and test("^[0-9a-f]{64}$")) and
+  .preFingerprint == .postFingerprint
+' "$restore_proof" >/dev/null || beta_storage_fail restore_fingerprint_binding
 mkdir -p "$(dirname -- "$output")"
 jq -cnS --arg receipt "$receipt_id" --arg point "$point" \
   --arg descriptor "$descriptor" --arg pre "$pre_digest" --arg post "$post_digest" \
   --arg preVersion "$pre_version" --arg postVersion "$post_version" \
-  --arg preFingerprint "$pre_fingerprint" --arg postFingerprint "$post_fingerprint" \
-  '{schema:"meet-backend/beta-recurring-probe-binding/v1",
+  --arg preRuntime "$pre_runtime_fingerprint" --arg postRuntime "$post_runtime_fingerprint" \
+  --arg restoreProof "$(jq -er '.proofDigest' "$receipt")" \
+  --arg restorePre "$(jq -er '.preFingerprint' "$restore_proof")" \
+  --arg restorePost "$(jq -er '.postFingerprint' "$restore_proof")" \
+  '{schema:"meet-backend/beta-recurring-probe-binding/v2",
     receiptId:$receipt,pointId:$point,pointDescriptorDigest:$descriptor,
     preProbeDigest:$pre,postProbeDigest:$post,
     preProbeVersion:$preVersion,postProbeVersion:$postVersion,
-    preFingerprint:$preFingerprint,postFingerprint:$postFingerprint}' |
+    preRuntimeFingerprint:$preRuntime,postRuntimeFingerprint:$postRuntime,
+    restoreProofDigest:$restoreProof,restorePreFingerprint:$restorePre,
+    restorePostFingerprint:$restorePost}' |
   install -m 600 /dev/stdin "$output"

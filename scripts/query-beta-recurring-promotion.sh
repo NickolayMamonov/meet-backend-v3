@@ -224,7 +224,7 @@ cmp -s "$receipt" "$tmp/receipt-artifact/protected-receipt.json" || {
   exit 1
 }
 verify_receipt_artifact "$post_zip" "$tmp/post-artifact" "$post_artifact_digest" \
-  $'post-probe.json\nprobe-binding.json' || {
+  $'post-probe.json\npre-probe.json\nprobe-binding.json' || {
   echo 'BACKUP_CUSTODY_BLOCKED:post_probe_artifact_bytes_invalid' >&2
   exit 1
 }
@@ -232,6 +232,14 @@ cmp -s "$probe_binding" "$tmp/post-artifact/probe-binding.json" || {
   echo 'BACKUP_CUSTODY_BLOCKED:probe_binding_artifact_invalid' >&2
   exit 1
 }
+pre_probe="$tmp/post-artifact/pre-probe.json"
+post_probe="$tmp/post-artifact/post-probe.json"
+pre_probe_digest=$(sha256sum "$pre_probe" | awk '{print $1}')
+post_probe_digest=$(sha256sum "$post_probe" | awk '{print $1}')
+[ "$pre_probe_digest" = "$(jq -er '.preProbeDigest' "$probe_binding")" ] ||
+  { echo 'BACKUP_CUSTODY_BLOCKED:pre_probe_digest_invalid' >&2; exit 1; }
+[ "$post_probe_digest" = "$(jq -er '.postProbeDigest' "$probe_binding")" ] ||
+  { echo 'BACKUP_CUSTODY_BLOCKED:post_probe_digest_invalid' >&2; exit 1; }
 reviewer_from_receipt=$(jq -er '.reviewerId' "$receipt")
 [ "$reviewer_from_receipt" = "$reviewer_id" ] || {
   echo 'BACKUP_CUSTODY_BLOCKED:reviewer_binding_mismatch' >&2

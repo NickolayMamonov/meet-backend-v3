@@ -120,6 +120,15 @@ fi
   echo 'BACKUP_CUSTODY_BLOCKED:restore_command_unavailable' >&2
   exit 1
 }
+if [ "${BETA_BACKUP_TEST_FIXTURE:-false}" != true ]; then
+  [ "$restore_command" = "$script_dir/run-beta-recurring-restore-command.sh" ] || {
+    echo 'BACKUP_CUSTODY_BLOCKED:restore_command_not_reviewed' >&2
+    exit 1
+  }
+  allowlist=${BETA_RECURRING_TOOLING_ALLOWLIST:-$script_dir/fixtures/beta-recurring/tooling-allowlist.json}
+  "$script_dir/validate-beta-recurring-tooling.sh" \
+    --role restore --path "$restore_command" --allowlist "$allowlist" >/dev/null
+fi
 [ -f "$identity" ] && [ ! -L "$identity" ] || {
   echo 'BACKUP_CUSTODY_BLOCKED:restore_identity_unavailable' >&2
   exit 1

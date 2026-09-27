@@ -82,9 +82,49 @@ cleanup_capture() {
     rm -f -- "$output/postgres.dump.age" "$output/uploads.tar.gz.age" \
       "$output/recovery-point.json" "$output/point.json" || status=1
   fi
+  if [ "${preacquired:-false}" = true ] &&
+    [ "${publish_started:-false}" = false ]; then
+    beta_storage_remote_writer_release "$owner" "$capture_txid" || status=1
+  fi
   exit "$status"
 }
 trap cleanup_capture EXIT HUP INT TERM
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+preacquired=false
+publish_started=false
+capture_txid="capture-slot-$slot"
+capture_reservation=''
+if [ -z "$storage_root" ]; then
+  # Keep the writer reservation across the capture itself.  This is the
+  # provider-side admission that prevents an unbounded capture from starting
+  # after the last capacity check.
+  # shellcheck source=beta-backup-storage.sh
+  source "$script_dir/beta-backup-storage.sh"
+  capture_reservation=$(beta_storage_capture_reservation)
+  capture_expected_keys=$(jq -cn --arg point "slot-$slot" '
+    ["points/"+$point+"/postgres.dump.age",
+     "points/"+$point+"/uploads.tar.gz.age",
+     "points/"+$point+"/recovery-point.json",
+     "points/"+$point+"/capture-database-proof.json",
+     "points/"+$point+"/capture-media-proof.json",
+     "points/"+$point+"/point.json",
+     "control/capture-head.json"]')
+  capture_intent=$(printf '%s\0%s\0%s' "slot-$slot" "$slot" \
+    "$capture_reservation" | sha256sum | awk '{print $1}')
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
+    "$capture_reservation" >/dev/null
+  beta_storage_remote_writer_acquire capture "$owner" "$capture_txid" \
+    "$capture_reservation" "$capture_intent" "$capture_expected_keys"
+  preacquired=true
+  beta_storage_remote_writer_transition capturing false "$capture_expected_keys"
+  capture_file_limit=$(( (capture_reservation -
+    16 * BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES) / 2 ))
+  (( capture_file_limit > 0 )) || {
+    echo 'BACKUP_CAPTURE_BLOCKED:capture_file_limit_invalid' >&2
+    exit 1
+  }
+  export BETA_BACKUP_CAPTURE_FILE_LIMIT_BYTES="$capture_file_limit"
+fi
 capture_digest=$(sha256sum "$capture_command" | awk '{print $1}')
 timeout --foreground --signal=TERM 900s "$capture_command" \
   --output-dir "$capture_output" --slot "$slot" --captured-at "$captured_at"
@@ -140,8 +180,18 @@ if [ "$source_schema" = meet-backend/beta-recurring-capture-source/v1 ]; then
       echo 'BACKUP_CAPTURE_BLOCKED:plaintext_evidence_mismatch' >&2
       exit 1
     }
-  "$age_binary" -r "$recipient" -o "$db_ciphertext" "$capture_output/postgres.dump"
-  "$age_binary" -r "$recipient" -o "$media_ciphertext" "$capture_output/uploads.tar.gz"
+  encrypt_age_file() {
+    local destination=$1 input=$2 limit=${BETA_BACKUP_CAPTURE_FILE_LIMIT_BYTES:-}
+    if [ -n "$limit" ]; then
+      [[ "$limit" =~ ^[1-9][0-9]*$ ]] || return 1
+      (ulimit -f "$((limit / 512))"
+        "$age_binary" -r "$recipient" -o "$destination" "$input")
+    else
+      "$age_binary" -r "$recipient" -o "$destination" "$input"
+    fi
+  }
+  encrypt_age_file "$db_ciphertext" "$capture_output/postgres.dump"
+  encrypt_age_file "$media_ciphertext" "$capture_output/uploads.tar.gz"
 elif [ "$source_schema" = meet-backend/beta-recovery-capture/v1 ]; then
   jq -e \
     --arg slot "$slot" --argjson captured "$captured_at" --arg command "$capture_digest" '
@@ -188,7 +238,6 @@ for ciphertext in "$db_ciphertext" "$media_ciphertext"; do
   chmod 600 "$ciphertext"
 done
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source_digest=$(sha256sum "$source_manifest" | awk '{print $1}')
 tmp=$(mktemp "$output/.recovery-point.XXXXXX")
 trap cleanup_capture EXIT HUP INT TERM
@@ -213,8 +262,18 @@ publish_args=(
   publish --source "$output" --point-id "slot-$slot" --slot "$slot"
   --captured-at "$captured_at" --owner "$owner"
 )
-[ -n "$storage_root" ] && publish_args+=(--storage-root "$storage_root")
-"$script_dir/run-beta-backup-storage.sh" "${publish_args[@]}"
+if [ "$preacquired" = true ]; then
+  beta_storage_capture_allowance_check "$output" "$capture_reservation" >/dev/null
+  publish_started=true
+  export BETA_STORAGE_PREACQUIRED_CAPTURE=true
+  export BETA_STORAGE_CAPTURE_RESERVATION_BYTES="$capture_reservation"
+  beta_storage_publish_remote "$output" "slot-$slot" "$slot" \
+    "$captured_at" "$owner"
+  preacquired=false
+else
+  [ -n "$storage_root" ] && publish_args+=(--storage-root "$storage_root")
+  "$script_dir/run-beta-backup-storage.sh" "${publish_args[@]}"
+fi
 rm -rf -- "$capture_output" "$output"
 trap - EXIT HUP INT TERM
 printf 'recurring_capture=committed point_id=slot-%s encrypted=true source_digest=%s durable=true\n' \

@@ -1095,6 +1095,9 @@ restore_previous_active_files() {
 rollback() {
   recovery_started_at=$SECONDS
   recovery_deadline_check
+  beta_backup_runtime_require_operation "$previous_image" \
+    test-vps-provider-rollback "$state/config.env.previous" ||
+    fail "rollback predecessor lacks backup safety gate capability"
   if [ "$updater_completed" = true ]; then
     validate_configuration_boundary "$state/config.env.target"
   elif [ "$updater_started" = false ]; then

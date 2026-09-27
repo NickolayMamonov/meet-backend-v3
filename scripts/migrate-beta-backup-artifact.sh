@@ -56,6 +56,10 @@ command -v unzip >/dev/null 2>&1 || exit 1
 [ -f "$manifest" ] && [ ! -L "$manifest" ] || {
   echo 'BACKUP_STORAGE_BLOCKED:manifest_unavailable' >&2; exit 1;
 }
+[ -f "$source_dir/recovery-point.json" ] && [ ! -L "$source_dir/recovery-point.json" ] &&
+  cmp -s "$manifest" "$source_dir/recovery-point.json" || {
+    echo 'BACKUP_STORAGE_BLOCKED:manifest_source_mismatch' >&2; exit 1;
+  }
 [ -x "$restore_command" ] && [ ! -L "$restore_command" ] || {
   echo 'BACKUP_CUSTODY_BLOCKED:destination_restore_command_unavailable' >&2; exit 1;
 }

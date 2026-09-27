@@ -277,6 +277,9 @@ restore_previous_active_files() {
 }
 
 rollback() {
+  beta_backup_runtime_require_operation "$previous_image" test-vps-rollback \
+    "$state/previous-env.production" ||
+    fail "rollback predecessor lacks backup safety gate capability"
   restore_previous_active_files
   [ -f "$state/previous-env.production" ] && [ ! -L "$state/previous-env.production" ] ||
     fail "rollback predecessor environment is unavailable"

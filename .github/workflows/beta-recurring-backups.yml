@@ -404,6 +404,7 @@ jobs:
             "$RUNNER_TEMP/pre-probe/pre-probe.json")" = \
             "$(jq -cS '{schema,healthy,runtime,https}' \
               "$RUNNER_TEMP/post-probe.json")"
+          cp -- "$RUNNER_TEMP/pre-probe/pre-probe.json" "$RUNNER_TEMP/pre-probe.json"
           scripts/bind-beta-recurring-probes.sh \
             --receipt "$RUNNER_TEMP/probe-receipt/protected-receipt.json" \
             --pre-probe "$RUNNER_TEMP/pre-probe/pre-probe.json" \
@@ -415,6 +416,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
           path: |
+            ${{ runner.temp }}/pre-probe.json
             ${{ runner.temp }}/post-probe.json
             ${{ runner.temp }}/probe-binding.json
 

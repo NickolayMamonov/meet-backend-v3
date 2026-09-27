@@ -25,7 +25,7 @@ class IngestionService(
     /** Прогнать все зарегистрированные источники. */
     fun runAll(): List<IngestionRun> {
         safetyGate.requireAdmitted("ingestion")
-        return providers.toList().map { runProvider(it) }
+        return providers.toList().map { runProviderAdmitted(it) }
     }
 
 
@@ -33,6 +33,10 @@ class IngestionService(
     /** Прогон одного источника: изоляция ошибок + запись в журнал. */
     fun runProvider(provider: EventProvider): IngestionRun {
         safetyGate.requireAdmitted("provider ingestion")
+        return runProviderAdmitted(provider)
+    }
+
+    private fun runProviderAdmitted(provider: EventProvider): IngestionRun {
         val run = IngestionRun(source = provider.source(), status = IngestionStatus.RUNNING)
         ingestionRunRepository.save(run)
 
