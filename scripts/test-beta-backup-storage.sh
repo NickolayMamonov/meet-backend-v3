@@ -47,6 +47,13 @@ if "$root/scripts/run-beta-backup-storage.sh" publish --source "$tmp/point" \
 else
   fail "idempotent publish was rejected"
 fi
+mv -- "$tmp/storage/control/capture-head.json" "$tmp/capture-head-for-duplicate.saved"
+if "$root/scripts/run-beta-backup-storage.sh" publish --source "$tmp/point" \
+  --storage-root "$tmp/storage" --point-id slot-1790000000 --slot 1790000000 \
+  --captured-at 1790000000 --owner test >/dev/null 2>&1; then
+  fail "duplicate publish without capture head was accepted"
+fi
+mv -- "$tmp/capture-head-for-duplicate.saved" "$tmp/storage/control/capture-head.json"
 cp -r "$tmp/point" "$tmp/changed-point"
 printf changed >"$tmp/changed-point/postgres.dump.age"
 if "$root/scripts/run-beta-backup-storage.sh" publish --source "$tmp/changed-point" \
@@ -212,6 +219,18 @@ grep -Fq 'create-multipart-upload' "$root/scripts/beta-backup-storage.sh" ||
   fail "remote provider lacks multipart publication"
 grep -Fq 'capture_reservation' "$root/scripts/run-beta-recurring-capture.sh" ||
   fail "recurring capture does not reserve capacity before capture"
+export BETA_BACKUP_STORAGE_ROOT="$tmp/storage"
+export BETA_BACKUP_BYTE_BUDGET=9223372036854775807
+if BETA_BACKUP_CAPTURE_ALLOWANCE_BYTES=5368709121 \
+  beta_storage_capture_reservation >/dev/null 2>&1; then
+  fail "capture allowance above conditional object limit was accepted"
+fi
+if BETA_BACKUP_CAPTURE_ALLOWANCE_BYTES=1 \
+  BETA_BACKUP_CAPTURE_FILE_LIMIT_BYTES=5368709121 \
+  beta_storage_capture_reservation >/dev/null 2>&1; then
+  fail "capture file limit above conditional object limit was accepted"
+fi
+unset BETA_BACKUP_STORAGE_ROOT BETA_BACKUP_BYTE_BUDGET
 mkdir "$tmp/storage/control/.writer.lock"
 if "$root/scripts/run-beta-backup-storage.sh" publish --source "$tmp/point" \
   --storage-root "$tmp/storage" --point-id slot-1790000001 --slot 1790000001 \
@@ -258,6 +277,7 @@ fi
 [ "$(jq -er '.schema' "$tmp/receiver/status.json")" = meet-backend/beta-backup-status/v1 ] ||
   fail "monitor status was not received"
 incident_deliveries=$(jq -er '.deliveryCount' "$tmp/incident.json")
+incident_id=$(jq -er '.incidentId' "$tmp/incident.json")
 BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000002 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
@@ -267,9 +287,19 @@ BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-m
 [ "$(jq -er '.deliveryCount' "$tmp/incident.json")" = "$incident_deliveries" ] ||
   fail "active incident was delivered more than once"
 cp -- "$tmp/capture-head.saved" "$tmp/storage/control/capture-head.json"
-cp -- "$tmp/verified-head.saved" "$tmp/storage/control/verified-head.json"
 BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000003 --receiver-root "$tmp/receiver" \
+  --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
+  --deadman-url https://deadman.invalid --deadman-provider curl \
+  --deadman-method POST --deadman-timeout 30 >/dev/null ||
+  fail "monitor reason-change delivery failed"
+[ "$(jq -er '.incidentId' "$tmp/incident.json")" = "$incident_id" ] ||
+  fail "active incident identity changed when reasons changed"
+[ "$(jq -er '.deliveryCount' "$tmp/incident.json")" -gt "$incident_deliveries" ] ||
+  fail "active reason change did not increment delivery count"
+cp -- "$tmp/verified-head.saved" "$tmp/storage/control/verified-head.json"
+BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
+  --environment closed-beta --now 1790000004 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
   --deadman-url https://deadman.invalid --deadman-provider curl \
   --deadman-method POST --deadman-timeout 30 >/dev/null ||
@@ -278,7 +308,7 @@ BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-m
   [ "$(jq -er '.recoveryCount' "$tmp/incident.json")" -eq 1 ] ||
   fail "monitor recovery transition was not persisted"
 if BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
-  --environment closed-beta --now 1790000004 --receiver-root "$tmp/receiver" \
+  --environment closed-beta --now 1790000005 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident.json" --incident-command "$tmp/incident.sh" \
   --deadman-url '' --deadman-provider curl --deadman-method POST \
   --deadman-timeout 30 >/dev/null 2>&1; then

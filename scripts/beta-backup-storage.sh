@@ -704,12 +704,20 @@ beta_storage_capture_reservation() {
   local budget=$BETA_BACKUP_BYTE_BUDGET allowance overhead
   allowance=${BETA_BACKUP_CAPTURE_ALLOWANCE_BYTES:-$((budget / 2))}
   [[ "$allowance" =~ ^[1-9][0-9]{0,18}$ ]] ||
-    beta_storage_fail capture_allowance_invalid
+    { beta_storage_fail capture_allowance_invalid; return 1; }
   overhead=$((16 * BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES))
   (( allowance <= 9223372036854775807 - overhead )) ||
-    beta_storage_fail capture_allowance_overflow
+    { beta_storage_fail capture_allowance_overflow; return 1; }
   (( allowance + overhead <= budget )) ||
-    beta_storage_fail capture_allowance_exceeds_budget
+    { beta_storage_fail capture_allowance_exceeds_budget; return 1; }
+  (( allowance <= BETA_STORAGE_CONDITIONAL_PUT_MAX_BYTES )) ||
+    { beta_storage_fail capture_allowance_exceeds_object_limit; return 1; }
+  if [ -n "${BETA_BACKUP_CAPTURE_FILE_LIMIT_BYTES:-}" ]; then
+    [[ "$BETA_BACKUP_CAPTURE_FILE_LIMIT_BYTES" =~ ^[1-9][0-9]{0,18}$ ]] ||
+      { beta_storage_fail capture_file_limit_invalid; return 1; }
+    (( BETA_BACKUP_CAPTURE_FILE_LIMIT_BYTES <= BETA_STORAGE_CONDITIONAL_PUT_MAX_BYTES )) ||
+      { beta_storage_fail capture_file_limit_exceeds_object_limit; return 1; }
+  fi
   printf '%s\n' "$((allowance + overhead))"
 }
 
@@ -1127,30 +1135,6 @@ beta_storage_publish_remote() {
     [ -s "$source/$name" ] && [ ! -L "$source/$name" ] ||
       beta_storage_fail ciphertext_missing
   done
-  local existing_head="$source/.remote-point-head.json"
-  local existing_descriptor="$source/.remote-point.json" duplicate_scratch
-  if beta_storage_remote_head "points/$point_id/point.json" "$existing_head"; then
-    beta_storage_remote_get_json "points/$point_id/point.json" "$existing_descriptor" \
-      "$(jq -er '.VersionId' "$existing_head")"
-    duplicate_scratch=$(mktemp -d)
-    if ! beta_storage_remote_validate_descriptor "$point_id" "$existing_descriptor" \
-      "$duplicate_scratch" false ||
-      ! beta_storage_source_matches_descriptor "$source" "$existing_descriptor"; then
-      rm -rf -- "$duplicate_scratch" "$existing_head" "$existing_descriptor"
-      beta_storage_fail duplicate_point_conflict
-    fi
-    rm -rf -- "$duplicate_scratch"
-    rm -f -- "$existing_head" "$existing_descriptor"
-    printf 'storage_publish=idempotent point_id=%s\n' "$point_id"
-    return 0
-  else
-    case "$?" in
-      1) : ;;
-      *) rm -f -- "$existing_head" "$existing_descriptor"
-         beta_storage_fail point_descriptor_read_failed ;;
-    esac
-  fi
-  rm -f -- "$existing_head" "$existing_descriptor"
   local txid
   if [ "${BETA_STORAGE_PREACQUIRED_CAPTURE:-false}" = true ]; then
     txid=${BETA_STORAGE_REMOTE_WRITER_TX:-}
@@ -1197,7 +1181,6 @@ beta_storage_publish_remote() {
     beta_storage_remote_writer_acquire publish "$owner" "$txid" \
       "$reserve" "$intent_digest" "$expected_keys"
   fi
-  beta_storage_remote_writer_transition publishing false "$expected_keys"
   local cleanup=true release_allowed=true scratch
   scratch=$(mktemp -d)
   export BETA_STORAGE_AMBIGUOUS_MARKER="$scratch/ambiguous"
@@ -1219,6 +1202,52 @@ beta_storage_publish_remote() {
     return "$status"
   }
   trap cleanup_remote_publish RETURN
+  local existing_head="$scratch/existing-point.meta"
+  local existing_descriptor="$scratch/existing-point.json"
+  local duplicate_scratch="$scratch/duplicate"
+  if beta_storage_remote_head "points/$point_id/point.json" "$existing_head"; then
+    local existing_point_version
+    existing_point_version=$(jq -er '.VersionId' "$existing_head")
+    beta_storage_remote_get_json "points/$point_id/point.json" "$existing_descriptor" \
+      "$existing_point_version"
+    mkdir "$duplicate_scratch"
+    beta_storage_remote_validate_descriptor "$point_id" "$existing_descriptor" \
+      "$duplicate_scratch" false ||
+      beta_storage_fail duplicate_point_conflict
+    beta_storage_source_matches_descriptor "$source" "$existing_descriptor" ||
+      beta_storage_fail duplicate_point_conflict
+    local capture_head="$scratch/existing-capture-head.json"
+    local capture_head_meta="$scratch/existing-capture-head.meta"
+    if beta_storage_remote_head control/capture-head.json "$capture_head_meta"; then
+      beta_storage_remote_get_json control/capture-head.json "$capture_head" \
+        "$(jq -er '.VersionId' "$capture_head_meta")"
+      jq -e --arg point "$point_id" --arg version "$existing_point_version" \
+        --arg digest "$(beta_storage_descriptor_digest "$existing_descriptor")" \
+        --argjson captured "$captured_at" '
+        type=="object" and
+        .schema=="meet-backend/beta-backup-head/v2" and
+        .pointId==$point and .capturedAt==$captured and
+        .descriptorVersion==$version and .descriptorDigest==$digest
+      ' "$capture_head" >/dev/null ||
+        beta_storage_fail duplicate_point_conflict
+      beta_storage_remote_writer_release "$owner" "$txid"
+      cleanup=false
+      trap - RETURN
+      rm -rf -- "$scratch"
+      unset BETA_STORAGE_AMBIGUOUS_MARKER
+      unset BETA_STORAGE_MUTATION_STARTED_MARKER
+      printf 'storage_publish=idempotent point_id=%s\n' "$point_id"
+      return 0
+    fi
+    [ "$?" -eq 1 ] || beta_storage_fail capture_head_read_failed
+    beta_storage_fail duplicate_point_uncommitted
+  else
+    case "$?" in
+      1) : ;;
+      *) beta_storage_fail point_descriptor_read_failed ;;
+    esac
+  fi
+  beta_storage_remote_writer_transition publishing false "$expected_keys"
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
     "$((reserve + writer_control_reserve))" >/dev/null
   local db_json media_json manifest_json db_version media_version manifest_version
@@ -1498,6 +1527,7 @@ beta_storage_remote_build_status_once() {
       capture_state=VALID
       capture_id=$point
       capture_at=$(jq -er '.capture.capturedAt' "$descriptor")
+      (( capture_at <= now )) || beta_storage_fail capture_time_future
       (( generation < $(jq -er '.generation' "$body") )) &&
         generation=$(jq -er '.generation' "$body")
     else
@@ -1537,15 +1567,19 @@ beta_storage_remote_build_status_once() {
       beta_storage_validate_receipt "$receipt" || beta_storage_fail receipt_invalid
       jq -e --arg point "$point" \
         --arg descriptor "$(beta_storage_descriptor_digest "$descriptor")" \
+        --arg source "$(jq -er '.capture.sourceRevision' "$descriptor")" \
+        --arg command "$(jq -er '.captureCommandDigest' "$descriptor")" \
         --argjson captured "$(jq -er '.capture.capturedAt' "$descriptor")" \
         --argjson verified "$(jq -er '.verifiedCapturedAt' "$body")" \
         '.pointId==$point and .pointDescriptorDigest==$descriptor and
          .captureAt==$captured and .verifiedCapturedAt==$captured and
-         .verifiedCapturedAt==$verified' "$receipt" >/dev/null ||
+         .verifiedCapturedAt==$verified and .captureRevision==$source and
+         .captureCommandDigest==$command' "$receipt" >/dev/null ||
         beta_storage_fail receipt_descriptor_binding
       verified_state=VALID
       verified_id=$point
       verified_at=$(jq -er '.capture.capturedAt' "$descriptor")
+      (( verified_at <= now )) || beta_storage_fail verified_time_future
       (( generation < $(jq -er '.generation' "$body") )) &&
         generation=$(jq -er '.generation' "$body")
     fi
@@ -1940,13 +1974,15 @@ beta_storage_prune_remote() {
   beta_storage_remote_require_safety "$safety_status" "$safety_watermark" \
     "$safety_environment" "$now"
   beta_storage_require_config
-  local intent_digest
-  intent_digest=$(printf '%s\0%s\0%s' prune "$now" "$BETA_BACKUP_BYTE_BUDGET" |
-    sha256sum | awk '{print $1}')
   local writer_control_reserve=$((4 * BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES))
+  local intent_digest
+  intent_digest=$(printf '%s\0%s\0%s\0%s' prune "$now" "$BETA_BACKUP_BYTE_BUDGET" \
+    "$writer_control_reserve" |
+    sha256sum | awk '{print $1}')
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
     "$writer_control_reserve" false >/dev/null
-  beta_storage_remote_writer_acquire prune "$owner" "prune-$now" 0 \
+  beta_storage_remote_writer_acquire prune "$owner" "prune-$now" \
+    "$writer_control_reserve" \
     "$intent_digest" '["control/verified-head.json"]'
   beta_storage_remote_writer_transition pruning false \
     '["control/verified-head.json"]'
@@ -2439,18 +2475,35 @@ beta_storage_publish_local() {
     beta_storage_validate_capture_proof media "$source/capture-media-proof.json" ||
       beta_storage_fail media_proof_invalid
   fi
-  [ ! -e "$point_dir" ] || {
-    beta_storage_local_validate_point_dir "$point_dir" "$point_id" ||
-      beta_storage_fail duplicate_point_conflict
-    beta_storage_source_matches_local_point "$source" "$point_dir" ||
-      beta_storage_fail duplicate_point_conflict
-    printf 'storage_publish=idempotent point_id=%s\n' "$point_id"
-    return 0
-  }
   local txid="publish-$point_id"
   beta_storage_local_acquire "$root" publish "$owner" "$txid"
   local cleanup=true
   trap 'if [ "$cleanup" = true ]; then rm -rf -- "$point_dir"; fi' RETURN
+  if [ -e "$point_dir" ]; then
+    beta_storage_local_validate_point_dir "$point_dir" "$point_id" ||
+      { cleanup=false; beta_storage_local_release "$root"; trap - RETURN;
+        beta_storage_fail duplicate_point_conflict; }
+    beta_storage_source_matches_local_point "$source" "$point_dir" ||
+      { cleanup=false; beta_storage_local_release "$root"; trap - RETURN;
+        beta_storage_fail duplicate_point_conflict; }
+    [ -f "$root/control/capture-head.json" ] &&
+      [ ! -L "$root/control/capture-head.json" ] &&
+      beta_storage_require_unique_json "$root/control/capture-head.json" &&
+      jq -e --arg point "$point_id" \
+        --arg digest "$(beta_storage_descriptor_digest "$point_dir/point.json")" \
+        --argjson captured "$captured_at" '
+        .schema=="meet-backend/beta-backup-head/v1" and
+        .pointId==$point and .capturedAt==$captured and
+        .descriptorDigest==$digest
+      ' "$root/control/capture-head.json" >/dev/null ||
+      { cleanup=false; beta_storage_local_release "$root"; trap - RETURN;
+        beta_storage_fail duplicate_point_uncommitted; }
+    cleanup=false
+    beta_storage_local_release "$root"
+    trap - RETURN
+    printf 'storage_publish=idempotent point_id=%s\n' "$point_id"
+    return 0
+  fi
   local budget=${BETA_BACKUP_BYTE_BUDGET:-9223372036854775807}
   local current=0 file bytes
   for file in "$root"/points/*/* "$root"/receipts/*/* "$root"/control/*.json; do

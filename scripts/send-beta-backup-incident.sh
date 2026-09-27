@@ -25,6 +25,9 @@ done
 : "${GITHUB_API_URL:=https://api.github.com}"
 : "${BETA_BACKUP_INCIDENT_REPOSITORY:?BETA_BACKUP_INCIDENT_REPOSITORY is required}"
 : "${BETA_BACKUP_INCIDENT_ISSUE_LABEL:?BETA_BACKUP_INCIDENT_ISSUE_LABEL is required}"
+[ "$GITHUB_API_URL" = https://api.github.com ] || {
+  echo 'BACKUP_INCIDENT_BLOCKED:api_origin_invalid' >&2; exit 1;
+}
 [[ "$BETA_BACKUP_INCIDENT_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
   echo 'BACKUP_INCIDENT_BLOCKED:repository_invalid' >&2; exit 1;
 }
@@ -96,12 +99,13 @@ jq -e '
 repo_url="$GITHUB_API_URL/repos/$BETA_BACKUP_INCIDENT_REPOSITORY"
 api() {
   local method=$1 path=$2 data=${3:-} output
-  output=$(mktemp)
+  output=$(mktemp "$tmp/api.XXXXXX")
   if [ -n "$data" ]; then
     curl --fail --silent --show-error --connect-timeout 5 --max-time 30 \
       --request "$method" --data-binary "$data" \
       -H "Authorization: Bearer $GITHUB_TOKEN" \
       -H 'Accept: application/vnd.github+json' \
+      -H 'Content-Type: application/json' \
       -H 'X-GitHub-Api-Version: 2022-11-28' "$repo_url$path" >"$output" ||
       { rm -f "$output"; echo 'BACKUP_INCIDENT_BLOCKED:github_api_failed' >&2; exit 1; }
   else
@@ -138,6 +142,7 @@ if ! jq -e --arg name "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
   rm -f "$created_label"
 fi
 dedupe=$(jq -er '.dedupeKey' "$event_file")
+incident_id=$(jq -er '.incidentId' "$event_file")
 issue_page=1
 issue_pages=()
 while (( issue_page <= 10 )); do
@@ -155,10 +160,10 @@ done
 }
 issues="$tmp/issues.json"
 jq -s 'add' "${issue_pages[@]}" >"$issues"
-issue=$(jq -c --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" --arg dedupe "$dedupe" '
+issue=$(jq -c --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" --arg incident "$incident_id" '
   [.[] | select(.pull_request|not) |
     select(any(.labels[]?; .name==$label)) |
-    select(.body|contains($dedupe))] |
+    select(.body|contains($incident))] |
   sort_by(.updated_at,.number) | last // empty
 ' "$issues")
 # Do not copy state or provider responses to an issue. The issue body contains
@@ -175,20 +180,39 @@ payload=$(jq -cn --arg body "$body" --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LAB
   '{title:"Closed-beta backup incident",body:$body,labels:[$label]}')
 if [ -n "$issue" ]; then
   number=$(jq -er '.number' <<<"$issue")
-  if [ "$(jq -er '.state' <<<"$issue")" != open ]; then
-    reopened=$(api PATCH "/issues/$number" \
-      "$(jq -cn '{state:"open"}')")
-    jq -e '.state=="open" and (.number|type=="number" and .>0)' "$reopened" >/dev/null || {
-      rm -f "$reopened"
-      echo 'BACKUP_INCIDENT_BLOCKED:issue_reopen_invalid' >&2
+  if [ "$(jq -er '.event' "$event_file")" = recovered ]; then
+    recovery_comment=$(jq -cn --arg body "$body" \
+      '{body:("Closed-beta backup recovery observed.\n\n"+$body)}')
+    recovery_response=$(api POST "/issues/$number/comments" "$recovery_comment")
+    jq -e '(.id|type=="number" and .>0)' "$recovery_response" >/dev/null || {
+      rm -f "$recovery_response"
+      echo 'BACKUP_INCIDENT_BLOCKED:recovery_comment_invalid' >&2
       exit 1
     }
-    rm -f "$reopened"
+    rm -f "$recovery_response"
+    closed=$(api PATCH "/issues/$number" \
+      "$(jq -cn --arg body "$body" '{state:"closed",body:$body}')")
+    jq -e '.state=="closed" and (.number|type=="number" and .>0)' "$closed" >/dev/null || {
+      rm -f "$closed"
+      echo 'BACKUP_INCIDENT_BLOCKED:issue_close_invalid' >&2
+      exit 1
+    }
+    rm -f "$closed"
+  else
+    updated=$(api PATCH "/issues/$number" \
+      "$(jq -cn --arg body "$body" '{state:"open",body:$body}')")
+    jq -e '.state=="open" and (.number|type=="number" and .>0)' "$updated" >/dev/null || {
+      rm -f "$updated"
+      echo 'BACKUP_INCIDENT_BLOCKED:issue_update_invalid' >&2
+      exit 1
+    }
+    rm -f "$updated"
   fi
-  # The issue body is the durable event-id record. An identical dedupe key
-  # means the external delivery already succeeded, so recovery after a lost
-  # provider-state CAS must not append a duplicate comment.
 else
+  [ "$(jq -er '.event' "$event_file")" = active ] || {
+    echo 'BACKUP_INCIDENT_BLOCKED:recovery_issue_missing' >&2
+    exit 1
+  }
   created_issue=$(api POST '/issues' "$payload")
   jq -e '(.number|type=="number" and .>0)' "$created_issue" >/dev/null || {
     rm -f "$created_issue"
