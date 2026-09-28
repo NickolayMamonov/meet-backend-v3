@@ -28,6 +28,9 @@ done
 [ "$GITHUB_API_URL" = https://api.github.com ] || {
   echo 'BACKUP_INCIDENT_BLOCKED:api_origin_invalid' >&2; exit 1;
 }
+readonly BETA_BACKUP_INCIDENT_MAX_RESPONSE_BYTES=1048576
+readonly BETA_BACKUP_INCIDENT_MAX_ISSUE_BODY_BYTES=65536
+readonly BETA_BACKUP_INCIDENT_MAX_PAGE_ITEMS=100
 [[ "$BETA_BACKUP_INCIDENT_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
   echo 'BACKUP_INCIDENT_BLOCKED:repository_invalid' >&2; exit 1;
 }
@@ -41,6 +44,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
 require_unique_json() {
   local file=$1
+  [ "$(wc -c <"$file" | tr -d '[:space:]')" -le \
+    "$BETA_BACKUP_INCIDENT_MAX_RESPONSE_BYTES" ] || return 1
   timeout --foreground 5s python3 - "$file" <<'PY'
 import json
 import sys
@@ -56,6 +61,70 @@ def reject_duplicates(pairs):
 with open(sys.argv[1], encoding="utf-8") as stream:
     json.load(stream, object_pairs_hook=reject_duplicates)
 PY
+}
+validate_repository_response() {
+  local file=$1
+  jq -e '
+    type=="object" and (.full_name|type=="string") and
+    (.private|type=="boolean") and (.has_issues|type=="boolean") and
+    (.permissions|type=="object") and (.permissions.issues|type=="boolean")
+  ' "$file" >/dev/null
+}
+validate_label_response() {
+  local file=$1
+  jq -e --argjson max_items "$BETA_BACKUP_INCIDENT_MAX_PAGE_ITEMS" '
+    type=="array" and length <= $max_items and
+    all(.[]; type=="object" and
+      (.name|type=="string" and utf8bytelength>=1 and utf8bytelength<=50))
+  ' "$file" >/dev/null
+}
+validate_issue_page() {
+  local file=$1
+  if jq -e --argjson max_items "$BETA_BACKUP_INCIDENT_MAX_PAGE_ITEMS" \
+    --argjson body_limit "$BETA_BACKUP_INCIDENT_MAX_ISSUE_BODY_BYTES" '
+    type=="array" and length <= $max_items and
+    all(.[]; type=="object" and
+      (.number|type=="number" and floor==. and .>0) and
+      (.state|type=="string" and (.=="open" or .=="closed")) and
+      (.body==null or (.body|type=="string" and
+        utf8bytelength <= $body_limit)) and
+      (.labels|type=="array" and length <= $max_items and
+        all(.[]; type=="object" and
+          (.name|type=="string" and utf8bytelength<=50))) and
+      (.pull_request==null or (.pull_request|type=="object")))
+  ' "$file" >/dev/null; then
+    return 0
+  fi
+  if jq -e --argjson body_limit "$BETA_BACKUP_INCIDENT_MAX_ISSUE_BODY_BYTES" '
+    type=="array" and any(.[]; .body != null and
+      (.body|type=="string" and utf8bytelength > $body_limit))
+  ' "$file" >/dev/null; then
+    echo 'BACKUP_INCIDENT_BLOCKED:issue_body_oversize' >&2
+  else
+    echo 'BACKUP_INCIDENT_BLOCKED:issue_page_invalid' >&2
+  fi
+  return 1
+}
+validate_comment_page() {
+  local file=$1
+  if jq -e --argjson max_items "$BETA_BACKUP_INCIDENT_MAX_PAGE_ITEMS" \
+    --argjson body_limit "$BETA_BACKUP_INCIDENT_MAX_ISSUE_BODY_BYTES" '
+    type=="array" and length <= $max_items and
+    all(.[]; type=="object" and
+      (.body==null or (.body|type=="string" and
+        utf8bytelength <= $body_limit)))
+  ' "$file" >/dev/null; then
+    return 0
+  fi
+  if jq -e --argjson body_limit "$BETA_BACKUP_INCIDENT_MAX_ISSUE_BODY_BYTES" '
+    type=="array" and any(.[]; .body != null and
+      (.body|type=="string" and utf8bytelength > $body_limit))
+  ' "$file" >/dev/null; then
+    echo 'BACKUP_INCIDENT_BLOCKED:comment_body_oversize' >&2
+  else
+    echo 'BACKUP_INCIDENT_BLOCKED:issue_comments_invalid' >&2
+  fi
+  return 1
 }
 require_unique_json "$state_file" || {
   echo 'BACKUP_INCIDENT_BLOCKED:state_ambiguous' >&2; exit 1;
@@ -99,29 +168,62 @@ jq -e '
 }
 repo_url="$GITHUB_API_URL/repos/$BETA_BACKUP_INCIDENT_REPOSITORY"
 api() {
-  local method=$1 path=$2 data=${3:-} output
+  local method=$1 path=$2 data=${3:-} output status
   output=$(mktemp "$tmp/api.XXXXXX")
   if [ -n "$data" ]; then
-    curl --fail --silent --show-error --connect-timeout 5 --max-time 30 \
+    if curl --fail --silent --show-error --connect-timeout 5 --max-time 30 \
+      --max-filesize "$BETA_BACKUP_INCIDENT_MAX_RESPONSE_BYTES" \
       --request "$method" --data-binary "$data" \
       -H "Authorization: Bearer $GITHUB_TOKEN" \
       -H 'Accept: application/vnd.github+json' \
       -H 'Content-Type: application/json' \
-      -H 'X-GitHub-Api-Version: 2022-11-28' "$repo_url$path" >"$output" ||
-      { rm -f "$output"; echo 'BACKUP_INCIDENT_BLOCKED:github_api_failed' >&2; exit 1; }
+      -H 'X-GitHub-Api-Version: 2022-11-28' "$repo_url$path" >"$output"; then
+      :
+    else
+      status=$?
+      rm -f "$output"
+      if [ "$status" -eq 63 ]; then
+        echo 'BACKUP_INCIDENT_BLOCKED:github_api_oversize' >&2
+      else
+        echo 'BACKUP_INCIDENT_BLOCKED:github_api_failed' >&2
+      fi
+      exit 1
+    fi
   else
-    curl --fail --silent --show-error --connect-timeout 5 --max-time 30 \
+    if curl --fail --silent --show-error --connect-timeout 5 --max-time 30 \
+      --max-filesize "$BETA_BACKUP_INCIDENT_MAX_RESPONSE_BYTES" \
       -H "Authorization: Bearer $GITHUB_TOKEN" \
       -H 'Accept: application/vnd.github+json' \
-      -H 'X-GitHub-Api-Version: 2022-11-28' "$repo_url$path" >"$output" ||
-      { rm -f "$output"; echo 'BACKUP_INCIDENT_BLOCKED:github_api_failed' >&2; exit 1; }
+      -H 'X-GitHub-Api-Version: 2022-11-28' "$repo_url$path" >"$output"; then
+      :
+    else
+      status=$?
+      rm -f "$output"
+      if [ "$status" -eq 63 ]; then
+        echo 'BACKUP_INCIDENT_BLOCKED:github_api_oversize' >&2
+      else
+        echo 'BACKUP_INCIDENT_BLOCKED:github_api_failed' >&2
+      fi
+      exit 1
+    fi
   fi
+  [ "$(wc -c <"$output" | tr -d '[:space:]')" -le \
+    "$BETA_BACKUP_INCIDENT_MAX_RESPONSE_BYTES" ] || {
+    rm -f "$output"
+    echo 'BACKUP_INCIDENT_BLOCKED:github_api_oversize' >&2
+    exit 1
+  }
   require_unique_json "$output" && jq -e . "$output" >/dev/null || {
     rm -f "$output"; echo 'BACKUP_INCIDENT_BLOCKED:github_api_invalid' >&2; exit 1;
   }
   printf '%s\n' "$output"
 }
 repo=$(api GET '')
+validate_repository_response "$repo" || {
+  rm -f "$repo"
+  echo 'BACKUP_INCIDENT_BLOCKED:repository_response_invalid' >&2
+  exit 1
+}
 jq -e --arg repo "$BETA_BACKUP_INCIDENT_REPOSITORY" '
   .full_name==$repo and .private==true and .has_issues==true and
   .permissions.issues==true
@@ -131,6 +233,11 @@ jq -e --arg repo "$BETA_BACKUP_INCIDENT_REPOSITORY" '
 label=$(jq -cn --arg name "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
   '{name:$name,color:"b60205",description:"closed-beta backup incident"}')
 labels=$(api GET '/labels')
+validate_label_response "$labels" || {
+  rm -f "$labels"
+  echo 'BACKUP_INCIDENT_BLOCKED:label_response_invalid' >&2
+  exit 1
+}
 if ! jq -e --arg name "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
   'any(.[]; .name==$name)' "$labels" >/dev/null; then
   created_label=$(api POST '/labels' "$label")
@@ -148,9 +255,7 @@ issue_page=1
 issue_pages=()
 while (( issue_page <= 10 )); do
   page_file=$(api GET "/issues?state=all&per_page=100&page=$issue_page")
-  jq -e 'type=="array"' "$page_file" >/dev/null || {
-    echo 'BACKUP_INCIDENT_BLOCKED:issue_page_invalid' >&2; exit 1;
-  }
+  validate_issue_page "$page_file" || exit 1
   issue_pages+=("$page_file")
   page_count=$(jq -er 'length' "$page_file")
   (( page_count < 100 )) && break
@@ -168,9 +273,9 @@ issue=$(jq -c --arg label "$BETA_BACKUP_INCIDENT_ISSUE_LABEL" \
   [.[] | select(.pull_request|not) |
     select(any(.labels[]?; .name==$label)) |
     select(($event=="recovered" or .state=="open") and
-      ((.body|contains($incident)) or
-       (.body|contains($dedupe)) or
-       (.body|contains($event_id))))] |
+      (((.body // "")|contains($incident)) or
+       ((.body // "")|contains($dedupe)) or
+       ((.body // "")|contains($event_id))))] |
   sort_by(.updated_at,.number) | last // empty
 ' "$issues")
 # Do not copy state or provider responses to an issue. The issue body contains
@@ -196,10 +301,7 @@ if [ -n "$issue" ]; then
     while (( comment_page <= 10 )); do
       comments=$(api GET \
         "/issues/$number/comments?state=all&per_page=100&page=$comment_page")
-      jq -e 'type=="array"' "$comments" >/dev/null || {
-        echo 'BACKUP_INCIDENT_BLOCKED:issue_comments_invalid' >&2
-        exit 1
-      }
+      validate_comment_page "$comments" || exit 1
       if jq -e --arg event "$event_id" \
         'any(.[]; (.body // "") | contains($event))' "$comments" >/dev/null; then
         recovery_seen=true

@@ -186,6 +186,18 @@ case "${FAKE_AWS_MODE:?}" in
       *) printf '{}\n' ;;
     esac
     ;;
+  parts-pagination)
+    case " $* " in
+      *' list-parts '*)
+        if [[ " $* " == *' --part-number-marker 1000 '* ]]; then
+          printf '{"IsTruncated":false,"Key":"points/paged/upload.bin","UploadId":"upload-1","Parts":[{"ETag":"etag-1001","PartNumber":1001,"Size":9}]}\n'
+        else
+          printf '{"IsTruncated":true,"Key":"points/paged/upload.bin","NextPartNumberMarker":1000,"UploadId":"upload-1","Parts":[{"ETag":"etag-1","PartNumber":1,"Size":8}]}\n'
+        fi
+        ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
   *) exit 1 ;;
 esac
 EOF
@@ -260,6 +272,13 @@ beta_storage_provider_get '' points/large-provider-object \
   fail "opaque provider version ID was rejected"
 cmp -- "$tmp/large-provider-object" "$tmp/opaque-provider-copy" ||
   fail "opaque provider version copy differs"
+export FAKE_AWS_MODE=parts-pagination
+paged_parts=$(beta_storage_remote_list_multipart_parts \
+  points/paged/upload.bin upload-1)
+[ "$(jq -er 'length' <<<"$paged_parts")" -eq 2 ] ||
+  fail "multipart part pagination was not consumed"
+[ "$(jq -er 'map(.PartNumber)|sort|join(",")' <<<"$paged_parts")" = 1,1001 ] ||
+  fail "multipart part pagination lost a part"
 grep -Fq 'create-multipart-upload' "$tmp/aws.log" ||
   fail "multipart create was not invoked"
 grep -Fq 'upload-part' "$tmp/aws.log" ||
@@ -403,6 +422,14 @@ grep -Fq 'beta_storage_remote_writer_transition ambiguous true' \
   fail "ambiguous mutations are not durably fenced"
 grep -Fq 'receipts/$point_id/' "$root/scripts/beta-backup-storage.sh" ||
   fail "orphan receipt graph cleanup is missing"
+grep -Fq 'pinned_receipt_closure_missing' "$root/scripts/beta-backup-storage.sh" ||
+  fail "retained receipt closure cleanup is not authenticated"
+grep -Fq 'beta_storage_remote_list_multipart_parts' \
+  "$root/scripts/beta-backup-storage.sh" ||
+  fail "multipart inventory does not use the bounded paginated reader"
+grep -Fq 'beta_storage_remote_list_multipart_parts' \
+  "$root/scripts/beta-backup-storage.sh" ||
+  fail "multipart prune does not use the bounded paginated reader"
 grep -Fq 'pinned_closure_invalid' "$root/scripts/beta-backup-storage.sh" ||
   fail "prune does not fail closed on invalid pinned closure"
 grep -Fq 'BETA_BACKUP_BYTE_BUDGET" 0 false' "$root/scripts/beta-backup-storage.sh" ||
@@ -417,4 +444,13 @@ grep -Fq 'conditional_create=true' "$root/scripts/run-beta-backup-storage.sh" ||
   fail "capability admission does not probe conditional create"
 grep -Fq -- '--if-none-match' "$root/scripts/beta-backup-storage.sh" ||
   fail "multipart conditional completion is not provider-enforced"
+grep -Fq -- '--max-filesize' \
+  "$root/scripts/send-beta-backup-incident.sh" ||
+  fail "incident API responses are not transport-bounded"
+grep -Fq 'issue_body_oversize' \
+  "$root/scripts/send-beta-backup-incident.sh" ||
+  fail "incident issue bodies are not bounded"
+grep -Fq '((.body // "")|contains' \
+  "$root/scripts/send-beta-backup-incident.sh" ||
+  fail "incident deduplication does not tolerate null issue bodies"
 printf 'test-beta-backup-storage.sh: passed\n'

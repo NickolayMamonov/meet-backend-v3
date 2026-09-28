@@ -419,6 +419,82 @@ beta_storage_aws_read() {
   beta_storage_fail provider_read_exhausted
 }
 
+beta_storage_remote_list_multipart_parts() {
+  local key=$1 upload_id=$2 part_marker='' page=0 truncated=false
+  local part_page all_parts='[]' part_json_file
+  beta_storage_key "$key" >/dev/null || return 1
+  [[ "$upload_id" =~ ^[A-Za-z0-9._:-]+$ ]] &&
+    [ "${#upload_id}" -le 256 ] ||
+    beta_storage_fail multipart_upload_id_invalid
+  while (( page < BETA_STORAGE_MAX_PAGES )); do
+    page=$((page + 1))
+    if [ -n "$part_marker" ]; then
+      part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
+        --key "$key" --upload-id "$upload_id" --max-parts 1000 \
+        --part-number-marker "$part_marker") ||
+        beta_storage_fail multipart_parts_unavailable
+    else
+      part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
+        --key "$key" --upload-id "$upload_id" --max-parts 1000) ||
+        beta_storage_fail multipart_parts_unavailable
+    fi
+    part_json_file=$(mktemp)
+    printf '%s\n' "$part_page" >"$part_json_file"
+    if ! beta_storage_require_unique_json "$part_json_file"; then
+      rm -f -- "$part_json_file"
+      beta_storage_fail multipart_parts_duplicate_json
+    fi
+    rm -f -- "$part_json_file"
+    jq -e --arg expected_key "$key" --arg expected_upload "$upload_id" \
+      --argjson max_parts "$BETA_STORAGE_MULTIPART_MAX_PARTS" '
+      . as $root |
+      ($root|type=="object") and
+      ($root.Parts|type=="array") and
+      (((($root|keys) - ["AbortDate","AbortRuleId","Bucket",
+        "ChecksumAlgorithm","ChecksumType","Initiator","IsTruncated","Key",
+        "MaxParts","NextPartNumberMarker","Owner","PartNumberMarker","Parts",
+        "ReplicationStatus","StorageClass","UploadId"]) | length) == 0) and
+      (($root.Parts|length) <= 1000) and
+      ($root.IsTruncated|type=="boolean") and
+      (($root.IsTruncated and
+        ($root.NextPartNumberMarker|type=="number" and floor==. and
+          .>=1 and .<=$max_parts)) or
+       (($root.IsTruncated|not) and
+        (($root.NextPartNumberMarker // "")==""))) and
+      $root.Key==$expected_key and $root.UploadId==$expected_upload and
+      (((($root.Parts | map(select(
+        (((keys - ["ChecksumCRC32","ChecksumCRC32C","ChecksumSHA1",
+          "ChecksumSHA256","ETag","LastModified","PartNumber","Size"]) |
+          length) == 0) and
+        (.PartNumber|type=="number" and floor==. and .>=1 and .<=$max_parts) and
+        (.Size|type=="number" and floor==. and .>=0 and
+          .<=9223372036854775807) and
+        (.ETag|type=="string" and length>0))
+      ))) | length) == ($root.Parts|length)) and
+      (($root.Parts|map(.PartNumber)|unique|length) ==
+        ($root.Parts|map(.PartNumber)|length))
+    ' <<<"$part_page" >/dev/null ||
+      beta_storage_fail multipart_parts_invalid
+    all_parts=$(jq -cn --argjson existing "$all_parts" \
+      --argjson page "$part_page" '$existing + ($page | .Parts)') ||
+      beta_storage_fail multipart_parts_invalid
+    truncated=$(jq -er '.IsTruncated' <<<"$part_page")
+    [ "$truncated" = true ] || break
+    part_marker=$(jq -er '.NextPartNumberMarker // empty' <<<"$part_page")
+    [[ "$part_marker" =~ ^[1-9][0-9]*$ ]] ||
+      beta_storage_fail multipart_parts_pagination_invalid
+  done
+  [ "$truncated" = false ] ||
+    beta_storage_fail multipart_parts_pagination_limit
+  jq -e --argjson max_parts "$BETA_STORAGE_MULTIPART_MAX_PARTS" '
+    type=="array" and length <= $max_parts and
+    (map(.PartNumber) as $numbers |
+      ($numbers|unique|length) == ($numbers|length))
+  ' <<<"$all_parts" >/dev/null ||
+    beta_storage_fail multipart_parts_invalid
+  printf '%s\n' "$all_parts"
+}
+
 beta_storage_aws_mutation() {
   if [ -n "${BETA_STORAGE_MUTATION_STARTED_MARKER:-}" ]; then
     : >"$BETA_STORAGE_MUTATION_STARTED_MARKER"
@@ -1377,31 +1453,8 @@ beta_storage_remote_inventory_total() {
       beta_storage_fail multipart_inventory_duplicate_json
     while IFS=$'\t' read -r upload_key upload_id; do
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
-      part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
-        --key "$upload_key" --upload-id "$upload_id" --max-parts 1000) ||
-        beta_storage_fail multipart_parts_unavailable
-      beta_storage_require_unique_json <(printf '%s\n' "$part_page") ||
-        beta_storage_fail multipart_parts_duplicate_json
-      jq -e --arg expected_key "$upload_key" --arg expected_upload "$upload_id" '
-        type=="object" and (.Parts|type=="array") and
-        ((keys - ["AbortDate","AbortRuleId","Bucket","ChecksumAlgorithm",
-          "ChecksumType","Initiator","IsTruncated","Key","MaxParts",
-          "NextPartNumberMarker","Owner","PartNumberMarker","Parts",
-          "ReplicationStatus","StorageClass","UploadId"])|length==0) and
-        (.Parts|length<=1000) and
-        (.IsTruncated|type=="boolean") and (.IsTruncated==false) and
-        ((.NextPartNumberMarker // "")=="") and
-        .Key==$expected_key and .UploadId==$expected_upload and
-        all(.Parts[]?;
-          ((keys - ["ChecksumCRC32","ChecksumCRC32C","ChecksumSHA1",
-            "ChecksumSHA256","ETag","LastModified","PartNumber","Size"])|length==0) and
-          (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
-          (.Size|type=="number" and floor==. and .>=0 and
-            .<=9223372036854775807) and
-          (.ETag|type=="string" and length>0)) and
-        ([.Parts[]?.PartNumber] | unique | length ==
-          ([.Parts[]?.PartNumber] | length))
-      ' <<<"$part_page" >/dev/null ||
+      part_page=$(beta_storage_remote_list_multipart_parts \
+        "$upload_key" "$upload_id") ||
         beta_storage_fail multipart_parts_incomplete
       part_bytes=$(jq -r '[.Parts[]?.Size] | add // 0' <<<"$part_page")
       [[ "$part_bytes" =~ ^[0-9]+$ ]] || beta_storage_fail multipart_parts_invalid
@@ -2662,6 +2715,45 @@ beta_storage_prune_remote() {
     deleted_points=$((deleted_points + 1))
   done <"$orphan_points"
   rm -f -- "$orphan_points"
+  # A retained point only needs the receipt/proof closure referenced by the
+  # authenticated verified head. Older promotion graphs are unreferenced
+  # storage, even when the point itself remains pinned or inside the age
+  # window. Reclaim them under the same writer lock and account every byte.
+  local live_receipt_key live_proof_key live_receipt_version live_proof_version
+  local receipt_key receipt_version receipt_point
+  live_receipt_key="receipts/$pinned/$(jq -er '.receiptId' "$head").json"
+  live_proof_key="receipts/$pinned/$(jq -er '.receiptId' "$head").proof.json"
+  live_receipt_version=$(jq -er '.receiptVersion' "$head")
+  live_proof_version=$(jq -er '.proofVersion' "$head")
+  jq -e --arg receipt_key "$live_receipt_key" \
+    --arg receipt_version "$live_receipt_version" \
+    --arg proof_key "$live_proof_key" \
+    --arg proof_version "$live_proof_version" '
+    any(.[].Versions[]?;
+      (.Key==$receipt_key and .VersionId==$receipt_version) or
+      (.Key==$proof_key and .VersionId==$proof_version))
+  ' <<<"$inventory" >/dev/null ||
+    beta_storage_fail pinned_receipt_closure_missing
+  while IFS=$'\t' read -r receipt_key receipt_version; do
+    [ -n "$receipt_key" ] || continue
+    receipt_point=${receipt_key#receipts/}
+    receipt_point=${receipt_point%%/*}
+    grep -Fxq -- "$receipt_point" "$deleted_point_ids" && continue
+    if [ "$receipt_key" = "$live_receipt_key" ] &&
+      [ "$receipt_version" = "$live_receipt_version" ]; then
+      continue
+    fi
+    delete_inventory_version "$receipt_key" "$receipt_version"
+  done < <(jq -r '.[].Versions[]? | select(.Key|startswith("receipts/")) |
+    [.Key,.VersionId]|@tsv' <<<"$inventory")
+  while IFS=$'\t' read -r receipt_key receipt_version; do
+    [ -n "$receipt_key" ] || continue
+    receipt_point=${receipt_key#receipts/}
+    receipt_point=${receipt_point%%/*}
+    grep -Fxq -- "$receipt_point" "$deleted_point_ids" && continue
+    delete_inventory_version "$receipt_key" "$receipt_version" marker
+  done < <(jq -r '.[].DeleteMarkers[]? | select(.Key|startswith("receipts/")) |
+    [.Key,.VersionId]|@tsv' <<<"$inventory")
   # Every control object is budgeted. Retain only its current live version;
   # this includes incident state, whose historical versions are not authority.
   local control_key
@@ -2730,31 +2822,8 @@ beta_storage_prune_remote() {
       beta_storage_remote_multipart_eligible "$upload_key" "$initiated" "$now" ||
         continue
       beta_storage_key "$upload_key" >/dev/null
-      part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
-        --key "$upload_key" --upload-id "$upload_id" --max-parts 1000) ||
-        beta_storage_fail multipart_parts_unavailable
-      beta_storage_require_unique_json <(printf '%s\n' "$part_page") ||
-        beta_storage_fail multipart_parts_duplicate_json
-      jq -e --arg expected_key "$upload_key" --arg expected_upload "$upload_id" '
-        type=="object" and (.Parts|type=="array") and
-        ((keys - ["AbortDate","AbortRuleId","Bucket","ChecksumAlgorithm",
-          "ChecksumType","Initiator","IsTruncated","Key","MaxParts",
-          "NextPartNumberMarker","Owner","PartNumberMarker","Parts",
-          "ReplicationStatus","StorageClass","UploadId"])|length==0) and
-        (.Parts|length<=1000) and
-        (.IsTruncated|type=="boolean") and (.IsTruncated==false) and
-        ((.NextPartNumberMarker // "")=="") and
-        .Key==$expected_key and .UploadId==$expected_upload and
-        all(.Parts[]?;
-          ((keys - ["ChecksumCRC32","ChecksumCRC32C","ChecksumSHA1",
-            "ChecksumSHA256","ETag","LastModified","PartNumber","Size"])|length==0) and
-          (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
-          (.Size|type=="number" and floor==. and .>=0 and
-            .<=9223372036854775807) and
-          (.ETag|type=="string" and length>0)) and
-        ([.Parts[]?.PartNumber] | unique | length ==
-          ([.Parts[]?.PartNumber] | length))
-      ' <<<"$part_page" >/dev/null ||
+      part_page=$(beta_storage_remote_list_multipart_parts \
+        "$upload_key" "$upload_id") ||
         beta_storage_fail multipart_parts_incomplete
       part_bytes=$(jq -r '[.Parts[]?.Size] | add // 0' <<<"$part_page")
       beta_storage_aws_mutation abort-multipart-upload --bucket "$BETA_BACKUP_BUCKET" \
