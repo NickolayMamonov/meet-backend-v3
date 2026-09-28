@@ -163,6 +163,8 @@ case "${FAKE_AWS_MODE:?}" in
   raw3|permission) exit 3 ;;
   timeout) exit 124 ;;
   malformed) printf '{}\n'; exit 0 ;;
+  duplicate) printf '{"VersionId":"one","VersionId":"two","ETag":"etag"}\n'; exit 0 ;;
+  oversize) dd if=/dev/zero bs=1M count=2 status=none; exit 0 ;;
   notfound)
     printf 'An error occurred (404) when calling the HeadObject operation: Not Found\n' >&2
     exit 3
@@ -233,6 +235,16 @@ if beta_storage_remote_head control/malformed.json "$tmp/malformed.json"; then
   fail "malformed provider response was accepted as a valid head"
 else
   [ "$?" -eq 2 ] || fail "malformed provider response was not rejected"
+fi
+export FAKE_AWS_MODE=duplicate
+if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" \
+  --key duplicate >/dev/null 2>&1; then
+  fail "duplicate provider response was accepted"
+fi
+export FAKE_AWS_MODE=oversize
+if beta_storage_aws_read list-object-versions --bucket "$BETA_BACKUP_BUCKET" \
+  --max-keys 1000 >/dev/null 2>&1; then
+  fail "oversized provider response was accepted"
 fi
 dd if=/dev/zero of="$tmp/large-provider-object" bs=1M count=9 status=none
 export FAKE_AWS_MODE=multipart
@@ -361,6 +373,12 @@ cat >"$tmp/inventory.json" <<'EOF'
 EOF
 [ "$("$root/scripts/run-beta-backup-storage.sh" inventory --file "$tmp/inventory.json" --budget 41)" = 40 ] ||
   fail "version accounting is incorrect"
+cat >"$tmp/inventory-delete-markers.json" <<'EOF'
+[{"bytes":10,"key":"points/a/postgres.dump.age","versions":2,"deleteMarkers":3}]
+EOF
+[ "$("$root/scripts/run-beta-backup-storage.sh" inventory \
+  --file "$tmp/inventory-delete-markers.json" --budget 23)" = 23 ] ||
+  fail "delete-marker byte accounting is incorrect"
 if "$root/scripts/run-beta-backup-storage.sh" inventory --file "$tmp/inventory.json" --budget 39 >/dev/null 2>&1; then
   fail "budget overflow was accepted"
 fi
@@ -395,4 +413,8 @@ grep -Fq 'beta_storage_aws_read head-bucket' "$root/scripts/run-beta-backup-stor
   fail "capability admission bypasses the bounded head-bucket read"
 grep -Fq 'beta_storage_aws_read get-bucket-versioning' "$root/scripts/run-beta-backup-storage.sh" ||
   fail "capability admission bypasses the bounded versioning read"
+grep -Fq 'conditional_create=true' "$root/scripts/run-beta-backup-storage.sh" ||
+  fail "capability admission does not probe conditional create"
+grep -Fq -- '--if-none-match' "$root/scripts/beta-backup-storage.sh" ||
+  fail "multipart conditional completion is not provider-enforced"
 printf 'test-beta-backup-storage.sh: passed\n'

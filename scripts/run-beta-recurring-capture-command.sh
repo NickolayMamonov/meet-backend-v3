@@ -33,6 +33,24 @@ done
 : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cleanup_capture_runner_temp() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  rm -f -- "$RUNNER_TEMP/postgres.dump.age" \
+    "$RUNNER_TEMP/uploads.tar.gz.age" \
+    "$RUNNER_TEMP/database-proof.json" \
+    "$RUNNER_TEMP/media-proof.json" \
+    "$RUNNER_TEMP/capture-database-proof.json" \
+    "$RUNNER_TEMP/capture-media-proof.json" \
+    "$RUNNER_TEMP/capture-runtime.json" \
+    "$RUNNER_TEMP/capture-result.json" ||
+    status=1
+  if [ "$status" -ne 0 ]; then
+    rm -f -- "$output"/* 2>/dev/null || status=1
+  fi
+  return "$status"
+}
+trap cleanup_capture_runner_temp EXIT HUP INT TERM
 install -d -m 700 "$output"
 AGE_RECIPIENT="$BETA_RECURRING_AGE_RECIPIENT" \
   PUBLIC_URL="$BETA_RECURRING_PUBLIC_URL" \
@@ -101,10 +119,21 @@ jq -e --arg name uploads.tar.gz.age --arg sha "$media_sha" \
   '.ciphertexts.uploads.name==$name and .ciphertexts.uploads.sha256==$sha and
    .ciphertexts.uploads.size==$size' "$remote_capture" >/dev/null ||
   { echo 'BACKUP_CAPTURE_BLOCKED:media_ciphertext_evidence_mismatch' >&2; exit 1; }
-for file in capture-database-proof.json capture-media-proof.json capture-runtime.json; do
-  [ -f "$RUNNER_TEMP/$file" ] && [ ! -L "$RUNNER_TEMP/$file" ] &&
-    cp -- "$RUNNER_TEMP/$file" "$output/$file" || true
-done
+stage_database_proof="$RUNNER_TEMP/database-proof.json"
+stage_media_proof="$RUNNER_TEMP/media-proof.json"
+if [ -e "$stage_database_proof" ] || [ -e "$stage_media_proof" ]; then
+  [ -s "$stage_database_proof" ] && [ ! -L "$stage_database_proof" ] &&
+    [ -s "$stage_media_proof" ] && [ ! -L "$stage_media_proof" ] || {
+      echo 'BACKUP_CAPTURE_BLOCKED:remote_capture_proof_pair_incomplete' >&2
+      exit 1
+    }
+  cp -- "$stage_database_proof" "$output/capture-database-proof.json"
+  cp -- "$stage_media_proof" "$output/capture-media-proof.json"
+fi
+[ -s "$RUNNER_TEMP/capture-runtime.json" ] &&
+  [ ! -L "$RUNNER_TEMP/capture-runtime.json" ] ||
+  { echo 'BACKUP_CAPTURE_BLOCKED:remote_capture_runtime_missing' >&2; exit 1; }
+cp -- "$RUNNER_TEMP/capture-runtime.json" "$output/capture-runtime.json"
 [ -s "$output/capture-runtime.json" ] || {
   echo 'BACKUP_CAPTURE_BLOCKED:remote_capture_runtime_missing' >&2
   exit 1

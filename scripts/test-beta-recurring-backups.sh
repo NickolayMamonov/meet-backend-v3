@@ -308,6 +308,12 @@ if BETA_RECURRING_REQUIRE_APPROVAL=true \
 fi
 capture_tool="$root/scripts/run-beta-recurring-capture-command.sh"
 restore_tool="$root/scripts/run-beta-recurring-restore-command.sh"
+grep -Fq 'cleanup_capture_runner_temp' "$capture_tool" ||
+  fail "recurring capture does not clean runner-temp artifacts"
+grep -Fq 'database-proof.json' "$capture_tool" &&
+  grep -Fq 'capture-database-proof.json' "$capture_tool" &&
+  grep -Fq 'remote_capture_proof_pair_incomplete' "$capture_tool" ||
+  fail "recurring capture does not retain the authenticated proof pair"
 "$root/scripts/validate-beta-recurring-tooling.sh" \
   --role capture --path "$capture_tool" \
   --allowlist "$root/scripts/fixtures/beta-recurring/tooling-allowlist.json" >/dev/null ||

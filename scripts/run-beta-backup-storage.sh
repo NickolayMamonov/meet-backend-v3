@@ -62,6 +62,15 @@ case "$operation" in
         echo "BACKUP_STORAGE_BLOCKED:versioning_disabled" >&2
         exit 1
       }
+      jq -e 'type=="object" and
+        ((keys - ["MFADelete","Status"])|length==0) and
+        .Status=="Enabled" and
+        ((.MFADelete // "Disabled")=="Enabled" or (.MFADelete // "Disabled")=="Disabled")' \
+        <<<"$(beta_storage_aws_read get-bucket-versioning \
+          --bucket "$BETA_BACKUP_BUCKET")" >/dev/null || {
+        echo "BACKUP_STORAGE_BLOCKED:versioning_response_invalid" >&2
+        exit 1
+      }
       lifecycle='{"Rules":[]}'
       if lifecycle=$(beta_storage_aws_read get-bucket-lifecycle-configuration \
         --bucket "$BETA_BACKUP_BUCKET"); then
@@ -74,6 +83,7 @@ case "$operation" in
         }
       fi
       jq -e 'type=="object" and (.Rules|type=="array") and
+        ((keys - ["Rules","ResponseMetadata"])|length==0) and
         all(.Rules[]?;
           (.Status=="Disabled") or
           ((.Expiration|not) and (.NoncurrentVersionExpiration|not) and
@@ -82,7 +92,97 @@ case "$operation" in
         echo "BACKUP_STORAGE_BLOCKED:lifecycle_policy_unsafe" >&2
         exit 1
       }
-      printf 'storage_capability=reachable bucket_versioning=Enabled lifecycle_pins=protected\n'
+      probe_key="control/capability-probe-$(date -u +%s)-$$"
+      probe=$(mktemp)
+      probe_update=$(mktemp)
+      probe_version_one=''
+      probe_version_two=''
+      capability_cleanup() {
+        local status=$?
+        trap - EXIT HUP INT TERM
+        for probe_version in "$probe_version_two" "$probe_version_one"; do
+          [ -n "$probe_version" ] || continue
+          beta_storage_provider_delete '' "$probe_key" "$probe_version" || status=1
+          if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" \
+            --key "$probe_key" --version-id "$probe_version" >/dev/null; then
+            status=1
+          else
+            [ "$?" -eq 3 ] || status=1
+          fi
+        done
+        rm -f -- "$probe" "$probe_update" "$probe_update.copy" || status=1
+        return "$status"
+      }
+      trap capability_cleanup EXIT HUP INT TERM
+      printf 'capability-probe-v1\n' >"$probe"
+      first=$(beta_storage_provider_put_conditional '' "$probe_key" "$probe" '' true) || {
+        echo "BACKUP_STORAGE_BLOCKED:conditional_create_unavailable" >&2
+        exit 1
+      }
+      probe_version_one=$(jq -er '.versionId' <<<"$first") || {
+        echo "BACKUP_STORAGE_BLOCKED:conditional_create_invalid" >&2
+        exit 1
+      }
+      first_sha=$(jq -er '.sha256' <<<"$first")
+      beta_storage_provider_get '' "$probe_key" "$probe_version_one" \
+        "$probe_update.copy" "$first_sha" >/dev/null || {
+        echo "BACKUP_STORAGE_BLOCKED:exact_version_get_unavailable" >&2
+        exit 1
+      }
+      if beta_storage_aws put-object --bucket "$BETA_BACKUP_BUCKET" \
+        --key "$probe_key" --body "$probe" --if-none-match '*' \
+        --metadata "sha256=$first_sha" >/dev/null; then
+        echo "BACKUP_STORAGE_BLOCKED:conditional_create_conflict_not_enforced" >&2
+        exit 1
+      fi
+      [[ "${BETA_STORAGE_LAST_ERROR:-}" =~ (PreconditionFailed|ConditionalRequestConflict|412) ]] || {
+        echo "BACKUP_STORAGE_BLOCKED:conditional_create_conflict_unproven" >&2
+        exit 1
+      }
+      printf 'capability-probe-v2\n' >"$probe_update"
+      first_meta=$(mktemp)
+      beta_storage_remote_head "$probe_key" "$first_meta" || {
+        rm -f -- "$first_meta"
+        echo "BACKUP_STORAGE_BLOCKED:conditional_head_unavailable" >&2
+        exit 1
+      }
+      first_etag=$(jq -er '.ETag' "$first_meta")
+      rm -f -- "$first_meta"
+      second=$(beta_storage_provider_put_conditional '' "$probe_key" "$probe_update" \
+        "$first_etag" false) || {
+        echo "BACKUP_STORAGE_BLOCKED:conditional_update_unavailable" >&2
+        exit 1
+      }
+      probe_version_two=$(jq -er '.versionId' <<<"$second") || {
+        echo "BACKUP_STORAGE_BLOCKED:conditional_update_invalid" >&2
+        exit 1
+      }
+      second_sha=$(jq -er '.sha256' <<<"$second")
+      beta_storage_provider_get '' "$probe_key" "$probe_version_two" \
+        "$probe_update.copy" "$second_sha" >/dev/null || {
+        echo "BACKUP_STORAGE_BLOCKED:updated_version_get_unavailable" >&2
+        exit 1
+      }
+      versions=$(beta_storage_aws_list_versions | jq -s '.')
+      jq -e --arg key "$probe_key" --arg one "$probe_version_one" \
+        --arg two "$probe_version_two" '
+        ([.[].Versions[]? | select(.Key==$key and
+          (.VersionId==$one or .VersionId==$two))] | map(.VersionId) | unique | sort)
+        == ([$one,$two] | sort)
+      ' <<<"$versions" >/dev/null || {
+        echo "BACKUP_STORAGE_BLOCKED:version_list_consistency_failed" >&2
+        exit 1
+      }
+      beta_storage_provider_delete '' "$probe_key" "$probe_version_two" ||
+        { echo "BACKUP_STORAGE_BLOCKED:exact_version_delete_unavailable" >&2; exit 1; }
+      beta_storage_provider_delete '' "$probe_key" "$probe_version_one" ||
+        { echo "BACKUP_STORAGE_BLOCKED:exact_version_delete_unavailable" >&2; exit 1; }
+      probe_version_two=''
+      probe_version_one=''
+      rm -f -- "$probe_update.copy"
+      trap - EXIT HUP INT TERM
+      capability_cleanup
+      printf 'storage_capability=reachable bucket_versioning=Enabled lifecycle_pins=protected conditional_create=true conditional_update=true exact_version_get=true exact_version_delete=true list_consistent=true\n'
     fi
     ;;
   provider-put)

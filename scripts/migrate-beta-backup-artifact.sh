@@ -187,14 +187,64 @@ else
   }
   beta_storage_require_local_root "$storage_root" >/dev/null
 fi
-beta_storage_validate_point "$manifest" || {
+source_manifest=$manifest
+source_manifest_sha=$(sha256sum "$source_manifest" | awk '{print $1}')
+manifest_schema=$(jq -er '.schema' "$source_manifest") || {
   echo 'BACKUP_STORAGE_BLOCKED:manifest_invalid' >&2; exit 1;
 }
-
-manifest_digest=$(sha256sum "$manifest" | awk '{print $1}')
-point_id=$(jq -er '.pointId' "$manifest")
-slot=$(jq -er '.slotId' "$manifest")
-captured_at=$(jq -er '.capture.capturedAt' "$manifest")
+if [ "$manifest_schema" = meet-backend/beta-recovery-manifest/v1 ]; then
+  beta_storage_validate_v1_import "$source_manifest" "$source_run_id" \
+    "$GITHUB_REPOSITORY" "$capture_revision" || {
+      echo 'BACKUP_STORAGE_BLOCKED:v1_import_invalid' >&2; exit 1;
+    }
+  point_id=$(jq -er '.recoveryId' "$source_manifest")
+  captured_at=$(date -u -d "$(jq -er '.recoveryPointTime' "$source_manifest")" +%s) || {
+    echo 'BACKUP_STORAGE_BLOCKED:v1_capture_time_invalid' >&2; exit 1;
+  }
+  [[ "$captured_at" =~ ^[0-9]+$ ]] || {
+    echo 'BACKUP_STORAGE_BLOCKED:v1_capture_time_invalid' >&2; exit 1;
+  }
+  slot=$(printf '%010d' "$captured_at")
+  [[ "$slot" =~ ^[0-9]{10}$ ]] || {
+    echo 'BACKUP_STORAGE_BLOCKED:v1_slot_invalid' >&2; exit 1;
+  }
+  runtime_digest=$(jq -cS '.captureRuntime' "$source_manifest" |
+    sha256sum | awk '{print $1}')
+  contract_digest=$(jq -cS '.contracts' "$source_manifest" |
+    sha256sum | awk '{print $1}')
+  proof_digest=$(jq -cnS --argjson database \
+      "$(jq -cS '.databaseProof' "$source_manifest")" \
+      --argjson media "$(jq -cS '.mediaProof' "$source_manifest")" \
+      '{database:$database,media:$media}' |
+    sha256sum | awk '{print $1}')
+  jq -cnS --arg point "$point_id" --arg slot "$slot" \
+    --arg source "$capture_revision" --arg runtime "$capture_revision" \
+    --arg command "$(jq -er '.contracts.tooling' "$source_manifest")" \
+    --arg evidence "$source_manifest_sha" --arg runtimeDigest "$runtime_digest" \
+    --arg contract "$contract_digest" --arg proof "$proof_digest" \
+    --argjson captured "$captured_at" \
+    '{schema:"meet-backend/beta-recovery-point/v2",pointId:$point,slotId:$slot,
+      capture:{capturedAt:$captured,sourceRevision:$source},
+      captureCommandDigest:$command,captureEvidenceDigest:$evidence,
+      captureRuntimeDigest:$runtimeDigest,runtimeRevision:$runtime,
+      contractDigest:$contract,proofDigest:$proof}' \
+    >"$destination_dir/recovery-point.json"
+  jq -cS '.databaseProof' "$source_manifest" \
+    >"$destination_dir/capture-database-proof.json"
+  jq -cS '.mediaProof' "$source_manifest" \
+    >"$destination_dir/capture-media-proof.json"
+  manifest="$destination_dir/recovery-point.json"
+else
+  beta_storage_validate_point "$source_manifest" || {
+    echo 'BACKUP_STORAGE_BLOCKED:manifest_invalid' >&2; exit 1;
+  }
+  point_id=$(jq -er '.pointId' "$source_manifest")
+  slot=$(jq -er '.slotId' "$source_manifest")
+  captured_at=$(jq -er '.capture.capturedAt' "$source_manifest")
+  [ "$capture_revision" = "$(jq -er '.capture.sourceRevision' "$source_manifest")" ] || {
+    echo 'BACKUP_STORAGE_BLOCKED:capture_provenance_changed' >&2; exit 1;
+  }
+fi
 [ "$capture_revision" = "$(jq -er '.capture.sourceRevision' "$manifest")" ] || {
   echo 'BACKUP_STORAGE_BLOCKED:capture_provenance_changed' >&2; exit 1;
 }
@@ -204,26 +254,52 @@ for object in postgres.dump.age uploads.tar.gz.age; do
     [ -s "$source_dir/$object" ] || {
       echo 'BACKUP_STORAGE_BLOCKED:source_ciphertext_missing' >&2; exit 1;
     }
+  if [ "$manifest_schema" = meet-backend/beta-recovery-manifest/v1 ]; then
+    artifact_binding=$(jq -er --arg path "$object" \
+      '.artifactFiles[] | select(.path==$path) | [.size,.sha256] | @tsv' \
+      "$source_manifest") || {
+        echo 'BACKUP_STORAGE_BLOCKED:v1_artifact_binding_missing' >&2; exit 1;
+      }
+    IFS=$'\t' read -r expected_size expected_sha <<<"$artifact_binding"
+    [ "$expected_size" = "$(wc -c <"$source_dir/$object" | tr -d '[:space:]')" ] &&
+      [ "$expected_sha" = "$(sha256sum "$source_dir/$object" | awk '{print $1}')" ] || {
+        echo 'BACKUP_STORAGE_BLOCKED:v1_ciphertext_binding_mismatch' >&2
+        exit 1
+      }
+    source_binding=$(jq -er --arg name "$object" '
+      if $name=="postgres.dump.age" then .source.ciphertexts.database
+      else .source.ciphertexts.uploads end |
+      [.name,.size,.sha256] | @tsv' "$source_manifest") || {
+        echo 'BACKUP_STORAGE_BLOCKED:v1_source_binding_missing' >&2; exit 1;
+      }
+    IFS=$'\t' read -r source_name source_size source_sha <<<"$source_binding"
+    [ "$source_name" = "$object" ] &&
+      [ "$source_size" = "$(wc -c <"$source_dir/$object" | tr -d '[:space:]')" ] &&
+      [ "$source_sha" = "$(sha256sum "$source_dir/$object" | awk '{print $1}')" ] || {
+        echo 'BACKUP_STORAGE_BLOCKED:v1_source_ciphertext_binding_mismatch' >&2
+        exit 1
+      }
+  fi
 done
-if [ -e "$source_dir/capture-database-proof.json" ] ||
-  [ -e "$source_dir/capture-media-proof.json" ]; then
-  [ -s "$source_dir/capture-database-proof.json" ] &&
-    [ -s "$source_dir/capture-media-proof.json" ] || {
-      echo 'BACKUP_STORAGE_BLOCKED:source_proof_pair_incomplete' >&2; exit 1;
+if [ "$manifest_schema" != meet-backend/beta-recovery-manifest/v1 ]; then
+  if [ -e "$source_dir/capture-database-proof.json" ] ||
+    [ -e "$source_dir/capture-media-proof.json" ]; then
+    [ -s "$source_dir/capture-database-proof.json" ] &&
+      [ -s "$source_dir/capture-media-proof.json" ] || {
+        echo 'BACKUP_STORAGE_BLOCKED:source_proof_pair_incomplete' >&2; exit 1;
+      }
+    beta_storage_validate_capture_proof database "$source_dir/capture-database-proof.json" || {
+      echo 'BACKUP_STORAGE_BLOCKED:source_database_proof_invalid' >&2; exit 1;
     }
-  beta_storage_validate_capture_proof database "$source_dir/capture-database-proof.json" || {
-    echo 'BACKUP_STORAGE_BLOCKED:source_database_proof_invalid' >&2; exit 1;
-  }
-  beta_storage_validate_capture_proof media "$source_dir/capture-media-proof.json" || {
-    echo 'BACKUP_STORAGE_BLOCKED:source_media_proof_invalid' >&2; exit 1;
-  }
-  cp -- "$source_dir/capture-database-proof.json" "$destination_dir/"
-  cp -- "$source_dir/capture-media-proof.json" "$destination_dir/"
+    beta_storage_validate_capture_proof media "$source_dir/capture-media-proof.json" || {
+      echo 'BACKUP_STORAGE_BLOCKED:source_media_proof_invalid' >&2; exit 1;
+    }
+    cp -- "$source_dir/capture-database-proof.json" "$destination_dir/"
+    cp -- "$source_dir/capture-media-proof.json" "$destination_dir/"
+  fi
 fi
 source_db_sha=$(sha256sum "$source_dir/postgres.dump.age" | awk '{print $1}')
 source_media_sha=$(sha256sum "$source_dir/uploads.tar.gz.age" | awk '{print $1}')
-source_manifest_sha=$manifest_digest
-
 # The local adapter is deterministic; remote mode commits through the same
 # manifest-last provider publish path and then retrieves exact versions again.
 if [ "$remote" = true ]; then
@@ -244,7 +320,9 @@ else
       --output "$destination_dir/$object" --sha256 "$expected_sha"
   done
 fi
-cp -- "$manifest" "$destination_dir/recovery-point.json"
+if [ "$manifest" != "$destination_dir/recovery-point.json" ]; then
+  cp -- "$manifest" "$destination_dir/recovery-point.json"
+fi
 chmod 600 "$destination_dir"/*
 
 publish_args=(publish --source "$destination_dir" --point-id "$point_id" --slot "$slot"
@@ -328,13 +406,13 @@ jq -e --arg capture "$capture_revision" --arg restore "$restore_revision" \
 ' "$proof_output" >/dev/null || {
   echo 'BACKUP_CUSTODY_BLOCKED:destination_restore_proof_invalid' >&2; exit 1;
 }
-if [ "$remote" = true ]; then
-  beta_storage_remote_commit_capture_head "$point_id" "$captured_at" migration
-fi
-[ "$source_manifest_sha" = "$(sha256sum "$manifest" | awk '{print $1}')" ] &&
+[ "$source_manifest_sha" = "$(sha256sum "$source_manifest" | awk '{print $1}')" ] &&
   [ "$source_db_sha" = "$(sha256sum "$source_dir/postgres.dump.age" | awk '{print $1}')" ] &&
   [ "$source_media_sha" = "$(sha256sum "$source_dir/uploads.tar.gz.age" | awk '{print $1}')" ] ||
   { echo 'BACKUP_STORAGE_BLOCKED:source_changed_during_migration' >&2; exit 1; }
+if [ "$remote" = true ]; then
+  beta_storage_remote_commit_capture_head "$point_id" "$captured_at" migration
+fi
 
 printf 'migration_status=verified destination_point_id=%s destination_descriptor=%s original_capture_at=%s source_preserved=true\n' \
   "$point_id" "$destination_descriptor" "$captured_at"
