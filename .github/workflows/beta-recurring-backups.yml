@@ -153,7 +153,7 @@ jobs:
           scripts/run-beta-recurring-capture.sh \
             --output "$RUNNER_TEMP/recurring-point" \
             --slot "$SLOT" \
-            --captured-at "$(date -u +%s)" \
+            --captured-at 0 \
             --source-revision "$SOURCE_REVISION" \
             --runtime-revision "$RUNTIME_REVISION" \
             --contract-digest "$(sha256sum scripts/run-beta-recurring-capture.sh | awk '{print $1}')" \
@@ -228,7 +228,7 @@ jobs:
       - name: Run exact-version protected drill
         env:
           POINT_ID: ${{ vars.BETA_RECURRING_DRILL_POINT_ID }}
-          APPROVAL_METADATA: ${{ secrets.BETA_RECURRING_APPROVAL_METADATA }}
+          GITHUB_TOKEN: ${{ github.token }}
           CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
           BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}
           BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
@@ -240,7 +240,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "$SCHEDULER_REF"
-          test -n "$POINT_ID" -a -n "$APPROVAL_METADATA" \
+          test -n "$POINT_ID" \
             -a -n "$BETA_BACKUP_BUCKET" -a -n "$BETA_BACKUP_REGION" \
             -a -n "$BETA_BACKUP_ENDPOINT" -a -n "$BETA_BACKUP_BYTE_BUDGET"
           scripts/install-beta-backup-aws.sh
@@ -262,8 +262,10 @@ jobs:
           approval_file="$RUNNER_TEMP/recurring-approval.json"
           scripts/query-beta-recurring-policy.sh --output "$policy_file"
           scripts/query-beta-recurring-ci.sh --sha "$CHECKOUT_SHA" --output "$ci_file"
-          printf '%s' "$APPROVAL_METADATA" >"$approval_file"
-          chmod 600 "$approval_file"
+          scripts/query-beta-recurring-approval.sh \
+            --run-id "${{ github.run_id }}" \
+            --environment closed-beta-recurring-restore \
+            --output "$approval_file"
           scripts/query-beta-recurring-policy.sh --output "$post_policy_file"
           reviewer_login=$(jq -er '.reviewerLogin' "$approval_file")
           reviewer_id=$(jq -er '.reviewerId' "$approval_file")
@@ -283,7 +285,7 @@ jobs:
             --policy-file "$policy_file" --ci-result-file "$ci_file" \
             --post-policy-file "$post_policy_file" \
             --actor "$GITHUB_ACTOR" --reviewer "$reviewer_login" \
-            --reviewer-id "$reviewer_id" --approval-file "$approval_file"
+            --reviewer-id "$reviewer_id"
           protection_body="$RUNNER_TEMP/recurring-restore-protection-body.json"
           protection_file="$RUNNER_TEMP/recurring-restore-protection.json"
           api_evidence_digest=$(jq -er '
@@ -291,12 +293,14 @@ jobs:
               .apiEvidenceDigest] | .[0]
           ' "$post_policy_file")
           jq -cnS --arg reviewer "$reviewer_id" \
-            --arg evidence "$api_evidence_digest" '{
+            --arg evidence "$api_evidence_digest" \
+            --arg approval "$(jq -er '.approvalDigest' "$approval_file")" '{
             schema:"meet-backend/beta-recurring-restore-protection/v2",
             environment:"closed-beta-recurring-restore",
             branchPolicy:"refs/heads/master",reviewerId:$reviewer,
             reviewerRequired:true,preventSelfReview:true,
-            adminBypassAllowed:false,apiEvidenceDigest:$evidence
+            adminBypassAllowed:false,apiEvidenceDigest:$evidence,
+            approvalDigest:$approval
           }' >"$protection_body"
           protection_digest=$(sha256sum "$protection_body" | awk '{print $1}')
           jq --arg digest "$protection_digest" \
@@ -347,7 +351,8 @@ jobs:
             --identity-file "$identity_file" \
             --restore-revision "$CHECKOUT_SHA" --reviewer-id "$reviewer_id" \
             --protection-file "$protection_file" \
-            --protection-digest "$protection_digest"
+            --protection-digest "$protection_digest" \
+            --approval-api-evidence "$RUNNER_TEMP/recurring-approval.json"
           test -s "$receipt"
       - name: Remove restore identity
         if: always()

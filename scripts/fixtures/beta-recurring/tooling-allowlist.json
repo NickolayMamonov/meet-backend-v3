@@ -11,12 +11,12 @@
     {
       "role": "capture",
       "path": "scripts/run-beta-recurring-capture-command.sh",
-      "sha256": "0f22aa4c368b2d963be88ffe25bea1461932eab466191202814453e77aae33ff"
+      "sha256": "650d0dbb0da7e7eb84facbf85afc0eeb53c923fb1330dd7e5d3bc7a1db292a54"
     },
     {
       "role": "restore",
       "path": "scripts/run-beta-recurring-restore-command.sh",
-      "sha256": "8aa201ee38556c6077b862c473ae4992a802d19e9d2a26e4ddf0dce0d2c71c45"
+      "sha256": "4e5488da5ebd7092047e20fbd120e9028e449417eacca3706a6bac907a9f4225"
     }
   ]
 }

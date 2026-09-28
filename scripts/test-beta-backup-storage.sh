@@ -3,13 +3,15 @@ set -euo pipefail
 
 fail() { echo "test-beta-backup-storage.sh: $1" >&2; exit 1; }
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+export BETA_BACKUP_TEST_FIXTURE=true
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 digest=$(printf x | sha256sum | awk '{print $1}')
 capture_command_digest=$(printf capture-command | sha256sum | awk '{print $1}')
 capture_evidence_digest=$(printf capture-evidence | sha256sum | awk '{print $1}')
+capture_runtime_digest=$(printf capture-runtime | sha256sum | awk '{print $1}')
 cat >"$tmp/point.json" <<EOF
-{"capture":{"capturedAt":1790000000,"sourceRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"captureCommandDigest":"$capture_command_digest","captureEvidenceDigest":"$capture_evidence_digest","contractDigest":"$digest","pointId":"slot-1790000000","proofDigest":"$digest","runtimeRevision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","schema":"meet-backend/beta-recovery-point/v2","slotId":"1790000000"}
+{"capture":{"capturedAt":1790000000,"sourceRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"captureCommandDigest":"$capture_command_digest","captureEvidenceDigest":"$capture_evidence_digest","captureRuntimeDigest":"$capture_runtime_digest","contractDigest":"$digest","pointId":"slot-1790000000","proofDigest":"$digest","runtimeRevision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","schema":"meet-backend/beta-recovery-point/v2","slotId":"1790000000"}
 EOF
 "$root/scripts/run-beta-backup-storage.sh" validate-point --file "$tmp/point.json" >/dev/null ||
   fail "valid point rejected"
@@ -77,6 +79,7 @@ jq -cnS --arg descriptor "$descriptor_digest" \
     captureRevision:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     restoreRevision:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     capturedAt:1790000000,pointDescriptorDigest:$descriptor,
+    approvalDigest:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     protectionDigest:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     identityCustody:"restore-only",isolated:true,databaseProbe:true,
     mediaProbe:true,cleanup:true,
@@ -90,6 +93,7 @@ jq -cnS --arg descriptor "$descriptor_digest" --arg command "$capture_command_di
     pointId:"slot-1790000000",captureRevision:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     restoreRevision:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     captureAt:1790000000,captureCommandDigest:$command,pointDescriptorDigest:$descriptor,
+    approvalDigest:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     protectionDigest:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     reviewerId:"reviewer-1",proofDigest:$proof,
     verifiedCapturedAt:1790000000}' >"$tmp/receipt.json"
@@ -305,7 +309,7 @@ BETA_BACKUP_TEST_FIXTURE=true PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-m
   --deadman-url https://deadman.invalid --deadman-provider curl \
   --deadman-method POST --deadman-timeout 30 >/dev/null ||
   fail "monitor delivery failed"
-if PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
+if BETA_BACKUP_TEST_FIXTURE=false PATH="$tmp:$PATH" "$root/scripts/run-beta-backup-monitor.sh" --storage-root "$tmp/storage" \
   --environment closed-beta --now 1790000001 --receiver-root "$tmp/receiver" \
   --incident-state "$tmp/incident-arbitrary.json" --incident-command "$tmp/incident.sh" \
   --deadman-url https://deadman.invalid --deadman-provider curl \

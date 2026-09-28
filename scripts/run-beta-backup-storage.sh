@@ -9,6 +9,13 @@ usage() {
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=beta-backup-storage.sh
 source "$script_dir/beta-backup-storage.sh"
+require_fixture_root() {
+  local root=$1
+  [ -z "$root" ] || [ "${BETA_BACKUP_TEST_FIXTURE:-false}" = true ] || {
+    echo 'BACKUP_STORAGE_BLOCKED:local_authority_fixture_only' >&2
+    exit 1
+  }
+}
 operation=${1:-}
 shift || true
 
@@ -37,6 +44,7 @@ case "$operation" in
     beta_storage_require_config
     if [ -n "${BETA_BACKUP_STORAGE_ROOT:-}" ]; then
       root=$(local_root)
+      require_fixture_root "$root"
       [ -d "$root/points" ] && [ -d "$root/receipts" ] && [ -d "$root/control" ] ||
         { echo "BACKUP_STORAGE_BLOCKED:storage_layout_invalid" >&2; exit 1; }
       printf 'storage_capability=local-versioned-writer conditional_lock=true manifest_last=true\n'
@@ -92,6 +100,7 @@ case "$operation" in
       echo 'BACKUP_STORAGE_BLOCKED:generic_remote_write_forbidden' >&2
       exit 1
     }
+    require_fixture_root "$root"
     beta_storage_require_local_root "$root" >/dev/null
     result=$(beta_storage_provider_put "$root" "$key" "$source")
     printf 'storage_provider_put=%s\n' "$result"
@@ -110,6 +119,7 @@ case "$operation" in
     done
     [ -n "$key" ] && [ -n "$version" ] && [ -n "$destination" ] || usage
     [[ -z "$expected_sha" || "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || usage
+    require_fixture_root "$root"
     beta_storage_provider_get "$root" "$key" "$version" "$destination" "$expected_sha"
     printf 'storage_provider_get=verified key=%s version=%s\n' "$key" "$version"
     ;;
@@ -128,6 +138,7 @@ case "$operation" in
       echo 'BACKUP_STORAGE_BLOCKED:generic_remote_delete_forbidden' >&2
       exit 1
     }
+    require_fixture_root "$root"
     beta_storage_require_local_root "$root" >/dev/null
     beta_storage_provider_delete "$root" "$key" "$version"
     printf 'storage_provider_delete=committed key=%s version=%s\n' "$key" "$version"
@@ -136,6 +147,8 @@ case "$operation" in
     root=${BETA_BACKUP_STORAGE_ROOT:-}
     if [ "$#" -eq 2 ] && [ "$1" = --storage-root ]; then root=$2; else [ "$#" -eq 0 ] || usage; fi
     if [ -n "$root" ]; then
+      require_fixture_root "$root"
+      beta_storage_require_local_root "$root" >/dev/null
       beta_storage_local_provider_list "$root" | jq -s .
     else
       beta_storage_aws_list_versions | jq -s '
@@ -157,6 +170,7 @@ case "$operation" in
       esac
     done
     if [ -n "$root" ]; then
+      require_fixture_root "$root"
       beta_storage_require_local_root "$root" >/dev/null
       beta_storage_publish_local "$source_dir" "$root" "$point_id" "$slot" "$captured_at" "$owner"
     else
@@ -180,6 +194,7 @@ case "$operation" in
       esac
     done
     if [ -n "$root" ]; then
+      require_fixture_root "$root"
       beta_storage_require_local_root "$root" >/dev/null
       beta_storage_promote_local "$receipt" "$root" "$owner"
     else
@@ -222,6 +237,7 @@ case "$operation" in
     done
     [ -n "$now" ] || usage
     if [ -n "$root" ]; then
+      require_fixture_root "$root"
       beta_storage_require_local_root "$root" >/dev/null
       beta_storage_prune_local "$root" "$now" "$owner"
     else
@@ -241,6 +257,7 @@ case "$operation" in
       usage
     fi
     if [ -n "$root" ]; then
+      require_fixture_root "$root"
       beta_storage_require_local_root "$root" >/dev/null
       beta_storage_reconcile_local "$root"
     else

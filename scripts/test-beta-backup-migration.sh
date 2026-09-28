@@ -3,6 +3,7 @@ set -euo pipefail
 
 fail() { echo "test-beta-backup-migration.sh: $1" >&2; exit 1; }
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+export BETA_BACKUP_TEST_FIXTURE=true
 tmp=$(mktemp -d)
 trap 'rm -r -- "$tmp"' EXIT HUP INT TERM
 
@@ -20,8 +21,9 @@ capture_command=$(printf reviewed-capture | sha256sum | awk '{print $1}')
 evidence_digest=$(printf reviewed-evidence | sha256sum | awk '{print $1}')
 contract_digest=$(printf reviewed-contract | sha256sum | awk '{print $1}')
 proof_digest=$(printf reviewed-proof | sha256sum | awk '{print $1}')
+runtime_digest=$(printf reviewed-runtime | sha256sum | awk '{print $1}')
 cat >"$source_dir/recovery-point.json" <<EOF
-{"capture":{"capturedAt":1790000000,"sourceRevision":"$source_revision"},"captureCommandDigest":"$capture_command","captureEvidenceDigest":"$evidence_digest","contractDigest":"$contract_digest","pointId":"slot-1790000000","proofDigest":"$proof_digest","runtimeRevision":"$restore_revision","schema":"meet-backend/beta-recovery-point/v2","slotId":"1790000000"}
+{"capture":{"capturedAt":1790000000,"sourceRevision":"$source_revision"},"captureCommandDigest":"$capture_command","captureEvidenceDigest":"$evidence_digest","captureRuntimeDigest":"$runtime_digest","contractDigest":"$contract_digest","pointId":"slot-1790000000","proofDigest":"$proof_digest","runtimeRevision":"$restore_revision","schema":"meet-backend/beta-recovery-point/v2","slotId":"1790000000"}
 EOF
 cp -- "$source_dir/recovery-point.json" "$tmp/original-manifest.json"
 cat >"$tmp/restore-command.sh" <<'EOF'

@@ -10,6 +10,17 @@ source_dir='' destination_dir='' manifest='' storage_root=''
 restore_command='' restore_output='' identity='' capture_revision=''
 restore_revision='' proof_output='' source_artifact_id='' source_run_id=''
 remote=false
+source_tmp=''
+remote_scratch=''
+cleanup_source_auth() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  [ -z "$source_tmp" ] || rm -rf -- "$source_tmp" || status=1
+  [ -z "$remote_scratch" ] || rm -rf -- "$remote_scratch" || status=1
+  [ -z "$identity" ] || rm -f -- "$identity" || status=1
+  exit "$status"
+}
+trap cleanup_source_auth EXIT HUP INT TERM
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --source) [ "$#" -ge 2 ] || usage; source_dir=$2; shift 2 ;;
@@ -40,18 +51,6 @@ done
   "$restore_revision" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$source_artifact_id" =~ ^[1-9][0-9]*$ &&
   "$source_run_id" =~ ^[1-9][0-9]*$ ]] || usage
-
-source_tmp=''
-remote_scratch=''
-cleanup_source_auth() {
-  local status=$?
-  trap - EXIT HUP INT TERM
-  [ -z "$source_tmp" ] || rm -rf -- "$source_tmp" || status=1
-  [ -z "$remote_scratch" ] || rm -rf -- "$remote_scratch" || status=1
-  [ -z "$identity" ] || rm -f -- "$identity" || status=1
-  exit "$status"
-}
-trap cleanup_source_auth EXIT HUP INT TERM
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
@@ -179,8 +178,15 @@ while IFS= read -r source_file; do
 done <<<"$source_files"
 # shellcheck source=beta-backup-storage.sh
 source "$script_dir/beta-backup-storage.sh"
-[ "$remote" = true ] && beta_storage_require_config ||
+if [ "$remote" = true ]; then
+  beta_storage_require_config
+else
+  [ "${BETA_BACKUP_TEST_FIXTURE:-false}" = true ] || {
+    echo 'BACKUP_STORAGE_BLOCKED:local_authority_fixture_only' >&2
+    exit 1
+  }
   beta_storage_require_local_root "$storage_root" >/dev/null
+fi
 beta_storage_validate_point "$manifest" || {
   echo 'BACKUP_STORAGE_BLOCKED:manifest_invalid' >&2; exit 1;
 }
@@ -244,7 +250,12 @@ chmod 600 "$destination_dir"/*
 publish_args=(publish --source "$destination_dir" --point-id "$point_id" --slot "$slot"
   --captured-at "$captured_at" --owner migration)
 [ "$remote" = true ] || publish_args+=(--storage-root "$storage_root")
-"$script_dir/run-beta-backup-storage.sh" "${publish_args[@]}"
+if [ "$remote" = true ]; then
+  BETA_STORAGE_DEFER_CAPTURE_HEAD=true \
+    "$script_dir/run-beta-backup-storage.sh" "${publish_args[@]}"
+else
+  "$script_dir/run-beta-backup-storage.sh" "${publish_args[@]}"
+fi
 if [ "$remote" = true ]; then
   beta_storage_remote_head "points/$point_id/point.json" \
     "$remote_scratch/descriptor.meta"
@@ -317,6 +328,9 @@ jq -e --arg capture "$capture_revision" --arg restore "$restore_revision" \
 ' "$proof_output" >/dev/null || {
   echo 'BACKUP_CUSTODY_BLOCKED:destination_restore_proof_invalid' >&2; exit 1;
 }
+if [ "$remote" = true ]; then
+  beta_storage_remote_commit_capture_head "$point_id" "$captured_at" migration
+fi
 [ "$source_manifest_sha" = "$(sha256sum "$manifest" | awk '{print $1}')" ] &&
   [ "$source_db_sha" = "$(sha256sum "$source_dir/postgres.dump.age" | awk '{print $1}')" ] &&
   [ "$source_media_sha" = "$(sha256sum "$source_dir/uploads.tar.gz.age" | awk '{print $1}')" ] ||

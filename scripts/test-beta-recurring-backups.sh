@@ -3,6 +3,7 @@ set -euo pipefail
 
 fail() { echo "test-beta-recurring-backups.sh: $1" >&2; exit 1; }
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+export BETA_BACKUP_TEST_FIXTURE=true
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
 
@@ -166,6 +167,7 @@ while [ "$#" -gt 0 ]; do
     --capture-revision) capture=$2; shift 2 ;;
     --restore-revision) restore=$2; shift 2 ;;
     --protection-digest) protection=$2; shift 2 ;;
+    --approval-digest) approval=$2; shift 2 ;;
     *) exit 2 ;;
   esac
 done
@@ -177,9 +179,11 @@ fingerprint=$(printf 'isolated-runtime\n' | sha256sum | awk '{print $1}')
 jq -cnS --arg capture "$capture" --arg restore "$restore" \
   --arg descriptor "$descriptor" --argjson captured "$captured" \
   --arg fingerprint "$fingerprint" --arg protection "$protection" \
+  --arg approval "$approval" \
   '{schema:"meet-backend/beta-recurring-restore-proof/v2",
     captureRevision:$capture,restoreRevision:$restore,capturedAt:$captured,
     pointDescriptorDigest:$descriptor,protectionDigest:$protection,
+    approvalDigest:$approval,
     identityCustody:"restore-only",
     isolated:true,databaseProbe:true,mediaProbe:true,cleanup:true,
     preFingerprint:$fingerprint,postFingerprint:$fingerprint}' >"$proof"
@@ -188,28 +192,44 @@ chmod 755 "$tmp/restore-command.sh"
 printf 'private restore identity\n' >"$tmp/identity"
 protection_body="$tmp/protection-body.json"
 protection="$tmp/protection.json"
-jq -cnS --arg reviewer reviewer-1 \
+jq -cnS --arg reviewer 1 \
   '{schema:"meet-backend/beta-recurring-restore-protection/v2",environment:"closed-beta-recurring-restore",
     branchPolicy:"refs/heads/master",reviewerId:$reviewer,
     reviewerRequired:true,preventSelfReview:true,adminBypassAllowed:false,
-    apiEvidenceDigest:("e" * 64)}' >"$protection_body"
+    apiEvidenceDigest:("e" * 64),approvalDigest:("a" * 64)}' >"$protection_body"
 protection_digest=$(sha256sum "$protection_body" | awk '{print $1}')
 jq --arg digest "$protection_digest" '. + {protectionDigest:$digest}' \
   "$protection_body" >"$protection"
 drill_receipt="$tmp/protected-receipt.json"
+approval_file="$tmp/approval-api.json"
+jq -cn '[{id:1,user:{id:1,login:"reviewer"},state:"approved",
+  environments:[{name:"closed-beta-recurring-restore"}]}]' \
+  >"$tmp/approval-response.json"
+"$root/scripts/query-beta-recurring-approval.sh" --run-id 1 \
+  --environment closed-beta-recurring-restore --reviewer-id 1 \
+  --response-file "$tmp/approval-response.json" --output "$approval_file" ||
+  fail "approval API evidence adapter rejected the authenticated fixture"
+approval_digest=$(jq -er '.approvalDigest' "$approval_file")
+jq -cS --arg approval "$approval_digest" \
+  '.approvalDigest=$approval' "$protection_body" >"$tmp/protection-body-with-approval.json"
+mv -- "$tmp/protection-body-with-approval.json" "$protection_body"
+protection_digest=$(sha256sum "$protection_body" | awk '{print $1}')
+jq --arg digest "$protection_digest" '. + {protectionDigest:$digest}' \
+  "$protection_body" >"$protection"
 BETA_BACKUP_TEST_FIXTURE=true "$root/scripts/run-beta-recurring-drill.sh" \
   --storage-root "$tmp/storage" --point-id slot-1790000000 --receipt "$drill_receipt" \
   --restore-command "$tmp/restore-command.sh" --restore-output "$tmp/restore-output" \
   --identity-file "$tmp/identity" --capture-revision "$good_master" \
-  --restore-revision "$good_tooling" --reviewer-id reviewer-1 \
-  --protection-file "$protection" --protection-digest "$protection_digest" ||
+  --restore-revision "$good_tooling" --reviewer-id 1 \
+  --protection-file "$protection" --protection-digest "$protection_digest" \
+  --approval-api-evidence "$approval_file" ||
   fail "generated protected restore proof was rejected"
 rm -f -- "$tmp/$(jq -er '.receiptId' "$drill_receipt").proof.json"
 if "$root/scripts/run-beta-recurring-drill.sh" \
   --storage-root "$tmp/storage" --point-id slot-1790000000 --receipt "$tmp/forged-command-receipt" \
   --restore-command "$tmp/restore-command.sh" --restore-output "$tmp/forged-output" \
   --identity-file "$tmp/identity" --capture-revision "$good_master" \
-  --restore-revision "$good_tooling" --reviewer-id reviewer-1 \
+  --restore-revision "$good_tooling" --reviewer-id 1 \
   --protection-file "$protection" --protection-digest "$protection_digest" >/dev/null 2>&1; then
   fail "arbitrary standalone restore command was accepted"
 fi

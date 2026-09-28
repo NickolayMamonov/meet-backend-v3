@@ -124,6 +124,13 @@ if [ -z "$storage_root" ]; then
     exit 1
   }
   export BETA_BACKUP_CAPTURE_FILE_LIMIT_BYTES="$capture_file_limit"
+else
+  [ "${BETA_BACKUP_TEST_FIXTURE:-false}" = true ] || {
+    echo 'BACKUP_CAPTURE_BLOCKED:local_authority_fixture_only' >&2
+    exit 1
+  }
+  # shellcheck source=beta-backup-storage.sh
+  source "$script_dir/beta-backup-storage.sh"
 fi
 capture_digest=$(sha256sum "$capture_command" | awk '{print $1}')
 timeout --foreground --signal=TERM 900s "$capture_command" \
@@ -196,6 +203,64 @@ if [ "$source_schema" = meet-backend/beta-recurring-capture-source/v1 ]; then
   }
   encrypt_age_file "$db_ciphertext" "$capture_output/postgres.dump"
   encrypt_age_file "$media_ciphertext" "$capture_output/uploads.tar.gz"
+elif [ "$source_schema" = meet-backend/beta-recurring-capture-source/v2 ]; then
+  jq -e \
+    --arg slot "$slot" --arg source "$source_revision" --arg command "$capture_digest" '
+    type=="object" and
+    (keys|sort)==["captureCommandDigest","captureHostFingerprint",
+      "captureRuntimeDigest","captureTransport","capturedAt","database",
+      "media","remoteCaptureDigest","schema","slotId","sourceRevision"] and
+    .schema=="meet-backend/beta-recurring-capture-source/v2" and
+    .slotId==$slot and .sourceRevision==$source and
+    .captureCommandDigest==$command and
+    (.capturedAt|type=="number" and floor==. and .>=0) and
+    .captureTransport=="ssh-host-key-verified-v1" and
+    (.captureHostFingerprint|type=="string" and test("^SHA256:[A-Za-z0-9+/=]+$")) and
+    (.remoteCaptureDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.captureRuntimeDigest|type=="string" and test("^[0-9a-f]{64}$")) and
+    all(.database,.media; type=="object" and
+      (keys|sort)==["length","name","sha256"] and
+      (.name|type=="string") and (.length|type=="number" and floor==. and .>0) and
+      (.sha256|type=="string" and test("^[0-9a-f]{64}$")))
+  ' "$source_manifest" >/dev/null || {
+    echo 'BACKUP_CAPTURE_BLOCKED:preencrypted_capture_evidence_invalid' >&2
+    exit 1
+  }
+  captured_at=$(jq -er '.capturedAt' "$source_manifest")
+  [ "$captured_at" -gt 0 ] || {
+    echo 'BACKUP_CAPTURE_BLOCKED:authoritative_capture_time_missing' >&2
+    exit 1
+  }
+  [ "$captured_at" -le "$(date -u +%s)" ] || {
+    echo 'BACKUP_CAPTURE_BLOCKED:authoritative_capture_time_future' >&2
+    exit 1
+  }
+  [ "$(jq -er '.database.name' "$source_manifest")" = postgres.dump.age ] &&
+    [ "$(jq -er '.media.name' "$source_manifest")" = uploads.tar.gz.age ] || {
+      echo 'BACKUP_CAPTURE_BLOCKED:preencrypted_capture_name_invalid' >&2
+      exit 1
+    }
+  for spec in database:postgres.dump.age media:uploads.tar.gz.age; do
+    kind=${spec%%:*}; name=${spec#*:}
+    file="$capture_output/$name"
+    [ -s "$file" ] && [ ! -L "$file" ] || {
+      echo "BACKUP_CAPTURE_BLOCKED:generated_${name}_missing" >&2
+      exit 1
+    }
+    head -n 1 "$file" | grep -Fxq 'age-encryption.org/v1' || {
+      echo 'BACKUP_CAPTURE_BLOCKED:generated_ciphertext_invalid' >&2
+      exit 1
+    }
+    actual_length=$(wc -c <"$file" | tr -d '[:space:]')
+    actual_sha=$(sha256sum "$file" | awk '{print $1}')
+    [ "$actual_length" = "$(jq -er ".$kind.length" "$source_manifest")" ] &&
+      [ "$actual_sha" = "$(jq -er ".$kind.sha256" "$source_manifest")" ] || {
+        echo 'BACKUP_CAPTURE_BLOCKED:preencrypted_capture_mismatch' >&2
+        exit 1
+      }
+  done
+  cp -- "$capture_output/postgres.dump.age" "$db_ciphertext"
+  cp -- "$capture_output/uploads.tar.gz.age" "$media_ciphertext"
 elif [ "$source_schema" = meet-backend/beta-recovery-capture/v1 ]; then
   jq -e \
     --arg slot "$slot" --argjson captured "$captured_at" --arg command "$capture_digest" '
@@ -243,6 +308,10 @@ for ciphertext in "$db_ciphertext" "$media_ciphertext"; do
 done
 
 source_digest=$(sha256sum "$source_manifest" | awk '{print $1}')
+runtime_capture_digest=$(jq -er '.captureRuntimeDigest // empty' \
+  "$source_manifest" 2>/dev/null) ||
+  runtime_capture_digest=$(printf '%s' absent-capture-runtime |
+    sha256sum | awk '{print $1}')
 tmp=$(mktemp "$output/.recovery-point.XXXXXX")
 trap cleanup_capture EXIT HUP INT TERM
 jq -cnS \
@@ -250,9 +319,11 @@ jq -cnS \
   --arg command "$capture_digest" --arg evidence "$source_digest" \
   --argjson captured "$captured_at" --arg contract "$contract_digest" \
   --arg proof "$proof_digest" \
+  --arg runtimeCapture "$runtime_capture_digest" \
   '{schema:"meet-backend/beta-recovery-point/v2",pointId:("slot-"+$slot),slotId:$slot,
     capture:{capturedAt:$captured,sourceRevision:$source},
     captureCommandDigest:$command,captureEvidenceDigest:$evidence,
+    captureRuntimeDigest:$runtimeCapture,
     runtimeRevision:$runtime,contractDigest:$contract,proofDigest:$proof}' >"$tmp"
 mv -f -- "$tmp" "$output/recovery-point.json"
 chmod 600 "$output/recovery-point.json"

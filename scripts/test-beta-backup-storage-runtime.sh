@@ -50,7 +50,8 @@ jq -cnS --argjson captured "$captured_at" --arg slot "$slot" \
   --arg contract "$digest" --arg proof "$digest" \
   '{schema:"meet-backend/beta-recovery-point/v2",pointId:("runtime-"+$slot),
     slotId:$slot,capture:{capturedAt:$captured,sourceRevision:$source},
-    runtimeRevision:$runtime,captureCommandDigest:$command,
+    runtimeRevision:$runtime,captureRuntimeDigest:$command,
+    captureCommandDigest:$command,
     captureEvidenceDigest:$evidence,contractDigest:$contract,proofDigest:$proof}' \
   >"$point/recovery-point.json"
 

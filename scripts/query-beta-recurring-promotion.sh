@@ -193,6 +193,11 @@ reviewer_approved=$(jq -e --argjson reviewer "$reviewer_id" '
   echo 'BACKUP_CUSTODY_BLOCKED:reviewer_approval_missing' >&2
   exit 1
 }
+"$script_dir/query-beta-recurring-approval.sh" \
+  --run-id "$run_id" --environment closed-beta-recurring-restore \
+  --reviewer-id "$reviewer_id" --response-file "$tmp/approvals" \
+  --output "$tmp/approval.json"
+approval_digest=$(jq -er '.approvalDigest' "$tmp/approval.json")
 receipt_digest=$(sha256sum "$receipt" | awk '{print $1}')
 probe_digest=$(sha256sum "$probe_binding" | awk '{print $1}')
 receipt_artifact_id=$(jq -er '.id' <<<"$receipt_artifact")
@@ -289,14 +294,15 @@ protection_api_evidence_digest=$(
 policy_digest=${BETA_RECURRING_POLICY_DIGEST:-}
 protection_body=$(
   jq -cS -n --arg reviewer "$reviewer_id" \
-    --arg evidence "$protection_api_evidence_digest" '
+    --arg evidence "$protection_api_evidence_digest" \
+    --arg approval "$approval_digest" '
     {schema:"meet-backend/beta-recurring-restore-protection/v2",
      environment:"closed-beta-recurring-restore",
      branchPolicy:"refs/heads/master",reviewerId:$reviewer,
      reviewerRequired:true,preventSelfReview:true,adminBypassAllowed:false,
-     apiEvidenceDigest:$evidence}'
+     apiEvidenceDigest:$evidence,approvalDigest:$approval}'
 )
-protection_digest=$(printf '%s' "$protection_body" |
+protection_digest=$(printf '%s\n' "$protection_body" |
   sha256sum | awk '{print $1}')
 [[ "$policy_digest" =~ ^[0-9a-f]{64}$ ]] || {
   echo 'BACKUP_CUSTODY_BLOCKED:policy_digest_missing' >&2
@@ -309,6 +315,7 @@ jq -cnS --argjson run "$run_id" --argjson restore "$restore_job_id" \
   --arg postArtifact "$post_artifact_digest" --arg policy "$policy_digest" \
   --argjson postArtifactId "$post_artifact_id" \
   --arg evidence "$api_evidence_digest" --arg protection "$protection_digest" \
+  --arg approval "$approval_digest" \
   --arg adapterDigest "$(sha256sum "$script_dir/query-beta-recurring-promotion.sh" | awk '{print $1}')" \
   --arg receiptProtection "$(jq -er '.protectionDigest' "$receipt")" \
   --argjson protectedRestore "$protected_restore" \
@@ -320,6 +327,7 @@ jq -cnS --argjson run "$run_id" --argjson restore "$restore_job_id" \
     postProbeArtifactId:$postArtifactId,postProbeArtifactDigest:$postArtifact,
     policyDigest:$policy,protectionDigest:$protection,
     receiptProtectionDigest:$receiptProtection,apiEvidenceDigest:$evidence,
+    approvalDigest:$approval,
     adapter:"scripts/query-beta-recurring-promotion.sh",adapterDigest:$adapterDigest,
     runRef:"refs/heads/master",environment:"closed-beta-recurring-restore",
     protectedRestore:$protectedRestore,postProbeSuccessful:$postProbeSuccessful}' |

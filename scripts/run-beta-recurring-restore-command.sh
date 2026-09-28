@@ -2,12 +2,13 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --point-dir DIR --identity-file PATH --output-dir DIR --capture-revision SHA --restore-revision SHA --protection-digest DIGEST --proof-output PATH" >&2
+  echo "usage: $0 --point-dir DIR --identity-file PATH --output-dir DIR --capture-revision SHA --restore-revision SHA --protection-digest DIGEST --approval-digest DIGEST --proof-output PATH" >&2
   exit 2
 }
 
 point='' identity='' output='' capture_revision='' restore_revision=''
 protection_digest='' proof_output=''
+approval_digest=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --point-dir) [ "$#" -ge 2 ] || usage; point=$2; shift 2 ;;
@@ -16,6 +17,7 @@ while [ "$#" -gt 0 ]; do
     --capture-revision) [ "$#" -ge 2 ] || usage; capture_revision=$2; shift 2 ;;
     --restore-revision) [ "$#" -ge 2 ] || usage; restore_revision=$2; shift 2 ;;
     --protection-digest) [ "$#" -ge 2 ] || usage; protection_digest=$2; shift 2 ;;
+    --approval-digest) [ "$#" -ge 2 ] || usage; approval_digest=$2; shift 2 ;;
     --proof-output) [ "$#" -ge 2 ] || usage; proof_output=$2; shift 2 ;;
     *) usage ;;
   esac
@@ -24,7 +26,8 @@ for path in "$point" "$identity" "$output" "$proof_output"; do
   [[ "$path" = /* && "$path" != *..* && "$path" != *$'\n'* ]] || usage
 done
 [[ "$capture_revision" =~ ^[0-9a-f]{40}$ && "$restore_revision" =~ ^[0-9a-f]{40}$ ]] || usage
-[[ "$protection_digest" =~ ^[0-9a-f]{64}$ ]] || usage
+[[ "$protection_digest" =~ ^[0-9a-f]{64}$ &&
+  "$approval_digest" =~ ^[0-9a-f]{64}$ ]] || usage
 [ -d "$point" ] && [ ! -L "$point" ] || usage
 [ -f "$point/recovery-point.json" ] && [ ! -L "$point/recovery-point.json" ] || usage
 [ -f "$point/postgres.dump.age" ] && [ ! -L "$point/postgres.dump.age" ] || usage
@@ -160,11 +163,13 @@ post_fingerprint=$(proof_fingerprint \
 }
 jq -cnS --arg capture "$capture_revision" --arg restore "$restore_revision" \
   --arg descriptor "$descriptor_digest" --arg protection "$protection_digest" \
+  --arg approval "$approval_digest" \
   --arg pre "$pre_fingerprint" --arg post "$post_fingerprint" \
   --argjson captured "$captured" \
   '{schema:"meet-backend/beta-recurring-restore-proof/v2",
     captureRevision:$capture,restoreRevision:$restore,capturedAt:$captured,
     pointDescriptorDigest:$descriptor,protectionDigest:$protection,
+    approvalDigest:$approval,
     identityCustody:"restore-only",isolated:true,databaseProbe:true,
     mediaProbe:true,cleanup:true,preFingerprint:$pre,postFingerprint:$post}' >"$proof_output"
 chmod 600 "$proof_output"
