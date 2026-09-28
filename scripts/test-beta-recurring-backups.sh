@@ -247,12 +247,15 @@ EOF
     (
       export CAPTURE_SOURCE_REVISION="$good_master"
       export EXPECTED_CAPTURE_COMMAND_DIGEST="$signal_capture_digest"
-      exec "$root/scripts/run-beta-recurring-capture.sh" \
+      exec setsid "$root/scripts/run-beta-recurring-capture.sh" \
         "${signal_args[@]}" \
         --output "$tmp/point-signal-$signal_name" \
         --capture-output "$tmp/source-signal-$signal_name"
     ) >/dev/null 2>&1 &
     signal_pid=$!
+    signal_pgid=$(ps -o pgid= -p "$signal_pid" | tr -d '[:space:]')
+    [ "$signal_pgid" = "$signal_pid" ] ||
+      fail "signal fixture did not create an isolated process group: $signal_name"
     signal_ready_seen=false
     for _ in $(seq 1 100); do
       if [ -f "$signal_ready" ]; then
@@ -263,7 +266,7 @@ EOF
     done
     [ "$signal_ready_seen" = true ] ||
       fail "signal fixture did not reach capture: $signal_name"
-    kill -"$signal_number" "$signal_pid" 2>/dev/null || true
+    kill -"$signal_number" -- "-$signal_pgid" 2>/dev/null || true
     set +e
     wait "$signal_pid"
     signal_status=$?
