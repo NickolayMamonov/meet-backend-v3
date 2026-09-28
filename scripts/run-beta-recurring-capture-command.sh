@@ -34,7 +34,7 @@ done
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cleanup_capture_runner_temp() {
-  local status=$?
+  local status=${1:-$?}
   trap - EXIT HUP INT TERM
   rm -f -- "$RUNNER_TEMP/postgres.dump.age" \
     "$RUNNER_TEMP/uploads.tar.gz.age" \
@@ -48,9 +48,12 @@ cleanup_capture_runner_temp() {
   if [ "$status" -ne 0 ]; then
     rm -f -- "$output"/* 2>/dev/null || status=1
   fi
-  return "$status"
+  exit "$status"
 }
-trap cleanup_capture_runner_temp EXIT HUP INT TERM
+trap 'cleanup_capture_runner_temp "$?"' EXIT
+trap 'cleanup_capture_runner_temp 129' HUP
+trap 'cleanup_capture_runner_temp 130' INT
+trap 'cleanup_capture_runner_temp 143' TERM
 install -d -m 700 "$output"
 AGE_RECIPIENT="$BETA_RECURRING_AGE_RECIPIENT" \
   PUBLIC_URL="$BETA_RECURRING_PUBLIC_URL" \

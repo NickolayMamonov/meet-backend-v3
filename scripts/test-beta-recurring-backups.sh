@@ -165,6 +165,126 @@ fi
 [ ! -e "$tmp/point-failure" ] && [ ! -e "$tmp/source-failure" ] ||
   fail "capture failure left owned staging artifacts"
 
+grep -Fq "trap 'cleanup_capture \"\$?\"' EXIT" \
+  "$root/scripts/run-beta-recurring-capture.sh" ||
+  fail "outer capture does not preserve EXIT status"
+for signal_trap in \
+  "trap 'cleanup_capture 129' HUP" \
+  "trap 'cleanup_capture 130' INT" \
+  "trap 'cleanup_capture 143' TERM"; do
+  grep -Fq "$signal_trap" "$root/scripts/run-beta-recurring-capture.sh" ||
+    fail "outer capture does not fence signal termination: $signal_trap"
+done
+grep -Fq "trap 'cleanup_capture_runner_temp \"\$?\"' EXIT" \
+  "$root/scripts/run-beta-recurring-capture-command.sh" ||
+  fail "runner capture does not preserve EXIT status"
+for signal_trap in \
+  "trap 'cleanup_capture_runner_temp 129' HUP" \
+  "trap 'cleanup_capture_runner_temp 130' INT" \
+  "trap 'cleanup_capture_runner_temp 143' TERM"; do
+  grep -Fq "$signal_trap" "$root/scripts/run-beta-recurring-capture-command.sh" ||
+    fail "runner capture does not fence signal termination: $signal_trap"
+done
+
+if [ "$(uname -s)" = Linux ]; then
+  cat >"$tmp/signal-capture-source.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output='' slot='' captured=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-dir) output=$2; shift 2 ;;
+    --slot) slot=$2; shift 2 ;;
+    --captured-at) captured=$2; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+mkdir -p "$output"
+printf 'signal database capture\n' >"$output/postgres.dump"
+printf 'signal media capture\n' >"$output/uploads.tar.gz"
+db_sha=$(sha256sum "$output/postgres.dump" | awk '{print $1}')
+media_sha=$(sha256sum "$output/uploads.tar.gz" | awk '{print $1}')
+jq -cnS --arg slot "$slot" --arg source "$CAPTURE_SOURCE_REVISION" \
+  --arg command "$EXPECTED_CAPTURE_COMMAND_DIGEST" --argjson captured "$captured" \
+  --arg db_sha "$db_sha" --arg media_sha "$media_sha" \
+  --argjson db_len "$(wc -c <"$output/postgres.dump")" \
+  --argjson media_len "$(wc -c <"$output/uploads.tar.gz")" \
+  '{schema:"meet-backend/beta-recurring-capture-source/v1",slotId:$slot,
+    capturedAt:$captured,sourceRevision:$source,captureCommandDigest:$command,
+    database:{length:$db_len,sha256:$db_sha},media:{length:$media_len,sha256:$media_sha}}' \
+  >"$output/capture-result.json"
+printf '%s\n' "$$" >"$SIGNAL_CHILD_PID_FILE"
+: >"$SIGNAL_READY_FILE"
+finish() {
+  rm -f -- "$SIGNAL_READY_FILE"
+  exit 143
+}
+trap finish HUP INT TERM
+while :; do sleep 1; done
+EOF
+  chmod 755 "$tmp/signal-capture-source.sh"
+  signal_capture_digest=$(sha256sum "$tmp/signal-capture-source.sh" | awk '{print $1}')
+  signal_args=(
+    --output "$tmp/point-signal" --slot 1790000001 --captured-at 1790000001
+    --source-revision "$good_master" --runtime-revision "$good_tooling"
+    --contract-digest "$contract_digest" --proof-digest "$proof_digest"
+    --capture-command "$tmp/signal-capture-source.sh"
+    --capture-output "$tmp/source-signal"
+    --age-binary "$tmp/age" --age-recipient-file "$tmp/recipient"
+  )
+  for signal_case in HUP:1:129 INT:2:130 TERM:15:143; do
+    signal_name=${signal_case%%:*}
+    signal_rest=${signal_case#*:}
+    signal_number=${signal_rest%%:*}
+    expected_status=${signal_rest#*:}
+    signal_root="$tmp/storage-signal-$signal_name"
+    signal_ready="$tmp/signal-ready-$signal_name"
+    signal_child_pid="$tmp/signal-child-$signal_name"
+    export SIGNAL_READY_FILE="$signal_ready"
+    export SIGNAL_CHILD_PID_FILE="$signal_child_pid"
+    export BETA_BACKUP_STORAGE_ROOT="$signal_root"
+    rm -f -- "$signal_ready" "$signal_child_pid"
+    (
+      export CAPTURE_SOURCE_REVISION="$good_master"
+      export EXPECTED_CAPTURE_COMMAND_DIGEST="$signal_capture_digest"
+      exec "$root/scripts/run-beta-recurring-capture.sh" \
+        "${signal_args[@]}" \
+        --output "$tmp/point-signal-$signal_name" \
+        --capture-output "$tmp/source-signal-$signal_name"
+    ) >/dev/null 2>&1 &
+    signal_pid=$!
+    signal_ready_seen=false
+    for _ in $(seq 1 100); do
+      if [ -f "$signal_ready" ]; then
+        signal_ready_seen=true
+        break
+      fi
+      sleep 0.1
+    done
+    [ "$signal_ready_seen" = true ] ||
+      fail "signal fixture did not reach capture: $signal_name"
+    kill -"$signal_number" "$signal_pid" 2>/dev/null || true
+    set +e
+    wait "$signal_pid"
+    signal_status=$?
+    set -e
+    if [ -f "$signal_child_pid" ]; then
+      signal_child=$(cat "$signal_child_pid")
+      kill -TERM "$signal_child" 2>/dev/null || true
+    fi
+    [ "$signal_status" -eq "$expected_status" ] ||
+      fail "signal termination returned $signal_status, expected $expected_status: $signal_name"
+    [ ! -e "$tmp/point-signal-$signal_name" ] &&
+      [ ! -e "$tmp/source-signal-$signal_name" ] ||
+      fail "signal termination left staging artifacts: $signal_name"
+    [ ! -e "$signal_root/control/capture-head.json" ] &&
+      [ ! -e "$signal_root/control/verified-head.json" ] &&
+      [ ! -e "$signal_root/points/slot-1790000001/point.json" ] ||
+      fail "signal termination advanced capture authority: $signal_name"
+  done
+  unset SIGNAL_READY_FILE SIGNAL_CHILD_PID_FILE
+fi
+
 "$root/scripts/run-beta-recurring-capture.sh" \
   "${capture_args[@]}" --output "$tmp/point-replay" --capture-output "$tmp/source-replay" \
   >/dev/null || fail "successful slot replay was rejected"

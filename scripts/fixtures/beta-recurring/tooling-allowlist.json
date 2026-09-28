@@ -11,7 +11,7 @@
     {
       "role": "capture",
       "path": "scripts/run-beta-recurring-capture-command.sh",
-      "sha256": "a002800e89538950045e581d074d2557b7c5bc6040110bf545bd67c411a974c7"
+      "sha256": "23b1207c717afc16cf705ed119dec2979cb4ea8ce406614af42e5a4813381600"
     },
     {
       "role": "restore",

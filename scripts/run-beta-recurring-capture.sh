@@ -79,7 +79,7 @@ source_manifest="$capture_output/capture-result.json"
 output_created=false
 capture_output_created=false
 cleanup_capture() {
-  local status=$?
+  local status=${1:-$?}
   trap - EXIT HUP INT TERM
   if [ "${capture_output_created:-false}" = true ]; then
     rm -rf -- "$capture_output" || status=1
@@ -99,7 +99,10 @@ cleanup_capture() {
   fi
   exit "$status"
 }
-trap cleanup_capture EXIT HUP INT TERM
+trap 'cleanup_capture "$?"' EXIT
+trap 'cleanup_capture 129' HUP
+trap 'cleanup_capture 130' INT
+trap 'cleanup_capture 143' TERM
 if [ "$(uname -s)" = Linux ]; then
   install -d -m 700 "$output"
 else
@@ -336,7 +339,7 @@ runtime_capture_digest=$(jq -er '.captureRuntimeDigest // empty' \
   runtime_capture_digest=$(printf '%s' absent-capture-runtime |
     sha256sum | awk '{print $1}')
 tmp=$(mktemp "$output/.recovery-point.XXXXXX")
-trap cleanup_capture EXIT HUP INT TERM
+trap 'cleanup_capture "$?"' EXIT
 jq -cnS \
   --arg slot "$slot" --arg source "$source_revision" --arg runtime "$runtime_revision" \
   --arg command "$capture_digest" --arg evidence "$source_digest" \
