@@ -1418,7 +1418,7 @@ beta_storage_remote_inventory_total() {
     beta_storage_fail inventory_unavailable
   [[ "$response" =~ ^[0-9]+$ ]] || beta_storage_fail inventory_invalid
   (( response <= 9223372036854775807 )) || beta_storage_fail budget_overflow
-  local key_marker='' upload_id_marker='' page=0 multipart_bytes=0
+  local key_marker='' upload_id_marker='' page=0 multipart_bytes=0 parts_file
   while (( page < BETA_STORAGE_MAX_PAGES )); do
     page=$((page + 1))
     if [ -n "$key_marker" ]; then
@@ -1449,8 +1449,13 @@ beta_storage_remote_inventory_total() {
         (.UploadId|type=="string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
         (.Initiated|type=="string" and length>0))
     ' <<<"$parts" >/dev/null || beta_storage_fail multipart_inventory_invalid
-    beta_storage_require_unique_json <(printf '%s\n' "$parts") ||
+    parts_file=$(mktemp)
+    printf '%s\n' "$parts" >"$parts_file"
+    if ! beta_storage_require_unique_json "$parts_file"; then
+      rm -f -- "$parts_file"
       beta_storage_fail multipart_inventory_duplicate_json
+    fi
+    rm -f -- "$parts_file"
     while IFS=$'\t' read -r upload_key upload_id; do
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
       part_page=$(beta_storage_remote_list_multipart_parts \
@@ -2739,8 +2744,10 @@ beta_storage_prune_remote() {
     receipt_point=${receipt_key#receipts/}
     receipt_point=${receipt_point%%/*}
     grep -Fxq -- "$receipt_point" "$deleted_point_ids" && continue
-    if [ "$receipt_key" = "$live_receipt_key" ] &&
-      [ "$receipt_version" = "$live_receipt_version" ]; then
+    if { [ "$receipt_key" = "$live_receipt_key" ] &&
+      [ "$receipt_version" = "$live_receipt_version" ]; } ||
+      { [ "$receipt_key" = "$live_proof_key" ] &&
+        [ "$receipt_version" = "$live_proof_version" ]; }; then
       continue
     fi
     delete_inventory_version "$receipt_key" "$receipt_version"
@@ -2781,7 +2788,7 @@ beta_storage_prune_remote() {
   done < <(jq -r '.[].Versions[]?, .[].DeleteMarkers[]? | .Key |
     select(startswith("control/"))' \
     <<<"$inventory" | sort -u)
-  local multipart key_marker='' upload_id_marker='' multipart_page=0
+  local multipart key_marker='' upload_id_marker='' multipart_page=0 multipart_file
   while (( multipart_page < BETA_STORAGE_MAX_PAGES )); do
     multipart_page=$((multipart_page + 1))
     if [ -n "$key_marker" ]; then
@@ -2815,8 +2822,13 @@ beta_storage_prune_remote() {
         (.Initiated|type=="string" and length>0))
     ' <<<"$multipart" >/dev/null ||
       beta_storage_fail multipart_inventory_invalid
-    beta_storage_require_unique_json <(printf '%s\n' "$multipart") ||
+    multipart_file=$(mktemp)
+    printf '%s\n' "$multipart" >"$multipart_file"
+    if ! beta_storage_require_unique_json "$multipart_file"; then
+      rm -f -- "$multipart_file"
       beta_storage_fail multipart_inventory_duplicate_json
+    fi
+    rm -f -- "$multipart_file"
     while IFS=$'\t' read -r upload_key upload_id initiated; do
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
       beta_storage_remote_multipart_eligible "$upload_key" "$initiated" "$now" ||
