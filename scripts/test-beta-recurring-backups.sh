@@ -146,6 +146,25 @@ jq -e '.versions.database and .versions.uploads and .versions.manifest and
   "$tmp/storage/points/slot-1790000000/point.json" >/dev/null ||
   fail "descriptor provenance is incomplete"
 
+cat >"$tmp/failing-age" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = --version ]; then
+  printf 'v1.3.1\n'
+  exit 0
+fi
+exit 1
+EOF
+chmod 755 "$tmp/failing-age"
+if "$root/scripts/run-beta-recurring-capture.sh" \
+  "${capture_args[@]}" --output "$tmp/point-failure" \
+  --capture-output "$tmp/source-failure" --age-binary "$tmp/failing-age" \
+  >/dev/null 2>&1; then
+  fail "capture failure injection unexpectedly succeeded"
+fi
+[ ! -e "$tmp/point-failure" ] && [ ! -e "$tmp/source-failure" ] ||
+  fail "capture failure left owned staging artifacts"
+
 "$root/scripts/run-beta-recurring-capture.sh" \
   "${capture_args[@]}" --output "$tmp/point-replay" --capture-output "$tmp/source-replay" \
   >/dev/null || fail "successful slot replay was rejected"
@@ -310,6 +329,10 @@ capture_tool="$root/scripts/run-beta-recurring-capture-command.sh"
 restore_tool="$root/scripts/run-beta-recurring-restore-command.sh"
 grep -Fq 'cleanup_capture_runner_temp' "$capture_tool" ||
   fail "recurring capture does not clean runner-temp artifacts"
+grep -Fq 'capture_output_created' "$root/scripts/run-beta-recurring-capture.sh" ||
+  fail "outer recurring capture does not track owned staging directories"
+grep -Fq 'staging_paths_same' "$root/scripts/run-beta-recurring-capture.sh" ||
+  fail "outer recurring capture does not fence staging path ownership"
 grep -Fq 'database-proof.json' "$capture_tool" &&
   grep -Fq 'capture-database-proof.json' "$capture_tool" &&
   grep -Fq 'remote_capture_proof_pair_incomplete' "$capture_tool" ||

@@ -66,19 +66,30 @@ recipient=$(awk 'NR==1 {print; next} NF {exit 1}' "$age_recipient_file") || {
   exit 1
 }
 
-mkdir -p "$output" "$capture_output"
-[ ! -L "$output" ] && [ ! -L "$capture_output" ] || {
-  echo 'BACKUP_CAPTURE_BLOCKED:capture_output_symlink' >&2
+[[ "$output" != "$capture_output" ]] || {
+  echo 'BACKUP_CAPTURE_BLOCKED:staging_paths_same' >&2
+  exit 1
+}
+[ ! -e "$output" ] && [ ! -e "$capture_output" ] || {
+  echo 'BACKUP_CAPTURE_BLOCKED:staging_path_exists' >&2
   exit 1
 }
 
 source_manifest="$capture_output/capture-result.json"
+output_created=false
+capture_output_created=false
 cleanup_capture() {
   local status=$?
   trap - EXIT HUP INT TERM
-  rm -f -- "$capture_output/postgres.dump" "$capture_output/uploads.tar.gz" \
-    "$source_manifest" "${tmp:-}" || status=1
-  if [ "$status" -ne 0 ]; then
+  if [ "${capture_output_created:-false}" = true ]; then
+    rm -rf -- "$capture_output" || status=1
+  else
+    rm -f -- "$capture_output/postgres.dump" "$capture_output/uploads.tar.gz" \
+      "$source_manifest" "${tmp:-}" || status=1
+  fi
+  if [ "${output_created:-false}" = true ]; then
+    rm -rf -- "$output" || status=1
+  elif [ "$status" -ne 0 ]; then
     rm -f -- "$output/postgres.dump.age" "$output/uploads.tar.gz.age" \
       "$output/recovery-point.json" "$output/point.json" || status=1
   fi
@@ -89,6 +100,18 @@ cleanup_capture() {
   exit "$status"
 }
 trap cleanup_capture EXIT HUP INT TERM
+if [ "$(uname -s)" = Linux ]; then
+  install -d -m 700 "$output"
+else
+  mkdir -p "$output"
+fi
+output_created=true
+if [ "$(uname -s)" = Linux ]; then
+  install -d -m 700 "$capture_output"
+else
+  mkdir -p "$capture_output"
+fi
+capture_output_created=true
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 preacquired=false
 publish_started=false
