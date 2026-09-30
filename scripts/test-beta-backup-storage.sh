@@ -176,6 +176,7 @@ case "${FAKE_AWS_MODE:?}" in
         metadata='{"Sha256":"'"${FAKE_AWS_SHA}"'","unexpected":"value"}'
         ;;
       invalid-type) metadata='{"Sha256":123}' ;;
+      empty) metadata='{"sha256":""}' ;;
       *) exit 1 ;;
     esac
     printf '{"VersionId":"metadata-version","ETag":"etag-metadata","ContentLength":1,"Metadata":%s}\n' \
@@ -294,7 +295,7 @@ for metadata_case in lower mixed; do
     '.Metadata == {"sha256":$sha}' "$tmp/metadata-head.json" >/dev/null ||
     fail "$metadata_case metadata was not canonicalized on the current-head path"
 done
-for metadata_case in collision unknown invalid-type; do
+for metadata_case in collision unknown invalid-type empty; do
   export FAKE_AWS_METADATA_CASE="$metadata_case"
   set +e
   beta_storage_remote_version_metadata points/metadata-version \
