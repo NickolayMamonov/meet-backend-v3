@@ -342,10 +342,48 @@ beta_storage_inventory_total() {
   printf '%s\n' "$total"
 }
 
+beta_storage_normalize_provider_metadata() {
+  local file=$1 normalized
+  normalized=$(mktemp) || return 1
+  if ! jq -e '
+    def ascii_lower:
+      explode |
+      map(if . >= 65 and . <= 90 then . + 32 else . end) |
+      implode;
+    . as $response |
+    if ($response.Metadata | type) != "object" then
+      error("metadata_type")
+    else
+      (reduce ($response.Metadata | to_entries[]) as $entry
+        ({};
+          ($entry.key | ascii_lower) as $key |
+          if has($key) then
+            error("metadata_duplicate")
+          elif $key != "sha256" then
+            error("metadata_unknown")
+          elif ($entry.value | type) != "string" or
+            ($entry.value | length) == 0 then
+            error("metadata_value")
+          else
+            .[$key] = $entry.value
+          end)) as $metadata |
+      if (($metadata | keys) == ["sha256"]) then
+        $response | .Metadata = $metadata
+      else
+        error("metadata_sha256_missing")
+      end
+    end
+  ' "$file" >"$normalized" 2>/dev/null; then
+    rm -f -- "$normalized"
+    return 1
+  fi
+  mv -- "$normalized" "$file"
+}
+
 beta_storage_aws() {
   beta_storage_require_config
   [ -z "${BETA_BACKUP_STORAGE_ROOT:-}" ] || beta_storage_fail local_provider_no_aws
-  local aws=${AWS_BIN:-aws} output error status
+  local aws=${AWS_BIN:-aws} output error status operation=${1:-}
   BETA_STORAGE_LAST_ERROR=''
   output=$(mktemp)
   error=$(mktemp)
@@ -369,6 +407,12 @@ beta_storage_aws() {
         return 1
       }
     fi
+    if [ "$operation" = head-object ] &&
+      ! beta_storage_normalize_provider_metadata "$output"; then
+      rm -f -- "$output" "$error"
+      beta_storage_fail provider_metadata_invalid
+      return 1
+    fi
     cat "$output"
     status=0
   else
@@ -379,7 +423,6 @@ beta_storage_aws() {
       "$([ "$status" -eq 124 ] && echo provider_timeout || echo provider_unavailable)" >&2
   fi
   rm -f -- "$output" "$error"
-  local operation=${1:-}
   case "$operation" in
     head-object)
       [[ "$BETA_STORAGE_LAST_ERROR" =~ ^An[[:space:]]error[[:space:]]occurred[[:space:]]\((404|NoSuchKey)\)[[:space:]]when[[:space:]]calling[[:space:]](the[[:space:]])?HeadObject[[:space:]]operation: ]] &&
@@ -1021,9 +1064,11 @@ beta_storage_remote_version_metadata() {
   local key=$1 version=$2 output=$3 size limit
   beta_storage_key "$key" >/dev/null
   beta_storage_require_version_id "$version"
-  beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
-    --version-id "$version" >"$output" ||
+  if ! beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
+    --version-id "$version" >"$output"; then
     beta_storage_fail provider_head_failed
+    return 1
+  fi
   limit=$(beta_storage_object_max_bytes "$key")
   jq -e --arg version "$version" '
     type=="object" and .VersionId==$version and

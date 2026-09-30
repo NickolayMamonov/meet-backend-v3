@@ -165,6 +165,22 @@ case "${FAKE_AWS_MODE:?}" in
   malformed) printf '{}\n'; exit 0 ;;
   duplicate) printf '{"VersionId":"one","VersionId":"two","ETag":"etag"}\n'; exit 0 ;;
   oversize) dd if=/dev/zero bs=1M count=2 status=none; exit 0 ;;
+  metadata)
+    case "${FAKE_AWS_METADATA_CASE:?}" in
+      lower) metadata='{"sha256":"'"${FAKE_AWS_SHA}"'"}' ;;
+      mixed) metadata='{"Sha256":"'"${FAKE_AWS_SHA}"'"}' ;;
+      collision)
+        metadata='{"sha256":"'"${FAKE_AWS_SHA}"'","Sha256":"'"${FAKE_AWS_SHA}"'"}'
+        ;;
+      unknown)
+        metadata='{"Sha256":"'"${FAKE_AWS_SHA}"'","unexpected":"value"}'
+        ;;
+      invalid-type) metadata='{"Sha256":123}' ;;
+      *) exit 1 ;;
+    esac
+    printf '{"VersionId":"metadata-version","ETag":"etag-metadata","ContentLength":1,"Metadata":%s}\n' \
+      "$metadata"
+    ;;
   notfound)
     printf 'An error occurred (404) when calling the HeadObject operation: Not Found\n' >&2
     exit 3
@@ -258,6 +274,43 @@ if beta_storage_aws_read list-object-versions --bucket "$BETA_BACKUP_BUCKET" \
   --max-keys 1000 >/dev/null 2>&1; then
   fail "oversized provider response was accepted"
 fi
+export FAKE_AWS_MODE=metadata
+FAKE_AWS_SHA=$(printf metadata | sha256sum | awk '{print $1}')
+export FAKE_AWS_SHA
+for metadata_case in lower mixed; do
+  export FAKE_AWS_METADATA_CASE="$metadata_case"
+  beta_storage_remote_version_metadata points/metadata-version \
+    metadata-version "$tmp/metadata-version.json" ||
+    fail "$metadata_case metadata was rejected on the version-specific path"
+  jq -e --arg sha "$FAKE_AWS_SHA" \
+    '.Metadata == {"sha256":$sha}' "$tmp/metadata-version.json" >/dev/null ||
+    fail "$metadata_case metadata was not canonicalized on the version-specific path"
+  beta_storage_remote_validate_object_metadata points/metadata-version \
+    metadata-version 1 "$FAKE_AWS_SHA" ||
+    fail "$metadata_case metadata digest equality failed on the version-specific path"
+  beta_storage_remote_head points/metadata-head "$tmp/metadata-head.json" ||
+    fail "$metadata_case metadata was rejected on the current-head path"
+  jq -e --arg sha "$FAKE_AWS_SHA" \
+    '.Metadata == {"sha256":$sha}' "$tmp/metadata-head.json" >/dev/null ||
+    fail "$metadata_case metadata was not canonicalized on the current-head path"
+done
+for metadata_case in collision unknown invalid-type; do
+  export FAKE_AWS_METADATA_CASE="$metadata_case"
+  set +e
+  beta_storage_remote_version_metadata points/metadata-version \
+    metadata-version "$tmp/metadata-invalid.json" >/dev/null 2>&1
+  metadata_status=$?
+  beta_storage_remote_head points/metadata-head "$tmp/metadata-invalid-head.json" \
+    >/dev/null 2>&1
+  head_status=$?
+  set -e
+  if [ "$metadata_status" -eq 0 ]; then
+    fail "$metadata_case metadata was accepted on the version-specific path"
+  fi
+  if [ "$head_status" -eq 0 ]; then
+    fail "$metadata_case metadata was accepted on the current-head path"
+  fi
+done
 dd if=/dev/zero of="$tmp/large-provider-object" bs=1M count=9 status=none
 export FAKE_AWS_MODE=multipart
 export FAKE_AWS_SOURCE="$tmp/large-provider-object"
