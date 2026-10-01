@@ -85,6 +85,69 @@ run_preacquired_inventory_failure_fixture() {
   grep -Fxq release "$consumer_log"
 }
 
+run_prune_delete_overflow_fixture() {
+  local delete_log=$1 summary_log=$2 prune_status
+  : >"$delete_log"
+  : >"$summary_log"
+  beta_storage_remote_require_safety() { :; }
+  beta_storage_require_config() { :; }
+  beta_storage_remote_inventory_total() { printf '0\n'; }
+  beta_storage_remote_writer_acquire() { :; }
+  beta_storage_remote_writer_transition() { :; }
+  beta_storage_remote_writer_release() { :; }
+  beta_storage_remote_head() {
+    local key=$1 output=$2
+    if [ "$key" = control/verified-head.json ]; then
+      printf '%s\n' '{"VersionId":"verified-v","ETag":"verified-etag"}' >"$output"
+      return 0
+    fi
+    return 1
+  }
+  beta_storage_remote_get_json() {
+    local key=$1 output=$2
+    if [ "$key" = control/verified-head.json ]; then
+      printf '%s\n' \
+        '{"pointId":"pinned","receiptId":"receipt-1","receiptVersion":"receipt-v","proofVersion":"proof-v"}' \
+        >"$output"
+    fi
+  }
+  beta_storage_remote_build_status_once() {
+    printf '%s\n' \
+      '{"verified":{"state":"VALID","id":"pinned"},"capture":{"id":"capture"}}' >"$1"
+  }
+  beta_storage_aws_list_versions() {
+    printf '%s\n' \
+      '{"Versions":[{"Key":"points/old/recovery-point.json","VersionId":"old-recovery","Size":9223372036854775807},{"Key":"points/old/postgres.dump.age","VersionId":"old-postgres","Size":9223372036854775807},{"Key":"receipts/pinned/receipt-1.json","VersionId":"receipt-v","Size":1},{"Key":"receipts/pinned/receipt-1.proof.json","VersionId":"proof-v","Size":1},{"Key":"control/verified-head.json","VersionId":"verified-v","Size":1}]}'
+  }
+  beta_storage_provider_get() {
+    printf '%s\n' '{"capture":{"capturedAt":1819000000}}' >"$4"
+  }
+  beta_storage_remote_point_graph_state() { return 1; }
+  beta_storage_aws_read() {
+    printf '%s\n' '{"Uploads":[],"IsTruncated":false}'
+  }
+  beta_storage_remote_delete_version() {
+    printf '%s\n' "$2" >>"$delete_log"
+    return 0
+  }
+  beta_storage_provider_put_conditional() {
+    printf 'put\n' >>"$summary_log"
+    printf '%s\n' '{"versionId":"summary-v"}'
+  }
+  set +e
+  (
+    trap - RETURN
+    set +u
+    beta_storage_prune_remote 1820000000 test VALID 1790000000 closed-beta \
+      >/dev/null 2>&1
+  )
+  prune_status=$?
+  set -e
+  [ "$prune_status" -ne 0 ] || return 1
+  [ "$(wc -l <"$delete_log" | tr -d '[:space:]')" -eq 1 ] || return 1
+  [ ! -s "$summary_log" ]
+}
+
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 export BETA_BACKUP_TEST_FIXTURE=true
 tmp=$(mktemp -d)
@@ -863,4 +926,9 @@ run_inventory_failure_consumer_fixture "$consumer_log" ||
 preacquired_log="$tmp/preacquired.log"
 run_preacquired_inventory_failure_fixture "$tmp/point" "$preacquired_log" ||
   fail "preacquired capture retained its writer after admission inventory failure"
+
+overflow_delete_log="$tmp/overflow-delete.log"
+overflow_summary_log="$tmp/overflow-summary.log"
+run_prune_delete_overflow_fixture "$overflow_delete_log" "$overflow_summary_log" ||
+  fail "prune continued after delete-accounting overflow"
 printf 'test-beta-backup-storage.sh: passed\n'

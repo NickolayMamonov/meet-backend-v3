@@ -2927,7 +2927,7 @@ beta_storage_prune_remote() {
     all(.DeleteMarkers[]?; (.Key|type=="string" and
       test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
       (.VersionId|type=="string" and utf8bytelength>=1 and
-        utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$")))' <<<"$inventory" >/dev/null ||
+        utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$"))))' <<<"$inventory" >/dev/null ||
     { beta_storage_fail inventory_invalid; return 1; }
   seen=$(mktemp)
   deleted_point_ids=$(mktemp)
@@ -2947,14 +2947,14 @@ beta_storage_prune_remote() {
     fi
     if [ "$object_kind" = marker ]; then
       (( deleted_delete_marker_bytes <= 9223372036854775807 - object_bytes )) ||
-        beta_storage_fail budget_overflow
+        { beta_storage_fail budget_overflow; return 1; }
       beta_storage_remote_delete_version "$object_key" "$object_version" "$object_kind" ||
         return 1
       deleted_delete_markers=$((deleted_delete_markers + 1))
       deleted_delete_marker_bytes=$((deleted_delete_marker_bytes + object_bytes))
     else
       (( deleted_object_bytes <= 9223372036854775807 - object_bytes )) ||
-        beta_storage_fail budget_overflow
+        { beta_storage_fail budget_overflow; return 1; }
       beta_storage_remote_delete_version "$object_key" "$object_version" "$object_kind" ||
         return 1
       deleted_object_bytes=$((deleted_object_bytes + object_bytes))
