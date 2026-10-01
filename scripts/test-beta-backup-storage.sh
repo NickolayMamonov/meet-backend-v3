@@ -3,40 +3,36 @@ set -euo pipefail
 
 fail() { echo "test-beta-backup-storage.sh: $1" >&2; exit 1; }
 
-declare BETA_TEST_WRITER_GATE_CALLS_FILE=''
-declare BETA_TEST_WRITER_GATE_STATUS_FILE=''
-declare BETA_TEST_WRITER_GATE_MUTATION_LOG=''
-
 run_writer_state_gate_fixture() {
   local initial_status=$1 mutation_log=$2 writer_status
   local calls_file="${mutation_log}.calls" status_file="${mutation_log}.status"
   : >"$mutation_log"
   : >"$calls_file"
   printf '%s\n' "$initial_status" >"$status_file"
-  BETA_TEST_WRITER_GATE_CALLS_FILE=$calls_file
-  BETA_TEST_WRITER_GATE_STATUS_FILE=$status_file
-  BETA_TEST_WRITER_GATE_MUTATION_LOG=$mutation_log
-  beta_storage_require_config() { :; }
-  beta_storage_remote_head() {
-    local call_count calls_path status_path
-    calls_path=$BETA_TEST_WRITER_GATE_CALLS_FILE
-    status_path=$BETA_TEST_WRITER_GATE_STATUS_FILE
-    call_count=$(wc -l <"$calls_path" | tr -d '[:space:]')
-    call_count=$((call_count + 1))
-    printf '%s\n' "$call_count" >>"$calls_path"
-    if [ "$call_count" -eq 1 ]; then
-      return "$(sed -n '1p' "$status_path")"
-    fi
-    printf '%s\n' '{"VersionId":"created-version","ETag":"created-etag"}' >"$2"
-    return 0
-  }
-  beta_storage_provider_put_conditional() {
-    printf 'conditional-create\n' >>"$BETA_TEST_WRITER_GATE_MUTATION_LOG"
-    printf '%s\n' '{"versionId":"created-version"}'
-  }
   set +e
   (
     trap - RETURN
+    export BETA_TEST_WRITER_GATE_CALLS_FILE="$calls_file"
+    export BETA_TEST_WRITER_GATE_STATUS_FILE="$status_file"
+    export BETA_TEST_WRITER_GATE_MUTATION_LOG="$mutation_log"
+    beta_storage_require_config() { :; }
+    beta_storage_remote_head() {
+      local call_count calls_path status_path
+      calls_path=${BETA_TEST_WRITER_GATE_CALLS_FILE:?}
+      status_path=${BETA_TEST_WRITER_GATE_STATUS_FILE:?}
+      call_count=$(wc -l <"$calls_path" | tr -d '[:space:]')
+      call_count=$((call_count + 1))
+      printf '%s\n' "$call_count" >>"$calls_path"
+      if [ "$call_count" -eq 1 ]; then
+        return "$(sed -n '1p' "$status_path")"
+      fi
+      printf '%s\n' '{"VersionId":"created-version","ETag":"created-etag"}' >"$2"
+      return 0
+    }
+    beta_storage_provider_put_conditional() {
+      printf 'conditional-create\n' >>"${BETA_TEST_WRITER_GATE_MUTATION_LOG:?}"
+      printf '%s\n' '{"versionId":"created-version"}'
+    }
     set +u
     beta_storage_remote_writer_acquire publish fixture-owner fixture-tx \
       1 "$(printf fixture | sha256sum | awk '{print $1}')" '[]' \
@@ -45,9 +41,6 @@ run_writer_state_gate_fixture() {
   writer_status=$?
   set -e
   rm -f -- "$calls_file" "$status_file"
-  BETA_TEST_WRITER_GATE_CALLS_FILE=''
-  BETA_TEST_WRITER_GATE_STATUS_FILE=''
-  BETA_TEST_WRITER_GATE_MUTATION_LOG=''
   if [ "$initial_status" -eq 1 ]; then
     [ "$writer_status" -eq 0 ] &&
       [ "$(wc -l <"$mutation_log" | tr -d '[:space:]')" -eq 1 ]
