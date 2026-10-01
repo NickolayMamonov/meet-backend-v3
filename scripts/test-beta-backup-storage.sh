@@ -509,10 +509,10 @@ case "${FAKE_AWS_MODE:?}" in
         ;;
       *' head-object '*)
         case "$FAKE_AWS_MODE" in
-          inventory-live) printf '{"VersionId":"live-version","ETag":"live-etag"}\n' ;;
-          inventory-stale) printf '{"VersionId":"current-version","ETag":"current-etag"}\n' ;;
-          inventory-pagination) printf '{"VersionId":"paged-current","ETag":"paged-etag"}\n' ;;
-          inventory-head-mismatch) printf '{"VersionId":"actual-version","ETag":"actual-etag"}\n' ;;
+          inventory-live) printf '{"VersionId":"live-version","ETag":"live-etag","Metadata":{}}\n' ;;
+          inventory-stale) printf '{"VersionId":"current-version","ETag":"current-etag","Metadata":{}}\n' ;;
+          inventory-pagination) printf '{"VersionId":"paged-current","ETag":"paged-etag","Metadata":{}}\n' ;;
+          inventory-head-mismatch) printf '{"VersionId":"actual-version","ETag":"actual-etag","Metadata":{}}\n' ;;
         esac
         ;;
       *) exit 1 ;;
