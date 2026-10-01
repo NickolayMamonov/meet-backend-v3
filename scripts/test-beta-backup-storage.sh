@@ -48,6 +48,7 @@ run_inventory_failure_consumer_fixture() {
   beta_storage_remote_commit_capture_head inventory-failure \
     1790000000 test >/dev/null 2>&1
   consumer_status=$?
+  trap - RETURN
   set -e
   [ "$consumer_status" -ne 0 ] || return 1
   ! grep -Eq '^(acquire|transition)$' "$consumer_log"
