@@ -70,8 +70,12 @@ run_preacquired_inventory_failure_fixture() {
   export BETA_STORAGE_REMOTE_WRITER_TX=capture-slot-slot-1790000000
   export BETA_STORAGE_CAPTURE_RESERVATION_BYTES=1000000000
   set +e
-  beta_storage_publish_remote "$source" slot-1790000000 1790000000 \
-    1790000000 test >/dev/null 2>&1
+  (
+    trap - RETURN
+    set +u
+    beta_storage_publish_remote "$source" slot-1790000000 1790000000 \
+      1790000000 test >/dev/null 2>&1
+  )
   consumer_status=$?
   set -e
   unset BETA_STORAGE_PREACQUIRED_CAPTURE
