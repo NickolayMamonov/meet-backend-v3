@@ -462,6 +462,169 @@ beta_storage_aws_read() {
   beta_storage_fail provider_read_exhausted
 }
 
+beta_storage_normalize_provider_list_response() {
+  local operation=$1 response=$2
+  case "$operation" in
+    list-object-versions)
+      jq -e '
+        if (
+        type=="object" and
+        ((keys - ["CommonPrefixes","DeleteMarkers","Delimiter","EncodingType",
+          "IsTruncated","KeyMarker","MaxKeys","Name","NextKeyMarker",
+          "NextVersionIdMarker","Prefix","VersionIdMarker","Versions"])|length==0) and
+        (.IsTruncated|type=="boolean") and
+        (if has("Versions") then
+          (.Versions|type=="array" and all(.[];
+            type=="object" and
+            ((keys - ["ChecksumAlgorithm","ChecksumType","ETag","IsLatest","Key",
+              "LastModified","Owner","RestoreStatus","Size","StorageClass",
+              "VersionId"])|length==0) and
+            (.Key|type=="string") and (.VersionId|type=="string") and
+            (.Size|type=="number" and floor==. and .>=0 and
+              .<=9223372036854775807) and
+            (if has("ETag") then (.ETag|type=="string") else true end) and
+            (if has("IsLatest") then (.IsLatest|type=="boolean") else true end) and
+            (if has("StorageClass") then (.StorageClass|type=="string") else true end)))
+        else true end) and
+        (if has("DeleteMarkers") then
+          (.DeleteMarkers|type=="array" and all(.[];
+            type=="object" and
+            ((keys - ["IsLatest","Key","LastModified","Owner","VersionId"])|length==0) and
+            (.Key|type=="string") and (.VersionId|type=="string") and
+            (if has("IsLatest") then (.IsLatest|type=="boolean") else true end)))
+        else true end) and
+        (if has("CommonPrefixes") then
+          (.CommonPrefixes|type=="array" and all(.[];
+            type=="object" and (keys|sort)==["Prefix"] and
+            (.Prefix|type=="string")))
+        else true end) and
+        (if has("KeyMarker") then (.KeyMarker|type=="string") else true end) and
+        (if has("VersionIdMarker") then (.VersionIdMarker|type=="string") else true end) and
+        (if has("NextKeyMarker") then (.NextKeyMarker|type=="string") else true end) and
+        (if has("NextVersionIdMarker") then
+          (.NextVersionIdMarker|type=="string")
+        else true end) and
+        (if .IsTruncated then
+          (.NextKeyMarker|type=="string" and
+            test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+          (.NextVersionIdMarker|type=="string" and
+            utf8bytelength>=1 and utf8bytelength<=1024 and
+            test("^[^\u0000-\u001F\u007F]+$"))
+        else
+          ((.NextKeyMarker // "")=="" and
+            (.NextVersionIdMarker // "")=="")
+        end)
+        ) then
+        .Versions=(if has("Versions") then .Versions else [] end) |
+        .DeleteMarkers=(if has("DeleteMarkers") then .DeleteMarkers else [] end) |
+        .CommonPrefixes=(if has("CommonPrefixes") then .CommonPrefixes else [] end) |
+        .KeyMarker=(if has("KeyMarker") then .KeyMarker else "" end) |
+        .VersionIdMarker=(if has("VersionIdMarker") then .VersionIdMarker else "" end) |
+        .NextKeyMarker=(if has("NextKeyMarker") then .NextKeyMarker else "" end) |
+        .NextVersionIdMarker=(if has("NextVersionIdMarker") then
+          .NextVersionIdMarker
+        else "" end)
+        else error("provider_response_invalid") end
+      ' <<<"$response"
+      ;;
+    list-multipart-uploads)
+      jq -e '
+        if (
+        type=="object" and
+        ((keys - ["AbortDate","AbortRuleId","Bucket","CommonPrefixes","Delimiter",
+          "EncodingType","IsTruncated","KeyMarker","MaxUploads","NextKeyMarker",
+          "NextUploadIdMarker","Prefix","UploadIdMarker","Uploads"])|length==0) and
+        (.IsTruncated|type=="boolean") and
+        (if has("Uploads") then
+          (.Uploads|type=="array" and all(.[];
+            type=="object" and
+            ((keys - ["ChecksumAlgorithm","ChecksumType","Initiated","Initiator",
+              "Key","Owner","StorageClass","UploadId"])|length==0) and
+            (.Key|type=="string") and (.UploadId|type=="string") and
+            (.Initiated|type=="string" and length>0) and
+            (if has("StorageClass") then (.StorageClass|type=="string") else true end) and
+            (if has("Initiator") then (.Initiator|type=="object") else true end) and
+            (if has("Owner") then (.Owner|type=="object") else true end)))
+        else true end) and
+        (if has("CommonPrefixes") then
+          (.CommonPrefixes|type=="array" and all(.[];
+            type=="object" and (keys|sort)==["Prefix"] and
+            (.Prefix|type=="string")))
+        else true end) and
+        (if has("KeyMarker") then (.KeyMarker|type=="string") else true end) and
+        (if has("UploadIdMarker") then (.UploadIdMarker|type=="string") else true end) and
+        (if has("NextKeyMarker") then (.NextKeyMarker|type=="string") else true end) and
+        (if has("NextUploadIdMarker") then
+          (.NextUploadIdMarker|type=="string")
+        else true end) and
+        (if .IsTruncated then
+          (.NextKeyMarker|type=="string" and
+            test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
+          (.NextUploadIdMarker|type=="string" and
+            test("^[A-Za-z0-9._:-]{1,256}$"))
+        else
+          ((.NextKeyMarker // "")=="" and
+            (.NextUploadIdMarker // "")=="")
+        end)
+        ) then
+        .Uploads=(if has("Uploads") then .Uploads else [] end) |
+        .CommonPrefixes=(if has("CommonPrefixes") then .CommonPrefixes else [] end) |
+        .KeyMarker=(if has("KeyMarker") then .KeyMarker else "" end) |
+        .UploadIdMarker=(if has("UploadIdMarker") then .UploadIdMarker else "" end) |
+        .NextKeyMarker=(if has("NextKeyMarker") then .NextKeyMarker else "" end) |
+        .NextUploadIdMarker=(if has("NextUploadIdMarker") then
+          .NextUploadIdMarker
+        else "" end)
+        else error("provider_response_invalid") end
+      ' <<<"$response"
+      ;;
+    list-parts)
+      jq -e '
+        if (
+        type=="object" and
+        ((keys - ["AbortDate","AbortRuleId","Bucket","ChecksumAlgorithm","ChecksumType",
+          "Initiator","IsTruncated","Key","MaxParts","NextPartNumberMarker","Owner",
+          "PartNumberMarker","Parts","ReplicationStatus","StorageClass","UploadId"])|length==0) and
+        (.IsTruncated|type=="boolean") and
+        (if has("Parts") then
+          (.Parts|type=="array" and all(.[];
+            type=="object" and
+            ((keys - ["ChecksumCRC32","ChecksumCRC32C","ChecksumSHA1","ChecksumSHA256",
+              "ETag","LastModified","PartNumber","Size"])|length==0) and
+            (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
+            (.Size|type=="number" and floor==. and .>=0 and
+              .<=9223372036854775807) and
+            (.ETag|type=="string" and length>0)))
+        else true end) and
+        (if has("Key") then (.Key|type=="string") else true end) and
+        (if has("UploadId") then (.UploadId|type=="string") else true end) and
+        (if has("PartNumberMarker") then
+          (.PartNumberMarker|type=="number" and floor==. and .>=0 and .<=10000)
+        else true end) and
+        (if has("NextPartNumberMarker") then
+          (.NextPartNumberMarker|type=="number" and floor==. and .>=1 and .<=10000)
+        else true end) and
+        (if .IsTruncated then
+          (.NextPartNumberMarker|type=="number" and floor==. and
+            .>=1 and .<=10000)
+        else
+          ((.NextPartNumberMarker // "")=="")
+        end)
+        ) then
+        .Parts=(if has("Parts") then .Parts else [] end) |
+        .PartNumberMarker=(if has("PartNumberMarker") then .PartNumberMarker else "" end) |
+        .NextPartNumberMarker=(if has("NextPartNumberMarker") then
+          .NextPartNumberMarker
+        else "" end)
+        else error("provider_response_invalid") end
+      ' <<<"$response"
+      ;;
+    *)
+      beta_storage_fail provider_list_operation_invalid
+      ;;
+  esac
+}
+
 beta_storage_remote_list_multipart_parts() {
   local key=$1 upload_id=$2 part_marker='' page=0 truncated=false
   local part_page all_parts='[]' part_json_file
@@ -481,6 +644,8 @@ beta_storage_remote_list_multipart_parts() {
         --key "$key" --upload-id "$upload_id" --max-parts 1000) ||
         beta_storage_fail multipart_parts_unavailable
     fi
+    part_page=$(beta_storage_normalize_provider_list_response list-parts "$part_page") ||
+      beta_storage_fail multipart_parts_invalid
     part_json_file=$(mktemp)
     printf '%s\n' "$part_page" >"$part_json_file"
     if ! beta_storage_require_unique_json "$part_json_file"; then
@@ -575,12 +740,14 @@ beta_storage_aws_list_versions() {
       response=$(beta_storage_aws_read list-object-versions --bucket "$BETA_BACKUP_BUCKET" \
         --max-keys 1000) || beta_storage_fail inventory_unavailable
     fi
+    response=$(beta_storage_normalize_provider_list_response \
+      list-object-versions "$response") || beta_storage_fail inventory_invalid
     jq -e '
       type=="object" and (.Versions|type=="array") and
       (.DeleteMarkers|type=="array") and
       ((keys - ["CommonPrefixes","DeleteMarkers","Delimiter","EncodingType",
         "IsTruncated","KeyMarker","MaxKeys","Name","NextKeyMarker",
-        "NextVersionIdMarker","Prefix","Versions"])|length==0) and
+        "NextVersionIdMarker","Prefix","VersionIdMarker","Versions"])|length==0) and
       (.IsTruncated|type=="boolean") and
       ((.Versions|length)+(.DeleteMarkers|length)<=1000) and
       ((.IsTruncated and
@@ -1474,6 +1641,8 @@ beta_storage_remote_inventory_total() {
       parts=$(beta_storage_aws_read list-multipart-uploads --bucket "$BETA_BACKUP_BUCKET" \
         --max-uploads 1000) || beta_storage_fail multipart_inventory_unavailable
     fi
+    parts=$(beta_storage_normalize_provider_list_response \
+      list-multipart-uploads "$parts") || beta_storage_fail multipart_inventory_invalid
     jq -e '
       type=="object" and (.Uploads|type=="array") and
       ((keys - ["AbortDate","AbortRuleId","Bucket","CommonPrefixes","Delimiter",
@@ -2846,6 +3015,9 @@ beta_storage_prune_remote() {
         --bucket "$BETA_BACKUP_BUCKET" --max-uploads 1000) ||
         beta_storage_fail multipart_inventory_unavailable
     fi
+    multipart=$(beta_storage_normalize_provider_list_response \
+      list-multipart-uploads "$multipart") ||
+      beta_storage_fail multipart_inventory_invalid
     jq -e '
       type=="object" and (.Uploads|type=="array") and
       ((keys - ["AbortDate","AbortRuleId","Bucket","CommonPrefixes","Delimiter",

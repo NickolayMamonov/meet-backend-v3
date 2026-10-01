@@ -186,6 +186,116 @@ case "${FAKE_AWS_MODE:?}" in
     printf 'An error occurred (404) when calling the HeadObject operation: Not Found\n' >&2
     exit 3
     ;;
+  notfound-key)
+    printf 'An error occurred (NoSuchKey) when calling the HeadObject operation: Not Found\n' >&2
+    exit 3
+    ;;
+  authorization)
+    printf 'An error occurred (AccessDenied) when calling the HeadObject operation: Forbidden\n' >&2
+    exit 3
+    ;;
+  shell-failure)
+    printf 'provider shell failure\n' >&2
+    exit 1
+    ;;
+  versions-pagination)
+    case " $* " in
+      *' list-object-versions '*)
+        if [[ " $* " == *' --key-marker points/page '* ]]; then
+          printf '{"IsTruncated":false,"KeyMarker":"points/page","VersionIdMarker":"version-1"}\n'
+        else
+          printf '{"IsTruncated":true,"KeyMarker":"","VersionIdMarker":"","NextKeyMarker":"points/page","NextVersionIdMarker":"version-1","Versions":[{"Key":"points/page/object","VersionId":"version-1","Size":8}]}\n'
+        fi
+        ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  multipart-empty)
+    case " $* " in
+      *' list-object-versions '*)
+        printf '{"IsTruncated":false}\n'
+        ;;
+      *' list-multipart-uploads '*)
+        if [[ " $* " == *' --key-marker points/page '* ]]; then
+          printf '{"IsTruncated":false,"KeyMarker":"points/page","UploadIdMarker":"upload-1"}\n'
+        else
+          printf '{"IsTruncated":true,"KeyMarker":"","UploadIdMarker":"","NextKeyMarker":"points/page","NextUploadIdMarker":"upload-1"}\n'
+        fi
+        ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  parts-empty)
+    case " $* " in
+      *' list-parts '*)
+        printf '{"IsTruncated":false,"Key":"points/empty/upload.bin","UploadId":"upload-1"}\n'
+        ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  list-unknown)
+    case " $* " in
+      *' list-object-versions '*) printf '{"IsTruncated":false,"Unexpected":[]}\n' ;;
+      *' list-multipart-uploads '*) printf '{"IsTruncated":false,"Unexpected":[]}\n' ;;
+      *' list-parts '*) printf '{"IsTruncated":false,"Key":"points/unknown","UploadId":"upload-1","Unexpected":[]}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  list-type)
+    case " $* " in
+      *' list-object-versions '*) printf '{"IsTruncated":"false"}\n' ;;
+      *' list-multipart-uploads '*) printf '{"IsTruncated":"false"}\n' ;;
+      *' list-parts '*) printf '{"IsTruncated":false,"Key":"points/type","UploadId":"upload-1","Parts":{}}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  list-pagination)
+    case " $* " in
+      *' list-object-versions '*) printf '{"IsTruncated":true}\n' ;;
+      *' list-multipart-uploads '*) printf '{"IsTruncated":true}\n' ;;
+      *' list-parts '*) printf '{"IsTruncated":true,"Key":"points/pagination","UploadId":"upload-1"}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  multipart-unknown)
+    case " $* " in
+      *' list-object-versions '*) printf '{"IsTruncated":false}\n' ;;
+      *' list-multipart-uploads '*) printf '{"IsTruncated":false,"Unexpected":[]}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  multipart-type)
+    case " $* " in
+      *' list-object-versions '*) printf '{"IsTruncated":false}\n' ;;
+      *' list-multipart-uploads '*) printf '{"IsTruncated":"false"}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  multipart-pagination)
+    case " $* " in
+      *' list-object-versions '*) printf '{"IsTruncated":false}\n' ;;
+      *' list-multipart-uploads '*) printf '{"IsTruncated":true}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  parts-unknown)
+    case " $* " in
+      *' list-parts '*) printf '{"IsTruncated":false,"Key":"points/unknown","UploadId":"upload-1","Unexpected":[]}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  parts-type)
+    case " $* " in
+      *' list-parts '*) printf '{"IsTruncated":false,"Key":"points/type","UploadId":"upload-1","Parts":{}}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  parts-pagination)
+    case " $* " in
+      *' list-parts '*) printf '{"IsTruncated":true,"Key":"points/pagination","UploadId":"upload-1"}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
   multipart)
     case " $* " in
       *' head-object '*)
@@ -259,6 +369,24 @@ if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key absent
 else
   [ "$?" -eq 3 ] || fail "genuine provider absence was not classified as absent"
 fi
+export FAKE_AWS_MODE=notfound-key
+if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key absent-key; then
+  fail "NoSuchKey provider absence was accepted as success"
+else
+  [ "$?" -eq 3 ] || fail "NoSuchKey provider absence was not classified as absent"
+fi
+export FAKE_AWS_MODE=authorization
+if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key denied; then
+  fail "authorization failure was accepted as success"
+else
+  [ "$?" -ne 3 ] || fail "authorization failure was classified as absence"
+fi
+export FAKE_AWS_MODE=shell-failure
+if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key failed; then
+  fail "provider shell failure was accepted as success"
+else
+  [ "$?" -ne 3 ] || fail "provider shell failure was classified as absence"
+fi
 export FAKE_AWS_MODE=malformed
 if beta_storage_remote_head control/malformed.json "$tmp/malformed.json"; then
   fail "malformed provider response was accepted as a valid head"
@@ -311,6 +439,47 @@ for metadata_case in collision unknown invalid-type empty; do
   if [ "$head_status" -eq 0 ]; then
     fail "$metadata_case metadata was accepted on the current-head path"
   fi
+done
+export FAKE_AWS_MODE=versions-pagination
+version_pages=$(beta_storage_aws_list_versions | jq -s 'length')
+[ "$version_pages" -eq 2 ] || fail "version-list pagination or absent collections was rejected"
+export FAKE_AWS_MODE=multipart-empty
+[ "$(beta_storage_remote_inventory_total 100000 false)" -eq 0 ] ||
+  fail "multipart-list pagination or absent uploads was rejected"
+export FAKE_AWS_MODE=parts-empty
+[ "$(beta_storage_remote_list_multipart_parts points/empty/upload.bin upload-1 | jq -r 'length')" -eq 0 ] ||
+  fail "multipart part absent collection was rejected"
+for invalid_list_case in list-unknown list-type list-pagination; do
+  export FAKE_AWS_MODE="$invalid_list_case"
+  set +e
+  beta_storage_aws_list_versions >/dev/null 2>&1
+  list_status=$?
+  set -e
+  [ "$list_status" -ne 0 ] || fail "$invalid_list_case version-list response was accepted"
+  set +e
+  beta_storage_remote_inventory_total 100000 false >/dev/null 2>&1
+  multipart_status=$?
+  set -e
+  [ "$multipart_status" -ne 0 ] || fail "$invalid_list_case multipart-list response was accepted"
+done
+for invalid_multipart_case in multipart-unknown multipart-type multipart-pagination; do
+  export FAKE_AWS_MODE="$invalid_multipart_case"
+  set +e
+  beta_storage_remote_inventory_total 100000 false >/dev/null 2>&1
+  multipart_status=$?
+  set -e
+  [ "$multipart_status" -ne 0 ] ||
+    fail "$invalid_multipart_case multipart-list response was accepted"
+done
+for invalid_parts_case in parts-unknown parts-type parts-pagination; do
+  export FAKE_AWS_MODE="$invalid_parts_case"
+  set +e
+  beta_storage_remote_list_multipart_parts points/invalid/upload.bin upload-1 \
+    >/dev/null 2>&1
+  parts_status=$?
+  set -e
+  [ "$parts_status" -ne 0 ] ||
+    fail "$invalid_parts_case multipart-parts response was accepted"
 done
 dd if=/dev/zero of="$tmp/large-provider-object" bs=1M count=9 status=none
 export FAKE_AWS_MODE=multipart
