@@ -861,6 +861,35 @@ beta_storage_aws_list_versions() {
   return 1
 }
 
+beta_storage_remote_current_object_state() {
+  local key=$1 inventory
+  beta_storage_key "$key" >/dev/null
+  inventory=$(beta_storage_aws_list_versions | jq -s '.') ||
+    { beta_storage_fail inventory_unavailable; return 1; }
+  jq -e --arg key "$key" '
+    [.[].Versions[] |
+      select(.Key==$key) |
+      {kind:"live",versionId:.VersionId,isLatest:(.IsLatest // null)}] +
+    [.[].DeleteMarkers[] |
+      select(.Key==$key) |
+      {kind:"delete-marker",versionId:.VersionId,isLatest:(.IsLatest // null)}]
+    | if length == 0 then
+        {state:"absent"}
+      elif any(.[]; (.isLatest|type) != "boolean") then
+        error("current_state_latest_missing")
+      elif ([.[] | select(.isLatest==true)] | length) != 1 then
+        error("current_state_latest_ambiguous")
+      else
+        ([.[] | select(.isLatest==true)][0]) |
+        {state:(if .kind=="live" then "live" else "delete-marker" end),
+         versionId:.versionId}
+      end
+  ' <<<"$inventory" || {
+    beta_storage_fail inventory_current_state_invalid
+    return 1
+  }
+}
+
 beta_storage_local_provider_put() {
   local root=$1 key=$2 source=$3
   beta_storage_require_local_root "$root" >/dev/null
@@ -1390,10 +1419,33 @@ beta_storage_provider_delete() {
 }
 
 beta_storage_remote_head() {
-  local key=$1 output=$2 status
+  local key=$1 output=$2 status current_state state current_version
   beta_storage_key "$key" >/dev/null
+  current_state=$(beta_storage_remote_current_object_state "$key") ||
+    return 2
+  state=$(jq -er '.state' <<<"$current_state") || return 2
+  case "$state" in
+    absent)
+      rm -f -- "$output"
+      return 1
+      ;;
+    delete-marker)
+      rm -f -- "$output"
+      beta_storage_fail current_object_delete_marker
+      return 2
+      ;;
+    live)
+      current_version=$(jq -er '.versionId' <<<"$current_state") || return 2
+      ;;
+    *)
+      rm -f -- "$output"
+      beta_storage_fail inventory_current_state_invalid
+      return 2
+      ;;
+  esac
   if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" >"$output"; then
-    jq -e 'type=="object" and
+    jq -e --arg expected_version "$current_version" '
+      type=="object" and
       ((keys - ["AcceptRanges","ContentEncoding","ContentLanguage","ContentLength",
         "ContentType","ETag","Expires","LastModified","Metadata","MissingMeta",
         "ObjectLockLegalHoldStatus","ObjectLockMode","ObjectLockRetainUntilDate",
@@ -1404,13 +1456,16 @@ beta_storage_remote_head() {
       (.VersionId|type=="string" and
       utf8bytelength>=1 and utf8bytelength<=1024 and
       test("^[^\u0000-\u001F\u007F]+$")) and
+      .VersionId==$expected_version and
       (.ETag|type=="string" and length>0) and
       ((.Metadata // {})|type=="object" and
-        ((keys - ["sha256"])|length==0))' "$output" >/dev/null || return 2
+        ((keys - ["sha256"])|length==0))' "$output" >/dev/null ||
+      { beta_storage_fail head_version_mismatch; return 2; }
     return 0
   fi
   status=$?
-  [ "$status" -eq 3 ] && return 1
+  rm -f -- "$output"
+  beta_storage_fail provider_head_unavailable
   return 2
 }
 

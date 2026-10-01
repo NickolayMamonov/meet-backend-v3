@@ -3,6 +3,40 @@ set -euo pipefail
 
 fail() { echo "test-beta-backup-storage.sh: $1" >&2; exit 1; }
 
+run_writer_state_gate_fixture() {
+  local initial_status=$1 mutation_log=$2 writer_status calls=0
+  : >"$mutation_log"
+  beta_storage_require_config() { :; }
+  beta_storage_remote_head() {
+    calls=$((calls + 1))
+    if [ "$calls" -eq 1 ]; then
+      return "$initial_status"
+    fi
+    printf '%s\n' '{"VersionId":"created-version","ETag":"created-etag"}' >"$2"
+    return 0
+  }
+  beta_storage_provider_put_conditional() {
+    printf 'conditional-create\n' >>"$mutation_log"
+    printf '%s\n' '{"versionId":"created-version"}'
+  }
+  set +e
+  (
+    trap - RETURN
+    set +u
+    beta_storage_remote_writer_acquire publish fixture-owner fixture-tx \
+      1 "$(printf fixture | sha256sum | awk '{print $1}')" '[]' \
+      >/dev/null 2>&1
+  )
+  writer_status=$?
+  set -e
+  if [ "$initial_status" -eq 1 ]; then
+    [ "$writer_status" -eq 0 ] &&
+      [ "$(wc -l <"$mutation_log" | tr -d '[:space:]')" -eq 1 ]
+  else
+    [ "$writer_status" -ne 0 ] && [ ! -s "$mutation_log" ]
+  fi
+}
+
 run_invalid_remote_delete_fixture() {
   local delete_log=$1 delete_status
   export FAKE_AWS_MODE=list-unknown
@@ -445,6 +479,64 @@ case "${FAKE_AWS_MODE:?}" in
     printf 'An error occurred (NoSuchKey) when calling the HeadObject operation: Not Found\n' >&2
     exit 3
     ;;
+  inventory-no-versions)
+    case " $* " in
+      *' list-object-versions '*) printf '{"IsTruncated":false}\n' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  inventory-live|inventory-stale|inventory-pagination|inventory-head-mismatch)
+    case " $* " in
+      *' list-object-versions '*)
+        case "$FAKE_AWS_MODE" in
+          inventory-live)
+            printf '{"IsTruncated":false,"Versions":[{"Key":"control/writer.json","VersionId":"live-version","IsLatest":true,"Size":1}]}\n'
+            ;;
+          inventory-stale)
+            printf '{"IsTruncated":false,"Versions":[{"Key":"control/writer.json","VersionId":"current-version","IsLatest":true,"Size":1},{"Key":"control/writer.json","VersionId":"stale-version","IsLatest":false,"Size":1}]}\n'
+            ;;
+          inventory-pagination)
+            if [[ " $* " == *' --key-marker points/page '* ]]; then
+              printf '{"IsTruncated":false,"KeyMarker":"points/page","VersionIdMarker":"version-1","Versions":[{"Key":"control/writer.json","VersionId":"paged-current","IsLatest":true,"Size":1}]}\n'
+            else
+              printf '{"IsTruncated":true,"NextKeyMarker":"points/page","NextVersionIdMarker":"version-1","Versions":[{"Key":"points/page/object","VersionId":"version-1","Size":1}]}\n'
+            fi
+            ;;
+          inventory-head-mismatch)
+            printf '{"IsTruncated":false,"Versions":[{"Key":"control/writer.json","VersionId":"expected-version","IsLatest":true,"Size":1}]}\n'
+            ;;
+        esac
+        ;;
+      *' head-object '*)
+        case "$FAKE_AWS_MODE" in
+          inventory-live) printf '{"VersionId":"live-version","ETag":"live-etag"}\n' ;;
+          inventory-stale) printf '{"VersionId":"current-version","ETag":"current-etag"}\n' ;;
+          inventory-pagination) printf '{"VersionId":"paged-current","ETag":"paged-etag"}\n' ;;
+          inventory-head-mismatch) printf '{"VersionId":"actual-version","ETag":"actual-etag"}\n' ;;
+        esac
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  inventory-delete-marker)
+    case " $* " in
+      *' list-object-versions '*)
+        printf '{"IsTruncated":false,"DeleteMarkers":[{"Key":"control/writer.json","VersionId":"deleted-version","IsLatest":true}]}\n'
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  inventory-authorization|inventory-read-exhausted)
+    exit 124
+    ;;
+  inventory-malformed)
+    case " $* " in
+      *' list-object-versions '*)
+        printf '{"IsTruncated":false,"Versions":[{"Key":"control/writer.json","VersionId":"bad-version","IsLatest":"true","Size":1}]}\n'
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
   authorization)
     printf 'An error occurred (AccessDenied) when calling the HeadObject operation: Forbidden\n' >&2
     exit 3
@@ -642,6 +734,39 @@ unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FIL
 # response receives the internal absent sentinel.
 # shellcheck source=beta-backup-storage.sh
 source "$root/scripts/beta-backup-storage.sh"
+
+for current_state_case in \
+  inventory-no-versions inventory-live inventory-delete-marker \
+  inventory-stale inventory-pagination inventory-head-mismatch \
+  inventory-authorization inventory-malformed inventory-read-exhausted; do
+  export FAKE_AWS_MODE="$current_state_case"
+  set +e
+  beta_storage_remote_head control/writer.json "$tmp/current-head.json" \
+    >/dev/null 2>&1
+  current_state_status=$?
+  set -e
+  case "$current_state_case" in
+    inventory-no-versions)
+      [ "$current_state_status" -eq 1 ] ||
+        fail "no-version inventory was not proven absent"
+      ;;
+    inventory-live|inventory-stale|inventory-pagination)
+      [ "$current_state_status" -eq 0 ] ||
+        fail "$current_state_case did not accept the exact latest live version"
+      ;;
+    *)
+      [ "$current_state_status" -ne 0 ] ||
+        fail "$current_state_case was accepted as a current object state"
+      ;;
+  esac
+done
+
+writer_gate_log="$tmp/writer-gate.log"
+run_writer_state_gate_fixture 1 "$writer_gate_log" ||
+  fail "only proven absence did not permit conditional writer creation"
+run_writer_state_gate_fixture 2 "$writer_gate_log" ||
+  fail "unknown writer state reached conditional writer creation"
+
 export FAKE_AWS_MODE=raw3
 if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key missing; then
   fail "raw provider exit 3 was accepted as a missing object"
