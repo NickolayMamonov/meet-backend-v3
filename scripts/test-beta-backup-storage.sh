@@ -768,4 +768,55 @@ grep -Fq 'issue_body_oversize' \
 grep -Fq '((.body // "")|contains' \
   "$root/scripts/send-beta-backup-incident.sh" ||
   fail "incident deduplication does not tolerate null issue bodies"
+
+export FAKE_AWS_MODE=list-unknown
+delete_log="$tmp/delete.log"
+: >"$delete_log"
+beta_storage_provider_delete() {
+  printf 'DELETE %s %s\n' "$2" "$3" >>"$delete_log"
+  return 0
+}
+set +e
+beta_storage_remote_delete_version points/delete-failure version-1 marker \
+  >/dev/null 2>&1
+delete_status=$?
+set -e
+[ "$delete_status" -ne 0 ] ||
+  fail "invalid version-list response was accepted by remote deletion"
+[ ! -s "$delete_log" ] ||
+  fail "remote deletion invoked provider delete after invalid version-list response"
+
+consumer_log="$tmp/consumer.log"
+: >"$consumer_log"
+beta_storage_require_config() { :; }
+beta_storage_remote_inventory_total() { return 1; }
+beta_storage_remote_writer_acquire() {
+  printf 'acquire\n' >>"$consumer_log"
+  return 0
+}
+beta_storage_remote_writer_release() {
+  printf 'release\n' >>"$consumer_log"
+  return 0
+}
+beta_storage_remote_writer_transition() {
+  printf 'transition\n' >>"$consumer_log"
+  return 0
+}
+beta_storage_remote_head() { return 1; }
+beta_storage_remote_get_json() { :; }
+beta_storage_remote_validate_descriptor() { :; }
+beta_storage_provider_put_conditional() {
+  printf '{"versionId":"fixture-version"}\n'
+}
+beta_storage_descriptor_digest() { printf '%s\n' fixture-digest; }
+set +e
+beta_storage_remote_commit_capture_head inventory-failure \
+  1790000000 test >/dev/null 2>&1
+consumer_status=$?
+set -e
+[ "$consumer_status" -ne 0 ] ||
+  fail "inventory failure was accepted by a strict consumer"
+if grep -Eq '^(acquire|transition)$' "$consumer_log"; then
+  fail "strict inventory consumer continued into writer work after failure"
+fi
 printf 'test-beta-backup-storage.sh: passed\n'

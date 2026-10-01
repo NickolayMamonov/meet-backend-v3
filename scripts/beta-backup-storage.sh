@@ -1844,10 +1844,12 @@ beta_storage_publish_remote() {
       beta_storage_fail capture_reservation_missing
     (( reserve + writer_control_reserve <= BETA_STORAGE_CAPTURE_RESERVATION_BYTES )) ||
       beta_storage_fail capture_reservation_exceeded
-    beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" 0 false >/dev/null
+    beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" 0 false >/dev/null ||
+      return 1
   else
     beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-      "$((reserve + writer_control_reserve))" >/dev/null
+      "$((reserve + writer_control_reserve))" >/dev/null ||
+      return 1
     beta_storage_remote_writer_acquire publish "$owner" "$txid" \
       "$reserve" "$intent_digest" "$expected_keys"
   fi
@@ -1919,7 +1921,8 @@ beta_storage_publish_remote() {
   fi
   beta_storage_remote_writer_transition publishing false "$expected_keys"
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$((reserve + writer_control_reserve))" >/dev/null
+    "$((reserve + writer_control_reserve))" >/dev/null ||
+    return 1
   local db_json media_json manifest_json db_version media_version manifest_version
   db_json=$(beta_storage_provider_put_conditional '' "points/$point_id/postgres.dump.age" \
     "$source/postgres.dump.age" '' true)
@@ -1998,7 +2001,8 @@ beta_storage_publish_remote() {
   if [ "${BETA_STORAGE_DEFER_CAPTURE_HEAD:-false}" = true ]; then
     beta_storage_remote_writer_transition publishing false "$expected_keys"
     beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-      "$writer_control_reserve" >/dev/null
+      "$writer_control_reserve" >/dev/null ||
+      return 1
     cleanup=false
     beta_storage_remote_writer_release "$owner" "$txid"
     trap - RETURN
@@ -2036,7 +2040,8 @@ beta_storage_publish_remote() {
   cmp -s "$head" "$scratch/committed-head.json" ||
     beta_storage_fail capture_head_commit_ambiguous
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$writer_control_reserve" >/dev/null
+    "$writer_control_reserve" >/dev/null ||
+    return 1
   cleanup=false
   beta_storage_remote_writer_release "$owner" "$txid"
   trap - RETURN
@@ -2073,7 +2078,8 @@ beta_storage_remote_commit_capture_head() {
   trap cleanup_capture_head RETURN
   local reserve=$((4 * BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES))
   local expected_keys='["control/capture-head.json"]'
-  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" "$reserve" >/dev/null
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" "$reserve" >/dev/null ||
+    return 1
   beta_storage_remote_writer_acquire publish "$owner" "$txid" "$reserve" \
     "$(printf '%s\0%s' "$point_id" "$captured_at" | sha256sum | awk '{print $1}')" \
     "$expected_keys"
@@ -2672,7 +2678,8 @@ beta_storage_promote_remote() {
      "control/verified-head.json"]')
   local writer_control_reserve=$((4 * BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES))
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$((reserve + writer_control_reserve))" >/dev/null
+    "$((reserve + writer_control_reserve))" >/dev/null ||
+    return 1
   txid="promote-$receipt_id"
   beta_storage_remote_writer_acquire promote "$owner" "$txid" \
     "$reserve" "$intent_digest" "$expected_keys"
@@ -2701,7 +2708,8 @@ beta_storage_promote_remote() {
     [ "$?" -eq 1 ] || beta_storage_fail proof_read_failed
   fi
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$((reserve + writer_control_reserve))" >/dev/null
+    "$((reserve + writer_control_reserve))" >/dev/null ||
+    return 1
   : "${receipt_version:=}"
   : "${proof_version:=}"
   if [ "$receipt_present" = false ]; then
@@ -2757,7 +2765,8 @@ beta_storage_promote_remote() {
   cmp -s "$head" "$scratch/committed-head.json" ||
     beta_storage_fail verified_head_commit_ambiguous
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$writer_control_reserve" >/dev/null
+    "$writer_control_reserve" >/dev/null ||
+    return 1
   printf 'storage_promote=provider_committed point_id=%s receipt_id=%s\n' \
     "$point_id" "$receipt_id"
 }
@@ -2766,39 +2775,41 @@ beta_storage_remote_delete_version() {
   local key=$1 version=$2 kind=${3:-version} head inventory
   if [ "$kind" = marker ]; then
     inventory=$(beta_storage_aws_list_versions | jq -s '.') ||
-      beta_storage_fail deletion_inventory_unreadable
+      { beta_storage_fail deletion_inventory_unreadable; return 1; }
     jq -e --arg key "$key" --arg version "$version" '
       any(.[].DeleteMarkers[]?; .Key==$key and .VersionId==$version)
     ' <<<"$inventory" >/dev/null ||
-      beta_storage_fail deletion_version_missing
+      { beta_storage_fail deletion_version_missing; return 1; }
   else
     head=$(mktemp)
     beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
       --version-id "$version" >"$head" ||
-      { rm -f "$head"; beta_storage_fail deletion_version_unreadable; }
+      { rm -f "$head"; beta_storage_fail deletion_version_unreadable; return 1; }
     jq -e --arg version "$version" '.VersionId==$version' "$head" >/dev/null ||
-      { rm -f "$head"; beta_storage_fail deletion_version_mismatch; }
+      { rm -f "$head"; beta_storage_fail deletion_version_mismatch; return 1; }
     rm -f "$head"
   fi
-  beta_storage_provider_delete '' "$key" "$version"
+  beta_storage_provider_delete '' "$key" "$version" || return 1
   if [ "$kind" = marker ]; then
     inventory=$(beta_storage_aws_list_versions | jq -s '.') ||
-      beta_storage_fail deletion_inventory_unreadable
+      { beta_storage_fail deletion_inventory_unreadable; return 1; }
     jq -e --arg key "$key" --arg version "$version" '
       (any(.[].Versions[]?; .Key==$key and .VersionId==$version) or
        any(.[].DeleteMarkers[]?; .Key==$key and .VersionId==$version)) | not
     ' <<<"$inventory" >/dev/null ||
-      beta_storage_fail deletion_not_confirmed
+      { beta_storage_fail deletion_not_confirmed; return 1; }
   else
     head=$(mktemp)
     if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key "$key" \
       --version-id "$version" >"$head"; then
       rm -f "$head"
       beta_storage_fail deletion_not_confirmed
+      return 1
     else
       local status=$?
       rm -f "$head"
-      [ "$status" -eq 3 ] || beta_storage_fail deletion_verification_failed
+      [ "$status" -eq 3 ] ||
+        { beta_storage_fail deletion_verification_failed; return 1; }
     fi
   fi
 }
@@ -3226,7 +3237,8 @@ beta_storage_prune_remote() {
   cmp -s "$summary" "$scratch/committed-prune-summary.json" ||
     beta_storage_fail prune_summary_commit_ambiguous
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$writer_control_reserve" >/dev/null
+    "$writer_control_reserve" >/dev/null ||
+    return 1
   rm -f "$head" "$head.meta" "$seen" "$deleted_point_ids"
   beta_storage_remote_writer_release "$owner" "prune-$now"
   release=false
