@@ -2984,7 +2984,8 @@ beta_storage_prune_remote() {
       while IFS=$'\t' read -r object_key object_version; do
         [[ "$object_key" == "points/$point_id/"* || "$object_key" == "receipts/$point_id/"* ]] ||
           continue
-        delete_inventory_version "$object_key" "$object_version"
+        delete_inventory_version "$object_key" "$object_version" ||
+          return 1
       done < <(jq -r --arg id "$point_id" '.[].Versions[]? |
         select(.Key|startswith("points/"+$id+"/") or startswith("receipts/"+$id+"/")) |
         [.Key,.VersionId,"version"]|@tsv
@@ -2992,7 +2993,8 @@ beta_storage_prune_remote() {
       while IFS=$'\t' read -r object_key object_version; do
         [[ "$object_key" == "points/$point_id/"* ||
           "$object_key" == "receipts/$point_id/"* ]] || continue
-        delete_inventory_version "$object_key" "$object_version" marker
+        delete_inventory_version "$object_key" "$object_version" marker ||
+          return 1
       done < <(jq -r --arg id "$point_id" '.[].DeleteMarkers[]? |
         select(.Key|startswith("points/"+$id+"/") or startswith("receipts/"+$id+"/")) |
         [.Key,.VersionId]|@tsv' <<<"$inventory")
@@ -3028,14 +3030,16 @@ beta_storage_prune_remote() {
     while IFS=$'\t' read -r object_key object_version; do
       [[ "$object_key" == "points/$point_id/"* ||
         "$object_key" == "receipts/$point_id/"* ]] || continue
-      delete_inventory_version "$object_key" "$object_version"
+      delete_inventory_version "$object_key" "$object_version" ||
+        return 1
     done < <(jq -r --arg id "$point_id" '.[].Versions[]? |
       select(.Key|startswith("points/"+$id+"/") or
         startswith("receipts/"+$id+"/")) | [.Key,.VersionId]|@tsv' <<<"$inventory")
     while IFS=$'\t' read -r object_key object_version; do
       [[ "$object_key" == "points/$point_id/"* ||
         "$object_key" == "receipts/$point_id/"* ]] || continue
-      delete_inventory_version "$object_key" "$object_version" marker
+      delete_inventory_version "$object_key" "$object_version" marker ||
+        return 1
     done < <(jq -r --arg id "$point_id" '.[].DeleteMarkers[]? |
       select(.Key|startswith("points/"+$id+"/") or
         startswith("receipts/"+$id+"/")) | [.Key,.VersionId]|@tsv' <<<"$inventory")
@@ -3073,7 +3077,8 @@ beta_storage_prune_remote() {
         [ "$receipt_version" = "$live_proof_version" ]; }; then
       continue
     fi
-    delete_inventory_version "$receipt_key" "$receipt_version"
+    delete_inventory_version "$receipt_key" "$receipt_version" ||
+      return 1
   done < <(jq -r '.[].Versions[]? | select(.Key|startswith("receipts/")) |
     [.Key,.VersionId]|@tsv' <<<"$inventory")
   while IFS=$'\t' read -r receipt_key receipt_version; do
@@ -3081,7 +3086,8 @@ beta_storage_prune_remote() {
     receipt_point=${receipt_key#receipts/}
     receipt_point=${receipt_point%%/*}
     grep -Fxq -- "$receipt_point" "$deleted_point_ids" && continue
-    delete_inventory_version "$receipt_key" "$receipt_version" marker
+    delete_inventory_version "$receipt_key" "$receipt_version" marker ||
+      return 1
   done < <(jq -r '.[].DeleteMarkers[]? | select(.Key|startswith("receipts/")) |
     [.Key,.VersionId]|@tsv' <<<"$inventory")
   # Every control object is budgeted. Retain only its current live version;
@@ -3093,19 +3099,22 @@ beta_storage_prune_remote() {
       current_control_version=$(jq -er '.VersionId' "$head.meta")
       while IFS=$'\t' read -r control_version_key control_version; do
         [ "$control_version" = "$current_control_version" ] && continue
-        delete_inventory_version "$control_version_key" "$control_version"
+        delete_inventory_version "$control_version_key" "$control_version" ||
+          return 1
       done < <(jq -r --arg key "$control_key" '.[].Versions[]? |
         select(.Key==$key) | [.Key,.VersionId]|@tsv' <<<"$inventory")
     else
       control_status=$?
       [ "$control_status" -eq 1 ] || beta_storage_fail control_read_failed
       while IFS=$'\t' read -r control_version_key control_version; do
-        delete_inventory_version "$control_version_key" "$control_version"
+        delete_inventory_version "$control_version_key" "$control_version" ||
+          return 1
       done < <(jq -r --arg key "$control_key" '.[].Versions[]? |
         select(.Key==$key) | [.Key,.VersionId]|@tsv' <<<"$inventory")
     fi
     while IFS=$'\t' read -r control_marker_key control_marker_version; do
-      delete_inventory_version "$control_marker_key" "$control_marker_version" marker
+      delete_inventory_version "$control_marker_key" "$control_marker_version" marker ||
+        return 1
     done < <(jq -r --arg key "$control_key" '.[].DeleteMarkers[]? |
       select(.Key==$key) | [.Key,.VersionId]|@tsv' <<<"$inventory")
   done < <(jq -r '.[].Versions[]?, .[].DeleteMarkers[]? | .Key |
@@ -3196,7 +3205,8 @@ beta_storage_prune_remote() {
   summary_meta="$scratch/prune-summary.meta"
   if beta_storage_remote_head control/prune-summary.json "$summary_meta"; then
     summary_current_version=$(jq -er '.VersionId' "$summary_meta")
-    delete_inventory_version control/prune-summary.json "$summary_current_version"
+    delete_inventory_version control/prune-summary.json "$summary_current_version" ||
+      return 1
   else
     summary_status=$?
     [ "$summary_status" -eq 1 ] ||

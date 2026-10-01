@@ -138,7 +138,8 @@ if [ -z "$storage_root" ]; then
   capture_intent=$(printf '%s\0%s\0%s' "slot-$slot" "$slot" \
     "$capture_reservation" | sha256sum | awk '{print $1}')
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$capture_reservation" >/dev/null
+    "$capture_reservation" >/dev/null ||
+    { echo 'BACKUP_CAPTURE_BLOCKED:inventory_admission_failed' >&2; exit 1; }
   beta_storage_remote_writer_acquire capture "$owner" "$capture_txid" \
     "$capture_reservation" "$capture_intent" "$capture_expected_keys"
   preacquired=true
