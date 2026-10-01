@@ -705,26 +705,27 @@ beta_storage_remote_list_multipart_parts() {
   beta_storage_key "$key" >/dev/null || return 1
   [[ "$upload_id" =~ ^[A-Za-z0-9._:-]+$ ]] &&
     [ "${#upload_id}" -le 256 ] ||
-    beta_storage_fail multipart_upload_id_invalid
+    { beta_storage_fail multipart_upload_id_invalid; return 1; }
   while (( page < BETA_STORAGE_MAX_PAGES )); do
     page=$((page + 1))
     if [ -n "$part_marker" ]; then
       part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
         --key "$key" --upload-id "$upload_id" --max-parts 1000 \
         --part-number-marker "$part_marker") ||
-        beta_storage_fail multipart_parts_unavailable
+        { beta_storage_fail multipart_parts_unavailable; return 1; }
     else
       part_page=$(beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
         --key "$key" --upload-id "$upload_id" --max-parts 1000) ||
-        beta_storage_fail multipart_parts_unavailable
+        { beta_storage_fail multipart_parts_unavailable; return 1; }
     fi
     part_page=$(beta_storage_normalize_provider_list_response list-parts "$part_page") ||
-      beta_storage_fail multipart_parts_invalid
+      { beta_storage_fail multipart_parts_invalid; return 1; }
     part_json_file=$(mktemp)
     printf '%s\n' "$part_page" >"$part_json_file"
     if ! beta_storage_require_unique_json "$part_json_file"; then
       rm -f -- "$part_json_file"
       beta_storage_fail multipart_parts_duplicate_json
+      return 1
     fi
     rm -f -- "$part_json_file"
     jq -e --arg expected_key "$key" --arg expected_upload "$upload_id" \
@@ -756,24 +757,24 @@ beta_storage_remote_list_multipart_parts() {
       (($root.Parts|map(.PartNumber)|unique|length) ==
         ($root.Parts|map(.PartNumber)|length))
     ' <<<"$part_page" >/dev/null ||
-      beta_storage_fail multipart_parts_invalid
+      { beta_storage_fail multipart_parts_invalid; return 1; }
     all_parts=$(jq -cn --argjson existing "$all_parts" \
       --argjson page "$part_page" '$existing + ($page | .Parts)') ||
-      beta_storage_fail multipart_parts_invalid
+      { beta_storage_fail multipart_parts_invalid; return 1; }
     truncated=$(jq -er '.IsTruncated' <<<"$part_page")
     [ "$truncated" = true ] || break
     part_marker=$(jq -er '.NextPartNumberMarker // empty' <<<"$part_page")
     [[ "$part_marker" =~ ^[1-9][0-9]*$ ]] ||
-      beta_storage_fail multipart_parts_pagination_invalid
+      { beta_storage_fail multipart_parts_pagination_invalid; return 1; }
   done
   [ "$truncated" = false ] ||
-    beta_storage_fail multipart_parts_pagination_limit
+    { beta_storage_fail multipart_parts_pagination_limit; return 1; }
   jq -e --argjson max_parts "$BETA_STORAGE_MULTIPART_MAX_PARTS" '
     type=="array" and length <= $max_parts and
     (map(.PartNumber) as $numbers |
       ($numbers|unique|length) == ($numbers|length))
   ' <<<"$all_parts" >/dev/null ||
-    beta_storage_fail multipart_parts_invalid
+    { beta_storage_fail multipart_parts_invalid; return 1; }
   printf '%s\n' "$all_parts"
 }
 
@@ -809,13 +810,14 @@ beta_storage_aws_list_versions() {
     if [ -n "$key_marker" ]; then
       response=$(beta_storage_aws_read list-object-versions --bucket "$BETA_BACKUP_BUCKET" \
         --max-keys 1000 --key-marker "$key_marker" --version-id-marker "$version_marker") ||
-        beta_storage_fail inventory_unavailable
+        { beta_storage_fail inventory_unavailable; return 1; }
     else
       response=$(beta_storage_aws_read list-object-versions --bucket "$BETA_BACKUP_BUCKET" \
-        --max-keys 1000) || beta_storage_fail inventory_unavailable
+        --max-keys 1000) || { beta_storage_fail inventory_unavailable; return 1; }
     fi
     response=$(beta_storage_normalize_provider_list_response \
-      list-object-versions "$response") || beta_storage_fail inventory_invalid
+      list-object-versions "$response") ||
+      { beta_storage_fail inventory_invalid; return 1; }
     jq -e '
       type=="object" and (.Versions|type=="array") and
       (.DeleteMarkers|type=="array") and
@@ -841,20 +843,22 @@ beta_storage_aws_list_versions() {
         (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
         (.VersionId|type=="string" and utf8bytelength>=1 and
           utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$"))) and
-      (([.Versions[]? | "v\(.Key)\u0000\(.VersionId)"] +
-        [.DeleteMarkers[]? | "d\(.Key)\u0000\(.VersionId)"]) |
-        unique | length ==
-        ([.Versions[]? | "v\(.Key)\u0000\(.VersionId)"] +
-         [.DeleteMarkers[]? | "d\(.Key)\u0000\(.VersionId)"] | length))
-    ' <<<"$response" >/dev/null || beta_storage_fail inventory_invalid
+      (. as $root |
+        ([ $root.Versions[]? | "v\(.Key)\u0000\(.VersionId)" ] +
+         [ $root.DeleteMarkers[]? | "d\(.Key)\u0000\(.VersionId)" ]) as $entries |
+        ($entries | unique | length) == ($entries | length))
+    ' <<<"$response" >/dev/null ||
+      { beta_storage_fail inventory_invalid; return 1; }
     printf '%s\n' "$response"
     truncated=$(jq -er '.IsTruncated' <<<"$response")
     [ "$truncated" = true ] || return 0
     key_marker=$(jq -er '.NextKeyMarker // empty' <<<"$response")
     version_marker=$(jq -er '.NextVersionIdMarker // empty' <<<"$response")
-    [ -n "$key_marker" ] && [ -n "$version_marker" ] || beta_storage_fail pagination_invalid
+    [ -n "$key_marker" ] && [ -n "$version_marker" ] ||
+      { beta_storage_fail pagination_invalid; return 1; }
   done
   beta_storage_fail pagination_limit
+  return 1
 }
 
 beta_storage_local_provider_put() {
@@ -1693,30 +1697,35 @@ beta_storage_remote_writer_release() {
 beta_storage_remote_inventory_total() {
   local budget=${1:-${BETA_BACKUP_BYTE_BUDGET:-0}} additional=${2:-0}
   local enforce_budget=${3:-true} response parts
-  [[ "$budget" =~ ^[0-9]+$ ]] || beta_storage_fail budget_invalid
-  [[ "$additional" =~ ^[0-9]+$ ]] || beta_storage_fail reservation_invalid
+  [[ "$budget" =~ ^[0-9]+$ ]] || { beta_storage_fail budget_invalid; return 1; }
+  [[ "$additional" =~ ^[0-9]+$ ]] ||
+    { beta_storage_fail reservation_invalid; return 1; }
   (( budget <= 9223372036854775807 &&
     additional <= 9223372036854775807 )) ||
-    beta_storage_fail budget_overflow
+    { beta_storage_fail budget_overflow; return 1; }
   response=$(beta_storage_aws_list_versions | jq -s --argjson markerBytes "$BETA_STORAGE_DELETE_MARKER_BYTES" '
     ([.[].Versions[]? | (.Size // 0)] | add // 0) +
     ([.[].DeleteMarkers[]? | $markerBytes] | add // 0)') ||
-    beta_storage_fail inventory_unavailable
-  [[ "$response" =~ ^[0-9]+$ ]] || beta_storage_fail inventory_invalid
-  (( response <= 9223372036854775807 )) || beta_storage_fail budget_overflow
+    { beta_storage_fail inventory_unavailable; return 1; }
+  [[ "$response" =~ ^[0-9]+$ ]] ||
+    { beta_storage_fail inventory_invalid; return 1; }
+  (( response <= 9223372036854775807 )) ||
+    { beta_storage_fail budget_overflow; return 1; }
   local key_marker='' upload_id_marker='' page=0 multipart_bytes=0 parts_file
   while (( page < BETA_STORAGE_MAX_PAGES )); do
     page=$((page + 1))
     if [ -n "$key_marker" ]; then
       parts=$(beta_storage_aws_read list-multipart-uploads --bucket "$BETA_BACKUP_BUCKET" \
         --max-uploads 1000 --key-marker "$key_marker" --upload-id-marker "$upload_id_marker") ||
-        beta_storage_fail multipart_inventory_unavailable
+        { beta_storage_fail multipart_inventory_unavailable; return 1; }
     else
       parts=$(beta_storage_aws_read list-multipart-uploads --bucket "$BETA_BACKUP_BUCKET" \
-        --max-uploads 1000) || beta_storage_fail multipart_inventory_unavailable
+        --max-uploads 1000) ||
+        { beta_storage_fail multipart_inventory_unavailable; return 1; }
     fi
     parts=$(beta_storage_normalize_provider_list_response \
-      list-multipart-uploads "$parts") || beta_storage_fail multipart_inventory_invalid
+      list-multipart-uploads "$parts") ||
+      { beta_storage_fail multipart_inventory_invalid; return 1; }
     jq -e '
       type=="object" and (.Uploads|type=="array") and
       ((keys - ["AbortDate","AbortRuleId","Bucket","CommonPrefixes","Delimiter",
@@ -1736,40 +1745,44 @@ beta_storage_remote_inventory_total() {
         (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
         (.UploadId|type=="string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
         (.Initiated|type=="string" and length>0))
-    ' <<<"$parts" >/dev/null || beta_storage_fail multipart_inventory_invalid
+    ' <<<"$parts" >/dev/null ||
+      { beta_storage_fail multipart_inventory_invalid; return 1; }
     parts_file=$(mktemp)
     printf '%s\n' "$parts" >"$parts_file"
     if ! beta_storage_require_unique_json "$parts_file"; then
       rm -f -- "$parts_file"
       beta_storage_fail multipart_inventory_duplicate_json
+      return 1
     fi
     rm -f -- "$parts_file"
     while IFS=$'\t' read -r upload_key upload_id; do
       [ -n "$upload_key" ] && [ -n "$upload_id" ] || continue
       part_page=$(beta_storage_remote_list_multipart_parts \
         "$upload_key" "$upload_id") ||
-        beta_storage_fail multipart_parts_incomplete
+        { beta_storage_fail multipart_parts_incomplete; return 1; }
       part_bytes=$(jq -r '[.Parts[]?.Size] | add // 0' <<<"$part_page")
-      [[ "$part_bytes" =~ ^[0-9]+$ ]] || beta_storage_fail multipart_parts_invalid
+      [[ "$part_bytes" =~ ^[0-9]+$ ]] ||
+        { beta_storage_fail multipart_parts_invalid; return 1; }
       (( part_bytes <= 9223372036854775807 - multipart_bytes )) ||
-        beta_storage_fail budget_overflow
+        { beta_storage_fail budget_overflow; return 1; }
       multipart_bytes=$((multipart_bytes + part_bytes))
     done < <(jq -r '.Uploads[]? | [.Key,.UploadId]|@tsv' <<<"$parts")
     [ "$(jq -er '.IsTruncated // false' <<<"$parts")" = true ] || break
     key_marker=$(jq -er '.NextKeyMarker // empty' <<<"$parts")
     upload_id_marker=$(jq -er '.NextUploadIdMarker // empty' <<<"$parts")
     [ -n "$key_marker" ] && [ -n "$upload_id_marker" ] ||
-      beta_storage_fail multipart_pagination_invalid
+      { beta_storage_fail multipart_pagination_invalid; return 1; }
   done
-  (( page < BETA_STORAGE_MAX_PAGES )) || beta_storage_fail multipart_pagination_limit
+  (( page < BETA_STORAGE_MAX_PAGES )) ||
+    { beta_storage_fail multipart_pagination_limit; return 1; }
   (( multipart_bytes <= 9223372036854775807 - response )) ||
-    beta_storage_fail budget_overflow
+    { beta_storage_fail budget_overflow; return 1; }
   local total=$((response + multipart_bytes))
   (( additional <= 9223372036854775807 - total )) ||
-    beta_storage_fail budget_overflow
+    { beta_storage_fail budget_overflow; return 1; }
   total=$((total + additional))
   if [ "$enforce_budget" = true ]; then
-    (( total <= budget )) || beta_storage_fail budget_exceeded
+    (( total <= budget )) || { beta_storage_fail budget_exceeded; return 1; }
   fi
   printf '%s\n' "$total"
 }
@@ -2801,7 +2814,7 @@ beta_storage_remote_multipart_eligible() {
 beta_storage_prune_remote() {
   local now=$1 owner=$2 safety_status=$3 safety_watermark=$4 safety_environment=$5
   local pinned='' capture_pinned='' head_version
-  [[ "$now" =~ ^[0-9]+$ ]] || beta_storage_fail clock_invalid
+  [[ "$now" =~ ^[0-9]+$ ]] || { beta_storage_fail clock_invalid; return 1; }
   beta_storage_remote_require_safety "$safety_status" "$safety_watermark" \
     "$safety_environment" "$now"
   beta_storage_require_config
@@ -2811,7 +2824,7 @@ beta_storage_prune_remote() {
     "$writer_control_reserve" |
     sha256sum | awk '{print $1}')
   beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$writer_control_reserve" false >/dev/null
+    "$writer_control_reserve" false >/dev/null || return 1
   beta_storage_remote_writer_acquire prune "$owner" "prune-$now" \
     "$writer_control_reserve" \
     "$intent_digest" '["control/verified-head.json"]'
@@ -2857,16 +2870,19 @@ beta_storage_prune_remote() {
     pinned=$(jq -er '.pointId' "$head")
   else
     beta_storage_fail verified_head_read_failed
+    return 1
   fi
-  [ -n "$pinned" ] || beta_storage_fail verified_head_missing
+  [ -n "$pinned" ] || { beta_storage_fail verified_head_missing; return 1; }
   beta_storage_remote_build_status_once "$scratch/pinned-status.json" \
-    "$safety_environment" "$now" || beta_storage_fail pinned_closure_unreadable
+    "$safety_environment" "$now" ||
+    { beta_storage_fail pinned_closure_unreadable; return 1; }
   jq -e --arg pinned "$pinned" \
     '.verified.state=="VALID" and .verified.id==$pinned' \
     "$scratch/pinned-status.json" >/dev/null ||
-    beta_storage_fail pinned_closure_invalid
+    { beta_storage_fail pinned_closure_invalid; return 1; }
   capture_pinned=$(jq -er '.capture.id // empty' "$scratch/pinned-status.json")
-  [ -n "$capture_pinned" ] || beta_storage_fail capture_head_missing
+  [ -n "$capture_pinned" ] ||
+    { beta_storage_fail capture_head_missing; return 1; }
   local expected_keys
   expected_keys=$(jq -cn --arg point "$pinned" --arg capture "$capture_pinned" \
     --arg receipt "$(jq -er '.receiptId' "$head")" \
@@ -2886,8 +2902,9 @@ beta_storage_prune_remote() {
   beta_storage_remote_writer_transition pruning false "$expected_keys"
   local inventory key version inventory_before
   inventory_before=$(beta_storage_remote_inventory_total \
-    "$BETA_BACKUP_BYTE_BUDGET" 0 false)
-  inventory=$(beta_storage_aws_list_versions | jq -s '.')
+    "$BETA_BACKUP_BYTE_BUDGET" 0 false) || return 1
+  inventory=$(beta_storage_aws_list_versions | jq -s '.') ||
+    { beta_storage_fail inventory_unavailable; return 1; }
   jq -e 'type=="array" and all(.[]; type=="object" and
     all(.Versions[]?; (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
       (.VersionId|type=="string" and utf8bytelength>=1 and
@@ -2897,7 +2914,7 @@ beta_storage_prune_remote() {
       test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
       (.VersionId|type=="string" and utf8bytelength>=1 and
         utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$")))' <<<"$inventory" >/dev/null ||
-    beta_storage_fail inventory_invalid
+    { beta_storage_fail inventory_invalid; return 1; }
   seen=$(mktemp)
   deleted_point_ids=$(mktemp)
   delete_inventory_version() {
@@ -2906,11 +2923,13 @@ beta_storage_prune_remote() {
       object_bytes=$BETA_STORAGE_DELETE_MARKER_BYTES
       jq -e --arg key "$object_key" --arg version "$object_version" '
         any(.[].DeleteMarkers[]?; .Key==$key and .VersionId==$version)
-      ' <<<"$inventory" >/dev/null || beta_storage_fail inventory_invalid
+      ' <<<"$inventory" >/dev/null ||
+        { beta_storage_fail inventory_invalid; return 1; }
     else
       object_bytes=$(jq -er --arg key "$object_key" --arg version "$object_version" '
         [.[].Versions[]? | select(.Key==$key and .VersionId==$version) | .Size][0]
-      ' <<<"$inventory") || beta_storage_fail inventory_invalid
+      ' <<<"$inventory") ||
+        { beta_storage_fail inventory_invalid; return 1; }
     fi
     if [ "$object_kind" = marker ]; then
       (( deleted_delete_marker_bytes <= 9223372036854775807 - object_bytes )) ||
@@ -3083,15 +3102,15 @@ beta_storage_prune_remote() {
       multipart=$(beta_storage_aws_read list-multipart-uploads \
         --bucket "$BETA_BACKUP_BUCKET" --max-uploads 1000 \
         --key-marker "$key_marker" --upload-id-marker "$upload_id_marker") ||
-        beta_storage_fail multipart_inventory_unavailable
+        { beta_storage_fail multipart_inventory_unavailable; return 1; }
     else
       multipart=$(beta_storage_aws_read list-multipart-uploads \
         --bucket "$BETA_BACKUP_BUCKET" --max-uploads 1000) ||
-        beta_storage_fail multipart_inventory_unavailable
+        { beta_storage_fail multipart_inventory_unavailable; return 1; }
     fi
     multipart=$(beta_storage_normalize_provider_list_response \
       list-multipart-uploads "$multipart") ||
-      beta_storage_fail multipart_inventory_invalid
+      { beta_storage_fail multipart_inventory_invalid; return 1; }
     jq -e '
       type=="object" and (.Uploads|type=="array") and
       ((keys - ["AbortDate","AbortRuleId","Bucket","CommonPrefixes","Delimiter",
@@ -3112,12 +3131,13 @@ beta_storage_prune_remote() {
         (.UploadId|type=="string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
         (.Initiated|type=="string" and length>0))
     ' <<<"$multipart" >/dev/null ||
-      beta_storage_fail multipart_inventory_invalid
+      { beta_storage_fail multipart_inventory_invalid; return 1; }
     multipart_file=$(mktemp)
     printf '%s\n' "$multipart" >"$multipart_file"
     if ! beta_storage_require_unique_json "$multipart_file"; then
       rm -f -- "$multipart_file"
       beta_storage_fail multipart_inventory_duplicate_json
+      return 1
     fi
     rm -f -- "$multipart_file"
     while IFS=$'\t' read -r upload_key upload_id initiated; do
@@ -3127,21 +3147,22 @@ beta_storage_prune_remote() {
       beta_storage_key "$upload_key" >/dev/null
       part_page=$(beta_storage_remote_list_multipart_parts \
         "$upload_key" "$upload_id") ||
-        beta_storage_fail multipart_parts_incomplete
+        { beta_storage_fail multipart_parts_incomplete; return 1; }
       part_bytes=$(jq -r '[.Parts[]?.Size] | add // 0' <<<"$part_page")
       beta_storage_aws_mutation abort-multipart-upload --bucket "$BETA_BACKUP_BUCKET" \
         --key "$upload_key" --upload-id "$upload_id" >/dev/null ||
-        beta_storage_fail multipart_abort_failed
+        { beta_storage_fail multipart_abort_failed; return 1; }
       if beta_storage_aws_read list-parts --bucket "$BETA_BACKUP_BUCKET" \
         --key "$upload_key" --upload-id "$upload_id" --max-parts 1000 >/dev/null; then
         beta_storage_fail multipart_abort_not_confirmed
+        return 1
       else
         local abort_status=$?
         [ "$abort_status" -eq 3 ] ||
-          beta_storage_fail multipart_abort_verification_failed
+          { beta_storage_fail multipart_abort_verification_failed; return 1; }
       fi
       (( deleted_multipart_bytes <= 9223372036854775807 - part_bytes )) ||
-        beta_storage_fail budget_overflow
+        { beta_storage_fail budget_overflow; return 1; }
       deleted_multipart_bytes=$((deleted_multipart_bytes + part_bytes))
       deleted_multipart_uploads=$((deleted_multipart_uploads + 1))
     done < <(jq -r '.Uploads[]? | [.Key,.UploadId,.Initiated // ""]|@tsv' <<<"$multipart")
@@ -3149,10 +3170,10 @@ beta_storage_prune_remote() {
     key_marker=$(jq -er '.NextKeyMarker // empty' <<<"$multipart")
     upload_id_marker=$(jq -er '.NextUploadIdMarker // empty' <<<"$multipart")
     [ -n "$key_marker" ] && [ -n "$upload_id_marker" ] ||
-      beta_storage_fail multipart_pagination_invalid
+      { beta_storage_fail multipart_pagination_invalid; return 1; }
   done
   (( multipart_page < BETA_STORAGE_MAX_PAGES )) ||
-    beta_storage_fail multipart_pagination_limit
+    { beta_storage_fail multipart_pagination_limit; return 1; }
   local inventory_after reclaimed_bytes summary summary_result summary_version
   summary="$scratch/prune-summary.json"
   local summary_meta summary_current_version summary_status
@@ -3166,7 +3187,7 @@ beta_storage_prune_remote() {
       beta_storage_fail prune_summary_read_failed
   fi
   inventory_after=$(beta_storage_remote_inventory_total \
-    "$BETA_BACKUP_BYTE_BUDGET" 0 false)
+    "$BETA_BACKUP_BYTE_BUDGET" 0 false) || return 1
   (( deleted_object_bytes <= 9223372036854775807 - deleted_multipart_bytes -
       deleted_delete_marker_bytes )) ||
     beta_storage_fail budget_overflow
@@ -3458,15 +3479,16 @@ beta_storage_reconcile_remote() {
   ' "$writer_state" >/dev/null ||
     { rm -f -- "$writer_meta" "$writer_state"; beta_storage_fail writer_state_not_terminal; }
   rm -f -- "$writer_meta" "$writer_state"
-  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" >/dev/null
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" >/dev/null ||
+    return 1
   inventory=$(beta_storage_aws_list_versions | jq -s '.') ||
-    beta_storage_fail inventory_unavailable
+    { beta_storage_fail inventory_unavailable; return 1; }
   jq -e 'type=="array" and all(.[]; type=="object" and
     all(.Versions[]?; (.Key|type=="string" and test("^(points|receipts|control)/[A-Za-z0-9._/-]+$")) and
       (.VersionId|type=="string" and utf8bytelength>=1 and
         utf8bytelength<=1024 and test("^[^\u0000-\u001F\u007F]+$")) and
       (.Size|type=="number" and floor==. and .>=0)))' <<<"$inventory" >/dev/null ||
-    beta_storage_fail inventory_invalid
+    { beta_storage_fail inventory_invalid; return 1; }
   while IFS=$'\t' read -r receipt_key; do
     [ -n "$receipt_key" ] || continue
     local receipt_point=${receipt_key#receipts/}

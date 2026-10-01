@@ -493,28 +493,41 @@ export FAKE_AWS_MODE=parts-empty
   fail "multipart part absent collection was rejected"
 for invalid_list_case in list-unknown list-type list-pagination; do
   export FAKE_AWS_MODE="$invalid_list_case"
+  invalid_list_start=$(wc -l <"$tmp/aws.log")
   set +e
   beta_storage_aws_list_versions >/dev/null 2>&1
   list_status=$?
   set -e
   [ "$list_status" -ne 0 ] || fail "$invalid_list_case version-list response was accepted"
+  invalid_list_end=$(wc -l <"$tmp/aws.log")
+  [ "$((invalid_list_end - invalid_list_start))" -eq 1 ] ||
+    fail "$invalid_list_case version-list failure reached a downstream provider call"
   set +e
+  invalid_inventory_start=$(wc -l <"$tmp/aws.log")
   beta_storage_remote_inventory_total 100000 0 false >/dev/null 2>&1
   multipart_status=$?
   set -e
   [ "$multipart_status" -ne 0 ] || fail "$invalid_list_case multipart-list response was accepted"
+  invalid_inventory_end=$(wc -l <"$tmp/aws.log")
+  [ "$((invalid_inventory_end - invalid_inventory_start))" -eq 1 ] ||
+    fail "$invalid_list_case inventory failure reached a downstream provider call"
 done
 for invalid_multipart_case in multipart-unknown multipart-type multipart-pagination; do
   export FAKE_AWS_MODE="$invalid_multipart_case"
+  invalid_multipart_start=$(wc -l <"$tmp/aws.log")
   set +e
   beta_storage_remote_inventory_total 100000 0 false >/dev/null 2>&1
   multipart_status=$?
   set -e
   [ "$multipart_status" -ne 0 ] ||
     fail "$invalid_multipart_case multipart-list response was accepted"
+  invalid_multipart_end=$(wc -l <"$tmp/aws.log")
+  [ "$((invalid_multipart_end - invalid_multipart_start))" -eq 2 ] ||
+    fail "$invalid_multipart_case multipart-list failure reached a downstream provider call"
 done
 for invalid_parts_case in parts-unknown parts-type parts-pagination-invalid; do
   export FAKE_AWS_MODE="$invalid_parts_case"
+  invalid_parts_start=$(wc -l <"$tmp/aws.log")
   set +e
   beta_storage_remote_list_multipart_parts points/invalid/upload.bin upload-1 \
     >/dev/null 2>&1
@@ -522,6 +535,9 @@ for invalid_parts_case in parts-unknown parts-type parts-pagination-invalid; do
   set -e
   [ "$parts_status" -ne 0 ] ||
     fail "$invalid_parts_case multipart-parts response was accepted"
+  invalid_parts_end=$(wc -l <"$tmp/aws.log")
+  [ "$((invalid_parts_end - invalid_parts_start))" -eq 1 ] ||
+    fail "$invalid_parts_case multipart-parts failure reached a downstream provider call"
 done
 for invalid_nested_case in nested-unknown nested-type; do
   export FAKE_AWS_MODE="$invalid_nested_case"
