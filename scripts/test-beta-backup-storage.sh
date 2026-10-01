@@ -474,21 +474,29 @@ case "${FAKE_AWS_MODE:?}" in
   duplicate) printf '{"VersionId":"one","VersionId":"two","ETag":"etag"}\n'; exit 0 ;;
   oversize) dd if=/dev/zero bs=1M count=2 status=none; exit 0 ;;
   metadata)
-    case "${FAKE_AWS_METADATA_CASE:?}" in
-      lower) metadata='{"sha256":"'"${FAKE_AWS_SHA}"'"}' ;;
-      mixed) metadata='{"Sha256":"'"${FAKE_AWS_SHA}"'"}' ;;
-      collision)
-        metadata='{"sha256":"'"${FAKE_AWS_SHA}"'","Sha256":"'"${FAKE_AWS_SHA}"'"}'
+    case " $* " in
+      *' list-object-versions '*)
+        printf '{"IsTruncated":false,"Versions":[{"Key":"points/metadata-head","VersionId":"metadata-version","IsLatest":true,"Size":1}]}\n'
         ;;
-      unknown)
-        metadata='{"Sha256":"'"${FAKE_AWS_SHA}"'","unexpected":"value"}'
+      *' head-object '*)
+        case "${FAKE_AWS_METADATA_CASE:?}" in
+          lower) metadata='{"sha256":"'"${FAKE_AWS_SHA}"'"}' ;;
+          mixed) metadata='{"Sha256":"'"${FAKE_AWS_SHA}"'"}' ;;
+          collision)
+            metadata='{"sha256":"'"${FAKE_AWS_SHA}"'","Sha256":"'"${FAKE_AWS_SHA}"'"}'
+            ;;
+          unknown)
+            metadata='{"Sha256":"'"${FAKE_AWS_SHA}"'","unexpected":"value"}'
+            ;;
+          invalid-type) metadata='{"Sha256":123}' ;;
+          empty) metadata='{"sha256":""}' ;;
+          *) exit 1 ;;
+        esac
+        printf '{"VersionId":"metadata-version","ETag":"etag-metadata","ContentLength":1,"Metadata":%s}\n' \
+          "$metadata"
         ;;
-      invalid-type) metadata='{"Sha256":123}' ;;
-      empty) metadata='{"sha256":""}' ;;
       *) exit 1 ;;
     esac
-    printf '{"VersionId":"metadata-version","ETag":"etag-metadata","ContentLength":1,"Metadata":%s}\n' \
-      "$metadata"
     ;;
   notfound)
     printf 'An error occurred (404) when calling the HeadObject operation: Not Found\n' >&2
