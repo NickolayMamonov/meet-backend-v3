@@ -3216,7 +3216,7 @@ beta_storage_prune_remote() {
     "$BETA_BACKUP_BYTE_BUDGET" 0 false) || return 1
   (( deleted_object_bytes <= 9223372036854775807 - deleted_multipart_bytes -
       deleted_delete_marker_bytes )) ||
-    beta_storage_fail budget_overflow
+    { beta_storage_fail budget_overflow; return 1; }
   reclaimed_bytes=$((deleted_object_bytes + deleted_multipart_bytes +
     deleted_delete_marker_bytes))
   jq -cnS --arg tx "prune-$now" --arg pinned "$pinned" \

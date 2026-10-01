@@ -148,6 +148,86 @@ run_prune_delete_overflow_fixture() {
   [ ! -s "$summary_log" ]
 }
 
+run_prune_reclaimed_overflow_fixture() {
+  local delete_log=$1 abort_log=$2 summary_log=$3 prune_status
+  : >"$delete_log"
+  : >"$abort_log"
+  : >"$summary_log"
+  beta_storage_remote_require_safety() { :; }
+  beta_storage_require_config() { :; }
+  beta_storage_remote_inventory_total() { printf '0\n'; }
+  beta_storage_remote_writer_acquire() { :; }
+  beta_storage_remote_writer_transition() { :; }
+  beta_storage_remote_writer_release() { :; }
+  beta_storage_remote_head() {
+    local key=$1 output=$2
+    if [ "$key" = control/verified-head.json ]; then
+      printf '%s\n' '{"VersionId":"verified-v","ETag":"verified-etag"}' >"$output"
+      return 0
+    fi
+    return 1
+  }
+  beta_storage_remote_get_json() {
+    local key=$1 output=$2
+    if [ "$key" = control/verified-head.json ]; then
+      printf '%s\n' \
+        '{"pointId":"pinned","receiptId":"receipt-1","receiptVersion":"receipt-v","proofVersion":"proof-v"}' \
+        >"$output"
+    fi
+  }
+  beta_storage_remote_build_status_once() {
+    printf '%s\n' \
+      '{"verified":{"state":"VALID","id":"pinned"},"capture":{"id":"capture"}}' >"$1"
+  }
+  beta_storage_aws_list_versions() {
+    printf '%s\n' \
+      '{"Versions":[{"Key":"points/old/recovery-point.json","VersionId":"old-recovery","Size":9223372036854775807},{"Key":"receipts/pinned/receipt-1.json","VersionId":"receipt-v","Size":1},{"Key":"receipts/pinned/receipt-1.proof.json","VersionId":"proof-v","Size":1}]}'
+  }
+  beta_storage_provider_get() {
+    printf '%s\n' '{"capture":{"capturedAt":1819000000}}' >"$4"
+  }
+  beta_storage_remote_point_graph_state() { return 1; }
+  beta_storage_remote_list_multipart_parts() {
+    printf '%s\n' \
+      '{"IsTruncated":false,"Key":"points/old/upload.bin","UploadId":"upload-1","Parts":[{"ETag":"etag","PartNumber":1,"Size":1}],"PartNumberMarker":"","NextPartNumberMarker":""}'
+  }
+  beta_storage_aws_read() {
+    case "$1" in
+      list-multipart-uploads)
+        printf '%s\n' \
+          '{"Uploads":[{"Key":"points/old/upload.bin","UploadId":"upload-1","Initiated":"1970-01-01T00:00:00Z"}],"IsTruncated":false}'
+        ;;
+      list-parts) return 3 ;;
+      *) return 1 ;;
+    esac
+  }
+  beta_storage_aws_mutation() {
+    printf '%s\n' "$1" >>"$abort_log"
+    return 0
+  }
+  beta_storage_remote_delete_version() {
+    printf '%s\n' "$2" >>"$delete_log"
+    return 0
+  }
+  beta_storage_provider_put_conditional() {
+    printf 'put\n' >>"$summary_log"
+    printf '%s\n' '{"versionId":"summary-v"}'
+  }
+  set +e
+  (
+    trap - RETURN
+    set +u
+    beta_storage_prune_remote 1820000000 test VALID 1790000000 closed-beta \
+      >/dev/null 2>&1
+  )
+  prune_status=$?
+  set -e
+  [ "$prune_status" -ne 0 ] || return 1
+  [ "$(wc -l <"$delete_log" | tr -d '[:space:]')" -eq 1 ] || return 1
+  [ "$(wc -l <"$abort_log" | tr -d '[:space:]')" -eq 1 ] || return 1
+  [ ! -s "$summary_log" ]
+}
+
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 export BETA_BACKUP_TEST_FIXTURE=true
 tmp=$(mktemp -d)
@@ -931,4 +1011,11 @@ overflow_delete_log="$tmp/overflow-delete.log"
 overflow_summary_log="$tmp/overflow-summary.log"
 run_prune_delete_overflow_fixture "$overflow_delete_log" "$overflow_summary_log" ||
   fail "prune continued after delete-accounting overflow"
+
+reclaimed_delete_log="$tmp/reclaimed-delete.log"
+reclaimed_abort_log="$tmp/reclaimed-abort.log"
+reclaimed_summary_log="$tmp/reclaimed-summary.log"
+run_prune_reclaimed_overflow_fixture \
+  "$reclaimed_delete_log" "$reclaimed_abort_log" "$reclaimed_summary_log" ||
+  fail "prune committed after aggregate reclaimed-byte overflow"
 printf 'test-beta-backup-storage.sh: passed\n'
