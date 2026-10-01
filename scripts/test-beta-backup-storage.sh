@@ -526,7 +526,16 @@ case "${FAKE_AWS_MODE:?}" in
       *) exit 1 ;;
     esac
     ;;
-  inventory-authorization|inventory-read-exhausted)
+  inventory-authorization)
+    case " $* " in
+      *' list-object-versions '*)
+        printf 'An error occurred (AccessDenied) when calling the ListObjectVersions operation: Forbidden\n' >&2
+        exit 3
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  inventory-read-exhausted)
     exit 124
     ;;
   inventory-malformed)
