@@ -54,8 +54,37 @@ run_inventory_failure_consumer_fixture() {
   consumer_status=$?
   set -e
   [ "$consumer_status" -ne 0 ] || return 1
-  ! grep -Eq '^(acquire|transition)$' "$consumer_log" &&
-    grep -Fxq release "$consumer_log"
+  [ ! -s "$consumer_log" ]
+}
+
+run_writer_release_mismatch_fixture() {
+  local writer_log=$1 release_status
+  : >"$writer_log"
+  beta_storage_remote_head() {
+    printf '%s\n' '{"ETag":"other-etag"}' >"$2"
+    return 0
+  }
+  beta_storage_provider_put_conditional() {
+    printf 'put\n' >>"$writer_log"
+    return 0
+  }
+  export BETA_STORAGE_REMOTE_WRITER_OWNER=test
+  export BETA_STORAGE_REMOTE_WRITER_TX=tx-1
+  export BETA_STORAGE_REMOTE_WRITER_ETAG=local-etag
+  export BETA_STORAGE_REMOTE_WRITER_FENCING=1
+  set +e
+  (
+    trap - RETURN
+    set +u
+    beta_storage_remote_writer_release test tx-1 >/dev/null 2>&1
+  )
+  release_status=$?
+  set -e
+  unset BETA_STORAGE_REMOTE_WRITER_OWNER
+  unset BETA_STORAGE_REMOTE_WRITER_TX
+  unset BETA_STORAGE_REMOTE_WRITER_ETAG
+  unset BETA_STORAGE_REMOTE_WRITER_FENCING
+  [ "$release_status" -ne 0 ] && [ ! -s "$writer_log" ]
 }
 
 run_preacquired_inventory_failure_fixture() {
@@ -1002,6 +1031,10 @@ run_invalid_remote_delete_fixture "$delete_log" ||
 consumer_log="$tmp/consumer.log"
 run_inventory_failure_consumer_fixture "$consumer_log" ||
   fail "inventory failure was accepted by a strict consumer"
+
+writer_log="$tmp/writer-release.log"
+run_writer_release_mismatch_fixture "$writer_log" ||
+  fail "stale writer release mutated a mismatched lock"
 
 preacquired_log="$tmp/preacquired.log"
 run_preacquired_inventory_failure_fixture "$tmp/point" "$preacquired_log" ||

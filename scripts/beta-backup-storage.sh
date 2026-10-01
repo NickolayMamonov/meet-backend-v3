@@ -1651,22 +1651,37 @@ beta_storage_remote_writer_transition() {
 
 beta_storage_remote_writer_release() {
   local owner=$1 txid=$2 body head state current_etag generation fencing
-  [ "$owner" = "${BETA_STORAGE_REMOTE_WRITER_OWNER:-}" ] &&
+  if ! { [ "$owner" = "${BETA_STORAGE_REMOTE_WRITER_OWNER:-}" ] &&
     [ "$txid" = "${BETA_STORAGE_REMOTE_WRITER_TX:-}" ] &&
-    [ -n "${BETA_STORAGE_REMOTE_WRITER_ETAG:-}" ] ||
+    [ -n "${BETA_STORAGE_REMOTE_WRITER_ETAG:-}" ]; }; then
     beta_storage_fail stale_owner
+    return 1
+  fi
   head=$(mktemp)
   state=$(mktemp)
   body=$(mktemp)
   trap - RETURN
-  beta_storage_remote_head control/writer.json "$head" || beta_storage_fail stale_owner
+  if ! beta_storage_remote_head control/writer.json "$head"; then
+    rm -f -- "$head" "$state" "$body"
+    beta_storage_fail stale_owner
+    return 1
+  fi
   current_etag=$(jq -er '.ETag' "$head")
-  [ "$current_etag" = "$BETA_STORAGE_REMOTE_WRITER_ETAG" ] || beta_storage_fail stale_owner
+  if [ "$current_etag" != "$BETA_STORAGE_REMOTE_WRITER_ETAG" ]; then
+    rm -f -- "$head" "$state" "$body"
+    beta_storage_fail stale_owner
+    return 1
+  fi
   beta_storage_remote_get_json control/writer.json "$state" "$(jq -er '.VersionId' "$head")"
-  jq -e --arg owner "$owner" --arg tx "$txid" --argjson fencing "$BETA_STORAGE_REMOTE_WRITER_FENCING" \
+  if ! jq -e --arg owner "$owner" --arg tx "$txid" \
+    --argjson fencing "$BETA_STORAGE_REMOTE_WRITER_FENCING" \
     '.locked==true and .ambiguous==false and .owner==$owner and
      .transactionId==$tx and .fencingToken==$fencing' \
-    "$state" >/dev/null || beta_storage_fail stale_owner
+    "$state" >/dev/null; then
+    rm -f -- "$head" "$state" "$body"
+    beta_storage_fail stale_owner
+    return 1
+  fi
   generation=$(jq -er '.generation' "$state")
   fencing=$(jq -er '.fencingToken' "$state")
   jq -cnS --arg owner "$owner" --arg tx "$txid" \
@@ -1683,6 +1698,7 @@ beta_storage_remote_writer_release() {
     BETA_STORAGE_WRITER_STATE_MUTATION=$previous_guard
     rm -f -- "$head" "$state" "$body"
     beta_storage_fail writer_release_failed
+    return 1
   fi
   BETA_STORAGE_WRITER_STATE_MUTATION=$previous_guard
   BETA_STORAGE_REMOTE_WRITER_ETAG=''
@@ -2064,14 +2080,14 @@ beta_storage_remote_commit_capture_head() {
   scratch=$(mktemp -d)
   export BETA_STORAGE_AMBIGUOUS_MARKER="$scratch/ambiguous"
   export BETA_STORAGE_MUTATION_STARTED_MARKER="$scratch/mutation-started"
-  local cleanup=true
+  local cleanup=true acquired=false
   cleanup_capture_head() {
     local status=$?
     trap - RETURN
     if [ -e "$BETA_STORAGE_AMBIGUOUS_MARKER" ] ||
       { [ "$status" -ne 0 ] && [ -e "$BETA_STORAGE_MUTATION_STARTED_MARKER" ]; }; then
       printf 'BACKUP_STORAGE_BLOCKED:ambiguous_transaction_retained tx=%s\n' "$txid" >&2
-    elif [ "$cleanup" = true ]; then
+    elif [ "$cleanup" = true ] && [ "$acquired" = true ]; then
       beta_storage_remote_writer_release "$owner" "$txid" || status=1
     fi
     rm -rf -- "$scratch" || status=1
@@ -2085,7 +2101,8 @@ beta_storage_remote_commit_capture_head() {
     return 1
   beta_storage_remote_writer_acquire publish "$owner" "$txid" "$reserve" \
     "$(printf '%s\0%s' "$point_id" "$captured_at" | sha256sum | awk '{print $1}')" \
-    "$expected_keys"
+    "$expected_keys" || return 1
+  acquired=true
   beta_storage_remote_writer_transition publishing false "$expected_keys"
   beta_storage_remote_head "points/$point_id/point.json" "$scratch/descriptor.meta" ||
     beta_storage_fail capture_descriptor_missing
