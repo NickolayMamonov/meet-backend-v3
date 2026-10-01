@@ -1559,7 +1559,11 @@ beta_storage_remote_writer_acquire() {
   else
     case "$?" in
       1) if_none=true ;;
-      *) rm -f -- "$head" "$state" "$body"; beta_storage_fail writer_state_unreadable ;;
+      *)
+        rm -f -- "$head" "$state" "$body"
+        beta_storage_fail writer_state_unreadable
+        return 1
+        ;;
     esac
   fi
   [[ "$reservation" =~ ^[0-9]+$ ]] || beta_storage_fail reservation_invalid
