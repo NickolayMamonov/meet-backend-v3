@@ -531,6 +531,7 @@ beta_storage_normalize_provider_list_response() {
             type=="object" and (keys|sort)==["Prefix"] and
             (.Prefix|type=="string")))
         else true end) and
+        string_if_present("AbortDate") and string_if_present("AbortRuleId") and
         (if has("KeyMarker") then (.KeyMarker|type=="string") else true end) and
         (if has("VersionIdMarker") then (.VersionIdMarker|type=="string") else true end) and
         (if has("NextKeyMarker") then (.NextKeyMarker|type=="string") else true end) and
@@ -645,6 +646,8 @@ beta_storage_normalize_provider_list_response() {
         (.IsTruncated|type=="boolean") and
         string_if_present("Bucket") and string_if_present("Key") and
         string_if_present("UploadId") and string_if_present("StorageClass") and
+        string_if_present("AbortDate") and string_if_present("AbortRuleId") and
+        string_if_present("ReplicationStatus") and
         (if has("ChecksumAlgorithm") then .ChecksumAlgorithm|type=="string" else true end) and
         string_if_present("ChecksumType") and
         (if has("Initiator") then .Initiator|principal else true end) and

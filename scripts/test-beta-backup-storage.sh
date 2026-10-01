@@ -324,6 +324,20 @@ case "${FAKE_AWS_MODE:?}" in
       *) printf '{}\n' ;;
     esac
     ;;
+  optional-type)
+    case " $* " in
+      *' list-object-versions '*)
+        printf '{"IsTruncated":false,"Name":7}\n'
+        ;;
+      *' list-multipart-uploads '*)
+        printf '{"IsTruncated":false,"AbortDate":7}\n'
+        ;;
+      *' list-parts '*)
+        printf '{"IsTruncated":false,"Key":"points/type","UploadId":"u1","ReplicationStatus":7}\n'
+        ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
   multipart)
     case " $* " in
       *' head-object '*)
@@ -527,6 +541,22 @@ for invalid_nested_case in nested-unknown nested-type; do
   [ "$nested_parts_status" -ne 0 ] ||
     fail "$invalid_nested_case multipart-parts nested response was accepted"
 done
+export FAKE_AWS_MODE=optional-type
+set +e
+beta_storage_aws_list_versions >/dev/null 2>&1
+optional_version_status=$?
+beta_storage_remote_inventory_total 100000 0 false >/dev/null 2>&1
+optional_multipart_status=$?
+beta_storage_remote_list_multipart_parts points/invalid/upload.bin upload-1 \
+  >/dev/null 2>&1
+optional_parts_status=$?
+set -e
+[ "$optional_version_status" -ne 0 ] ||
+  fail "optional version-list field type was accepted"
+[ "$optional_multipart_status" -ne 0 ] ||
+  fail "optional multipart-list field type was accepted"
+[ "$optional_parts_status" -ne 0 ] ||
+  fail "optional multipart-parts field type was accepted"
 dd if=/dev/zero of="$tmp/large-provider-object" bs=1M count=9 status=none
 export FAKE_AWS_MODE=multipart
 export FAKE_AWS_SOURCE="$tmp/large-provider-object"
