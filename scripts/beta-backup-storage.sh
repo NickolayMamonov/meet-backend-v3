@@ -869,10 +869,12 @@ beta_storage_remote_current_object_state() {
   jq -e --arg key "$key" '
     [.[].Versions[] |
       select(.Key==$key) |
-      {kind:"live",versionId:.VersionId,isLatest:(.IsLatest // null)}] +
+      {kind:"live",versionId:.VersionId,
+       isLatest:(if has("IsLatest") then .IsLatest else null end)}] +
     [.[].DeleteMarkers[] |
       select(.Key==$key) |
-      {kind:"delete-marker",versionId:.VersionId,isLatest:(.IsLatest // null)}]
+      {kind:"delete-marker",versionId:.VersionId,
+       isLatest:(if has("IsLatest") then .IsLatest else null end)}]
     | if length == 0 then
         {state:"absent"}
       elif any(.[]; (.isLatest|type) != "boolean") then
