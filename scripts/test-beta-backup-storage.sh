@@ -6,6 +6,10 @@ fail() { echo "test-beta-backup-storage.sh: $1" >&2; exit 1; }
 run_writer_state_gate_fixture() {
   local initial_status=$1 mutation_log=$2 writer_status
   local calls_file="${mutation_log}.calls" status_file="${mutation_log}.status"
+  local original_require_config original_remote_head original_provider_put
+  original_require_config=$(declare -f beta_storage_require_config)
+  original_remote_head=$(declare -f beta_storage_remote_head)
+  original_provider_put=$(declare -f beta_storage_provider_put_conditional)
   : >"$mutation_log"
   : >"$calls_file"
   printf '%s\n' "$initial_status" >"$status_file"
@@ -40,6 +44,9 @@ run_writer_state_gate_fixture() {
   )
   writer_status=$?
   set -e
+  eval "$original_require_config"
+  eval "$original_remote_head"
+  eval "$original_provider_put"
   rm -f -- "$calls_file" "$status_file"
   if [ "$initial_status" -eq 1 ]; then
     [ "$writer_status" -eq 0 ] &&
