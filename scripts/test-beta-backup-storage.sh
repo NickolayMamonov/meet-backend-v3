@@ -4,13 +4,19 @@ set -euo pipefail
 fail() { echo "test-beta-backup-storage.sh: $1" >&2; exit 1; }
 
 run_writer_state_gate_fixture() {
-  local initial_status=$1 mutation_log=$2 writer_status calls=0
+  local initial_status=$1 mutation_log=$2 writer_status
+  local calls_file="${mutation_log}.calls" status_file="${mutation_log}.status"
   : >"$mutation_log"
+  : >"$calls_file"
+  printf '%s\n' "$initial_status" >"$status_file"
   beta_storage_require_config() { :; }
   beta_storage_remote_head() {
-    calls=$((calls + 1))
-    if [ "$calls" -eq 1 ]; then
-      return "$initial_status"
+    local call_count
+    call_count=$(wc -l <"$calls_file" | tr -d '[:space:]')
+    call_count=$((call_count + 1))
+    printf '%s\n' "$call_count" >>"$calls_file"
+    if [ "$call_count" -eq 1 ]; then
+      return "$(sed -n '1p' "$status_file")"
     fi
     printf '%s\n' '{"VersionId":"created-version","ETag":"created-etag"}' >"$2"
     return 0
@@ -29,6 +35,7 @@ run_writer_state_gate_fixture() {
   )
   writer_status=$?
   set -e
+  rm -f -- "$calls_file" "$status_file"
   if [ "$initial_status" -eq 1 ]; then
     [ "$writer_status" -eq 0 ] &&
       [ "$(wc -l <"$mutation_log" | tr -d '[:space:]')" -eq 1 ]
