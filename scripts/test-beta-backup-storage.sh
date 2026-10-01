@@ -290,9 +290,37 @@ case "${FAKE_AWS_MODE:?}" in
       *) printf '{}\n' ;;
     esac
     ;;
-  parts-pagination)
+  parts-pagination-invalid)
     case " $* " in
       *' list-parts '*) printf '{"IsTruncated":true,"Key":"points/pagination","UploadId":"upload-1"}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  nested-unknown)
+    case " $* " in
+      *' list-object-versions '*)
+        printf '{"IsTruncated":false,"Versions":[{"Key":"points/nested","VersionId":"v1","Size":1,"Owner":{"Unexpected":"x"}}]}\n'
+        ;;
+      *' list-multipart-uploads '*)
+        printf '{"IsTruncated":false,"Uploads":[{"Key":"points/nested","UploadId":"u1","Initiated":"2026-01-01T00:00:00Z","Owner":{"Unexpected":"x"}}]}\n'
+        ;;
+      *' list-parts '*)
+        printf '{"IsTruncated":false,"Key":"points/nested","UploadId":"u1","Parts":[{"PartNumber":1,"Size":1,"ETag":"e","Unexpected":"x"}]}\n'
+        ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  nested-type)
+    case " $* " in
+      *' list-object-versions '*)
+        printf '{"IsTruncated":false,"Versions":[{"Key":"points/nested","VersionId":"v1","Size":1,"RestoreStatus":"wrong"}]}\n'
+        ;;
+      *' list-multipart-uploads '*)
+        printf '{"IsTruncated":false,"Uploads":[{"Key":"points/nested","UploadId":"u1","Initiated":"2026-01-01T00:00:00Z","Initiator":[]}]}\n'
+        ;;
+      *' list-parts '*)
+        printf '{"IsTruncated":false,"Key":"points/nested","UploadId":"u1","Parts":[{"PartNumber":1,"Size":1,"ETag":"e","ChecksumCRC32":7}]}\n'
+        ;;
       *) printf '{}\n' ;;
     esac
     ;;
@@ -444,7 +472,7 @@ export FAKE_AWS_MODE=versions-pagination
 version_pages=$(beta_storage_aws_list_versions | jq -s 'length')
 [ "$version_pages" -eq 2 ] || fail "version-list pagination or absent collections was rejected"
 export FAKE_AWS_MODE=multipart-empty
-[ "$(beta_storage_remote_inventory_total 100000 false)" -eq 0 ] ||
+[ "$(beta_storage_remote_inventory_total 100000 0 false)" -eq 0 ] ||
   fail "multipart-list pagination or absent uploads was rejected"
 export FAKE_AWS_MODE=parts-empty
 [ "$(beta_storage_remote_list_multipart_parts points/empty/upload.bin upload-1 | jq -r 'length')" -eq 0 ] ||
@@ -457,7 +485,7 @@ for invalid_list_case in list-unknown list-type list-pagination; do
   set -e
   [ "$list_status" -ne 0 ] || fail "$invalid_list_case version-list response was accepted"
   set +e
-  beta_storage_remote_inventory_total 100000 false >/dev/null 2>&1
+  beta_storage_remote_inventory_total 100000 0 false >/dev/null 2>&1
   multipart_status=$?
   set -e
   [ "$multipart_status" -ne 0 ] || fail "$invalid_list_case multipart-list response was accepted"
@@ -465,13 +493,13 @@ done
 for invalid_multipart_case in multipart-unknown multipart-type multipart-pagination; do
   export FAKE_AWS_MODE="$invalid_multipart_case"
   set +e
-  beta_storage_remote_inventory_total 100000 false >/dev/null 2>&1
+  beta_storage_remote_inventory_total 100000 0 false >/dev/null 2>&1
   multipart_status=$?
   set -e
   [ "$multipart_status" -ne 0 ] ||
     fail "$invalid_multipart_case multipart-list response was accepted"
 done
-for invalid_parts_case in parts-unknown parts-type parts-pagination; do
+for invalid_parts_case in parts-unknown parts-type parts-pagination-invalid; do
   export FAKE_AWS_MODE="$invalid_parts_case"
   set +e
   beta_storage_remote_list_multipart_parts points/invalid/upload.bin upload-1 \
@@ -480,6 +508,24 @@ for invalid_parts_case in parts-unknown parts-type parts-pagination; do
   set -e
   [ "$parts_status" -ne 0 ] ||
     fail "$invalid_parts_case multipart-parts response was accepted"
+done
+for invalid_nested_case in nested-unknown nested-type; do
+  export FAKE_AWS_MODE="$invalid_nested_case"
+  set +e
+  beta_storage_aws_list_versions >/dev/null 2>&1
+  nested_version_status=$?
+  beta_storage_remote_inventory_total 100000 0 false >/dev/null 2>&1
+  nested_multipart_status=$?
+  beta_storage_remote_list_multipart_parts points/invalid/upload.bin upload-1 \
+    >/dev/null 2>&1
+  nested_parts_status=$?
+  set -e
+  [ "$nested_version_status" -ne 0 ] ||
+    fail "$invalid_nested_case version-list nested response was accepted"
+  [ "$nested_multipart_status" -ne 0 ] ||
+    fail "$invalid_nested_case multipart-list nested response was accepted"
+  [ "$nested_parts_status" -ne 0 ] ||
+    fail "$invalid_nested_case multipart-parts nested response was accepted"
 done
 dd if=/dev/zero of="$tmp/large-provider-object" bs=1M count=9 status=none
 export FAKE_AWS_MODE=multipart

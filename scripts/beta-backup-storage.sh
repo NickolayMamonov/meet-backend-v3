@@ -467,12 +467,35 @@ beta_storage_normalize_provider_list_response() {
   case "$operation" in
     list-object-versions)
       jq -e '
+        def string_if_present($key):
+          if has($key) then .[$key]|type=="string" else true end;
+        def principal:
+          type=="object" and
+          ((keys - ["DisplayName","ID"])|length==0) and
+          all(.[]; type=="string");
+        def restore_status:
+          type=="object" and
+          ((keys - ["IsRestoreInProgress","RestoreExpiryDate"])|length==0) and
+          (if has("IsRestoreInProgress") then
+            .IsRestoreInProgress|type=="boolean"
+          else true end) and
+          (if has("RestoreExpiryDate") then
+            .RestoreExpiryDate|type=="string"
+          else true end);
         if (
         type=="object" and
         ((keys - ["CommonPrefixes","DeleteMarkers","Delimiter","EncodingType",
           "IsTruncated","KeyMarker","MaxKeys","Name","NextKeyMarker",
           "NextVersionIdMarker","Prefix","VersionIdMarker","Versions"])|length==0) and
         (.IsTruncated|type=="boolean") and
+        (if has("MaxKeys") then
+          (.MaxKeys|type=="number" and floor==. and .>=0 and .<=1000)
+        else true end) and
+        string_if_present("Delimiter") and string_if_present("EncodingType") and
+        string_if_present("KeyMarker") and string_if_present("Name") and
+        string_if_present("NextKeyMarker") and
+        string_if_present("NextVersionIdMarker") and
+        string_if_present("Prefix") and string_if_present("VersionIdMarker") and
         (if has("Versions") then
           (.Versions|type=="array" and all(.[];
             type=="object" and
@@ -482,16 +505,26 @@ beta_storage_normalize_provider_list_response() {
             (.Key|type=="string") and (.VersionId|type=="string") and
             (.Size|type=="number" and floor==. and .>=0 and
               .<=9223372036854775807) and
-            (if has("ETag") then (.ETag|type=="string") else true end) and
+            string_if_present("ETag") and
             (if has("IsLatest") then (.IsLatest|type=="boolean") else true end) and
-            (if has("StorageClass") then (.StorageClass|type=="string") else true end)))
+            string_if_present("LastModified") and
+            (if has("Owner") then .Owner|principal else true end) and
+            (if has("RestoreStatus") then .RestoreStatus|restore_status else true end) and
+            (if has("ChecksumAlgorithm") then
+              (.ChecksumAlgorithm|type=="array" and
+                all(.[]; type=="string"))
+            else true end) and
+            string_if_present("ChecksumType") and
+            string_if_present("StorageClass")))
         else true end) and
         (if has("DeleteMarkers") then
           (.DeleteMarkers|type=="array" and all(.[];
             type=="object" and
             ((keys - ["IsLatest","Key","LastModified","Owner","VersionId"])|length==0) and
             (.Key|type=="string") and (.VersionId|type=="string") and
-            (if has("IsLatest") then (.IsLatest|type=="boolean") else true end)))
+            (if has("IsLatest") then (.IsLatest|type=="boolean") else true end) and
+            string_if_present("LastModified") and
+            (if has("Owner") then .Owner|principal else true end)))
         else true end) and
         (if has("CommonPrefixes") then
           (.CommonPrefixes|type=="array" and all(.[];
@@ -529,12 +562,26 @@ beta_storage_normalize_provider_list_response() {
       ;;
     list-multipart-uploads)
       jq -e '
+        def string_if_present($key):
+          if has($key) then .[$key]|type=="string" else true end;
+        def principal:
+          type=="object" and
+          ((keys - ["DisplayName","ID"])|length==0) and
+          all(.[]; type=="string");
         if (
         type=="object" and
         ((keys - ["AbortDate","AbortRuleId","Bucket","CommonPrefixes","Delimiter",
           "EncodingType","IsTruncated","KeyMarker","MaxUploads","NextKeyMarker",
           "NextUploadIdMarker","Prefix","UploadIdMarker","Uploads"])|length==0) and
         (.IsTruncated|type=="boolean") and
+        (if has("MaxUploads") then
+          (.MaxUploads|type=="number" and floor==. and .>=0 and .<=1000)
+        else true end) and
+        string_if_present("Bucket") and string_if_present("Delimiter") and
+        string_if_present("EncodingType") and string_if_present("KeyMarker") and
+        string_if_present("NextKeyMarker") and
+        string_if_present("NextUploadIdMarker") and
+        string_if_present("Prefix") and string_if_present("UploadIdMarker") and
         (if has("Uploads") then
           (.Uploads|type=="array" and all(.[];
             type=="object" and
@@ -542,9 +589,13 @@ beta_storage_normalize_provider_list_response() {
               "Key","Owner","StorageClass","UploadId"])|length==0) and
             (.Key|type=="string") and (.UploadId|type=="string") and
             (.Initiated|type=="string" and length>0) and
-            (if has("StorageClass") then (.StorageClass|type=="string") else true end) and
-            (if has("Initiator") then (.Initiator|type=="object") else true end) and
-            (if has("Owner") then (.Owner|type=="object") else true end)))
+            string_if_present("StorageClass") and
+            (if has("ChecksumAlgorithm") then
+              .ChecksumAlgorithm|type=="string"
+            else true end) and
+            string_if_present("ChecksumType") and
+            (if has("Initiator") then .Initiator|principal else true end) and
+            (if has("Owner") then .Owner|principal else true end)))
         else true end) and
         (if has("CommonPrefixes") then
           (.CommonPrefixes|type=="array" and all(.[];
@@ -580,12 +631,27 @@ beta_storage_normalize_provider_list_response() {
       ;;
     list-parts)
       jq -e '
+        def string_if_present($key):
+          if has($key) then .[$key]|type=="string" else true end;
+        def principal:
+          type=="object" and
+          ((keys - ["DisplayName","ID"])|length==0) and
+          all(.[]; type=="string");
         if (
         type=="object" and
         ((keys - ["AbortDate","AbortRuleId","Bucket","ChecksumAlgorithm","ChecksumType",
           "Initiator","IsTruncated","Key","MaxParts","NextPartNumberMarker","Owner",
           "PartNumberMarker","Parts","ReplicationStatus","StorageClass","UploadId"])|length==0) and
         (.IsTruncated|type=="boolean") and
+        string_if_present("Bucket") and string_if_present("Key") and
+        string_if_present("UploadId") and string_if_present("StorageClass") and
+        (if has("ChecksumAlgorithm") then .ChecksumAlgorithm|type=="string" else true end) and
+        string_if_present("ChecksumType") and
+        (if has("Initiator") then .Initiator|principal else true end) and
+        (if has("Owner") then .Owner|principal else true end) and
+        (if has("MaxParts") then
+          .MaxParts|type=="number" and floor==. and .>=0 and .<=1000
+        else true end) and
         (if has("Parts") then
           (.Parts|type=="array" and all(.[];
             type=="object" and
@@ -594,7 +660,12 @@ beta_storage_normalize_provider_list_response() {
             (.PartNumber|type=="number" and floor==. and .>=1 and .<=10000) and
             (.Size|type=="number" and floor==. and .>=0 and
               .<=9223372036854775807) and
-            (.ETag|type=="string" and length>0)))
+            (.ETag|type=="string" and length>0) and
+            string_if_present("LastModified") and
+            string_if_present("ChecksumCRC32") and
+            string_if_present("ChecksumCRC32C") and
+            string_if_present("ChecksumSHA1") and
+            string_if_present("ChecksumSHA256")))
         else true end) and
         (if has("Key") then (.Key|type=="string") else true end) and
         (if has("UploadId") then (.UploadId|type=="string") else true end) and
