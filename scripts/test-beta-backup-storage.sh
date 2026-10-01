@@ -45,13 +45,40 @@ run_inventory_failure_consumer_fixture() {
   }
   beta_storage_descriptor_digest() { printf '%s\n' fixture-digest; }
   set +e
-  beta_storage_remote_commit_capture_head inventory-failure \
-    1790000000 test >/dev/null 2>&1
+  (
+    trap - RETURN
+    set +u
+    beta_storage_remote_commit_capture_head inventory-failure \
+      1790000000 test >/dev/null 2>&1
+  )
   consumer_status=$?
-  trap - RETURN
   set -e
   [ "$consumer_status" -ne 0 ] || return 1
-  ! grep -Eq '^(acquire|transition)$' "$consumer_log"
+  ! grep -Eq '^(acquire|transition)$' "$consumer_log" &&
+    grep -Fxq release "$consumer_log"
+}
+
+run_preacquired_inventory_failure_fixture() {
+  local source=$1 consumer_log=$2 consumer_status
+  : >"$consumer_log"
+  beta_storage_remote_inventory_total() { return 1; }
+  beta_storage_remote_writer_release() {
+    printf 'release\n' >>"$consumer_log"
+    return 0
+  }
+  export BETA_STORAGE_PREACQUIRED_CAPTURE=true
+  export BETA_STORAGE_REMOTE_WRITER_TX=capture-slot-slot-1790000000
+  export BETA_STORAGE_CAPTURE_RESERVATION_BYTES=1000000000
+  set +e
+  beta_storage_publish_remote "$source" slot-1790000000 1790000000 \
+    1790000000 test >/dev/null 2>&1
+  consumer_status=$?
+  set -e
+  unset BETA_STORAGE_PREACQUIRED_CAPTURE
+  unset BETA_STORAGE_REMOTE_WRITER_TX
+  unset BETA_STORAGE_CAPTURE_RESERVATION_BYTES
+  [ "$consumer_status" -ne 0 ] || return 1
+  grep -Fxq release "$consumer_log"
 }
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -828,4 +855,8 @@ run_invalid_remote_delete_fixture "$delete_log" ||
 consumer_log="$tmp/consumer.log"
 run_inventory_failure_consumer_fixture "$consumer_log" ||
   fail "inventory failure was accepted by a strict consumer"
+
+preacquired_log="$tmp/preacquired.log"
+run_preacquired_inventory_failure_fixture "$tmp/point" "$preacquired_log" ||
+  fail "preacquired capture retained its writer after admission inventory failure"
 printf 'test-beta-backup-storage.sh: passed\n'

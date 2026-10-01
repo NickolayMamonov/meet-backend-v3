@@ -1844,8 +1844,11 @@ beta_storage_publish_remote() {
       beta_storage_fail capture_reservation_missing
     (( reserve + writer_control_reserve <= BETA_STORAGE_CAPTURE_RESERVATION_BYTES )) ||
       beta_storage_fail capture_reservation_exceeded
-    beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" 0 false >/dev/null ||
+    if ! beta_storage_remote_inventory_total \
+      "$BETA_BACKUP_BYTE_BUDGET" 0 false >/dev/null; then
+      beta_storage_remote_writer_release "$owner" "$txid" || return 1
       return 1
+    fi
   else
     beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
       "$((reserve + writer_control_reserve))" >/dev/null ||
@@ -2945,13 +2948,15 @@ beta_storage_prune_remote() {
     if [ "$object_kind" = marker ]; then
       (( deleted_delete_marker_bytes <= 9223372036854775807 - object_bytes )) ||
         beta_storage_fail budget_overflow
-      beta_storage_remote_delete_version "$object_key" "$object_version" "$object_kind"
+      beta_storage_remote_delete_version "$object_key" "$object_version" "$object_kind" ||
+        return 1
       deleted_delete_markers=$((deleted_delete_markers + 1))
       deleted_delete_marker_bytes=$((deleted_delete_marker_bytes + object_bytes))
     else
       (( deleted_object_bytes <= 9223372036854775807 - object_bytes )) ||
         beta_storage_fail budget_overflow
-      beta_storage_remote_delete_version "$object_key" "$object_version" "$object_kind"
+      beta_storage_remote_delete_version "$object_key" "$object_version" "$object_kind" ||
+        return 1
       deleted_object_bytes=$((deleted_object_bytes + object_bytes))
       deleted_object_versions=$((deleted_object_versions + 1))
     fi
@@ -3229,6 +3234,9 @@ beta_storage_prune_remote() {
       inventoryBeforeBytes:$before,inventoryAfterBytes:$after,
       reclaimedBytes:$reclaimed,outcome:$outcome
     }' >"$summary"
+  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
+    "$writer_control_reserve" >/dev/null ||
+    return 1
   summary_result=$(beta_storage_provider_put_conditional '' \
     control/prune-summary.json "$summary" '' true)
   summary_version=$(jq -er '.versionId' <<<"$summary_result")
@@ -3236,9 +3244,6 @@ beta_storage_prune_remote() {
     "$scratch/committed-prune-summary.json" "$summary_version"
   cmp -s "$summary" "$scratch/committed-prune-summary.json" ||
     beta_storage_fail prune_summary_commit_ambiguous
-  beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
-    "$writer_control_reserve" >/dev/null ||
-    return 1
   rm -f "$head" "$head.meta" "$seen" "$deleted_point_ids"
   beta_storage_remote_writer_release "$owner" "prune-$now"
   release=false
