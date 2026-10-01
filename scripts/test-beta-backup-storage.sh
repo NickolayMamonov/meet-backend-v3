@@ -1029,12 +1029,12 @@ run_invalid_remote_delete_fixture "$delete_log" ||
   fail "remote deletion invoked provider delete after invalid version-list response"
 
 consumer_log="$tmp/consumer.log"
-run_inventory_failure_consumer_fixture "$consumer_log" ||
-  fail "inventory failure was accepted by a strict consumer"
-
 writer_log="$tmp/writer-release.log"
 run_writer_release_mismatch_fixture "$writer_log" ||
   fail "stale writer release mutated a mismatched lock"
+
+run_inventory_failure_consumer_fixture "$consumer_log" ||
+  fail "inventory failure was accepted by a strict consumer"
 
 preacquired_log="$tmp/preacquired.log"
 run_preacquired_inventory_failure_fixture "$tmp/point" "$preacquired_log" ||
