@@ -280,7 +280,9 @@ if [ "${1:-}" = --check-fixed-roots ]; then
   exit 0
 fi
 
-fixture_root=$(mktemp -d /tmp/meet-retention-fixture.XXXXXX 2>/dev/null) ||
+# The provider helper rejects world-writable ancestors; /run keeps the
+# disposable provider-state root within the same private-path contract.
+fixture_root=$(mktemp -d /run/meet-retention-fixture.XXXXXX 2>/dev/null) ||
   prerequisite_missing
 chmod 700 "$fixture_root" 2>/dev/null || prerequisite_missing
 fixture_root_identity=$(root_identity "$fixture_root" 2>/dev/null) ||
