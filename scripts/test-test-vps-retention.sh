@@ -199,6 +199,40 @@ assert_replacement_rejected() {
   timeout 30s rm -r -- "$root"
   remove_owned_root "$original" "$expected"
 }
+remove_parent_after_owned_children() {
+  local child_status=$1
+  local parent=$2
+  local expected=$3
+  [ "$child_status" -eq 0 ] || return 1
+  [ -n "$parent" ] || return 0
+  remove_owned_root "$parent" "$expected"
+}
+assert_nested_replacement_preserved() {
+  local parent child expected_parent expected_child original_child status actual
+  parent=$(mktemp -d /tmp/meet-retention-parent.XXXXXX) ||
+    prerequisite_missing
+  expected_parent=$(root_identity "$parent" 2>/dev/null) ||
+    prerequisite_missing
+  child="$parent/nested"
+  mkdir -m 700 -- "$child" || prerequisite_missing
+  expected_child=$(root_identity "$child" 2>/dev/null) ||
+    prerequisite_missing
+  original_child="$child.original"
+  mv -- "$child" "$original_child" || prerequisite_missing
+  mkdir -m 700 -- "$child" || prerequisite_missing
+  printf 'nested-replacement\n' >"$child/sentinel" || prerequisite_missing
+  actual=$(root_identity "$child" 2>/dev/null) || prerequisite_missing
+  status=0
+  [ "$actual" = "$expected_child" ] || status=1
+  set +e
+  remove_parent_after_owned_children "$status" "$parent" "$expected_parent"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ]
+  grep -Fxq 'nested-replacement' "$child/sentinel"
+  timeout 30s rm -r -- "$child"
+  remove_owned_root "$parent" "$expected_parent"
+}
 cleanup() {
   local status=$?
   local cleanup_status=0
@@ -220,10 +254,9 @@ cleanup() {
   if [ -n "$sentinel_root" ]; then
     grep -Fxq 'outside-fixture' "$sentinel_root/sentinel" || status=1
   fi
-  if [ -n "$fixture_root" ] &&
-    { [ -e "$fixture_root" ] || [ -L "$fixture_root" ]; }; then
-    remove_owned_root "$fixture_root" "$fixture_root_identity" ||
-      cleanup_status=1
+  if ! remove_parent_after_owned_children "$cleanup_status" \
+    "$fixture_root" "$fixture_root_identity"; then
+    cleanup_status=1
   fi
   if [ -n "$sentinel_root" ] &&
     { [ -e "$sentinel_root" ] || [ -L "$sentinel_root" ]; }; then
@@ -276,6 +309,7 @@ done
 
 assert_replacement_rejected fixture-root
 assert_replacement_rejected sentinel-root
+assert_nested_replacement_preserved
 
 (
   set -euo pipefail
