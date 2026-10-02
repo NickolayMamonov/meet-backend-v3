@@ -352,7 +352,7 @@ demo_checks AS (
         (SELECT count(*) FROM demo_catalog_state) AS state_rows,
         (SELECT count(*) FROM demo_catalog_state
          WHERE catalog_name = 'closed-beta-demo'
-           AND manifest_version = '2026-08-15.v1') AS matching_state_rows,
+           AND manifest_version = '2027-09-13.v1') AS matching_state_rows,
         (SELECT count(*) FROM (
              SELECT demo_catalog_key FROM users
              UNION ALL SELECT demo_catalog_key FROM communities

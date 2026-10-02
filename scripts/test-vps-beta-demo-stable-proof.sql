@@ -19,12 +19,12 @@ expected_roots(kind, catalog_key, id, time_ms, date_text, ends_at, person_host, 
         ('community', 'closed-beta-demo/community/moscow-meets', 1::bigint, NULL, NULL, NULL, NULL, NULL),
         ('community', 'closed-beta-demo/community/city-walks', 2::bigint, NULL, NULL, NULL, NULL, NULL),
         ('community', 'closed-beta-demo/community/online-club', 3::bigint, NULL, NULL, NULL, NULL, NULL),
-        ('meeting', 'closed-beta-demo/meeting/welcome', 1::bigint, 1790006400000, '21.09.2026', 1790013600000, 'closed-beta-demo/user/01', 'closed-beta-demo/community/moscow-meets'),
-        ('meeting', 'closed-beta-demo/meeting/organize-online', 2::bigint, 1790269200000, '24.09.2026', 1790274600000, 'closed-beta-demo/user/05', 'closed-beta-demo/community/online-club'),
-        ('meeting', 'closed-beta-demo/meeting/board-games', 3::bigint, 1790613000000, '28.09.2026', 1790622000000, 'closed-beta-demo/user/04', 'closed-beta-demo/community/moscow-meets'),
-        ('meeting', 'closed-beta-demo/meeting/vdnkh-walk', 4::bigint, 1791187200000, '05.10.2026', 1791194400000, 'closed-beta-demo/user/02', 'closed-beta-demo/community/city-walks'),
-        ('meeting', 'closed-beta-demo/meeting/networking-online', 5::bigint, 1791478800000, '08.10.2026', 1791484200000, 'closed-beta-demo/user/03', 'closed-beta-demo/community/online-club'),
-        ('meeting', 'closed-beta-demo/meeting/public-speaking', 6::bigint, 1791993600000, '14.10.2026', 1792000800000, 'closed-beta-demo/user/03', 'closed-beta-demo/community/moscow-meets'),
+        ('meeting', 'closed-beta-demo/meeting/welcome', 1::bigint, 1821456000000, '20.09.2027', 1821463200000, 'closed-beta-demo/user/01', 'closed-beta-demo/community/moscow-meets'),
+        ('meeting', 'closed-beta-demo/meeting/organize-online', 2::bigint, 1821718800000, '23.09.2027', 1821724200000, 'closed-beta-demo/user/05', 'closed-beta-demo/community/online-club'),
+        ('meeting', 'closed-beta-demo/meeting/board-games', 3::bigint, 1822062600000, '27.09.2027', 1822071600000, 'closed-beta-demo/user/04', 'closed-beta-demo/community/moscow-meets'),
+        ('meeting', 'closed-beta-demo/meeting/vdnkh-walk', 4::bigint, 1822636800000, '04.10.2027', 1822644000000, 'closed-beta-demo/user/02', 'closed-beta-demo/community/city-walks'),
+        ('meeting', 'closed-beta-demo/meeting/networking-online', 5::bigint, 1822928400000, '07.10.2027', 1822933800000, 'closed-beta-demo/user/03', 'closed-beta-demo/community/online-club'),
+        ('meeting', 'closed-beta-demo/meeting/public-speaking', 6::bigint, 1823443200000, '13.10.2027', 1823450400000, 'closed-beta-demo/user/03', 'closed-beta-demo/community/moscow-meets'),
         ('ad', 'closed-beta-demo/ad/communities', 1::bigint, NULL, NULL, NULL, NULL, NULL),
         ('ad', 'closed-beta-demo/ad/interests', 2::bigint, NULL, NULL, NULL, NULL, NULL),
         ('ad', 'closed-beta-demo/ad/people', 3::bigint, NULL, NULL, NULL, NULL, NULL)
@@ -169,9 +169,9 @@ checks AS (
         ) = (SELECT value FROM expected_root_json) AS roots_ok,
         (SELECT value FROM actual_relationship_json) = (SELECT value FROM expected_relationship_json) AS relationships_ok,
         (SELECT count(*) FROM state) = 1
-            AND (SELECT manifest_version FROM state) = '2026-08-15.v1'
-            AND (SELECT schedule_anchor_date FROM state) = DATE '2026-09-14'
-            AND (SELECT catalog_valid_through FROM state) = TIMESTAMPTZ '2026-09-14T00:00:00Z' AS state_ok,
+            AND (SELECT manifest_version FROM state) = '2027-09-13.v1'
+            AND (SELECT schedule_anchor_date FROM state) = DATE '2027-09-13'
+            AND (SELECT catalog_valid_through FROM state) = TIMESTAMPTZ '2027-09-13T00:00:00Z' AS state_ok,
         (SELECT count(*) FROM expected_roots WHERE kind = 'tag') = (SELECT count(*) FROM tags WHERE demo_catalog_key LIKE 'closed-beta-demo/%') AS tag_count_ok,
         (SELECT count(*) FROM expected_roots WHERE kind = 'user') = (SELECT count(*) FROM users WHERE demo_catalog_key LIKE 'closed-beta-demo/%') AS user_count_ok,
         (SELECT count(*) FROM expected_roots WHERE kind = 'community') = (SELECT count(*) FROM communities WHERE demo_catalog_key LIKE 'closed-beta-demo/%') AS community_count_ok,

@@ -10,6 +10,7 @@ transaction.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import json
 import os
@@ -29,11 +30,17 @@ MAX_INSPECTION_BYTES = 8 * 1024 * 1024
 MAX_CREDENTIAL_BYTES = 1024 * 1024
 MAX_WITNESS_BYTES = 16 * 1024 * 1024
 MAX_JSON_DEPTH = 32
+MAX_OWNER_BYTES = 4096
 CONTAINER_CREDENTIAL_PATH = "/run/secrets/meet-firebase-service-account.json"
 HOST_CREDENTIAL_PARENT = "/var/lib/meet-production/credentials"
 HOST_CREDENTIAL_PATH = HOST_CREDENTIAL_PARENT + "/firebase-service-account.json"
 EXPECTED_PROJECT = "meeting-1d258"
 RUN_KEY_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+STATE_RUN_KEY_RE = r"^[0-9]+-[0-9]+$"
+OWNER_MARKER = "provider-owner.json"
+OWNER = "meet-test-vps-provider"
+STATE_KINDS = frozenset(("final-deploy", "rollback-drill"))
+RENAME_NOREPLACE = 1
 PUSH_KEYS = (
     "APP_PUSH_PROVIDER_ENABLED",
     "APP_PUSH_DISCOVERY_ENABLED",
@@ -342,9 +349,36 @@ def _child_witness(
         after = os.fstat(fd)
         if _identity(before) != _identity(after):
             _fail("recovery")
-        return _identity(before), data
-    finally:
+        identity = _identity(before)
+        # Keep the descriptor open through the witnessed mutation.  Some
+        # filesystems can immediately reuse an unlinked inode with identical
+        # ctime/mtime metadata; an open witness prevents that ambiguity.
+        identity["_witnessFd"] = fd
+        return identity, data
+    except Exception:
         os.close(fd)
+        raise
+
+
+def _witness_identity(value: dict[str, int]) -> dict[str, int]:
+    return {
+        key: item
+        for key, item in value.items()
+        if key != "_witnessFd"
+    }
+
+
+def _close_owned_witnesses(
+    witnesses: Iterable[tuple[dict[str, int], bytes]],
+) -> None:
+    for identity, _ in witnesses:
+        witness_fd = identity.pop("_witnessFd", None)
+        if witness_fd is None:
+            continue
+        try:
+            os.close(witness_fd)
+        except OSError:
+            pass
 
 
 def _validate_credential(data: bytes) -> None:
@@ -607,6 +641,349 @@ def _write_private(path: str, data: bytes, mode: int, gid: int = 0) -> None:
         os.close(fd)
 
 
+def _write_private_at(
+    directory_fd: int,
+    name: str,
+    data: bytes,
+    mode: int,
+    gid: int = 0,
+) -> None:
+    if not name or "/" in name or "\x00" in name:
+        _fail("recovery")
+    fd = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        mode,
+        dir_fd=directory_fd,
+    )
+    try:
+        offset = 0
+        while offset < len(data):
+            offset += os.write(fd, data[offset:])
+        os.fsync(fd)
+        os.fchown(fd, 0, gid)
+        os.fchmod(fd, mode)
+        _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _rename_noreplace_boundary(
+    directory_fd: int,
+    source: str,
+    destination: str,
+) -> None:
+    return None
+
+
+def _rename_noreplace(
+    directory_fd: int,
+    source: str,
+    destination: str,
+    *,
+    expected_source_fd: int | None = None,
+    expected_source_inode: tuple[int, int] | None = None,
+) -> None:
+    if (
+        not source
+        or not destination
+        or "/" in source
+        or "/" in destination
+        or "\x00" in source
+        or "\x00" in destination
+    ):
+        _fail("recovery")
+    if expected_source_fd is not None:
+        opened = os.fstat(expected_source_fd)
+        current = os.stat(
+            source,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or not _same_inode(opened, current)
+            or (
+                expected_source_inode is not None
+                and (opened.st_dev, opened.st_ino) != expected_source_inode
+            )
+        ):
+            _fail("recovery")
+    _rename_noreplace_boundary(directory_fd, source, destination)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (AttributeError, OSError):
+        _fail("recovery")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        directory_fd,
+        os.fsencode(source),
+        directory_fd,
+        os.fsencode(destination),
+        RENAME_NOREPLACE,
+    )
+    if result != 0:
+        # EEXIST, ENOSYS and unsupported filesystems are all recovery states.
+        ctypes.get_errno()
+        _fail("recovery")
+
+
+def _state_parts(name: str) -> tuple[str, str]:
+    match = re.fullmatch(
+        r"(?P<run>[0-9]+-[0-9]+)-(?P<kind>final-deploy|rollback-drill)",
+        name,
+    )
+    if match is None:
+        _fail("recovery")
+    return match.group("run"), match.group("kind")
+
+
+def _state_marker(run_key: str, state_kind: str) -> bytes:
+    if re.fullmatch(STATE_RUN_KEY_RE, run_key) is None or state_kind not in STATE_KINDS:
+        _fail("recovery")
+    return json.dumps(
+        {
+            "schemaVersion": 1,
+            "owner": OWNER,
+            "runKey": run_key,
+            "stateKind": state_kind,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _parse_state_marker(data: bytes, run_key: str, state_kind: str) -> None:
+    if len(data) > MAX_OWNER_BYTES:
+        _fail("recovery")
+    value = _json(data, "recovery")
+    if not isinstance(value, dict) or set(value) != {
+        "schemaVersion",
+        "owner",
+        "runKey",
+        "stateKind",
+    }:
+        _fail("recovery")
+    if (
+        type(value["schemaVersion"]) is not int
+        or value["schemaVersion"] != 1
+        or value["owner"] != OWNER
+        or value["runKey"] != run_key
+        or value["stateKind"] != state_kind
+        or not isinstance(value["owner"], str)
+        or not isinstance(value["runKey"], str)
+        or not isinstance(value["stateKind"], str)
+    ):
+        _fail("recovery")
+
+
+def _validate_state_directory(path: str, name: str) -> tuple[str, str]:
+    run_key, state_kind = _state_parts(name)
+    if os.path.islink(path) or not os.path.isdir(path):
+        _fail("recovery")
+    info = os.stat(path, follow_symlinks=False)
+    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+        _fail("recovery")
+    _acl_is_safe(path, category="recovery")
+    marker = os.path.join(path, OWNER_MARKER)
+    fd, marker_info, data = _open_private_state_file(marker)
+    os.close(fd)
+    if (
+        marker_info.st_uid != 0
+        or marker_info.st_nlink != 1
+        or stat.S_IMODE(marker_info.st_mode) != 0o600
+    ):
+        _fail("recovery")
+    _parse_state_marker(data, run_key, state_kind)
+    return run_key, state_kind
+
+
+def _open_private_state_file(path: str) -> tuple[int, os.stat_result, bytes]:
+    _check_ancestors(path, category="recovery")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        _fail("recovery")
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            _fail("recovery")
+        _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+        data = _read_fd_bounded(fd, MAX_OWNER_BYTES)
+        final = os.fstat(fd)
+        if _identity(info) != _identity(final):
+            _fail("recovery")
+        return fd, info, data
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_private_state_file_at(
+    directory_fd: int,
+    name: str,
+) -> tuple[int, os.stat_result, bytes]:
+    if not name or "/" in name or "\x00" in name:
+        _fail("recovery")
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+    except OSError:
+        _fail("recovery")
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            _fail("recovery")
+        _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+        data = _read_fd_bounded(fd, MAX_OWNER_BYTES)
+        final = os.fstat(fd)
+        if _identity(info) != _identity(final):
+            _fail("recovery")
+        return fd, info, data
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _ensure_state_root(state_root: str) -> os.stat_result:
+    if (
+        not isinstance(state_root, str)
+        or not state_root.startswith("/")
+        or "\x00" in state_root
+        or any(part in ("", ".", "..") for part in state_root.split("/")[1:])
+    ):
+        _fail("recovery")
+    if os.path.lexists(state_root):
+        if os.path.islink(state_root) or not os.path.isdir(state_root):
+            _fail("recovery")
+        info = os.stat(state_root, follow_symlinks=False)
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+            _fail("recovery")
+    else:
+        _check_ancestors(state_root, category="recovery")
+        os.mkdir(state_root, 0o700)
+        os.chown(state_root, 0, 0)
+        os.chmod(state_root, 0o700)
+    _check_ancestors(state_root, category="recovery")
+    _acl_is_safe(state_root, category="recovery")
+    return os.stat(state_root, follow_symlinks=False)
+
+
+def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
+    _state_marker(run_key, state_kind)
+    expected_root = _ensure_state_root(state_root)
+    name = f"{run_key}-{state_kind}"
+    temporary = f".provider-state.{name}.tmp"
+    parent_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
+        _lock_directory(parent_fd)
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
+        _validate_retention_state_root_fd(parent_fd)
+        _retention_interlocks_fd("", parent_fd)
+        for candidate in (temporary, name):
+            try:
+                os.stat(candidate, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            _fail("recovery")
+        os.mkdir(temporary, 0o700, dir_fd=parent_fd)
+        temporary_fd = os.open(
+            temporary,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.fchown(temporary_fd, 0, 0)
+            os.fchmod(temporary_fd, 0o700)
+            temporary_inode = (
+                os.fstat(temporary_fd).st_dev,
+                os.fstat(temporary_fd).st_ino,
+            )
+            _write_private_at(
+                temporary_fd,
+                OWNER_MARKER,
+                _state_marker(run_key, state_kind),
+                0o600,
+            )
+            os.fsync(temporary_fd)
+            os.fsync(parent_fd)
+            _retention_interlocks_fd(
+                "",
+                parent_fd,
+                allowed_temporary=temporary,
+            )
+            source_path_info = os.stat(
+                temporary,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            source_fd_info = os.fstat(temporary_fd)
+            if (
+                not _same_inode(source_path_info, source_fd_info)
+                or (source_fd_info.st_dev, source_fd_info.st_ino)
+                != temporary_inode
+            ):
+                _fail("recovery")
+            _validate_state_directory_fd(temporary_fd, name)
+            _rename_noreplace(
+                parent_fd,
+                temporary,
+                name,
+                expected_source_fd=temporary_fd,
+                expected_source_inode=temporary_inode,
+            )
+            published_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                published = os.fstat(published_fd)
+                if (
+                    not _same_inode(published, os.fstat(temporary_fd))
+                    or (published.st_dev, published.st_ino) != temporary_inode
+                ):
+                    _fail("recovery")
+                _validate_state_directory_fd(published_fd, name)
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if not _same_inode(current, published):
+                    _fail("recovery")
+                _revalidate_retention_state_root_path(state_root, expected_root)
+            finally:
+                os.close(published_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(temporary_fd)
+    finally:
+        os.close(parent_fd)
+    _result(False, False, False, "published")
+
+
 def _read_existing(path: str, source: bool = False) -> tuple[dict[str, int], bytes]:
     fd, info, data = _open_regular(path, max_bytes=MAX_CREDENTIAL_BYTES, source=source)
     try:
@@ -696,7 +1073,11 @@ def _marker(state_root: str, run_key: str) -> dict[str, Any]:
         "durableDisposition",
     }:
         _fail("recovery")
-    if value["schemaVersion"] != SCHEMA_VERSION or value["runKey"] != run_key:
+    if (
+        type(value["schemaVersion"]) is not int
+        or value["schemaVersion"] != SCHEMA_VERSION
+        or value["runKey"] != run_key
+    ):
         _fail("recovery")
     if value["phase"] not in (
         "preparing",
@@ -709,7 +1090,7 @@ def _marker(state_root: str, run_key: str) -> dict[str, Any]:
         _fail("recovery")
     if value["durableDisposition"] not in ("none", "created", "reused"):
         _fail("recovery")
-    if not isinstance(value["providerEnabled"], bool):
+    if type(value["providerEnabled"]) is not bool:
         _fail("recovery")
     return value
 
@@ -756,7 +1137,7 @@ def _validate_identity(value: Any) -> None:
         "durable",
     }:
         _fail("recovery")
-    if value["schemaVersion"] != SCHEMA_VERSION:
+    if type(value["schemaVersion"]) is not int or value["schemaVersion"] != SCHEMA_VERSION:
         _fail("recovery")
     for record in (value["predecessor"], value["durable"]):
         if not isinstance(record, dict) or set(record) != {
@@ -766,7 +1147,10 @@ def _validate_identity(value: Any) -> None:
             "ctimeNs",
         }:
             _fail("recovery")
-        if any(not isinstance(record[key], int) or record[key] < 0 for key in record):
+        if any(
+            type(record[key]) is not int or record[key] < 0
+            for key in record
+        ):
             _fail("recovery")
 
 
@@ -840,19 +1224,48 @@ def _witnessed_unlink(
     mode: int,
     link_count: int,
 ) -> None:
+    witness_fd = (
+        expected_identity.pop("_witnessFd", None)
+        if expected_identity is not None
+        else None
+    )
+    entry_fd: int | None = None
+
+    def close_owned(fd: int | None) -> None:
+        # Early witness failures occur before the main mutation finally block.
+        # Cleanup must preserve RECOVERY_REQUIRED even if an injected race
+        # already invalidated one descriptor.
+        if fd is None:
+            return
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def fail_witness() -> None:
+        nonlocal entry_fd, witness_fd
+        close_owned(entry_fd)
+        close_owned(witness_fd)
+        entry_fd = None
+        witness_fd = None
+        _fail("recovery")
+
     try:
         path_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except OSError:
-        _fail("recovery")
+        fail_witness()
     if (
         not stat.S_ISREG(path_info.st_mode)
         or path_info.st_uid != uid
         or path_info.st_gid != gid
         or stat.S_IMODE(path_info.st_mode) != mode
         or path_info.st_nlink != link_count
-        or (expected_identity is not None and _identity(path_info) != expected_identity)
+        or (
+            expected_identity is not None
+            and _identity(path_info) != _witness_identity(expected_identity)
+        )
     ):
-        _fail("recovery")
+        fail_witness()
     try:
         entry_fd = os.open(
             name,
@@ -860,11 +1273,15 @@ def _witnessed_unlink(
             dir_fd=directory_fd,
         )
     except OSError:
-        _fail("recovery")
+        fail_witness()
     try:
         opened = os.fstat(entry_fd)
         if (
             _identity(opened) != _identity(path_info)
+            or (
+                witness_fd is not None
+                and _identity(opened) != _identity(os.fstat(witness_fd))
+            )
             or opened.st_uid != uid
             or opened.st_gid != gid
             or stat.S_IMODE(opened.st_mode) != mode
@@ -893,7 +1310,7 @@ def _witnessed_unlink(
             or _identity(final_path_info) != _identity(final_fd_info)
             or (
                 expected_identity is not None
-                and _identity(final_path_info) != expected_identity
+                and _identity(final_path_info) != _witness_identity(expected_identity)
             )
             or final_fd_info.st_uid != uid
             or final_fd_info.st_gid != gid
@@ -927,15 +1344,7 @@ def _witnessed_unlink(
                 break
         if quarantine is None:
             _fail("recovery")
-        try:
-            os.rename(
-                name,
-                quarantine,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-            )
-        except OSError:
-            _fail("recovery")
+        _rename_noreplace(directory_fd, name, quarantine)
         quarantine_info = os.stat(
             quarantine,
             dir_fd=directory_fd,
@@ -993,7 +1402,8 @@ def _witnessed_unlink(
             return
         _fail("recovery")
     finally:
-        os.close(entry_fd)
+        close_owned(entry_fd)
+        close_owned(witness_fd)
 
 
 def _remove_created_destination(
@@ -1343,6 +1753,10 @@ def _check() -> None:
         _fail("prerequisite")
     if not hasattr(os, "link") or not hasattr(os, "fsync") or not hasattr(os.stat_result, "st_mtime_ns"):
         _fail("prerequisite")
+    try:
+        getattr(ctypes.CDLL(None, use_errno=True), "renameat2")
+    except (AttributeError, OSError):
+        _fail("prerequisite")
     _result(False, False, False, "checked")
 
 
@@ -1354,20 +1768,143 @@ def _retention_reference(path: str) -> str:
         or any(part in ("", ".", "..") for part in path.split("/")[1:])
     ):
         _fail("recovery")
+    current = "/"
+    for component in path.split("/")[1:]:
+        current = os.path.join(current, component)
+        if os.path.islink(current):
+            _fail("recovery")
     if os.path.lexists(path) and os.path.realpath(path) != path:
         _fail("recovery")
     return path
 
 
-def _validate_terminal_state(path: str, name: str) -> None:
-    if os.path.islink(path) or not os.path.isdir(path):
+def _open_reference_parent(path: str) -> tuple[int, str]:
+    components = path.split("/")[1:]
+    if not components or any(not component for component in components):
         _fail("recovery")
-    info = os.stat(path, follow_symlinks=False)
-    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+    parent_fd = os.open(
+        "/",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        for component in components[:-1]:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return parent_fd, components[-1]
+    except Exception:
+        os.close(parent_fd)
+        raise
+
+
+def _protected_reference_witness(
+    path: str,
+) -> tuple[tuple[int, ...], bytes | None] | None:
+    _retention_reference(path)
+    try:
+        parent_fd, name = _open_reference_parent(path)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            _fail("recovery")
+        data: bytes | None = None
+        if stat.S_ISREG(info.st_mode):
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+            try:
+                before = os.fstat(fd)
+                if not _same_inode(before, info):
+                    _fail("recovery")
+                data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
+                after = os.fstat(fd)
+                if _stable_entry_identity(before) != _stable_entry_identity(after):
+                    _fail("recovery")
+                info = before
+            finally:
+                os.close(fd)
+        return _stable_entry_identity(info), data
+    finally:
+        os.close(parent_fd)
+
+
+def _revalidate_protected_references(
+    paths: Iterable[str],
+    witnesses: Iterable[tuple[tuple[int, ...], bytes | None] | None],
+) -> None:
+    for path, witness in zip(paths, witnesses):
+        if _protected_reference_witness(path) != witness:
+            _fail("recovery")
+
+
+def _reject_protected_reference_aliases(
+    witnesses: Iterable[tuple[tuple[int, ...], bytes | None] | None],
+    state_info: os.stat_result,
+    child_witnesses: dict[str, tuple[dict[str, int], bytes]],
+) -> None:
+    state_inode = (state_info.st_dev, state_info.st_ino)
+    child_inodes = {
+        (identity["device"], identity["inode"])
+        for identity, _ in child_witnesses.values()
+    }
+    for witness in witnesses:
+        if witness is None:
+            continue
+        reference_inode = (witness[0][0], witness[0][1])
+        if reference_inode == state_inode or reference_inode in child_inodes:
+            _fail("recovery")
+
+
+def _owned_state(path: str, name: str, *, require_terminal: bool) -> tuple[str, str]:
+    run_key, state_kind = _validate_state_directory(path, name)
+    if require_terminal:
+        _validate_terminal_state(path, name)
+    return run_key, state_kind
+
+
+def _validate_state_directory_fd(directory_fd: int, name: str) -> tuple[str, str]:
+    run_key, state_kind = _state_parts(name)
+    info = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
         _fail("recovery")
-    terminal = os.path.join(path, "terminal.json")
-    value = _json(_read_private(terminal), "recovery")
-    run_key = name.rsplit("-", 2)[0]
+    _acl_is_safe(
+        f"/proc/self/fd/{directory_fd}",
+        follow_symlinks=True,
+        category="recovery",
+    )
+    marker_fd, marker_info, data = _open_private_state_file_at(
+        directory_fd,
+        OWNER_MARKER,
+    )
+    os.close(marker_fd)
+    if (
+        marker_info.st_uid != 0
+        or marker_info.st_nlink != 1
+        or stat.S_IMODE(marker_info.st_mode) != 0o600
+    ):
+        _fail("recovery")
+    _parse_state_marker(data, run_key, state_kind)
+    return run_key, state_kind
+
+
+def _parse_terminal_state_data(data: bytes, name: str) -> tuple[str, bool]:
+    value = _json(data, "recovery")
+    run_key, _ = _state_parts(name)
     if set(value) != {
         "schemaVersion",
         "runKey",
@@ -1376,12 +1913,337 @@ def _validate_terminal_state(path: str, name: str) -> None:
     }:
         _fail("recovery")
     if (
-        value["schemaVersion"] != SCHEMA_VERSION
+        type(value["schemaVersion"]) is not int
+        or value["schemaVersion"] != SCHEMA_VERSION
+        or type(value["runKey"]) is not str
         or value["runKey"] != run_key
+        or type(value["outcome"]) is not str
         or value["outcome"] not in ("committed", "rolled-back")
-        or not isinstance(value["providerEnabled"], bool)
+        or type(value["providerEnabled"]) is not bool
     ):
         _fail("recovery")
+    return value["outcome"], value["providerEnabled"]
+
+
+def _validate_terminal_state(path: str, name: str) -> None:
+    terminal = os.path.join(path, "terminal.json")
+    terminal_fd, terminal_info, terminal_data = _open_private_state_file(terminal)
+    os.close(terminal_fd)
+    if terminal_info.st_uid != 0 or terminal_info.st_nlink != 1:
+        _fail("recovery")
+    _parse_terminal_state_data(terminal_data, name)
+
+
+def _validate_terminal_state_fd(directory_fd: int, name: str) -> None:
+    terminal_fd, terminal_info, terminal_data = _open_private_state_file_at(
+        directory_fd,
+        "terminal.json",
+    )
+    os.close(terminal_fd)
+    if terminal_info.st_uid != 0 or terminal_info.st_nlink != 1:
+        _fail("recovery")
+    _parse_terminal_state_data(terminal_data, name)
+
+
+def _owned_state_fd(
+    directory_fd: int,
+    name: str,
+    *,
+    require_terminal: bool,
+) -> tuple[str, str]:
+    result = _validate_state_directory_fd(directory_fd, name)
+    if require_terminal:
+        _validate_terminal_state_fd(directory_fd, name)
+    return result
+
+
+def _iter_directory_fd_names(directory_fd: int) -> Iterable[str]:
+    with os.scandir(f"/proc/self/fd/{directory_fd}") as entries:
+        for entry in entries:
+            yield entry.name
+
+
+def _open_optional_directory_reference(path: str) -> int | None:
+    _retention_reference(path)
+    try:
+        parent_fd, name = _open_reference_parent(path)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if (
+            stat.S_ISLNK(expected.st_mode)
+            or not stat.S_ISDIR(expected.st_mode)
+            or expected.st_uid != 0
+            or stat.S_IMODE(expected.st_mode) != 0o700
+        ):
+            _fail("recovery")
+        directory_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(directory_fd)
+        if not _same_inode(opened, expected):
+            os.close(directory_fd)
+            _fail("recovery")
+        _acl_is_safe(
+            f"/proc/self/fd/{directory_fd}",
+            follow_symlinks=True,
+            category="recovery",
+        )
+        return directory_fd
+    finally:
+        os.close(parent_fd)
+
+
+def _retention_interlocks_fd(
+    root: str,
+    state_root_fd: int,
+    *,
+    allowed_temporary: str | None = None,
+) -> None:
+    parent = _rooted(HOST_CREDENTIAL_PARENT, root)
+    for name in (
+        ".provider-transaction.current",
+        ".smtp-transaction.current",
+    ):
+        try:
+            os.stat(name, dir_fd=state_root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        else:
+            _fail("recovery")
+    for name in _iter_directory_fd_names(state_root_fd):
+        if name.startswith(".provider-transaction.") or name.startswith(
+            ".provider-state."
+        ):
+            if allowed_temporary is not None and name == allowed_temporary:
+                continue
+            _fail("recovery")
+    parent_fd = _open_optional_directory_reference(parent)
+    if parent_fd is None:
+        return
+    try:
+        for name in _iter_directory_fd_names(parent_fd):
+            if name.startswith(".transaction-"):
+                _fail("recovery")
+    finally:
+        os.close(parent_fd)
+
+
+def _retention_interlocks(root: str, state_root: str) -> None:
+    state_root_fd = os.open(
+        state_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        _retention_interlocks_fd(root, state_root_fd)
+    finally:
+        os.close(state_root_fd)
+
+
+def _validate_retention_state_root_path(state_root: str) -> os.stat_result:
+    if (
+        not isinstance(state_root, str)
+        or not state_root.startswith("/")
+        or "\x00" in state_root
+        or any(part in ("", ".", "..") for part in state_root.split("/")[1:])
+        or not os.path.lexists(state_root)
+        or os.path.islink(state_root)
+        or not os.path.isdir(state_root)
+    ):
+        _fail("recovery")
+    info = os.stat(state_root, follow_symlinks=False)
+    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+        _fail("recovery")
+    _check_ancestors(state_root, category="recovery")
+    _acl_is_safe(state_root, category="recovery")
+    return info
+
+
+def _validate_retention_state_root_fd(fd: int) -> None:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        _fail("recovery")
+    _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+
+
+def _revalidate_retention_state_root_path(
+    state_root: str,
+    expected_root: os.stat_result,
+) -> None:
+    try:
+        current = os.stat(state_root, follow_symlinks=False)
+    except OSError:
+        _fail("recovery")
+    if not _same_inode(current, expected_root):
+        _fail("recovery")
+
+
+def _retention_classify(
+    root: str,
+    state_root: str,
+    protected_paths: Iterable[str] = (),
+    protected_states: Iterable[str] = (),
+) -> list[str]:
+    if (
+        not isinstance(state_root, str)
+        or not state_root.startswith("/")
+        or "\x00" in state_root
+        or any(part in ("", ".", "..") for part in state_root.split("/")[1:])
+    ):
+        _fail("recovery")
+    expected_root = _validate_retention_state_root_path(state_root)
+    parent_fd = os.open(
+        state_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
+        _lock_directory(parent_fd)
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
+        _validate_retention_state_root_fd(parent_fd)
+        _retention_interlocks_fd(root, parent_fd)
+        references = list(protected_paths)
+        reference_witnesses = [
+            _protected_reference_witness(path) for path in references
+        ]
+        explicit_states: set[str] = set()
+        for path in protected_states:
+            witness = _protected_reference_witness(path)
+            if (
+                os.path.dirname(path.rstrip("/")) != state_root.rstrip("/")
+                or witness is None
+                or not stat.S_ISDIR(witness[0][2])
+            ):
+                _fail("recovery")
+            explicit_states.add(os.path.normpath(path))
+        _revalidate_protected_references(references, reference_witnesses)
+        owned_states: list[str] = []
+        encoded_size = len(
+            b'{"schemaVersion":1,"outcome":"retention-safe","ownedStates":['
+        ) + len(b"]}\n")
+        for name in _iter_directory_fd_names(parent_fd):
+            if re.fullmatch(r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name):
+                state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(
+                    state_info.st_mode
+                ):
+                    _fail("recovery")
+                state_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    if not _same_inode(os.fstat(state_fd), state_info):
+                        _fail("recovery")
+                    try:
+                        os.stat(
+                            OWNER_MARKER,
+                            dir_fd=state_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        # An absent marker is an unowned legacy state.  Its
+                        # contents are deliberately opaque and never
+                        # participate in retention.
+                        continue
+                    _owned_state_fd(state_fd, name, require_terminal=True)
+                    child_names = _bounded_retention_children(state_fd)
+                    if child_names is not None:
+                        encoded_name = json.dumps(
+                            name,
+                            separators=(",", ":"),
+                        ).encode()
+                        additional = len(encoded_name) + (
+                            1 if owned_states else 0
+                        )
+                        if encoded_size + additional > MAX_INSPECTION_BYTES:
+                            _fail("recovery")
+                        encoded_size += additional
+                        owned_states.append(name)
+                    if not _same_inode(os.fstat(state_fd), state_info):
+                        _fail("recovery")
+                finally:
+                    os.close(state_fd)
+                continue
+            state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(state_info.st_mode):
+                _fail("recovery")
+            if not stat.S_ISDIR(state_info.st_mode):
+                continue
+            if name.startswith(".provider-state."):
+                _fail("recovery")
+            state_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                if not _same_inode(os.fstat(state_fd), state_info):
+                    _fail("recovery")
+                try:
+                    os.stat(
+                        OWNER_MARKER,
+                        dir_fd=state_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    _fail("recovery")
+                if not _same_inode(os.fstat(state_fd), state_info):
+                    _fail("recovery")
+            finally:
+                os.close(state_fd)
+            path = os.path.join(state_root, name)
+            if os.path.normpath(path) in explicit_states:
+                continue
+            for reference in references:
+                if reference == path or reference.startswith(path + "/"):
+                    # The caller resolves Docker/Compose references and passes
+                    # them here.  A component boundary is required so a state
+                    # named "1-2" cannot protect or match "1-20".
+                    break
+    finally:
+        os.close(parent_fd)
+    return sorted(owned_states)
+
+
+def _retention_list(
+    root: str,
+    state_root: str,
+    protected_paths: Iterable[str] = (),
+    protected_states: Iterable[str] = (),
+) -> None:
+    owned_states = _retention_classify(
+        root,
+        state_root,
+        protected_paths,
+        protected_states,
+    )
+    encoded = json.dumps(
+        {
+            "schemaVersion": 1,
+            "outcome": "retention-safe",
+            "ownedStates": owned_states,
+        },
+        separators=(",", ":"),
+    ).encode()
+    if len(encoded) > MAX_INSPECTION_BYTES:
+        _fail("recovery")
+    sys.stdout.buffer.write(encoded + b"\n")
 
 
 def _retention_check(
@@ -1390,67 +2252,14 @@ def _retention_check(
     protected_paths: Iterable[str] = (),
     protected_states: Iterable[str] = (),
 ) -> None:
-    parent = _rooted(HOST_CREDENTIAL_PARENT, root)
-    marker = os.path.join(state_root, ".provider-transaction.current")
-    if os.path.lexists(marker):
-        _fail("recovery")
-    if os.path.isdir(state_root) and any(
-        name.startswith(".provider-transaction.")
-        for name in os.listdir(state_root)
-    ):
-        _fail("recovery")
-    if os.path.isdir(parent):
-        for name in os.listdir(parent):
-            if name.startswith(".transaction-"):
-                _fail("recovery")
-    if os.path.lexists(state_root) and (
-        os.path.islink(state_root)
-        or not os.path.isdir(state_root)
-    ):
-        _fail("recovery")
-    if os.path.isdir(state_root):
-        state_root_real = os.path.realpath(state_root)
-        references = [_retention_reference(path) for path in protected_paths]
-        explicit_states = {
-            os.path.realpath(path)
-            for path in protected_states
-        }
-        for path in protected_states:
-            if (
-                not isinstance(path, str)
-                or os.path.dirname(path.rstrip("/")) != state_root.rstrip("/")
-                or os.path.islink(path)
-                or not os.path.isdir(path)
-            ):
-                _fail("recovery")
-        for name in os.listdir(state_root):
-            path = os.path.join(state_root, name)
-            if re.fullmatch(
-                r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)",
-                name,
-            ):
-                _validate_terminal_state(path, name)
-            if os.path.islink(path):
-                continue
-            if not os.path.isdir(path):
-                continue
-            real_path = os.path.realpath(path)
-            if real_path == state_root_real:
-                _fail("recovery")
-            if real_path in explicit_states:
-                continue
-            for reference in references:
-                if reference == path or reference.startswith(path + "/"):
-                    # The caller resolves Docker/Compose references and passes
-                    # them here.  A component boundary is required so a state
-                    # named "1-2" cannot protect or match "1-20".
-                    break
+    _retention_classify(root, state_root, protected_paths, protected_states)
     _result(False, False, False, "retention-safe")
 
 
 RETENTION_CHILDREN = frozenset(
     {
         "terminal.json",
+        OWNER_MARKER,
         "previous-active-compose.yml",
         "previous-active-compose.identity",
         "previous-active-runtime.yml",
@@ -1484,35 +2293,90 @@ RETENTION_CHILDREN = frozenset(
 )
 
 
-def _retention_delete(state_root: str, state_path: str) -> None:
+def _bounded_retention_children(directory_fd: int) -> set[str] | None:
+    names: set[str] = set()
+    for name in _iter_directory_fd_names(directory_fd):
+        if name not in RETENTION_CHILDREN:
+            return None
+        names.add(name)
+    return names
+
+
+def _retention_delete(
+    state_root: str,
+    state_path: str,
+    protected_paths: Iterable[str] = (),
+    protected_states: Iterable[str] = (),
+) -> None:
     if (
         not isinstance(state_root, str)
         or not state_root.startswith("/")
+        or "\x00" in state_root
+        or any(part in ("", ".", "..") for part in state_root.split("/")[1:])
         or not isinstance(state_path, str)
         or not state_path.startswith("/")
+        or "\x00" in state_path
+        or any(part in ("", ".", "..") for part in state_path.split("/")[1:])
     ):
         _fail("recovery")
     name = os.path.basename(state_path)
-    if not re.fullmatch(
-        r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)",
-        name,
-    ):
+    if re.fullmatch(r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name) is None:
         _fail("recovery")
-    _run_key(name.rsplit("-", 2)[0])
-    if os.path.lexists(state_root) and (
-        os.path.islink(state_root) or not os.path.isdir(state_root)
-    ):
+    state_norm = os.path.normpath(state_path)
+    root_norm = os.path.normpath(state_root)
+    if os.path.dirname(state_norm) != root_norm:
         _fail("recovery")
+    references = list(protected_paths)
+    reference_witnesses = [
+        _protected_reference_witness(path) for path in references
+    ]
+    protected_state_paths = list(protected_states)
+    protected_state_witnesses: list[
+        tuple[tuple[int, ...], bytes | None] | None
+    ] = []
+    for protected in protected_state_paths:
+        witness = _protected_reference_witness(protected)
+        if (
+            os.path.dirname(protected.rstrip("/")) != root_norm
+            or witness is None
+            or not stat.S_ISDIR(witness[0][2])
+        ):
+            _fail("recovery")
+        protected_state_witnesses.append(witness)
+        protected_norm = os.path.normpath(protected)
+        if (
+            protected_norm == state_norm
+            or protected_norm.startswith(state_norm + os.sep)
+            or state_norm.startswith(protected_norm + os.sep)
+        ):
+            _fail("recovery")
+    for reference in references:
+        reference_norm = os.path.normpath(reference)
+        if (
+            reference_norm == state_norm
+            or reference_norm.startswith(state_norm + os.sep)
+            or state_norm.startswith(reference_norm + os.sep)
+        ):
+            _fail("recovery")
+    expected_root = _validate_retention_state_root_path(state_root)
     parent_fd = os.open(
         state_root,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
     try:
-        _lock_directory(parent_fd)
-        if (
-            os.path.dirname(os.path.normpath(state_path)) != os.path.normpath(state_root)
-        ):
+        if not _same_inode(os.fstat(parent_fd), expected_root):
             _fail("recovery")
+        _lock_directory(parent_fd)
+        if not _same_inode(os.fstat(parent_fd), expected_root):
+            _fail("recovery")
+        _validate_retention_state_root_fd(parent_fd)
+        _retention_interlocks_fd("", parent_fd)
+        _revalidate_protected_references(references, reference_witnesses)
+        _revalidate_protected_references(
+            protected_state_paths,
+            protected_state_witnesses,
+        )
+        _revalidate_retention_state_root_path(state_root, expected_root)
         state_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (
             not stat.S_ISDIR(state_info.st_mode)
@@ -1525,32 +2389,101 @@ def _retention_delete(state_root: str, state_path: str) -> None:
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
             dir_fd=parent_fd,
         )
+        witnesses: dict[str, tuple[dict[str, int], bytes]] = {}
         try:
             if not _same_inode(os.fstat(state_fd), state_info):
                 _fail("recovery")
             _lock_directory(state_fd)
-            names = set(os.listdir(state_fd))
-            if not names.difference(RETENTION_CHILDREN):
-                witnesses = {
-                    child: _child_witness(state_fd, child)
-                    for child in names
-                }
-                for child in sorted(names):
-                    child_info = os.stat(
-                        child,
-                        dir_fd=state_fd,
-                        follow_symlinks=False,
-                    )
-                    if (
-                        not stat.S_ISREG(child_info.st_mode)
-                        or child_info.st_uid != 0
-                        or stat.S_IMODE(child_info.st_mode) != 0o600
-                        or child_info.st_nlink != 1
-                    ):
-                        _fail("recovery")
+            if not _same_inode(os.fstat(state_fd), state_info):
+                _fail("recovery")
+            _validate_state_directory_fd(state_fd, name)
+            _validate_terminal_state_fd(state_fd, name)
+            _revalidate_protected_references(references, reference_witnesses)
+            _revalidate_protected_references(
+                protected_state_paths,
+                protected_state_witnesses,
+            )
+            names = _bounded_retention_children(state_fd)
+            if not names:
+                _fail("recovery")
+            if OWNER_MARKER not in names or "terminal.json" not in names:
+                _fail("recovery")
+            for child in names:
+                child_info = os.stat(child, dir_fd=state_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(child_info.st_mode)
+                    or child_info.st_uid != 0
+                    or stat.S_IMODE(child_info.st_mode) != 0o600
+                    or child_info.st_nlink != 1
+                ):
+                    _fail("recovery")
+                witnesses[child] = _child_witness(state_fd, child)
+            # Re-parse the bytes captured by the deletion witnesses.  The
+            # earlier path-based validation only admits the state; it must not
+            # authorize deletion after a child replacement.  Semantic
+            # admission and unlink authorization therefore share these exact
+            # descriptor-backed bytes and identities.
+            _parse_state_marker(
+                witnesses[OWNER_MARKER][1],
+                *_state_parts(name),
+            )
+            _parse_terminal_state_data(witnesses["terminal.json"][1], name)
+            _reject_protected_reference_aliases(
+                [*reference_witnesses, *protected_state_witnesses],
+                state_info,
+                witnesses,
+            )
+            quarantine = f".provider-state.{name}.tmp"
+            try:
+                os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                _fail("recovery")
+            _retention_interlocks_fd("", parent_fd)
+            current_state = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not _same_inode(current_state, state_info):
+                _fail("recovery")
+            _revalidate_protected_references(references, reference_witnesses)
+            _revalidate_protected_references(
+                protected_state_paths,
+                protected_state_witnesses,
+            )
+            _rename_noreplace(parent_fd, name, quarantine)
+            os.fsync(parent_fd)
+            _retention_interlocks_fd(
+                "",
+                parent_fd,
+                allowed_temporary=quarantine,
+            )
+            try:
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                _fail("recovery")
+            quarantine_fd = os.open(
+                quarantine,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                if (
+                    not _same_inode(os.fstat(quarantine_fd), state_info)
+                    or not _same_inode(os.fstat(quarantine_fd), os.fstat(state_fd))
+                ):
+                    _fail("recovery")
+                # state_fd already holds the descriptor lock for this inode;
+                # reopening it after the no-replace move would deadlock on
+                # Linux flock semantics.
+                for child in sorted(names - {OWNER_MARKER}):
                     child_identity, child_data = witnesses[child]
                     _witnessed_unlink(
-                        state_fd,
+                        quarantine_fd,
                         child,
                         expected_identity=child_identity,
                         expected_data=child_data,
@@ -1559,21 +2492,28 @@ def _retention_delete(state_root: str, state_path: str) -> None:
                         mode=0o600,
                         link_count=1,
                     )
-            final_state_info = os.stat(
-                name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-            if not _same_inode(final_state_info, state_info):
-                _fail("recovery")
+                    os.fsync(quarantine_fd)
+                child_identity, child_data = witnesses[OWNER_MARKER]
+                _witnessed_unlink(
+                    quarantine_fd,
+                    OWNER_MARKER,
+                    expected_identity=child_identity,
+                    expected_data=child_data,
+                    uid=0,
+                    gid=0,
+                    mode=0o600,
+                    link_count=1,
+                )
+                os.fsync(quarantine_fd)
+                if next(_iter_directory_fd_names(quarantine_fd), None) is not None:
+                    _fail("recovery")
+            finally:
+                os.close(quarantine_fd)
+            os.rmdir(quarantine, dir_fd=parent_fd)
+            os.fsync(parent_fd)
         finally:
+            _close_owned_witnesses(witnesses.values())
             os.close(state_fd)
-        try:
-            os.rmdir(name, dir_fd=parent_fd)
-        except OSError as error:
-            if error.errno != errno.ENOTEMPTY:
-                _fail("recovery")
-        os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
     _result(False, False, False, "retention-safe")
@@ -1590,6 +2530,8 @@ def _parser() -> argparse.ArgumentParser:
             "prepare",
             "verify",
             "finish",
+            "state-publish",
+            "retention-list",
             "retention-check",
             "retention-delete",
         ),
@@ -1601,6 +2543,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--protected-path", action="append", default=[])
     parser.add_argument("--protected-state", action="append", default=[])
     parser.add_argument("--retention-state", default="")
+    parser.add_argument("--state-kind", default="")
     return parser
 
 
@@ -1636,6 +2579,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "finish":
             _run_key(args.run_key)
             _finish(args.run_key, args.state_root, "", args.outcome, _bounded_stdin(MAX_INSPECTION_BYTES))
+        elif args.command == "state-publish":
+            _state_publish(args.state_root, args.run_key, args.state_kind)
+        elif args.command == "retention-list":
+            _retention_list(
+                "",
+                args.state_root,
+                args.protected_path,
+                args.protected_state,
+            )
         elif args.command == "retention-check":
             _retention_check(
                 "",
@@ -1644,7 +2596,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                 args.protected_state,
             )
         else:
-            _retention_delete(args.state_root, args.retention_state)
+            _retention_delete(
+                args.state_root,
+                args.retention_state,
+                args.protected_path,
+                args.protected_state,
+            )
         return 0
     except ProviderError as exc:
         sys.stderr.write(exc.category + "\n")

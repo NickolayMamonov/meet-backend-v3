@@ -89,7 +89,7 @@ data class BetaDemoCatalogManifest(
 
 object BetaDemoCatalog {
     const val CATALOG_NAME = "closed-beta-demo"
-    const val MANIFEST_VERSION = "2026-08-15.v1"
+    const val MANIFEST_VERSION = "2027-09-13.v1"
     const val MEDIA_BASE = "https://api.whysoezzy.online/demo-assets/v1/"
     private fun key(type: String, slug: String) = CatalogKey("$CATALOG_NAME/$type/$slug")
     private fun tag(slug: String, text: String) = ManifestTag(key("tag", slug), text)

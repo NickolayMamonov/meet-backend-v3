@@ -137,7 +137,7 @@ jq -e '
   .schema == "meet-backend/test-vps-admission-contract/v1" and
   (.stateModes | sort) == ["closed-beta-demo","empty-closed"] and
   .populated.catalogName == "closed-beta-demo" and
-  .populated.manifestVersion == "2026-08-15.v1" and
+  .populated.manifestVersion == "2027-09-13.v1" and
   .populated.stableProof.byteLength == 6867
 ' "$contract" >/dev/null || fail "admission proof contract is invalid"
 populated_meetings=$(jq -er \
@@ -715,7 +715,7 @@ jq -cnS \
     admission:(if $stateMode == "empty-closed"
       then {mode:$stateMode,stateSha256:null}
       else {mode:$stateMode,stateSha256:$admissionStateSha256,
-        catalogName:"closed-beta-demo",manifestVersion:"2026-08-15.v1",
+        catalogName:"closed-beta-demo",manifestVersion:"2027-09-13.v1",
         recoveryProofSha256:$admissionDatabaseProofSha256,
         stableProofSha256:$admissionStableProofSha256,
         publicProjectionSha256:$admissionPublicProofSha256,routes:$admissionRoutes}

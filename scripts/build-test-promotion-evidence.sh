@@ -456,7 +456,7 @@ jq -e '
   (.stateModes | sort) == ["closed-beta-demo","empty-closed"] and
   (.populated | type == "object" and
     .catalogName == "closed-beta-demo" and
-    .manifestVersion == "2026-08-15.v1" and
+    .manifestVersion == "2027-09-13.v1" and
     (.recoveryProof | type == "object" and
       (keys | sort) == ["schema","sha256"]) and
     (.stableProof | type == "object" and
