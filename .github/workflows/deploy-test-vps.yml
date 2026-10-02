@@ -553,16 +553,28 @@ jobs:
           set -euo pipefail
           if ! timeout 300s ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$PATH_ON_HOST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-            "$REMOTE_TOOLING" <<'REMOTE'
+            "$REMOTE_TOOLING" /var/lib/meet-test-vps-deploy \
+            /var/lib/meet-production <<'REMOTE'
           set -euo pipefail
           root=$1
           run_id=$2
           run_attempt=$3
           tooling=$4
+          state_root=${5:-/var/lib/meet-test-vps-deploy}
+          production_root=${6:-/var/lib/meet-production}
+          for path in "$root" "$state_root" "$production_root"; do
+            [[ "$path" = /* && "$path" != *..* && "$path" != *$'\n'* ]] || {
+              echo "RECOVERY_REQUIRED" >&2
+              exit 1
+            }
+            [ ! -L "$path" ] || {
+              echo "RECOVERY_REQUIRED" >&2
+              exit 1
+            }
+          done
           tooling_prefix="$root/.test-vps-tooling-"
-          state_root=/var/lib/meet-test-vps-deploy
           [[ "$run_id" =~ ^[0-9]+$ ]] && [[ "$run_attempt" =~ ^[0-9]+$ ]]
-          [ -d "$root" ] && [ -d "$state_root" ]
+          [ -d "$root" ] && [ -d "$state_root" ] && [ -d "$production_root" ]
           if timeout 1s sh -c 'sleep 2' >/dev/null 2>&1; then
             echo "RECOVERY_REQUIRED" >&2
             exit 1
@@ -632,11 +644,11 @@ jobs:
               [ "$retention_unresolved" = false ] || break
             done <<<"$running_containers"
           fi
-          if [ -s /var/lib/meet-production/active-compose.yml ] &&
-            [ -s /var/lib/meet-production/active-runtime.override.yml ]; then
+          if [ -s "$production_root/active-compose.yml" ] &&
+            [ -s "$production_root/active-runtime.override.yml" ]; then
             compose_refs \
-              -f /var/lib/meet-production/active-compose.yml \
-              -f /var/lib/meet-production/active-runtime.override.yml ||
+              -f "$production_root/active-compose.yml" \
+              -f "$production_root/active-runtime.override.yml" ||
               retention_unresolved=true
           else
             retention_unresolved=true
@@ -760,8 +772,8 @@ jobs:
             tooling_removed=$((tooling_removed + 1))
           done
 
-          [ -s /var/lib/meet-production/active-compose.yml ]
-          [ -s /var/lib/meet-production/active-runtime.override.yml ]
+          [ -s "$production_root/active-compose.yml" ]
+          [ -s "$production_root/active-runtime.override.yml" ]
           kept=$((${#states[@]} - states_removed))
           echo "retention=applied tooling_removed=$tooling_removed states_removed=$states_removed states_kept=$kept"
           REMOTE

@@ -9,25 +9,33 @@ if [ "$(uname -s)" != Linux ] || [ "$(id -u)" -ne 0 ]; then
   exit 77
 fi
 
+if grep -Eq '/var/lib/meet-(production|test-vps-deploy)' \
+  "${BASH_SOURCE[0]}"; then
+  echo "RECOVERY_REQUIRED" >&2
+  exit 1
+fi
+
 fixture_root=$(mktemp -d /tmp/meet-retention-fixture.XXXXXX)
-state_root=/var/lib/meet-test-vps-deploy
-production_root=/var/lib/meet-retention-production
+sentinel_root=$(mktemp -d /tmp/meet-retention-sentinel.XXXXXX)
+state_root="$fixture_root/state"
+production_root="$fixture_root/production"
 fake_bin="$fixture_root/bin"
 remote_script="$fixture_root/retention-remote.sh"
+printf 'outside-fixture\n' >"$sentinel_root/sentinel"
 cleanup() {
   local status=$?
   trap - EXIT
-  rm -r -- "$fixture_root" "$state_root" "$production_root"
+  grep -Fxq 'outside-fixture' "$sentinel_root/sentinel" || status=1
+  rm -r -- "$fixture_root" "$sentinel_root" || status=1
   exit "$status"
 }
 trap cleanup EXIT
 
 install -d -m 700 "$fake_bin" "$state_root" "$production_root"
-install -d -m 700 /var/lib/meet-production
 printf 'fixture\n' >"$production_root/.env.production"
 printf 'services:\n  backend:\n    image: fixture\n' >"$production_root/docker-compose.production.yml"
-printf 'services:\n  backend:\n    image: fixture\n' >/var/lib/meet-production/active-compose.yml
-printf 'services:\n  backend:\n    healthcheck:\n      test: ["CMD", "true"]\n' >/var/lib/meet-production/active-runtime.override.yml
+printf 'services:\n  backend:\n    image: fixture\n' >"$production_root/active-compose.yml"
+printf 'services:\n  backend:\n    healthcheck:\n      test: ["CMD", "true"]\n' >"$production_root/active-runtime.override.yml"
 
 cat >"$fake_bin/docker" <<'FAKE_DOCKER'
 #!/usr/bin/env bash
@@ -42,7 +50,8 @@ case "${1:-}" in
         printf '[{"Type":"volume","Name":"uploads","Destination":"/data/uploads"}]\n'
         ;;
       fixture-provider)
-        printf '[{"Type":"bind","Source":"/var/lib/meet-test-vps-deploy/12-1-final-deploy/provider-runtime","Destination":"/run/provider"}]\n'
+        printf '[{"Type":"bind","Source":"%s/12-1-final-deploy/provider-runtime","Destination":"/run/provider"}]\n' \
+          "${FIXTURE_STATE_ROOT:?}"
         ;;
       *)
         printf '{}\n'
@@ -52,7 +61,8 @@ case "${1:-}" in
   compose)
     case " $* " in
       *"/12-1-final-deploy/"*)
-        printf '{"services":{"backend":{"volumes":[{"type":"bind","source":"/var/lib/meet-test-vps-deploy/12-1-final-deploy/protected-input","target":"/protected"}]}}}\n'
+        printf '{"services":{"backend":{"volumes":[{"type":"bind","source":"%s/12-1-final-deploy/protected-input","target":"/protected"}]}}}\n' \
+          "${FIXTURE_STATE_ROOT:?}"
         ;;
       *)
         printf '{"services":{"backend":{"volumes":[]}}}\n'
@@ -73,6 +83,13 @@ awk '
   inside { sub(/^          /, ""); print }
 ' .github/workflows/deploy-test-vps.yml >"$remote_script"
 chmod 700 "$remote_script"
+set +e
+unsafe_output=$(bash "$remote_script" "$production_root" 1 1 \
+  "$production_root/.missing-tooling" "$state_root/../unsafe" "$production_root" 2>&1)
+unsafe_status=$?
+set -e
+[ "$unsafe_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$unsafe_output"
 
 for index in $(seq 1 12); do
   state="$state_root/${index}-1-final-deploy"
@@ -125,8 +142,8 @@ module = runpy.run_path("$tooling_root/scripts/provider-credential-real.py")
 raise SystemExit(module["main"](arguments))
 EOF
 chmod 700 "$tooling_root/scripts/test-vps-provider-credential.py"
-PATH="$fake_bin:$PATH" bash "$remote_script" \
-  "$production_root" 1 1 "$tooling_root"
+FIXTURE_STATE_ROOT="$state_root" PATH="$fake_bin:$PATH" bash "$remote_script" \
+  "$production_root" 1 1 "$tooling_root" "$state_root" "$production_root"
 
 [ -d "$state_root/1-1-final-deploy" ]
 [ -d "$state_root/10-1-final-deploy" ]
@@ -144,7 +161,8 @@ PATH="$fake_bin:$PATH" bash "$remote_script" \
 ln -s "$state_root/12-1-final-deploy" "$state_root/13-1-final-deploy"
 set +e
 symlink_output=$(bash "$remote_script" \
-  "$production_root" 1 1 "$production_root/.missing-tooling" 2>&1)
+  "$production_root" 1 1 "$production_root/.missing-tooling" \
+  "$state_root" "$production_root" 2>&1)
 symlink_status=$?
 set -e
 [ "$symlink_status" -eq 1 ]
@@ -158,7 +176,8 @@ printf 'pre-marker-snapshot\n' >"$unresolved_state/config.env.production"
 chmod 600 "$unresolved_state/config.env.production"
 set +e
 unresolved_output=$(bash "$remote_script" \
-  "$production_root" 1 1 "$production_root/.missing-tooling" 2>&1)
+  "$production_root" 1 1 "$production_root/.missing-tooling" \
+  "$state_root" "$production_root" 2>&1)
 unresolved_status=$?
 set -e
 [ "$unresolved_status" -eq 1 ]
@@ -219,16 +238,17 @@ raise SystemExit(module["main"](sys.argv[1:]))
 EOF
 chmod 700 "$tooling_root/scripts/test-vps-provider-credential.py"
 set +e
-timeout_output=$(PATH="$hang_bin:$fake_bin:$PATH" bash "$remote_script" \
-  "$production_root" 1 1 "$tooling_root" 2>&1)
+timeout_output=$(FIXTURE_STATE_ROOT="$state_root" \
+  PATH="$hang_bin:$fake_bin:$PATH" bash "$remote_script" \
+  "$production_root" 1 1 "$tooling_root" "$state_root" "$production_root" 2>&1)
 timeout_status=$?
 set -e
 [ "$timeout_status" -eq 1 ]
 grep -Fq 'RECOVERY_REQUIRED' <<<"$timeout_output"
 [ -d "$state" ]
 [ -d "$tooling_root" ]
-PATH="$fake_bin:$PATH" bash "$remote_script" \
-  "$production_root" 1 1 "$tooling_root"
+FIXTURE_STATE_ROOT="$state_root" PATH="$fake_bin:$PATH" bash "$remote_script" \
+  "$production_root" 1 1 "$tooling_root" "$state_root" "$production_root"
 [ ! -e "$state" ]
 [ ! -e "$tooling_root" ]
 
@@ -251,8 +271,8 @@ module = runpy.run_path("$tooling_root/scripts/provider-credential-real.py")
 raise SystemExit(module["main"](sys.argv[1:]))
 EOF
 chmod 700 "$tooling_root/scripts/test-vps-provider-credential.py"
-PATH="$fake_bin:$PATH" bash "$remote_script" \
-  "$production_root" 1 1 "$tooling_root"
+FIXTURE_STATE_ROOT="$state_root" PATH="$fake_bin:$PATH" bash "$remote_script" \
+  "$production_root" 1 1 "$tooling_root" "$state_root" "$production_root"
 [ ! -e "$state_root/15-1-final-deploy" ]
 [ ! -e "$tooling_root" ]
-echo "retention fixture passed: all-service mounts, timeout failure, self-tooling ordering, repeated-run cleanup, protected reference, unknown, symlink and prefix-collision cases"
+echo "retention fixture passed: isolated roots, cleanup boundary, unsafe-path rejection, all-service mounts, timeout failure, self-tooling ordering, repeated-run cleanup, protected reference, unknown, symlink and prefix-collision cases"
