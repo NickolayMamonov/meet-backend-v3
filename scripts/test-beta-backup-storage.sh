@@ -126,6 +126,48 @@ run_remote_control_interleaving_fixture() {
   ! grep -Fxq put "$log"
 }
 
+run_remote_control_update_fixture() {
+  local source=$1 log=$2 status result
+  printf 'remote-control-update-fixture\n' >"$source"
+  : >"$log"
+  set +e
+  (
+    trap - RETURN
+    set +u
+    beta_storage_remote_inventory_total() {
+      printf '0\n'
+    }
+    beta_storage_remote_writer_acquire() {
+      printf 'acquire\n' >>"$log"
+    }
+    beta_storage_remote_writer_transition() {
+      printf 'transition\n' >>"$log"
+    }
+    beta_storage_remote_head() {
+      printf '%s\n' '{"ETag":"existing-etag"}' >"$2"
+    }
+    beta_storage_provider_put_conditional() {
+      [ "$4" = existing-etag ] && [ "$5" = false ] || return 1
+      printf 'put\n' >>"$log"
+      printf '%s\n' '{"versionId":"updated-version"}'
+    }
+    beta_storage_remote_writer_release() {
+      printf 'release\n' >>"$log"
+    }
+    set +e
+    result=$(beta_storage_remote_control_put monitor fixture-owner fixture-update \
+      control/incident.json "$source" existing-etag false)
+    status=$?
+    set -e
+    [ "$status" -eq 0 ] || exit 1
+    [ "$result" = '{"versionId":"updated-version"}' ] || exit 1
+  )
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || return 1
+  grep -Fxq put "$log" && grep -Fxq release "$log"
+}
+
 run_invalid_remote_delete_fixture() {
   local delete_log=$1 delete_status
   export FAKE_AWS_MODE=list-unknown
@@ -863,6 +905,8 @@ source "$root/scripts/beta-backup-storage.sh"
 
 run_remote_control_interleaving_fixture "$tmp/remote-control.json" \
   "$tmp/remote-control.log" || fail "control mutation was not serialized fail-closed"
+run_remote_control_update_fixture "$tmp/remote-control-update.json" \
+  "$tmp/remote-control-update.log" || fail "live control update was not admitted"
 
 for current_state_case in \
   inventory-no-versions inventory-common-prefixes inventory-live inventory-delete-marker \

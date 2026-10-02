@@ -1868,6 +1868,10 @@ beta_storage_remote_control_put() {
       beta_storage_remote_writer_release "$owner" "$txid" || status=1
     return "$status"
   fi
+  head=$(mktemp) || {
+    beta_storage_remote_writer_release "$owner" "$txid" || true
+    return 1
+  }
   if beta_storage_remote_head "$key" "$head"; then
     observed_etag=$(jq -er '.ETag' "$head")
     if [ "$if_none_match" = true ] || [ "$observed_etag" != "$if_match" ]; then
