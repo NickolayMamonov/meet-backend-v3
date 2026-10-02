@@ -380,40 +380,76 @@ beta_storage_normalize_provider_metadata() {
   mv -- "$normalized" "$file"
 }
 
-beta_storage_aws() {
-  beta_storage_require_config
-  [ -z "${BETA_BACKUP_STORAGE_ROOT:-}" ] || beta_storage_fail local_provider_no_aws
-  local aws=${AWS_BIN:-aws} output error status operation=${1:-}
-  local response_limit_blocks output_bytes error_bytes
-  response_limit_blocks=$(( (BETA_STORAGE_MAX_JSON_RESPONSE_BYTES + 511) / 512 ))
-  BETA_STORAGE_LAST_ERROR=''
-  output=$(mktemp)
-  error=$(mktemp)
-  # ulimit -f is inherited by the provider process and bounds each redirected
-  # stream in 512-byte blocks. A writer that reaches the cap is terminated by
-  # SIGXFSZ; the exact-cap/nonzero check below also classifies that case when
-  # the producer handles the signal and exits normally.
-  if (
-    ulimit -f "$response_limit_blocks"
-    timeout --foreground --signal=TERM \
-        "${BETA_STORAGE_REQUEST_TIMEOUT_SECONDS}s" \
-        "$aws" --no-cli-pager --no-paginate --endpoint-url "$BETA_BACKUP_ENDPOINT" \
-        --region "$BETA_BACKUP_REGION" \
-        --cli-connect-timeout "$BETA_STORAGE_CONNECT_TIMEOUT_SECONDS" \
-        --cli-read-timeout "$BETA_STORAGE_READ_TIMEOUT_SECONDS" \
-        s3api "$@" >"$output" 2>"$error"
-  ); then
+beta_storage_run_bounded_provider() {
+  # The captured API streams are bounded independently. An s3api get-object
+  # body may be written to its explicit destination path, whose size is
+  # separately checked against the authenticated ContentLength.
+  local output=$1 error=$2
+  local capture_dir stdout_fifo stderr_fifo provider_pid
+  local stdout_reader stderr_reader output_bytes error_bytes overflow=false
+  local status
+  shift 2
+  capture_dir=$(mktemp -d) || return 1
+  stdout_fifo="$capture_dir/stdout"
+  stderr_fifo="$capture_dir/stderr"
+  if ! mkfifo "$stdout_fifo" "$stderr_fifo"; then
+    rm -rf -- "$capture_dir"
+    return 1
+  fi
+  "$@" >"$stdout_fifo" 2>"$stderr_fifo" &
+  provider_pid=$!
+  head -c "$((BETA_STORAGE_MAX_JSON_RESPONSE_BYTES + 1))" \
+    "$stdout_fifo" >"$output" &
+  stdout_reader=$!
+  head -c "$((BETA_STORAGE_MAX_JSON_RESPONSE_BYTES + 1))" \
+    "$stderr_fifo" >"$error" &
+  stderr_reader=$!
+  while kill -0 "$stdout_reader" 2>/dev/null ||
+    kill -0 "$stderr_reader" 2>/dev/null; do
+    output_bytes=$(wc -c <"$output" 2>/dev/null | tr -d '[:space:]')
+    error_bytes=$(wc -c <"$error" 2>/dev/null | tr -d '[:space:]')
+    if (( output_bytes > BETA_STORAGE_MAX_JSON_RESPONSE_BYTES ||
+          error_bytes > BETA_STORAGE_MAX_JSON_RESPONSE_BYTES )); then
+      overflow=true
+      kill "$provider_pid" 2>/dev/null || true
+    fi
+    sleep 0.01
+  done
+  if wait "$provider_pid"; then
     status=0
   else
     status=$?
   fi
-  output_bytes=$(wc -c <"$output" | tr -d '[:space:]')
-  error_bytes=$(wc -c <"$error" | tr -d '[:space:]')
-  if (( output_bytes > BETA_STORAGE_MAX_JSON_RESPONSE_BYTES ||
-        error_bytes > BETA_STORAGE_MAX_JSON_RESPONSE_BYTES ||
-        (status != 0 &&
-          (output_bytes == BETA_STORAGE_MAX_JSON_RESPONSE_BYTES ||
-           error_bytes == BETA_STORAGE_MAX_JSON_RESPONSE_BYTES)) )); then
+  wait "$stdout_reader" 2>/dev/null || true
+  wait "$stderr_reader" 2>/dev/null || true
+  rm -rf -- "$capture_dir"
+  [ "$overflow" = true ] && return 1
+  return "$status"
+}
+
+beta_storage_aws() {
+  beta_storage_require_config
+  [ -z "${BETA_BACKUP_STORAGE_ROOT:-}" ] || beta_storage_fail local_provider_no_aws
+  local aws=${AWS_BIN:-aws} output error status operation=${1:-}
+  BETA_STORAGE_LAST_ERROR=''
+  output=$(mktemp)
+  error=$(mktemp)
+  if beta_storage_run_bounded_provider \
+      "$output" "$error" timeout --foreground --signal=TERM \
+      "${BETA_STORAGE_REQUEST_TIMEOUT_SECONDS}s" \
+      "$aws" --no-cli-pager --no-paginate --endpoint-url "$BETA_BACKUP_ENDPOINT" \
+      --region "$BETA_BACKUP_REGION" \
+      --cli-connect-timeout "$BETA_STORAGE_CONNECT_TIMEOUT_SECONDS" \
+      --cli-read-timeout "$BETA_STORAGE_READ_TIMEOUT_SECONDS" \
+      s3api "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$(wc -c <"$output" | tr -d '[:space:]')" -gt \
+      "$BETA_STORAGE_MAX_JSON_RESPONSE_BYTES" ] ||
+    [ "$(wc -c <"$error" | tr -d '[:space:]')" -gt \
+      "$BETA_STORAGE_MAX_JSON_RESPONSE_BYTES" ]; then
     rm -f -- "$output" "$error"
     beta_storage_fail provider_response_oversize
     return 1
