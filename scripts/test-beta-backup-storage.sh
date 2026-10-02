@@ -535,6 +535,14 @@ case "${FAKE_AWS_MODE:?}" in
       *) exit 1 ;;
     esac
     ;;
+  inventory-common-prefixes)
+    case " $* " in
+      *' list-object-versions '*)
+        printf '{"IsTruncated":false,"CommonPrefixes":[{"Prefix":"control/"}]}\n'
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
   inventory-live|inventory-stale|inventory-pagination|inventory-head-mismatch)
     case " $* " in
       *' list-object-versions '*)
@@ -795,7 +803,7 @@ unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FIL
 source "$root/scripts/beta-backup-storage.sh"
 
 for current_state_case in \
-  inventory-no-versions inventory-live inventory-delete-marker \
+  inventory-no-versions inventory-common-prefixes inventory-live inventory-delete-marker \
   inventory-stale inventory-pagination inventory-head-mismatch \
   inventory-authorization inventory-malformed inventory-read-exhausted; do
   export FAKE_AWS_MODE="$current_state_case"
@@ -826,7 +834,7 @@ run_writer_state_gate_fixture 1 "$writer_gate_log" ||
 run_writer_state_gate_fixture 2 "$writer_gate_log" ||
   fail "unknown writer state reached conditional writer creation"
 for unknown_writer_case in \
-  inventory-delete-marker inventory-head-mismatch inventory-authorization \
+  inventory-common-prefixes inventory-delete-marker inventory-head-mismatch inventory-authorization \
   inventory-malformed inventory-read-exhausted; do
   run_writer_unknown_state_fixture "$unknown_writer_case" "$writer_gate_log" ||
     fail "$unknown_writer_case reached conditional writer creation"
@@ -936,7 +944,8 @@ export FAKE_AWS_MODE=multipart-empty
 export FAKE_AWS_MODE=parts-empty
 [ "$(beta_storage_remote_list_multipart_parts points/empty/upload.bin upload-1 | jq -r 'length')" -eq 0 ] ||
   fail "multipart part absent collection was rejected"
-for invalid_list_case in list-unknown list-type list-pagination; do
+for invalid_list_case in \
+  list-unknown list-type list-pagination inventory-common-prefixes; do
   export FAKE_AWS_MODE="$invalid_list_case"
   invalid_list_start=$(wc -l <"$tmp/aws.log")
   set +e
