@@ -9,8 +9,9 @@ if [ "$(uname -s)" != Linux ] || [ "$(id -u)" -ne 0 ]; then
   exit 77
 fi
 
-if grep -Eq '/var/lib/meet-(production|test-vps-deploy)' \
-  "${BASH_SOURCE[0]}"; then
+fixed_root_prefix='/var/lib/meet-'
+if grep -Fq "${fixed_root_prefix}production" "${BASH_SOURCE[0]}" ||
+  grep -Fq "${fixed_root_prefix}test-vps-deploy" "${BASH_SOURCE[0]}"; then
   echo "RECOVERY_REQUIRED" >&2
   exit 1
 fi
