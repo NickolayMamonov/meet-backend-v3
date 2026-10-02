@@ -442,6 +442,7 @@ test "$legacy_before" = "$(legacy_digest)"
 fixture_write "$fake_bin/docker" 700 <<'FAKE_DOCKER'
 #!/usr/bin/env bash
 set -euo pipefail
+fixture_state_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../state" && pwd)
 case "${1:-}" in
   ps)
     printf 'fixture-backend\nfixture-provider\n'
@@ -453,7 +454,7 @@ case "${1:-}" in
         ;;
       fixture-provider)
         printf '[{"Type":"bind","Source":"%s/12-1-final-deploy/provider-runtime","Destination":"/run/provider"}]\n' \
-          "${FIXTURE_STATE_ROOT:?}"
+          "$fixture_state_root"
         ;;
       *)
         printf '{}\n'
@@ -464,7 +465,7 @@ case "${1:-}" in
     case " $* " in
       *"/12-1-final-deploy/"*)
         printf '{"services":{"backend":{"volumes":[{"type":"bind","source":"%s/12-1-final-deploy/protected-input","target":"/protected"}]}}}\n' \
-          "${FIXTURE_STATE_ROOT:?}"
+          "$fixture_state_root"
         ;;
       *)
         printf '{"services":{"backend":{"volumes":[]}}}\n'
