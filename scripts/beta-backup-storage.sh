@@ -1849,7 +1849,7 @@ beta_storage_remote_control_reservation() {
 beta_storage_remote_control_put() {
   local operation=$1 owner=$2 txid=$3 key=$4 source=$5
   local if_match=${6:-} if_none_match=${7:-false}
-  local reserve expected_keys intent head observed_etag observed_status
+  local reserve expected_keys intent head='' observed_etag observed_status
   local result status
   [ "$if_none_match" = true ] || [ "$if_none_match" = false ] ||
     beta_storage_fail conditional_mode_invalid
