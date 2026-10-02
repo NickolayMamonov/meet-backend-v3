@@ -268,6 +268,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [ "${1:-}" = --check-fixed-roots ]; then
+  shift
+  [ "$#" -eq 3 ] || exit 77
+  for path in "$@"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      echo "PREREQUISITE_MISSING: fixture root already exists" >&2
+      exit 77
+    fi
+  done
+  exit 0
+fi
+
 fixture_root=$(mktemp -d /tmp/meet-retention-fixture.XXXXXX 2>/dev/null) ||
   prerequisite_missing
 chmod 700 "$fixture_root" 2>/dev/null || prerequisite_missing
@@ -288,16 +300,6 @@ if grep -Fq "${fixed_root_prefix}production" "${BASH_SOURCE[0]}" ||
   grep -Fq "${fixed_root_prefix}test-vps-deploy" "${BASH_SOURCE[0]}"; then
   echo "RECOVERY_REQUIRED" >&2
   exit 1
-fi
-
-if [ "${1:-}" = --check-fixed-roots ]; then
-  for path in "$state_root" "$production_root" "$production_runtime_root"; do
-    if [ -e "$path" ] || [ -L "$path" ]; then
-      echo "PREREQUISITE_MISSING: fixture root already exists" >&2
-      exit 77
-    fi
-  done
-  exit 0
 fi
 
 for path in "$state_root" "$production_root" "$production_runtime_root"; do
@@ -350,7 +352,8 @@ EOF
     done | sort
   )
   set +e
-  fixed_output=$(bash "$0" --check-fixed-roots 2>&1)
+  fixed_output=$(bash "$0" --check-fixed-roots \
+    "$state_root" "$production_root" "$production_runtime_root" 2>&1)
   fixed_status=$?
   set -e
   [ "$fixed_status" -eq 77 ]
