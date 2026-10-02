@@ -599,7 +599,7 @@ beta_storage_normalize_provider_list_response() {
             (if has("Owner") then .Owner|principal else true end)))
         else true end) and
         (if has("CommonPrefixes") then
-          (.CommonPrefixes|type=="array" and all(.[];
+          (.CommonPrefixes|type=="array" and length==0 and all(.[];
             type=="object" and (keys|sort)==["Prefix"] and
             (.Prefix|type=="string")))
         else true end) and

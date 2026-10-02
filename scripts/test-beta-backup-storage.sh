@@ -639,6 +639,17 @@ case "${FAKE_AWS_MODE:?}" in
       *) printf '{}\n' ;;
     esac
     ;;
+  multipart-common-prefixes)
+    case " $* " in
+      *' list-object-versions '*)
+        printf '{"IsTruncated":false}\n'
+        ;;
+      *' list-multipart-uploads '*)
+        printf '{"IsTruncated":false,"CommonPrefixes":[{"Prefix":"control/"}]}\n'
+        ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
   parts-empty)
     case " $* " in
       *' list-parts '*)
@@ -966,7 +977,8 @@ for invalid_list_case in \
   [ "$((invalid_inventory_end - invalid_inventory_start))" -eq 1 ] ||
     fail "$invalid_list_case inventory failure reached a downstream provider call"
 done
-for invalid_multipart_case in multipart-unknown multipart-type multipart-pagination; do
+for invalid_multipart_case in \
+  multipart-unknown multipart-type multipart-pagination multipart-common-prefixes; do
   export FAKE_AWS_MODE="$invalid_multipart_case"
   invalid_multipart_start=$(wc -l <"$tmp/aws.log")
   set +e
