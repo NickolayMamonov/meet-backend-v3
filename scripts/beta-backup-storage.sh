@@ -384,23 +384,42 @@ beta_storage_aws() {
   beta_storage_require_config
   [ -z "${BETA_BACKUP_STORAGE_ROOT:-}" ] || beta_storage_fail local_provider_no_aws
   local aws=${AWS_BIN:-aws} output error status operation=${1:-}
+  local response_limit_blocks output_bytes error_bytes
+  response_limit_blocks=$(( (BETA_STORAGE_MAX_JSON_RESPONSE_BYTES + 511) / 512 ))
   BETA_STORAGE_LAST_ERROR=''
   output=$(mktemp)
   error=$(mktemp)
-  if timeout --foreground --signal=TERM \
-      "${BETA_STORAGE_REQUEST_TIMEOUT_SECONDS}s" \
-      "$aws" --no-cli-pager --no-paginate --endpoint-url "$BETA_BACKUP_ENDPOINT" \
-      --region "$BETA_BACKUP_REGION" \
-      --cli-connect-timeout "$BETA_STORAGE_CONNECT_TIMEOUT_SECONDS" \
-      --cli-read-timeout "$BETA_STORAGE_READ_TIMEOUT_SECONDS" \
-      s3api "$@" >"$output" 2>"$error"; then
+  # ulimit -f is inherited by the provider process and bounds each redirected
+  # stream in 512-byte blocks. A writer that reaches the cap is terminated by
+  # SIGXFSZ; the exact-cap/nonzero check below also classifies that case when
+  # the producer handles the signal and exits normally.
+  if (
+    ulimit -f "$response_limit_blocks"
+    timeout --foreground --signal=TERM \
+        "${BETA_STORAGE_REQUEST_TIMEOUT_SECONDS}s" \
+        "$aws" --no-cli-pager --no-paginate --endpoint-url "$BETA_BACKUP_ENDPOINT" \
+        --region "$BETA_BACKUP_REGION" \
+        --cli-connect-timeout "$BETA_STORAGE_CONNECT_TIMEOUT_SECONDS" \
+        --cli-read-timeout "$BETA_STORAGE_READ_TIMEOUT_SECONDS" \
+        s3api "$@" >"$output" 2>"$error"
+  ); then
+    status=0
+  else
+    status=$?
+  fi
+  output_bytes=$(wc -c <"$output" | tr -d '[:space:]')
+  error_bytes=$(wc -c <"$error" | tr -d '[:space:]')
+  if (( output_bytes > BETA_STORAGE_MAX_JSON_RESPONSE_BYTES ||
+        error_bytes > BETA_STORAGE_MAX_JSON_RESPONSE_BYTES ||
+        (status != 0 &&
+          (output_bytes == BETA_STORAGE_MAX_JSON_RESPONSE_BYTES ||
+           error_bytes == BETA_STORAGE_MAX_JSON_RESPONSE_BYTES)) )); then
+    rm -f -- "$output" "$error"
+    beta_storage_fail provider_response_oversize
+    return 1
+  fi
+  if [ "$status" -eq 0 ]; then
     if [ -s "$output" ]; then
-      [ "$(wc -c <"$output" | tr -d '[:space:]')" -le \
-        "$BETA_STORAGE_MAX_JSON_RESPONSE_BYTES" ] || {
-        rm -f -- "$output" "$error"
-        beta_storage_fail provider_response_oversize
-        return 1
-      }
       beta_storage_require_unique_json "$output" || {
         rm -f -- "$output" "$error"
         beta_storage_fail provider_response_duplicate_json
@@ -416,7 +435,6 @@ beta_storage_aws() {
     cat "$output"
     status=0
   else
-    status=$?
     BETA_STORAGE_LAST_ERROR=$(tr '\n' ' ' <"$error" | sed 's/[[:space:]]\+/ /g')
     : >"$output"
     printf 'BACKUP_STORAGE_BLOCKED:%s\n' \
@@ -1769,6 +1787,84 @@ beta_storage_remote_writer_release() {
   BETA_STORAGE_REMOTE_WRITER_AMBIGUOUS_RESOURCE=''
   BETA_STORAGE_REMOTE_EXPECTED_KEYS=''
   rm -f -- "$head" "$state" "$body"
+}
+
+beta_storage_remote_control_reservation() {
+  local key=$1 source=$2 additional=${3:-0} bytes limit reserve
+  [ -f "$source" ] && [ ! -L "$source" ] && [ -s "$source" ] ||
+    beta_storage_fail control_source_invalid
+  [[ "$additional" =~ ^[0-9]+$ ]] ||
+    beta_storage_fail reservation_invalid
+  bytes=$(wc -c <"$source" | tr -d '[:space:]')
+  limit=$(beta_storage_object_max_bytes "$key")
+  (( bytes <= limit )) || beta_storage_fail control_object_too_large
+  (( bytes <= 9223372036854775807 - additional )) ||
+    beta_storage_fail reservation_overflow
+  reserve=$((bytes + additional))
+  (( reserve <= 9223372036854775807 -
+      (4 * BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES) )) ||
+    beta_storage_fail reservation_overflow
+  reserve=$((reserve + 4 * BETA_STORAGE_WRITER_CONTROL_VERSION_BYTES))
+  beta_storage_remote_inventory_total "${BETA_BACKUP_BYTE_BUDGET:-0}" \
+    "$reserve" >/dev/null || return 1
+  printf '%s\n' "$reserve"
+}
+
+beta_storage_remote_control_put() {
+  local operation=$1 owner=$2 txid=$3 key=$4 source=$5
+  local if_match=${6:-} if_none_match=${7:-false}
+  local reserve expected_keys intent head observed_etag observed_status
+  local result status
+  [ "$if_none_match" = true ] || [ "$if_none_match" = false ] ||
+    beta_storage_fail conditional_mode_invalid
+  reserve=$(beta_storage_remote_control_reservation "$key" "$source") || return 1
+  expected_keys=$(jq -cn --arg key "$key" '[$key]')
+  intent=$(printf '%s\0%s\0%s' "$key" "$txid" "$reserve" |
+    sha256sum | awk '{print $1}')
+  beta_storage_remote_writer_acquire "$operation" "$owner" "$txid" \
+    "$reserve" "$intent" "$expected_keys" || return 1
+  if beta_storage_remote_writer_transition control_writing false \
+    "$expected_keys"; then
+    :
+  else
+    status=$?
+    [ -e "${BETA_STORAGE_AMBIGUOUS_MARKER:-}" ] ||
+      beta_storage_remote_writer_release "$owner" "$txid" || status=1
+    return "$status"
+  fi
+  if beta_storage_remote_head "$key" "$head"; then
+    observed_etag=$(jq -er '.ETag' "$head")
+    if [ "$if_none_match" = true ] || [ "$observed_etag" != "$if_match" ]; then
+      rm -f -- "$head"
+      beta_storage_fail control_state_changed
+      beta_storage_remote_writer_release "$owner" "$txid" || true
+      return 1
+    fi
+  else
+    observed_status=$?
+    if [ "$if_none_match" != true ] || [ "$observed_status" -ne 1 ]; then
+      rm -f -- "$head"
+      beta_storage_fail control_state_changed
+      beta_storage_remote_writer_release "$owner" "$txid" || true
+      return 1
+    fi
+  fi
+  rm -f -- "$head"
+  beta_storage_remote_inventory_total "${BETA_BACKUP_BYTE_BUDGET:-0}" \
+    "$reserve" >/dev/null || {
+      beta_storage_remote_writer_release "$owner" "$txid" || true
+      return 1
+    }
+  if result=$(beta_storage_provider_put_conditional '' "$key" "$source" \
+    "$if_match" "$if_none_match"); then
+    beta_storage_remote_writer_release "$owner" "$txid" || return 1
+    printf '%s\n' "$result"
+  else
+    status=$?
+    [ -e "${BETA_STORAGE_AMBIGUOUS_MARKER:-}" ] ||
+      beta_storage_remote_writer_release "$owner" "$txid" || status=1
+    return "$status"
+  fi
 }
 
 beta_storage_remote_inventory_total() {

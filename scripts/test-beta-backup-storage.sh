@@ -79,6 +79,53 @@ run_writer_unknown_state_fixture() {
   [ "$writer_status" -ne 0 ] && [ ! -s "$mutation_log" ]
 }
 
+run_remote_control_interleaving_fixture() {
+  local source=$1 log=$2 status result
+  printf 'remote-control-fixture\n' >"$source"
+  : >"$log"
+  set +e
+  (
+    trap - RETURN
+    set +u
+    beta_storage_remote_inventory_total() {
+      printf 'inventory\n' >>"$log"
+      [ "$(wc -l <"$log" | tr -d '[:space:]')" -eq 1 ] && printf '0\n' || return 1
+    }
+    beta_storage_remote_writer_acquire() {
+      printf 'acquire\n' >>"$log"
+    }
+    beta_storage_remote_writer_transition() {
+      printf 'transition\n' >>"$log"
+    }
+    beta_storage_remote_head() {
+      return 1
+    }
+    beta_storage_provider_put_conditional() {
+      printf 'put\n' >>"$log"
+      printf '%s\n' '{"versionId":"unexpected"}'
+    }
+    beta_storage_remote_writer_release() {
+      printf 'release\n' >>"$log"
+    }
+    set +e
+    result=$(beta_storage_remote_control_put monitor fixture-owner fixture-tx \
+      control/incident.json "$source" '' true)
+    status=$?
+    set -e
+    [ "$status" -ne 0 ] || exit 1
+    [ -z "$result" ] || exit 1
+  )
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || return 1
+  [ "$(sed -n '1p' "$log")" = inventory ] || return 1
+  [ "$(sed -n '2p' "$log")" = acquire ] || return 1
+  [ "$(sed -n '3p' "$log")" = transition ] || return 1
+  [ "$(sed -n '4p' "$log")" = inventory ] || return 1
+  [ "$(sed -n '5p' "$log")" = release ] || return 1
+  ! grep -Fxq put "$log"
+}
+
 run_invalid_remote_delete_fixture() {
   local delete_log=$1 delete_status
   export FAKE_AWS_MODE=list-unknown
@@ -496,6 +543,7 @@ case "${FAKE_AWS_MODE:?}" in
   malformed) printf '{}\n'; exit 0 ;;
   duplicate) printf '{"VersionId":"one","VersionId":"two","ETag":"etag"}\n'; exit 0 ;;
   oversize) dd if=/dev/zero bs=1M count=2 status=none; exit 0 ;;
+  oversize-stderr) dd if=/dev/zero bs=1M count=2 status=none >&2; exit 1 ;;
   metadata)
     case " $* " in
       *' list-object-versions '*)
@@ -813,6 +861,9 @@ unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FIL
 # shellcheck source=beta-backup-storage.sh
 source "$root/scripts/beta-backup-storage.sh"
 
+run_remote_control_interleaving_fixture "$tmp/remote-control.json" \
+  "$tmp/remote-control.log" || fail "control mutation was not serialized fail-closed"
+
 for current_state_case in \
   inventory-no-versions inventory-common-prefixes inventory-live inventory-delete-marker \
   inventory-stale inventory-pagination inventory-head-mismatch \
@@ -908,6 +959,11 @@ export FAKE_AWS_MODE=oversize
 if beta_storage_aws_read list-object-versions --bucket "$BETA_BACKUP_BUCKET" \
   --max-keys 1000 >/dev/null 2>&1; then
   fail "oversized provider response was accepted"
+fi
+export FAKE_AWS_MODE=oversize-stderr
+if beta_storage_aws_read list-object-versions --bucket "$BETA_BACKUP_BUCKET" \
+  --max-keys 1000 >/dev/null 2>&1; then
+  fail "oversized provider error response was accepted"
 fi
 export FAKE_AWS_MODE=metadata
 FAKE_AWS_SHA=$(printf metadata | sha256sum | awk '{print $1}')

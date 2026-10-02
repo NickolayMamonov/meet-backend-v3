@@ -97,24 +97,59 @@ case "$operation" in
       probe_update=$(mktemp)
       probe_version_one=''
       probe_version_two=''
+      capability_scratch=$(mktemp -d)
+      capability_acquired=false
+      capability_owner=capability
+      capability_txid="capability-$probe_key"
+      capability_expected_keys=$(jq -cn --arg key "$probe_key" '[$key]')
+      printf 'capability-probe-v1\n' >"$probe"
+      printf 'capability-probe-v2\n' >"$probe_update"
+      capability_reserve=$(beta_storage_remote_control_reservation \
+        "$probe_key" "$probe" "$(wc -c <"$probe_update" | tr -d '[:space:]')")
+      capability_intent=$(printf '%s\0%s\0%s' "$probe_key" "$capability_txid" \
+        "$capability_reserve" | sha256sum | awk '{print $1}')
+      export BETA_STORAGE_AMBIGUOUS_MARKER="$capability_scratch/ambiguous"
+      export BETA_STORAGE_MUTATION_STARTED_MARKER="$capability_scratch/mutation-started"
       capability_cleanup() {
         local status=$?
         trap - EXIT HUP INT TERM
-        for probe_version in "$probe_version_two" "$probe_version_one"; do
-          [ -n "$probe_version" ] || continue
-          beta_storage_provider_delete '' "$probe_key" "$probe_version" || status=1
-          if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" \
-            --key "$probe_key" --version-id "$probe_version" >/dev/null; then
-            status=1
-          else
-            [ "$?" -eq 3 ] || status=1
+        if [ -e "$BETA_STORAGE_AMBIGUOUS_MARKER" ] ||
+          { [ "$status" -ne 0 ] &&
+            [ -e "$BETA_STORAGE_MUTATION_STARTED_MARKER" ]; }; then
+          printf 'BACKUP_STORAGE_BLOCKED:ambiguous_transaction_retained tx=%s\n' \
+            "$capability_txid" >&2
+          status=1
+        else
+          for probe_version in "$probe_version_two" "$probe_version_one"; do
+            [ -n "$probe_version" ] || continue
+            beta_storage_provider_delete '' "$probe_key" "$probe_version" || status=1
+            if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" \
+              --key "$probe_key" --version-id "$probe_version" >/dev/null; then
+              status=1
+            else
+              [ "$?" -eq 3 ] || status=1
+            fi
+          done
+          if [ "$capability_acquired" = true ]; then
+            beta_storage_remote_writer_release "$capability_owner" \
+              "$capability_txid" || status=1
+            capability_acquired=false
           fi
-        done
+        fi
         rm -f -- "$probe" "$probe_update" "$probe_update.copy" || status=1
+        rm -rf -- "$capability_scratch" || status=1
+        unset BETA_STORAGE_AMBIGUOUS_MARKER BETA_STORAGE_MUTATION_STARTED_MARKER
         return "$status"
       }
       trap capability_cleanup EXIT HUP INT TERM
-      printf 'capability-probe-v1\n' >"$probe"
+      beta_storage_remote_writer_acquire capability "$capability_owner" \
+        "$capability_txid" "$capability_reserve" "$capability_intent" \
+        "$capability_expected_keys"
+      capability_acquired=true
+      beta_storage_remote_writer_transition probing false \
+        "$capability_expected_keys"
+      beta_storage_remote_inventory_total "$BETA_BACKUP_BYTE_BUDGET" \
+        "$capability_reserve" >/dev/null
       first=$(beta_storage_provider_put_conditional '' "$probe_key" "$probe" '' true) || {
         echo "BACKUP_STORAGE_BLOCKED:conditional_create_unavailable" >&2
         exit 1
@@ -139,7 +174,6 @@ case "$operation" in
         echo "BACKUP_STORAGE_BLOCKED:conditional_create_conflict_unproven" >&2
         exit 1
       }
-      printf 'capability-probe-v2\n' >"$probe_update"
       first_meta=$(mktemp)
       beta_storage_remote_head "$probe_key" "$first_meta" || {
         rm -f -- "$first_meta"

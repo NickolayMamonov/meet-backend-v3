@@ -94,8 +94,30 @@ status_tmp=$(mktemp)
 event_tmp=$(mktemp)
 next_state_tmp=$(mktemp)
 remote_state_tmp=$(mktemp)
-trap 'rm -f -- "$status_tmp" "$event_tmp" "$next_state_tmp" "$remote_state_tmp"' \
-  EXIT HUP INT TERM
+writer_scratch=$(mktemp -d)
+writer_acquired=false
+writer_owner="monitor-$environment"
+writer_txid=''
+export BETA_STORAGE_AMBIGUOUS_MARKER="$writer_scratch/ambiguous"
+export BETA_STORAGE_MUTATION_STARTED_MARKER="$writer_scratch/mutation-started"
+cleanup_monitor() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [ -e "$BETA_STORAGE_AMBIGUOUS_MARKER" ] ||
+    { [ "$status" -ne 0 ] && [ -e "$BETA_STORAGE_MUTATION_STARTED_MARKER" ]; }; then
+    printf 'BACKUP_STORAGE_BLOCKED:ambiguous_transaction_retained tx=%s\n' \
+      "${writer_txid:-unknown}" >&2
+    status=1
+  elif [ "$writer_acquired" = true ]; then
+    beta_storage_remote_writer_release "$writer_owner" "$writer_txid" || status=1
+  fi
+  rm -f -- "$status_tmp" "$event_tmp" "$next_state_tmp" "$remote_state_tmp" ||
+    status=1
+  rm -rf -- "$writer_scratch" || status=1
+  unset BETA_STORAGE_AMBIGUOUS_MARKER BETA_STORAGE_MUTATION_STARTED_MARKER
+  return "$status"
+}
+trap cleanup_monitor EXIT HUP INT TERM
 
 if [ -n "$storage_root" ]; then
   [ "${BETA_BACKUP_TEST_FIXTURE:-false}" = true ] || {
@@ -290,13 +312,10 @@ else
   else
     [ "$?" -eq 1 ] || { echo 'BACKUP_INCIDENT_BLOCKED:incident_state_read_failed' >&2; exit 1; }
   fi
-  if [ -n "$current_etag" ]; then
-    beta_storage_provider_put_conditional '' "$incident_state_key" "$next_state_tmp" \
-      "$current_etag" false >/dev/null
-  else
-    beta_storage_provider_put_conditional '' "$incident_state_key" "$next_state_tmp" \
-      '' true >/dev/null
-  fi
+  writer_txid="incident-$environment-$now-$$"
+  beta_storage_remote_control_put incident "$writer_owner" "$writer_txid" \
+    "$incident_state_key" "$next_state_tmp" "$current_etag" \
+    "$([ -z "$current_etag" ] && echo true || echo false)" >/dev/null
 fi
 
 if [ "${remote_authority_failed:-false}" = true ]; then
