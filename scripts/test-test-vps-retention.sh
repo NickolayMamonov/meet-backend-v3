@@ -14,26 +14,19 @@ if [ "$(uname -s)" != Linux ] || [ "$(id -u)" -ne 0 ]; then
   exit 77
 fi
 
-fixture_root=$(mktemp -d /tmp/meet-retention-fixture.XXXXXX 2>/dev/null) ||
-  prerequisite_missing
-chmod 700 "$fixture_root" 2>/dev/null || prerequisite_missing
-sentinel_root=$(mktemp -d /tmp/meet-retention-sentinel.XXXXXX 2>/dev/null) ||
-  prerequisite_missing
-state_root="$fixture_root/state"
-production_root="$fixture_root/production"
-production_runtime_root="$fixture_root/production-runtime"
-fake_bin="$fixture_root/bin"
-remote_script="$fixture_root/retention-remote.sh"
+fixture_root=
+fixture_root_identity=
+sentinel_root=
+sentinel_root_identity=
+state_root=
+production_root=
+production_runtime_root=
+fake_bin=
+remote_script=
 created_fixed_roots=()
 created_fixed_root_identities=()
 owned_root_recorder=record_created_root
-printf 'outside-fixture\n' >"$sentinel_root/sentinel"
 fixed_root_prefix='/var/lib/meet-'
-if grep -Fq "${fixed_root_prefix}production" "${BASH_SOURCE[0]}" ||
-  grep -Fq "${fixed_root_prefix}test-vps-deploy" "${BASH_SOURCE[0]}"; then
-  echo "RECOVERY_REQUIRED" >&2
-  exit 1
-fi
 root_identity() {
   stat -c '%d:%i:%f:%u:%g' -- "$1"
 }
@@ -185,6 +178,27 @@ fixture_copy() {
 fixture_touch() {
   touch "$@" 2>/dev/null || prerequisite_missing
 }
+assert_replacement_rejected() {
+  local label=$1
+  local root expected original status
+  root=$(mktemp -d /tmp/meet-retention-owned-root.XXXXXX) ||
+    prerequisite_missing
+  expected=$(root_identity "$root" 2>/dev/null) || prerequisite_missing
+  original="$root.original"
+  [ ! -e "$original" ] && [ ! -L "$original" ] || prerequisite_missing
+  mv -- "$root" "$original" || prerequisite_missing
+  mkdir -m 700 -- "$root" || prerequisite_missing
+  printf 'replacement-%s\n' "$label" >"$root/sentinel" ||
+    prerequisite_missing
+  set +e
+  remove_owned_root "$root" "$expected"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ]
+  grep -Fxq "replacement-$label" "$root/sentinel"
+  timeout 30s rm -r -- "$root"
+  remove_owned_root "$original" "$expected"
+}
 cleanup() {
   local status=$?
   local cleanup_status=0
@@ -203,15 +217,45 @@ cleanup() {
       fi
     fi
   done
-  grep -Fxq 'outside-fixture' "$sentinel_root/sentinel" || status=1
-  timeout 30s rm -r -- "$fixture_root" >/dev/null 2>&1 ||
-    cleanup_status=1
-  timeout 30s rm -r -- "$sentinel_root" >/dev/null 2>&1 ||
-    cleanup_status=1
+  if [ -n "$sentinel_root" ]; then
+    grep -Fxq 'outside-fixture' "$sentinel_root/sentinel" || status=1
+  fi
+  if [ -n "$fixture_root" ] &&
+    { [ -e "$fixture_root" ] || [ -L "$fixture_root" ]; }; then
+    remove_owned_root "$fixture_root" "$fixture_root_identity" ||
+      cleanup_status=1
+  fi
+  if [ -n "$sentinel_root" ] &&
+    { [ -e "$sentinel_root" ] || [ -L "$sentinel_root" ]; }; then
+    remove_owned_root "$sentinel_root" "$sentinel_root_identity" ||
+      cleanup_status=1
+  fi
   [ "$status" -ne 0 ] || [ "$cleanup_status" -eq 0 ] || status=1
   exit "$status"
 }
 trap cleanup EXIT
+
+fixture_root=$(mktemp -d /tmp/meet-retention-fixture.XXXXXX 2>/dev/null) ||
+  prerequisite_missing
+chmod 700 "$fixture_root" 2>/dev/null || prerequisite_missing
+fixture_root_identity=$(root_identity "$fixture_root" 2>/dev/null) ||
+  prerequisite_missing
+sentinel_root=$(mktemp -d /tmp/meet-retention-sentinel.XXXXXX 2>/dev/null) ||
+  prerequisite_missing
+sentinel_root_identity=$(root_identity "$sentinel_root" 2>/dev/null) ||
+  prerequisite_missing
+state_root="$fixture_root/state"
+production_root="$fixture_root/production"
+production_runtime_root="$fixture_root/production-runtime"
+fake_bin="$fixture_root/bin"
+remote_script="$fixture_root/retention-remote.sh"
+printf 'outside-fixture\n' >"$sentinel_root/sentinel"
+fixed_root_prefix='/var/lib/meet-'
+if grep -Fq "${fixed_root_prefix}production" "${BASH_SOURCE[0]}" ||
+  grep -Fq "${fixed_root_prefix}test-vps-deploy" "${BASH_SOURCE[0]}"; then
+  echo "RECOVERY_REQUIRED" >&2
+  exit 1
+fi
 
 if [ "${1:-}" = --check-fixed-roots ]; then
   for path in "$state_root" "$production_root" "$production_runtime_root"; do
@@ -229,6 +273,9 @@ for path in "$state_root" "$production_root" "$production_runtime_root"; do
     exit 77
   fi
 done
+
+assert_replacement_rejected fixture-root
+assert_replacement_rejected sentinel-root
 
 (
   set -euo pipefail
