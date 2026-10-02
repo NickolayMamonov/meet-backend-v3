@@ -56,6 +56,29 @@ run_writer_state_gate_fixture() {
   fi
 }
 
+run_writer_unknown_state_fixture() {
+  local mode=$1 mutation_log=$2 writer_status
+  : >"$mutation_log"
+  set +e
+  (
+    trap - RETURN
+    export FAKE_AWS_MODE="$mode"
+    export BETA_TEST_WRITER_UNKNOWN_MUTATION_LOG="$mutation_log"
+    beta_storage_provider_put_conditional() {
+      printf 'conditional-create\n' \
+        >>"${BETA_TEST_WRITER_UNKNOWN_MUTATION_LOG:?}"
+      return 0
+    }
+    set +u
+    beta_storage_remote_writer_acquire publish fixture-owner fixture-tx \
+      1 "$(printf fixture | sha256sum | awk '{print $1}')" '[]' \
+      >/dev/null 2>&1
+  )
+  writer_status=$?
+  set -e
+  [ "$writer_status" -ne 0 ] && [ ! -s "$mutation_log" ]
+}
+
 run_invalid_remote_delete_fixture() {
   local delete_log=$1 delete_status
   export FAKE_AWS_MODE=list-unknown
@@ -791,8 +814,8 @@ for current_state_case in \
         fail "$current_state_case did not accept the exact latest live version"
       ;;
     *)
-      [ "$current_state_status" -ne 0 ] ||
-        fail "$current_state_case was accepted as a current object state"
+      [ "$current_state_status" -eq 2 ] ||
+        fail "$current_state_case was not classified as an unknown state"
       ;;
   esac
 done
@@ -802,6 +825,12 @@ run_writer_state_gate_fixture 1 "$writer_gate_log" ||
   fail "only proven absence did not permit conditional writer creation"
 run_writer_state_gate_fixture 2 "$writer_gate_log" ||
   fail "unknown writer state reached conditional writer creation"
+for unknown_writer_case in \
+  inventory-delete-marker inventory-head-mismatch inventory-authorization \
+  inventory-malformed inventory-read-exhausted; do
+  run_writer_unknown_state_fixture "$unknown_writer_case" "$writer_gate_log" ||
+    fail "$unknown_writer_case reached conditional writer creation"
+done
 
 export FAKE_AWS_MODE=raw3
 if beta_storage_aws_read head-object --bucket "$BETA_BACKUP_BUCKET" --key missing; then
