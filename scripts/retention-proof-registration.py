@@ -715,7 +715,7 @@ class GitHubReader:
             raise Denied("invalid pinned file path")
         self.deadline = time.monotonic() + 30
         commit = self._json(f"/git/commits/{commit_sha}")
-        if commit.get("sha") not in (None, commit_sha):
+        if commit.get("sha") != commit_sha:
             raise Denied("pinned commit object identity mismatch")
         root_tree = commit.get("tree")
         if not isinstance(root_tree, dict) or not isinstance(root_tree.get("sha"), str):
@@ -728,6 +728,8 @@ class GitHubReader:
         blob_sha = ""
         for index, part in enumerate(parts):
             response = self._json(f"/git/trees/{selected_tree}")
+            if response.get("sha") != selected_tree:
+                raise Denied("pinned source tree identity mismatch")
             if response.get("truncated") is not False:
                 raise Denied("pinned source tree is truncated")
             entries = response.get("tree")
@@ -794,7 +796,7 @@ class GitHubReader:
         self.deadline = time.monotonic() + 30
         initial_commit = self._ref()
         commit = self._json(f"/git/commits/{initial_commit}")
-        if commit.get("sha") not in (None, initial_commit):
+        if commit.get("sha") != initial_commit:
             raise Denied("commit object identity mismatch")
         tree = commit.get("tree")
         if not isinstance(tree, dict) or not isinstance(tree.get("sha"), str):
@@ -810,6 +812,8 @@ class GitHubReader:
         path_parts = REGISTRATION_PATH.split("/")
         for index, part in enumerate(path_parts):
             tree_response = self._json(f"/git/trees/{selected_tree}")
+            if tree_response.get("sha") != selected_tree:
+                raise Denied("registration tree identity mismatch")
             if tree_response.get("truncated") is not False:
                 raise Denied("truncated tree response")
             entries = tree_response.get("tree")

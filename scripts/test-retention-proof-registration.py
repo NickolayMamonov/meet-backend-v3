@@ -74,6 +74,9 @@ class FakeAPI:
         self.oversize = False
         self.duplicate_tree_path = False
         self.bad_commit_sha: str | None = None
+        self.missing_commit_sha = False
+        self.missing_tree_sha: set[str] = set()
+        self.bad_tree_sha: dict[str, str] = {}
 
     def set_raw(self, raw: bytes) -> None:
         self.raw = raw
@@ -104,18 +107,22 @@ class FakeAPI:
             sha = self.refs.pop(0) if self.refs else self.commit
             return Response({"ref": "refs/heads/master", "object": {"type": "commit", "sha": sha}})
         if path.endswith(f"/git/commits/{self.commit}"):
-            return Response(
-                {
-                    "sha": self.bad_commit_sha or self.commit,
-                    "tree": {"sha": self.root_tree},
-                }
-            )
+            commit = {"tree": {"sha": self.root_tree}}
+            if not self.missing_commit_sha:
+                commit["sha"] = self.bad_commit_sha or self.commit
+            return Response(commit)
         if path.endswith(f"/git/trees/{self.root_tree}"):
-            return Response(
-                {
-                    "truncated": self.truncate,
-                    "tree": [{"path": ".github", "mode": "040000", "type": "tree", "sha": self.file_tree}],
-                }
+            return self.tree_response(
+                self.root_tree,
+                [
+                    {
+                        "path": ".github",
+                        "mode": "040000",
+                        "type": "tree",
+                        "sha": self.file_tree,
+                    }
+                ],
+                truncated=self.truncate,
             )
         if path.endswith(f"/git/trees/{self.file_tree}"):
             entry = {
@@ -125,7 +132,7 @@ class FakeAPI:
                 "sha": self.blob,
             }
             entries = [entry, entry] if self.duplicate_tree_path else [entry]
-            return Response({"truncated": False, "tree": entries})
+            return self.tree_response(self.file_tree, entries)
         if path.endswith(f"/git/blobs/{self.blob}"):
             value = {
                     "sha": self.blob_response_sha or self.blob,
@@ -136,6 +143,14 @@ class FakeAPI:
                 value["content"] += " " * 70_000
             return Response(value)
         raise AssertionError(f"forbidden API route accessed: {path}")
+
+    def tree_response(
+        self, requested_sha: str, entries: list[dict[str, object]], *, truncated: bool = False
+    ) -> Response:
+        value: dict[str, object] = {"truncated": truncated, "tree": entries}
+        if requested_sha not in self.missing_tree_sha:
+            value["sha"] = self.bad_tree_sha.get(requested_sha, requested_sha)
+        return Response(value)
 
 
 class FakeLiveAuthority:
@@ -169,6 +184,16 @@ def denied(api: FakeAPI, label: str) -> None:
     except registration.Denied:
         return
     raise AssertionError(f"accepted invalid registration case: {label}")
+
+
+def denied_file_at(api: FakeAPI, label: str) -> None:
+    try:
+        registration.GitHubReader(
+            "owner/repository", "fake-token", 123, opener=api
+        ).read_file_at(api.commit, registration.REGISTRATION_PATH)
+    except registration.Denied:
+        return
+    raise AssertionError(f"accepted invalid pinned-file case: {label}")
 
 
 def main() -> None:
@@ -208,6 +233,17 @@ def main() -> None:
         or "/git/blobs/" in route
         for route in success.routes
     )
+    pinned_content, pinned_identity = registration.GitHubReader(
+        "owner/repository", "fake-token", 123, opener=success
+    ).read_file_at(success.commit, registration.REGISTRATION_PATH)
+    assert pinned_content == success.raw
+    assert pinned_identity == {
+        "mode": "100644",
+        "rootTree": success.root_tree,
+        "tree": success.file_tree,
+        "blob": success.blob,
+        "contentSha256": hashlib.sha256(success.raw).hexdigest(),
+    }
     tuple_value = {
         "schemaVersion": 1,
         "repositoryId": 123,
@@ -712,6 +748,44 @@ def main() -> None:
     bad_commit = FakeAPI()
     bad_commit.bad_commit_sha = "2" * 40
     denied(bad_commit, "wrong commit response identity")
+    wrong_pinned_commit = FakeAPI()
+    wrong_pinned_commit.bad_commit_sha = "2" * 40
+    denied_file_at(wrong_pinned_commit, "wrong pinned commit response identity")
+    missing_commit_identity = FakeAPI()
+    missing_commit_identity.missing_commit_sha = True
+    denied(missing_commit_identity, "missing commit response identity")
+    missing_pinned_commit_identity = FakeAPI()
+    missing_pinned_commit_identity.missing_commit_sha = True
+    denied_file_at(missing_pinned_commit_identity, "missing pinned commit response identity")
+    mismatched_pinned_commit = FakeAPI()
+    mismatched_pinned_commit.bad_commit_sha = "2" * 40
+    denied_file_at(mismatched_pinned_commit, "mismatched pinned commit response identity")
+    for tree_sha, label in (
+        ("root", "root tree"),
+        ("file", "nested tree"),
+    ):
+        missing_tree = FakeAPI()
+        requested_tree = missing_tree.root_tree if tree_sha == "root" else missing_tree.file_tree
+        missing_tree.missing_tree_sha.add(requested_tree)
+        denied(missing_tree, f"missing {label} response identity")
+        missing_pinned_tree = FakeAPI()
+        requested_tree = (
+            missing_pinned_tree.root_tree
+            if tree_sha == "root"
+            else missing_pinned_tree.file_tree
+        )
+        missing_pinned_tree.missing_tree_sha.add(requested_tree)
+        denied_file_at(missing_pinned_tree, f"missing pinned {label} response identity")
+        wrong_tree = FakeAPI()
+        requested_tree = wrong_tree.root_tree if tree_sha == "root" else wrong_tree.file_tree
+        wrong_tree.bad_tree_sha[requested_tree] = "2" * 40
+        denied(wrong_tree, f"mismatched {label} response identity")
+        wrong_pinned_tree = FakeAPI()
+        requested_tree = (
+            wrong_pinned_tree.root_tree if tree_sha == "root" else wrong_pinned_tree.file_tree
+        )
+        wrong_pinned_tree.bad_tree_sha[requested_tree] = "2" * 40
+        denied_file_at(wrong_pinned_tree, f"mismatched pinned {label} response identity")
     missing = FakeAPI()
     missing.fail = f"/repos/owner/repository/git/trees/{missing.file_tree}"
     denied(missing, "403 missing registration")

@@ -77,6 +77,36 @@ MOUNT_EVIDENCE = {
 }
 
 
+def docker_info_from_cli(version_payload: dict[str, object]) -> dict[str, object]:
+    info_payload = {"DockerRootDir": ROOT, "ServerVersion": "untrusted-info-value"}
+    results = [
+        subprocess.CompletedProcess(
+            ["docker", "info"],
+            0,
+            json.dumps(info_payload).encode(),
+            b"",
+        ),
+        subprocess.CompletedProcess(
+            ["docker", "version"],
+            0,
+            json.dumps(version_payload).encode(),
+            b"",
+        ),
+    ]
+    with patch.object(supervisor.subprocess, "run", side_effect=results) as run:
+        value = supervisor.DockerEngine().info()
+    calls = run.call_args_list
+    assert calls[0].args[0] == ["docker", "info", "--format", "{{json .}}"]
+    assert calls[1].args[0] == [
+        "docker",
+        "version",
+        "--format",
+        "{{json .Server}}",
+    ]
+    assert all(call.kwargs["timeout"] == 30 for call in calls)
+    return value
+
+
 def inspection(*, started: bool, owner: str = OWNER) -> dict[str, object]:
     configured_mount = {
         "Type": "bind",
@@ -343,6 +373,41 @@ def new_supervisor(
 
 
 def main() -> None:
+    server_version = {
+        "Platform": {"Name": "Docker Engine - Community"},
+        "Version": LOCK["engineVersion"],
+        "ApiVersion": LOCK["engineApiVersion"],
+        "MinAPIVersion": "1.24",
+    }
+    live_format = docker_info_from_cli(server_version)
+    assert live_format["ServerVersion"] == LOCK["engineVersion"]
+    assert live_format["ApiVersion"] == LOCK["engineApiVersion"]
+    assert supervisor.validate_engine_info(live_format, LOCK) == ROOT
+    for invalid_version, label in (
+        (
+            {
+                key: value
+                for key, value in server_version.items()
+                if key != "ApiVersion"
+            },
+            "missing Docker server API version",
+        ),
+        (
+            {**server_version, "ApiVersion": "1.52"},
+            "mismatched Docker server API version",
+        ),
+        (
+            {**server_version, "Version": "29.0.0"},
+            "mismatched Docker server version",
+        ),
+    ):
+        denied(
+            lambda invalid_version=invalid_version: supervisor.validate_engine_info(
+                docker_info_from_cli(invalid_version), LOCK
+            ),
+            label,
+        )
+
     for started in (False, True):
         supervisor.validate_inspection(
             inspection(started=started),

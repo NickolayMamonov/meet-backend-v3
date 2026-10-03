@@ -206,6 +206,25 @@ class DockerEngine:
         value = policy.decode_json(raw)
         if not isinstance(value, dict):
             raise Denied("container-engine metadata is malformed")
+        version_raw = self._run(
+            ["version", "--format", "{{json .Server}}"],
+            timeout=30,
+            maximum=64 * 1024,
+        )
+        server = policy.decode_json(version_raw)
+        if not isinstance(server, dict):
+            raise Denied("container-engine server version metadata is malformed")
+        server_version = server.get("Version")
+        api_version = server.get("ApiVersion")
+        if (
+            not isinstance(server_version, str)
+            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", server_version)
+            or not isinstance(api_version, str)
+            or not re.fullmatch(r"[0-9]+\.[0-9]+", api_version)
+        ):
+            raise Denied("container-engine server version or API version is missing")
+        value["ServerVersion"] = server_version
+        value["ApiVersion"] = api_version
         return value
 
     def create(
@@ -479,8 +498,10 @@ def validate_engine_file_evidence(
 def validate_engine_info(info: dict[str, object], lock: dict[str, object]) -> str:
     docker_root = info.get("DockerRootDir")
     if (
-        info.get("ServerVersion") != lock["engineVersion"]
-        or info.get("ApiVersion") != lock["engineApiVersion"]
+        not isinstance(info.get("ServerVersion"), str)
+        or info["ServerVersion"] != lock["engineVersion"]
+        or not isinstance(info.get("ApiVersion"), str)
+        or info["ApiVersion"] != lock["engineApiVersion"]
         or lock["engineLayout"] != "moby-v28-root-container-id-v1"
         or not isinstance(docker_root, str)
         or not docker_root.startswith("/")

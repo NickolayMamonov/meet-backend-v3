@@ -245,6 +245,39 @@ jobs:
             expected_sha="${PR_HEAD_SHA:-$WORKFLOW_SHA}"
             test "$actual_sha" = "$expected_sha"
           fi
+      - name: Read-only Docker Engine info and server API inspection
+        working-directory: ${{ inputs.source_sha != '' && 'tooling' || '.' }}
+        run: |
+          set -euo pipefail
+          timeout 65s python3 -B - <<'PY'
+          import importlib.util
+          import re
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location(
+              "retention_proof_supervisor",
+              Path("scripts/retention-proof-supervisor.py"),
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("retention supervisor module is unavailable")
+          supervisor = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(supervisor)
+          engine = supervisor.DockerEngine()
+          metadata = engine.info()
+          if (
+              not isinstance(metadata.get("DockerRootDir"), str)
+              or not metadata["DockerRootDir"].startswith("/")
+              or not isinstance(metadata.get("ServerVersion"), str)
+              or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", metadata["ServerVersion"])
+              or not isinstance(metadata.get("ApiVersion"), str)
+              or not re.fullmatch(r"[0-9]+\.[0-9]+", metadata["ApiVersion"])
+          ):
+              raise SystemExit("Docker Engine info/version metadata is incomplete")
+          print(
+              "read-only Docker Engine metadata validated: "
+              f"server={metadata['ServerVersion']} api={metadata['ApiVersion']}"
+          )
+          PY
       - name: Provision and canary pinned age toolchain
         working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
