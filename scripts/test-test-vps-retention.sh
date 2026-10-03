@@ -14,6 +14,55 @@ if [ "$(uname -s)" != Linux ] || [ "$(id -u)" -ne 0 ]; then
   exit 77
 fi
 
+if [ "${1:-}" != --fixture-parent ] ||
+  { [ "$#" -ne 2 ] && [ "$#" -ne 6 ]; }; then
+  echo "PREREQUISITE_MISSING: explicit fixture parent required" >&2
+  exit 77
+fi
+fixture_parent=$2
+[ "$fixture_parent" = /fixture ] ||
+  { echo "PREREQUISITE_MISSING: fixture parent must be /fixture" >&2; exit 77; }
+if [ "$#" -eq 6 ] && [ "${3:-}" != --check-fixed-roots ]; then
+  echo "PREREQUISITE_MISSING: arbitrary fixture-root arguments are forbidden" >&2
+  exit 77
+fi
+[ -d "$fixture_parent" ] && [ ! -L "$fixture_parent" ] ||
+  prerequisite_missing
+[ "$(stat -c '%u:%a' "$fixture_parent" 2>/dev/null)" = 0:700 ] ||
+  prerequisite_missing
+fixture_mount=$(findmnt -n -o TARGET,FSTYPE --target "$fixture_parent" 2>/dev/null) ||
+  prerequisite_missing
+[ "$fixture_mount" = $'/fixture tmpfs' ] || prerequisite_missing
+[ "$(findmnt -R -n -o TARGET "$fixture_parent" 2>/dev/null)" = /fixture ] ||
+  prerequisite_missing
+python3 - "$fixture_parent" <<'PY' || prerequisite_missing
+import errno
+import os
+import stat
+import sys
+
+for path in ("/", sys.argv[1]):
+    info = os.lstat(path)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise SystemExit(1)
+    for attribute in (
+        "system.posix_acl_access",
+        "system.posix_acl_default",
+    ):
+        try:
+            os.getxattr(path, attribute, follow_symlinks=False)
+        except OSError as error:
+            if error.errno == errno.ENODATA:
+                continue
+            raise SystemExit(1)
+        raise SystemExit(1)
+PY
+fixture_parent_identity=$(stat -c '%d:%i:%f:%u:%g' "$fixture_parent")
+
 fixture_root=
 fixture_root_identity=
 sentinel_root=
@@ -23,8 +72,10 @@ production_root=
 production_runtime_root=
 fake_bin=
 remote_script=
+remote_script_digest=
 created_fixed_roots=()
 created_fixed_root_identities=()
+completed_cases=()
 owned_root_recorder=record_created_root
 fixed_root_prefix='/var/lib/meet-'
 root_identity() {
@@ -160,6 +211,75 @@ record_created_root() {
   created_fixed_roots+=("$path")
   created_fixed_root_identities+=("$identity")
 }
+record_case() {
+  local case_id=$1 existing
+  for existing in "${completed_cases[@]}"; do
+    [ "$existing" != "$case_id" ] || {
+      echo "RETENTION_PROOF_DENIED" >&2
+      exit 1
+    }
+  done
+  completed_cases+=("$case_id")
+}
+emit_summary() {
+  RETENTION_PROOF_CASES=$(printf '%s\n' "${completed_cases[@]}") \
+    RETENTION_PROOF_BLOCK_SHA256=$remote_script_digest \
+    python3 -B - <<'PY'
+import json
+import os
+import re
+import sys
+
+required = (
+    "eligible-owned-terminal-states-removed",
+    "active-protected-legacy-unknown-preserved",
+    "all-service-mount-references-respected",
+    "current-tooling-deleted-last",
+    "repeat-run-is-idempotent",
+    "only-owned-roots-removed",
+    "outside-sentinel-preserved",
+    "missing-or-unsafe-root-denied",
+    "symlink-hardlink-prefix-collision-denied",
+    "top-level-nested-replacement-preserved",
+    "malformed-helper-inspection-denied",
+    "smtp-transaction-lock-contention-denied",
+    "timeout-hup-int-term-denied",
+    "cleanup-failure-overrides-pass",
+)
+cases = os.environ.get("RETENTION_PROOF_CASES", "").splitlines()
+if len(cases) != len(required) or set(cases) != set(required):
+    raise SystemExit(1)
+source = os.environ.get("RETENTION_PROOF_SOURCE_SHA", "")
+image = os.environ.get("RETENTION_PROOF_IMAGE_DIGEST", "")
+toolchain = os.environ.get("RETENTION_PROOF_TOOLCHAIN_SHA256", "")
+block = os.environ.get("RETENTION_PROOF_BLOCK_SHA256", "")
+if not re.fullmatch(r"[0-9a-f]{40}", source):
+    raise SystemExit(1)
+if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+    raise SystemExit(1)
+if not re.fullmatch(r"[0-9a-f]{64}", toolchain):
+    raise SystemExit(1)
+if not re.fullmatch(r"[0-9a-f]{64}", block):
+    raise SystemExit(1)
+summary = {
+    "schemaVersion": 1,
+    "outcome": "passed",
+    "sourceSha": source,
+    "planSha256": "a7cf15f7bf1ff2860a3e3716ee986f0543bedac339469756a74ed8830047ce2a",
+    "imageDigest": image,
+    "toolchainSha256": toolchain,
+    "extractedRetentionBlockSha256": block,
+    "cases": [{"id": case_id, "outcome": "passed"} for case_id in required],
+    "selectiveCleanup": True,
+    "outsideSentinel": True,
+}
+if os.environ.get("RETENTION_PROOF_PLAN_SHA256") != summary["planSha256"]:
+    raise SystemExit(1)
+print("RETENTION_FIXTURE_SUMMARY:" + json.dumps(
+    summary, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+))
+PY
+}
 fixture_install_dir() {
   install -d -m "$1" -- "$2" 2>/dev/null || prerequisite_missing
 }
@@ -181,7 +301,7 @@ fixture_touch() {
 assert_replacement_rejected() {
   local label=$1
   local root expected original status
-  root=$(mktemp -d /tmp/meet-retention-owned-root.XXXXXX) ||
+  root=$(mktemp -d "$fixture_parent/owned-root.XXXXXX") ||
     prerequisite_missing
   expected=$(root_identity "$root" 2>/dev/null) || prerequisite_missing
   original="$root.original"
@@ -209,7 +329,7 @@ remove_parent_after_owned_children() {
 }
 assert_nested_replacement_preserved() {
   local parent child expected_parent expected_child original_child status actual
-  parent=$(mktemp -d /tmp/meet-retention-parent.XXXXXX) ||
+  parent=$(mktemp -d "$fixture_parent/nested-parent.XXXXXX") ||
     prerequisite_missing
   expected_parent=$(root_identity "$parent" 2>/dev/null) ||
     prerequisite_missing
@@ -263,15 +383,23 @@ cleanup() {
     remove_owned_root "$sentinel_root" "$sentinel_root_identity" ||
       cleanup_status=1
   fi
+  [ "$(stat -c '%d:%i:%f:%u:%g' "$fixture_parent" 2>/dev/null || true)" = \
+    "$fixture_parent_identity" ] || cleanup_status=1
   [ "$status" -ne 0 ] || [ "$cleanup_status" -eq 0 ] || status=1
+  if [ "$status" -eq 0 ]; then
+    emit_summary || status=1
+  fi
   exit "$status"
 }
 trap cleanup EXIT
 
-if [ "${1:-}" = --check-fixed-roots ]; then
-  shift
-  [ "$#" -eq 3 ] || exit 77
-  for path in "$@"; do
+if [ "${3:-}" = --check-fixed-roots ]; then
+  [ "$#" -eq 6 ] || exit 77
+  for path in "${@:4}"; do
+    [[ "$path" == "$fixture_parent"/* ]] || exit 77
+    case "$path" in
+      *'/../'*|*'/./'*|*$'\n'*|*$'\r'*) exit 77 ;;
+    esac
     if [ -e "$path" ] || [ -L "$path" ]; then
       echo "PREREQUISITE_MISSING: fixture root already exists" >&2
       exit 77
@@ -280,14 +408,13 @@ if [ "${1:-}" = --check-fixed-roots ]; then
   exit 0
 fi
 
-# The provider helper rejects world-writable ancestors; /run keeps the
-# disposable provider-state root within the same private-path contract.
-fixture_root=$(mktemp -d /run/meet-retention-fixture.XXXXXX 2>/dev/null) ||
+# All application-shaped state remains synthetic and fixture-local.
+fixture_root=$(mktemp -d "$fixture_parent/run.XXXXXX" 2>/dev/null) ||
   prerequisite_missing
 chmod 700 "$fixture_root" 2>/dev/null || prerequisite_missing
 fixture_root_identity=$(root_identity "$fixture_root" 2>/dev/null) ||
   prerequisite_missing
-sentinel_root=$(mktemp -d /tmp/meet-retention-sentinel.XXXXXX 2>/dev/null) ||
+sentinel_root=$(mktemp -d "$fixture_parent/sentinel.XXXXXX" 2>/dev/null) ||
   prerequisite_missing
 sentinel_root_identity=$(root_identity "$sentinel_root" 2>/dev/null) ||
   prerequisite_missing
@@ -297,6 +424,12 @@ production_runtime_root="$fixture_root/production-runtime"
 fake_bin="$fixture_root/bin"
 remote_script="$fixture_root/retention-remote.sh"
 printf 'outside-fixture\n' >"$sentinel_root/sentinel"
+if [ "${RETENTION_PROOF_INJECT_CLEANUP_FAILURE:-}" = 1 ]; then
+  mv -- "$fixture_root" "$fixture_parent/cleanup-original" ||
+    prerequisite_missing
+  ln -s -- "$sentinel_root" "$fixture_root" || prerequisite_missing
+  exit 0
+fi
 fixed_root_prefix='/var/lib/meet-'
 if grep -Fq "${fixed_root_prefix}production" "${BASH_SOURCE[0]}" ||
   grep -Fq "${fixed_root_prefix}test-vps-deploy" "${BASH_SOURCE[0]}"; then
@@ -314,6 +447,24 @@ done
 assert_replacement_rejected fixture-root
 assert_replacement_rejected sentinel-root
 assert_nested_replacement_preserved
+record_case top-level-nested-replacement-preserved
+
+set +e
+unsafe_parent_output=$(bash "$0" --fixture-parent '/fixture/../fixture' 2>&1)
+unsafe_parent_status=$?
+set -e
+[ "$unsafe_parent_status" -eq 77 ]
+grep -Fq 'explicit fixture parent required' <<<"$unsafe_parent_output"
+record_case missing-or-unsafe-root-denied
+
+set +e
+cleanup_failure_output=$(RETENTION_PROOF_INJECT_CLEANUP_FAILURE=1 \
+  bash "$0" --fixture-parent "$fixture_parent" 2>&1)
+cleanup_failure_status=$?
+set -e
+[ "$cleanup_failure_status" -eq 1 ]
+! grep -Fq 'RETENTION_FIXTURE_SUMMARY:' <<<"$cleanup_failure_output"
+record_case cleanup-failure-overrides-pass
 
 (
   set -euo pipefail
@@ -354,7 +505,8 @@ EOF
     done | sort
   )
   set +e
-  fixed_output=$(bash "$0" --check-fixed-roots \
+  fixed_output=$(bash "$0" --fixture-parent "$fixture_parent" \
+    --check-fixed-roots \
     "$state_root" "$production_root" "$production_runtime_root" 2>&1)
   fixed_status=$?
   set -e
@@ -450,11 +602,20 @@ set -euo pipefail
 fixture_state_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../state" && pwd)
 case "${1:-}" in
   ps)
+    if [ -n "${RETENTION_SIGNAL_READY_FIFO:-}" ]; then
+      printf 'ready\n' >"$RETENTION_SIGNAL_READY_FIFO"
+      IFS= read -r signal_release <"$RETENTION_SIGNAL_RELEASE_FIFO"
+      [ "$signal_release" = RELEASE ] || exit 88
+    fi
     printf 'fixture-backend\nfixture-provider\n'
     ;;
   inspect)
     case "${2:-}" in
       fixture-backend)
+        if [ "${RETENTION_MALFORMED_DOCKER:-}" = 1 ]; then
+          printf 'not-json\n'
+          exit 0
+        fi
         printf '[{"Type":"volume","Name":"uploads","Destination":"/data/uploads"}]\n'
         ;;
       fixture-provider)
@@ -490,7 +651,111 @@ remote_content=$(awk '
   inside { sub(/^          /, ""); print }
 ' .github/workflows/deploy-test-vps.yml 2>/dev/null) ||
   prerequisite_missing
+block_markers=$(grep -Fc \
+  'name: Apply bounded test-VPS deployment retention' \
+  .github/workflows/deploy-test-vps.yml) || prerequisite_missing
+remote_markers=$(awk '
+  /name: Apply bounded test-VPS deployment retention/ { section=1 }
+  section && /<<'\''REMOTE'\''/ { count++ }
+  END { print count + 0 }
+' .github/workflows/deploy-test-vps.yml) || prerequisite_missing
+[ "$block_markers" -eq 1 ] && [ "$remote_markers" -eq 1 ] ||
+  { echo "RECOVERY_REQUIRED" >&2; exit 1; }
 fixture_write "$remote_script" 700 <<<"$remote_content"
+remote_script_digest=$(sha256sum "$remote_script" | cut -d ' ' -f 1) ||
+  prerequisite_missing
+[ "$remote_script_digest" = \
+  7cdc12b1f0fc3a5252686bbccaf74bac04c433f42061432d1e9d3749a82934f3 ] ||
+  { echo "RECOVERY_REQUIRED" >&2; exit 1; }
+for signature in \
+  'exec 9>"$state_root/.deploy.lock"' \
+  'if [ -e "$smtp_pointer" ] || [ -L "$smtp_pointer" ]' \
+  'delete_owned_state "$path"' \
+  'tooling_removed=0' \
+  'retention=applied'; do
+  grep -Fq "$signature" "$remote_script" ||
+    { echo "RECOVERY_REQUIRED" >&2; exit 1; }
+done
+fixture_touch "$state_root/.deploy.lock"
+signal_before=$(find "$state_root" -xdev -printf '%p|%y|%m|%u|%g|%l|%T@\n' |
+  sort)
+python3 - "$remote_script" "$production_root" "$production_runtime_root" \
+  "$state_root" "$fake_bin" "$fixture_root" <<'PY'
+import os
+import selectors
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+remote, config_root, runtime_root, state_root, fake_bin, fixture_root = sys.argv[1:]
+for name, sig in (
+    ("hup", signal.SIGHUP),
+    ("int", signal.SIGINT),
+    ("term", signal.SIGTERM),
+):
+    control = Path(fixture_root) / ("signal-" + name)
+    control.mkdir(mode=0o700)
+    ready = control / "ready"
+    release = control / "release"
+    os.mkfifo(ready, 0o600)
+    os.mkfifo(release, 0o600)
+    ready_fd = os.open(ready, os.O_RDWR | os.O_NONBLOCK)
+    release_fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": fake_bin + os.pathsep + environment.get("PATH", ""),
+            "FIXTURE_STATE_ROOT": state_root,
+            "RETENTION_SIGNAL_READY_FIFO": str(ready),
+            "RETENTION_SIGNAL_RELEASE_FIFO": str(release),
+        }
+    )
+    process = subprocess.Popen(
+        [
+            "bash",
+            remote,
+            config_root,
+            "1",
+            "1",
+            str(Path(config_root) / ".signal-tooling"),
+            state_root,
+            runtime_root,
+        ],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(ready_fd, selectors.EVENT_READ)
+    events = selector.select(35)
+    selector.close()
+    if not events or os.read(ready_fd, 64) != b"ready\n":
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate(timeout=5)
+        raise SystemExit(1)
+    os.killpg(process.pid, sig)
+    os.write(release_fd, b"ABORT\n")
+    try:
+        stdout, stderr = process.communicate(timeout=35)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate(timeout=5)
+        raise SystemExit(1)
+    if process.returncode == 0:
+        raise SystemExit(1)
+    if b"RETENTION_FIXTURE_SUMMARY:" in stdout + stderr:
+        raise SystemExit(1)
+    os.close(ready_fd)
+    os.close(release_fd)
+    ready.unlink()
+    release.unlink()
+    control.rmdir()
+PY
+test "$signal_before" = "$(
+  find "$state_root" -xdev -printf '%p|%y|%m|%u|%g|%l|%T@\n' | sort
+)"
 set +e
 unsafe_output=$(bash "$remote_script" "$production_root" 1 1 \
   "$production_root/.missing-tooling" "$state_root/../unsafe" \
@@ -668,6 +933,89 @@ grep -Fq 'RECOVERY_REQUIRED' <<<"$hard_output"
 [ -f "$hard_witness" ]
 [ "$(stat -c '%d:%i' "$hard_state/terminal.json")" = "$(stat -c '%d:%i' "$hard_witness")" ]
 rm -r -- "$hard_state" "$hard_witness"
+record_case symlink-hardlink-prefix-collision-denied
+
+helper_before=$(find "$state_root" -xdev -printf '%p|%y|%m|%u|%g|%l|%T@\n' |
+  sort)
+set +e
+malformed_output=$(python3 scripts/test-vps-provider-credential.py \
+  retention-delete --state-root "$state_root" \
+  --retention-state "$state_root/../outside" 2>&1)
+malformed_status=$?
+set -e
+[ "$malformed_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$malformed_output"
+test "$helper_before" = "$(
+  find "$state_root" -xdev -printf '%p|%y|%m|%u|%g|%l|%T@\n' | sort
+)"
+
+lock_state="$state_root/20-1-final-deploy"
+fixture_install_dir 700 "$lock_state"
+fixture_write "$lock_state/terminal.json" 600 <<'EOF'
+{"schemaVersion":1,"runKey":"20-1","outcome":"committed","providerEnabled":false}
+EOF
+write_owner_marker "$lock_state"
+fixture_touch -d '@1799999950.123456789' "$lock_state"
+lock_before=$(owned_digest "$lock_state")
+python3 - "$state_root" scripts/test-vps-provider-credential.py \
+  "$lock_state" <<'PY'
+import subprocess
+import sys
+
+state_root, helper, state = sys.argv[1:]
+holder = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        (
+            "import fcntl,os,sys; fd=os.open(sys.argv[1],os.O_RDONLY|os.O_DIRECTORY); "
+            "fcntl.flock(fd,fcntl.LOCK_EX); print('LOCKED',flush=True); "
+            "sys.stdin.buffer.read(1); fcntl.flock(fd,fcntl.LOCK_UN)"
+        ),
+        state_root,
+    ],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+)
+if holder.stdout is None or holder.stdout.readline() != b"LOCKED\n":
+    holder.kill()
+    raise SystemExit(1)
+result = subprocess.run(
+    [
+        "timeout",
+        "2s",
+        sys.executable,
+        helper,
+        "retention-delete",
+        "--state-root",
+        state_root,
+        "--retention-state",
+        state,
+    ],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=5,
+)
+if result.returncode != 124:
+    holder.stdin.write(b"x")
+    holder.stdin.flush()
+    holder.wait(timeout=3)
+    raise SystemExit(1)
+holder.stdin.write(b"x")
+holder.stdin.flush()
+holder.wait(timeout=3)
+PY
+test "$lock_before" = "$(owned_digest "$lock_state")"
+record_case smtp-transaction-lock-contention-denied
+
+malformed_state="$state_root/21-1-final-deploy"
+fixture_install_dir 700 "$malformed_state"
+fixture_write "$malformed_state/terminal.json" 600 <<'EOF'
+{"schemaVersion":1,"runKey":"21-1","outcome":"committed","providerEnabled":false}
+EOF
+write_owner_marker "$malformed_state"
+fixture_touch -d '@1799999940.123456789' "$malformed_state"
 
 hang_bin="$fixture_root/hang-bin"
 fixture_install_dir 700 "$hang_bin"
@@ -696,7 +1044,21 @@ import runpy
 import sys
 
 module = runpy.run_path("$tooling_root/scripts/provider-credential-real.py")
+if sys.argv[1:2] == ["retention-delete"]:
+    with open("$fixture_root/retention-events", "a", encoding="utf-8") as trace:
+        trace.write("state-delete\\n")
 raise SystemExit(module["main"](sys.argv[1:]))
+EOF
+operation_log=$fixture_root/retention-events
+real_find=$(command -v find)
+fixture_write "$fake_bin/find" 700 <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "\${FIXTURE_TOOLING_ROOT:-}" ] &&
+  [[ " \$* " == *" -delete "* ]]; then
+  echo tooling-delete >>"\$RETENTION_OPERATION_LOG"
+fi
+exec "$real_find" "\$@"
 EOF
 set +e
 timeout_output=$(FIXTURE_STATE_ROOT="$state_root" \
@@ -709,10 +1071,37 @@ set -e
 grep -Fq 'RECOVERY_REQUIRED' <<<"$timeout_output"
 [ -d "$state" ]
 [ -d "$tooling_root" ]
-FIXTURE_STATE_ROOT="$state_root" PATH="$fake_bin:$PATH" bash "$remote_script" \
+malformed_before=$(owned_digest "$malformed_state")
+set +e
+malformed_docker_output=$(RETENTION_MALFORMED_DOCKER=1 \
+  FIXTURE_STATE_ROOT="$state_root" \
+  FIXTURE_TOOLING_ROOT="$tooling_root" \
+  RETENTION_OPERATION_LOG="$operation_log" \
+  RETENTION_REAL_FIND="$real_find" \
+  PATH="$fake_bin:$PATH" bash "$remote_script" \
+  "$production_root" 1 1 "$tooling_root" "$state_root" \
+  "$production_runtime_root" 2>&1)
+malformed_docker_status=$?
+set -e
+[ "$malformed_docker_status" -eq 1 ]
+grep -Fq 'RECOVERY_REQUIRED' <<<"$malformed_docker_output"
+test "$malformed_before" = "$(owned_digest "$malformed_state")"
+[ -d "$tooling_root" ]
+record_case malformed-helper-inspection-denied
+FIXTURE_STATE_ROOT="$state_root" \
+FIXTURE_TOOLING_ROOT="$tooling_root" \
+RETENTION_OPERATION_LOG="$operation_log" \
+RETENTION_REAL_FIND="$real_find" \
+PATH="$fake_bin:$PATH" bash "$remote_script" \
   "$production_root" 1 1 "$tooling_root" "$state_root" "$production_runtime_root"
 [ ! -e "$state" ]
 [ ! -e "$tooling_root" ]
+grep -Fxq state-delete "$operation_log"
+[ "$(tail -n 1 "$operation_log")" = tooling-delete ]
+record_case eligible-owned-terminal-states-removed
+record_case active-protected-legacy-unknown-preserved
+record_case all-service-mount-references-respected
+record_case current-tooling-deleted-last
 
 state="$state_root/15-1-final-deploy"
 fixture_install_dir 700 "$state"
@@ -738,4 +1127,7 @@ FIXTURE_STATE_ROOT="$state_root" PATH="$fake_bin:$PATH" bash "$remote_script" \
 [ ! -e "$state_root/15-1-final-deploy" ]
 [ ! -e "$tooling_root" ]
 test "$legacy_before" = "$(legacy_digest)"
-echo "retention fixture passed: all-service mounts, timeout failure, self-tooling ordering, repeated-run cleanup, protected reference, unknown, symlink and prefix-collision cases"
+record_case repeat-run-is-idempotent
+record_case timeout-hup-int-term-denied
+record_case only-owned-roots-removed
+record_case outside-sentinel-preserved

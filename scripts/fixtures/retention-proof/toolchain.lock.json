@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "enabled": false,
+  "platform": "linux/amd64",
+  "baseImage": "",
+  "ubuntuSnapshot": "",
+  "packages": [],
+  "dockerfileSha256": "",
+  "preparedImage": "",
+  "provenanceSha256": "",
+  "engineVersion": "",
+  "engineApiVersion": "",
+  "engineLayout": ""
+}

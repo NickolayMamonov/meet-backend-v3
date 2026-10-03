@@ -12,16 +12,26 @@ provider_helper=scripts/test-vps-provider-credential.py
 provider_tests=scripts/test-test-vps-provider-credential.py
 provider_runtime=scripts/test-test-vps-provider-runtime.sh
 retention_fixture=scripts/test-test-vps-retention.sh
+retention_proof_workflow=.github/workflows/prove-test-vps-retention.yml
 public_probes=scripts/test-test-vps-public-probes.sh
 public_probe=scripts/test-vps-public-probe.sh
 closed_beta_fixture=scripts/test-test-vps-closed-beta-deploy.sh
 baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
+retention_baseline=c701535717e67275a35a01e926851d181dff916e
+
+git diff --quiet "$retention_baseline" -- \
+  .github/workflows/deploy-test-vps.yml \
+  scripts/test-vps-provider-credential.py ||
+  { echo "retention proof must preserve the reviewed workflow block and helper" >&2; exit 1; }
 
 [ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ] &&
   [ -f "$update" ] &&
   [ -f "$provider_deploy" ] && [ -f "$provider_helper" ] &&
   [ -f "$provider_tests" ] && [ -f "$provider_runtime" ] &&
-  [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
+  [ -f "$retention_fixture" ] && [ -f "$retention_proof_workflow" ] &&
+  [ -f scripts/retention-proof-registration.py ] &&
+  [ -f scripts/test-retention-proof-launcher.sh ] &&
+  [ -f "$public_probes" ] &&
   [ -f "$public_probe" ] && [ -f "$closed_beta_fixture" ]
 workflow_text=$(<"$workflow")
 deploy_text=$(<"$deploy")
@@ -668,22 +678,9 @@ update_line=$(awk '/"\$update_script" "\$image"/{print NR; exit}' "$deploy")
 
 require 'runtime_check=network' "$runtime_text" "shared runtime helper"
 
-if [ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ]; then
-  set +e
-  timeout 300s bash "$closed_beta_fixture"
-  closed_beta_status=$?
-  set -e
-  case "$closed_beta_status" in
-    0) ;;
-    77)
-      echo "closed-beta staged compatibility environment-blocked: isolated /var/lib/meet-production is unavailable"
-      ;;
-    *)
-      exit "$closed_beta_status"
-      ;;
-  esac
-  timeout 300s bash "$retention_fixture"
-fi
+! grep -Fq "bash \"\$retention_fixture\"" "${BASH_SOURCE[0]}" ||
+  fail "ordinary deployment CI must not execute the privileged retention fixture"
+echo "RETENTION_FIXTURE_PROOF_DEFERRED: separately approved protected Ubuntu proof required"
 
 case "$workflow_text"$'\n'"$deploy_text" in
   *'rm -rf'*) echo "test VPS deployment must not recursively delete host state" >&2; exit 1 ;;
