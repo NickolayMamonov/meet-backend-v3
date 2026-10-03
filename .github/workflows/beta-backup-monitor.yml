@@ -1,0 +1,148 @@
+name: Closed-beta backup monitor
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+concurrency:
+  group: closed-beta-recurring-monitor
+  cancel-in-progress: false
+
+env:
+  AWS_EC2_METADATA_DISABLED: "true"
+  SCHEDULER_REF: refs/heads/master
+  BETA_RECURRING_TOOLING_ALLOWLIST: ${{ github.workspace }}/scripts/fixtures/beta-recurring/tooling-allowlist.json
+
+jobs:
+  admission:
+    if: vars.BETA_RECURRING_ACTIVATED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      checkout_sha: ${{ steps.authorize.outputs.checkout_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Validate registered custody and CI provenance
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_REF: ${{ github.ref }}
+          SCHEDULER_SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+        id: authorize
+        run: |
+          set -euo pipefail
+          test "$RUN_REF" = "$SCHEDULER_REF"
+          checkout_sha=$(timeout --foreground 30s git ls-remote \
+            "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/dev | awk '{print $1}')
+          test "$checkout_sha" != "$SCHEDULER_SHA"
+          policy_file="$RUNNER_TEMP/monitor-policy.json"
+          ci_file="$RUNNER_TEMP/monitor-ci.json"
+          scripts/query-beta-recurring-policy.sh --output "$policy_file"
+          scripts/query-beta-recurring-ci.sh --sha "$checkout_sha" --output "$ci_file"
+          scripts/authorize-beta-recurring.sh \
+            --event "${{ github.event_name }}" \
+            --run-ref "$RUN_REF" \
+            --default-ref "$SCHEDULER_REF" \
+            --scheduler-sha "$SCHEDULER_SHA" \
+            --checkout-sha "$checkout_sha" \
+            --ci-sha "$checkout_sha" \
+            --environment closed-beta-recurring-monitor \
+            --policy-file "$policy_file" \
+            --ci-result-file "$ci_file" \
+            --actor "$ACTOR"
+          printf 'checkout_sha=%s\n' "$checkout_sha" >>"$GITHUB_OUTPUT"
+
+  monitor:
+    needs: admission
+    if: vars.BETA_RECURRING_ACTIVATED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: closed-beta-recurring-monitor
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: Select reviewed tooling revision
+        env:
+          CHECKOUT_SHA: ${{ needs.admission.outputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          timeout --foreground 30s git fetch --no-tags --depth=1 origin "$CHECKOUT_SHA"
+          git checkout --detach "$CHECKOUT_SHA"
+      - name: Deliver authenticated authority snapshot
+        env:
+          BETA_BACKUP_BUCKET: ${{ secrets.BETA_BACKUP_BUCKET }}
+          BETA_BACKUP_REGION: ${{ vars.BETA_BACKUP_REGION }}
+          BETA_BACKUP_ENDPOINT: ${{ vars.BETA_BACKUP_ENDPOINT }}
+          BETA_BACKUP_BYTE_BUDGET: ${{ vars.BETA_BACKUP_BYTE_BUDGET }}
+          BETA_RECURRING_MONITOR_AWS_ACCESS_KEY_ID: ${{ secrets.BETA_RECURRING_MONITOR_AWS_ACCESS_KEY_ID }}
+          BETA_RECURRING_MONITOR_AWS_SECRET_ACCESS_KEY: ${{ secrets.BETA_RECURRING_MONITOR_AWS_SECRET_ACCESS_KEY }}
+          BETA_RECURRING_MONITOR_AWS_SESSION_TOKEN: ${{ secrets.BETA_RECURRING_MONITOR_AWS_SESSION_TOKEN }}
+          RECEIVER_HOST: ${{ vars.BETA_RECURRING_HOST }}
+          RECEIVER_USER: ${{ vars.BETA_RECURRING_SSH_USER }}
+          RECEIVER_SSH_CONFIG: ${{ runner.temp }}/receiver-ssh-config
+          RECEIVER_KNOWN_HOSTS: ${{ runner.temp }}/receiver-known-hosts
+          RECEIVER_PRIVATE_KEY: ${{ secrets.BETA_RECURRING_SSH_PRIVATE_KEY }}
+          INCIDENT_STATE_KEY: control/incidents/closed-beta.json
+          INCIDENT_COMMAND: ${{ github.workspace }}/scripts/send-beta-backup-incident.sh
+          INCIDENT_REPOSITORY: ${{ vars.BETA_BACKUP_INCIDENT_REPOSITORY }}
+          INCIDENT_LABEL: ${{ vars.BETA_BACKUP_INCIDENT_ISSUE_LABEL }}
+          DEADMANS_URL: ${{ secrets.BETA_BACKUP_DEADMAN_URL }}
+          DEADMANS_PROVIDER: ${{ vars.BETA_BACKUP_DEADMAN_PROVIDER }}
+          DEADMANS_METHOD: ${{ vars.BETA_BACKUP_DEADMAN_METHOD }}
+          DEADMANS_TIMEOUT: ${{ vars.BETA_BACKUP_DEADMAN_TIMEOUT_SECONDS }}
+          AWS_CLI_VERSION: ${{ vars.BETA_BACKUP_AWS_CLI_VERSION }}
+          AWS_CLI_ARCHIVE_URL: ${{ vars.BETA_BACKUP_AWS_CLI_ARCHIVE_URL }}
+          AWS_CLI_SHA256: ${{ vars.BETA_BACKUP_AWS_CLI_SHA256 }}
+          BETA_RECURRING_TOOLING_ALLOWLIST: ${{ github.workspace }}/scripts/fixtures/beta-recurring/tooling-allowlist.json
+          RECEIVER_KEY_FILE: ${{ runner.temp }}/receiver-key
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/master
+          test -n "$BETA_BACKUP_BUCKET" -a -n "$BETA_BACKUP_REGION" \
+            -a -n "$BETA_BACKUP_ENDPOINT" -a -n "$BETA_BACKUP_BYTE_BUDGET" \
+            -a -n "$RECEIVER_HOST" -a -n "$RECEIVER_USER" \
+            -a -n "$RECEIVER_PRIVATE_KEY" -a -n "$DEADMANS_URL" \
+            -a -n "$DEADMANS_PROVIDER" -a -n "$DEADMANS_METHOD" \
+            -a -n "$DEADMANS_TIMEOUT"
+          scripts/install-beta-backup-aws.sh
+          AWS_BIN="$HOME/.local/aws-cli-v${AWS_CLI_VERSION}/aws/dist/aws"
+          export AWS_BIN BETA_BACKUP_AWS_SHA256="$AWS_CLI_SHA256"
+          export BETA_BACKUP_AWS_VERSION="$AWS_CLI_VERSION"
+          export BETA_BACKUP_SCOPED_CREDENTIALS=true
+          export AWS_ACCESS_KEY_ID="$BETA_RECURRING_MONITOR_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$BETA_RECURRING_MONITOR_AWS_SECRET_ACCESS_KEY"
+          export AWS_SESSION_TOKEN="$BETA_RECURRING_MONITOR_AWS_SESSION_TOKEN"
+          install -m 600 /dev/null "$RECEIVER_KEY_FILE" "$RECEIVER_SSH_CONFIG"
+          install -m 600 /dev/null "$RECEIVER_KNOWN_HOSTS"
+          printf '%s\n' "$RECEIVER_PRIVATE_KEY" >"$RECEIVER_KEY_FILE"
+          printf 'Host *\n  IdentityFile %s\n  User %s\n' \
+            "$RECEIVER_KEY_FILE" "$RECEIVER_USER" >"$RECEIVER_SSH_CONFIG"
+          printf '%s\n' "${{ vars.BETA_RECURRING_HOST_KNOWN_KEY }}" >"$RECEIVER_KNOWN_HOSTS"
+          chmod 600 "$RECEIVER_SSH_CONFIG" "$RECEIVER_KNOWN_HOSTS"
+          export GITHUB_TOKEN="${{ secrets.BETA_BACKUP_INCIDENT_TOKEN }}"
+          export BETA_BACKUP_INCIDENT_REPOSITORY="$INCIDENT_REPOSITORY"
+          export BETA_BACKUP_INCIDENT_ISSUE_LABEL="$INCIDENT_LABEL"
+          scripts/run-beta-backup-monitor.sh \
+            --environment closed-beta \
+            --now "$(date -u +%s)" \
+            --receiver-host "$RECEIVER_HOST" --receiver-user "$RECEIVER_USER" \
+            --receiver-ssh-config "$RECEIVER_SSH_CONFIG" \
+            --receiver-known-hosts "$RECEIVER_KNOWN_HOSTS" \
+            --incident-state-key "$INCIDENT_STATE_KEY" \
+            --incident-command "$INCIDENT_COMMAND" \
+            --deadman-url "$DEADMANS_URL" \
+            --deadman-provider "$DEADMANS_PROVIDER" \
+            --deadman-method "$DEADMANS_METHOD" \
+            --deadman-timeout "$DEADMANS_TIMEOUT"

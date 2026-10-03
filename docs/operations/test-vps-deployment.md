@@ -240,6 +240,10 @@ verify the existing auth response privately, rotate refresh credentials and
 reject the old one, then logout and reject the rotated credential. Record only
 safe success booleans and status categories.
 
+The separately gated synthetic retention fixture proof is documented in
+[`retention-fixture-proof.md`](retention-fixture-proof.md). It does not reuse
+this deployment workflow or imply provider/VPS/live acceptance.
+
 ## Closed-beta promotion from `dev`
 
 The recovery drill may use the existing `.deploy.lock` only during its bounded

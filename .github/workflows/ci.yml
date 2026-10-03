@@ -245,6 +245,39 @@ jobs:
             expected_sha="${PR_HEAD_SHA:-$WORKFLOW_SHA}"
             test "$actual_sha" = "$expected_sha"
           fi
+      - name: Read-only Docker Engine info and server API inspection
+        working-directory: ${{ inputs.source_sha != '' && 'tooling' || '.' }}
+        run: |
+          set -euo pipefail
+          timeout 65s python3 -B - <<'PY'
+          import importlib.util
+          import re
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location(
+              "retention_proof_supervisor",
+              Path("scripts/retention-proof-supervisor.py"),
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("retention supervisor module is unavailable")
+          supervisor = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(supervisor)
+          engine = supervisor.DockerEngine()
+          metadata = engine.info()
+          if (
+              not isinstance(metadata.get("DockerRootDir"), str)
+              or not metadata["DockerRootDir"].startswith("/")
+              or not isinstance(metadata.get("ServerVersion"), str)
+              or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", metadata["ServerVersion"])
+              or not isinstance(metadata.get("ApiVersion"), str)
+              or not re.fullmatch(r"[0-9]+\.[0-9]+", metadata["ApiVersion"])
+          ):
+              raise SystemExit("Docker Engine info/version metadata is incomplete")
+          print(
+              "read-only Docker Engine metadata validated: "
+              f"server={metadata['ServerVersion']} api={metadata['ApiVersion']}"
+          )
+          PY
       - name: Provision and canary pinned age toolchain
         working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
@@ -257,10 +290,28 @@ jobs:
           set -euo pipefail
           mapfile -t shell_files < <(find "$TOOLING_SCRIPTS" -maxdepth 1 -type f -name '*.sh' -print | sort)
           shell_files+=("$TOOLING_SCRIPTS/fixtures/beta-recovery/fake-docker.sh")
+          shell_files+=("$TOOLING_SCRIPTS/fixtures/retention-proof/proof-entrypoint.sh")
           for script in "${shell_files[@]}"; do
             bash -n "$script"
           done
           shellcheck --severity=warning "${shell_files[@]}"
+          timeout 60s bash -c 'set -e; for script in "$@"; do bash -n "$script"; done' _ \
+            "$TOOLING_SCRIPTS/test-test-vps-retention.sh" \
+            "$TOOLING_SCRIPTS/run-test-vps-retention-proof.sh" \
+            "$TOOLING_SCRIPTS/test-retention-proof-launcher.sh" \
+            "$TOOLING_SCRIPTS/fixtures/retention-proof/proof-entrypoint.sh"
+          timeout 120s shellcheck --severity=warning \
+            "$TOOLING_SCRIPTS/test-test-vps-retention.sh" \
+            "$TOOLING_SCRIPTS/run-test-vps-retention-proof.sh" \
+            "$TOOLING_SCRIPTS/test-retention-proof-launcher.sh" \
+            "$TOOLING_SCRIPTS/fixtures/retention-proof/proof-entrypoint.sh"
+          timeout 60s python3 -B -c \
+            'from pathlib import Path; import sys; [compile(Path(p).read_bytes(), p, "exec") for p in sys.argv[1:]]' \
+            "$TOOLING_SCRIPTS/retention-proof-registration.py" \
+            "$TOOLING_SCRIPTS/retention-proof-authorize.py" \
+            "$TOOLING_SCRIPTS/retention-proof-supervisor.py" \
+            "$TOOLING_SCRIPTS/test-retention-proof-registration.py"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-retention-proof-launcher.sh"
           bash "$TOOLING_SCRIPTS/test-release-asset-inventory.sh"
           bash "$TOOLING_SCRIPTS/test-release-page-normalization.sh"
           bash "$TOOLING_SCRIPTS/test-release-registry-state.sh"
@@ -280,7 +331,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-empty-release-continuation.sh"
           bash "$TOOLING_SCRIPTS/test-classify-release-continuation.sh"
           bash "$TOOLING_SCRIPTS/test-release-publish-tooling-routing.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
           bash "$TOOLING_SCRIPTS/test-dev-promotion-source.sh"
           bash "$TOOLING_SCRIPTS/test-dev-promotion-authorization.sh"
           bash "$TOOLING_SCRIPTS/test-promote-dev-digest-workflow.sh"
@@ -307,19 +358,24 @@ jobs:
               *) return "$fixture_status" ;;
             esac
           }
-          run_prerequisite_fixture bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-deploy.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-state.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-workflow.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-deploy.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-fake-remote.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-workflow.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-ssh-host-key.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-authorization.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-evidence.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-capture.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-restore.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-restore-docker.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-semantic-route.sh"
+          run_prerequisite_fixture timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-deploy.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-state.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-workflow.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-deploy.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-fake-remote.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-workflow.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-recurring-backups.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-storage.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-migration.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-snapshot.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-gates.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-ssh-host-key.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-authorization.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-evidence.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-capture.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-restore.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-restore-docker.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-semantic-route.sh"
           bash "$TOOLING_SCRIPTS/test-release-post-publication-routing.sh"
           bash "$TOOLING_SCRIPTS/test-release-protected-snapshot.sh"
           bash "$TOOLING_SCRIPTS/test-release-mutation-revalidation.sh"
@@ -355,7 +411,13 @@ jobs:
           "$binary" -version
           WORKFLOW=.github/workflows/ci.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
+            WORKFLOW=.github/workflows/beta-recurring-backups.yml \
+              "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
+            WORKFLOW=.github/workflows/beta-backup-monitor.yml \
+              "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
           WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
+            "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
+          WORKFLOW=.github/workflows/prove-test-vps-retention.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
           WORKFLOW=.github/workflows/promote-dev-digest-to-test-vps.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
