@@ -475,7 +475,9 @@ def validate_engine_file_evidence(
         try:
             info = os.lstat(expected)
         except OSError as error:
-            raise Denied("engine file source is unavailable") from error
+            raise Denied(
+                f"engine file source is unavailable (errno={error.errno})"
+            ) from error
         if not stat.S_ISREG(info.st_mode) or info.st_uid != 0:
             raise Denied("engine file source is not a root-owned regular file")
         host = host_backing_mount(expected, host_mounts)
