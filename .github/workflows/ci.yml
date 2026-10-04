@@ -438,7 +438,10 @@ jobs:
               if len(result.stdout) > maximum or len(result.stderr) > 4096:
                   raise RuntimeError("Docker Engine probe response exceeded its bound")
               if result.returncode != 0:
-                  raise RuntimeError("Docker Engine probe request was denied")
+                  detail = result.stderr.decode("utf-8", errors="replace").strip()
+                  raise RuntimeError(
+                      f"Docker {arguments[0]} failed with exit {result.returncode}: {detail}"
+                  )
               return result.stdout
 
           def inspect(identifier):
@@ -449,8 +452,41 @@ jobs:
                   raise RuntimeError("named container inspection is malformed")
               return response[0]
 
+          def owned_container_id():
+              identifiers = docker(
+                  [
+                      "ps",
+                      "--all",
+                      "--quiet",
+                      "--no-trunc",
+                      "--filter",
+                      "name=" + name,
+                  ],
+                  maximum=4096,
+              ).decode("ascii", errors="strict").splitlines()
+              if not identifiers:
+                  return ""
+              if len(identifiers) != 1 or not re.fullmatch(r"[0-9a-f]{64}", identifiers[0]):
+                  raise RuntimeError("named container teardown inventory is ambiguous")
+              inspection = inspect(identifiers[0])
+              if not isinstance(inspection, dict):
+                  raise RuntimeError("named container teardown inspection is malformed")
+              config = inspection.get("Config") if isinstance(inspection, dict) else None
+              labels = config.get("Labels") if isinstance(config, dict) else None
+              if (
+                  inspection.get("Id") != identifiers[0]
+                  or inspection.get("Name") != "/" + name
+                  or not isinstance(labels, dict)
+                  or labels.get("com.meet.retention-proof.owner") != owner
+                  or (container_id and container_id != identifiers[0])
+              ):
+                  raise RuntimeError("named container teardown ownership differs")
+              return identifiers[0]
+
+          stage = "base-image pull"
           try:
               docker(["pull", "--platform", "linux/amd64", image], timeout=30)
+              stage = "owned container creation"
               create_attempted = True
               created = docker(
                   [
@@ -498,6 +534,7 @@ jobs:
                   raise RuntimeError("Docker Engine returned an invalid container ID")
               container_id = created
 
+              stage = "pre-start isolation inspection"
               before = inspect(container_id)
               config = before.get("Config")
               host = before.get("HostConfig")
@@ -516,6 +553,7 @@ jobs:
               ):
                   raise RuntimeError("pre-start container isolation differs")
 
+              stage = "container start and post-start inspection"
               docker(["start", container_id])
               after = inspect(container_id)
               state = after.get("State")
@@ -533,6 +571,7 @@ jobs:
               ):
                   raise RuntimeError("post-start container isolation differs")
 
+              stage = "container mount evidence"
               mountinfo = docker(
                   ["exec", container_id, "/bin/bash", "-euo", "pipefail", "-c", "cat /proc/self/mountinfo"]
               )
@@ -587,65 +626,18 @@ jobs:
                   "server=28.0.4 api=1.48 layout=moby-v28-root-container-id-v1"
               )
           except Exception as error:
-              raise SystemExit("hosted Docker Engine mount-layout probe denied") from error
+              raise SystemExit(
+                  f"hosted Docker Engine mount-layout probe denied during {stage}: "
+                  f"{type(error).__name__}: {error}"
+              ) from error
           finally:
               if create_attempted:
-                  result = subprocess.run(
-                      ["docker", "inspect", "--type", "container", name],
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.PIPE,
-                      timeout=30,
-                      env=environment,
-                      check=False,
-                  )
-                  if len(result.stdout) > 4096 or len(result.stderr) > 4096:
-                      raise SystemExit("hosted Docker Engine teardown evidence exceeded its bound")
-                  if (
-                      result.returncode == 1
-                      and not result.stdout
-                      and result.stderr == f"Error: No such object: {name}\n".encode()
-                  ):
-                      if container_id:
-                          raise SystemExit("created container disappeared before owned teardown")
-                  elif result.returncode == 0:
-                      try:
-                          response = json.loads(result.stdout)
-                      except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                          raise SystemExit("hosted Docker Engine teardown identity is malformed") from error
-                      if not isinstance(response, list) or len(response) != 1:
-                          raise SystemExit("hosted Docker Engine teardown identity is ambiguous")
-                      inspection = response[0]
-                      config = inspection.get("Config") if isinstance(inspection, dict) else None
-                      labels = config.get("Labels") if isinstance(config, dict) else None
-                      owned_id = inspection.get("Id") if isinstance(inspection, dict) else None
-                      if (
-                          not isinstance(owned_id, str)
-                          or not re.fullmatch(r"[0-9a-f]{64}", owned_id)
-                          or inspection.get("Name") != "/" + name
-                          or not isinstance(labels, dict)
-                          or labels.get("com.meet.retention-proof.owner") != owner
-                          or (container_id and owned_id != container_id)
-                      ):
-                          raise SystemExit("hosted Docker Engine teardown ownership differs")
-                      container_id = owned_id
-                      docker(["rm", "--force", container_id], timeout=30, maximum=4096)
-                      result = subprocess.run(
-                          ["docker", "inspect", "--type", "container", container_id],
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE,
-                          timeout=30,
-                          env=environment,
-                          check=False,
-                      )
-                      if (
-                          result.returncode != 1
-                          or result.stdout
-                          or result.stderr
-                          != f"Error: No such object: {container_id}\n".encode()
-                      ):
+                  stage = "owned container teardown"
+                  owned_id = owned_container_id()
+                  if owned_id:
+                      docker(["rm", "--force", owned_id], timeout=30, maximum=4096)
+                      if owned_container_id():
                           raise SystemExit("hosted Docker Engine probe teardown was not verified")
-                  else:
-                      raise SystemExit("hosted Docker Engine teardown could not verify ownership or absence")
           PY
       - name: Provision and canary pinned age toolchain
         working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
