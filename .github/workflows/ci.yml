@@ -509,7 +509,7 @@ jobs:
                       "--security-opt",
                       "no-new-privileges:true",
                       "--security-opt",
-                      "seccomp=default",
+                      "seccomp=builtin",
                       "--pids-limit",
                       "256",
                       "--cpus",

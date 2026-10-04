@@ -164,7 +164,7 @@ def inspection(*, started: bool, owner: str = OWNER) -> dict[str, object]:
         "IpcMode": "private",
         "CapAdd": ["CHOWN"],
         "CapDrop": ["ALL"],
-        "SecurityOpt": ["no-new-privileges:true", "seccomp=default"],
+        "SecurityOpt": ["no-new-privileges:true", "seccomp=builtin"],
         "Devices": [],
         "DeviceRequests": [],
         "PortBindings": {},

@@ -262,7 +262,7 @@ class DockerEngine:
             "--security-opt",
             "no-new-privileges:true",
             "--security-opt",
-            "seccomp=default",
+            "seccomp=builtin",
             "--pids-limit",
             "256",
             "--cpus",
@@ -559,7 +559,7 @@ def validate_inspection(
         or not isinstance(security_options, list)
         or len(security_options) != 2
         or set(security_options)
-        != {"no-new-privileges:true", "seccomp=default"}
+        != {"no-new-privileges:true", "seccomp=builtin"}
         or host.get("Devices") not in (None, [])
         or host.get("DeviceRequests") not in (None, [])
         or host.get("PortBindings") not in (None, {})
