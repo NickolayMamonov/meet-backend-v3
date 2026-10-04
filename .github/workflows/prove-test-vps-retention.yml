@@ -100,7 +100,7 @@ jobs:
           timeout 120s python3 -B scripts/retention-proof-authorize.py \
             --checkpoint admission \
             --source-sha "$SOURCE_SHA" \
-            --plan-sha256 a7cf15f7bf1ff2860a3e3716ee986f0543bedac339469756a74ed8830047ce2a \
+            --plan-sha256 148fa8e5529122094f9161cae83f568c7693110b10ba668882c9b02b71c97db6 \
             --image-digest "$IMAGE_DIGEST" \
             --source-checkout "$GITHUB_WORKSPACE/source" \
             --expected-registration "$EXPECTED_REGISTRATION" \
@@ -181,7 +181,7 @@ jobs:
           timeout 120s python3 -B scripts/retention-proof-authorize.py \
             --checkpoint job \
             --source-sha "$SOURCE_SHA" \
-            --plan-sha256 a7cf15f7bf1ff2860a3e3716ee986f0543bedac339469756a74ed8830047ce2a \
+            --plan-sha256 148fa8e5529122094f9161cae83f568c7693110b10ba668882c9b02b71c97db6 \
             --image-digest "$IMAGE_DIGEST" \
             --source-checkout "$GITHUB_WORKSPACE/source" \
             --expected-registration "$EXPECTED_REGISTRATION" \

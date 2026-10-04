@@ -35,6 +35,7 @@ OWNER_LABEL = "com.meet.retention-proof.owner"
 NAME_PREFIX = "meet-retention-proof-"
 OUTPUT_LIMIT = 1024 * 1024
 SUMMARY_LIMIT = 64 * 1024
+METADATA_HELPER_SHA256 = "c034d42e3cc2b8d9ce5258af671e9da116ab4b62dabb1aeadefa12efb8280c13"
 FIXTURE_SECONDS = 300
 OUTER_SECONDS = 600
 STOP_SECONDS = 30
@@ -161,6 +162,8 @@ class Engine(Protocol):
     def absent(self, container_id: str) -> bool: ...
 
     def host_mountinfo(self) -> bytes: ...
+
+    def collect_host_metadata(self, request: bytes) -> dict[str, object]: ...
 
 
 class DockerEngine:
@@ -378,6 +381,234 @@ class DockerEngine:
             raise Denied("host mount table exceeds its bound")
         return data
 
+    @staticmethod
+    def _runtime_path(path: str, *, allow_python_symlink: bool = False) -> str:
+        if not path.startswith("/") or posixpath.normpath(path) != path:
+            raise Denied("root metadata runtime path is not canonical")
+        parts = path.split("/")[1:]
+        current = "/"
+        for index, part in enumerate(parts):
+            current = posixpath.join(current, part)
+            info = os.lstat(current)
+            final = index == len(parts) - 1
+            if stat.S_ISLNK(info.st_mode):
+                if not (allow_python_symlink and final and current == "/usr/bin/python3"):
+                    raise Denied("root metadata runtime path contains a symlink")
+                if info.st_uid != 0:
+                    raise Denied("root metadata interpreter link is not root-owned")
+                continue
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                raise Denied("root metadata runtime path is writable by an untrusted user")
+            if final and not stat.S_ISREG(info.st_mode):
+                raise Denied("root metadata executable is not a regular file")
+            if not final and not stat.S_ISDIR(info.st_mode):
+                raise Denied("root metadata runtime ancestry is not a directory")
+        resolved = os.path.realpath(path)
+        if allow_python_symlink:
+            if not re.fullmatch(r"/usr/bin/python3\.[0-9]+", resolved):
+                raise Denied("root metadata interpreter target is outside the admitted system path")
+        elif resolved != path:
+            raise Denied("root metadata privilege tool path is redirected")
+        target = os.stat(path)
+        if target.st_uid != 0 or target.st_mode & 0o022 or not stat.S_ISREG(target.st_mode):
+            raise Denied("root metadata runtime executable provenance differs")
+        return resolved
+
+    @classmethod
+    def _verify_metadata_runtime(cls) -> None:
+        interpreter = cls._runtime_path("/usr/bin/python3", allow_python_symlink=True)
+        cls._runtime_path("/usr/bin/sudo")
+        match = re.fullmatch(r"/usr/bin/python3\.([0-9]+)", interpreter)
+        assert match
+        standard_library = "/usr/lib/python3." + match.group(1)
+        for path in (standard_library, standard_library + "/lib-dynload"):
+            current = "/"
+            for part in path.split("/")[1:]:
+                current = posixpath.join(current, part)
+                info = os.lstat(current)
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != 0
+                    or info.st_mode & 0o022
+                ):
+                    raise Denied("root metadata standard library provenance differs")
+
+    @staticmethod
+    def _helper_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_uid,
+            info.st_gid,
+            info.st_size,
+            info.st_mtime_ns,
+        )
+
+    @classmethod
+    def _read_metadata_helper(cls) -> tuple[Path, bytes, tuple[int, int, int, int, int, int, int]]:
+        path = Path(__file__).with_name("retention-proof-host-metadata.py")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+            try:
+                before = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or before.st_size <= 0
+                    or before.st_size > 64 * 1024
+                ):
+                    raise Denied("trusted host metadata helper size or type differs")
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    chunk = os.read(descriptor, min(8192, 64 * 1024 + 1 - size))
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > 64 * 1024:
+                        raise Denied("trusted host metadata helper exceeds its bound")
+                    chunks.append(chunk)
+                after = os.fstat(descriptor)
+                current = os.stat(path, follow_symlinks=False)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise Denied("trusted host metadata helper cannot be read safely") from error
+        content = b"".join(chunks)
+        identity = cls._helper_identity(before)
+        if (
+            identity != cls._helper_identity(after)
+            or identity != cls._helper_identity(current)
+            or len(content) != before.st_size
+            or hashlib.sha256(content).hexdigest() != METADATA_HELPER_SHA256
+        ):
+            raise Denied("trusted host metadata helper identity or digest differs")
+        try:
+            decoded = content.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise Denied("trusted host metadata helper is not UTF-8") from error
+        if decoded.encode("utf-8") != content:
+            raise Denied("trusted host metadata helper does not round-trip")
+        return path, content, identity
+
+    @classmethod
+    def _verify_helper_path(cls, path: Path, identity: tuple[int, int, int, int, int, int, int]) -> None:
+        try:
+            current = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise Denied("trusted host metadata helper changed before privilege transition") from error
+        if cls._helper_identity(current) != identity:
+            raise Denied("trusted host metadata helper changed before privilege transition")
+
+    def collect_host_metadata(self, request: bytes) -> dict[str, object]:
+        expected = validate_metadata_request(request)
+        started = time.monotonic()
+        remaining = self.deadline - started if self.deadline else 30
+        if remaining <= 0:
+            raise Denied("host metadata deadline expired")
+        deadline = started + min(30, remaining)
+        self._verify_metadata_runtime()
+        helper_path, helper_bytes, helper_identity = self._read_metadata_helper()
+        self._verify_helper_path(helper_path, helper_identity)
+        command = [
+            "/usr/bin/sudo",
+            "-n",
+            "-u",
+            "root",
+            "--",
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            "-c",
+            helper_bytes.decode("utf-8", errors="strict"),
+        ]
+        environment = {
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "TZ": "UTC",
+            "HOME": "/",
+        }
+        if (
+            len(command) != 10
+            or command[:9]
+            != [
+                "/usr/bin/sudo",
+                "-n",
+                "-u",
+                "root",
+                "--",
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                "-c",
+            ]
+            or hashlib.sha256(helper_bytes).hexdigest() != METADATA_HELPER_SHA256
+            or len(request) > 1024
+        ):
+            raise Denied("host metadata privilege invocation differs from its fixed contract")
+        self._verify_helper_path(helper_path, helper_identity)
+        if time.monotonic() >= deadline:
+            raise Denied("host metadata deadline expired before privilege transition")
+        process: subprocess.Popen[bytes] | None = None
+        selector: selectors.BaseSelector | None = None
+        output = bytearray()
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd="/",
+                env=environment,
+                close_fds=True,
+                shell=False,
+                start_new_session=True,
+                bufsize=0,
+            )
+            assert process.stdin and process.stdout
+            process.stdin.write(request)
+            process.stdin.close()
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise Denied("root host metadata collection timed out")
+                for key, _ in selector.select(min(1.0, timeout)):
+                    chunk = os.read(key.fd, 4096)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    output.extend(chunk)
+                    if len(output) > 64 * 1024:
+                        raise Denied("root host metadata response exceeds its bound")
+            return_code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            if return_code != 0:
+                raise Denied("root host metadata collector denied evidence")
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Denied("bounded root host metadata invocation failed") from error
+        finally:
+            if selector is not None:
+                selector.close()
+            if process is not None:
+                for stream in (process.stdin, process.stdout):
+                    if stream is not None and not stream.closed:
+                        stream.close()
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        process.wait(timeout=1)
+                    except (OSError, subprocess.SubprocessError):
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait(timeout=1)
+                        except (OSError, subprocess.SubprocessError):
+                            raise Denied("root host metadata process teardown failed")
+        return validate_metadata_response(bytes(output), expected)
+
 
 def _mount_unescape(value: str) -> str:
     return re.sub(
@@ -441,6 +672,136 @@ def host_backing_mount(path: str, mounts: list[dict[str, str]]) -> dict[str, str
     return {"root": mapped_root, "device": mount["device"]}
 
 
+def _strict_json(raw: bytes, *, maximum: int) -> object:
+    if not raw or len(raw) > maximum:
+        raise Denied("metadata JSON is empty or oversized")
+
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise Denied("metadata JSON contains duplicate keys")
+            value[key] = item
+        return value
+
+    try:
+        return json.loads(raw.decode("utf-8", errors="strict"), object_pairs_hook=object_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Denied("metadata JSON is malformed") from error
+
+
+def validate_metadata_request(raw: bytes) -> dict[str, object]:
+    value = _strict_json(raw, maximum=1024)
+    keys = {
+        "schemaVersion",
+        "containerId",
+        "owner",
+        "dockerRootDir",
+        "engineVersion",
+        "engineApiVersion",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or type(value.get("schemaVersion")) is not int
+        or value["schemaVersion"] != 1
+        or not isinstance(value.get("containerId"), str)
+        or not CONTAINER_ID.fullmatch(value["containerId"])
+        or not isinstance(value.get("owner"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", value["owner"])
+        or not isinstance(value.get("dockerRootDir"), str)
+        or not isinstance(value.get("engineVersion"), str)
+        or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value["engineVersion"])
+        or not isinstance(value.get("engineApiVersion"), str)
+        or not re.fullmatch(r"[0-9]+\.[0-9]+", value["engineApiVersion"])
+    ):
+        raise Denied("metadata request schema or identity differs")
+    root = value["dockerRootDir"]
+    if (
+        not root.startswith("/")
+        or root == "/"
+        or len(root.encode("utf-8")) > 4096
+        or "\x00" in root
+        or "\n" in root
+        or "\r" in root
+        or posixpath.normpath(root) != root
+        or any(part in ("", ".", "..") for part in root.split("/")[1:])
+    ):
+        raise Denied("metadata request Engine root is not canonical")
+    if json.dumps(value, sort_keys=True, separators=(",", ":")).encode() != raw:
+        raise Denied("metadata request is not canonical JSON")
+    return value
+
+
+def validate_metadata_response(raw: bytes, expected: dict[str, object]) -> dict[str, object]:
+    if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise Denied("root host metadata output framing differs")
+    value = _strict_json(raw[:-1], maximum=SUMMARY_LIMIT - 1)
+    keys = {
+        "schemaVersion",
+        "containerId",
+        "owner",
+        "dockerRootDir",
+        "engineVersion",
+        "engineApiVersion",
+        "files",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or type(value.get("schemaVersion")) is not int
+        or value["schemaVersion"] != 1
+        or any(value.get(key) != expected[key] for key in keys - {"schemaVersion", "files"})
+        or json.dumps(value, sort_keys=True, separators=(",", ":")).encode() != raw[:-1]
+    ):
+        raise Denied("root host metadata identity or schema differs")
+    files = value["files"]
+    targets = {"/etc/hostname", "/etc/hosts", "/etc/resolv.conf"}
+    record_keys = {
+        "source",
+        "mode",
+        "uid",
+        "gid",
+        "device",
+        "inode",
+        "mountRoot",
+        "mountDevice",
+    }
+    if not isinstance(files, dict) or set(files) != targets:
+        raise Denied("root host metadata file set differs")
+    leaves = {
+        "/etc/hostname": "hostname",
+        "/etc/hosts": "hosts",
+        "/etc/resolv.conf": "resolv.conf",
+    }
+    root = expected["dockerRootDir"]
+    container_id = expected["containerId"]
+    for target, leaf in leaves.items():
+        record = files[target]
+        source = f"{root}/containers/{container_id}/{leaf}"
+        if (
+            not isinstance(record, dict)
+            or set(record) != record_keys
+            or record.get("source") != source
+            or len(source.encode("utf-8")) > 4096
+            or any(
+                type(record.get(key)) is not int or record[key] < 0
+                for key in ("mode", "uid", "gid", "device", "inode")
+            )
+            or record["inode"] == 0
+            or not stat.S_ISREG(record["mode"])
+            or record["uid"] != 0
+            or not isinstance(record.get("mountRoot"), str)
+            or not record["mountRoot"].startswith("/")
+            or posixpath.normpath(record["mountRoot"]) != record["mountRoot"]
+            or not isinstance(record.get("mountDevice"), str)
+            or not re.fullmatch(r"[0-9]+:[0-9]+", record["mountDevice"])
+            or device_number(record["device"]) != record["mountDevice"]
+        ):
+            raise Denied("root host metadata record differs")
+    return value
+
+
 def device_number(device: int) -> str:
     major = (device >> 8) & 0xFFF
     major |= (device >> 32) & 0xFFFFF000
@@ -454,6 +815,10 @@ def validate_engine_file_evidence(
     *,
     engine_root: str,
     container_id: str,
+    owner: str,
+    engine_version: str,
+    engine_api_version: str,
+    host_metadata: object,
     host_mountinfo_bytes: bytes,
     container_evidence: object,
 ) -> None:
@@ -463,6 +828,27 @@ def validate_engine_file_evidence(
         or set(container_evidence) != {"/etc/hostname", "/etc/hosts", "/etc/resolv.conf"}
     ):
         raise Denied("container engine-file mount evidence is incomplete")
+    expected_identity = {
+        "containerId": container_id,
+        "owner": owner,
+        "dockerRootDir": engine_root,
+        "engineVersion": engine_version,
+        "engineApiVersion": engine_api_version,
+    }
+    if not isinstance(host_metadata, dict):
+        raise Denied("root host metadata is missing")
+    metadata = validate_metadata_response(
+        json.dumps(host_metadata, sort_keys=True, separators=(",", ":")).encode() + b"\n",
+        expected_identity,
+    )
+    config = inspection.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    if (
+        inspection.get("Id") != container_id
+        or not isinstance(labels, dict)
+        or labels.get(OWNER_LABEL) != owner
+    ):
+        raise Denied("host metadata is not bound to the owned container")
     leaves = {
         "/etc/hostname": ("HostnamePath", "hostname"),
         "/etc/hosts": ("HostsPath", "hosts"),
@@ -472,16 +858,8 @@ def validate_engine_file_evidence(
         expected = f"{engine_root}/containers/{container_id}/{leaf}"
         if inspection.get(field) != expected:
             raise Denied("engine file source path differs")
-        try:
-            info = os.lstat(expected)
-        except OSError as error:
-            raise Denied(
-                f"engine file source is unavailable (errno={error.errno})"
-            ) from error
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0:
-            raise Denied("engine file source is not a root-owned regular file")
+        record = metadata["files"][target]
         host = host_backing_mount(expected, host_mounts)
-        device = device_number(info.st_dev)
         inner = container_evidence[target]
         if (
             not isinstance(inner, dict)
@@ -492,7 +870,9 @@ def validate_engine_file_evidence(
             or inner["uid"] != 0
             or inner["root"] != host["root"]
             or inner["device"] != host["device"]
-            or device != host["device"]
+            or record["mountRoot"] != host["root"]
+            or record["mountDevice"] != host["device"]
+            or device_number(record["device"]) != host["device"]
         ):
             raise Denied("container and host engine-file mount evidence differs")
 
@@ -798,6 +1178,93 @@ class RetentionSupervisor:
             started=False,
         )
 
+    @staticmethod
+    def _engine_file_identity(inspection: dict[str, object]) -> tuple[object, ...]:
+        config = inspection.get("Config")
+        host = inspection.get("HostConfig")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        state = inspection.get("State")
+        paths = tuple(
+            inspection.get(field)
+            for field in ("HostnamePath", "HostsPath", "ResolvConfPath")
+        )
+        return (
+            inspection.get("Id"),
+            labels.get(OWNER_LABEL) if isinstance(labels, dict) else None,
+            paths,
+            config,
+            host,
+            inspection.get("Mounts"),
+            state.get("Running") if isinstance(state, dict) else None,
+        )
+
+    def _collect_engine_file_evidence(
+        self,
+        initial_inspection: dict[str, object],
+        container_evidence: object,
+    ) -> None:
+        expected_engine = (
+            self.engine_root,
+            self.lock["engineVersion"],
+            self.lock["engineApiVersion"],
+        )
+
+        def snapshot() -> tuple[tuple[str, str, str], dict[str, object]]:
+            info = self.engine.info()
+            root = validate_engine_info(info, self.lock)
+            identity = (root, info["ServerVersion"], info["ApiVersion"])
+            if identity != expected_engine:
+                raise Denied("Engine identity changed around host metadata collection")
+            inspection = self.engine.inspect(self.container_id)
+            validate_inspection(
+                inspection,
+                image_digest=self.image_digest,
+                source_sha=self.source_sha,
+                toolchain_sha256=self.toolchain_sha256,
+                source_export=self.source_export,
+                owner=self.owner,
+                container_id=self.container_id,
+                engine_root=self.engine_root,
+                started=True,
+            )
+            return identity, inspection
+
+        initial_identity = self._engine_file_identity(initial_inspection)
+        before_identity, before_inspection = snapshot()
+        if self._engine_file_identity(before_inspection) != initial_identity:
+            raise Denied("owned container identity changed before host metadata collection")
+        request = json.dumps(
+            {
+                "schemaVersion": 1,
+                "containerId": self.container_id,
+                "owner": self.owner,
+                "dockerRootDir": before_identity[0],
+                "engineVersion": before_identity[1],
+                "engineApiVersion": before_identity[2],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        validate_metadata_request(request)
+        host_metadata = self.engine.collect_host_metadata(request)
+        after_identity, after_inspection = snapshot()
+        if (
+            after_identity != before_identity
+            or self._engine_file_identity(after_inspection) != initial_identity
+        ):
+            raise Denied("owned Engine/container identity changed during host metadata collection")
+        validate_engine_file_evidence(
+            after_inspection,
+            engine_root=self.engine_root,
+            container_id=self.container_id,
+            owner=self.owner,
+            engine_version=after_identity[1],
+            engine_api_version=after_identity[2],
+            host_metadata=host_metadata,
+            host_mountinfo_bytes=self.engine.host_mountinfo(),
+            container_evidence=container_evidence,
+        )
+
     def _wait_for_ready(self) -> dict[str, object]:
         assert self.process and self.process.stdout
         selector = selectors.DefaultSelector()
@@ -967,13 +1434,7 @@ class RetentionSupervisor:
                 engine_root=self.engine_root,
                 started=True,
             )
-            validate_engine_file_evidence(
-                after_start,
-                engine_root=self.engine_root,
-                container_id=self.container_id,
-                host_mountinfo_bytes=self.engine.host_mountinfo(),
-                container_evidence=self.wait_evidence,
-            )
+            self._collect_engine_file_evidence(after_start, self.wait_evidence)
             self._authorize("barrier")
             assert self.process.stdin
             self.process.stdin.write(b"RELEASE\n")

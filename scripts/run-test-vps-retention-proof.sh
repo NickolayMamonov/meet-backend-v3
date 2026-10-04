@@ -88,7 +88,7 @@ timeout 600s python3 -B \
   --source-checkout "$SOURCE_CHECKOUT" \
   --source-sha "$SOURCE_SHA" \
   --image-digest "$IMAGE_DIGEST" \
-  --plan-sha256 a7cf15f7bf1ff2860a3e3716ee986f0543bedac339469756a74ed8830047ce2a \
+  --plan-sha256 148fa8e5529122094f9161cae83f568c7693110b10ba668882c9b02b71c97db6 \
   --toolchain-lock "$source_lock" \
   --toolchain-sha256 "$toolchain_sha256" \
   --tuple-sha256 "$EXPECTED_TUPLE_SHA256" \

@@ -200,6 +200,7 @@ def main() -> None:
     for filename in (
         "retention-proof-registration.py",
         "retention-proof-authorize.py",
+        "retention-proof-host-metadata.py",
         "retention-proof-supervisor.py",
         "test-retention-proof-registration.py",
         "test-retention-proof-supervisor.py",

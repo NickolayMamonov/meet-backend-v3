@@ -29,6 +29,7 @@ LAUNCHER_BUNDLE_FILES = {
     "scripts/run-test-vps-retention-proof.sh": "100755",
     "scripts/retention-proof-registration.py": "100644",
     "scripts/retention-proof-authorize.py": "100644",
+    "scripts/retention-proof-host-metadata.py": "100644",
 }
 
 

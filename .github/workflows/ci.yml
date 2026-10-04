@@ -571,6 +571,66 @@ jobs:
               ):
                   raise RuntimeError("post-start container isolation differs")
 
+              engine_identity = {
+                  "schemaVersion": 1,
+                  "containerId": container_id,
+                  "owner": owner,
+                  "dockerRootDir": docker_root,
+                  "engineVersion": engine_info["ServerVersion"],
+                  "engineApiVersion": engine_info["ApiVersion"],
+              }
+              metadata_request = json.dumps(
+                  engine_identity, sort_keys=True, separators=(",", ":")
+              ).encode("utf-8")
+              supervisor.validate_metadata_request(metadata_request)
+
+              def live_identity():
+                  live_info = engine.info()
+                  live_root = supervisor.validate_engine_info(live_info, expected_lock)
+                  live = inspect(container_id)
+                  config = live.get("Config")
+                  labels = config.get("Labels") if isinstance(config, dict) else None
+                  state = live.get("State")
+                  if (
+                      live_root != docker_root
+                      or live_info.get("ServerVersion") != engine_identity["engineVersion"]
+                      or live_info.get("ApiVersion") != engine_identity["engineApiVersion"]
+                      or live.get("Id") != container_id
+                      or live.get("Name") != "/" + name
+                      or not isinstance(labels, dict)
+                      or labels.get("com.meet.retention-proof.owner") != owner
+                      or not isinstance(state, dict)
+                      or state.get("Running") is not True
+                      or any(
+                          live.get(field)
+                          != f"{docker_root}/containers/{container_id}/{leaf}"
+                          for field, leaf in (
+                              ("HostnamePath", "hostname"),
+                              ("HostsPath", "hosts"),
+                              ("ResolvConfPath", "resolv.conf"),
+                          )
+                      )
+                  ):
+                      raise RuntimeError("live Engine/container identity changed")
+                  return (
+                      live_root,
+                      live_info["ServerVersion"],
+                      live_info["ApiVersion"],
+                      live.get("Id"),
+                      labels.get("com.meet.retention-proof.owner"),
+                      tuple(live.get(key) for key in ("HostnamePath", "HostsPath", "ResolvConfPath")),
+                      config,
+                      live.get("HostConfig"),
+                      live.get("Mounts"),
+                      state.get("Running"),
+                  ), live
+
+              before_identity, _ = live_identity()
+              metadata = engine.collect_host_metadata(metadata_request)
+              after_identity, after = live_identity()
+              if before_identity != after_identity:
+                  raise RuntimeError("Engine/container identity changed during host metadata collection")
+
               stage = "container mount evidence"
               mountinfo = docker(
                   ["exec", container_id, "/bin/bash", "-euo", "pipefail", "-c", "cat /proc/self/mountinfo"]
@@ -618,6 +678,10 @@ jobs:
                   after,
                   engine_root=docker_root,
                   container_id=container_id,
+                  owner=owner,
+                  engine_version=engine_identity["engineVersion"],
+                  engine_api_version=engine_identity["engineApiVersion"],
+                  host_metadata=metadata,
                   host_mountinfo_bytes=engine.host_mountinfo(),
                   container_evidence=evidence,
               )
@@ -670,6 +734,7 @@ jobs:
             'from pathlib import Path; import sys; [compile(Path(p).read_bytes(), p, "exec") for p in sys.argv[1:]]' \
             "$TOOLING_SCRIPTS/retention-proof-registration.py" \
             "$TOOLING_SCRIPTS/retention-proof-authorize.py" \
+            "$TOOLING_SCRIPTS/retention-proof-host-metadata.py" \
             "$TOOLING_SCRIPTS/retention-proof-supervisor.py" \
             "$TOOLING_SCRIPTS/test-retention-proof-registration.py"
           timeout 300s bash "$TOOLING_SCRIPTS/test-retention-proof-launcher.sh"

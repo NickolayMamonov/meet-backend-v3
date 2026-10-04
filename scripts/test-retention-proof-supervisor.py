@@ -12,6 +12,7 @@ from pathlib import Path
 import signal
 import stat
 import subprocess
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,11 +24,19 @@ assert spec and spec.loader
 supervisor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(supervisor)
 
+helper_spec = importlib.util.spec_from_file_location(
+    "retention_proof_host_metadata",
+    Path(__file__).with_name("retention-proof-host-metadata.py"),
+)
+assert helper_spec and helper_spec.loader
+host_metadata_helper = importlib.util.module_from_spec(helper_spec)
+helper_spec.loader.exec_module(host_metadata_helper)
+
 CONTAINER_ID = "a" * 64
 IMAGE = "sha256:" + "b" * 64
 SOURCE = Path(__file__).resolve().parent
 SOURCE_PATH = os.path.realpath(SOURCE)
-OWNER = "test-owner"
+OWNER = "f" * 32
 ROOT = "/var/lib/docker"
 SOURCE_SHA = "c" * 40
 PLAN_SHA = supervisor.policy.PLAN_SHA256
@@ -75,6 +84,159 @@ MOUNT_EVIDENCE = {
         ("/etc/resolv.conf", "resolv.conf"),
     )
 }
+
+
+class FakeMetadataOS:
+    O_RDONLY = 1
+    O_DIRECTORY = 2
+    O_CLOEXEC = 4
+    O_NOFOLLOW = 8
+    O_PATH = 16
+
+    def __init__(self) -> None:
+        self.mountinfo = b"1 0 8:1 / / rw - ext4 /dev/root rw\n"
+        self.trace: list[tuple[object, ...]] = []
+        self.nodes: dict[str, SimpleNamespace] = {}
+        self.descriptors: dict[int, str] = {}
+        self.offsets: dict[int, int] = {}
+        self.next_descriptor = 10
+        self.root_opens = 0
+        self.replace_on_second_walk = False
+        self.replace_directory_on_second_walk = False
+        self.mount_reads = 0
+        self.change_mount_between_reads = False
+        path = ""
+        for index, component in enumerate(("", "var", "lib", "docker", "containers", CONTAINER_ID)):
+            path = "/" if index == 0 else (path.rstrip("/") + "/" + component)
+            self.nodes[path] = self._info(stat.S_IFDIR | 0o755, 0, index + 1)
+        container_dir = f"{ROOT}/containers/{CONTAINER_ID}"
+        for index, leaf in enumerate(("hostname", "hosts", "resolv.conf"), start=20):
+            self.nodes[f"{container_dir}/{leaf}"] = self._info(
+                stat.S_IFREG | 0o644, 0, index
+            )
+
+    @staticmethod
+    def _info(mode: int, uid: int, inode: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            st_mode=mode,
+            st_uid=uid,
+            st_gid=0,
+            st_dev=2049,
+            st_ino=inode,
+        )
+
+    def _path(self, path: str, dir_fd: int | None) -> str:
+        if dir_fd is None:
+            return path
+        base = self.descriptors[dir_fd]
+        return (base.rstrip("/") + "/" + path) if base != "/" else "/" + path
+
+    def open(self, path: str, flags: int, *, dir_fd: int | None = None) -> int:
+        self.trace.append(("open", path, flags, dir_fd))
+        if path == "/":
+            self.root_opens += 1
+            if self.replace_on_second_walk and self.root_opens == 2:
+                file_path = f"{ROOT}/containers/{CONTAINER_ID}/hosts"
+                self.nodes[file_path].st_ino += 100
+            if self.replace_directory_on_second_walk and self.root_opens == 2:
+                self.nodes[f"{ROOT}/containers"].st_ino += 100
+            resolved = "/"
+        elif path == "/proc/self/mountinfo":
+            self.mount_reads += 1
+            if self.change_mount_between_reads and self.mount_reads == 2:
+                self.mountinfo = b"1 0 8:2 / / rw - ext4 /dev/root rw\n"
+            resolved = path
+        else:
+            resolved = self._path(path, dir_fd)
+        if resolved not in self.nodes and resolved != "/proc/self/mountinfo":
+            raise FileNotFoundError(resolved)
+        if resolved == "/proc/self/mountinfo":
+            self.offsets[self.next_descriptor] = 0
+        if flags & self.O_DIRECTORY and resolved != "/proc/self/mountinfo":
+            if not stat.S_ISDIR(self.nodes[resolved].st_mode):
+                raise NotADirectoryError(resolved)
+        descriptor = self.next_descriptor
+        self.next_descriptor += 1
+        self.descriptors[descriptor] = resolved
+        return descriptor
+
+    def stat(
+        self, path: str, *, dir_fd: int | None = None, follow_symlinks: bool = True
+    ) -> SimpleNamespace:
+        resolved = self._path(path, dir_fd)
+        self.trace.append(("stat", resolved, follow_symlinks))
+        if resolved not in self.nodes:
+            raise FileNotFoundError(resolved)
+        return self.nodes[resolved]
+
+    def fstat(self, descriptor: int) -> SimpleNamespace:
+        path = self.descriptors[descriptor]
+        self.trace.append(("fstat", path))
+        if path == "/proc/self/mountinfo":
+            return self._info(stat.S_IFREG | 0o444, 0, 500)
+        return self.nodes[path]
+
+    def read(self, descriptor: int, maximum: int) -> bytes:
+        path = self.descriptors[descriptor]
+        self.trace.append(("read", path, maximum))
+        if path != "/proc/self/mountinfo":
+            raise AssertionError("collector attempted to read a backing-file content")
+        offset = self.offsets[descriptor]
+        chunk = self.mountinfo[offset : offset + maximum]
+        self.offsets[descriptor] = offset + len(chunk)
+        return chunk
+
+    def close(self, descriptor: int) -> None:
+        path = self.descriptors.pop(descriptor)
+        self.trace.append(("close", path))
+        self.offsets.pop(descriptor, None)
+
+    def write(self, *_args: object) -> None:
+        raise AssertionError("metadata collector must not write")
+
+
+def metadata_request() -> bytes:
+    return json.dumps(
+        {
+            "schemaVersion": 1,
+            "containerId": CONTAINER_ID,
+            "owner": OWNER,
+            "dockerRootDir": ROOT,
+            "engineVersion": LOCK["engineVersion"],
+            "engineApiVersion": LOCK["engineApiVersion"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+def host_metadata_value() -> dict[str, object]:
+    files: dict[str, dict[str, object]] = {}
+    for target, leaf in (
+        ("/etc/hostname", "hostname"),
+        ("/etc/hosts", "hosts"),
+        ("/etc/resolv.conf", "resolv.conf"),
+    ):
+        source = f"{ROOT}/containers/{CONTAINER_ID}/{leaf}"
+        files[target] = {
+            "source": source,
+            "mode": stat.S_IFREG | 0o644,
+            "uid": 0,
+            "gid": 0,
+            "device": 2049,
+            "inode": 20 + ("hostname", "hosts", "resolv.conf").index(leaf),
+            "mountRoot": source,
+            "mountDevice": "8:1",
+        }
+    return {
+        "schemaVersion": 1,
+        "containerId": CONTAINER_ID,
+        "owner": OWNER,
+        "dockerRootDir": ROOT,
+        "engineVersion": LOCK["engineVersion"],
+        "engineApiVersion": LOCK["engineApiVersion"],
+        "files": files,
+    }
 
 
 def docker_info_from_cli(version_payload: dict[str, object]) -> dict[str, object]:
@@ -198,7 +360,7 @@ def inspection(*, started: bool, owner: str = OWNER) -> dict[str, object]:
 def denied(callable_, label: str) -> None:
     try:
         callable_()
-    except supervisor.Denied:
+    except (supervisor.Denied, host_metadata_helper.Denied):
         return
     raise AssertionError(f"accepted invalid supervisor case: {label}")
 
@@ -271,6 +433,10 @@ class FakeEngine:
         self.absence_confirmed = True
         self.stop_fails = False
         self.invalid_after_start = False
+        self.metadata_failure = False
+        self.identity_drift_after_metadata = False
+        self.path_drift_after_metadata = False
+        self.metadata_collected = False
         self.created_image = ""
         self.created_source = ""
         self.process: FakeProcess | None = None
@@ -308,6 +474,8 @@ class FakeEngine:
         value = inspection(started=self.started)
         if self.invalid_after_start and self.started:
             value["Mounts"].append(value["Mounts"][0])
+        if self.path_drift_after_metadata and self.metadata_collected and self.started:
+            value["HostsPath"] = f"{ROOT}/containers/{CONTAINER_ID}/substituted"
         return value
 
     def start_attached(self, container_id: str) -> FakeProcess:
@@ -320,6 +488,22 @@ class FakeEngine:
     def host_mountinfo(self) -> bytes:
         self.events.append("host-mountinfo")
         return b"1 0 8:1 / / rw - ext4 /dev/root rw\n"
+
+    def collect_host_metadata(self, request: bytes) -> dict[str, object]:
+        self.events.append("metadata")
+        parsed = supervisor.validate_metadata_request(request)
+        assert parsed["containerId"] == CONTAINER_ID
+        assert parsed["owner"] == OWNER
+        if self.metadata_failure:
+            raise supervisor.Denied("injected host metadata failure")
+        self.metadata_collected = True
+        if self.identity_drift_after_metadata:
+            self.info = lambda: {
+                "DockerRootDir": "/changed",
+                "ServerVersion": LOCK["engineVersion"],
+                "ApiVersion": LOCK["engineApiVersion"],
+            }
+        return host_metadata_value()
 
     def stop(self, container_id: str) -> None:
         assert container_id == CONTAINER_ID
@@ -372,7 +556,323 @@ def new_supervisor(
     return instance
 
 
+def test_host_metadata_helper() -> None:
+    request = metadata_request()
+    fake_os = FakeMetadataOS()
+    result = host_metadata_helper.collect_metadata(request, ops=fake_os)
+    assert result == host_metadata_value()
+    assert not fake_os.descriptors
+    assert all(event[0] in {"open", "stat", "fstat", "read", "close"} for event in fake_os.trace)
+    assert all(
+        event[1] == "/proc/self/mountinfo"
+        for event in fake_os.trace
+        if event[0] == "read"
+    )
+    opened_paths = [event[1] for event in fake_os.trace if event[0] == "open"]
+    assert opened_paths.count("/proc/self/mountinfo") == 2
+    assert not any(event[0] == "write" for event in fake_os.trace)
+
+    duplicate = request.replace(
+        b'"schemaVersion":1',
+        b'"schemaVersion":1,"schemaVersion":1',
+        1,
+    )
+    unknown = request[:-1] + b',"unexpected":true}'
+    for invalid in (duplicate, unknown, b"x" * 1025):
+        fake = FakeMetadataOS()
+        denied(
+            lambda invalid=invalid, fake=fake: host_metadata_helper.collect_metadata(
+                invalid, ops=fake
+            ),
+            "invalid collector request",
+        )
+        assert not fake.trace
+
+    for mutate, label in (
+        (
+            lambda fake: setattr(
+                fake.nodes["/var"], "st_mode", stat.S_IFLNK | 0o777
+            ),
+            "symlinked ancestry",
+        ),
+        (
+            lambda fake: setattr(
+                fake.nodes[f"{ROOT}/containers/{CONTAINER_ID}/hostname"],
+                "st_uid",
+                1000,
+            ),
+            "non-root-owned leaf",
+        ),
+        (
+            lambda fake: setattr(
+                fake.nodes[f"{ROOT}/containers/{CONTAINER_ID}/hostname"],
+                "st_mode",
+                stat.S_IFLNK | 0o777,
+            ),
+            "symlink leaf",
+        ),
+        (
+            lambda fake: setattr(
+                fake.nodes[f"{ROOT}/containers/{CONTAINER_ID}/hostname"],
+                "st_mode",
+                stat.S_IFDIR | 0o755,
+            ),
+            "non-regular leaf",
+        ),
+        (
+            lambda fake: setattr(fake, "replace_on_second_walk", True),
+            "replaced file inode",
+        ),
+        (
+            lambda fake: setattr(fake, "replace_directory_on_second_walk", True),
+            "replaced ancestry",
+        ),
+        (
+            lambda fake: setattr(
+                fake,
+                "mountinfo",
+                b"1 0 8:2 / / rw - ext4 /dev/root rw\n",
+            ),
+            "device mismatch",
+        ),
+        (
+            lambda fake: setattr(fake, "change_mount_between_reads", True),
+            "mount-table change",
+        ),
+        (
+            lambda fake: setattr(fake, "mountinfo", b"x" * (1024 * 1024 + 1)),
+            "oversized mount table",
+        ),
+    ):
+        fake = FakeMetadataOS()
+        mutate(fake)
+        denied(
+            lambda fake=fake: host_metadata_helper.collect_metadata(
+                request, ops=fake
+            ),
+            label,
+        )
+
+
+def test_root_collector_invocation() -> None:
+    request = metadata_request()
+    result = host_metadata_helper.collect_metadata(request, ops=FakeMetadataOS())
+    encoded = json.dumps(result, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    processes: list[object] = []
+
+    class CapturedInput(io.BytesIO):
+        captured = b""
+
+        def close(self) -> None:
+            self.captured = self.getvalue()
+            super().close()
+
+    class CapturedOutput:
+        def __init__(self) -> None:
+            self.closed = False
+
+        @staticmethod
+        def fileno() -> int:
+            return 77
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeSelector:
+        def __init__(self) -> None:
+            self.files: dict[int, object] = {}
+
+        def register(self, fileobj: object, _events: int) -> None:
+            self.files[fileobj.fileno()] = fileobj
+
+        def unregister(self, fileobj: object) -> None:
+            self.files.pop(fileobj.fileno())
+
+        def get_map(self) -> dict[int, object]:
+            return self.files
+
+        def select(self, timeout: float) -> list[tuple[object, int]]:
+            assert timeout > 0
+            if keep_open:
+                time.sleep(min(timeout, 0.01))
+                return []
+            return [
+                (
+                    SimpleNamespace(fd=descriptor, fileobj=fileobj),
+                    supervisor.selectors.EVENT_READ,
+                )
+                for descriptor, fileobj in self.files.items()
+            ]
+
+        def close(self) -> None:
+            self.files.clear()
+
+    class CollectorProcess:
+        def __init__(self, return_code: int | None) -> None:
+            self.stdin = CapturedInput()
+            self.stdout = CapturedOutput()
+            self.stderr = None
+            self.pid = 999999
+            self.return_code = return_code
+
+        def poll(self) -> int | None:
+            return self.return_code
+
+        def wait(self, timeout: float) -> int:
+            assert timeout > 0
+            if self.return_code is None:
+                self.return_code = -15
+            return self.return_code
+
+    def spawn(command: list[str], **kwargs: object) -> CollectorProcess:
+        process = CollectorProcess(exit_code)
+        processes.append(process)
+        assert kwargs["shell"] is False
+        assert kwargs["cwd"] == "/"
+        assert kwargs["close_fds"] is True
+        assert kwargs["start_new_session"] is True
+        assert kwargs["env"] == {
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "TZ": "UTC",
+            "HOME": "/",
+        }
+        assert command[:9] == [
+            "/usr/bin/sudo",
+            "-n",
+            "-u",
+            "root",
+            "--",
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            "-c",
+        ]
+        helper_bytes = Path(__file__).with_name(
+            "retention-proof-host-metadata.py"
+        ).read_bytes()
+        assert command[9].encode("utf-8") == helper_bytes
+        assert hashlib.sha256(command[9].encode("utf-8")).hexdigest() == (
+            supervisor.METADATA_HELPER_SHA256
+        )
+        return process
+
+    output = bytearray(encoded)
+    exit_code: int | None = 0
+    keep_open = False
+    real_read = os.read
+
+    def fake_read(descriptor: int, maximum: int) -> bytes:
+        if descriptor != 77:
+            return real_read(descriptor, maximum)
+        chunk = bytes(output[:maximum])
+        del output[:maximum]
+        return chunk
+
+    engine = supervisor.DockerEngine()
+    with (
+        patch.object(supervisor.DockerEngine, "_verify_metadata_runtime"),
+        patch.object(supervisor.subprocess, "Popen", side_effect=spawn) as popen,
+        patch.object(supervisor.selectors, "DefaultSelector", FakeSelector),
+        patch.object(supervisor.os, "read", side_effect=fake_read),
+    ):
+        assert engine.collect_host_metadata(request) == result
+    assert popen.call_count == 1
+    assert processes[0].stdin.captured == request
+    assert processes[0].stdout.closed
+
+    exit_code = 1
+    output = bytearray(encoded)
+    with (
+        patch.object(supervisor.DockerEngine, "_verify_metadata_runtime"),
+        patch.object(supervisor.subprocess, "Popen", side_effect=spawn),
+        patch.object(supervisor.selectors, "DefaultSelector", FakeSelector),
+        patch.object(supervisor.os, "read", side_effect=fake_read),
+    ):
+        denied(
+            lambda: engine.collect_host_metadata(request),
+            "collector nonzero exit",
+        )
+
+    exit_code = 0
+    output = bytearray(b"x" * (64 * 1024 + 1))
+    with (
+        patch.object(supervisor.DockerEngine, "_verify_metadata_runtime"),
+        patch.object(supervisor.subprocess, "Popen", side_effect=spawn),
+        patch.object(supervisor.selectors, "DefaultSelector", FakeSelector),
+        patch.object(supervisor.os, "read", side_effect=fake_read),
+    ):
+        denied(
+            lambda: engine.collect_host_metadata(request),
+            "oversized collector output",
+        )
+
+    output = bytearray()
+    keep_open = True
+    exit_code = None
+    engine.deadline = time.monotonic() + 0.05
+    terminated: list[tuple[int, int]] = []
+    with (
+        patch.object(supervisor.DockerEngine, "_verify_metadata_runtime"),
+        patch.object(supervisor.subprocess, "Popen", side_effect=spawn),
+        patch.object(supervisor.selectors, "DefaultSelector", FakeSelector),
+        patch.object(supervisor.os, "read", side_effect=fake_read),
+        patch.object(
+            supervisor.os,
+            "killpg",
+            create=True,
+            side_effect=lambda pid, signum: terminated.append((pid, signum)),
+        ),
+    ):
+        denied(lambda: engine.collect_host_metadata(request), "collector timeout")
+    assert terminated == [(999999, signal.SIGTERM)]
+    assert processes[-1].return_code == -15
+    engine.deadline = 0
+    keep_open = False
+
+    with (
+        patch.object(supervisor.DockerEngine, "_verify_metadata_runtime"),
+        patch.object(
+            supervisor,
+            "METADATA_HELPER_SHA256",
+            "0" * 64,
+        ),
+        patch.object(supervisor.subprocess, "Popen") as popen,
+    ):
+        denied(lambda: engine.collect_host_metadata(request), "bad helper digest")
+        popen.assert_not_called()
+
+    with (
+        patch.object(supervisor.DockerEngine, "_verify_metadata_runtime"),
+        patch.object(
+            supervisor.DockerEngine,
+            "_verify_helper_path",
+            side_effect=[None, supervisor.Denied("replacement before transition")],
+        ),
+        patch.object(supervisor.subprocess, "Popen") as popen,
+    ):
+        denied(
+            lambda: engine.collect_host_metadata(request),
+            "helper replacement before privilege",
+        )
+        popen.assert_not_called()
+
+    with (
+        patch.object(supervisor.DockerEngine, "_verify_metadata_runtime"),
+        patch.object(supervisor.subprocess, "Popen") as popen,
+    ):
+        denied(
+            lambda: engine.collect_host_metadata(request[:-1] + b',"path":"/etc/passwd"}'),
+            "caller-selected path",
+        )
+        popen.assert_not_called()
+
+
 def main() -> None:
+    test_host_metadata_helper()
+    test_root_collector_invocation()
+
     server_version = {
         "Platform": {"Name": "Docker Engine - Community"},
         "Version": LOCK["engineVersion"],
@@ -513,22 +1013,24 @@ def main() -> None:
         }
         for target, values in MOUNT_EVIDENCE.items()
     }
+    metadata = host_metadata_value()
     with patch.object(
         supervisor.os,
         "lstat",
-        return_value=SimpleNamespace(
-            st_mode=stat.S_IFREG | 0o600,
-            st_uid=0,
-            st_dev=2049,
-        ),
-    ):
+        side_effect=PermissionError(13, "permission denied"),
+    ) as denied_unprivileged_lstat:
         supervisor.validate_engine_file_evidence(
             inspection_started,
             engine_root=ROOT,
             container_id=CONTAINER_ID,
+            owner=OWNER,
+            engine_version=LOCK["engineVersion"],
+            engine_api_version=LOCK["engineApiVersion"],
+            host_metadata=metadata,
             host_mountinfo_bytes=host_mountinfo,
             container_evidence=evidence,
         )
+        denied_unprivileged_lstat.assert_not_called()
         for changed in (
             {**evidence, "/etc/hosts": {**evidence["/etc/hosts"], "readOnly": False}},
             {**evidence, "/etc/hosts": {**evidence["/etc/hosts"], "device": "8:2"}},
@@ -540,10 +1042,65 @@ def main() -> None:
                     inspection_started,
                     engine_root=ROOT,
                     container_id=CONTAINER_ID,
+                    owner=OWNER,
+                    engine_version=LOCK["engineVersion"],
+                    engine_api_version=LOCK["engineApiVersion"],
+                    host_metadata=metadata,
                     host_mountinfo_bytes=host_mountinfo,
                     container_evidence=changed,
                 ),
                 "forged host/container mount evidence",
+            )
+        for changed_metadata in (
+            {**metadata, "owner": "0" * 32},
+            {**metadata, "dockerRootDir": "/changed"},
+            {**metadata, "containerId": "0" * 64},
+            {**metadata, "engineVersion": "29.0.0"},
+            {**metadata, "engineApiVersion": "1.52"},
+            {
+                **metadata,
+                "files": {
+                    **metadata["files"],
+                    "/etc/hosts": {
+                        **metadata["files"]["/etc/hosts"],
+                        "source": "/etc/passwd",
+                    },
+                },
+            },
+            {
+                **metadata,
+                "files": {
+                    **metadata["files"],
+                    "/etc/hosts": {
+                        **metadata["files"]["/etc/hosts"],
+                        "uid": 1000,
+                    },
+                },
+            },
+            {
+                **metadata,
+                "files": {
+                    **metadata["files"],
+                    "/etc/hosts": {
+                        **metadata["files"]["/etc/hosts"],
+                        "mountRoot": "/wrong",
+                    },
+                },
+            },
+        ):
+            denied(
+                lambda changed_metadata=changed_metadata: supervisor.validate_engine_file_evidence(
+                    inspection_started,
+                    engine_root=ROOT,
+                    container_id=CONTAINER_ID,
+                    owner=OWNER,
+                    engine_version=LOCK["engineVersion"],
+                    engine_api_version=LOCK["engineApiVersion"],
+                    host_metadata=changed_metadata,
+                    host_mountinfo_bytes=host_mountinfo,
+                    container_evidence=evidence,
+                ),
+                "unbound or substituted host metadata",
             )
     for invalid_mountinfo in (
         b"",
@@ -560,17 +1117,31 @@ def main() -> None:
     events: list[str] = []
     engine = FakeEngine(events)
     instance = new_supervisor(engine, events)
-    with patch.object(supervisor, "validate_engine_file_evidence"):
-        result = instance.run(LOCK_BYTES)
+    result = instance.run(LOCK_BYTES)
     assert result["outcome"] == "passed"
     assert result["containerDestroyed"] is True
     assert engine.removed and events.count("absent") == 1
     assert events.index("info") < events.index("pre-create") < events.index("create")
     assert events.index("create") < events.index("pre-start") < events.index("start")
+    assert events.index("metadata") < events.index("host-mountinfo")
     assert events.index("host-mountinfo") < events.index("barrier")
     assert events.index("barrier") < events.index("release:RELEASE")
     assert events.index("release:RELEASE") < events.index("summary")
     assert events.index("summary") < events.index("remove") < events.index("absent")
+
+    for attribute, label in (
+        ("metadata_failure", "collector denial"),
+        ("identity_drift_after_metadata", "Engine identity drift"),
+        ("path_drift_after_metadata", "Engine path drift"),
+    ):
+        events = []
+        engine = FakeEngine(events)
+        setattr(engine, attribute, True)
+        instance = new_supervisor(engine, events)
+        denied(lambda: instance.run(LOCK_BYTES), label)
+        assert "metadata" in events
+        assert "release:RELEASE" not in events
+        assert engine.removed and events[-1] == "absent"
 
     for point in ("pre-create", "pre-start", "barrier"):
         events = []
