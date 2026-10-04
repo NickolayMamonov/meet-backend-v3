@@ -43,8 +43,18 @@ set -e
 [ "$status" -eq 1 ]
 grep -Fq 'RETENTION_PROOF_BLOCKED' "$tmp/stderr"
 [ ! -e "$docker_trace" ]
-grep -Fq '"enabled": false' scripts/fixtures/retention-proof/toolchain.lock.json
-grep -Fq '"enabled": false' .github/retention-proof-registration.json
+python3 -B - \
+  scripts/fixtures/retention-proof/toolchain.lock.json \
+  .github/retention-proof-registration.json <<'PY'
+import json
+import sys
+from pathlib import Path
+
+for filename in sys.argv[1:]:
+    value = json.loads(Path(filename).read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("enabled") is not False:
+        raise SystemExit(f"proof activation must remain disabled: {filename}")
+PY
 ! grep -Eq '(^|[[:space:]])(docker|sudo|curl|gh)([[:space:]]|$)|test-test-vps-retention.sh' \
   scripts/run-test-vps-retention-proof.sh
 
