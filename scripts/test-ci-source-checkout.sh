@@ -36,6 +36,33 @@ count_exact() {
 }
 
 jobs=(gradle postgres scripts docker)
+reviewed_source_jobs=(retention-proof-toolchain gradle postgres scripts docker)
+
+for job in "${reviewed_source_jobs[@]}"; do
+  job_block=$(
+    awk -v wanted="$job" '
+      /^  [a-z][a-z0-9-]*:$/ {
+        name=$0
+        sub(/^  /, "", name)
+        sub(/:$/, "", name)
+        in_job=(name == wanted)
+      }
+      in_job { print }
+    ' "$WORKFLOW"
+  )
+
+  [ -n "$job_block" ] || {
+    echo "reviewed source checkout job not found: $job" >&2
+    exit 1
+  }
+  source_checkout_count=$(grep -Fc 'name: Checkout reviewed source' <<<"$job_block" || true)
+  source_ref_count=$(grep -Fc 'ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}' <<<"$job_block" || true)
+  [ "$source_checkout_count" -eq 1 ] && [ "$source_ref_count" -eq 1 ] || {
+    echo "reviewed source checkout/ref must appear once in job: $job" >&2
+    exit 1
+  }
+done
+
 for job in "${jobs[@]}"; do
   job_block=$(
     awk -v wanted="$job" '
@@ -66,12 +93,12 @@ for job in "${jobs[@]}"; do
   }
 done
 
-count_exact 4 \
+count_exact 5 \
   'name: Checkout reviewed source' \
-  'non-release source checkout sites'
-count_exact 4 \
+  'reviewed source checkout sites'
+count_exact 5 \
   'ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}' \
-  'non-release source checkout refs'
+  'reviewed source checkout refs'
 count_exact 4 \
   'name: Record reviewed source identity' \
   'source identity proof steps'
@@ -122,7 +149,7 @@ count_exact 8 \
 
 require 'permissions:' 'workflow permissions'
 require '  contents: read' 'read-only workflow permissions'
-count_exact 2 'contents: read' 'read-only permission declarations'
+count_exact 3 'contents: read' 'read-only permission declarations'
 if grep -Eq 'contents:[[:space:]]*write|permissions:[[:space:]]*write' "$WORKFLOW"; then
   echo "CI workflow grants write permissions" >&2
   exit 1
