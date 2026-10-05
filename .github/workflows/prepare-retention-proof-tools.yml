@@ -1,0 +1,238 @@
+name: Prepare retention proof tools image
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_workflow_sha:
+        description: Exact master workflow SHA approved by the operator-side preflight
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: retention-proof-tools-publisher
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/nickolaymamonov/retention-proof-tools
+  BUILD_INPUT_SHA: cfea146e7d72b85177cb1e42adf3b4cf8e6c7d10
+  BUILD_CI_RUN_ID: 37246504835
+  TOOLCHAIN_LOCK_SHA256: a0e3187dc11eb32503e572363955f66c9681b7b9f397866d03724b5c1925f71b
+  TOOLCHAIN_DOCKERFILE_SHA256: 60eb7d6e54b20468668fa1be3ec024f06907b4fea89eaa3c82747c335aae9621
+  PUBLISHER_WORKFLOW: .github/workflows/prepare-retention-proof-tools.yml
+
+jobs:
+  admit:
+    name: Read-only exact W/B admission
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/master' &&
+      github.workflow_sha == inputs.expected_workflow_sha &&
+      github.sha == inputs.expected_workflow_sha &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      admitted: ${{ steps.admission.outputs.admitted }}
+    steps:
+      - name: Checkout only the exact trusted W revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - id: admission
+        name: Authenticate W, B, CI and exact input bytes
+        timeout-minutes: 4
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EXPECTED_WORKFLOW_SHA: ${{ inputs.expected_workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = NickolayMamonov/meet-backend-v3
+          test "$REPOSITORY_ID" = 1146014865
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/master
+          test "$GITHUB_SHA" = "$WORKFLOW_SHA"
+          test "$WORKFLOW_SHA" = "$EXPECTED_WORKFLOW_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$WORKFLOW_SHA"
+          context="$RUNNER_TEMP/retention-tools-context"
+          timeout 180s python3 -I -B scripts/retention-tools-publisher.py \
+            --workflow-file "$GITHUB_WORKSPACE/$PUBLISHER_WORKFLOW" \
+            --output-dir "$context" \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --event "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --sha "$GITHUB_SHA" \
+            --attempt "$GITHUB_RUN_ATTEMPT" \
+            --run-id "$GITHUB_RUN_ID" \
+            --repository "$REPOSITORY" \
+            --repository-id "$REPOSITORY_ID"
+          printf 'admitted=true\n' >>"$GITHUB_OUTPUT"
+
+  publish:
+    name: Build once, inspect, publish once and attest
+    needs: admit
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/master' &&
+      github.workflow_sha == inputs.expected_workflow_sha &&
+      github.sha == inputs.expected_workflow_sha &&
+      github.run_attempt == 1 &&
+      needs.admit.outputs.admitted == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout only the exact trusted W revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - id: admission
+        name: Recheck live W and materialize pinned B inputs
+        timeout-minutes: 4
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EXPECTED_WORKFLOW_SHA: ${{ inputs.expected_workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = NickolayMamonov/meet-backend-v3
+          test "$REPOSITORY_ID" = 1146014865
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/master
+          test "$GITHUB_SHA" = "$WORKFLOW_SHA"
+          test "$WORKFLOW_SHA" = "$EXPECTED_WORKFLOW_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$WORKFLOW_SHA"
+          context="$RUNNER_TEMP/retention-tools-context"
+          timeout 180s python3 -I -B scripts/retention-tools-publisher.py \
+            --workflow-file "$GITHUB_WORKSPACE/$PUBLISHER_WORKFLOW" \
+            --output-dir "$context" \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --event "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --sha "$GITHUB_SHA" \
+            --attempt "$GITHUB_RUN_ATTEMPT" \
+            --run-id "$GITHUB_RUN_ID" \
+            --repository "$REPOSITORY" \
+            --repository-id "$REPOSITORY_ID" \
+            --recheck-only
+          timeout 90s python3 -I -B scripts/retention-tools-publisher.py \
+            --derive-build-args \
+            --lock "$context/toolchain.lock.json" \
+            --dockerfile "$context/Dockerfile" \
+            >"$RUNNER_TEMP/retention-tools-build-args"
+          printf 'context=%s\n' "$context" >>"$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.8.0
+      - name: Login to GHCR with the ephemeral repository token
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: build
+        name: Build exact admitted tools context once
+        timeout-minutes: 10
+        shell: bash
+        env:
+          CONTEXT: ${{ steps.admission.outputs.context }}
+        run: |
+          set -euo pipefail
+          engine_version=$(timeout 30s docker version \
+            --format '{{.Client.Version}}/{{.Server.Version}}/{{.Server.APIVersion}}')
+          buildx_version=$(timeout 30s docker buildx version)
+          printf 'Builder Docker version: %s\nBuilder Buildx version: %s\n' \
+            "$engine_version" "$buildx_version" >>"$GITHUB_STEP_SUMMARY"
+          while IFS='=' read -r key value; do
+            case "$key" in
+              UBUNTU_BASE_IMAGE|UBUNTU_SNAPSHOT|PACKAGE_LOCK_BASE64|PACKAGE_LOCK_SHA256|PACKAGE_PINS_BASE64|PACKAGE_PINS_SHA256|DOCKERFILE_SHA256) ;;
+              *) echo "unexpected derived build argument" >&2; exit 1 ;;
+            esac
+            export "$key=$value"
+          done <"$RUNNER_TEMP/retention-tools-build-args"
+          tag="prepare-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          timeout 600s docker buildx build \
+            --pull \
+            --no-cache \
+            --platform linux/amd64 \
+            --progress plain \
+            --load \
+            --file "$CONTEXT/Dockerfile" \
+            --tag "$IMAGE:$tag" \
+            --build-arg "UBUNTU_BASE_IMAGE=$UBUNTU_BASE_IMAGE" \
+            --build-arg "UBUNTU_SNAPSHOT=$UBUNTU_SNAPSHOT" \
+            --build-arg "PACKAGE_LOCK_BASE64=$PACKAGE_LOCK_BASE64" \
+            --build-arg "PACKAGE_LOCK_SHA256=$PACKAGE_LOCK_SHA256" \
+            --build-arg "PACKAGE_PINS_BASE64=$PACKAGE_PINS_BASE64" \
+            --build-arg "PACKAGE_PINS_SHA256=$PACKAGE_PINS_SHA256" \
+            --build-arg "DOCKERFILE_SHA256=$DOCKERFILE_SHA256" \
+            "$CONTEXT"
+          test "$(timeout 30s docker image inspect "$IMAGE:$tag" \
+            --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
+          labels=$(timeout 30s docker image inspect "$IMAGE:$tag" \
+            --format '{{json .Config.Labels}}')
+          jq -e \
+            --arg base "$UBUNTU_BASE_IMAGE" \
+            --arg snapshot "$UBUNTU_SNAPSHOT" \
+            --arg packages "$PACKAGE_LOCK_SHA256" \
+            --arg dockerfile "$DOCKERFILE_SHA256" '
+              type == "object" and
+              (has("org.opencontainers.image.source") | not) and
+              .["org.opencontainers.image.base.name"] == $base and
+              .["com.meet.retention-proof.snapshot"] == $snapshot and
+              .["com.meet.retention-proof.packages-sha256"] == $packages and
+              .["com.meet.retention-proof.dockerfile-sha256"] == $dockerfile
+            ' <<<"$labels" >/dev/null
+          timeout 150s docker save "$IMAGE:$tag" |
+            timeout 120s python3 -I -B scripts/inspect-retention-tools-image.py
+          printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
+      - id: publish
+        name: Push exact inspected image once and bind registry digest
+        timeout-minutes: 4
+        shell: bash
+        env:
+          TAG: ${{ steps.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          push_log="$RUNNER_TEMP/retention-tools-push.log"
+          timeout 240s docker push "$IMAGE:$TAG" >"$push_log" 2>&1
+          digest_lines=$(grep -Eo 'digest: sha256:[0-9a-f]{64}' "$push_log" || true)
+          test "$(printf '%s\n' "$digest_lines" | wc -l)" -eq 1
+          image_digest=${digest_lines#digest: }
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          timeout 30s docker buildx imagetools inspect "$IMAGE@$image_digest" --raw \
+            >"$RUNNER_TEMP/retention-tools-registry-manifest.json"
+          manifest_sha256=$(sha256sum "$RUNNER_TEMP/retention-tools-registry-manifest.json" | cut -d' ' -f1)
+          test "$manifest_sha256" = "${image_digest#sha256:}"
+          printf 'digest=%s\n' "${image_digest#sha256:}" >>"$GITHUB_OUTPUT"
+          printf 'Published immutable image digest: %s\n' "$image_digest"
+      - name: Sign one provenance statement for the published digest
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
