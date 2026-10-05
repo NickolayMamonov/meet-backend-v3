@@ -67,18 +67,31 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      packages: read
+      actions: read
       attestations: read
     env:
       IMAGE: ghcr.io/nickolaymamonov/retention-proof-tools
-      PACKAGE_OWNER: ${{ github.repository_owner }}
-      GH_TOKEN: ${{ github.token }}
+      APPROVED_PUBLISHER_WORKFLOW_SHA: ""
     steps:
       - name: Checkout reviewed source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
+          persist-credentials: false
+
+      - name: Inspect the pinned Ubuntu base CA path read-only
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          classification=$(timeout 400s bash scripts/inspect-retention-proof-base-ca.sh)
+          case "$classification" in
+            CA_BUNDLE_PRESENT_REGULAR|CA_BUNDLE_PRESENT_SYMLINK|CA_BUNDLE_PRESENT_NONREGULAR|CA_BUNDLE_ABSENT) ;;
+            *) echo "unexpected base inspection classification" >&2; exit 1 ;;
+          esac
+          printf 'base_ca_bundle=%s\n' "$classification" >>"$GITHUB_OUTPUT"
+          printf '%s\n' "$classification"
 
       - name: Validate image lock and provenance identity
         id: lock
@@ -92,7 +105,8 @@ jobs:
           package_lock_json=$(jq -cS '.packages' "$lock")
           package_lock_sha256=$(printf '%s' "$package_lock_json" | sha256sum | cut -d' ' -f1)
           dockerfile_sha256=$(sha256sum "$dockerfile" | cut -d' ' -f1)
-          test "$(jq -r '.enabled' "$lock")" = false
+          jq -e '.enabled == false' "$lock" >/dev/null
+          jq -e '.enabled == false' .github/retention-proof-registration.json >/dev/null
           test "$(jq -r '.dockerfileSha256' "$lock")" = "$dockerfile_sha256"
           test "$(jq -r '.packages | length' "$lock")" = 115
           image_digest=$(jq -r '.preparedImage' "$lock")
@@ -134,39 +148,63 @@ jobs:
           printf 'package_lock_sha256=%s\n' "$package_lock_sha256" >>"$GITHUB_OUTPUT"
           printf 'provenance_sha256=%s\n' "$provenance_sha256" >>"$GITHUB_OUTPUT"
 
-      - name: Authenticate to private GHCR package
-        if: steps.lock.outputs.prepared == 'true'
-        env:
-          GHCR_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$GHCR_TOKEN" |
-            timeout 30s docker login ghcr.io --username "${{ github.actor }}" --password-stdin
-
-      - name: Pull and verify exact tools-only image
+      - name: Pull and inspect exact public tools-only digest anonymously
         if: steps.lock.outputs.prepared == 'true'
         env:
           IMAGE_DIGEST: ${{ steps.lock.outputs.image_digest }}
-          SOURCE_SHA: ${{ steps.lock.outputs.source_sha }}
-          SIGNER_WORKFLOW: ${{ steps.lock.outputs.signer_workflow }}
           PACKAGE_LOCK_SHA256: ${{ steps.lock.outputs.package_lock_sha256 }}
-          PROVENANCE_SHA256: ${{ steps.lock.outputs.provenance_sha256 }}
         run: |
           set -euo pipefail
-          test "$(timeout 30s gh api "users/$PACKAGE_OWNER/packages/container/retention-proof-tools" --jq '.visibility')" = private
+          unset DOCKER_AUTH_CONFIG
+          DOCKER_CONFIG="$(mktemp -d)"
+          chmod 700 "$DOCKER_CONFIG"
+          export DOCKER_CONFIG
+          test -z "$(find "$DOCKER_CONFIG" -mindepth 1 -print -quit)"
           timeout 240s docker pull "$IMAGE@$IMAGE_DIGEST" >/dev/null
           test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
-          test -z "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')"
+          labels=$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{json .Config.Labels}}')
+          jq -e 'type == "object" and (has("org.opencontainers.image.source") | not)' <<<"$labels" >/dev/null
           test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.base.name"}}')" = ubuntu:24.04@sha256:f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b
           test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{index .Config.Labels "com.meet.retention-proof.snapshot"}}')" = 20260918T000000Z
           test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{index .Config.Labels "com.meet.retention-proof.packages-sha256"}}')" = "$PACKAGE_LOCK_SHA256"
           test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{index .Config.Labels "com.meet.retention-proof.dockerfile-sha256"}}')" = "$(sha256sum scripts/fixtures/retention-proof/Dockerfile | cut -d' ' -f1)"
+          timeout 120s docker save "$IMAGE@$IMAGE_DIGEST" |
+            timeout 120s python3 -I -B scripts/inspect-retention-tools-image.py
+
+      - name: Verify signed provenance chain with read-only GitHub access
+        if: steps.lock.outputs.prepared == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          IMAGE_DIGEST: ${{ steps.lock.outputs.image_digest }}
+          SOURCE_SHA: ${{ steps.lock.outputs.source_sha }}
+          SIGNER_WORKFLOW: ${{ steps.lock.outputs.signer_workflow }}
+          PROVENANCE_SHA256: ${{ steps.lock.outputs.provenance_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$SIGNER_WORKFLOW" = .github/workflows/prepare-retention-proof-tools.yml
+          test "$(sha256sum scripts/fixtures/retention-proof/provenance.bundle.json | cut -d' ' -f1)" = "$PROVENANCE_SHA256"
+          [[ "$APPROVED_PUBLISHER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
           timeout 60s gh attestation verify "oci://$IMAGE@$IMAGE_DIGEST" \
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "github.com/$GITHUB_REPOSITORY/$SIGNER_WORKFLOW" \
-            --source-digest "$SOURCE_SHA" \
-            --bundle scripts/fixtures/retention-proof/provenance.bundle.json >/dev/null
-          test "$(sha256sum scripts/fixtures/retention-proof/provenance.bundle.json | cut -d' ' -f1)" = "$PROVENANCE_SHA256"
+            --source-digest "$APPROVED_PUBLISHER_WORKFLOW_SHA" \
+            --signer-digest "$APPROVED_PUBLISHER_WORKFLOW_SHA" \
+            --source-ref refs/heads/master \
+            --bundle scripts/fixtures/retention-proof/provenance.bundle.json \
+            --format json >"$RUNNER_TEMP/retention-tools-verified-attestation.json"
+          chain=$(timeout 120s python3 -I -B \
+            scripts/retention-tools-provenance.py \
+            --expected-workflow-sha "$APPROVED_PUBLISHER_WORKFLOW_SHA" \
+            --provenance scripts/fixtures/retention-proof/provenance.json \
+            --bundle scripts/fixtures/retention-proof/provenance.bundle.json \
+            --current-lock scripts/fixtures/retention-proof/toolchain.lock.json \
+            --current-dockerfile scripts/fixtures/retention-proof/Dockerfile \
+            --verified-attestation "$RUNNER_TEMP/retention-tools-verified-attestation.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID")
+          workflow_sha=$(jq -er '.workflowSha' <<<"$chain")
+          test "$(jq -er '.buildInputSha' <<<"$chain")" = "$SOURCE_SHA"
 
   gradle:
     name: Gradle tests and build
@@ -736,7 +774,17 @@ jobs:
             "$TOOLING_SCRIPTS/retention-proof-authorize.py" \
             "$TOOLING_SCRIPTS/retention-proof-host-metadata.py" \
             "$TOOLING_SCRIPTS/retention-proof-supervisor.py" \
-            "$TOOLING_SCRIPTS/test-retention-proof-registration.py"
+            "$TOOLING_SCRIPTS/test-retention-proof-registration.py" \
+            "$TOOLING_SCRIPTS/prepare-retention-proof-tools.py" \
+            "$TOOLING_SCRIPTS/test-retention-tools-preparation.py" \
+            "$TOOLING_SCRIPTS/inspect-retention-tools-image.py" \
+            "$TOOLING_SCRIPTS/retention-tools-provenance.py" \
+            "$TOOLING_SCRIPTS/test-retention-tools-provenance.py"
+          timeout 120s python3 -I -B \
+            "$TOOLING_SCRIPTS/test-retention-tools-preparation.py"
+          timeout 120s python3 -I -B \
+            "$TOOLING_SCRIPTS/test-retention-tools-provenance.py"
+          timeout 120s bash "$TOOLING_SCRIPTS/test-retention-proof-base-ca.sh"
           timeout 300s bash "$TOOLING_SCRIPTS/test-retention-proof-launcher.sh"
           bash "$TOOLING_SCRIPTS/test-release-asset-inventory.sh"
           bash "$TOOLING_SCRIPTS/test-release-page-normalization.sh"

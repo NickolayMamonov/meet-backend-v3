@@ -12,22 +12,26 @@ The source is exported separately and mounted read-only by the trusted
 supervisor. No GitHub token, provider credential, or host secret enters the
 image or proof container.
 
-The private GHCR publication is currently blocked on package access
-configuration. The backend repository is public, and publishing a linked
-package with its `GITHUB_TOKEN` would inherit repository access. The operator
-requires repository-permission inheritance disabled and explicit
-Actions-only access before any package is created or image is published.
-GitHub exposes those package settings only in the package settings UI, so they
-cannot be prepared before a first publication through the authorized
-repository-token path. The toolchain lock remains incomplete and disabled;
-ordinary CI's exact-digest pull/provenance check is deferred until the package
-exists under the approved access model.
+The approved package identity is the public
+`ghcr.io/nickolaymamonov/retention-proof-tools`; consumers use only its
+immutable digest. Public visibility is an intentional disclosure: once made
+public, it cannot be changed back to private, and deleting the package cannot
+retract copies already downloaded. An authorized administrator must confirm
+the package identity and public-disclosure decision in GitHub's package
+settings UI and verify the resulting Public state. Repository linkage or
+inherited access does not prove visibility. If authorized UI access is
+unavailable, publication remains unaccepted until an administrator completes
+that manual step; no settings-API workaround is permitted.
+
+The publication workflow is manual-only and separate from the protected proof.
+It publishes only the tools image, records its returned immutable digest and
+signed provenance, and never runs the image entrypoint or fixture. CI verifies
+prepared images with a fresh anonymous digest pull, isolated from any
+attestation-verification token. Both the toolchain lock and proof registration
+remain disabled. Publication does not authorize source or fixture execution,
+or provider/VPS/backup/restore/prune/deploy/catalog/live operations.
 
 The toolchain lock and registration remain disabled. A local Docker Desktop
 build is preparation evidence only, not hosted Ubuntu Engine evidence. The
-protected environment is master-only, reviewer protected, and is not
+protected environment is master-only and reviewer-protected; it is not
 permission to dispatch or approve a proof.
-
-Publishing this tools-only image does not authorize source or fixture execution,
-or provider/VPS/backup/restore/prune/deploy/catalog operations. Those remain
-separately gated.
