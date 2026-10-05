@@ -1,0 +1,22 @@
+{
+  "schema": "meet-backend/beta-recurring-tooling-allowlist/v1",
+  "awsCli": {
+    "publisher": "amazon-aws",
+    "platform": "linux-x86_64",
+    "version": "2.27.53",
+    "archiveUrl": "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.27.53.zip",
+    "sha256": "f7e69d8bce3b48518c6d1096312807259de526243dd35f2ca0b9285fa37d54eb"
+  },
+  "tools": [
+    {
+      "role": "capture",
+      "path": "scripts/run-beta-recurring-capture-command.sh",
+      "sha256": "23b1207c717afc16cf705ed119dec2979cb4ea8ce406614af42e5a4813381600"
+    },
+    {
+      "role": "restore",
+      "path": "scripts/run-beta-recurring-restore-command.sh",
+      "sha256": "4e5488da5ebd7092047e20fbd120e9028e449417eacca3706a6bac907a9f4225"
+    }
+  ]
+}

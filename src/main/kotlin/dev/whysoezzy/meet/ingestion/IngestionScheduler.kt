@@ -1,5 +1,6 @@
 package dev.whysoezzy.meet.ingestion
 
+import dev.whysoezzy.meet.api.error.BackupSafetyBlockedException
 import mu.KotlinLogging
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.scheduling.annotation.Scheduled
@@ -15,7 +16,11 @@ class IngestionScheduler(
     @Scheduled(cron = "\${app.ingestion.cron}", zone = "\${app.ingestion.zone}")
     fun scheduled() {
         logger.info { "Запуск ингестии по расписанию" }
-        val runs = ingestionService.runAll()
-        logger.info { "Ингестия завершена: прогонов=${runs.size}" }
+        try {
+            val runs = ingestionService.runAll()
+            logger.info { "Ингестия завершена: прогонов=${runs.size}" }
+        } catch (_: BackupSafetyBlockedException) {
+            logger.warn { "Ингестия пропущена: backup safety policy blocks new work" }
+        }
     }
 }

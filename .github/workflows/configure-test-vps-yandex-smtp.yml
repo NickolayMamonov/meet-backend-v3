@@ -152,6 +152,9 @@ jobs:
             scripts/production-compose.sh
             scripts/production-config-digest.sh
             scripts/test-vps-runtime-invariants.sh
+            scripts/beta-backup-policy.sh
+            scripts/check-beta-backup-safety.sh
+            scripts/beta-backup-runtime-gate.sh
             scripts/configure-test-vps-yandex-smtp.sh
           )
           for file in "${files[@]}"; do

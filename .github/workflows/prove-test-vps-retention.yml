@@ -1,0 +1,224 @@
+name: Prove test-VPS retention fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact reviewed source commit
+        required: true
+        type: string
+      image_digest:
+        description: Separately approved immutable proof image digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: retention-proof-${{ github.repository }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  admission:
+    name: Admit an exact attempt-1 proof tuple
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/master' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      registration: ${{ steps.authorize.outputs.registration }}
+      tuple: ${{ steps.authorize.outputs.tuple }}
+      tuple_sha256: ${{ steps.authorize.outputs.tuple_sha256 }}
+    steps:
+      - name: Check out the workflow revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: workflow
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - id: registration
+        name: Read fixed live master registration
+        working-directory: workflow
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/master
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          timeout 60s python3 -B scripts/retention-proof-registration.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            >"$RUNNER_TEMP/retention-registration.json"
+          python3 -B - "$RUNNER_TEMP/retention-registration.json" \
+            "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+          if len(encoded.encode("utf-8")) > 16 * 1024:
+              raise SystemExit(1)
+          with open(sys.argv[2], "a", encoding="utf-8") as output:
+              output.write("identity=" + encoded + "\n")
+          PY
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ fromJSON(steps.registration.outputs.identity).registration.workflowRevision }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+      - id: authorize
+        name: Validate live registration, exact CI and tuple
+        working-directory: trusted
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          EXPECTED_REGISTRATION: ${{ steps.registration.outputs.identity }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          timeout 120s python3 -B scripts/retention-proof-authorize.py \
+            --checkpoint admission \
+            --source-sha "$SOURCE_SHA" \
+            --plan-sha256 148fa8e5529122094f9161cae83f568c7693110b10ba668882c9b02b71c97db6 \
+            --image-digest "$IMAGE_DIGEST" \
+            --source-checkout "$GITHUB_WORKSPACE/source" \
+            --expected-registration "$EXPECTED_REGISTRATION" \
+            >"$RUNNER_TEMP/retention-admission.json"
+          python3 -B - "$RUNNER_TEMP/retention-admission.json" \
+            "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          tuple_value = value["tuple"]
+          tuple_json = value["tupleBytes"]
+          tuple_digest = value["tupleSha256"]
+          if json.loads(tuple_json) != tuple_value:
+              raise SystemExit(1)
+          outputs = {
+              "registration": json.dumps(
+                  value["registration"],
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ),
+              "tuple": tuple_json,
+              "tuple_sha256": tuple_digest,
+          }
+          with open(sys.argv[2], "a", encoding="utf-8") as stream:
+              for key, item in outputs.items():
+                  if "\n" in item or "\r" in item:
+                      raise SystemExit(1)
+                  stream.write(key + "=" + item + "\n")
+          with open(sys.argv[3], "a", encoding="utf-8") as summary:
+              summary.write("## Exact retention-proof approval tuple\n\n")
+              summary.write("Approve the protected environment only with the\n")
+              summary.write("required exact comment shown below.\n\n")
+              summary.write("`retention-proof:")
+              summary.write(str(tuple_value["runId"]) + ":1:")
+              summary.write(tuple_digest + "`\n\n```json\n")
+              summary.write(json.dumps(tuple_value, sort_keys=True, indent=2))
+              summary.write("\n```\n")
+          PY
+
+  proof:
+    name: Isolated privileged retention proof
+    needs: admission
+    if: needs.admission.result == 'success' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: retention-fixture-proof
+    steps:
+      - name: Check out the registered trusted tooling revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ fromJSON(needs.admission.outputs.registration).registration.workflowRevision }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out the exact source revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Reauthorize at the first protected execution step
+        working-directory: trusted
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_REGISTRATION: ${{ needs.admission.outputs.registration }}
+          EXPECTED_TUPLE: ${{ needs.admission.outputs.tuple }}
+          EXPECTED_TUPLE_SHA256: ${{ needs.admission.outputs.tuple_sha256 }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          timeout 120s python3 -B scripts/retention-proof-authorize.py \
+            --checkpoint job \
+            --source-sha "$SOURCE_SHA" \
+            --plan-sha256 148fa8e5529122094f9161cae83f568c7693110b10ba668882c9b02b71c97db6 \
+            --image-digest "$IMAGE_DIGEST" \
+            --source-checkout "$GITHUB_WORKSPACE/source" \
+            --expected-registration "$EXPECTED_REGISTRATION" \
+            --expected-tuple-sha256 "$EXPECTED_TUPLE_SHA256" \
+            >"$RUNNER_TEMP/retention-protected-job.json"
+          python3 -B - "$RUNNER_TEMP/retention-protected-job.json" \
+            "$EXPECTED_TUPLE" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          current = json.loads(
+              Path(sys.argv[1]).read_text(encoding="utf-8")
+          )
+          expected = json.loads(sys.argv[2])
+          if current["tuple"] != expected or current["reviewerApproved"] is not True:
+              raise SystemExit(1)
+          PY
+      - name: Run the isolated retention proof
+        working-directory: trusted
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_REGISTRATION: ${{ needs.admission.outputs.registration }}
+          EXPECTED_TUPLE_SHA256: ${{ needs.admission.outputs.tuple_sha256 }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_CHECKOUT: ${{ github.workspace }}/source
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          timeout 600s scripts/run-test-vps-retention-proof.sh
+      - name: Retain only the sanitized verified summary
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: retention-proof-summary-${{ github.run_id }}-attempt-1
+          path: ${{ runner.temp }}/retention-proof-summary.json
+          if-no-files-found: error
+          retention-days: 7

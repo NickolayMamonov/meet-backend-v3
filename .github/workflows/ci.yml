@@ -62,6 +62,150 @@ jobs:
           test "$RELEASE_TAG" = "v$RELEASE_VERSION"
           [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
 
+  retention-proof-toolchain:
+    name: Verify pinned retention tools package when prepared
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    env:
+      IMAGE: ghcr.io/nickolaymamonov/retention-proof-tools
+      APPROVED_PUBLISHER_WORKFLOW_SHA: ""
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Inspect the pinned Ubuntu base CA path read-only
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          classification=$(timeout 400s bash scripts/inspect-retention-proof-base-ca.sh)
+          case "$classification" in
+            CA_BUNDLE_PRESENT_REGULAR|CA_BUNDLE_PRESENT_SYMLINK|CA_BUNDLE_PRESENT_NONREGULAR|CA_BUNDLE_ABSENT) ;;
+            *) echo "unexpected base inspection classification" >&2; exit 1 ;;
+          esac
+          printf 'base_ca_bundle=%s\n' "$classification" >>"$GITHUB_OUTPUT"
+          printf '%s\n' "$classification"
+
+      - name: Validate image lock and provenance identity
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=scripts/fixtures/retention-proof/toolchain.lock.json
+          dockerfile=scripts/fixtures/retention-proof/Dockerfile
+          provenance=scripts/fixtures/retention-proof/provenance.json
+          bundle=scripts/fixtures/retention-proof/provenance.bundle.json
+          package_lock_json=$(jq -cS '.packages' "$lock")
+          package_lock_sha256=$(printf '%s' "$package_lock_json" | sha256sum | cut -d' ' -f1)
+          dockerfile_sha256=$(sha256sum "$dockerfile" | cut -d' ' -f1)
+          jq -e '.enabled == false' "$lock" >/dev/null
+          jq -e '.enabled == false' .github/retention-proof-registration.json >/dev/null
+          test "$(jq -r '.dockerfileSha256' "$lock")" = "$dockerfile_sha256"
+          test "$(jq -r '.packages | length' "$lock")" = 115
+          image_digest=$(jq -r '.preparedImage' "$lock")
+          provenance_sha256=$(jq -r '.provenanceSha256' "$lock")
+
+          if [ -z "$image_digest" ] && [ -z "$provenance_sha256" ] &&
+             [ ! -e "$provenance" ] && [ ! -e "$bundle" ]; then
+            echo "toolchain package publication is deferred; protected proof remains disabled"
+            echo "prepared=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$provenance_sha256" =~ ^[0-9a-f]{64}$ ]]
+          test -f "$provenance" && test ! -L "$provenance"
+          test -f "$bundle" && test ! -L "$bundle"
+          test "$(wc -c <"$bundle")" -le 65536
+          test "$(sha256sum "$bundle" | cut -d' ' -f1)" = "$provenance_sha256"
+          jq -e \
+            --arg image "$IMAGE" \
+            --arg image_digest "$image_digest" \
+            --arg bundle_sha256 "$provenance_sha256" '
+              type == "object" and
+              (keys == ["bundleSha256","image","imageDigest","runId","schemaVersion","sourceSha","workflow"]) and
+              .schemaVersion == 1 and
+              .image == $image and
+              .imageDigest == $image_digest and
+              .bundleSha256 == $bundle_sha256 and
+              (.sourceSha | type == "string" and test("^[0-9a-f]{40}$")) and
+              (.workflow | type == "string" and test("^\\.github/workflows/[A-Za-z0-9_.-]+\\.yml$")) and
+              (.runId | type == "string" and test("^[1-9][0-9]*$"))
+            ' "$provenance" >/dev/null
+          source_sha=$(jq -r '.sourceSha' "$provenance")
+          signer_workflow=$(jq -r '.workflow' "$provenance")
+          printf 'prepared=true\n' >>"$GITHUB_OUTPUT"
+          printf 'image_digest=%s\n' "$image_digest" >>"$GITHUB_OUTPUT"
+          printf 'source_sha=%s\n' "$source_sha" >>"$GITHUB_OUTPUT"
+          printf 'signer_workflow=%s\n' "$signer_workflow" >>"$GITHUB_OUTPUT"
+          printf 'package_lock_sha256=%s\n' "$package_lock_sha256" >>"$GITHUB_OUTPUT"
+          printf 'provenance_sha256=%s\n' "$provenance_sha256" >>"$GITHUB_OUTPUT"
+
+      - name: Pull and inspect exact public tools-only digest anonymously
+        if: steps.lock.outputs.prepared == 'true'
+        env:
+          IMAGE_DIGEST: ${{ steps.lock.outputs.image_digest }}
+          PACKAGE_LOCK_SHA256: ${{ steps.lock.outputs.package_lock_sha256 }}
+        run: |
+          set -euo pipefail
+          unset DOCKER_AUTH_CONFIG
+          DOCKER_CONFIG="$(mktemp -d)"
+          chmod 700 "$DOCKER_CONFIG"
+          export DOCKER_CONFIG
+          test -z "$(find "$DOCKER_CONFIG" -mindepth 1 -print -quit)"
+          timeout 240s docker pull "$IMAGE@$IMAGE_DIGEST" >/dev/null
+          test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
+          labels=$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{json .Config.Labels}}')
+          jq -e 'type == "object" and (has("org.opencontainers.image.source") | not)' <<<"$labels" >/dev/null
+          test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.base.name"}}')" = ubuntu:24.04@sha256:f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b
+          test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{index .Config.Labels "com.meet.retention-proof.snapshot"}}')" = 20260918T000000Z
+          test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{index .Config.Labels "com.meet.retention-proof.packages-sha256"}}')" = "$PACKAGE_LOCK_SHA256"
+          test "$(timeout 30s docker image inspect "$IMAGE@$IMAGE_DIGEST" --format '{{index .Config.Labels "com.meet.retention-proof.dockerfile-sha256"}}')" = "$(sha256sum scripts/fixtures/retention-proof/Dockerfile | cut -d' ' -f1)"
+          timeout 120s docker save "$IMAGE@$IMAGE_DIGEST" |
+            timeout 120s python3 -I -B scripts/inspect-retention-tools-image.py
+
+      - name: Verify signed provenance chain with read-only GitHub access
+        if: steps.lock.outputs.prepared == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          IMAGE_DIGEST: ${{ steps.lock.outputs.image_digest }}
+          SOURCE_SHA: ${{ steps.lock.outputs.source_sha }}
+          SIGNER_WORKFLOW: ${{ steps.lock.outputs.signer_workflow }}
+          PROVENANCE_SHA256: ${{ steps.lock.outputs.provenance_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$SIGNER_WORKFLOW" = .github/workflows/prepare-retention-proof-tools.yml
+          test "$(sha256sum scripts/fixtures/retention-proof/provenance.bundle.json | cut -d' ' -f1)" = "$PROVENANCE_SHA256"
+          [[ "$APPROVED_PUBLISHER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          timeout 60s gh attestation verify "oci://$IMAGE@$IMAGE_DIGEST" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "github.com/$GITHUB_REPOSITORY/$SIGNER_WORKFLOW" \
+            --source-digest "$APPROVED_PUBLISHER_WORKFLOW_SHA" \
+            --signer-digest "$APPROVED_PUBLISHER_WORKFLOW_SHA" \
+            --source-ref refs/heads/master \
+            --bundle scripts/fixtures/retention-proof/provenance.bundle.json \
+            --format json >"$RUNNER_TEMP/retention-tools-verified-attestation.json"
+          chain=$(timeout 120s python3 -I -B \
+            scripts/retention-tools-provenance.py \
+            --expected-workflow-sha "$APPROVED_PUBLISHER_WORKFLOW_SHA" \
+            --provenance scripts/fixtures/retention-proof/provenance.json \
+            --bundle scripts/fixtures/retention-proof/provenance.bundle.json \
+            --current-lock scripts/fixtures/retention-proof/toolchain.lock.json \
+            --current-dockerfile scripts/fixtures/retention-proof/Dockerfile \
+            --verified-attestation "$RUNNER_TEMP/retention-tools-verified-attestation.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID")
+          workflow_sha=$(jq -er '.workflowSha' <<<"$chain")
+          test "$(jq -er '.buildInputSha' <<<"$chain")" = "$SOURCE_SHA"
+
   gradle:
     name: Gradle tests and build
     runs-on: ubuntu-24.04
@@ -245,6 +389,358 @@ jobs:
             expected_sha="${PR_HEAD_SHA:-$WORKFLOW_SHA}"
             test "$actual_sha" = "$expected_sha"
           fi
+      - name: Read-only Docker Engine info and server API inspection
+        working-directory: ${{ inputs.source_sha != '' && 'tooling' || '.' }}
+        run: |
+          set -euo pipefail
+          timeout 65s python3 -B - <<'PY'
+          import importlib.util
+          import re
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location(
+              "retention_proof_supervisor",
+              Path("scripts/retention-proof-supervisor.py"),
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("retention supervisor module is unavailable")
+          supervisor = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(supervisor)
+          engine = supervisor.DockerEngine()
+          metadata = engine.info()
+          if (
+              not isinstance(metadata.get("DockerRootDir"), str)
+              or not metadata["DockerRootDir"].startswith("/")
+              or not isinstance(metadata.get("ServerVersion"), str)
+              or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", metadata["ServerVersion"])
+              or not isinstance(metadata.get("ApiVersion"), str)
+              or not re.fullmatch(r"[0-9]+\.[0-9]+", metadata["ApiVersion"])
+          ):
+              raise SystemExit("Docker Engine info/version metadata is incomplete")
+          print(
+              "read-only Docker Engine metadata validated: "
+              f"server={metadata['ServerVersion']} api={metadata['ApiVersion']}"
+          )
+          PY
+      - name: Verify hosted Docker Engine generated mount layout
+        working-directory: ${{ inputs.source_sha != '' && 'tooling' || '.' }}
+        run: |
+          set -euo pipefail
+          timeout 150s python3 -B - <<'PY'
+          import importlib.util
+          import json
+          import re
+          import subprocess
+          import uuid
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location(
+              "retention_proof_supervisor",
+              Path("scripts/retention-proof-supervisor.py"),
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("retention supervisor module is unavailable")
+          supervisor = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(supervisor)
+
+          engine = supervisor.DockerEngine()
+          engine_info = engine.info()
+          expected_lock = {
+              "engineVersion": "28.0.4",
+              "engineApiVersion": "1.48",
+              "engineLayout": "moby-v28-root-container-id-v1",
+          }
+          docker_root = supervisor.validate_engine_info(engine_info, expected_lock)
+          image = (
+              "ubuntu:24.04@sha256:"
+              "f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b"
+          )
+          owner = uuid.uuid4().hex
+          name = "meet-retention-engine-layout-" + owner
+          container_id = ""
+          create_attempted = False
+          environment = engine._environment()
+
+          def docker(arguments, *, timeout=30, maximum=1024 * 1024):
+              try:
+                  result = subprocess.run(
+                      ["docker", *arguments],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      timeout=timeout,
+                      env=environment,
+                      check=False,
+                  )
+              except (OSError, subprocess.SubprocessError) as error:
+                  raise RuntimeError("bounded Docker Engine probe failed") from error
+              if len(result.stdout) > maximum or len(result.stderr) > 4096:
+                  raise RuntimeError("Docker Engine probe response exceeded its bound")
+              if result.returncode != 0:
+                  detail = result.stderr.decode("utf-8", errors="replace").strip()
+                  raise RuntimeError(
+                      f"Docker {arguments[0]} failed with exit {result.returncode}: {detail}"
+                  )
+              return result.stdout
+
+          def inspect(identifier):
+              response = json.loads(
+                  docker(["inspect", "--type", "container", identifier])
+              )
+              if not isinstance(response, list) or len(response) != 1:
+                  raise RuntimeError("named container inspection is malformed")
+              return response[0]
+
+          def owned_container_id():
+              identifiers = docker(
+                  [
+                      "ps",
+                      "--all",
+                      "--quiet",
+                      "--no-trunc",
+                      "--filter",
+                      "name=" + name,
+                  ],
+                  maximum=4096,
+              ).decode("ascii", errors="strict").splitlines()
+              if not identifiers:
+                  return ""
+              if len(identifiers) != 1 or not re.fullmatch(r"[0-9a-f]{64}", identifiers[0]):
+                  raise RuntimeError("named container teardown inventory is ambiguous")
+              inspection = inspect(identifiers[0])
+              if not isinstance(inspection, dict):
+                  raise RuntimeError("named container teardown inspection is malformed")
+              config = inspection.get("Config") if isinstance(inspection, dict) else None
+              labels = config.get("Labels") if isinstance(config, dict) else None
+              if (
+                  inspection.get("Id") != identifiers[0]
+                  or inspection.get("Name") != "/" + name
+                  or not isinstance(labels, dict)
+                  or labels.get("com.meet.retention-proof.owner") != owner
+                  or (container_id and container_id != identifiers[0])
+              ):
+                  raise RuntimeError("named container teardown ownership differs")
+              return identifiers[0]
+
+          stage = "base-image pull"
+          try:
+              docker(["pull", "--platform", "linux/amd64", image], timeout=30)
+              stage = "owned container creation"
+              create_attempted = True
+              created = docker(
+                  [
+                      "create",
+                      "--name",
+                      name,
+                      "--label",
+                      "com.meet.retention-proof.owner=" + owner,
+                      "--network",
+                      "none",
+                      "--log-driver",
+                      "none",
+                      "--read-only",
+                      "--user",
+                      "0:0",
+                      "--cap-drop",
+                      "ALL",
+                      "--cap-add",
+                      "CHOWN",
+                      "--security-opt",
+                      "no-new-privileges:true",
+                      "--security-opt",
+                      "seccomp=builtin",
+                      "--pids-limit",
+                      "256",
+                      "--cpus",
+                      "2",
+                      "--memory",
+                      "1g",
+                      "--tmpfs",
+                      "/fixture:rw,noexec,nosuid,nodev,size=268435456,mode=0700",
+                      "--tmpfs",
+                      "/tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777",
+                      "--entrypoint",
+                      "/bin/bash",
+                      image,
+                      "-euo",
+                      "pipefail",
+                      "-c",
+                      "exec sleep 120",
+                  ],
+                  maximum=4096,
+              ).decode("ascii").strip()
+              if not re.fullmatch(r"[0-9a-f]{64}", created):
+                  raise RuntimeError("Docker Engine returned an invalid container ID")
+              container_id = created
+
+              stage = "pre-start isolation inspection"
+              before = inspect(container_id)
+              config = before.get("Config")
+              host = before.get("HostConfig")
+              if (
+                  before.get("Id") != container_id
+                  or not isinstance(config, dict)
+                  or config.get("Image") != image
+                  or config.get("Volumes") not in (None, {})
+                  or not isinstance(host, dict)
+                  or host.get("NetworkMode") != "none"
+                  or host.get("ReadonlyRootfs") is not True
+                  or host.get("Binds") not in (None, [])
+                  or host.get("Mounts") not in (None, [])
+                  or host.get("VolumesFrom") not in (None, [])
+                  or set(host.get("Tmpfs", {})) != {"/fixture", "/tmp"}
+              ):
+                  raise RuntimeError("pre-start container isolation differs")
+
+              stage = "container start and post-start inspection"
+              docker(["start", container_id])
+              after = inspect(container_id)
+              state = after.get("State")
+              config = after.get("Config")
+              host = after.get("HostConfig")
+              if (
+                  after.get("Id") != container_id
+                  or not isinstance(state, dict)
+                  or state.get("Running") is not True
+                  or not isinstance(config, dict)
+                  or config.get("Image") != image
+                  or not isinstance(host, dict)
+                  or host.get("NetworkMode") != "none"
+                  or host.get("ReadonlyRootfs") is not True
+              ):
+                  raise RuntimeError("post-start container isolation differs")
+
+              engine_identity = {
+                  "schemaVersion": 1,
+                  "containerId": container_id,
+                  "owner": owner,
+                  "dockerRootDir": docker_root,
+                  "engineVersion": engine_info["ServerVersion"],
+                  "engineApiVersion": engine_info["ApiVersion"],
+              }
+              metadata_request = json.dumps(
+                  engine_identity, sort_keys=True, separators=(",", ":")
+              ).encode("utf-8")
+              supervisor.validate_metadata_request(metadata_request)
+
+              def live_identity():
+                  live_info = engine.info()
+                  live_root = supervisor.validate_engine_info(live_info, expected_lock)
+                  live = inspect(container_id)
+                  config = live.get("Config")
+                  labels = config.get("Labels") if isinstance(config, dict) else None
+                  state = live.get("State")
+                  if (
+                      live_root != docker_root
+                      or live_info.get("ServerVersion") != engine_identity["engineVersion"]
+                      or live_info.get("ApiVersion") != engine_identity["engineApiVersion"]
+                      or live.get("Id") != container_id
+                      or live.get("Name") != "/" + name
+                      or not isinstance(labels, dict)
+                      or labels.get("com.meet.retention-proof.owner") != owner
+                      or not isinstance(state, dict)
+                      or state.get("Running") is not True
+                      or any(
+                          live.get(field)
+                          != f"{docker_root}/containers/{container_id}/{leaf}"
+                          for field, leaf in (
+                              ("HostnamePath", "hostname"),
+                              ("HostsPath", "hosts"),
+                              ("ResolvConfPath", "resolv.conf"),
+                          )
+                      )
+                  ):
+                      raise RuntimeError("live Engine/container identity changed")
+                  return (
+                      live_root,
+                      live_info["ServerVersion"],
+                      live_info["ApiVersion"],
+                      live.get("Id"),
+                      labels.get("com.meet.retention-proof.owner"),
+                      tuple(live.get(key) for key in ("HostnamePath", "HostsPath", "ResolvConfPath")),
+                      config,
+                      live.get("HostConfig"),
+                      live.get("Mounts"),
+                      state.get("Running"),
+                  ), live
+
+              before_identity, _ = live_identity()
+              metadata = engine.collect_host_metadata(metadata_request)
+              after_identity, after = live_identity()
+              if before_identity != after_identity:
+                  raise RuntimeError("Engine/container identity changed during host metadata collection")
+
+              stage = "container mount evidence"
+              mountinfo = docker(
+                  ["exec", container_id, "/bin/bash", "-euo", "pipefail", "-c", "cat /proc/self/mountinfo"]
+              )
+              stat_output = docker(
+                  [
+                      "exec",
+                      container_id,
+                      "/bin/bash",
+                      "-euo",
+                      "pipefail",
+                      "-c",
+                      "for path in /etc/hostname /etc/hosts /etc/resolv.conf; do test -f \"$path\" && test ! -L \"$path\" || exit 1; stat -c '%n|%u|%F' \"$path\"; done",
+                  ],
+                  maximum=4096,
+              ).decode("utf-8", errors="strict")
+              stat_rows = stat_output.splitlines()
+              targets = ("/etc/hostname", "/etc/hosts", "/etc/resolv.conf")
+              if len(stat_rows) != len(targets):
+                  raise RuntimeError("container Engine mount file evidence is incomplete")
+              inner_mounts = supervisor.parse_mountinfo(mountinfo)
+              evidence = {}
+              for target, row in zip(targets, stat_rows, strict=True):
+                  fields = row.split("|")
+                  matches = [mount for mount in inner_mounts if mount["mountpoint"] == target]
+                  if len(fields) != 3 or fields[0] != target or len(matches) != 1:
+                      raise RuntimeError("container Engine mount evidence is ambiguous")
+                  mount = matches[0]
+                  options = set(mount["options"].split(","))
+                  if (
+                      not re.fullmatch(r"[0-9]+", fields[1])
+                      or fields[2] != "regular file"
+                      or "ro" not in options
+                      or "rw" in options
+                  ):
+                      raise RuntimeError("container Engine mount is not a read-only regular file")
+                  evidence[target] = {
+                      "root": mount["root"],
+                      "device": mount["device"],
+                      "readOnly": True,
+                      "regular": True,
+                      "uid": int(fields[1]),
+                  }
+              supervisor.validate_engine_file_evidence(
+                  after,
+                  engine_root=docker_root,
+                  container_id=container_id,
+                  owner=owner,
+                  engine_version=engine_identity["engineVersion"],
+                  engine_api_version=engine_identity["engineApiVersion"],
+                  host_metadata=metadata,
+                  host_mountinfo_bytes=engine.host_mountinfo(),
+                  container_evidence=evidence,
+              )
+              print(
+                  "hosted Docker Engine generated mount layout validated: "
+                  "server=28.0.4 api=1.48 layout=moby-v28-root-container-id-v1"
+              )
+          except Exception as error:
+              raise SystemExit(
+                  f"hosted Docker Engine mount-layout probe denied during {stage}: "
+                  f"{type(error).__name__}: {error}"
+              ) from error
+          finally:
+              if create_attempted:
+                  stage = "owned container teardown"
+                  owned_id = owned_container_id()
+                  if owned_id:
+                      docker(["rm", "--force", owned_id], timeout=30, maximum=4096)
+                      if owned_container_id():
+                          raise SystemExit("hosted Docker Engine probe teardown was not verified")
+          PY
       - name: Provision and canary pinned age toolchain
         working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
         run: |
@@ -257,10 +753,39 @@ jobs:
           set -euo pipefail
           mapfile -t shell_files < <(find "$TOOLING_SCRIPTS" -maxdepth 1 -type f -name '*.sh' -print | sort)
           shell_files+=("$TOOLING_SCRIPTS/fixtures/beta-recovery/fake-docker.sh")
+          shell_files+=("$TOOLING_SCRIPTS/fixtures/retention-proof/proof-entrypoint.sh")
           for script in "${shell_files[@]}"; do
             bash -n "$script"
           done
           shellcheck --severity=warning "${shell_files[@]}"
+          timeout 60s bash -c 'set -e; for script in "$@"; do bash -n "$script"; done' _ \
+            "$TOOLING_SCRIPTS/test-test-vps-retention.sh" \
+            "$TOOLING_SCRIPTS/run-test-vps-retention-proof.sh" \
+            "$TOOLING_SCRIPTS/test-retention-proof-launcher.sh" \
+            "$TOOLING_SCRIPTS/fixtures/retention-proof/proof-entrypoint.sh"
+          timeout 120s shellcheck --severity=warning \
+            "$TOOLING_SCRIPTS/test-test-vps-retention.sh" \
+            "$TOOLING_SCRIPTS/run-test-vps-retention-proof.sh" \
+            "$TOOLING_SCRIPTS/test-retention-proof-launcher.sh" \
+            "$TOOLING_SCRIPTS/fixtures/retention-proof/proof-entrypoint.sh"
+          timeout 60s python3 -B -c \
+            'from pathlib import Path; import sys; [compile(Path(p).read_bytes(), p, "exec") for p in sys.argv[1:]]' \
+            "$TOOLING_SCRIPTS/retention-proof-registration.py" \
+            "$TOOLING_SCRIPTS/retention-proof-authorize.py" \
+            "$TOOLING_SCRIPTS/retention-proof-host-metadata.py" \
+            "$TOOLING_SCRIPTS/retention-proof-supervisor.py" \
+            "$TOOLING_SCRIPTS/test-retention-proof-registration.py" \
+            "$TOOLING_SCRIPTS/prepare-retention-proof-tools.py" \
+            "$TOOLING_SCRIPTS/test-retention-tools-preparation.py" \
+            "$TOOLING_SCRIPTS/inspect-retention-tools-image.py" \
+            "$TOOLING_SCRIPTS/retention-tools-provenance.py" \
+            "$TOOLING_SCRIPTS/test-retention-tools-provenance.py"
+          timeout 120s python3 -I -B \
+            "$TOOLING_SCRIPTS/test-retention-tools-preparation.py"
+          timeout 120s python3 -I -B \
+            "$TOOLING_SCRIPTS/test-retention-tools-provenance.py"
+          timeout 120s bash "$TOOLING_SCRIPTS/test-retention-proof-base-ca.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-retention-proof-launcher.sh"
           bash "$TOOLING_SCRIPTS/test-release-asset-inventory.sh"
           bash "$TOOLING_SCRIPTS/test-release-page-normalization.sh"
           bash "$TOOLING_SCRIPTS/test-release-registry-state.sh"
@@ -280,7 +805,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-empty-release-continuation.sh"
           bash "$TOOLING_SCRIPTS/test-classify-release-continuation.sh"
           bash "$TOOLING_SCRIPTS/test-release-publish-tooling-routing.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
           bash "$TOOLING_SCRIPTS/test-dev-promotion-source.sh"
           bash "$TOOLING_SCRIPTS/test-dev-promotion-authorization.sh"
           bash "$TOOLING_SCRIPTS/test-promote-dev-digest-workflow.sh"
@@ -307,19 +832,24 @@ jobs:
               *) return "$fixture_status" ;;
             esac
           }
-          run_prerequisite_fixture bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-deploy.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-state.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-workflow.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-deploy.sh"
-          bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-fake-remote.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-workflow.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-ssh-host-key.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-authorization.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-evidence.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-capture.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-restore.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-restore-docker.sh"
-          bash "$TOOLING_SCRIPTS/test-beta-recovery-semantic-route.sh"
+          run_prerequisite_fixture timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-deploy.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-state.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-workflow.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-deploy.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-test-vps-yandex-smtp-fake-remote.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-workflow.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-recurring-backups.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-storage.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-migration.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-snapshot.sh"
+          timeout 900s bash "$TOOLING_SCRIPTS/test-beta-backup-gates.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-ssh-host-key.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-authorization.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-evidence.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-capture.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-restore.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-restore-docker.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-beta-recovery-semantic-route.sh"
           bash "$TOOLING_SCRIPTS/test-release-post-publication-routing.sh"
           bash "$TOOLING_SCRIPTS/test-release-protected-snapshot.sh"
           bash "$TOOLING_SCRIPTS/test-release-mutation-revalidation.sh"
@@ -355,7 +885,13 @@ jobs:
           "$binary" -version
           WORKFLOW=.github/workflows/ci.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
+            WORKFLOW=.github/workflows/beta-recurring-backups.yml \
+              "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
+            WORKFLOW=.github/workflows/beta-backup-monitor.yml \
+              "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
           WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
+            "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
+          WORKFLOW=.github/workflows/prove-test-vps-retention.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
           WORKFLOW=.github/workflows/promote-dev-digest-to-test-vps.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"

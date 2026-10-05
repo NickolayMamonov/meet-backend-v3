@@ -19,7 +19,8 @@ ARG BACKEND_VERSION
 ARG BACKEND_REVISION
 LABEL org.opencontainers.image.source="https://github.com/NickolayMamonov/meet-backend-v3" \
       org.opencontainers.image.version="${BACKEND_VERSION}" \
-      org.opencontainers.image.revision="${BACKEND_REVISION}"
+      org.opencontainers.image.revision="${BACKEND_REVISION}" \
+      org.opencontainers.image.backup-safety-gate="v1"
 
 RUN test -n "${BACKEND_VERSION}" \
     && case "${BACKEND_VERSION}" in *[!0-9.]*|.*|*.|*..*) exit 1;; esac \

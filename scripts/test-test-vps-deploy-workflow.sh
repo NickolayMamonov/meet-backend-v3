@@ -5,27 +5,40 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT_DIR"
 workflow=.github/workflows/deploy-test-vps.yml
 deploy=scripts/deploy-test-vps-release.sh
+update=scripts/update-production-release.sh
 runtime=scripts/test-vps-runtime-invariants.sh
 provider_deploy=scripts/deploy-test-vps-provider-release.sh
 provider_helper=scripts/test-vps-provider-credential.py
 provider_tests=scripts/test-test-vps-provider-credential.py
 provider_runtime=scripts/test-test-vps-provider-runtime.sh
 retention_fixture=scripts/test-test-vps-retention.sh
+retention_proof_workflow=.github/workflows/prove-test-vps-retention.yml
 public_probes=scripts/test-test-vps-public-probes.sh
 public_probe=scripts/test-vps-public-probe.sh
 closed_beta_fixture=scripts/test-test-vps-closed-beta-deploy.sh
 baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
+retention_baseline=c701535717e67275a35a01e926851d181dff916e
+
+git diff --quiet "$retention_baseline" -- \
+  .github/workflows/deploy-test-vps.yml \
+  scripts/test-vps-provider-credential.py ||
+  { echo "retention proof must preserve the reviewed workflow block and helper" >&2; exit 1; }
 
 [ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ] &&
+  [ -f "$update" ] &&
   [ -f "$provider_deploy" ] && [ -f "$provider_helper" ] &&
   [ -f "$provider_tests" ] && [ -f "$provider_runtime" ] &&
-  [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
+  [ -f "$retention_fixture" ] && [ -f "$retention_proof_workflow" ] &&
+  [ -f scripts/retention-proof-registration.py ] &&
+  [ -f scripts/test-retention-proof-launcher.sh ] &&
+  [ -f "$public_probes" ] &&
   [ -f "$public_probe" ] && [ -f "$closed_beta_fixture" ]
 workflow_text=$(<"$workflow")
 deploy_text=$(<"$deploy")
 runtime_text=$(<"$runtime")
 provider_deploy_text=$(<"$provider_deploy")
 provider_helper_text=$(<"$provider_helper")
+update_text=$(<"$update")
 # shellcheck source=scripts/deploy-test-vps-release.sh
 source "$deploy"
 
@@ -80,6 +93,20 @@ for text in \
   'retention=applied'; do
   require "$text" "$workflow_text" "test VPS workflow"
 done
+for text in \
+  'source "$SCRIPTS_DIR/beta-backup-runtime-gate.sh"' \
+  'beta_backup_runtime_require_operation "" production-update "$ENV_FILE"'; do
+  require "$text" "$update_text" "standalone production update gate"
+done
+
+require 'beta_backup_runtime_require_operation "$image" test-vps-deploy' \
+  "$deploy_text" "direct test-VPS deployment gate"
+require '"$root/.env.production"' \
+  "$deploy_text" "direct test-VPS gate uses the trusted root environment"
+require 'previous-env.production' "$deploy_text" \
+  "direct test-VPS rollback snapshots the predecessor environment"
+require 'target-env.sha256' "$deploy_text" \
+  "direct test-VPS rollback binds the admitted candidate environment"
 
 for text in \
   'scripts/deploy-test-vps-provider-release.sh' \
@@ -187,10 +214,8 @@ require 'state=$state_root/$run_key-$state_suffix' "$provider_deploy_text" \
 
 for frozen in \
   .github/workflows/promote-dev-digest-to-test-vps.yml \
-  scripts/deploy-test-vps-release.sh \
   scripts/test-vps-runtime-invariants.sh \
-  scripts/production-compose.sh \
-  scripts/update-production-release.sh; do
+  scripts/production-compose.sh; do
   git diff --quiet "$baseline" -- "$frozen" ||
     { echo "frozen release/promotion file changed: $frozen" >&2; exit 1; }
 done
@@ -631,6 +656,9 @@ state_writer_line=$(awk '/install -d -m 700 "\$state_root"/{print NR; exit}' "$d
 state_directory_line=$(awk '/state-publish/{print NR; exit}' "$provider_deploy")
 provider_retention_line=$(awk '/retention-check/{print NR; exit}' "$provider_deploy")
 mutation_line=$(awk '/mutation_started=true/{print NR; exit}' "$deploy")
+gate_line=$(grep -nF \
+  'beta_backup_runtime_require_operation "$image" test-vps-deploy' "$deploy" |
+  cut -d: -f1 | head -n 1)
 target_line=$(awk '/is_supported_test_vps_version "\$version"/{print NR; exit}' "$deploy")
 predecessor_line=$(awk '/is_supported_test_vps_version "\$previous_version"/{print NR; exit}' "$deploy")
 predecessor_state_line=$(awk '/previous-image"/{print NR; exit}' "$deploy")
@@ -645,25 +673,14 @@ update_line=$(awk '/"\$update_script" "\$image"/{print NR; exit}' "$deploy")
   fail "deployment floor checks are ordered after a protected writer"
 [ "$provider_retention_line" -lt "$state_directory_line" ] ||
   fail "provider retention admission runs after state-directory creation"
+[ -n "$gate_line" ] && [ "$gate_line" -lt "$mutation_line" ] ||
+  fail "direct test-VPS safety admission runs after active mutation"
 
 require 'runtime_check=network' "$runtime_text" "shared runtime helper"
 
-if [ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ]; then
-  set +e
-  timeout 300s bash "$closed_beta_fixture"
-  closed_beta_status=$?
-  set -e
-  case "$closed_beta_status" in
-    0) ;;
-    77)
-      echo "closed-beta staged compatibility environment-blocked: isolated /var/lib/meet-production is unavailable"
-      ;;
-    *)
-      exit "$closed_beta_status"
-      ;;
-  esac
-  timeout 300s bash "$retention_fixture"
-fi
+! grep -Fq "bash \"\$retention_fixture\"" "${BASH_SOURCE[0]}" ||
+  fail "ordinary deployment CI must not execute the privileged retention fixture"
+echo "RETENTION_FIXTURE_PROOF_DEFERRED: separately approved protected Ubuntu proof required"
 
 case "$workflow_text"$'\n'"$deploy_text" in
   *'rm -rf'*) echo "test VPS deployment must not recursively delete host state" >&2; exit 1 ;;

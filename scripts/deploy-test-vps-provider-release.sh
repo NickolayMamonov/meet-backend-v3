@@ -579,6 +579,15 @@ verify_production_env_settings "$root/.env.production" ||
   fail "PROVIDER_STATE_INVALID"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [ -f "$script_dir/beta-backup-runtime-gate.sh" ]; then
+  # shellcheck source=beta-backup-runtime-gate.sh
+  source "$script_dir/beta-backup-runtime-gate.sh"
+else
+  beta_backup_runtime_require_operation() {
+    [ "${APP_BACKUP_SAFETY_ENABLED:-false}" != true ] ||
+      fail "backup safety helper is unavailable"
+  }
+fi
 compose_script=$script_dir/production-compose.sh
 update_script=$script_dir/update-production-release.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
@@ -641,6 +650,8 @@ if [ "$closed_beta_safety" = true ]; then
   [ -f "$safety_hook" ] && [ ! -L "$safety_hook" ] && [ -x "$safety_hook" ] ||
     fail "closed-beta safety hook is unavailable"
 fi
+beta_backup_runtime_require_operation "$image" test-vps-provider-deploy \
+  "$root/.env.production"
 
 # This is intentionally an existence/type-only interlock.  SMTP tooling owns
 # parsing, recovery, terminal publication, and cleanup of every object class.
@@ -1087,10 +1098,17 @@ restore_previous_active_files() {
 rollback() {
   recovery_started_at=$SECONDS
   recovery_deadline_check
+  beta_backup_runtime_require_operation "$previous_image" \
+    test-vps-provider-rollback "$state/config.env.previous" ||
+    fail "rollback predecessor lacks backup safety gate capability"
   if [ "$updater_completed" = true ]; then
     validate_configuration_boundary "$state/config.env.target"
   elif [ "$updater_started" = false ]; then
     validate_configuration_boundary "$state/config.env.production"
+  else
+    (cmp -s "$root/.env.production" "$state/config.env.production" ||
+      cmp -s "$root/.env.production" "$state/config.env.target") ||
+      fail "RECOVERY_REQUIRED"
   fi
   write_provider_marker rolling-back "${durable_disposition:-none}"
   restore_previous_active_files
@@ -1098,9 +1116,10 @@ rollback() {
     validate_configuration_boundary "$state/config.env.target"
   fi
   updater_started=true
-  PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
-    timeout 60s "$update_script" "$previous_image" "$previous_revision" "$previous_version" \
-    >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
+  [ -f "$state/config.env.previous" ] && [ ! -L "$state/config.env.previous" ] ||
+    fail "RECOVERY_REQUIRED"
+  timeout 30s install -m 600 "$state/config.env.previous" \
+    "$root/.env.production" || fail "RECOVERY_REQUIRED"
   cmp -s "$root/.env.production" "$state/config.env.previous" ||
     fail "RECOVERY_REQUIRED"
   printf '%s\n' "$(configuration_file_identity "$root/.env.production")" \

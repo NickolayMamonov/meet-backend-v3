@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "enabled": false,
+  "planSha256": "da21be2bc38466fc8322a1c4fc53cf853130cc50ac3de4ae2950116475479215",
+  "workflowPath": ".github/workflows/prove-test-vps-retention.yml",
+  "workflowRevision": "b567defcc1ba2ba0a555c9bc9070af793acac9b4",
+  "environmentName": "retention-fixture-proof",
+  "environmentId": 23395562674,
+  "authorizedReviewerIds": [
+    196440864
+  ],
+  "launcherSha256": "91506b2a9ad4e023238399647aec8012307668301685192f3403092fdc523110",
+  "supervisorSha256": "727db7a71cada3238b718cedb3d3775c5bab7ed3968ce035e4fd35991bea6406"
+}

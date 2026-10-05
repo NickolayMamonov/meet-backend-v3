@@ -88,8 +88,12 @@ fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 compose_script=$script_dir/production-compose.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
+# shellcheck source=beta-backup-runtime-gate.sh
+source "$script_dir/beta-backup-runtime-gate.sh"
 # shellcheck source=/dev/null
 source "$runtime_helper"
+beta_backup_runtime_resolve_config "$root/.env.production" ||
+  fail_result precheck_failed 20
 
 state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
 transactions=$state_root/.smtp-transactions
@@ -296,7 +300,9 @@ journal_allowed=(
   pre_config_sha256 pre_runtime_fingerprint prior_selector
   prior_selector_value prior_generation_sha256 candidate_generation
   candidate_runtime_fingerprint terminal_category terminal_status
-  terminal_fingerprint
+  terminal_fingerprint safety_admitted safety_enrollment_fingerprint
+  safety_mount_fingerprint safety_snapshot_digest safety_observed_at
+  safety_verified_at
 )
 
 load_journal() {
@@ -308,11 +314,22 @@ load_journal() {
     [ -z "${journal[$key]+present}" ] || return 1
     journal[$key]=$value
   done <"$file"
-  [ "$line_count" -eq "${#journal_allowed[@]}" ] || return 1
+  [ "$line_count" -eq 14 ] || [ "$line_count" -eq "${#journal_allowed[@]}" ] || return 1
   for key in "${journal_required[@]}"; do
     [ -n "${journal[$key]+present}" ] || return 1
   done
-  [ "${journal[version]}" = 1 ] || return 1
+  [ "${journal[version]}" = 1 ] || [ "${journal[version]}" = 2 ] || return 1
+  if [ "${journal[version]}" = 1 ]; then
+    [ "${APP_BACKUP_SAFETY_ENABLED:-false}" != true ] || return 1
+  else
+    [ "$line_count" -eq "${#journal_allowed[@]}" ] || return 1
+    [ "${journal[safety_admitted]}" = true ] || return 1
+    [[ "${journal[safety_enrollment_fingerprint]}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "${journal[safety_mount_fingerprint]}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "${journal[safety_snapshot_digest]}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "${journal[safety_observed_at]}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${journal[safety_verified_at]}" =~ ^[0-9]+$ ]] || return 1
+  fi
   [[ "${journal[transaction_id]}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
   [ "${journal[transaction_id]}" = "$(basename -- "$(dirname -- "$file")")" ] ||
     return 1
@@ -369,7 +386,7 @@ load_journal() {
 
 journal_text() {
   local phase=$1 critical=$2 category=$3 status=$4 fingerprint=$5 candidate_fingerprint=$6
-  printf 'version=1\n'
+  printf 'version=%s\n' "${journal[version]}"
   printf 'transaction_id=%s\n' "${journal[transaction_id]}"
   printf 'phase=%s\ncritical=%s\n' "$phase" "$critical"
   printf 'pre_config_sha256=%s\npre_runtime_fingerprint=%s\n' \
@@ -381,6 +398,14 @@ journal_text() {
   printf 'candidate_runtime_fingerprint=%s\n' "$candidate_fingerprint"
   printf 'terminal_category=%s\nterminal_status=%s\nterminal_fingerprint=%s\n' \
     "$category" "$status" "$fingerprint"
+  if [ "${journal[version]}" = 2 ]; then
+    printf 'safety_admitted=%s\nsafety_enrollment_fingerprint=%s\n' \
+      "${journal[safety_admitted]}" "${journal[safety_enrollment_fingerprint]}"
+    printf 'safety_mount_fingerprint=%s\nsafety_snapshot_digest=%s\n' \
+      "${journal[safety_mount_fingerprint]}" "${journal[safety_snapshot_digest]}"
+    printf 'safety_observed_at=%s\nsafety_verified_at=%s\n' \
+      "${journal[safety_observed_at]}" "${journal[safety_verified_at]}"
+  fi
 }
 
 write_journal() {
@@ -662,6 +687,15 @@ recover_transaction() {
   local saved_fail_at=${MEE_SMTP_FAIL_AT:-}
   MEE_SMTP_INTERRUPT_BOUNDARY=
   MEE_SMTP_FAIL_AT=
+  if [ "${journal[version]}" = 2 ]; then
+    beta_backup_runtime_revalidate_fingerprints \
+      "${journal[safety_enrollment_fingerprint]}" \
+      "${journal[safety_mount_fingerprint]}" \
+      "${journal[safety_snapshot_digest]}" \
+      "${journal[safety_observed_at]}" \
+      "${journal[safety_verified_at]}" \
+      "$root/.env.production" || return 1
+  fi
   interrupt_boundary restore
   restore_files || return 1
   if [ -e "$transaction_dir/had-active-compose" ]; then
@@ -948,6 +982,10 @@ trap 'exit 130' INT
 trap 'exit 129' HUP
 TRANSACTION_TRAP_INSTALLED=true
 
+# Startup reconciliation above may complete only an authenticated transaction
+# admitted before safety expired. Every new request is admitted independently.
+beta_backup_runtime_require_operation "" "smtp-$mode"
+
 prior_selector=absent
 prior_selector_value=
 prior_generation_sha256=
@@ -1085,6 +1123,29 @@ sync_directory "$transactions" transaction_directory
 
 journal=()
 journal[version]=1
+if [ "${APP_BACKUP_SAFETY_ENABLED:-false}" = true ]; then
+  journal[version]=2
+  mapfile -t safety_admission_values < <(beta_backup_runtime_admission_fingerprints) ||
+    fail_result precheck_failed 20
+  [ "${#safety_admission_values[@]}" -eq 1 ] || fail_result precheck_failed 20
+  read -r safety_enrollment_fingerprint safety_mount_fingerprint \
+    safety_snapshot_digest safety_observed_at safety_verified_at \
+    <<<"${safety_admission_values[0]}" ||
+    fail_result precheck_failed 20
+  journal[safety_enrollment_fingerprint]=$safety_enrollment_fingerprint
+  journal[safety_mount_fingerprint]=$safety_mount_fingerprint
+  journal[safety_snapshot_digest]=$safety_snapshot_digest
+  journal[safety_observed_at]=$safety_observed_at
+  journal[safety_verified_at]=$safety_verified_at
+  journal[safety_admitted]=true
+else
+  journal[safety_admitted]=false
+  journal[safety_enrollment_fingerprint]=
+  journal[safety_mount_fingerprint]=
+  journal[safety_snapshot_digest]=
+  journal[safety_observed_at]=
+  journal[safety_verified_at]=
+fi
 journal[transaction_id]=$transaction_id
 journal[pre_config_sha256]=$pre_config_sha256
 journal[pre_runtime_fingerprint]=$pre_runtime_fingerprint
