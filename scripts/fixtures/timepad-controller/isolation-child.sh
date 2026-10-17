@@ -67,7 +67,6 @@ check test "$(readlink /proc/self/ns/pid)" != "$parent_pid_ns"
 mount --make-rprivate /
 mount -t tmpfs -o mode=755,size=64m,nodev,nosuid tmpfs /var/lib
 mount -t tmpfs -o mode=1777,size=256m,nodev,nosuid tmpfs /tmp
-mount -t tmpfs -o mode=755,size=32m,nodev,nosuid tmpfs /run
 if [ -L /var/run ]; then
   check test "$(readlink -f /var/run)" = /run
 else
@@ -76,6 +75,7 @@ else
 fi
 mount -t proc -o nosuid,nodev,noexec proc /proc
 check test "$(readlink /proc/self/ns/pid)" = "$(readlink /proc/1/ns/pid)"
+mount -t tmpfs -o mode=755,size=32m,nodev,nosuid tmpfs /run
 
 for path in /var/lib /tmp /run /var/run; do
   check check_private_tmpfs "$path"
