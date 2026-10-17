@@ -396,6 +396,92 @@ jobs:
           export BACKEND_IMAGE=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           docker compose -f docker-compose.production.yml config --quiet
 
+  timepad-fixtures:
+    name: Timepad release safety fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: validate-call
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_VERSION: ${{ inputs.release_version }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      TOOLING_SCRIPTS: ${{ inputs.source_sha != '' && '../tooling/scripts' || 'scripts' }}
+    steps:
+      - name: Checkout reviewed source
+        if: inputs.source_sha == ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Checkout reviewed CI tooling
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: tooling
+      - name: Checkout exact release source
+        if: inputs.source_sha != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          path: source
+      - name: Record reviewed source identity
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          EXPLICIT_REF: ${{ inputs.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          echo "reviewed source SHA: $actual_sha"
+          if [ -n "$SOURCE_SHA" ]; then
+            test "$actual_sha" = "$SOURCE_SHA"
+          elif [ -n "$EXPLICIT_REF" ]; then
+            echo "reviewed source ref: $EXPLICIT_REF"
+          else
+            expected_sha="${PR_HEAD_SHA:-$WORKFLOW_SHA}"
+            test "$actual_sha" = "$expected_sha"
+          fi
+      - name: Provision ACL fixture tools before isolation
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          timeout 300s sudo -n apt-get update
+          timeout 300s sudo -n apt-get install --no-install-recommends --yes acl
+      - name: Preflight isolated fixture tools
+        run: |
+          set -euo pipefail
+          for tool in bash python3 jq shellcheck timeout unshare flock setfacl getfacl; do
+            command -v "$tool"
+          done
+          python3 --version
+          shellcheck --version
+          unshare --version
+      - name: Run Timepad fixture suites
+        timeout-minutes: 85
+        working-directory: ${{ inputs.source_sha != '' && 'source' || '.' }}
+        run: |
+          set -euo pipefail
+          timeout 300s python3 -B "$TOOLING_SCRIPTS/test-test-vps-provider-credential.py"
+          timeout 600s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
+            python3 -B "$TOOLING_SCRIPTS/test-test-vps-timepad-state.py"
+          timeout 1800s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
+            bash "$TOOLING_SCRIPTS/test-test-vps-timepad-controller.sh"
+          timeout 600s bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
+          timeout 1200s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
+            bash "$TOOLING_SCRIPTS/test-test-vps-provider-runtime.sh" --filesystem-only
+          timeout 900s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
+            bash "$TOOLING_SCRIPTS/test-test-vps-retention.sh"
+          timeout 900s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
+            bash "$TOOLING_SCRIPTS/test-test-vps-closed-beta-deploy.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-script-execution-contract.sh"
+          timeout 300s bash "$TOOLING_SCRIPTS/test-ci-source-checkout.sh"
+
   docker:
     name: Docker image verification
     runs-on: ubuntu-24.04

@@ -35,7 +35,7 @@ count_exact() {
   }
 }
 
-jobs=(gradle postgres scripts docker)
+jobs=(gradle postgres scripts timepad-fixtures docker)
 for job in "${jobs[@]}"; do
   job_block=$(
     awk -v wanted="$job" '
@@ -66,22 +66,22 @@ for job in "${jobs[@]}"; do
   }
 done
 
-count_exact 4 \
+count_exact 5 \
   'name: Checkout reviewed source' \
   'non-release source checkout sites'
-count_exact 4 \
+count_exact 5 \
   'ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}' \
   'non-release source checkout refs'
-count_exact 4 \
+count_exact 5 \
   'name: Record reviewed source identity' \
   'source identity proof steps'
-count_exact 4 \
+count_exact 5 \
   'actual_sha=$(git rev-parse HEAD)' \
   'source identity resolution'
-count_exact 4 \
+count_exact 5 \
   'test "$actual_sha" = "$SOURCE_SHA"' \
   'release source identity assertions'
-count_exact 4 \
+count_exact 5 \
   'expected_sha="${PR_HEAD_SHA:-$WORKFLOW_SHA}"' \
   'ordinary source fallback assertions'
 
@@ -98,25 +98,25 @@ require 'PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}' \
 require 'WORKFLOW_SHA: ${{ github.sha }}' \
   'push/default identity'
 
-count_exact 4 \
+count_exact 5 \
   'name: Checkout reviewed CI tooling' \
   'release tooling checkout sites'
-count_exact 4 \
+count_exact 5 \
   'ref: ${{ github.sha }}' \
   'release tooling refs'
-count_exact 4 \
+count_exact 5 \
   'path: tooling' \
   'release tooling paths'
-count_exact 4 \
+count_exact 5 \
   'name: Checkout exact release source' \
   'release source checkout sites'
-count_exact 4 \
+count_exact 5 \
   'ref: ${{ inputs.source_sha }}' \
   'release source refs'
-count_exact 4 \
+count_exact 5 \
   'path: source' \
   'release source paths'
-count_exact 8 \
+count_exact 10 \
   "if: inputs.source_sha != ''" \
   'release checkout guards'
 

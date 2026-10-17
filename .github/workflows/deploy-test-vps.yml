@@ -3,6 +3,15 @@ name: Deploy backend release to test VPS
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: Deployment, explicit guard bootstrap, or exact-image recovery
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - bootstrap-guard
+          - forward-recover
       release_tag:
         description: Published immutable backend release tag
         required: true
@@ -13,6 +22,42 @@ on:
         required: true
         default: true
         type: boolean
+      rollout_domain:
+        description: Reviewed rollout contract domain for a normal deployment
+        required: false
+        default: initial-domain
+        type: choice
+        options:
+          - initial-domain
+          - timepad-first-transition
+      initial_proof_id:
+        description: Reviewed initial-runtime/schema proof selector (never proof contents)
+        required: false
+        type: string
+      bootstrap_id:
+        description: One-time authorized guard bootstrap selector
+        required: false
+        type: string
+      recovery_run_key:
+        description: Original deployment run key for exact-image recovery
+        required: false
+        type: string
+      recovery_incident:
+        description: Persisted incident selector
+        required: false
+        type: string
+      recovery_epoch:
+        description: Persisted operation epoch selector
+        required: false
+        type: string
+      recovery_binding_digest:
+        description: Frozen evidence binding digest selector
+        required: false
+        type: string
+      recovery_action:
+        description: Exact permitted recovery action
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -31,6 +76,15 @@ jobs:
     env:
       TAG: ${{ inputs.release_tag }}
       RUN_ROLLBACK_DRILL: ${{ inputs.run_rollback_drill }}
+      OPERATION: ${{ inputs.operation }}
+      ROLLOUT_DOMAIN: ${{ inputs.rollout_domain }}
+      INITIAL_PROOF_ID: ${{ inputs.initial_proof_id }}
+      BOOTSTRAP_ID: ${{ inputs.bootstrap_id }}
+      RECOVERY_RUN_KEY: ${{ inputs.recovery_run_key }}
+      RECOVERY_INCIDENT: ${{ inputs.recovery_incident }}
+      RECOVERY_EPOCH: ${{ inputs.recovery_epoch }}
+      RECOVERY_BINDING_DIGEST: ${{ inputs.recovery_binding_digest }}
+      RECOVERY_ACTION: ${{ inputs.recovery_action }}
       HOST: ${{ vars.TEST_VPS_HOST }}
       PORT: ${{ vars.TEST_VPS_PORT }}
       SSH_USER: ${{ vars.TEST_VPS_USER }}
@@ -46,6 +100,53 @@ jobs:
           set -euo pipefail
           [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           case "$RUN_ROLLBACK_DRILL" in true|false) ;; *) exit 1 ;; esac
+          case "$OPERATION" in deploy|bootstrap-guard|forward-recover) ;; *) exit 1 ;; esac
+          case "$ROLLOUT_DOMAIN" in initial-domain|timepad-first-transition) ;; *) exit 1 ;; esac
+          [[ "$INITIAL_PROOF_ID" =~ ^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$BOOTSTRAP_ID" =~ ^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$RECOVERY_RUN_KEY" =~ ^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$RECOVERY_INCIDENT" =~ ^$|^[A-Fa-f0-9-]{16,64}$ ]]
+          [[ "$RECOVERY_EPOCH" =~ ^$|^(0|[1-9][0-9]{0,19})$ ]]
+          [[ "$RECOVERY_BINDING_DIGEST" =~ ^$|^[0-9a-f]{64}$ ]]
+          case "$RECOVERY_ACTION" in ""|retry-exact-candidate) ;; *) exit 1 ;; esac
+          case "$OPERATION" in
+            deploy)
+              [ -z "$BOOTSTRAP_ID" ] && [ -z "$RECOVERY_RUN_KEY" ] &&
+                [ -z "$RECOVERY_INCIDENT" ] && [ -z "$RECOVERY_EPOCH" ] &&
+                [ -z "$RECOVERY_BINDING_DIGEST" ] && [ -z "$RECOVERY_ACTION" ] ||
+                { echo "invalid mixed operation selectors" >&2; exit 1; }
+              if [ "$ROLLOUT_DOMAIN" = timepad-first-transition ]; then
+                [ "$RUN_ROLLBACK_DRILL" = false ] && [ -n "$INITIAL_PROOF_ID" ] ||
+                  { echo "first transition requires explicit proof and drill=false" >&2; exit 1; }
+              else
+                [ -z "$INITIAL_PROOF_ID" ] ||
+                  { echo "initial proof is only valid for first transition" >&2; exit 1; }
+              fi
+              ;;
+            bootstrap-guard)
+              [ "$RUN_ROLLBACK_DRILL" = false ] &&
+                [ -n "$BOOTSTRAP_ID" ] && [ -n "$INITIAL_PROOF_ID" ] &&
+                [ -z "$RECOVERY_RUN_KEY" ] && [ -z "$RECOVERY_INCIDENT" ] &&
+                [ -z "$RECOVERY_EPOCH" ] && [ -z "$RECOVERY_BINDING_DIGEST" ] &&
+                [ -z "$RECOVERY_ACTION" ] &&
+                [ "$ROLLOUT_DOMAIN" = initial-domain ] ||
+                { echo "invalid bootstrap selectors" >&2; exit 1; }
+              ;;
+            forward-recover)
+              [ "$RUN_ROLLBACK_DRILL" = false ] &&
+                [ -n "$RECOVERY_RUN_KEY" ] && [ -n "$RECOVERY_INCIDENT" ] &&
+                [ -n "$RECOVERY_EPOCH" ] && [ -n "$RECOVERY_BINDING_DIGEST" ] &&
+                [ "$RECOVERY_ACTION" = retry-exact-candidate ] &&
+                [ -z "$BOOTSTRAP_ID" ] && [ -z "$INITIAL_PROOF_ID" ] &&
+                [ "$ROLLOUT_DOMAIN" = initial-domain ] ||
+                { echo "invalid recovery selectors" >&2; exit 1; }
+              ;;
+          esac
+          if [ "$OPERATION" != deploy ] &&
+            [ "$ROLLOUT_DOMAIN" != initial-domain ]; then
+            echo "bootstrap and recovery cannot include deploy selectors" >&2
+            exit 1
+          fi
           [[ "$HOST" =~ ^[A-Za-z0-9.-]+$ ]]
           [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]
           [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]]
@@ -221,6 +322,10 @@ jobs:
           archive="$RUNNER_TEMP/test-vps-tooling.tar"
           remote="$PATH_ON_HOST/.test-vps-tooling-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$stage/scripts"
+          contract_check=$(python3 -B scripts/test_vps_timepad_state.py \
+            check-contract --contract scripts/test-vps-timepad-release-contracts.json)
+          jq -e '.outcome == "valid" and (.active | type == "boolean")' \
+            <<<"$contract_check" >/dev/null
           files=(
             docker-compose.production.yml
             scripts/production-compose.sh
@@ -231,12 +336,14 @@ jobs:
             scripts/deploy-test-vps-release.sh
             scripts/deploy-test-vps-provider-release.sh
             scripts/test-vps-provider-credential.py
+            scripts/test_vps_timepad_state.py
+            scripts/test-vps-timepad-release-contracts.json
           )
           for file in "${files[@]}"; do
             mkdir -p "$stage/$(dirname "$file")"
             cp -- "$file" "$stage/$file"
           done
-          chmod 755 "$stage"/scripts/*.sh "$stage"/scripts/test-vps-provider-credential.py
+          chmod 755 "$stage"/scripts/*.sh "$stage"/scripts/*.py
           (
             cd "$stage"
             sha256sum "${files[@]}" >SHA256SUMS
@@ -291,7 +398,7 @@ jobs:
           echo "TARGET_IMAGE_ID=$target_id" >>"$GITHUB_ENV"
 
       - name: Exercise automatic image rollback
-        if: inputs.run_rollback_drill
+        if: inputs.operation == 'deploy' && inputs.run_rollback_drill
         shell: bash
         run: |
           set -euo pipefail
@@ -317,7 +424,10 @@ jobs:
             --version "$VERSION" \
             --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --public-url "$PUBLIC_URL" \
-            --mode rollback-drill 2>&1)
+            --mode rollback-drill \
+            --operation deploy \
+            --rollout-domain "$ROLLOUT_DOMAIN" \
+            --initial-proof-id "$INITIAL_PROOF_ID" 2>&1)
           status=$?
           set -e
           if [ "$status" -eq 124 ] || [ "$status" -eq 143 ]; then
@@ -380,6 +490,7 @@ jobs:
           } >>"$GITHUB_ENV"
 
       - name: Deploy selected release successfully
+        if: inputs.operation == 'deploy'
         shell: bash
         run: |
           set -euo pipefail
@@ -392,7 +503,10 @@ jobs:
             --version "$VERSION" \
             --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --public-url "$PUBLIC_URL" \
-            --mode deploy |
+            --mode deploy \
+            --operation deploy \
+            --rollout-domain "$ROLLOUT_DOMAIN" \
+            --initial-proof-id "$INITIAL_PROOF_ID" |
             tee "$RUNNER_TEMP/deploy-output.txt"; then
             echo "RECOVERY_REQUIRED" >&2
             exit 1
@@ -438,13 +552,88 @@ jobs:
           provider_enabled=$(jq -er '.providerEnabled' <<<"$provider_json")
           credential_mount_present=$(jq -er '.credentialMountPresent' <<<"$provider_json")
           credential_mount_read_only=$(jq -er '.credentialMountReadOnly' <<<"$provider_json")
+          mapfile -t schema_guard_outcomes < <(
+            grep -E '^schema_guard=(legacy-no-transition|pre-barrier-only|post-barrier-compatible|cutover-possible|rolled-back|committed)$' \
+              "$RUNNER_TEMP/deploy-output.txt" |
+              sed 's/^schema_guard=//'
+          )
+          [ "${#schema_guard_outcomes[@]}" -ge 1 ] || {
+            echo "RECOVERY_REQUIRED: missing schema guard outcome" >&2
+            exit 1
+          }
+          schema_guard=${schema_guard_outcomes[${#schema_guard_outcomes[@]}-1]}
+          case "$ROLLOUT_DOMAIN:$schema_guard" in
+            initial-domain:legacy-no-transition|timepad-first-transition:committed) ;;
+            *)
+              echo "RECOVERY_REQUIRED: schema guard outcome does not match the selected rollout" >&2
+              exit 1
+              ;;
+          esac
           {
             echo "PROVIDER_ENABLED=$provider_enabled"
             echo "CREDENTIAL_MOUNT_PRESENT=$credential_mount_present"
             echo "CREDENTIAL_MOUNT_READ_ONLY=$credential_mount_read_only"
+            echo "SCHEMA_GUARD_OUTCOME=$schema_guard"
           } >>"$GITHUB_ENV"
 
+      - name: Bootstrap guard or recover exact candidate
+        if: inputs.operation == 'bootstrap-guard' || inputs.operation == 'forward-recover'
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --root "$PATH_ON_HOST"
+            --base-compose "$REMOTE_TOOLING/docker-compose.production.yml"
+            --image "$IMAGE@$DIGEST"
+            --revision "$SOURCE_SHA"
+            --version "$VERSION"
+            --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            --public-url "$PUBLIC_URL"
+            --mode deploy
+            --operation "$OPERATION"
+          )
+          if [ "$OPERATION" = bootstrap-guard ]; then
+            args+=(--initial-proof-id "$INITIAL_PROOF_ID" --bootstrap-id "$BOOTSTRAP_ID")
+          else
+            args+=(
+              --recovery-run-key "$RECOVERY_RUN_KEY"
+              --recovery-incident "$RECOVERY_INCIDENT"
+              --recovery-epoch "$RECOVERY_EPOCH"
+              --recovery-binding-digest "$RECOVERY_BINDING_DIGEST"
+              --recovery-action "$RECOVERY_ACTION"
+            )
+          fi
+          output=$(timeout 900s ssh -F "$SSH_CONFIG" test-vps \
+            "$REMOTE_TOOLING/scripts/deploy-test-vps-provider-release.sh" \
+            "${args[@]}" 2>&1) || {
+            status=$?
+            printf '%s\n' "$output"
+            if [ "$OPERATION" = forward-recover ] &&
+              [ "$(grep -Fc 'test VPS deployment failed: RECOVERY_RECONCILIATION_UNAVAILABLE' <<<"$output" || true)" -eq 1 ]; then
+              echo "RECOVERY_REQUIRED: exact-image reconciliation is unavailable" >&2
+            else
+              echo "RECOVERY_REQUIRED" >&2
+            fi
+            exit "$status"
+          }
+          printf '%s\n' "$output"
+          [ "$OPERATION" = bootstrap-guard ] || {
+            echo "RECOVERY_REQUIRED: recovery returned without reconciliation" >&2
+            exit 1
+          }
+          [ "$(grep -Ec '^schema_guard=ready$' <<<"$output" || true)" -eq 1 ] &&
+            [ "$(grep -Ec '^operation_outcome=(bootstrapped|already-initialized)$' <<<"$output" || true)" -eq 1 ] ||
+            { echo "GUARD_BOOTSTRAP_OUTCOME_INVALID" >&2; exit 1; }
+          operation_outcome=$(grep -E '^operation_outcome=(bootstrapped|already-initialized)$' \
+            <<<"$output" | sed 's/^operation_outcome=//')
+          {
+            echo "## Test VPS schema guard"
+            echo
+            echo "- Guard bootstrap: \`$operation_outcome\` (epoch 0)"
+          } >>"$GITHUB_STEP_SUMMARY"
+
       - name: Capture runtime and public HTTPS evidence
+        if: inputs.operation == 'deploy'
         shell: bash
         run: |
           set -euo pipefail
@@ -541,10 +730,12 @@ jobs:
             echo "- Runtime: healthy, user \`10001:10001\`, backend loopback-only"
             echo "- Volumes: PostgreSQL and uploads preserved"
             echo "- Provider: enabled=$PROVIDER_ENABLED, credential mount present=$CREDENTIAL_MOUNT_PRESENT, read-only=$CREDENTIAL_MOUNT_READ_ONLY"
+            echo "- Schema guard: \`$SCHEMA_GUARD_OUTCOME\`"
             echo "- Public probes: meetings=$meetings_status, actuator=$actuator_status, HTTP redirect=$redirect_status"
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Apply bounded test-VPS deployment retention
+        if: inputs.operation != 'bootstrap-guard'
         shell: bash
         run: |
           set -euo pipefail
@@ -570,15 +761,59 @@ jobs:
               exit 1
             }
           fi
-          exec 9>"$state_root/.deploy.lock"
+          exec 9<"$state_root/.deploy.lock"
           flock -n 9
+          guard_helper="$tooling/scripts/test_vps_timepad_state.py"
+          protected_refs=()
+          protected_states=()
+          guard_directory="$state_root/timepad-guard"
+          if [ -L "$guard_directory" ]; then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
+          if [ -e "$guard_directory" ] || [ -L "$guard_directory" ]; then
+            [ -d "$guard_directory" ] && [ ! -L "$guard_directory" ] &&
+              [ -f "$guard_helper" ] && [ ! -L "$guard_helper" ] || {
+              echo "RECOVERY_REQUIRED" >&2
+              exit 1
+            }
+            if ! guard_state_json=$(timeout 30s python3 "$guard_helper" read-state \
+              --root "$state_root" --deploy-lock-fd 9); then
+              echo "RECOVERY_REQUIRED" >&2
+              exit 1
+            fi
+            if ! guard_owned_run=$(jq -er '
+              if type == "object" and .outcome == "read" and
+                (.originDigest | type == "string" and test("^[a-f0-9]{64}$")) and
+                (.current | type == "object") and
+                .current.controller == "timepad-cutover-v1" and
+                (.current.operationEpoch | type == "number" and floor == . and . >= 0) and
+                (.current.phase | type == "string" and
+                  test("^(READY|PREPARED|CUTOVER_POSSIBLE|VERIFYING|COMMITTING|COMMITTED|ROLLING_BACK|ROLLED_BACK|RECOVERY_REQUIRED|FORWARD_RECOVERING)$")) and
+                (.current.ownedRun == null or
+                  (.current.ownedRun | type == "string" and
+                    test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}-(rollback-drill|final-deploy)$")))
+              then .current.ownedRun // empty
+              else error("invalid guard state")
+              end
+            ' <<<"$guard_state_json"); then
+              echo "RECOVERY_REQUIRED" >&2
+              exit 1
+            fi
+            if [ -n "$guard_owned_run" ]; then
+              guard_run_path="$state_root/$guard_owned_run"
+              [ -d "$guard_run_path" ] && [ ! -L "$guard_run_path" ] || {
+                echo "RECOVERY_REQUIRED" >&2
+                exit 1
+              }
+              protected_states+=("$guard_run_path")
+            fi
+          fi
           smtp_pointer="$state_root/.smtp-transaction.current"
           if [ -e "$smtp_pointer" ] || [ -L "$smtp_pointer" ]; then
             echo "retention=skipped smtp_transaction_present"
             exit 1
           fi
-          protected_refs=()
-          protected_states=()
           retention_unresolved=false
           add_protected_ref() {
             local ref=$1
@@ -651,7 +886,7 @@ jobs:
           delete_owned_state() {
             local path=$1
             local -a delete_args=(retention-delete --state-root "$state_root"
-              --retention-state "$path")
+              --retention-state "$path" --deploy-lock-fd 9)
             local ref protected
             for ref in "${protected_refs[@]}"; do
               delete_args+=(--protected-path "$ref")
@@ -676,6 +911,7 @@ jobs:
               cut -d' ' -f2-
           )
           provider_args=(retention-list --state-root "$state_root")
+          provider_args+=(--deploy-lock-fd 9)
           for ref in "${protected_refs[@]}"; do
             provider_args+=(--protected-path "$ref")
           done
@@ -744,6 +980,7 @@ jobs:
             done
           done
           provider_args=(retention-list --state-root "$state_root")
+          provider_args+=(--deploy-lock-fd 9)
           for ref in "${protected_refs[@]}"; do
             provider_args+=(--protected-path "$ref")
           done

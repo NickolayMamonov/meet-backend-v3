@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${TIMEPAD_FIXTURE_CURL_LOG:?fixture curl log is required}"
+printf 'curl\n' >>"$TIMEPAD_FIXTURE_CURL_LOG"
+case "${TIMEPAD_FIXTURE_CURL_RESPONSE:-fail}" in
+  fail) exit 90 ;;
+  *) echo "fixture curl response mode is unsupported" >&2; exit 90 ;;
+esac

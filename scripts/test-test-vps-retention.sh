@@ -390,6 +390,20 @@ remote_content=$(awk '
 ' .github/workflows/deploy-test-vps.yml 2>/dev/null) ||
   prerequisite_missing
 fixture_write "$remote_script" 700 <<<"$remote_content"
+grep -Fq 'exec 9<"$state_root/.deploy.lock"' "$remote_script"
+grep -Fq -- '--deploy-lock-fd 9' "$remote_script"
+[ "$(grep -Fc -- '--deploy-lock-fd 9' "$remote_script")" -eq 4 ]
+[ "$(grep -Fc 'provider_args+=(--deploy-lock-fd 9)' "$remote_script")" -eq 2 ]
+grep -Fq 'local -a delete_args=(retention-delete --state-root "$state_root"' "$remote_script"
+grep -Fq -- '--retention-state "$path" --deploy-lock-fd 9)' "$remote_script"
+! grep -Fq 'exec 9>"$state_root/.deploy.lock"' "$remote_script"
+grep -Fq 'timepad-guard' "$remote_script"
+grep -Fq 'read-state' "$remote_script"
+grep -Fq '.current.ownedRun' "$remote_script"
+grep -Fq 'protected_states+=("$guard_run_path")' "$remote_script"
+grep -Fq -- 'retention-list --state-root "$state_root"' "$remote_script"
+grep -Fq -- 'retention-delete --state-root "$state_root"' "$remote_script"
+grep -Fq -- '--protected-state "$protected"' "$remote_script"
 
 for index in $(seq 1 12); do
   state="$state_root/${index}-1-final-deploy"

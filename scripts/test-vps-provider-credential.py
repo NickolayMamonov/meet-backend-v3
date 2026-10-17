@@ -10,15 +10,19 @@ transaction.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import errno
+import hashlib
+import importlib.util
 import json
 import os
+import pathlib
 import re
 import secrets
 import stat
 import sys
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 try:
     import fcntl
@@ -29,6 +33,7 @@ SCHEMA_VERSION = 1
 MAX_INSPECTION_BYTES = 8 * 1024 * 1024
 MAX_CREDENTIAL_BYTES = 1024 * 1024
 MAX_WITNESS_BYTES = 16 * 1024 * 1024
+MAX_FINALIZATION_BYTES = 8 * 1024
 MAX_JSON_DEPTH = 32
 MAX_OWNER_BYTES = 4096
 CONTAINER_CREDENTIAL_PATH = "/run/secrets/meet-firebase-service-account.json"
@@ -39,6 +44,10 @@ RUN_KEY_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 STATE_RUN_KEY_RE = r"^[0-9]+-[0-9]+$"
 OWNER_MARKER = "provider-owner.json"
 OWNER = "meet-test-vps-provider"
+FINALIZATION_SCHEMA = "meet-backend/test-vps-provider-finalization/v1"
+LIVE_RESUME_SCHEMA = "meet-backend/test-vps-provider-live-resume/v1"
+ABSENCE_RESUME_SCHEMA = "meet-backend/test-vps-provider-absence-resume/v1"
+MAX_LIVE_RESUME_BYTES = MAX_INSPECTION_BYTES + 32768
 STATE_KINDS = frozenset(("final-deploy", "rollback-drill"))
 RENAME_NOREPLACE = 1
 PUSH_KEYS = (
@@ -69,6 +78,11 @@ ERRORS = {
 }
 
 
+def _deploy_lock_mode_is_safe(mode: int) -> bool:
+    permissions = stat.S_IMODE(mode)
+    return permissions in (0o600, 0o640, 0o644)
+
+
 class ProviderError(Exception):
     def __init__(self, category: str):
         super().__init__(category)
@@ -83,6 +97,102 @@ def _lock_directory(fd: int) -> None:
     if fcntl is None:
         _fail("prerequisite")
     fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+@contextlib.contextmanager
+def _deploy_lock(
+    state_root: str,
+    inherited_fd: int | None,
+    *,
+    create_state_root: bool = False,
+) -> Iterator[int]:
+    """Serialize public provider operations with the controller's deploy lock."""
+    if fcntl is None:
+        _fail("prerequisite")
+    if create_state_root:
+        expected_root = _ensure_state_root(state_root)
+    else:
+        expected_root = _validate_retention_state_root_path(state_root)
+    root_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    lock_fd: int | None = inherited_fd
+    owns_fd = inherited_fd is None
+    try:
+        root_info = os.fstat(root_fd)
+        if not _same_inode(root_info, expected_root):
+            _fail("recovery")
+        _validate_retention_state_root_fd(root_fd)
+        if owns_fd:
+            try:
+                lock_fd = os.open(
+                    ".deploy.lock",
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+                os.fsync(lock_fd)
+                os.fsync(root_fd)
+            except FileExistsError:
+                try:
+                    lock_fd = os.open(
+                        ".deploy.lock",
+                        os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=root_fd,
+                    )
+                except OSError:
+                    _fail("recovery")
+            except OSError:
+                _fail("recovery")
+            lock_info = os.fstat(lock_fd)
+            if lock_info.st_nlink == 0:
+                _fail("recovery")
+        else:
+            if type(inherited_fd) is not int or inherited_fd < 0:
+                _fail("recovery")
+            try:
+                lock_info = os.fstat(inherited_fd)
+                if not os.get_inheritable(inherited_fd):
+                    _fail("recovery")
+            except OSError:
+                _fail("recovery")
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_uid != 0
+            or lock_info.st_nlink != 1
+            or not _deploy_lock_mode_is_safe(lock_info.st_mode)
+        ):
+            _fail("recovery")
+        _acl_is_safe(
+            f"/proc/self/fd/{lock_fd}",
+            follow_symlinks=True,
+            category="recovery",
+        )
+        try:
+            path_info = os.stat(
+                ".deploy.lock",
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            _fail("recovery")
+        if not _same_inode(path_info, lock_info):
+            _fail("recovery")
+        _revalidate_retention_state_root_path(state_root, root_info)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            _fail("recovery")
+        yield lock_fd
+    finally:
+        if owns_fd and lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(root_fd)
 
 
 def _bounded_stdin(limit: int) -> bytes:
@@ -117,9 +227,9 @@ def _depth(value: Any, level: int = 0) -> None:
 def _json(data: bytes, category: str = "provider") -> Any:
     try:
         value = json.loads(data.decode("utf-8"), object_pairs_hook=_pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError, ProviderError):
+        _depth(value)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, ProviderError):
         _fail(category)
-    _depth(value)
     return value
 
 
@@ -368,6 +478,19 @@ def _witness_identity(value: dict[str, int]) -> dict[str, int]:
     }
 
 
+def _validate_quarantine_name(name: str, quarantine_name: str) -> str:
+    if (
+        not isinstance(quarantine_name, str)
+        or not quarantine_name
+        or quarantine_name in (".", "..")
+        or "/" in quarantine_name
+        or "\x00" in quarantine_name
+        or quarantine_name == name
+    ):
+        _fail("recovery")
+    return quarantine_name
+
+
 def _close_owned_witnesses(
     witnesses: Iterable[tuple[dict[str, int], bytes]],
 ) -> None:
@@ -402,7 +525,10 @@ def _env_entries(inspect: dict[str, Any]) -> list[tuple[str, str]]:
     config = inspect.get("Config")
     if not isinstance(config, dict):
         _fail("provider")
-    env = config.get("Env", [])
+    return _configuration_env_entries(config.get("Env", []))
+
+
+def _configuration_env_entries(env: Any) -> list[tuple[str, str]]:
     if not isinstance(env, list):
         _fail("provider")
     entries: list[tuple[str, str]] = []
@@ -478,7 +604,10 @@ def _provider_state(inspect: dict[str, Any]) -> tuple[bool, dict[str, str]]:
         _fail("provider")
     entries = _env_entries(inspect)
     _validate_configuration_channels(config, entries)
-    values = dict(entries)
+    return _provider_values(dict(entries))
+
+
+def _provider_values(values: dict[str, str]) -> tuple[bool, dict[str, str]]:
     enabled_value = values.get("APP_PUSH_PROVIDER_ENABLED", "false").strip().lower()
     if enabled_value not in ("true", "false"):
         _fail("provider")
@@ -578,6 +707,10 @@ def _inspect_records(data: bytes) -> tuple[dict[str, Any], dict[str, Any] | None
 
 def _effective_tuple(inspect: dict[str, Any]) -> dict[str, str]:
     enabled, values = _provider_state(inspect)
+    return _normalized_provider_tuple(enabled, values)
+
+
+def _normalized_provider_tuple(enabled: bool, values: dict[str, str]) -> dict[str, str]:
     result = {
         key: values.get(key, "")
         for key in PUSH_KEYS
@@ -592,6 +725,2307 @@ def _effective_tuple(inspect: dict[str, Any]) -> dict[str, str]:
     )
     result["APP_PUSH_PROVIDER_ENABLED"] = "true" if enabled else "false"
     return result
+
+
+def _finalization_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _validate_finalization_file_record(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "device", "inode", "uid", "gid", "mode", "size", "mtimeNs", "ctimeNs",
+        "links", "sha256",
+    }:
+        _fail("recovery")
+    for key in (
+        "device", "inode", "uid", "gid", "mode", "size", "mtimeNs", "ctimeNs", "links",
+    ):
+        if type(value[key]) is not int or value[key] < 0:
+            _fail("recovery")
+    if value["links"] < 1 or re.fullmatch(r"[0-9a-f]{64}", str(value["sha256"])) is None:
+        _fail("recovery")
+
+
+def _validate_finalization_directory_record(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "device", "inode", "uid", "gid", "mode", "links",
+    }:
+        _fail("recovery")
+    if any(type(value[key]) is not int or value[key] < 0 for key in value):
+        _fail("recovery")
+
+
+def _validate_finalization_witness(value: Any) -> dict[str, Any]:
+    keys = {
+        "schema", "outcome", "runKey", "stateKind", "ownedRun", "rootId",
+        "originDigest", "incidentId", "operationEpoch", "evidenceDigest",
+        "commitWitnessDigest", "containerId", "configHash", "imageId",
+        "revision", "version", "repositoryDigest", "platformImageId",
+        "providerEnabled", "durableDisposition", "effectiveProviderDigest",
+        "config", "transaction", "durableCredential", "terminal", "pointer", "startAttemptId",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+        _fail("recovery")
+    if value["schema"] != FINALIZATION_SCHEMA or value["outcome"] != "committed":
+        _fail("recovery")
+    _run_key(value["runKey"])
+    if (
+        not isinstance(value["stateKind"], str)
+        or value["stateKind"] not in STATE_KINDS
+    ):
+        _fail("recovery")
+    if value["ownedRun"] != f'{value["runKey"]}-{value["stateKind"]}':
+        _fail("recovery")
+    for key in (
+        "originDigest", "evidenceDigest", "commitWitnessDigest", "configHash",
+        "repositoryDigest", "platformImageId", "effectiveProviderDigest",
+    ):
+        if not isinstance(value[key], str) or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None:
+            _fail("recovery")
+    if (
+        not isinstance(value["rootId"], str)
+        or not value["rootId"]
+        or len(value["rootId"]) > 128
+        or not isinstance(value["incidentId"], str)
+        or re.fullmatch(r"[a-f0-9]{32}", value["incidentId"]) is None
+        or type(value["operationEpoch"]) is not int
+        or value["operationEpoch"] <= 0
+    ):
+        _fail("recovery")
+    attempt = re.fullmatch(
+        r"([a-f0-9]{32}):([1-9][0-9]{0,19})",
+        value["startAttemptId"] if isinstance(value["startAttemptId"], str) else "",
+    )
+    if (
+        attempt is None or attempt.group(1) != value["incidentId"]
+        or int(attempt.group(2)) > (1 << 64) - 1
+    ):
+        _fail("recovery")
+    if (
+        not isinstance(value["containerId"], str)
+        or re.fullmatch(r"[a-f0-9]{12,64}", value["containerId"]) is None
+        or not isinstance(value["imageId"], str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", value["imageId"]) is None
+        or not isinstance(value["platformImageId"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["platformImageId"]) is None
+        or not isinstance(value["revision"], str)
+        or re.fullmatch(r"[a-f0-9]{40,64}", value["revision"]) is None
+        or not isinstance(value["version"], str)
+        or not value["version"]
+        or len(value["version"]) > 64
+    ):
+        _fail("recovery")
+    if value["imageId"] != "sha256:" + value["platformImageId"]:
+        _fail("recovery")
+    if type(value["providerEnabled"]) is not bool:
+        _fail("recovery")
+    if value["durableDisposition"] not in ("none", "created", "reused"):
+        _fail("recovery")
+    if (
+        not isinstance(value["config"], list)
+        or len(value["config"]) != 4
+        or any(not isinstance(entry, dict) for entry in value["config"])
+    ):
+        _fail("recovery")
+    config_names: set[str] = set()
+    for entry in value["config"]:
+        if not isinstance(entry, dict) or set(entry) != {"name", "identity"}:
+            _fail("recovery")
+        if not isinstance(entry["name"], str) or entry["name"] not in {
+            "config.env.target",
+            "config.env.target.identity",
+            "config.base-compose.yml",
+            "config.base-compose.yml.identity",
+        } or entry["name"] in config_names:
+            _fail("recovery")
+        config_names.add(entry["name"])
+        _validate_finalization_file_record(entry["identity"])
+    if config_names != {
+        "config.env.target",
+        "config.env.target.identity",
+        "config.base-compose.yml",
+        "config.base-compose.yml.identity",
+    }:
+        _fail("recovery")
+    if value["providerEnabled"]:
+        if value["durableDisposition"] not in ("created", "reused"):
+            _fail("recovery")
+        transaction = value["transaction"]
+        if not isinstance(transaction, dict) or set(transaction) != {
+            "parent", "directory", "entries",
+        }:
+            _fail("recovery")
+        _validate_finalization_directory_record(transaction["parent"])
+        _validate_finalization_directory_record(transaction["directory"])
+        expected_names = ["identity.json", "snapshot"]
+        if value["durableDisposition"] == "created":
+            expected_names.append("publication")
+        entries = transaction["entries"]
+        if (
+            not isinstance(entries, list)
+            or any(not isinstance(entry, dict) for entry in entries)
+            or [entry.get("name") for entry in entries] != expected_names
+        ):
+            _fail("recovery")
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {
+                "name", "identity", "quarantineName", "linkProgression",
+            }:
+                _fail("recovery")
+            _validate_finalization_file_record(entry["identity"])
+            expected_quarantine = f'.provider-cleanup-{value["runKey"]}-{entry["name"].replace(".", "-")}'
+            if entry["quarantineName"] != expected_quarantine:
+                _fail("recovery")
+            if entry["name"] == "publication":
+                if entry["linkProgression"] != [2, 1]:
+                    _fail("recovery")
+            elif entry["linkProgression"] != [1]:
+                _fail("recovery")
+        durable = value["durableCredential"]
+        if durable is None:
+            _fail("recovery")
+        _validate_finalization_file_record(durable)
+        if durable["links"] != (2 if value["durableDisposition"] == "created" else 1):
+            _fail("recovery")
+    elif (
+        value["durableDisposition"] != "none"
+        or value["transaction"] is not None
+        or value["durableCredential"] is not None
+    ):
+        _fail("recovery")
+    terminal = value["terminal"]
+    if not isinstance(terminal, dict) or set(terminal) != {
+        "schemaVersion", "runKey", "outcome", "providerEnabled",
+    } or terminal != {
+        "schemaVersion": SCHEMA_VERSION,
+        "runKey": value["runKey"],
+        "outcome": "committed",
+        "providerEnabled": value["providerEnabled"],
+    }:
+        _fail("recovery")
+    if value["pointer"] != {
+        "schemaVersion": SCHEMA_VERSION,
+        "runKey": value["runKey"],
+        "phase": "finalizing",
+        "providerEnabled": value["providerEnabled"],
+        "durableDisposition": value["durableDisposition"],
+    }:
+        _fail("recovery")
+    return value
+
+
+def _directory_record(info: os.stat_result) -> dict[str, int]:
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+        _fail("recovery")
+    return {
+        "device": int(info.st_dev),
+        "inode": int(info.st_ino),
+        "uid": int(info.st_uid),
+        "gid": int(info.st_gid),
+        "mode": stat.S_IMODE(info.st_mode),
+        "links": int(info.st_nlink),
+    }
+
+
+def _file_record(
+    directory_fd: int,
+    name: str,
+    *,
+    uid: int = 0,
+    gid: int = 0,
+    mode: int = 0o600,
+    links: int = 1,
+) -> dict[str, Any]:
+    identity, data = _child_witness(directory_fd, name, limit=MAX_WITNESS_BYTES)
+    witness_fd = identity.pop("_witnessFd")
+    try:
+        info = os.fstat(witness_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != uid
+            or info.st_gid != gid
+            or stat.S_IMODE(info.st_mode) != mode
+            or info.st_nlink != links
+            or _identity(info) != identity
+        ):
+            _fail("recovery")
+        _acl_is_safe(
+            f"/proc/self/fd/{witness_fd}",
+            follow_symlinks=True,
+            category="recovery",
+        )
+        return {
+            "device": int(info.st_dev),
+            "inode": int(info.st_ino),
+            "uid": int(info.st_uid),
+            "gid": int(info.st_gid),
+            "mode": stat.S_IMODE(info.st_mode),
+            "size": int(info.st_size),
+            "mtimeNs": int(info.st_mtime_ns),
+            "ctimeNs": int(info.st_ctime_ns),
+            "links": int(info.st_nlink),
+            "sha256": _finalization_digest(data),
+        }
+    finally:
+        os.close(witness_fd)
+
+
+def _read_child_file(directory_fd: int, name: str, limit: int) -> tuple[dict[str, Any], bytes]:
+    identity, data = _child_witness(directory_fd, name, limit=limit)
+    witness_fd = identity.pop("_witnessFd")
+    try:
+        info = os.fstat(witness_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+            or _identity(info) != identity
+        ):
+            _fail("recovery")
+        _acl_is_safe(
+            f"/proc/self/fd/{witness_fd}",
+            follow_symlinks=True,
+            category="recovery",
+        )
+        record = {
+            "device": int(info.st_dev),
+            "inode": int(info.st_ino),
+            "uid": int(info.st_uid),
+            "gid": int(info.st_gid),
+            "mode": stat.S_IMODE(info.st_mode),
+            "size": int(info.st_size),
+            "mtimeNs": int(info.st_mtime_ns),
+            "ctimeNs": int(info.st_ctime_ns),
+            "links": int(info.st_nlink),
+            "sha256": _finalization_digest(data),
+        }
+        return record, data
+    finally:
+        os.close(witness_fd)
+
+
+def _read_finalization_witness(directory_fd: int) -> tuple[dict[str, Any], bytes]:
+    try:
+        info = os.stat(
+            "provider-finalization.json",
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError:
+        _fail("recovery")
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+        or info.st_size > MAX_FINALIZATION_BYTES
+    ):
+        _fail("recovery")
+    record, data = _read_child_file(
+        directory_fd,
+        "provider-finalization.json",
+        MAX_FINALIZATION_BYTES,
+    )
+    value = _validate_finalization_witness(_json(data, "recovery"))
+    if record["size"] != len(data):
+        _fail("recovery")
+    return value, data
+
+
+def _timepad_current(state_root: str, deploy_lock_fd: int) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    module = _timepad_state_module()
+    try:
+        origin, current = module._read_guard_locked(state_root)
+    except (module.GuardError, OSError, ValueError, TypeError, AttributeError):
+        _fail("recovery")
+    if not isinstance(origin, dict) or not isinstance(current, dict):
+        _fail("recovery")
+    if not isinstance(deploy_lock_fd, int) or deploy_lock_fd < 0:
+        _fail("recovery")
+    return module, origin, current
+
+
+def _controller_commit_witness(
+    run_fd: int,
+    current: dict[str, Any],
+    *,
+    require_state_digest: bool,
+) -> tuple[dict[str, Any], bytes, str]:
+    _, data = _read_child_file(
+        run_fd,
+        "timepad-commit-witness.json",
+        MAX_OWNER_BYTES,
+    )
+    value = _json(data, "recovery")
+    expected_keys = {
+        "schema", "operationEpoch", "incidentId", "containerId", "configHash",
+        "imageId", "revision", "version", "providerEnabled",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        _fail("recovery")
+    if (
+        value["schema"] != "meet-backend/test-vps-timepad-commit-witness/v1"
+        or type(value["operationEpoch"]) is not int
+        or type(value["providerEnabled"]) is not bool
+        or not isinstance(value["incidentId"], str)
+        or not isinstance(value["containerId"], str)
+        or not isinstance(value["configHash"], str)
+        or not isinstance(value["imageId"], str)
+        or not isinstance(value["revision"], str)
+        or not isinstance(value["version"], str)
+    ):
+        _fail("recovery")
+    digest = _finalization_digest(data)
+    recorded_digest = current.get("commitWitnessDigest")
+    if require_state_digest:
+        if recorded_digest != digest:
+            _fail("recovery")
+    elif recorded_digest is not None and recorded_digest != digest:
+        _fail("recovery")
+    return value, data, digest
+
+
+def _finalization_context(
+    run_key: str,
+    state_root: str,
+    state_kind: str,
+    inspect_data: bytes,
+    deploy_lock_fd: int,
+    *,
+    for_resume: bool,
+) -> tuple[dict[str, Any], int, int, dict[str, Any], dict[str, Any], bytes]:
+    if state_kind not in STATE_KINDS:
+        _fail("recovery")
+    run_name = f"{run_key}-{state_kind}"
+    module, origin, current = _timepad_current(state_root, deploy_lock_fd)
+    allowed_phases = {"COMMITTING", "COMMITTED"}
+    if not for_resume:
+        allowed_phases |= {"VERIFYING"}
+    if (
+        current.get("phase") not in allowed_phases
+        or current.get("ownedChild") is not None
+        or current.get("operation") != "deploy"
+        or current.get("ownedRun") != run_name
+        or current.get("operationEpoch") <= 0
+        or current.get("runId") != run_key
+        or current.get("commitSubstep") not in (
+            None,
+            "provider-cleanup",
+            "terminal-policy-intent",
+            "policy-restored",
+            "replacement-container-authorized",
+            "replacement-provider-cleanup",
+            "replacement-terminal-policy-intent",
+            "replacement-policy-restored",
+        )
+        or not for_resume
+        and isinstance(current.get("commitSubstep"), str)
+        and current["commitSubstep"].startswith("replacement-")
+    ):
+        _fail("recovery")
+    try:
+        _validate_state_directory(os.path.join(state_root, run_name), run_name)
+        run_fd = os.open(
+            os.path.join(state_root, run_name),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError:
+        _fail("recovery")
+    try:
+        run_info = os.fstat(run_fd)
+        _directory_record(run_info)
+        if stat.S_IMODE(run_info.st_mode) != 0o700:
+            _fail("recovery")
+        commit, commit_data, commit_digest = _controller_commit_witness(
+            run_fd,
+            current,
+            require_state_digest=for_resume,
+        )
+        inspect = _inspect(inspect_data)
+        enabled, _ = _provider_state(inspect)
+        present, read_only, source = _provider_mount(inspect, enabled)
+        target = current.get("target")
+        if not isinstance(target, dict) or not isinstance(target.get("tuple"), dict):
+            _fail("recovery")
+        target_tuple = target["tuple"]
+        config = inspect.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        config_hash = labels.get("com.docker.compose.config-hash") if isinstance(labels, dict) else None
+        container_id = inspect.get("Id")
+        image_id = inspect.get("Image")
+        if (
+            enabled != commit["providerEnabled"]
+            or commit["operationEpoch"] != current["operationEpoch"]
+            or commit["incidentId"] != current["incidentId"]
+            or (not for_resume and commit["containerId"] != current["containerId"])
+            or commit["configHash"] != current["configHash"]
+            or commit["configHash"] != config_hash
+            or current["containerId"] != container_id
+            or commit["imageId"] != image_id
+            or commit["imageId"] != (
+                "sha256:" + target_tuple.get("platformImageId", "")
+            )
+            or commit["revision"] != target_tuple.get("revision")
+            or commit["version"] != target_tuple.get("version")
+            or origin.get("originDigest") != current.get("originDigest")
+            or not present and (read_only or source is not None)
+            or enabled and (not present or not read_only or source != HOST_CREDENTIAL_PATH)
+        ):
+            _fail("recovery")
+        if for_resume and (
+            current.get("providerFinalizationDigest") is None
+            or current.get("commitSubstep") not in (
+                "provider-cleanup", "terminal-policy-intent", "policy-restored",
+                "replacement-container-authorized", "replacement-provider-cleanup",
+                "replacement-terminal-policy-intent", "replacement-policy-restored",
+            )
+        ):
+            _fail("recovery")
+        if not for_resume and current["phase"] == "COMMITTING" and (
+            current.get("providerFinalizationDigest") is None
+        ):
+            _fail("recovery")
+        if for_resume:
+            witness, witness_data = _read_finalization_witness(run_fd)
+            if _finalization_digest(witness_data) != current["providerFinalizationDigest"]:
+                _fail("recovery")
+            _receipt_runtime_binding(witness, current, commit, inspect)
+        return module, run_fd, deploy_lock_fd, origin, current, commit_data
+    except Exception:
+        os.close(run_fd)
+        raise
+
+
+def _build_finalization_witness(
+    *,
+    run_key: str,
+    state_kind: str,
+    origin: dict[str, Any],
+    current: dict[str, Any],
+    commit: dict[str, Any],
+    run_fd: int,
+    inspect: dict[str, Any],
+    state_root: str,
+) -> dict[str, Any]:
+    enabled, _ = _provider_state(inspect)
+    marker = _marker(state_root, run_key)
+    if marker["phase"] not in ("verifying", "finalizing"):
+        _fail("recovery")
+    if marker["providerEnabled"] != enabled:
+        _fail("recovery")
+    disposition = marker["durableDisposition"]
+    if enabled and disposition not in ("created", "reused"):
+        _fail("recovery")
+    if not enabled and disposition != "none":
+        _fail("recovery")
+
+    config_records = [
+        {"name": name, "identity": _file_record(run_fd, name)}
+        for name in (
+            "config.env.target",
+            "config.env.target.identity",
+            "config.base-compose.yml",
+            "config.base-compose.yml.identity",
+        )
+    ]
+    transaction: dict[str, Any] | None = None
+    durable_credential: dict[str, Any] | None = None
+    if enabled:
+        parent = _rooted(HOST_CREDENTIAL_PARENT, None)
+        tx = _transaction(parent, run_key)
+        _validate_transaction(tx)
+        identity_data = _read_private(os.path.join(tx, "identity.json"))
+        identity = _json(identity_data, "recovery")
+        _validate_identity(identity)
+        snapshot = _read_private(os.path.join(tx, "snapshot"))
+        tx_fd = os.open(tx, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            parent_info = os.fstat(parent_fd)
+            tx_info = os.fstat(tx_fd)
+            if (
+                stat.S_IMODE(parent_info.st_mode) != 0o700
+                or stat.S_IMODE(tx_info.st_mode) != 0o700
+                or parent_info.st_uid != 0
+                or tx_info.st_uid != 0
+            ):
+                _fail("recovery")
+            children = ["identity.json", "snapshot"]
+            if disposition == "created":
+                children.append("publication")
+            expected_names = set(children)
+            if set(os.listdir(tx_fd)) != expected_names:
+                _fail("recovery")
+            entries = []
+            for name in children:
+                record = _file_record(
+                    tx_fd,
+                    name,
+                    gid=10001 if name == "publication" else 0,
+                    mode=0o440 if name == "publication" else 0o600,
+                    links=2 if name == "publication" else 1,
+                )
+                if name == "publication" and record["sha256"] != _finalization_digest(snapshot):
+                    _fail("recovery")
+                entries.append(
+                    {
+                        "name": name,
+                        "identity": record,
+                        "quarantineName": (
+                            f".provider-cleanup-{run_key}-{name.replace('.', '-')}"
+                        ),
+                        "linkProgression": [2, 1] if name == "publication" else [1],
+                    }
+                )
+            durable_path = _rooted(HOST_CREDENTIAL_PATH, None)
+            durable_fd, durable_info, durable_data = _open_regular(
+                durable_path,
+                max_bytes=MAX_CREDENTIAL_BYTES,
+            )
+            try:
+                if (
+                    identity["durable"] != _identity(durable_info)
+                    or durable_data != snapshot
+                    or disposition == "created" and durable_info.st_nlink != 2
+                    or disposition == "reused" and durable_info.st_nlink != 1
+                ):
+                    _fail("recovery")
+                durable_credential = {
+                    "device": int(durable_info.st_dev),
+                    "inode": int(durable_info.st_ino),
+                    "uid": int(durable_info.st_uid),
+                    "gid": int(durable_info.st_gid),
+                    "mode": stat.S_IMODE(durable_info.st_mode),
+                    "size": int(durable_info.st_size),
+                    "mtimeNs": int(durable_info.st_mtime_ns),
+                    "ctimeNs": int(durable_info.st_ctime_ns),
+                    "links": int(durable_info.st_nlink),
+                    "sha256": _finalization_digest(durable_data),
+                }
+            finally:
+                os.close(durable_fd)
+            transaction = {
+                "parent": _directory_record(parent_info),
+                "directory": _directory_record(tx_info),
+                "entries": entries,
+            }
+        finally:
+            os.close(tx_fd)
+            os.close(parent_fd)
+    tuple_digest = _finalization_digest(
+        json.dumps(
+            _effective_tuple(inspect),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
+    target_tuple = current["target"]["tuple"]
+    witness = {
+        "schema": FINALIZATION_SCHEMA,
+        "outcome": "committed",
+        "runKey": run_key,
+        "stateKind": state_kind,
+        "ownedRun": current["ownedRun"],
+        "rootId": origin["rootId"],
+        "originDigest": current["originDigest"],
+        "incidentId": current["incidentId"],
+        "operationEpoch": current["operationEpoch"],
+        "evidenceDigest": current["evidenceDigest"],
+        "commitWitnessDigest": _finalization_digest(
+            _read_child_file(run_fd, "timepad-commit-witness.json", MAX_OWNER_BYTES)[1]
+        ),
+        "containerId": commit["containerId"],
+        "configHash": commit["configHash"],
+        "imageId": commit["imageId"],
+        "revision": commit["revision"],
+        "version": commit["version"],
+        "repositoryDigest": target_tuple["repositoryDigest"],
+        "platformImageId": target_tuple["platformImageId"],
+        "providerEnabled": enabled,
+        "durableDisposition": disposition,
+        "effectiveProviderDigest": tuple_digest,
+        # Correlates the one permitted replacement start, not schema compatibility.
+        "startAttemptId": current["latestAttemptId"],
+        "config": config_records,
+        "transaction": transaction,
+        "durableCredential": durable_credential,
+        "terminal": {
+            "schemaVersion": SCHEMA_VERSION,
+            "runKey": run_key,
+            "outcome": "committed",
+            "providerEnabled": enabled,
+        },
+        "pointer": {
+            "schemaVersion": SCHEMA_VERSION,
+            "runKey": run_key,
+            "phase": "finalizing",
+            "providerEnabled": enabled,
+            "durableDisposition": disposition,
+        },
+    }
+    return _validate_finalization_witness(witness)
+
+
+def _store_finalization_witness(run_fd: int, data: bytes) -> None:
+    if len(data) > MAX_FINALIZATION_BYTES:
+        _fail("recovery")
+    name = "provider-finalization.json"
+    try:
+        existing = _read_child_file(run_fd, name, MAX_FINALIZATION_BYTES)[1]
+    except ProviderError:
+        try:
+            os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        else:
+            _fail("recovery")
+    if existing is not None:
+        if existing != data:
+            _fail("recovery")
+        return
+    temporary = ".provider-finalization.tmp"
+    try:
+        os.stat(temporary, dir_fd=run_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        _fail("recovery")
+    _write_private_at(run_fd, temporary, data, 0o600)
+    _rename_noreplace(run_fd, temporary, name)
+    os.fsync(run_fd)
+
+
+def _finalization_expected_identity(record: dict[str, Any]) -> dict[str, int]:
+    return {
+        "device": record["device"],
+        "inode": record["inode"],
+        "mtimeNs": record["mtimeNs"],
+        "ctimeNs": record["ctimeNs"],
+    }
+
+
+def _finalization_stable_identity(record: dict[str, Any]) -> tuple[int, ...]:
+    return (
+        record["device"],
+        record["inode"],
+        stat.S_IFREG | record["mode"],
+        record["uid"],
+        record["gid"],
+        record["size"],
+        record["mtimeNs"],
+        record["links"],
+    )
+
+
+def _matches_finalization_context(
+    witness: dict[str, Any],
+    *,
+    origin: dict[str, Any],
+    current: dict[str, Any],
+    commit: dict[str, Any],
+    commit_data: bytes,
+    run_fd: int,
+    inspect: dict[str, Any],
+) -> None:
+    _matches_finalization_identity(
+        witness, origin=origin, current=current, commit=commit,
+        commit_data=commit_data, run_fd=run_fd,
+        effective_provider_digest=_finalization_digest(json.dumps(
+            _effective_tuple(inspect), sort_keys=True, separators=(",", ":"),
+        ).encode()),
+    )
+
+
+def _matches_finalization_identity(
+    witness: dict[str, Any],
+    *,
+    origin: dict[str, Any],
+    current: dict[str, Any],
+    commit: dict[str, Any],
+    commit_data: bytes,
+    run_fd: int,
+    effective_provider_digest: str,
+) -> None:
+    target_tuple = current["target"]["tuple"]
+    expected = {
+        "runKey": current["runId"],
+        "stateKind": _state_parts(current["ownedRun"])[1],
+        "ownedRun": current["ownedRun"],
+        "rootId": origin["rootId"],
+        "originDigest": current["originDigest"],
+        "incidentId": current["incidentId"],
+        "operationEpoch": current["operationEpoch"],
+        "evidenceDigest": current["evidenceDigest"],
+        "commitWitnessDigest": _finalization_digest(commit_data),
+        "containerId": commit["containerId"],
+        "configHash": commit["configHash"],
+        "imageId": commit["imageId"],
+        "revision": commit["revision"],
+        "version": commit["version"],
+        "repositoryDigest": target_tuple["repositoryDigest"],
+        "platformImageId": target_tuple["platformImageId"],
+        "providerEnabled": commit["providerEnabled"],
+        "effectiveProviderDigest": effective_provider_digest,
+    }
+    if any(witness[key] != value for key, value in expected.items()):
+        _fail("recovery")
+    actual_config = [
+        {"name": name, "identity": _file_record(run_fd, name)}
+        for name in (
+            "config.env.target",
+            "config.env.target.identity",
+            "config.base-compose.yml",
+            "config.base-compose.yml.identity",
+        )
+    ]
+    if witness["config"] != actual_config:
+        _fail("recovery")
+
+
+def _receipt_runtime_binding(
+    witness: dict[str, Any], current: dict[str, Any],
+    commit: dict[str, Any], inspect: dict[str, Any],
+    *, require_replacement_health: bool = True,
+) -> None:
+    """The original receipt proves cleanup; replacement health is a separate proof."""
+    expected = {
+        "schema": "meet-backend/test-vps-timepad-commit-witness/v1",
+        "operationEpoch": current["operationEpoch"],
+        "incidentId": current["incidentId"],
+        "containerId": witness["containerId"],
+        "configHash": current["configHash"],
+        "imageId": inspect["Image"],
+        "revision": current["target"]["tuple"]["revision"],
+        "version": current["target"]["tuple"]["version"],
+        "providerEnabled": _provider_state(inspect)[0],
+    }
+    if (
+        commit != expected
+        or inspect["Id"] != current["containerId"]
+        or commit["configHash"] != inspect["Config"]["Labels"].get(
+            "com.docker.compose.config-hash"
+        )
+        or witness["configHash"] != current["configHash"]
+        or witness["operationEpoch"] != current["operationEpoch"]
+        or witness["incidentId"] != current["incidentId"]
+        or witness["imageId"] != inspect["Image"]
+        or witness["revision"] != expected["revision"]
+        or witness["version"] != expected["version"]
+    ):
+        _fail("recovery")
+    baseline = witness.get("startAttemptId")
+    latest = current.get("latestAttemptId")
+    pattern = r"([a-f0-9]{32}):([1-9][0-9]{0,19})"
+    original = re.fullmatch(pattern, baseline if isinstance(baseline, str) else "")
+    attempt = re.fullmatch(pattern, latest if isinstance(latest, str) else "")
+    if (
+        original is None or attempt is None
+        or original.group(1) != current["incidentId"]
+        or attempt.group(1) != current["incidentId"]
+        or int(original.group(2)) > (1 << 64) - 1
+        or int(attempt.group(2)) > (1 << 64) - 1
+    ):
+        _fail("recovery")
+    replacement = current["containerId"] != witness["containerId"]
+    replacement_substeps = {
+        "replacement-container-authorized",
+        "replacement-provider-cleanup",
+        "replacement-terminal-policy-intent",
+        "replacement-policy-restored",
+    }
+    if current["commitSubstep"] in replacement_substeps and not replacement:
+        _fail("recovery")
+    # The counter identifies every owned command, including exact-container
+    # retries. The monotonic replacement substeps, not a counter delta, enforce
+    # the single replacement budget.
+    if int(attempt.group(2)) < int(original.group(2)) + int(replacement):
+        _fail("recovery")
+    if replacement:
+        if current["commitSubstep"] not in replacement_substeps or current["phase"] not in {
+            "COMMITTING", "COMMITTED", "RECOVERY_REQUIRED", "FORWARD_RECOVERING",
+        } or current["ownedChild"] is not None:
+            _fail("recovery")
+        _, healthy = _live_resume_runtime(inspect, current, "runtime")
+        if require_replacement_health and not healthy:
+            _fail("recovery")
+
+
+def _resume_quarantined_child(
+    directory_fd: int,
+    entry: dict[str, Any],
+    *,
+    link_count: int,
+) -> None:
+    name = entry["name"]
+    quarantine_name = entry["quarantineName"]
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        _fail("recovery")
+    try:
+        quarantine_info = os.stat(
+            quarantine_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError:
+        _fail("recovery")
+    record = entry["identity"]
+    stable = _finalization_stable_identity(record)
+    if (
+        not stat.S_ISREG(quarantine_info.st_mode)
+        or _stable_entry_identity(quarantine_info) != stable
+        or quarantine_info.st_nlink != link_count
+    ):
+        _fail("recovery")
+    try:
+        fd = os.open(
+            quarantine_name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+    except OSError:
+        _fail("recovery")
+    try:
+        before = os.fstat(fd)
+        if (
+            not _same_inode(before, quarantine_info)
+            or _stable_entry_identity(before) != stable
+            or before.st_nlink != link_count
+        ):
+            _fail("recovery")
+        _acl_is_safe(
+            f"/proc/self/fd/{fd}",
+            follow_symlinks=True,
+            category="recovery",
+        )
+        data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
+        if _finalization_digest(data) != record["sha256"]:
+            _fail("recovery")
+        after = os.fstat(fd)
+        path_after = os.stat(
+            quarantine_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _stable_entry_identity(after) != stable
+            or _stable_entry_identity(path_after) != stable
+            or after.st_nlink != link_count
+        ):
+            _fail("recovery")
+        os.unlink(quarantine_name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        os.close(fd)
+
+
+def _cleanup_transaction_from_witness(
+    run_key: str,
+    witness: dict[str, Any],
+) -> None:
+    if not witness["providerEnabled"]:
+        tx = _transaction(_rooted(HOST_CREDENTIAL_PARENT, None), run_key)
+        try:
+            os.stat(tx, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        _fail("recovery")
+    transaction = witness["transaction"]
+    parent = _rooted(HOST_CREDENTIAL_PARENT, None)
+    name = ".transaction-" + run_key
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        parent_info = os.fstat(parent_fd)
+        parent_record = _directory_record(parent_info)
+        if any(
+            parent_record[key] != transaction["parent"][key]
+            for key in ("device", "inode", "uid", "gid", "mode")
+        ):
+            _fail("recovery")
+        _lock_directory(parent_fd)
+        try:
+            tx_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(tx_info.st_mode):
+            _fail("recovery")
+        tx_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            tx_record = _directory_record(os.fstat(tx_fd))
+            if any(
+                tx_record[key] != transaction["directory"][key]
+                for key in ("device", "inode", "uid", "gid", "mode")
+            ) or not _same_inode(os.fstat(tx_fd), tx_info):
+                _fail("recovery")
+            _lock_directory(tx_fd)
+            entries = transaction["entries"]
+            names = set(_iter_directory_fd_names(tx_fd))
+            all_names = {
+                item
+                for entry in entries
+                for item in (entry["name"], entry["quarantineName"])
+            }
+            if names - all_names:
+                _fail("recovery")
+            first_present = next(
+                (
+                    index
+                    for index, entry in enumerate(entries)
+                    if entry["name"] in names or entry["quarantineName"] in names
+                ),
+                len(entries),
+            )
+            for index, entry in enumerate(entries):
+                original = entry["name"]
+                quarantine = entry["quarantineName"]
+                if index < first_present:
+                    if original in names or quarantine in names:
+                        _fail("recovery")
+                    continue
+                if index > first_present:
+                    if original not in names or quarantine in names:
+                        _fail("recovery")
+                    continue
+                if quarantine in names:
+                    if original in names:
+                        _fail("recovery")
+                    link_count = (
+                        entry["identity"]["links"]
+                        if original == "publication"
+                        else 1
+                    )
+                    _resume_quarantined_child(
+                        tx_fd,
+                        entry,
+                        link_count=link_count,
+                    )
+                    names.remove(quarantine)
+                elif original in names:
+                    link_count = entry["identity"]["links"]
+                    _witnessed_unlink(
+                        tx_fd,
+                        original,
+                        expected_identity=_finalization_expected_identity(
+                            entry["identity"]
+                        ),
+                        uid=entry["identity"]["uid"],
+                        gid=entry["identity"]["gid"],
+                        mode=entry["identity"]["mode"],
+                        link_count=link_count,
+                        quarantine_name=quarantine,
+                        expected_data_digest=entry["identity"]["sha256"],
+                        expected_stable_identity=_finalization_stable_identity(
+                            entry["identity"]
+                        ),
+                    )
+                    names.remove(original)
+                    os.fsync(tx_fd)
+                else:
+                    _fail("recovery")
+            if set(_iter_directory_fd_names(tx_fd)):
+                _fail("recovery")
+        finally:
+            os.close(tx_fd)
+        current_tx = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_inode(current_tx, tx_info):
+            _fail("recovery")
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _verify_durable_credential(witness: dict[str, Any]) -> None:
+    if not witness["providerEnabled"]:
+        return
+    path = _rooted(HOST_CREDENTIAL_PATH, None)
+    fd, info, data = _open_regular(path, max_bytes=MAX_CREDENTIAL_BYTES)
+    try:
+        _validate_credential(data)
+        record = witness["durableCredential"]
+        if (
+            info.st_dev != record["device"]
+            or info.st_ino != record["inode"]
+            or info.st_uid != record["uid"]
+            or info.st_gid != record["gid"]
+            or stat.S_IMODE(info.st_mode) != record["mode"]
+            or info.st_size != record["size"]
+            or info.st_mtime_ns != record["mtimeNs"]
+            or info.st_nlink != 1
+            or _finalization_digest(data) != record["sha256"]
+        ):
+            _fail("recovery")
+    finally:
+        os.close(fd)
+
+
+def _terminal_bytes(witness: dict[str, Any]) -> bytes:
+    return json.dumps(
+        witness["terminal"],
+        separators=(",", ":"),
+    ).encode()
+
+
+def _publish_terminal_record(run_fd: int, witness: dict[str, Any]) -> None:
+    expected = _terminal_bytes(witness)
+    try:
+        terminal_info = os.stat(
+            "terminal.json",
+            dir_fd=run_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        temporary = ".provider-terminal.tmp"
+        try:
+            os.stat(temporary, dir_fd=run_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            _fail("recovery")
+        _write_private_at(run_fd, temporary, expected, 0o600)
+        _rename_noreplace(run_fd, temporary, "terminal.json")
+        os.fsync(run_fd)
+        return
+    except OSError:
+        _fail("recovery")
+    if (
+        not stat.S_ISREG(terminal_info.st_mode)
+        or terminal_info.st_uid != 0
+        or stat.S_IMODE(terminal_info.st_mode) != 0o600
+        or terminal_info.st_nlink != 1
+    ):
+        _fail("recovery")
+    fd, _, actual = _open_private_state_file_at(run_fd, "terminal.json")
+    try:
+        if actual != expected:
+            _fail("recovery")
+        _parse_terminal_state_data(actual, witness["ownedRun"])
+    finally:
+        os.close(fd)
+
+
+def _unlink_finalizing_pointer(
+    state_root: str,
+    run_key: str,
+    witness: dict[str, Any],
+) -> None:
+    root_fd = os.open(
+        state_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        try:
+            info = os.stat(
+                ".provider-transaction.current",
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            _fail("recovery")
+        marker = _marker(state_root, run_key)
+        if marker != witness["pointer"]:
+            _fail("recovery")
+        pointer_fd, pointer_info, data = _open_private_state_file_at(
+            root_fd,
+            ".provider-transaction.current",
+        )
+        try:
+            if not _same_inode(info, pointer_info):
+                _fail("recovery")
+            if _json(data, "recovery") != witness["pointer"]:
+                _fail("recovery")
+            final = os.stat(
+                ".provider-transaction.current",
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not _same_inode(final, os.fstat(pointer_fd))
+                or _identity(final) != _identity(os.fstat(pointer_fd))
+            ):
+                _fail("recovery")
+            os.unlink(".provider-transaction.current", dir_fd=root_fd)
+            os.fsync(root_fd)
+        finally:
+            os.close(pointer_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _finalization_result(digest: str, outcome: str) -> None:
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or outcome != "witness-prepared"
+    ):
+        _fail("recovery")
+    sys.stdout.write(
+        json.dumps(
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "providerFinalizationDigest": digest,
+                "outcome": outcome,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def _open_deploy_state_root(state_root: str) -> int:
+    expected = _validate_retention_state_root_path(state_root)
+    try:
+        fd = os.open(
+            state_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError:
+        _fail("recovery")
+    if not _same_inode(os.fstat(fd), expected):
+        os.close(fd)
+        _fail("recovery")
+    _validate_retention_state_root_fd(fd)
+    return fd
+
+
+def _prepare_committed_finalization(
+    run_key: str,
+    state_root: str,
+    state_kind: str,
+    inspect_data: bytes,
+    deploy_lock_fd: int,
+) -> None:
+    root_fd = _open_deploy_state_root(state_root)
+    try:
+        _lock_directory(root_fd)
+        _, run_fd, _, origin, current, _ = _finalization_context(
+            run_key,
+            state_root,
+            state_kind,
+            inspect_data,
+            deploy_lock_fd,
+            for_resume=False,
+        )
+        try:
+            _lock_directory(run_fd)
+            if current["phase"] not in ("VERIFYING", "COMMITTING"):
+                _fail("recovery")
+            if current["phase"] == "COMMITTING" and current.get("commitSubstep") != "provider-cleanup":
+                _fail("recovery")
+            commit, _, _ = _controller_commit_witness(
+                run_fd,
+                current,
+                require_state_digest=current["phase"] == "COMMITTING",
+            )
+            inspect = _inspect(inspect_data)
+            witness = _build_finalization_witness(
+                run_key=run_key,
+                state_kind=state_kind,
+                origin=origin,
+                current=current,
+                commit=commit,
+                run_fd=run_fd,
+                inspect=inspect,
+                state_root=state_root,
+            )
+            data = json.dumps(
+                witness,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            if len(data) > MAX_FINALIZATION_BYTES:
+                _fail("recovery")
+            _store_finalization_witness(run_fd, data)
+            digest = _finalization_digest(data)
+            if (
+                current.get("providerFinalizationDigest") is not None
+                and current["providerFinalizationDigest"] != digest
+            ):
+                _fail("recovery")
+            _finalization_result(digest, "witness-prepared")
+        finally:
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _finalize_tx_residual(
+    run_key: str,
+    transaction: dict[str, Any],
+) -> None:
+    parent = _rooted(HOST_CREDENTIAL_PARENT, None)
+    name = ".transaction-" + run_key
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        parent_info = os.fstat(parent_fd)
+        expected_parent = transaction["parent"]
+        if any(
+            getattr(parent_info, field) != value
+            for field, value in (
+                ("st_dev", expected_parent["device"]),
+                ("st_ino", expected_parent["inode"]),
+                ("st_uid", expected_parent["uid"]),
+                ("st_gid", expected_parent["gid"]),
+            )
+        ) or stat.S_IMODE(parent_info.st_mode) != expected_parent["mode"]:
+            _fail("recovery")
+        _lock_directory(parent_fd)
+        try:
+            tx_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(tx_info.st_mode):
+            _fail("recovery")
+        tx_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            tx_info_fd = os.fstat(tx_fd)
+            expected_tx = transaction["directory"]
+            if (
+                not _same_inode(tx_info_fd, tx_info)
+                or tx_info_fd.st_uid != expected_tx["uid"]
+                or tx_info_fd.st_gid != expected_tx["gid"]
+                or stat.S_IMODE(tx_info_fd.st_mode) != expected_tx["mode"]
+                or (tx_info_fd.st_dev, tx_info_fd.st_ino)
+                != (expected_tx["device"], expected_tx["inode"])
+            ):
+                _fail("recovery")
+            _lock_directory(tx_fd)
+            entries = transaction["entries"]
+            allowed = {
+                name
+                for entry in entries
+                for name in (entry["name"], entry["quarantineName"])
+            }
+            while True:
+                names = set(_iter_directory_fd_names(tx_fd))
+                if names - allowed:
+                    _fail("recovery")
+                first = next(
+                    (
+                        index
+                        for index, entry in enumerate(entries)
+                        if entry["name"] in names or entry["quarantineName"] in names
+                    ),
+                    len(entries),
+                )
+                if first == len(entries):
+                    break
+                for index, entry in enumerate(entries):
+                    original = entry["name"]
+                    quarantine = entry["quarantineName"]
+                    if index < first:
+                        if original in names or quarantine in names:
+                            _fail("recovery")
+                        continue
+                    if index > first:
+                        if original not in names or quarantine in names:
+                            _fail("recovery")
+                        continue
+                    if (original in names) == (quarantine in names):
+                        _fail("recovery")
+                entry = entries[first]
+                _witnessed_unlink(
+                    tx_fd,
+                    entry["name"],
+                    expected_identity=_finalization_expected_identity(
+                        entry["identity"]
+                    ),
+                    uid=entry["identity"]["uid"],
+                    gid=entry["identity"]["gid"],
+                    mode=entry["identity"]["mode"],
+                    link_count=entry["identity"]["links"],
+                    quarantine_name=entry["quarantineName"],
+                    expected_data_digest=entry["identity"]["sha256"],
+                    expected_stable_identity=_finalization_stable_identity(
+                        entry["identity"]
+                    ),
+                )
+                os.fsync(tx_fd)
+        finally:
+            os.close(tx_fd)
+        final_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_inode(final_info, tx_info):
+            _fail("recovery")
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _verify_finalization_durable(witness: dict[str, Any]) -> None:
+    if not witness["providerEnabled"]:
+        return
+    fd, info, data = _open_regular(
+        _rooted(HOST_CREDENTIAL_PATH, None),
+        max_bytes=MAX_CREDENTIAL_BYTES,
+    )
+    try:
+        _validate_credential(data)
+        expected = witness["durableCredential"]
+        if (
+            (info.st_dev, info.st_ino, info.st_uid, info.st_gid)
+            != (
+                expected["device"],
+                expected["inode"],
+                expected["uid"],
+                expected["gid"],
+            )
+            or stat.S_IMODE(info.st_mode) != expected["mode"]
+            or info.st_size != expected["size"]
+            or info.st_mtime_ns != expected["mtimeNs"]
+            or info.st_nlink != 1
+            or _finalization_digest(data) != expected["sha256"]
+        ):
+            _fail("recovery")
+    finally:
+        os.close(fd)
+
+
+def _publish_finalization_terminal(
+    run_fd: int,
+    witness: dict[str, Any],
+) -> None:
+    expected = json.dumps(
+        witness["terminal"],
+        separators=(",", ":"),
+    ).encode()
+    try:
+        current = os.stat(
+            "terminal.json",
+            dir_fd=run_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        temporary = ".provider-terminal.tmp"
+        try:
+            os.stat(temporary, dir_fd=run_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            _fail("recovery")
+        _write_private_at(run_fd, temporary, expected, 0o600)
+        _rename_noreplace(run_fd, temporary, "terminal.json")
+        os.fsync(run_fd)
+        return
+    except OSError:
+        _fail("recovery")
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_uid != 0
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or current.st_nlink != 1
+    ):
+        _fail("recovery")
+    fd, opened, data = _open_private_state_file_at(run_fd, "terminal.json")
+    try:
+        if not _same_inode(current, opened) or data != expected:
+            _fail("recovery")
+        _parse_terminal_state_data(data, witness["ownedRun"])
+    finally:
+        os.close(fd)
+
+
+def _validate_existing_finalization_terminal(
+    run_fd: int,
+    witness: dict[str, Any],
+) -> None:
+    expected = json.dumps(
+        witness["terminal"],
+        separators=(",", ":"),
+    ).encode()
+    try:
+        info = os.stat("terminal.json", dir_fd=run_fd, follow_symlinks=False)
+    except OSError:
+        _fail("recovery")
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+    ):
+        _fail("recovery")
+    fd, opened, data = _open_private_state_file_at(run_fd, "terminal.json")
+    try:
+        if not _same_inode(info, opened) or data != expected:
+            _fail("recovery")
+        _parse_terminal_state_data(data, witness["ownedRun"])
+    finally:
+        os.close(fd)
+
+
+def _remove_finalizing_pointer(
+    state_root: str,
+    run_key: str,
+    witness: dict[str, Any],
+) -> None:
+    root_fd = _open_deploy_state_root(state_root)
+    try:
+        try:
+            path_info = os.stat(
+                ".provider-transaction.current",
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError:
+            _fail("recovery")
+        if (
+            not stat.S_ISREG(path_info.st_mode)
+            or path_info.st_uid != 0
+            or stat.S_IMODE(path_info.st_mode) != 0o600
+            or path_info.st_nlink != 1
+        ):
+            _fail("recovery")
+        marker = _marker(state_root, run_key)
+        if marker != witness["pointer"]:
+            _fail("recovery")
+        fd, opened, data = _open_private_state_file_at(
+            root_fd,
+            ".provider-transaction.current",
+        )
+        try:
+            if (
+                not _same_inode(path_info, opened)
+                or _json(data, "recovery") != witness["pointer"]
+                or _identity(path_info) != _identity(os.fstat(fd))
+            ):
+                _fail("recovery")
+            latest_path = os.stat(
+                ".provider-transaction.current",
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not _same_inode(latest_path, os.fstat(fd))
+                or _identity(latest_path) != _identity(os.fstat(fd))
+            ):
+                _fail("recovery")
+            os.unlink(".provider-transaction.current", dir_fd=root_fd)
+            os.fsync(root_fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+
+
+def _finish_committed_resume(
+    run_key: str,
+    state_root: str,
+    state_kind: str,
+    inspect_data: bytes,
+    deploy_lock_fd: int,
+) -> None:
+    root_fd = _open_deploy_state_root(state_root)
+    try:
+        _lock_directory(root_fd)
+        _, run_fd, _, origin, current, commit_data = _finalization_context(
+            run_key,
+            state_root,
+            state_kind,
+            inspect_data,
+            deploy_lock_fd,
+            for_resume=True,
+        )
+        try:
+            _lock_directory(run_fd)
+            witness, witness_data = _read_finalization_witness(run_fd)
+            witness_digest = _finalization_digest(witness_data)
+            if (
+                witness_digest != current["providerFinalizationDigest"]
+                or witness["commitWitnessDigest"] != current["commitWitnessDigest"]
+                or witness["originDigest"] != origin["originDigest"]
+                or witness["ownedRun"] != current["ownedRun"]
+                or witness["runKey"] != run_key
+                or witness["stateKind"] != state_kind
+            ):
+                _fail("recovery")
+            try:
+                pointer_info = os.stat(
+                    ".provider-transaction.current",
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+                pointer_present = True
+            except FileNotFoundError:
+                pointer_present = False
+            if pointer_present and _marker(state_root, run_key) != witness["pointer"]:
+                _fail("recovery")
+            if not pointer_present:
+                _validate_existing_finalization_terminal(run_fd, witness)
+                tx = _transaction(_rooted(HOST_CREDENTIAL_PARENT, None), run_key)
+                try:
+                    os.stat(tx, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    _fail("recovery")
+            commit, actual_commit_data, commit_digest = _controller_commit_witness(
+                run_fd,
+                current,
+                require_state_digest=True,
+            )
+            if actual_commit_data != commit_data:
+                _fail("recovery")
+            inspect = _inspect(inspect_data)
+            _matches_finalization_context(
+                witness,
+                origin=origin,
+                current=current,
+                commit=commit,
+                commit_data=commit_data,
+                run_fd=run_fd,
+                inspect=inspect,
+            )
+            if commit_digest != witness["commitWitnessDigest"]:
+                _fail("recovery")
+            _finalize_tx_residual(run_key, witness["transaction"]) if witness[
+                "providerEnabled"
+            ] else _cleanup_transaction_from_witness(run_key, witness)
+            _verify_finalization_durable(witness)
+            _publish_finalization_terminal(run_fd, witness)
+            _remove_finalizing_pointer(state_root, run_key, witness)
+            enabled = witness["providerEnabled"]
+            _result(enabled, enabled, enabled, "committed")
+        finally:
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _live_resume_authority(
+    value: Any,
+    *,
+    module: Any,
+    origin: dict[str, Any],
+    current: dict[str, Any],
+    run_key: str,
+    state_kind: str,
+) -> tuple[dict[str, Any], str]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "authorization", "inspection", "stage"}
+        or value["schema"] != LIVE_RESUME_SCHEMA
+        or value["stage"] not in ("admission", "runtime", "quiescence")
+        or value["stage"] == "quiescence" and (
+            current.get("ownedChild") is None or current.get("phase") == "COMMITTED"
+        )
+        or not isinstance(value["authorization"], dict)
+    ):
+        _fail("recovery")
+    _resume_binding_authority(
+        value["authorization"], module=module, origin=origin, current=current,
+        run_key=run_key, state_kind=state_kind,
+    )
+    if current["phase"] == "PREPARED" and any(
+        current.get(key) is not None
+        for key in (
+            "containerId", "configHash", "commitWitnessDigest",
+            "providerFinalizationDigest", "commitSubstep", "terminalReceipt",
+            "ownedChild", "latestAttemptId",
+        )
+    ):
+        _fail("recovery")
+    # Quiescence admission is read-only and authorizes no finalization. It
+    # proves all inputs before the controller asks the state helper to signal
+    # the independently identified owned group. Runtime proof follows again
+    # after stop, group absence and durable reap/clear.
+    if current["ownedChild"] is not None:
+        try:
+            if value["stage"] != "quiescence" or not module.owned_child_is_same_process(
+                current["ownedChild"]
+            ):
+                module.require_child_group_quiescent(current["ownedChild"])
+        except (module.GuardError, OSError):
+            _fail("recovery")
+    inspect = _inspect(json.dumps(value["inspection"], separators=(",", ":")).encode())
+    return inspect, value["stage"]
+
+
+def _resume_binding_authority(
+    authorization: dict[str, Any], *, module: Any, origin: dict[str, Any],
+    current: dict[str, Any], run_key: str, state_kind: str,
+) -> None:
+    if (
+        current.get("originDigest") != origin.get("originDigest")
+        or current.get("runId") != run_key
+        or current.get("ownedRun") != f"{run_key}-{state_kind}"
+        or current.get("operation") != (
+            "deploy" if state_kind == "final-deploy" else "rollback-drill"
+        )
+    ):
+        _fail("recovery")
+    try:
+        module.authorize_recovery(
+            authorization, root_id=origin["rootId"], current=current
+        )
+        contract = module.parse_contract(module._read_input(
+            pathlib.Path(__file__).with_name("test-vps-timepad-release-contracts.json"),
+            module.MAX_CONTRACT_BYTES,
+        ))
+        admission = module.admit(
+            contract,
+            root_id=origin["rootId"],
+            target_id=current["target"]["id"],
+            predecessor_id=current["predecessor"]["id"],
+            transition_id=current["transitionId"],
+            target_tuple=current["target"]["tuple"],
+            predecessor_tuple=current["predecessor"]["tuple"],
+        )
+    except (module.GuardError, OSError, ValueError, TypeError, KeyError):
+        _fail("recovery")
+    target = current["target"]["tuple"]
+    if (
+        admission.disposition != current["predecessorDisposition"]
+        or admission.contract_digest != current["evidenceDigest"]
+        or target["retryExact"] is not True
+        or target["unknownTransitionCovered"] is not True
+        or target["dependencyPolicy"] != "resolved"
+    ):
+        _fail("recovery")
+def _live_resume_runtime(
+    inspect: dict[str, Any], current: dict[str, Any], stage: str
+) -> tuple[bool, bool]:
+    config = inspect.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    state = inspect.get("State")
+    host = inspect.get("HostConfig")
+    restart = host.get("RestartPolicy") if isinstance(host, dict) else None
+    if (
+        not isinstance(labels, dict)
+        or not isinstance(state, dict)
+        or not isinstance(restart, dict)
+        or type(state.get("Running")) is not bool
+        or state.get("Paused") is not False
+        or state.get("Restarting") is not False
+        or state.get("Dead") is not False
+        or labels.get("com.docker.compose.project") != "meet-production"
+        or labels.get("com.docker.compose.service") != "backend"
+        or not isinstance(inspect.get("Id"), str)
+        or re.fullmatch(r"[a-f0-9]{12,64}", inspect["Id"]) is None
+        or not isinstance(labels.get("com.docker.compose.config-hash"), str)
+        or re.fullmatch(
+            r"[a-f0-9]{64}", labels["com.docker.compose.config-hash"]
+        ) is None
+        or restart.get("Name") not in ("no", "unless-stopped")
+    ):
+        _fail("recovery")
+    target = current["target"]["tuple"]
+    exact_target = inspect.get("Image") == "sha256:" + target["platformImageId"]
+    expected_tuple = target
+    if exact_target:
+        if (
+            current.get("containerId") != inspect["Id"]
+            or current.get("configHash") != labels["com.docker.compose.config-hash"]
+        ):
+            _fail("recovery")
+    else:
+        if stage != "admission" or current["phase"] not in {
+            "PREPARED", "CUTOVER_POSSIBLE", "ROLLING_BACK",
+            "RECOVERY_REQUIRED", "FORWARD_RECOVERING",
+        } or current.get("providerFinalizationDigest") is not None:
+            _fail("recovery")
+        expected_tuple = current["predecessor"]["tuple"]
+        if (
+            inspect.get("Image") != "sha256:" + expected_tuple["platformImageId"]
+            or inspect["Id"] != current.get("predecessorContainerId")
+        ):
+            _fail("recovery")
+        # Past the fence even a known incompatible predecessor must be stopped.
+        if current["phase"] != "PREPARED" and (
+            state["Running"] or restart["Name"] != "no"
+        ):
+            _fail("recovery")
+    if (
+        labels.get("org.opencontainers.image.revision") != expected_tuple["revision"]
+        or labels.get("org.opencontainers.image.version") != expected_tuple["version"]
+        or labels.get("org.opencontainers.image.source")
+        != "https://github.com/NickolayMamonov/meet-backend-v3"
+        or config.get("User") != "10001:10001"
+    ):
+        _fail("recovery")
+    phase = current["phase"]
+    if exact_target and phase != "COMMITTED":
+        permitted = {"no"}
+        if phase in {"COMMITTING", "RECOVERY_REQUIRED", "FORWARD_RECOVERING"} and (
+            current["commitSubstep"] in {
+                "terminal-policy-intent", "policy-restored",
+                "replacement-terminal-policy-intent", "replacement-policy-restored",
+            }
+        ):
+            permitted.add("unless-stopped")
+        if restart["Name"] not in permitted:
+            _fail("recovery")
+    healthy = (
+        exact_target and state["Running"]
+        and isinstance(state.get("Health"), dict)
+        and state["Health"].get("Status") == "healthy"
+    )
+    if phase == "COMMITTED" and (
+        not healthy or restart["Name"] != "unless-stopped"
+        or current["ownedChild"] is not None
+    ):
+        _fail("recovery")
+    return exact_target, healthy
+
+
+def _live_resume_config(run_fd: int, current: dict[str, Any]) -> None:
+    names = ("config.env.target", "config.base-compose.yml")
+    for name in names:
+        record, data = _read_child_file(run_fd, name, MAX_CREDENTIAL_BYTES)
+        identity_name = name + ".identity"
+        if name == "config.env.target" and current["phase"] == "PREPARED":
+            # Target identity is recorded only after applying it. PREPARED may
+            # prove the original snapshots, never an invented post-cutover one.
+            identity_name = "config.env.production.identity"
+            _read_child_file(run_fd, "config.env.production", MAX_CREDENTIAL_BYTES)
+        _, identity = _read_child_file(run_fd, identity_name, MAX_OWNER_BYTES)
+        match = re.fullmatch(
+            rb"([0-9]+):([0-9]+):([0-9]+):([0-9]+):([0-9]+):"
+            rb"([0-9]+):([0-9]+):([0-9]+):([0-9a-f]{64})\n?",
+            identity,
+        )
+        if match is None:
+            _fail("recovery")
+        fields = match.groups()
+        if name == "config.env.target" and current["phase"] == "PREPARED":
+            record, data = _read_child_file(
+                run_fd, "config.env.production", MAX_CREDENTIAL_BYTES
+            )
+        if (
+            int(fields[3]) != 0
+            or not stat.S_ISREG(int(fields[2]))
+            or stat.S_IMODE(int(fields[2])) & 0o022
+            or int(fields[5]) != len(data)
+            or fields[8].decode("ascii") != record["sha256"]
+        ):
+            _fail("recovery")
+
+
+def _live_resume_predecessor(
+    run_fd: int, current: dict[str, Any], inspect: dict[str, Any]
+) -> None:
+    expected_tuple = current["predecessor"]["tuple"]
+    labels = inspect["Config"]["Labels"]
+    expected = {
+        "previous-image-id": "sha256:" + expected_tuple["platformImageId"],
+        "previous-revision": expected_tuple["revision"],
+        "previous-version": expected_tuple["version"],
+        "previous-runtime-config-hash": labels["com.docker.compose.config-hash"],
+    }
+    for name, value in expected.items():
+        _, data = _read_child_file(run_fd, name, MAX_OWNER_BYTES)
+        if data != (value + "\n").encode("ascii"):
+            _fail("recovery")
+    _, data = _read_child_file(run_fd, "previous-image", MAX_OWNER_BYTES)
+    try:
+        reference = data.decode("ascii")
+    except UnicodeDecodeError:
+        _fail("recovery")
+    if re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:"
+        + expected_tuple["repositoryDigest"] + r"\n",
+        reference,
+    ) is None:
+        _fail("recovery")
+
+
+def _live_resume_transaction(
+    run_key: str, state_root: str, inspect: dict[str, Any], *, predecessor: bool
+) -> dict[str, Any]:
+    enabled, _ = _provider_state(inspect)
+    _, _, source = _provider_mount(inspect, enabled, allow_external_source=predecessor)
+    marker = _marker(state_root, run_key)
+    if (
+        marker["phase"] not in {"prepared", "applying", "verifying", "rolling-back"}
+        or marker["providerEnabled"] != enabled
+        or enabled and marker["durableDisposition"] not in {"created", "reused"}
+        or not enabled and marker["durableDisposition"] != "none"
+    ):
+        _fail("recovery")
+    tx = _transaction(HOST_CREDENTIAL_PARENT, run_key)
+    if not enabled:
+        if os.path.lexists(tx):
+            _fail("recovery")
+        return marker
+    _validate_transaction(tx)
+    tx_fd = os.open(tx, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _lock_directory(tx_fd)
+        expected_names = {"identity.json", "snapshot"}
+        if marker["durableDisposition"] == "created":
+            expected_names.add("publication")
+        if set(_iter_directory_fd_names(tx_fd)) != expected_names:
+            _fail("recovery")
+        _, identity_data = _read_child_file(tx_fd, "identity.json", MAX_OWNER_BYTES)
+        _, snapshot = _read_child_file(tx_fd, "snapshot", MAX_CREDENTIAL_BYTES)
+        identity = _json(identity_data, "recovery")
+        _validate_identity(identity)
+        _validate_credential(snapshot)
+        durable, data = _read_existing(HOST_CREDENTIAL_PATH)
+        if data != snapshot or durable != identity["durable"]:
+            _fail("recovery")
+        if marker["durableDisposition"] == "created":
+            _verify_created_publication(tx, HOST_CREDENTIAL_PATH, identity, snapshot)
+        else:
+            info = os.stat(HOST_CREDENTIAL_PATH, follow_symlinks=False)
+            if info.st_nlink != 1:
+                _fail("recovery")
+        if predecessor:
+            if source is None:
+                _fail("recovery")
+            previous_identity, previous_data = _read_existing(source, source=True)
+            if previous_identity != identity["predecessor"] or previous_data != snapshot:
+                _fail("recovery")
+        return marker
+    finally:
+        os.close(tx_fd)
+
+
+def _live_resume_receipt(
+    root_fd: int, run_fd: int, state_root: str, current: dict[str, Any],
+    origin: dict[str, Any], inspect: dict[str, Any],
+) -> None:
+    witness, data = _read_finalization_witness(run_fd)
+    if _finalization_digest(data) != current["providerFinalizationDigest"]:
+        _fail("recovery")
+    commit, commit_data, _ = _controller_commit_witness(
+        run_fd, current, require_state_digest=True
+    )
+    _receipt_runtime_binding(
+        witness, current, commit, inspect, require_replacement_health=False,
+    )
+    _matches_finalization_context(
+        witness, origin=origin, current=current, commit=commit,
+        commit_data=commit_data, run_fd=run_fd, inspect=inspect,
+    )
+    _receipt_residuals(root_fd, run_fd, state_root, current, witness, inspect=inspect)
+
+
+def _receipt_residuals(
+    root_fd: int, run_fd: int, state_root: str, current: dict[str, Any],
+    witness: dict[str, Any], *, inspect: dict[str, Any] | None,
+) -> None:
+    try:
+        os.stat(".provider-transaction.current", dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        marker = None
+        _validate_existing_finalization_terminal(run_fd, witness)
+    else:
+        marker = _marker(state_root, current["runId"])
+        if marker != witness["pointer"]:
+            # Crash before finalizing publication permits only intact inputs.
+            if marker != dict(witness["pointer"], phase="verifying"):
+                _fail("recovery")
+            if inspect is not None:
+                _live_resume_transaction(
+                    current["runId"], state_root, inspect, predecessor=False
+                )
+    tx = _transaction(HOST_CREDENTIAL_PARENT, current["runId"])
+    if current["phase"] == "COMMITTED" and marker is not None:
+        _fail("recovery")
+    publication_present = False
+    if os.path.lexists(tx):
+        if not witness["providerEnabled"] or marker is None:
+            _fail("recovery")
+        tx_fd = os.open(tx, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            _lock_directory(tx_fd)
+            transaction = witness["transaction"]
+            actual_dir = _directory_record(os.fstat(tx_fd))
+            if any(
+                actual_dir[key] != transaction["directory"][key]
+                for key in ("device", "inode", "uid", "gid", "mode")
+            ):
+                _fail("recovery")
+            parent_fd = os.open(
+                HOST_CREDENTIAL_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            try:
+                actual_parent = _directory_record(os.fstat(parent_fd))
+                if any(
+                    actual_parent[key] != transaction["parent"][key]
+                    for key in ("device", "inode", "uid", "gid", "mode")
+                ):
+                    _fail("recovery")
+            finally:
+                os.close(parent_fd)
+            names = set(_iter_directory_fd_names(tx_fd))
+            entries = transaction["entries"]
+            if inspect is None and marker["phase"] == "verifying" and names != {
+                entry["name"] for entry in entries
+            }:
+                _fail("recovery")
+            allowed = {n for e in entries for n in (e["name"], e["quarantineName"])}
+            if names - allowed:
+                _fail("recovery")
+            first = next(
+                (i for i, e in enumerate(entries)
+                 if e["name"] in names or e["quarantineName"] in names),
+                len(entries),
+            )
+            for i, entry in enumerate(entries):
+                original, quarantine = entry["name"], entry["quarantineName"]
+                if i < first:
+                    continue
+                if i > first and (original not in names or quarantine in names):
+                    _fail("recovery")
+                if (original in names) == (quarantine in names):
+                    _fail("recovery")
+                name = original if original in names else quarantine
+                expected = entry["identity"]
+                actual = _file_record(
+                    tx_fd, name, uid=expected["uid"], gid=expected["gid"],
+                    mode=expected["mode"], links=expected["links"],
+                )
+                compare = set(expected) - ({"ctimeNs"} if name == quarantine else set())
+                if any(actual[key] != expected[key] for key in compare):
+                    _fail("recovery")
+                publication_present |= original == "publication"
+        finally:
+            os.close(tx_fd)
+    elif marker is not None and marker["phase"] != "finalizing" and witness["providerEnabled"]:
+        _fail("recovery")
+    if witness["providerEnabled"]:
+        fd, info, credential = _open_regular(
+            HOST_CREDENTIAL_PATH, max_bytes=MAX_CREDENTIAL_BYTES
+        )
+        try:
+            _validate_credential(credential)
+            expected = witness["durableCredential"]
+            actual = {
+                "device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid,
+                "gid": info.st_gid, "mode": stat.S_IMODE(info.st_mode),
+                "size": info.st_size, "mtimeNs": info.st_mtime_ns,
+                "links": info.st_nlink, "sha256": _finalization_digest(credential),
+            }
+            if actual != {
+                key: (2 if publication_present else 1) if key == "links" else expected[key]
+                for key in actual
+            }:
+                _fail("recovery")
+        finally:
+            os.close(fd)
+    if current["phase"] == "COMMITTED":
+        stream = json.dumps({
+            "schemaVersion": SCHEMA_VERSION,
+            "providerEnabled": witness["providerEnabled"],
+            "credentialMountPresent": witness["providerEnabled"],
+            "credentialMountReadOnly": witness["providerEnabled"],
+            "outcome": "committed",
+        }, separators=(",", ":")).encode()
+        if _finalization_digest(stream) != current["terminalReceipt"]:
+            _fail("recovery")
+
+
+def _absence_target_tuple(
+    image: dict[str, Any], configuration: Any, current: dict[str, Any],
+) -> dict[str, str]:
+    """Resolve configuration evidence, without constructing a runtime record."""
+    _image_admission(image)
+    target = current["target"]["tuple"]
+    labels = image["Config"].get("Labels")
+    if (
+        image.get("Id") != "sha256:" + target["platformImageId"]
+        or image["Config"].get("User") != "10001:10001"
+        or not isinstance(labels, dict)
+        or labels.get("org.opencontainers.image.revision") != target["revision"]
+        or labels.get("org.opencontainers.image.version") != target["version"]
+        or labels.get("org.opencontainers.image.source")
+        != "https://github.com/NickolayMamonov/meet-backend-v3"
+        or not isinstance(configuration, dict)
+        or not isinstance(configuration.get("services"), dict)
+        or not isinstance(configuration["services"].get("backend"), dict)
+    ):
+        _fail("recovery")
+    backend = configuration["services"]["backend"]
+    reference = backend.get("image")
+    environment = backend.get("environment", {})
+    if (
+        not isinstance(reference, str)
+        or reference != "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:"
+        + target["repositoryDigest"]
+        or not isinstance(environment, dict)
+        or any(not isinstance(k, str) or not isinstance(v, str)
+               for k, v in environment.items())
+    ):
+        _fail("recovery")
+    values = dict(_env_entries(image))
+    values.update(environment)
+    config = dict(image["Config"])
+    for source, destination in (("command", "Cmd"), ("entrypoint", "Entrypoint")):
+        if source in backend:
+            config[destination] = backend[source]
+    _validate_configuration_channels(config, list(values.items()))
+    enabled, provider = _provider_values(values)
+    volumes = backend.get("volumes", [])
+    if not isinstance(volumes, list):
+        _fail("recovery")
+    credential = []
+    for mount in volumes:
+        if not isinstance(mount, dict):
+            _fail("recovery")
+        destination = mount.get("target")
+        if destination == CONTAINER_CREDENTIAL_PATH:
+            credential.append(mount)
+        elif destination != "/data/uploads":
+            _fail("recovery")
+    if enabled:
+        if len(credential) != 1 or not isinstance(credential[0].get("bind"), dict):
+            _fail("recovery")
+        if any((
+            credential[0].get("type") != "bind",
+            credential[0].get("source") != HOST_CREDENTIAL_PATH,
+            credential[0].get("read_only") is not True,
+            credential[0]["bind"].get("create_host_path") is not False,
+        )):
+            _fail("recovery")
+    elif credential:
+        _fail("recovery")
+    return _normalized_provider_tuple(enabled, provider)
+
+
+def _absence_receipt(
+    root_fd: int, run_fd: int, state_root: str, current: dict[str, Any],
+    origin: dict[str, Any], effective: dict[str, str],
+) -> None:
+    if (
+        current["phase"] not in {"COMMITTING", "RECOVERY_REQUIRED", "FORWARD_RECOVERING"}
+        or current["ownedChild"] is not None
+        or current["providerFinalizationDigest"] is None
+        or current["commitWitnessDigest"] is None
+        or current["commitSubstep"] not in {
+            "provider-cleanup", "terminal-policy-intent", "policy-restored",
+        }
+    ):
+        _fail("recovery")
+    witness, data = _read_finalization_witness(run_fd)
+    if _finalization_digest(data) != current["providerFinalizationDigest"]:
+        _fail("recovery")
+    commit, commit_data, _ = _controller_commit_witness(
+        run_fd, current, require_state_digest=True,
+    )
+    target = current["target"]["tuple"]
+    if (
+        commit != {
+            "schema": "meet-backend/test-vps-timepad-commit-witness/v1",
+            "operationEpoch": current["operationEpoch"],
+            "incidentId": current["incidentId"],
+            "containerId": current["containerId"], "configHash": current["configHash"],
+            "imageId": "sha256:" + target["platformImageId"],
+            "revision": target["revision"], "version": target["version"],
+            "providerEnabled": effective["APP_PUSH_PROVIDER_ENABLED"] == "true",
+        }
+        or witness["containerId"] != current["containerId"]
+    ):
+        _fail("recovery")
+    original = re.fullmatch(
+        re.escape(current["incidentId"]) + r":([1-9][0-9]{0,19})",
+        witness["startAttemptId"],
+    )
+    latest = re.fullmatch(
+        re.escape(current["incidentId"]) + r":([1-9][0-9]{0,19})",
+        current["latestAttemptId"] or "",
+    )
+    if original is None or latest is None or not (
+        int(original.group(1)) <= int(latest.group(1)) <= (1 << 64) - 1
+    ):
+        _fail("recovery")
+    _matches_finalization_identity(
+        witness, origin=origin, current=current, commit=commit,
+        commit_data=commit_data, run_fd=run_fd,
+        effective_provider_digest=_finalization_digest(json.dumps(
+            effective, sort_keys=True, separators=(",", ":"),
+        ).encode()),
+    )
+    _receipt_residuals(root_fd, run_fd, state_root, current, witness, inspect=None)
+
+
+def _absence_resume(
+    run_key: str, state_root: str, state_kind: str,
+    input_data: bytes, deploy_lock_fd: int,
+) -> None:
+    if (
+        type(deploy_lock_fd) is not int or deploy_lock_fd < 0
+        or state_kind != "final-deploy" or len(input_data) > MAX_LIVE_RESUME_BYTES
+    ):
+        _fail("recovery")
+    value = _json(input_data, "recovery")
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "schema", "authorization", "imageInspection",
+            "targetConfiguration", "backendInventory",
+        }
+        or value["schema"] != ABSENCE_RESUME_SCHEMA
+        or value["backendInventory"] != []
+        or not isinstance(value["authorization"], dict)
+    ):
+        _fail("recovery")
+    root_fd = _open_deploy_state_root(state_root)
+    try:
+        _lock_directory(root_fd)
+        module, origin, current = _timepad_current(state_root, deploy_lock_fd)
+        _resume_binding_authority(
+            value["authorization"], module=module, origin=origin, current=current,
+            run_key=run_key, state_kind=state_kind,
+        )
+        image = _inspect(json.dumps(value["imageInspection"], separators=(",", ":")).encode())
+        effective = _absence_target_tuple(image, value["targetConfiguration"], current)
+        run_fd = os.open(
+            current["ownedRun"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        credential_parent = None
+        try:
+            _lock_directory(run_fd)
+            _validate_state_directory_fd(run_fd, current["ownedRun"])
+            for name in _iter_directory_fd_names(root_fd):
+                if name == ".smtp-transaction.current" or (
+                    name.startswith((".provider-transaction.", ".provider-state."))
+                    and name != ".provider-transaction.current"
+                ):
+                    _fail("recovery")
+            credential_parent = _open_optional_directory_reference(HOST_CREDENTIAL_PARENT)
+            if credential_parent is not None:
+                _lock_directory(credential_parent)
+                for name in _iter_directory_fd_names(credential_parent):
+                    if name.startswith(".transaction-") and name != ".transaction-" + run_key:
+                        _fail("recovery")
+            _live_resume_config(run_fd, current)
+            _absence_receipt(root_fd, run_fd, state_root, current, origin, effective)
+            _, final_origin, final_current = _timepad_current(state_root, deploy_lock_fd)
+            if final_origin != origin or final_current != current:
+                _fail("recovery")
+            enabled = effective["APP_PUSH_PROVIDER_ENABLED"] == "true"
+            _result(enabled, enabled, enabled, "retry-exact-candidate")
+        finally:
+            if credential_parent is not None:
+                os.close(credential_parent)
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _live_resume(
+    run_key: str, state_root: str, state_kind: str,
+    input_data: bytes, deploy_lock_fd: int,
+) -> None:
+    """Private, read-only proof; the controller owns reconciliation and retries."""
+    if (
+        type(deploy_lock_fd) is not int or deploy_lock_fd < 0
+        or state_kind not in STATE_KINDS
+        or len(input_data) > MAX_LIVE_RESUME_BYTES
+    ):
+        _fail("recovery")
+    root_fd = _open_deploy_state_root(state_root)
+    try:
+        _lock_directory(root_fd)
+        module, origin, current = _timepad_current(state_root, deploy_lock_fd)
+        inspect, stage = _live_resume_authority(
+            _json(input_data, "recovery"), module=module, origin=origin,
+            current=current, run_key=run_key, state_kind=state_kind,
+        )
+        exact_target, healthy = _live_resume_runtime(inspect, current, stage)
+        run_fd = os.open(
+            current["ownedRun"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        credential_parent = None
+        try:
+            _lock_directory(run_fd)
+            _validate_state_directory_fd(run_fd, current["ownedRun"])
+            for name in _iter_directory_fd_names(root_fd):
+                if name == ".smtp-transaction.current" or (
+                    name.startswith((".provider-transaction.", ".provider-state."))
+                    and name != ".provider-transaction.current"
+                ):
+                    _fail("recovery")
+            credential_parent = _open_optional_directory_reference(HOST_CREDENTIAL_PARENT)
+            if credential_parent is not None:
+                _lock_directory(credential_parent)
+                for name in _iter_directory_fd_names(credential_parent):
+                    if name.startswith(".transaction-") and name != (
+                        ".transaction-" + run_key
+                    ):
+                        _fail("recovery")
+            _live_resume_config(run_fd, current)
+            if not exact_target:
+                _live_resume_predecessor(run_fd, current, inspect)
+            if current["phase"] == "PREPARED":
+                for name in ("timepad-commit-witness.json", "provider-finalization.json"):
+                    try:
+                        os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    _fail("recovery")
+            enabled, _ = _provider_state(inspect)
+            present, read_only, _ = _provider_mount(
+                inspect, enabled, allow_external_source=not exact_target
+            )
+            if current["providerFinalizationDigest"] is not None:
+                if not exact_target:
+                    _fail("recovery")
+                _live_resume_receipt(root_fd, run_fd, state_root, current, origin, inspect)
+                outcome = "already-completed" if current["phase"] == "COMMITTED" else (
+                    "finalization-only" if healthy else "retry-exact-candidate"
+                )
+            else:
+                if current["phase"] in {"COMMITTING", "COMMITTED"}:
+                    _fail("recovery")
+                marker = _live_resume_transaction(
+                    run_key, state_root, inspect, predecessor=not exact_target
+                )
+                # Applying is published before target configuration writes,
+                # while the schema phase remains PREPARED until the barrier.
+                if current["phase"] == "PREPARED" and marker["phase"] not in {
+                    "prepared", "applying",
+                }:
+                    _fail("recovery")
+                outcome = (
+                    "finalization-only"
+                    if current["phase"] in {
+                        "VERIFYING", "RECOVERY_REQUIRED", "FORWARD_RECOVERING",
+                    } and exact_target and healthy
+                    and current["ownedChild"] is None and marker["phase"] == "verifying"
+                    else "retry-exact-candidate"
+                )
+            if stage == "quiescence":
+                outcome = "retry-exact-candidate"
+            _, final_origin, final_current = _timepad_current(state_root, deploy_lock_fd)
+            if final_origin != origin or final_current != current:
+                _fail("recovery")
+            _result(enabled, present, read_only, outcome)
+        finally:
+            if credential_parent is not None:
+                os.close(credential_parent)
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _rooted(path: str, root: str | None) -> str:
@@ -1223,6 +3657,9 @@ def _witnessed_unlink(
     gid: int,
     mode: int,
     link_count: int,
+    quarantine_name: str | None = None,
+    expected_data_digest: str | None = None,
+    expected_stable_identity: tuple[int, ...] | None = None,
 ) -> None:
     witness_fd = (
         expected_identity.pop("_witnessFd", None)
@@ -1249,6 +3686,101 @@ def _witnessed_unlink(
         entry_fd = None
         witness_fd = None
         _fail("recovery")
+
+    if expected_data is not None and expected_data_digest is not None:
+        fail_witness()
+    if expected_data_digest is not None and re.fullmatch(
+        r"[0-9a-f]{64}",
+        expected_data_digest,
+    ) is None:
+        fail_witness()
+    if quarantine_name is not None:
+        quarantine = _validate_quarantine_name(name, quarantine_name)
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                quarantine_info = os.stat(
+                    quarantine,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                fail_witness()
+            expected_stable = expected_stable_identity
+            if expected_stable is None:
+                if expected_identity is None:
+                    fail_witness()
+                expected_stable = (
+                    expected_identity["device"],
+                    expected_identity["inode"],
+                    stat.S_IFREG | mode,
+                    uid,
+                    gid,
+                    quarantine_info.st_size,
+                    expected_identity["mtimeNs"],
+                    link_count,
+                )
+            if (
+                not stat.S_ISREG(quarantine_info.st_mode)
+                or _stable_entry_identity(quarantine_info) != expected_stable
+                or quarantine_info.st_nlink != link_count
+            ):
+                fail_witness()
+            try:
+                entry_fd = os.open(
+                    quarantine,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=directory_fd,
+                )
+            except OSError:
+                fail_witness()
+            try:
+                opened = os.fstat(entry_fd)
+                if (
+                    not _same_inode(opened, quarantine_info)
+                    or _stable_entry_identity(opened) != expected_stable
+                    or opened.st_nlink != link_count
+                    or opened.st_uid != uid
+                    or opened.st_gid != gid
+                    or stat.S_IMODE(opened.st_mode) != mode
+                ):
+                    _fail("recovery")
+                _acl_is_safe(
+                    f"/proc/self/fd/{entry_fd}",
+                    follow_symlinks=True,
+                    category="recovery",
+                )
+                data = _read_fd_bounded(entry_fd, MAX_WITNESS_BYTES)
+                if (
+                    expected_data_digest is not None
+                    and _finalization_digest(data) != expected_data_digest
+                ):
+                    _fail("recovery")
+                final_info = os.stat(
+                    quarantine,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    _stable_entry_identity(os.fstat(entry_fd)) != expected_stable
+                    or _stable_entry_identity(final_info) != expected_stable
+                ):
+                    _fail("recovery")
+                os.unlink(quarantine, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+                return
+            finally:
+                close_owned(entry_fd)
+        except OSError:
+            fail_witness()
+        else:
+            try:
+                os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                fail_witness()
 
     try:
         path_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1299,6 +3831,10 @@ def _witnessed_unlink(
                 max(MAX_CREDENTIAL_BYTES, len(expected_data)),
             ) != expected_data:
                 _fail("recovery")
+        elif expected_data_digest is not None and _finalization_digest(
+            _read_fd_bounded(entry_fd, MAX_WITNESS_BYTES)
+        ) != expected_data_digest:
+            _fail("recovery")
         final_fd_info = os.fstat(entry_fd)
         final_path_info = os.stat(
             name,
@@ -1334,17 +3870,31 @@ def _witnessed_unlink(
                 or final_data != expected_data
             ):
                 _fail("recovery")
-        quarantine = None
-        for _ in range(8):
-            candidate = f".cleanup-{os.getpid()}-{secrets.token_hex(8)}"
-            try:
-                os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                quarantine = candidate
-                break
-        if quarantine is None:
+        elif expected_data_digest is not None and _finalization_digest(
+            _read_fd_bounded(entry_fd, MAX_WITNESS_BYTES)
+        ) != expected_data_digest:
             _fail("recovery")
+        if quarantine_name is not None:
+            quarantine = _validate_quarantine_name(name, quarantine_name)
+            try:
+                os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                _fail("recovery")
+        else:
+            quarantine = None
+            for _ in range(8):
+                candidate = f".cleanup-{os.getpid()}-{secrets.token_hex(8)}"
+                try:
+                    os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    quarantine = candidate
+                    break
+            if quarantine is None:
+                _fail("recovery")
         _rename_noreplace(directory_fd, name, quarantine)
+        os.fsync(directory_fd)
         quarantine_info = os.stat(
             quarantine,
             dir_fd=directory_fd,
@@ -1380,6 +3930,10 @@ def _witnessed_unlink(
                 max(MAX_CREDENTIAL_BYTES, len(expected_data)),
             ) != expected_data:
                 _fail("recovery")
+        elif expected_data_digest is not None and _finalization_digest(
+            _read_fd_bounded(entry_fd, MAX_WITNESS_BYTES)
+        ) != expected_data_digest:
+            _fail("recovery")
         try:
             os.unlink(quarantine, dir_fd=directory_fd)
         except OSError:
@@ -1396,6 +3950,7 @@ def _witnessed_unlink(
                 except OSError:
                     pass
             _fail("recovery")
+        os.fsync(directory_fd)
         try:
             os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -2004,8 +4559,13 @@ def _retention_interlocks_fd(
     root: str,
     state_root_fd: int,
     *,
+    state_root: str | None = None,
+    deploy_lock_fd: int | None = None,
     allowed_temporary: str | None = None,
-) -> None:
+) -> str | None:
+    guard = None
+    if state_root is not None:
+        guard = _timepad_retention_guard(state_root, state_root_fd, deploy_lock_fd)
     parent = _rooted(HOST_CREDENTIAL_PARENT, root)
     for name in (
         ".provider-transaction.current",
@@ -2026,22 +4586,107 @@ def _retention_interlocks_fd(
             _fail("recovery")
     parent_fd = _open_optional_directory_reference(parent)
     if parent_fd is None:
-        return
+        return guard
     try:
         for name in _iter_directory_fd_names(parent_fd):
             if name.startswith(".transaction-"):
                 _fail("recovery")
     finally:
         os.close(parent_fd)
+    return guard
 
 
-def _retention_interlocks(root: str, state_root: str) -> None:
+def _timepad_state_module():
+    spec = importlib.util.spec_from_file_location(
+        "test_vps_timepad_state_for_provider_retention",
+        pathlib.Path(__file__).with_name("test_vps_timepad_state.py"),
+    )
+    if spec is None or spec.loader is None:
+        _fail("prerequisite")
+    module = sys.modules.get(spec.name)
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except (ImportError, OSError, SyntaxError):
+            sys.modules.pop(spec.name, None)
+            _fail("prerequisite")
+    return module
+
+
+def _timepad_retention_guard(
+    state_root: str,
+    state_root_fd: int,
+    deploy_lock_fd: int | None,
+) -> str | None:
+    """Fail closed on guard state and identify the latest run that retention must keep."""
+    try:
+        root_path_info = os.stat(state_root, follow_symlinks=False)
+    except OSError:
+        _fail("recovery")
+    root_fd_info = os.fstat(state_root_fd)
+    if not _same_inode(root_path_info, root_fd_info):
+        _fail("recovery")
+    try:
+        names = set(_iter_directory_fd_names(state_root_fd))
+    except OSError:
+        _fail("recovery")
+    if any(name.startswith(".timepad-bootstrap-") for name in names):
+        _fail("recovery")
+    try:
+        os.stat("timepad-guard", dir_fd=state_root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        _fail("recovery")
+
+    module = _timepad_state_module()
+    try:
+        if deploy_lock_fd is None:
+            _, current = module.read_guard(state_root)
+        else:
+            _, current = module.read_guard(state_root, deploy_lock_fd=deploy_lock_fd)
+    except (module.GuardError, OSError, ValueError, TypeError, AttributeError):
+        _fail("recovery")
+    if current["phase"] not in {"COMMITTED", "ROLLED_BACK"}:
+        _fail("recovery")
+    try:
+        final_root_path_info = os.stat(state_root, follow_symlinks=False)
+    except OSError:
+        _fail("recovery")
+    if not _same_inode(final_root_path_info, os.fstat(state_root_fd)):
+        _fail("recovery")
+    owned_run = current["ownedRun"]
+    if not isinstance(owned_run, str):
+        _fail("recovery")
+    try:
+        _state_parts(owned_run)
+    except ProviderError:
+        _fail("recovery")
+    return owned_run
+
+
+def _retention_guard_protects_state(name: str, latest_run: str | None) -> bool:
+    return latest_run is not None and name == latest_run
+
+
+def _retention_interlocks(
+    root: str,
+    state_root: str,
+    deploy_lock_fd: int | None = None,
+) -> str | None:
     state_root_fd = os.open(
         state_root,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
     try:
-        _retention_interlocks_fd(root, state_root_fd)
+        return _retention_interlocks_fd(
+            root,
+            state_root_fd,
+            state_root=state_root,
+            deploy_lock_fd=deploy_lock_fd,
+        )
     finally:
         os.close(state_root_fd)
 
@@ -2093,6 +4738,7 @@ def _retention_classify(
     state_root: str,
     protected_paths: Iterable[str] = (),
     protected_states: Iterable[str] = (),
+    deploy_lock_fd: int | None = None,
 ) -> list[str]:
     if (
         not isinstance(state_root, str)
@@ -2113,7 +4759,12 @@ def _retention_classify(
         if not _same_inode(os.fstat(parent_fd), expected_root):
             _fail("recovery")
         _validate_retention_state_root_fd(parent_fd)
-        _retention_interlocks_fd(root, parent_fd)
+        latest_run = _retention_interlocks_fd(
+            root,
+            parent_fd,
+            state_root=state_root,
+            deploy_lock_fd=deploy_lock_fd,
+        )
         references = list(protected_paths)
         reference_witnesses = [
             _protected_reference_witness(path) for path in references
@@ -2160,6 +4811,8 @@ def _retention_classify(
                         # participate in retention.
                         continue
                     _owned_state_fd(state_fd, name, require_terminal=True)
+                    if _retention_guard_protects_state(name, latest_run):
+                        continue
                     child_names = _bounded_retention_children(state_fd)
                     if child_names is not None:
                         encoded_name = json.dumps(
@@ -2226,12 +4879,14 @@ def _retention_list(
     state_root: str,
     protected_paths: Iterable[str] = (),
     protected_states: Iterable[str] = (),
+    deploy_lock_fd: int | None = None,
 ) -> None:
     owned_states = _retention_classify(
         root,
         state_root,
         protected_paths,
         protected_states,
+        deploy_lock_fd=deploy_lock_fd,
     )
     encoded = json.dumps(
         {
@@ -2251,8 +4906,15 @@ def _retention_check(
     state_root: str,
     protected_paths: Iterable[str] = (),
     protected_states: Iterable[str] = (),
+    deploy_lock_fd: int | None = None,
 ) -> None:
-    _retention_classify(root, state_root, protected_paths, protected_states)
+    _retention_classify(
+        root,
+        state_root,
+        protected_paths,
+        protected_states,
+        deploy_lock_fd=deploy_lock_fd,
+    )
     _result(False, False, False, "retention-safe")
 
 
@@ -2260,6 +4922,7 @@ RETENTION_CHILDREN = frozenset(
     {
         "terminal.json",
         OWNER_MARKER,
+        "provider-finalization.json",
         "previous-active-compose.yml",
         "previous-active-compose.identity",
         "previous-active-runtime.yml",
@@ -2307,6 +4970,7 @@ def _retention_delete(
     state_path: str,
     protected_paths: Iterable[str] = (),
     protected_states: Iterable[str] = (),
+    deploy_lock_fd: int | None = None,
 ) -> None:
     if (
         not isinstance(state_root, str)
@@ -2370,7 +5034,14 @@ def _retention_delete(
         if not _same_inode(os.fstat(parent_fd), expected_root):
             _fail("recovery")
         _validate_retention_state_root_fd(parent_fd)
-        _retention_interlocks_fd("", parent_fd)
+        latest_run = _retention_interlocks_fd(
+            "",
+            parent_fd,
+            state_root=state_root,
+            deploy_lock_fd=deploy_lock_fd,
+        )
+        if _retention_guard_protects_state(name, latest_run):
+            _fail("recovery")
         _revalidate_protected_references(references, reference_witnesses)
         _revalidate_protected_references(
             protected_state_paths,
@@ -2440,7 +5111,14 @@ def _retention_delete(
                 pass
             else:
                 _fail("recovery")
-            _retention_interlocks_fd("", parent_fd)
+            latest_run = _retention_interlocks_fd(
+                "",
+                parent_fd,
+                state_root=state_root,
+                deploy_lock_fd=deploy_lock_fd,
+            )
+            if _retention_guard_protects_state(name, latest_run):
+                _fail("recovery")
             current_state = os.stat(
                 name,
                 dir_fd=parent_fd,
@@ -2458,6 +5136,8 @@ def _retention_delete(
             _retention_interlocks_fd(
                 "",
                 parent_fd,
+                state_root=state_root,
+                deploy_lock_fd=deploy_lock_fd,
                 allowed_temporary=quarantine,
             )
             try:
@@ -2530,6 +5210,10 @@ def _parser() -> argparse.ArgumentParser:
             "prepare",
             "verify",
             "finish",
+            "prepare-finalization",
+            "finish-committed-resume",
+            "live-resume",
+            "absence-resume",
             "state-publish",
             "retention-list",
             "retention-check",
@@ -2544,64 +5228,139 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--protected-state", action="append", default=[])
     parser.add_argument("--retention-state", default="")
     parser.add_argument("--state-kind", default="")
+    parser.add_argument("--deploy-lock-fd", type=int)
     return parser
+
+
+def _dispatch(args: argparse.Namespace) -> None:
+    if args.command == "check":
+        _check()
+    elif args.command == "check-image":
+        _image_admission(_inspect(_bounded_stdin(MAX_INSPECTION_BYTES)))
+        _result(False, False, False, "checked")
+    elif args.command == "observe":
+        inspect = _inspect(_bounded_stdin(MAX_INSPECTION_BYTES))
+        enabled, _ = _provider_state(inspect)
+        present, read_only, _ = _provider_mount(
+            inspect,
+            enabled,
+            allow_external_source=True,
+        )
+        _result(enabled, present, read_only, "observed")
+    elif args.command == "prepare":
+        _run_key(args.run_key)
+        _prepare(args.run_key, args.state_root, "", _bounded_stdin(MAX_INSPECTION_BYTES))
+    elif args.command == "verify":
+        _run_key(args.run_key)
+        _verify(
+            args.run_key,
+            "",
+            _bounded_stdin(MAX_INSPECTION_BYTES),
+            args.phase,
+            args.state_root,
+        )
+    elif args.command == "finish":
+        _run_key(args.run_key)
+        _finish(
+            args.run_key,
+            args.state_root,
+            "",
+            args.outcome,
+            _bounded_stdin(MAX_INSPECTION_BYTES),
+        )
+    elif args.command == "prepare-finalization":
+        _run_key(args.run_key)
+        _prepare_committed_finalization(
+            args.run_key,
+            args.state_root,
+            args.state_kind,
+            _bounded_stdin(MAX_INSPECTION_BYTES),
+            args.active_deploy_lock_fd,
+        )
+    elif args.command == "finish-committed-resume":
+        _run_key(args.run_key)
+        _finish_committed_resume(
+            args.run_key,
+            args.state_root,
+            args.state_kind,
+            _bounded_stdin(MAX_INSPECTION_BYTES),
+            args.active_deploy_lock_fd,
+        )
+    elif args.command == "live-resume":
+        _run_key(args.run_key)
+        _live_resume(
+            args.run_key, args.state_root, args.state_kind,
+            _bounded_stdin(MAX_LIVE_RESUME_BYTES), args.active_deploy_lock_fd,
+        )
+    elif args.command == "absence-resume":
+        _run_key(args.run_key)
+        _absence_resume(
+            args.run_key, args.state_root, args.state_kind,
+            _bounded_stdin(MAX_LIVE_RESUME_BYTES), args.active_deploy_lock_fd,
+        )
+    elif args.command == "state-publish":
+        _state_publish(args.state_root, args.run_key, args.state_kind)
+    elif args.command == "retention-list":
+        _retention_list(
+            "",
+            args.state_root,
+            args.protected_path,
+            args.protected_state,
+            deploy_lock_fd=args.active_deploy_lock_fd,
+        )
+    elif args.command == "retention-check":
+        _retention_check(
+            "",
+            args.state_root,
+            args.protected_path,
+            args.protected_state,
+            deploy_lock_fd=args.active_deploy_lock_fd,
+        )
+    else:
+        _retention_delete(
+            args.state_root,
+            args.retention_state,
+            args.protected_path,
+            args.protected_state,
+            deploy_lock_fd=args.active_deploy_lock_fd,
+        )
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     try:
         args = _parser().parse_args(list(argv) if argv is not None else None)
-        if args.command == "check":
-            _check()
-        elif args.command == "check-image":
-            _image_admission(_inspect(_bounded_stdin(MAX_INSPECTION_BYTES)))
-            _result(False, False, False, "checked")
-        elif args.command == "observe":
-            inspect = _inspect(_bounded_stdin(MAX_INSPECTION_BYTES))
-            enabled, _ = _provider_state(inspect)
-            present, read_only, _ = _provider_mount(
-                inspect,
-                enabled,
-                allow_external_source=True,
-            )
-            _result(enabled, present, read_only, "observed")
-        elif args.command == "prepare":
-            _run_key(args.run_key)
-            _prepare(args.run_key, args.state_root, "", _bounded_stdin(MAX_INSPECTION_BYTES))
-        elif args.command == "verify":
-            _run_key(args.run_key)
-            _verify(
-                args.run_key,
-                "",
-                _bounded_stdin(MAX_INSPECTION_BYTES),
-                args.phase,
+        lock_commands = {
+            "prepare",
+            "verify",
+            "finish",
+            "prepare-finalization",
+            "finish-committed-resume",
+            "live-resume",
+            "absence-resume",
+            "state-publish",
+            "retention-list",
+            "retention-check",
+            "retention-delete",
+        }
+        if args.deploy_lock_fd is not None and args.command not in lock_commands:
+            _fail("recovery")
+        if args.command in {"live-resume", "absence-resume"} and args.deploy_lock_fd is None:
+            _fail("recovery")
+        if args.command in {"live-resume", "absence-resume"} and (
+            args.phase or args.outcome or args.protected_path
+            or args.protected_state or args.retention_state
+        ):
+            _fail("recovery")
+        if args.command in lock_commands:
+            with _deploy_lock(
                 args.state_root,
-            )
-        elif args.command == "finish":
-            _run_key(args.run_key)
-            _finish(args.run_key, args.state_root, "", args.outcome, _bounded_stdin(MAX_INSPECTION_BYTES))
-        elif args.command == "state-publish":
-            _state_publish(args.state_root, args.run_key, args.state_kind)
-        elif args.command == "retention-list":
-            _retention_list(
-                "",
-                args.state_root,
-                args.protected_path,
-                args.protected_state,
-            )
-        elif args.command == "retention-check":
-            _retention_check(
-                "",
-                args.state_root,
-                args.protected_path,
-                args.protected_state,
-            )
+                args.deploy_lock_fd,
+                create_state_root=args.command == "state-publish",
+            ) as active_deploy_lock_fd:
+                args.active_deploy_lock_fd = active_deploy_lock_fd
+                _dispatch(args)
         else:
-            _retention_delete(
-                args.state_root,
-                args.retention_state,
-                args.protected_path,
-                args.protected_state,
-            )
+            _dispatch(args)
         return 0
     except ProviderError as exc:
         sys.stderr.write(exc.category + "\n")

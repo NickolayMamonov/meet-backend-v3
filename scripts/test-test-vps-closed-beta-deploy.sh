@@ -105,6 +105,11 @@ staged=$fake_remote
 [ -x "$staged/scripts/update-production-release.sh" ]
 [ ! -e "$staged/scripts/deploy-test-vps-provider-release.sh" ]
 [ ! -e "$staged/scripts/test-vps-provider-credential.py" ]
+[ ! -e "$staged/scripts/test_vps_timepad_state.py" ]
+[ ! -e "$staged/scripts/test-vps-timepad-release-contracts.json" ]
+! grep -q 'timepad-guard\|test_vps_timepad_state.py\|test-vps-timepad-release-contracts.json' \
+  "$promotion"
+! tar -tf "$archive" | grep -Eq '(^|/)(test_vps_timepad_state\.py|test-vps-timepad-release-contracts\.json)$'
 
 trace=$fixture/trace.log
 fake_env=$fixture/runtime.env
