@@ -288,45 +288,44 @@ class LiveResumeTests(unittest.TestCase):
             ),
             "providerEnabled": False, "durableDisposition": "none",
         }
-        with (
-            mock.patch.object(module, "_read_input", return_value=json.dumps(contract).encode()),
-            mock.patch.object(helper, "_open_deploy_state_root", return_value=11),
-            mock.patch.object(helper, "_timepad_current", side_effect=[
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(module, "_read_input", return_value=json.dumps(contract).encode()))
+            stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
+            stack.enter_context(mock.patch.object(helper, "_timepad_current", side_effect=[
                 (module, origin, current),
                 (module, origin, dict(current, operationEpoch=2)) if state_drift
                 else (module, origin, current),
-            ]),
-            mock.patch.object(helper, "_lock_directory"),
-            mock.patch.multiple(
+            ]))
+            stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+            stack.enter_context(mock.patch.multiple(
                 helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
                 O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
-            ),
-            mock.patch.object(helper.os, "open", return_value=12),
-            mock.patch.object(helper.os, "close"),
-            mock.patch.object(helper, "_validate_state_directory_fd"),
-            mock.patch.object(helper, "_iter_directory_fd_names", return_value=()),
-            mock.patch.object(helper, "_open_optional_directory_reference", return_value=None),
-            mock.patch.object(helper, "_live_resume_config") as config,
-            mock.patch.object(helper, "_live_resume_predecessor"),
-            mock.patch.object(
+            ))
+            stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+            stack.enter_context(mock.patch.object(helper.os, "close"))
+            stack.enter_context(mock.patch.object(helper, "_validate_state_directory_fd"))
+            stack.enter_context(mock.patch.object(helper, "_iter_directory_fd_names", return_value=()))
+            stack.enter_context(mock.patch.object(helper, "_open_optional_directory_reference", return_value=None))
+            config = stack.enter_context(mock.patch.object(helper, "_live_resume_config"))
+            stack.enter_context(mock.patch.object(helper, "_live_resume_predecessor"))
+            transaction = stack.enter_context(mock.patch.object(
                 helper, "_live_resume_transaction", return_value=marker,
                 side_effect=helper.ProviderError("RECOVERY_REQUIRED") if transaction_error else None,
-            ) as transaction,
-            mock.patch.object(
+            ))
+            receipt = stack.enter_context(mock.patch.object(
                 helper, "_live_resume_receipt",
                 side_effect=helper.ProviderError("RECOVERY_REQUIRED") if receipt_error else None,
-            ) as receipt,
-            mock.patch.object(
+            ))
+            absence_receipt = stack.enter_context(mock.patch.object(
                 helper, "_absence_receipt",
                 side_effect=helper.ProviderError("RECOVERY_REQUIRED") if receipt_error else None,
-            ) as absence_receipt,
-            mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError),
-            mock.patch.object(helper.os, "unlink") as unlink,
-            mock.patch.object(helper.os, "replace") as replace,
-            mock.patch.object(helper.os, "write") as write,
-            mock.patch.object(helper.os, "fsync") as fsync,
-            contextlib.redirect_stdout(stream),
-        ):
+            ))
+            stack.enter_context(mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError))
+            unlink = stack.enter_context(mock.patch.object(helper.os, "unlink"))
+            replace = stack.enter_context(mock.patch.object(helper.os, "replace"))
+            write = stack.enter_context(mock.patch.object(helper.os, "write"))
+            fsync = stack.enter_context(mock.patch.object(helper.os, "fsync"))
+            stack.enter_context(contextlib.redirect_stdout(stream))
             proof = helper._absence_resume if absence_envelope is not None else helper._live_resume
             proof(
                 current["runId"], "/var/lib/meet-test-vps-deploy", "final-deploy",
