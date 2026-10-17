@@ -1041,34 +1041,47 @@ class LiveResumeTests(unittest.TestCase):
             def file_record(fd, name, **kwargs):
                 return dict(config_records[name] if fd == 12 else tx_records[name])
 
-            with (
-                self.subTest(names=names),
-                mock.patch.multiple(
+            with self.subTest(names=names), contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.multiple(
                     helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
                     O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
-                ),
-                mock.patch.object(helper, "_read_finalization_witness", return_value=(witness, data)),
-                mock.patch.object(helper, "_controller_commit_witness", return_value=(
-                    commit, commit_data, helper._finalization_digest(commit_data),
-                )),
-                mock.patch.object(helper, "_file_record", side_effect=file_record),
-                mock.patch.object(helper.os, "stat"),
-                mock.patch.object(helper, "_marker", return_value=witness["pointer"]),
-                mock.patch.object(helper.os.path, "lexists", return_value=True),
-                mock.patch.object(helper.os, "open", side_effect=[13, 14]),
-                mock.patch.object(helper.os, "close"),
-                mock.patch.object(helper.os, "fstat"),
-                mock.patch.object(helper, "_lock_directory"),
-                mock.patch.object(helper, "_directory_record", side_effect=[
-                    witness["transaction"]["directory"], witness["transaction"]["parent"],
-                ]),
-                mock.patch.object(helper, "_iter_directory_fd_names", return_value=names),
-                mock.patch.object(helper, "_open_regular", return_value=(15, info, credential_data)),
-                mock.patch.object(helper, "_validate_credential"),
-                mock.patch.object(helper.os, "unlink") as unlink,
-                mock.patch.object(helper.os, "write") as write,
-                mock.patch.object(helper.os, "fsync") as fsync,
-            ):
+                ))
+                stack.enter_context(mock.patch.object(
+                    helper, "_read_finalization_witness", return_value=(witness, data),
+                ))
+                stack.enter_context(mock.patch.object(
+                    helper, "_controller_commit_witness", return_value=(
+                        commit, commit_data, helper._finalization_digest(commit_data),
+                    ),
+                ))
+                stack.enter_context(mock.patch.object(
+                    helper, "_file_record", side_effect=file_record,
+                ))
+                stack.enter_context(mock.patch.object(helper.os, "stat"))
+                stack.enter_context(mock.patch.object(
+                    helper, "_marker", return_value=witness["pointer"],
+                ))
+                stack.enter_context(mock.patch.object(helper.os.path, "lexists", return_value=True))
+                stack.enter_context(mock.patch.object(helper.os, "open", side_effect=[13, 14]))
+                stack.enter_context(mock.patch.object(helper.os, "close"))
+                stack.enter_context(mock.patch.object(helper.os, "fstat"))
+                stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+                stack.enter_context(mock.patch.object(
+                    helper, "_directory_record", side_effect=[
+                        witness["transaction"]["directory"],
+                        witness["transaction"]["parent"],
+                    ],
+                ))
+                stack.enter_context(mock.patch.object(
+                    helper, "_iter_directory_fd_names", return_value=names,
+                ))
+                stack.enter_context(mock.patch.object(
+                    helper, "_open_regular", return_value=(15, info, credential_data),
+                ))
+                stack.enter_context(mock.patch.object(helper, "_validate_credential"))
+                unlink = stack.enter_context(mock.patch.object(helper.os, "unlink"))
+                write = stack.enter_context(mock.patch.object(helper.os, "write"))
+                fsync = stack.enter_context(mock.patch.object(helper.os, "fsync"))
                 if valid:
                     helper._live_resume_receipt(11, 12, "/state", current, origin, observed)
                 else:
