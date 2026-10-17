@@ -88,19 +88,21 @@ class MeetingUpsertService(
 
     /**
      * Приоритет координат:
-     * 1) дал источник (Timepad) — берём их;
-     * 2) уже геокодили раньше (сохранённые ≠ 0) — оставляем (повторно не геокодим);
-     * 3) иначе геокодируем адрес (кроме онлайна / пустого адреса);
-     * 4) не вышло — нули (на клиенте карта просто не покажется).
+     * 1) онлайн-событие — всегда нули, чтобы не переносить координаты площадки;
+     * 2) физическое место из источника — берём координаты источника;
+     * 3) ранее геокодированное место — оставляем (повторно не геокодим);
+     * 4) иначе геокодируем адрес;
+     * 5) не вышло — нули (на клиенте карта просто не покажется).
      */
     private fun resolveCoordinates(
         raw: RawEvent,
         existingLat: Double,
         existingLng: Double,
     ): Pair<Double, Double> {
+        if (raw.isOnline) return 0.0 to 0.0
         if (raw.latitude != 0.0 || raw.longitude != 0.0) return raw.latitude to raw.longitude
         if (existingLat != 0.0 || existingLng != 0.0) return existingLat to existingLng
-        if (!raw.isOnline && raw.address.isNotBlank()) {
+        if (raw.address.isNotBlank()) {
             geocodingService.geocode(raw.address)?.let { return it.latitude to it.longitude }
         }
         return 0.0 to 0.0

@@ -22,6 +22,48 @@ import kotlin.test.assertTrue
 @ExtendWith(OutputCaptureExtension::class)
 class TimepadProviderTest {
     @Test
+    fun `provider skips bad starts and delegates explicit online mapping`(output: CapturedOutput) {
+        val payload = """{"total":5,"values":[
+            {"id":1,"name":"Backend","starts_at":"2026-10-18T19:00:00+0300",
+             "location":{"city":"Москва","address":" онЛайн ","coordinates":["55.75","37.61"]}},
+            {"id":2,"name":"secret-missing"},
+            {"id":3,"name":"secret-blank","starts_at":" "},
+            {"id":4,"name":"secret-invalid","starts_at":"secret-date"},
+            {"id":5,"name":"Backend","starts_at":"2026-10-19",
+             "location":{"city":"Moscow","address":"Venue 1","coordinates":["55.75","37.61"]}}
+        ]}"""
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/events.json") { exchange ->
+            val bytes = payload.toByteArray(Charsets.UTF_8)
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.start()
+        try {
+            val properties = TimepadProperties().apply {
+                baseUrl = "http://127.0.0.1:${server.address.port}"
+                maxPages = 1
+            }
+            val events = TimepadProvider(properties, RestClient.builder()).fetch(null)
+            assertEquals(listOf("1", "5"), events.map { it.sourceExternalId })
+            assertTrue(events.first().isOnline)
+            assertEquals("Онлайн", events.first().address)
+            assertEquals(0.0, events.first().latitude)
+            assertEquals(0.0, events.first().longitude)
+            assertFalse(events.last().isOnline)
+            assertEquals(55.75, events.last().latitude)
+            assertEquals(37.61, events.last().longitude)
+            assertContains(output.all, "externalId=2 reason=missing_start")
+            assertContains(output.all, "externalId=3 reason=missing_start")
+            assertContains(output.all, "externalId=4 reason=malformed_start")
+            assertTrue("secret-" !in output.all)
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
     fun `maps representative Timepad payload without changing source semantics`() {
         val payload =
             """

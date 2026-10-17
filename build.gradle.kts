@@ -120,3 +120,18 @@ tasks.register<Test>("postgresTest") {
     }
     shouldRunAfter(tasks.named("test"))
 }
+
+tasks.register<JavaExec>("timepadPreview") {
+    description = "Previews explicitly reviewed local Timepad JSON without Spring, network or database."
+    group = "application"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("dev.whysoezzy.meet.ingestion.timepad.TimepadPreviewCliKt")
+    doFirst {
+        val properties = listOf("previewInput", "previewReviewed", "previewAsOf")
+        val values = properties.map { name ->
+            providers.gradleProperty(name).orNull?.takeIf { it.isNotBlank() }
+                ?: throw GradleException("Missing -P$name")
+        }
+        setArgs(listOf("--input", values[0], "--reviewed", values[1], "--as-of", values[2]))
+    }
+}
