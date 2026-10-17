@@ -10,10 +10,9 @@ import org.springframework.stereotype.Component
 import org.springframework.web.client.RestClient
 import java.time.LocalDate
 import java.time.LocalDateTime
-import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-import tools.jackson.databind.JsonNode
+import java.util.Locale
 
 private val logger = KotlinLogging.logger {}
 
@@ -60,10 +59,10 @@ class TimepadProvider(
             if (response.values.isEmpty()) break
             response.values.forEach { event ->
                 try {
-                    collected += event.toRawEvent(zone)
+                    collected += TimepadEventMapper.map(event, zone)
                 } catch (rejection: EventMappingRejection) {
                     logger.warn {
-                        "Timepad: skipped event source=${source()} externalId=${event.id} reason=${rejection.reason}"
+                        "Timepad: skipped event source=${source()} externalId=${event.id} reason=${rejection.reason.name.lowercase(Locale.ROOT)}"
                     }
                 }
             }
@@ -75,87 +74,4 @@ class TimepadProvider(
         logger.info { "Timepad: всего нормализовано ${collected.size} событий" }
         return collected
     }
-
-    private fun TimepadEvent.toRawEvent(zone: ZoneId): RawEvent {
-        // poster_image / location могут прийти объектом, пустым массивом [] или отсутствовать —
-        // JsonNode.path() безопасен в любом случае (вернёт MissingNode, не упадёт).
-        val imageUrl = posterImage?.path("default_url")?.takeIf { it.isString }?.stringValue().orEmpty()
-
-        val loc = location
-        val city = loc?.path("city")?.takeIf { it.isString }?.stringValue().orEmpty()
-        val address = loc?.path("address")?.takeIf { it.isString }?.stringValue().orEmpty()
-
-        val coords = loc?.path("coordinates")
-        val lat = coords?.takeIf { it.isArray && it.size() > 0 }?.get(0)?.asString()?.toDoubleOrNull() ?: 0.0
-        val lng = coords?.takeIf { it.isArray && it.size() > 1 }?.get(1)?.asString()?.toDoubleOrNull() ?: 0.0
-
-        val hasPhysical = address.isNotBlank() ||
-                (city.isNotBlank() && !city.equals("Онлайн", ignoreCase = true))
-        val addr = when {
-            address.isNotBlank() -> address
-            city.isNotBlank() -> city
-            else -> "Онлайн"
-        }
-
-        val startsAtEpochMs = parseTimestamp(startsAt, zone) ?: 0L
-        val endsAtEpochMs = if (endsAt.isNullOrBlank()) {
-            null
-        } else {
-            parseTimestamp(endsAt, zone) ?: throw EventMappingRejection("malformed_end")
-        }
-        if (endsAtEpochMs != null && endsAtEpochMs < startsAtEpochMs) {
-            throw EventMappingRejection("end_before_start")
-        }
-
-        return RawEvent(
-            sourceExternalId = id.toString(),
-            title = name,
-            description = descriptionShort?.takeIf { it.isNotBlank() } ?: descriptionHtml.orEmpty(),
-            imageUrl = imageUrl,
-            startsAtEpochMs = startsAtEpochMs,
-            endsAtEpochMs = endsAtEpochMs,
-            address = addr,
-            latitude = lat,
-            longitude = lng,
-            externalUrl = url,
-            isOnline = !hasPhysical,
-            topicKeywords = extractCategoryNames(categories),
-        )
-    }
-
-    private fun parseTimestamp(value: String?, zone: ZoneId): Long? {
-        if (value.isNullOrBlank()) return null
-        // Timepad обычно отдаёт смещение без двоеточия: 2026-09-15T19:00:00+0300
-        runCatching {
-            return OffsetDateTime.parse(value, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ"))
-                .toInstant().toEpochMilli()
-        }
-        runCatching {
-            return OffsetDateTime.parse(value, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-                .toInstant().toEpochMilli()
-        }
-        runCatching {
-            return LocalDateTime.parse(value, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"))
-                .atZone(zone).toInstant().toEpochMilli()
-        }
-        runCatching {
-            return LocalDateTime.parse(value, DateTimeFormatter.ISO_LOCAL_DATE_TIME)
-                .atZone(zone).toInstant().toEpochMilli()
-        }
-        return runCatching {
-            LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE)
-                .atStartOfDay(zone).toInstant().toEpochMilli()
-        }.getOrNull()
-    }
-}
-
-private class EventMappingRejection(val reason: String) : RuntimeException()
-
-private fun extractCategoryNames(node: JsonNode?): Set<String> {
-    // categories бывает массивом [{name:...}] или объектом {..:{name:...}} — обходим оба
-    if (node == null || (!node.isArray && !node.isObject)) return emptySet()
-    return node.values().asSequence()
-        .mapNotNull { el -> el.path("name").takeIf { it.isString }?.stringValue() }
-        .filter { it.isNotBlank() }
-        .toSet()
 }
