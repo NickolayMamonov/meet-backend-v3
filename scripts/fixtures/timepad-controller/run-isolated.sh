@@ -40,7 +40,9 @@ timeout --signal=TERM --kill-after=10s 1800s \
 
     check() {
       if ! "$@"; then
-        echo "ISOLATION_UNAVAILABLE: namespace boundary could not be proven" >&2
+        printf 'ISOLATION_UNAVAILABLE: failed isolation assertion:' >&2
+        printf " %q" "$@" >&2
+        printf "\n" >&2
         exit 77
       fi
     }
