@@ -58,7 +58,6 @@ check_empty_directory() {
 check test "$(readlink /proc/self/ns/mnt)" != "$parent_mount_ns"
 check test "$(readlink /proc/self/ns/net)" != "$parent_network_ns"
 check test "$(readlink /proc/self/ns/pid)" != "$parent_pid_ns"
-check test "$(readlink /proc/self/ns/pid)" = "$(readlink /proc/1/ns/pid)"
 
 mount --make-rprivate /
 mount -t tmpfs -o mode=755,size=64m,nodev,nosuid tmpfs /var/lib
@@ -71,6 +70,7 @@ else
   mount -t tmpfs -o mode=755,size=32m,nodev,nosuid tmpfs /var/run
 fi
 mount -t proc -o nosuid,nodev,noexec proc /proc
+check test "$(readlink /proc/self/ns/pid)" = "$(readlink /proc/1/ns/pid)"
 
 for path in /var/lib /tmp /run /var/run; do
   check check_private_tmpfs "$path"
