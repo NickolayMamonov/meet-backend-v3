@@ -50,9 +50,14 @@ check_private_proc() {
 }
 
 check_empty_directory() {
-  local entry
-  entry=$(find "$1" -mindepth 1 -maxdepth 1 -print -quit) || return 1
-  [ -z "$entry" ]
+  local first_entry_type
+  first_entry_type=$(timeout 5s find "$1" -mindepth 1 -maxdepth 1 \
+    -printf '%y\n' -quit) || return 1
+  [ -z "$first_entry_type" ] || {
+    printf 'ISOLATION_UNAVAILABLE: fresh tmpfs contains an entry (path=%s, type=%s)\n' \
+      "$1" "$first_entry_type" >&2
+    return 1
+  }
 }
 
 check test "$(readlink /proc/self/ns/mnt)" != "$parent_mount_ns"
