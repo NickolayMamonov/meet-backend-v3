@@ -236,4 +236,18 @@ class TimepadPreviewCliTest {
             "--input", input.toString()))
         assertEquals(0, result.exit, result.err)
     }
+
+    @Test
+    fun `JSON output is UTF8 even when supplied stdout uses Windows native encoding`() {
+        assertEquals(0, execute().exit)
+        val bytes = ByteArrayOutputStream()
+        val err = ByteArrayOutputStream()
+        val exit = PrintStream(bytes, true, charset("windows-1251")).use { nativeOut ->
+            TimepadPreviewCli.run(args(dir.resolve("source.json"), dir.resolve("reviewed.json")), nativeOut, err)
+        }
+        assertEquals(0, exit)
+        assertEquals("", err.toString(Charsets.UTF_8))
+        assertEquals("Онлайн", json.readTree(bytes.toString(Charsets.UTF_8))
+            .path("results")[0].path("normalized").path("address").stringValue())
+    }
 }

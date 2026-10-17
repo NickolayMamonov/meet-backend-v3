@@ -9,6 +9,7 @@ import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
 import tools.jackson.module.kotlin.KotlinModule
 import java.io.IOException
+import java.io.OutputStream
 import java.io.PrintStream
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
@@ -42,7 +43,10 @@ object TimepadPreviewCli {
         .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
         .build()
 
-    fun run(args: Array<String>, out: PrintStream, err: PrintStream): Int = try {
+    fun run(args: Array<String>, out: OutputStream, err: OutputStream): Int =
+        runUtf8(args, PrintStream(out, true, Charsets.UTF_8), PrintStream(err, true, Charsets.UTF_8))
+
+    private fun runUtf8(args: Array<String>, out: PrintStream, err: PrintStream): Int = try {
         val options = arguments(args)
         val sourceBytes = readBounded(options.input, SOURCE_LIMIT)
         val reviewBytes = readBounded(options.reviewed, REVIEW_LIMIT)
