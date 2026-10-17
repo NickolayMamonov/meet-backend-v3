@@ -87,7 +87,10 @@ check test ! -S /run/docker.sock
 check test ! -S /var/run/docker.sock
 check test -z "${DOCKER_HOST:-}"
 check awk 'NR > 1 { exit 1 }' /proc/net/route
-check awk 'NF { exit 1 }' /proc/net/ipv6_route
+# A fresh network namespace may expose kernel loopback routes, but never an
+# external interface route.
+check awk 'NF { if (NF != 10 || $10 != "lo") bad = 1 } END { exit bad }' \
+  /proc/net/ipv6_route
 check awk -F: 'NR > 2 && NF >= 2 {
   name = $1
   gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
