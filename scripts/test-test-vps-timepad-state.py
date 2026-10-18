@@ -236,7 +236,7 @@ echo "bound:$recovery_container"
                 )
                 trace = (path / "trace").read_text().splitlines() if (path / "trace").exists() else []
                 if fault == "none":
-                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertEqual(0, result.returncode, f"{result.stderr}; trace={trace!r}")
                     self.assertEqual([
                         "proof", "state:FORWARD_RECOVERING:",
                         "state:FORWARD_RECOVERING:replacement-create-intent",
@@ -1309,6 +1309,7 @@ class TimepadStateTests(unittest.TestCase):
                 state.check_execution_lease(root, attempt=lease["attempt"])
             self.assertEqual("EXECUTION_LEASE_FD_REQUIRED", error.exception.reason)
             with state.deploy_lock(root) as reacquired_fd:
+                os.set_inheritable(reacquired_fd, True)
                 with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=False):
                     with self.assertRaises(state.GuardError) as error:
                         state.check_execution_lease(
