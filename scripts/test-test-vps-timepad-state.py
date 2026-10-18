@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import importlib.util
+import argparse
+from contextlib import ExitStack, nullcontext
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -13,6 +16,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import stat
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -22,6 +28,9 @@ assert SPEC is not None and SPEC.loader is not None
 state = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = state
 SPEC.loader.exec_module(state)
+import test_vps_timepad_supervisor as supervisor
+
+LEASE_START_NS = time.monotonic_ns()
 
 
 def digest(ch: str) -> str:
@@ -102,9 +111,9 @@ def execution_lease(
         supervisor = {"pid": pid, "startTicks": int(fields[19]), "bootId": boot_id}
     return {
         "format": 1, "attempt": attempt, "operation": operation,
-        "t0Ns": 1_000 if started else None,
-        "workEndNs": 540_000_001_000 if started else None,
-        "hardEndNs": 600_000_001_000 if started else None,
+        "t0Ns": LEASE_START_NS if started else None,
+        "workEndNs": LEASE_START_NS + 540_000_000_000 if started else None,
+        "hardEndNs": LEASE_START_NS + 600_000_000_000 if started else None,
         "firstFailure": None, "firstStatus": None,
         "rollbackIssued": rollback_issued, "lifecycle": lifecycle, "revision": revision,
         "supervisor": supervisor,
@@ -117,6 +126,247 @@ def controller_function(name: str) -> str:
     match = re.search(r"^" + re.escape(name) + r"\(\) \{\n.*?^\}", source, re.M | re.S)
     assert match is not None, name
     return match.group()
+
+
+class ExecutionGrantTests(unittest.TestCase):
+    """Portable private-RPC admission tests, not Linux durability evidence."""
+
+    def setUp(self):
+        self.lease = execution_lease(revision=1, lifecycle="armed")
+        self.grant = state.ExecutionGrant("a" * 32, "b" * 32, LEASE_START_NS + 10_000_000_000)
+        self.client = mock.Mock(
+            attempt=self.grant.attempt, role="controller-worker", supervisor=self.lease["supervisor"],
+        )
+        self.client.request.return_value = {
+            "attempt": self.grant.attempt, "grantId": self.grant.grant_id,
+            "endNs": self.grant.end_ns, "role": "controller-worker", "name": "state-publish",
+        }
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(
+            state, "_read_execution_lease_locked", return_value=self.lease,
+        ))
+        self.stack.enter_context(mock.patch.object(
+            state, "_execution_lease_supervisor_is_live", return_value=True,
+        ))
+        self.stack.enter_context(mock.patch.object(
+            state.time, "monotonic_ns", return_value=LEASE_START_NS + 1,
+        ))
+        self.factory = self.stack.enter_context(mock.patch.object(
+            supervisor, "WorkerClient", return_value=self.client,
+        ))
+
+    def test_live_grant_is_rechecked_and_context_is_cleared_without_renewal(self):
+        with state._execution_mutation("/fixture", 9, self.grant):
+            state._execution_check()
+        self.assertIsNone(state._EXECUTION_CHECK.get())
+        self.assertEqual(3, self.client.request.call_count)
+        self.client.request.assert_called_with(
+            "validate-grant", grantId=self.grant.grant_id, endNs=self.grant.end_ns,
+        )
+        self.client.close.assert_called_once()
+
+    def test_missing_incomplete_or_unbound_authority_refuses_before_rpc(self):
+        for fd, grant in (
+            (None, self.grant), (9, None),
+            (9, state.ExecutionGrant("c" * 32, "b" * 32, self.grant.end_ns)),
+            (9, state.ExecutionGrant("a" * 32, "b" * 32, self.lease["workEndNs"] + 1)),
+        ):
+            with self.subTest(fd=fd, grant=grant), self.assertRaises(state.GuardError):
+                with state._execution_mutation("/fixture", fd, grant):
+                    self.fail("unbound writer admitted")
+        self.factory.assert_not_called()
+
+    def test_nonce_fd_or_durable_lease_does_not_override_a_revoked_private_grant(self):
+        self.client.request.side_effect = supervisor.SupervisorError("GRANT_REVOKED")
+        with self.assertRaisesRegex(state.GuardError, "EXECUTION_GRANT_REVOKED"):
+            with state._execution_mutation("/fixture", 9, self.grant):
+                self.fail("revoked writer admitted")
+        self.assertIsNone(state._EXECUTION_CHECK.get())
+        self.client.close.assert_called_once()
+
+    def test_response_identity_deadline_role_name_and_shape_must_match(self):
+        original = self.client.request.return_value
+        for key, value in (
+            ("attempt", "c" * 32), ("grantId", "c" * 32),
+            ("endNs", self.grant.end_ns + 1), ("role", "rollback-worker"),
+            ("name", "provider"), ("extra", "private-canary"),
+        ):
+            self.client.request.return_value = {**original, key: value}
+            with self.subTest(key=key), self.assertRaisesRegex(
+                state.GuardError, "EXECUTION_GRANT_INVALID",
+            ) as error:
+                with state._execution_mutation("/fixture", 9, self.grant):
+                    self.fail("different grant admitted")
+            self.assertNotIn("private-canary", str(error.exception))
+
+    def test_cancelled_unarmed_or_terminal_lease_cannot_admit_state_writer(self):
+        for lifecycle in (
+            "registered", "cancel-forward", "drain-forward", "draining",
+            "rollback-admission", "quiescence-unconfirmed", "drained",
+        ):
+            self.lease["lifecycle"] = lifecycle
+            with self.subTest(lifecycle=lifecycle), self.assertRaises(state.GuardError):
+                with state._execution_mutation("/fixture", 9, self.grant):
+                    self.fail("cancelled writer admitted")
+        self.factory.assert_not_called()
+
+    def test_local_deadline_is_checked_before_and_after_private_response(self):
+        for times, requests in (
+            ([self.grant.end_ns], 0),
+            ([LEASE_START_NS + 1, self.grant.end_ns], 1),
+        ):
+            self.client.reset_mock()
+            with mock.patch.object(state.time, "monotonic_ns", side_effect=times), \
+                    self.assertRaisesRegex(state.GuardError, "EXECUTION_GRANT_EXPIRED"):
+                with state._execution_mutation("/fixture", 9, self.grant):
+                    self.fail("expired writer admitted")
+            self.assertEqual(requests, self.client.request.call_count)
+
+    def test_cleanup_reserve_uses_only_cleanup_publication_and_hard_end(self):
+        self.lease.update(workerMode="fail-closed-worker", lifecycle="draining",
+                          firstFailure="WORK_EXHAUSTED", firstStatus=1)
+        self.client.role = "fail-closed-worker"
+        self.client.request.return_value = {
+            **self.client.request.return_value, "role": "fail-closed-worker",
+            "name": "cleanup-publish",
+        }
+        grant = state.ExecutionGrant(
+            self.grant.attempt, self.grant.grant_id, self.lease["hardEndNs"] - 1,
+        )
+        self.client.request.return_value["endNs"] = grant.end_ns
+        with state._execution_mutation("/fixture", 9, grant, cleanup_only=True):
+            state._execution_check()
+        self.assertEqual(3, self.client.request.call_count)
+        self.client.request.return_value["name"] = "cleanup-stop"
+        with self.assertRaisesRegex(state.GuardError, "EXECUTION_GRANT_INVALID"):
+            with state._execution_mutation("/fixture", 9, grant, cleanup_only=True):
+                self.fail("stop grant used to write schema")
+        with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_STOP_ONLY"):
+            with state._execution_mutation("/fixture", 9, grant):
+                self.fail("cleanup worker admitted to an ordinary writer")
+
+    def test_state_cleanup_cannot_clear_ownership_or_publish_success(self):
+        current = {**prepared_state(), "executionAttempt": self.grant.attempt}
+        self.lease.update(workerMode="fail-closed-worker", lifecycle="draining")
+        unresolved = state.advance_state(current, "RECOVERY_REQUIRED", reason="QUIESCENCE_UNCONFIRMED")
+        state._validate_execution_state_write(self.lease, current, unresolved, LEASE_START_NS + 1)
+        child = owned_child()
+        active = {
+            **state.advance_state(current, "CUTOVER_POSSIBLE"), "ownedChild": child,
+            "latestAttemptId": child["attemptId"],
+        }
+        unresolved = state.advance_state(active, "RECOVERY_REQUIRED", reason="QUIESCENCE_UNCONFIRMED")
+        for candidate in (
+            {**unresolved, "ownedChild": None},
+            {**unresolved, "containerId": digest("f")},
+            {**unresolved, "rollbackIssued": True},
+            {**unresolved, "phase": "COMMITTED"},
+        ):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(
+                state.GuardError, "EXECUTION_LEASE_STOP_ONLY",
+            ):
+                state._validate_execution_state_write(self.lease, active, candidate, LEASE_START_NS + 1)
+        committing = {
+            **unresolved, "phase": "COMMITTING", "commitWitnessDigest": digest("c"),
+            "providerFinalizationDigest": digest("d"), "commitSubstep": "provider-cleanup",
+        }
+        state._validate_execution_state_write(
+            self.lease, committing, {**committing, "reason": "QUIESCENCE_UNCONFIRMED"},
+            LEASE_START_NS + 1,
+        )
+        with self.assertRaises(state.GuardError):
+            state._validate_execution_state_write(
+                self.lease, committing, {**committing, "phase": "RECOVERY_REQUIRED"}, LEASE_START_NS + 1,
+            )
+
+    def test_revocation_at_each_atomic_write_boundary_never_acknowledges_publication(self):
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_nlink=1)
+        # create/write/file-fsync/replace/directory-fsync checks surround every
+        # durability boundary. Failure after replace is uncertain, never an ack.
+        for point in range(1, 8):
+            check = mock.Mock(side_effect=[None] * (point - 1) + [
+                state.GuardError("EXECUTION_GRANT_REVOKED"),
+            ])
+            token = state._EXECUTION_CHECK.set(check)
+            try:
+                with self.subTest(point=point), ExitStack() as stack:
+                    for name, value in (
+                        ("listdir", []), ("open", 99), ("fchmod", None), ("fstat", info),
+                        ("write", 1), ("close", None), ("unlink", None), ("stat", info),
+                    ):
+                        stack.enter_context(mock.patch.object(state.os, name, return_value=value, create=True))
+                    stack.enter_context(mock.patch.object(state.os, "O_NOFOLLOW", 0, create=True))
+                    stack.enter_context(mock.patch.object(state, "_require_no_acl"))
+                    fsync = stack.enter_context(mock.patch.object(state.os, "fsync", create=True))
+                    replace = stack.enter_context(mock.patch.object(state.os, "replace"))
+                    with self.assertRaisesRegex(state.GuardError, "EXECUTION_GRANT_REVOKED"):
+                        state._atomic_write(20, "current.json", b"x", 4096, replace=True)
+                    self.assertEqual(point, check.call_count)
+                    self.assertEqual(1 if point >= 6 else 0, replace.call_count)
+                    self.assertEqual((1 if point >= 4 else 0) + (1 if point >= 7 else 0),
+                                     fsync.call_count)
+            finally:
+                state._EXECUTION_CHECK.reset(token)
+
+    def test_cli_requires_all_three_fixed_capability_fields(self):
+        parser = state._cli()
+        for command in ("bootstrap", "publish-state", "prepare", "advance",
+                        "claim-rollback", "stop-owned-child", "retain-unresolved"):
+            subparser = next(action for action in parser._actions
+                             if isinstance(action, argparse._SubParsersAction)).choices[command]
+            flags = {flag for action in subparser._actions for flag in action.option_strings}
+            self.assertTrue({"--execution-attempt", "--execution-grant", "--deadline-ns"} <= flags)
+        from argparse import Namespace
+        self.assertIsNone(state._cli_execution_grant(Namespace()))
+        for fields in (
+            {"execution_attempt": self.grant.attempt},
+            {"execution_grant": self.grant.grant_id, "deadline_ns": self.grant.end_ns},
+            {"execution_attempt": self.grant.attempt, "execution_grant": "secret-canary",
+             "deadline_ns": self.grant.end_ns},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(state.GuardError):
+                state._cli_execution_grant(Namespace(**fields))
+
+    def test_retain_unresolved_is_fixed_and_preserves_committing_proof_and_owned_child(self):
+        self.lease.update(workerMode="fail-closed-worker", lifecycle="draining")
+        self.client.role = "fail-closed-worker"
+        self.client.request.return_value.update(role="fail-closed-worker", name="cleanup-publish")
+        current = {**prepared_state(), "executionAttempt": self.grant.attempt}
+        barrier = state.advance_state(current, "CUTOVER_POSSIBLE")
+        child = owned_child()
+        waiting = state.advance_state(
+            barrier, "CUTOVER_POSSIBLE", ownedChild=child, latestAttemptId=child["attemptId"],
+        )
+        verifying = state.advance_state(barrier, "VERIFYING", containerId=digest("c"), configHash=digest("d"))
+        committing = state.advance_state(
+            verifying, "COMMITTING", commitWitnessDigest=digest("e"),
+            providerFinalizationDigest=digest("f"), commitSubstep="provider-cleanup",
+        )
+        for previous in (current, waiting, committing):
+            def publish(_root, candidate):
+                state._validate_execution_state_write(self.lease, previous, candidate, LEASE_START_NS + 1)
+                state.validate_state_transition(previous, candidate)
+                return candidate
+
+            with self.subTest(phase=previous["phase"]), mock.patch.object(
+                state, "deploy_lock", return_value=nullcontext(9),
+            ), mock.patch.object(state, "_read_guard_locked", return_value=({}, previous)), \
+                    mock.patch.object(state, "_publish_current_locked", side_effect=publish) as writer, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                status = state.main([
+                    "retain-unresolved", "--root", "/fixture", "--deploy-lock-fd", "9",
+                    "--execution-attempt", self.grant.attempt,
+                    "--execution-grant", self.grant.grant_id, "--deadline-ns", str(self.grant.end_ns),
+                ])
+                self.assertEqual(0, status)
+                candidate = writer.call_args.args[1]
+                self.assertEqual(
+                    {**previous, "phase": "COMMITTING" if previous is committing else "RECOVERY_REQUIRED",
+                     "reason": "QUIESCENCE_UNCONFIRMED"},
+                    candidate,
+                )
+                self.assertEqual("QUIESCENCE_UNCONFIRMED", json.loads(output.getvalue())["result"])
 
 
 class ControllerRecoveryContractTests(unittest.TestCase):
@@ -133,8 +383,8 @@ class ControllerRecoveryContractTests(unittest.TestCase):
         if bash is None:
             self.fail("Bash is required for controller source contracts")
         return subprocess.run(
-            [bash, "-c", "set -euo pipefail\n" + script, "_", *arguments],
-            text=True, capture_output=True, check=False, timeout=20,
+            [bash, "-s", "--", *arguments], input="set -euo pipefail\n" + script,
+            text=True, capture_output=True, check=False, timeout=60 if os.name == "nt" else 20,
         )
 
     def test_effective_timeout_dispatches_to_supervisor_without_shadowing(self) -> None:
@@ -164,6 +414,7 @@ if timeout 5s bash -c 'exit 23'; then exit 90; else [ "$?" -eq 23 ]; fi
                 result = self.run_shell(controller_function("supervisor_timeout") + r"""
 trace=$1/trace
 fault=$2
+TIMEPAD_ATTEMPT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 provider_helper=/fixture/provider.py
 timepad_helper=/fixture/state.py
 supervisor_client() {
@@ -195,7 +446,9 @@ command() {
     echo "run:$1:$2" >>"$trace"
     [ "$1" = --kill-after=5s ] && [ "$2" = 0.5s ] &&
       [ "$3" = python3 ] && [ "$4" = "$provider_helper" ] &&
-      [ "$5" = verify ] || return 94
+      [ "$5" = verify ] && [ "$6" = --execution-attempt ] &&
+      [ "$7" = "$TIMEPAD_ATTEMPT" ] && [ "$8" = --deadline-ns ] &&
+      [ "$9" = 1000000000 ] && [ "$#" -eq 9 ] || return 94
     [ "$fault" != command ] || return 23
   fi
 }
@@ -1268,6 +1521,123 @@ fi
 
 
 class TimepadStateTests(unittest.TestCase):
+    def terminal_lease_pair(self):
+        previous = execution_lease(revision=3, lifecycle="drained")
+        previous["workers"] = [{"mode": "controller-worker", **previous["supervisor"], "pid": 102}]
+        candidate = execution_lease(attempt="b" * 32)
+        candidate["supervisor"] = {**previous["supervisor"], "pid": 201}
+        candidate["worker"] = {**candidate["supervisor"], "pid": 202}
+        candidate["workers"] = [{"mode": "controller-worker", **candidate["worker"]}]
+        return previous, candidate
+
+    def test_terminal_lease_succession_refuses_worker_intent_and_failed_attempts(self):
+        previous, candidate = self.terminal_lease_pair()
+        for invalid in (
+            {**previous, "lifecycle": "armed"},
+            {**previous, "worker": previous["supervisor"]},
+            {**previous, "workers": []},
+            {**previous, "firstFailure": "TERM", "firstStatus": 143},
+        ):
+            with self.subTest(previous=invalid), self.assertRaisesRegex(
+                state.GuardError, "EXECUTION_LEASE_UNRESOLVED",
+            ):
+                state._validate_terminal_lease_successor("/fixture", invalid, candidate)
+
+    def test_terminal_lease_succession_requires_all_old_identities_exited(self):
+        previous, candidate = self.terminal_lease_pair()
+        for live in (previous["supervisor"], *previous["workers"]):
+            with self.subTest(live=live), mock.patch.object(
+                state, "_execution_process_exited", side_effect=lambda identity: identity != live,
+            ), self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                state._validate_terminal_lease_successor("/fixture", previous, candidate)
+
+    def test_terminal_lease_succession_requires_bound_worker_and_terminal_guard(self):
+        previous, candidate = self.terminal_lease_pair()
+        worker = candidate["worker"]
+        with mock.patch.object(state, "_execution_process_exited", return_value=True), \
+                mock.patch.object(state, "_execution_process_record") as process, \
+                mock.patch.object(state, "_read_guard_locked") as guard, \
+                mock.patch.object(state, "_open_root", return_value=55), \
+                mock.patch.object(state.os, "listdir", return_value=[]) as names, \
+                mock.patch.object(state.os, "close"):
+            process.return_value = (
+                worker["bootId"], worker["startTicks"], candidate["supervisor"]["pid"],
+            )
+            guard.return_value = ({}, state.new_ready_state(digest("a")))
+            state._validate_terminal_lease_successor("/fixture", previous, candidate)
+            for bad_parent in (None, (worker["bootId"], worker["startTicks"], 999)):
+                process.return_value = bad_parent
+                with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                    state._validate_terminal_lease_successor("/fixture", previous, candidate)
+            process.return_value = (
+                worker["bootId"], worker["startTicks"], candidate["supervisor"]["pid"],
+            )
+            guard.return_value = ({}, prepared_state())
+            with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                state._validate_terminal_lease_successor("/fixture", previous, candidate)
+            guard.side_effect = state.GuardError("GUARD_STATE_LOST")
+            with self.assertRaisesRegex(state.GuardError, "GUARD_STATE_LOST"):
+                state._validate_terminal_lease_successor("/fixture", previous, candidate)
+            guard.side_effect = None
+            guard.return_value = ({}, state.new_ready_state(digest("a")))
+            for entry in (".provider-transaction.current", ".smtp-transaction.current",
+                          ".timepad-bootstrap-incomplete"):
+                names.return_value = [entry]
+                with self.subTest(entry=entry), self.assertRaisesRegex(
+                    state.GuardError, "EXECUTION_LEASE_UNRESOLVED",
+                ):
+                    state._validate_terminal_lease_successor("/fixture", previous, candidate)
+
+    def test_recorded_process_absence_is_distinct_from_unreadable_or_malformed_proc(self):
+        identity = execution_lease()["supervisor"]
+        for raw in (b"", b"invalid\n", b"1 (name) S 1\n", b"x" * 4097):
+            with self.subTest(raw=raw[:20]), mock.patch(
+                "builtins.open", side_effect=[
+                    io.StringIO(identity["bootId"] + "\n"), io.BytesIO(raw),
+                ],
+            ), self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                state._execution_process_exited(identity)
+        for error in (PermissionError(), OSError()):
+            with self.subTest(error=type(error)), mock.patch(
+                "builtins.open", side_effect=[
+                    io.StringIO(identity["bootId"] + "\n"), error,
+                ],
+            ), self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                state._execution_process_exited(identity)
+        with mock.patch("builtins.open", side_effect=[
+            io.StringIO(identity["bootId"] + "\n"), FileNotFoundError(),
+        ]):
+            self.assertTrue(state._execution_process_exited(identity))
+        for record, exited in (
+            ((identity["bootId"], identity["startTicks"], 1), False),
+            ((identity["bootId"], identity["startTicks"] + 1, 1), True),
+            (("12345678-89ab-cdef-0123-456789abcdef", identity["startTicks"], 1), True),
+        ):
+            with self.subTest(record=record), mock.patch.object(
+                state, "_execution_process_record", return_value=record,
+            ):
+                self.assertEqual(exited, state._execution_process_exited(identity))
+
+    def test_childless_marker_requires_sole_helper_and_no_surviving_worker(self):
+        previous, _ = self.terminal_lease_pair()
+        with mock.patch.object(state.os, "getppid", return_value=previous["supervisor"]["pid"]), \
+                mock.patch.object(state.os, "getpid", return_value=300), \
+                mock.patch.object(state, "_execution_process_exited", return_value=True) as exited:
+            for children in (b"300 ", b"300 999 ", b""):
+                with self.subTest(children=children), mock.patch(
+                    "builtins.open", return_value=io.BytesIO(children),
+                ):
+                    if children == b"300 ":
+                        state._validate_childless_lease_publication(previous)
+                    else:
+                        with self.assertRaisesRegex(
+                            state.GuardError, "EXECUTION_LEASE_CHILDLESS_REQUIRED",
+                        ):
+                            state._validate_childless_lease_publication(previous)
+            exited.return_value = False
+            with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_CHILDLESS_REQUIRED"):
+                state._validate_childless_lease_publication(previous)
+
     def test_execution_lease_parser_is_exact_bounded_and_sanitized(self) -> None:
         lease = execution_lease()
         state._execution_lease(lease)
@@ -1334,6 +1704,15 @@ class TimepadStateTests(unittest.TestCase):
                         root, armed, deploy_lock_fd=lock_fd,
                     )
                     self.assertEqual(1, ack["revision"])
+                    # A lost acknowledgment can be retried only with the
+                    # identical current snapshot, not a stale or skipped one.
+                    self.assertEqual(ack, state.publish_execution_lease(
+                        root, armed, deploy_lock_fd=lock_fd,
+                    ))
+                    with self.assertRaisesRegex(
+                        state.GuardError, "EXECUTION_LEASE_REVISION_CONFLICT",
+                    ):
+                        state.publish_execution_lease(root, first, deploy_lock_fd=lock_fd)
                     self.assertEqual(
                         {"attempt": first["attempt"], "revision": 1, "outcome": "matched"},
                         state.check_execution_lease(
@@ -1358,7 +1737,7 @@ class TimepadStateTests(unittest.TestCase):
                         )
                     self.assertEqual("EXECUTION_LEASE_UNRESOLVED", error.exception.reason)
 
-    def test_execution_lease_interlocks_state_writes_but_keeps_bootstrap_independent(self) -> None:
+    def test_execution_lease_interlocks_bootstrap_and_state_writes(self) -> None:
         if not hasattr(os, "geteuid") or os.geteuid() != 0 or os.name != "posix":
             self.skipTest("root-owned lease filesystem checks require Linux root")
         with tempfile.TemporaryDirectory() as parent:
@@ -1381,7 +1760,24 @@ class TimepadStateTests(unittest.TestCase):
                     "schema": digest("c"), "startupInventory": digest("d"),
                     "schemaHistoryProvenance": True,
                 }
-                state.bootstrap_guard(root, authority=authority, observed=observed, deploy_lock_fd=lock_fd)
+                with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                    state.bootstrap_guard(root, authority=authority, observed=observed, deploy_lock_fd=lock_fd)
+                self.assertFalse((root / state.GUARD_DIR).exists())
+                armed = execution_lease(revision=1, lifecycle="armed")
+                state.publish_execution_lease(root, armed, deploy_lock_fd=lock_fd)
+                grant = state.ExecutionGrant(lease["attempt"], "b" * 32, armed["workEndNs"] - 1)
+                client = mock.Mock(
+                    attempt=grant.attempt, role=armed["workerMode"], supervisor=armed["supervisor"],
+                )
+                client.request.return_value = {
+                    "attempt": grant.attempt, "grantId": grant.grant_id, "endNs": grant.end_ns,
+                    "role": "controller-worker", "name": "state-publish",
+                }
+                with mock.patch.object(supervisor, "WorkerClient", return_value=client):
+                    state.bootstrap_guard(
+                        root, authority=authority, observed=observed,
+                        deploy_lock_fd=lock_fd, execution_grant=grant,
+                    )
                 with self.assertRaises(state.GuardError) as error:
                     state.publish_current(root, prepared_state(), deploy_lock_fd=lock_fd)
                 self.assertEqual("EXECUTION_LEASE_UNRESOLVED", error.exception.reason)
@@ -1399,17 +1795,19 @@ class TimepadStateTests(unittest.TestCase):
                     tooling_digest=digest("2"), prepared_proof_digest=digest("9"),
                     execution_attempt=lease["attempt"],
                 )
-                state.publish_current(root, prepared, deploy_lock_fd=lock_fd)
-                armed = execution_lease(revision=1, lifecycle="armed")
-                state.publish_execution_lease(root, armed, deploy_lock_fd=lock_fd)
                 advanced = state.advance_state(prepared, "CUTOVER_POSSIBLE")
                 self.assertEqual(lease["attempt"], advanced["executionAttempt"])
-                self.assertEqual(advanced, state.publish_current(root, advanced, deploy_lock_fd=lock_fd))
+                with mock.patch.object(supervisor, "WorkerClient", return_value=client):
+                    state.publish_current(root, prepared, deploy_lock_fd=lock_fd, execution_grant=grant)
+                    self.assertEqual(advanced, state.publish_current(
+                        root, advanced, deploy_lock_fd=lock_fd, execution_grant=grant,
+                    ))
                 unresolved = execution_lease(revision=2, lifecycle="quiescence-unconfirmed")
                 state.publish_execution_lease(root, unresolved, deploy_lock_fd=lock_fd)
                 with self.assertRaises(state.GuardError) as error:
                     state.publish_current(
                         root, state.advance_state(advanced, "VERIFYING"), deploy_lock_fd=lock_fd,
+                        execution_grant=grant,
                     )
                 self.assertEqual("EXECUTION_LEASE_UNRESOLVED", error.exception.reason)
                 with self.assertRaises(state.GuardError) as error:
@@ -1619,6 +2017,29 @@ class TimepadStateTests(unittest.TestCase):
                                      predecessor_container_id="f" * 64,
                                      owned_run="123-1", tooling_digest=digest("2"),
                                      prepared_proof_digest=digest("9"))
+
+    def test_prepared_never_contains_target_runtime_or_bypasses_acknowledged_barrier(self) -> None:
+        prepared = prepared_state()
+        self.assertIsNotNone(prepared["preparedProofDigest"])
+        for changes in (
+            {"containerId": digest("a")}, {"configHash": digest("b")},
+            {"commitSubstep": "provider-cleanup"}, {"terminalReceipt": digest("c")},
+            {"ownedChild": owned_child(), "latestAttemptId": owned_child()["attemptId"]},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(state.GuardError):
+                state._current({**prepared, **changes})
+        for phase in ("VERIFYING", "FORWARD_RECOVERING"):
+            self.assertNotIn(phase, state.PHASE_EDGES["PREPARED"])
+            with self.subTest(phase=phase), self.assertRaisesRegex(
+                state.GuardError, "CUTOVER_BARRIER_REQUIRED",
+            ):
+                state.advance_state(prepared, phase)
+        bound = {**prepared, "executionAttempt": "a" * 32}
+        with self.assertRaisesRegex(state.GuardError, "STATE_EXECUTION_ATTEMPT_CONFLICT"):
+            state.advance_state(bound, "CUTOVER_POSSIBLE", executionAttempt="b" * 32)
+        barrier = state.advance_state(bound, "CUTOVER_POSSIBLE")
+        self.assertEqual(bound["preparedProofDigest"], barrier["preparedProofDigest"])
+        self.assertEqual(bound["operationEpoch"], barrier["operationEpoch"])
 
     def test_committing_requires_an_immutable_provider_finalization_digest(self) -> None:
         admission = state.admit(

@@ -31,7 +31,8 @@ Worker contract (also exposed by WorkerClient):
 * ``prepare-terminal`` freezes grants and provides a drained lease snapshot.
   Publish/ack it, then ``terminal STATUS`` only after exact daemon/runtime and
   durable incident/terminal-result checks. Exit immediately. Success is not
-  returned until kernel ECHILD; a worker exit alone is never success.
+  returned until kernel ECHILD and a final supervisor-owned durable drained
+  revision with worker=null. A worker exit alone is never success.
 * ``cancel REASON STATUS`` revokes forward work. Traps never do rollback.
 
 Lease disk publication and semantic rollback/runtime admission belong to the
@@ -85,6 +86,11 @@ FAILURES = frozenset({
 })
 NONCE = re.compile(r"^[a-f0-9]{32}$")
 DIGEST = re.compile(r"^[a-f0-9]{64}$")
+SUCCESS_OUTCOMES = {
+    "bootstrapped": ("deploy", "ready"),
+    "already-initialized": ("deploy", "ready"),
+    "already-completed": ("forward-recover", "committed"),
+}
 
 
 class SupervisorError(Exception):
@@ -203,6 +209,7 @@ class Attempt:
         self.first_status: int | None = None
         self.rollback_issued = False
         self.rollback_admitted = False
+        self.rollback_admission_completed = False
         self.grants: dict[str, Grant] = {}
         self.idle_end = self.clock() + timing.idle_ns
         self.drain_end: int | None = None
@@ -210,7 +217,9 @@ class Attempt:
         self.cleanup_stop_end: int | None = None
         self.role = "retention-worker" if operation == "retention" else "controller-worker"
         self.pending_terminal: int | None = None
+        self.pending_outcome: str | None = None
         self.result: tuple[int, str] | None = None
+        self.on_change: Callable[[], None] | None = None
         if operation == "forward-recover":
             self._start_clock()
 
@@ -219,6 +228,8 @@ class Attempt:
         self.revision += 1
         self.acked_revision = -1
         self.lease_digest = None
+        if self.on_change is not None:
+            self.on_change()
 
     def _start_clock(self) -> None:
         if self.t0 is not None:
@@ -244,6 +255,8 @@ class Attempt:
         self.arm()
         self.grants.clear()
         self.pending_terminal = None
+        self.pending_outcome = None
+        self._change("cancel-forward")
         self._change("drain-forward")
         self.begin_drain()
 
@@ -328,7 +341,21 @@ class Attempt:
         if grant is None or self.clock() >= grant.end_ns:
             reject("GRANT_REVOKED")
         del self.grants[grant_id]
+        if grant.name == "rollback-admission":
+            self.rollback_admission_completed = True
         self.idle_end = self.clock() + self.timing.idle_ns
+
+    def validate_grant(self, grant_id: str, end_ns: int) -> Grant:
+        """Read-only helper admission; never renew or recreate a wait."""
+        grant = self.grants.get(_nonce(grant_id))
+        _integer(end_ns, 1)
+        if grant is None or grant.end_ns != end_ns or self.clock() >= end_ns or \
+                self.draining or self.lifecycle == "quiescence-unconfirmed" or \
+                self.pending_terminal is not None:
+            reject("GRANT_REVOKED")
+        if grant.name != "lease-publish" and self.acked_revision != self.revision:
+            reject("GRANT_REVOKED")
+        return grant
 
     def after_drain(self) -> str | None:
         """Called only after kernel ECHILD; never merely after worker exit."""
@@ -359,6 +386,7 @@ class Attempt:
     def admit_rollback(self) -> None:
         if self.role != "rollback-worker" or self.lifecycle != "rollback-admission" or \
                 self.acked_revision != self.revision or self.grants or \
+                not self.rollback_admission_completed or \
                 self.work_end is None or self.clock() >= self.work_end:
             reject("ROLLBACK_REFUSED")
         self.rollback_admitted = True
@@ -367,7 +395,7 @@ class Attempt:
     def prepare_terminal(self) -> None:
         if self.grants or self.acked_revision != self.revision:
             reject("TERMINAL_REFUSED")
-        if self.operation == "forward-recover" and self.lifecycle == "registered":
+        if self.lifecycle == "registered":
             reject("TERMINAL_REFUSED")
         if self.role == "rollback-worker" and not self.rollback_admitted:
             reject("TERMINAL_REFUSED")
@@ -375,8 +403,14 @@ class Attempt:
             return
         self._change("drained")
 
-    def terminal(self, status: int) -> None:
+    def terminal(self, status: int, outcome: str | None = None) -> None:
         _integer(status, 0, 255)
+        if outcome is not None and (
+            not isinstance(outcome, str) or outcome not in SUCCESS_OUTCOMES
+            or SUCCESS_OUTCOMES[outcome][0] != self.operation or status != 0
+            or self.role != "controller-worker"
+        ):
+            reject("TERMINAL_REFUSED")
         if self.lifecycle != "drained" or self.acked_revision != self.revision or self.grants:
             reject("TERMINAL_REFUSED")
         end = self.hard_end if self.role == "fail-closed-worker" else self.work_end
@@ -393,6 +427,7 @@ class Attempt:
         if self.first_reason is not None and self.role == "controller-worker":
             reject("TERMINAL_REFUSED")
         self.pending_terminal = status
+        self.pending_outcome = outcome
 
     def finish_childless(self) -> None:
         if self.pending_terminal is None:
@@ -406,8 +441,12 @@ class Attempt:
             self.result = (self.pending_terminal, "COMPLETED" if self.pending_terminal == 0 else "FAILED")
 
     def unconfirmed(self) -> None:
+        if self.lifecycle == "quiescence-unconfirmed":
+            self.result = (self.failure_status, "QUIESCENCE_UNCONFIRMED")
+            return
         self.grants.clear()
         self.pending_terminal = None
+        self.pending_outcome = None
         self._change("quiescence-unconfirmed")
         self.result = (self.failure_status, "QUIESCENCE_UNCONFIRMED")
 
@@ -467,11 +506,17 @@ def process_identity(pid: int) -> ProcessIdentity:
     _integer(pid, 1)
     with open(f"/proc/{pid}/stat", "rb", buffering=0) as source:
         data = source.read(4097)
-    if len(data) > 4096:
+    if len(data) > 4096 or not data.endswith(b"\n") or b")" not in data:
         reject("OWNERSHIP_UNCERTAIN")
-    fields = data.rsplit(b")", 1)[1].split()
-    info = os.stat(f"/proc/{pid}")
-    return ProcessIdentity(pid, int(fields[1]), int(fields[19]), info.st_uid)
+    try:
+        fields = data.rsplit(b")", 1)[1].split()
+        parent, start = int(fields[1]), int(fields[19])
+        if not 0 <= parent < 1 << 31 or start <= 0:
+            reject("OWNERSHIP_UNCERTAIN")
+        info = os.stat(f"/proc/{pid}")
+        return ProcessIdentity(pid, parent, start, info.st_uid)
+    except (IndexError, ValueError):
+        reject("OWNERSHIP_UNCERTAIN")
 
 
 def boot_id() -> str:
@@ -718,6 +763,15 @@ class Supervisor:
         self.reported = False
         self.pending_signals: list[int] = []
         self.last_clock: tuple[int | None, int] | None = None
+        self.completing = False
+        self.lease_snapshots: dict[int, dict[str, Any]] = {}
+        self.completion_channel: socket.socket | None = None
+        self.completion_pid: int | None = None
+        self.completion_status: int | None = None
+        self.completion_ack: dict[str, Any] | None = None
+        self.completion_grant: Grant | None = None
+        self.completion_snapshot: dict[str, Any] | None = None
+        self.attempt.on_change = self._record_lease
 
     def _signal(self, number: int, _frame: Any) -> None:
         if not self.pending_signals:
@@ -727,7 +781,17 @@ class Supervisor:
         return {
             **self.attempt.lease(), "supervisor": self.identity,
             "worker": self.worker_identity, "workerMode": self.attempt.role,
-            "workers": self.worker_identities,
+            "workers": list(self.worker_identities),
+        }
+
+    def _record_lease(self) -> None:
+        if len(self.lease_snapshots) >= 16 and self.attempt.revision not in self.lease_snapshots:
+            reject("PROTOCOL_INVALID")
+        self.lease_snapshots[self.attempt.revision] = self._lease()
+
+    def _published(self, revision: int) -> None:
+        self.lease_snapshots = {
+            key: snapshot for key, snapshot in self.lease_snapshots.items() if key > revision
         }
 
     def acquire_lock(self) -> None:
@@ -816,6 +880,7 @@ class Supervisor:
             end = min(end, self.attempt.hard_end)
         self.worker_handshake_end = end
         self.attempt.idle_end = end
+        self._record_lease()
 
     def _rpc(self) -> None:
         assert self.worker is not None
@@ -838,13 +903,18 @@ class Supervisor:
                 "hello": set(), "arm": set(), "lease": set(),
                 "lease-ack": {"revision", "digest"}, "grant": {"name", "localNs"},
                 "complete": {"grantId"}, "cancel": {"reason", "status"},
+                "validate-grant": {"grantId", "endNs"},
                 "admit-rollback": set(), "prepare-terminal": set(), "terminal": {"status"},
             }
+            if kind == "terminal" and "outcome" in frame:
+                schemas["terminal"] = {"status", "outcome"}
             if not isinstance(kind, str) or kind not in schemas or \
                     set(frame) != {"kind", "attempt", "role"} | schemas[kind]:
                 reject()
             if self.attempt.draining or self.attempt.lifecycle == "quiescence-unconfirmed":
                 reject("GRANT_REVOKED")
+            if self.attempt.pending_terminal is not None:
+                reject("TERMINAL_REFUSED")
             value: dict[str, Any] = {}
             if not self.worker_hello and kind != "hello":
                 reject("PRIVATE_WORKER_REQUIRED")
@@ -867,10 +937,13 @@ class Supervisor:
                 value = self._lease()
             elif kind == "lease-ack":
                 self.attempt.acknowledge_lease(_integer(frame["revision"]), frame["digest"])
+                self._published(frame["revision"])
             elif kind == "grant":
                 value = self.attempt.grant(frame["name"], _integer(frame["localNs"], 1)).frame()
             elif kind == "complete":
                 self.attempt.complete(frame["grantId"])
+            elif kind == "validate-grant":
+                value = self.attempt.validate_grant(frame["grantId"], frame["endNs"]).frame()
             elif kind == "cancel":
                 self.attempt.cancel(frame["reason"], _integer(frame["status"], 1, 255))
                 self._notify_clock()
@@ -881,7 +954,7 @@ class Supervisor:
                 self.attempt.prepare_terminal()
                 value = self._lease()
             elif kind == "terminal":
-                self.attempt.terminal(_integer(frame["status"], 0, 255))
+                self.attempt.terminal(_integer(frame["status"], 0, 255), frame.get("outcome"))
             send_frame(reply, {
                 "ok": True, "attempt": self.attempt.nonce,
                 "supervisor": self.identity, "value": value,
@@ -940,9 +1013,70 @@ class Supervisor:
                 send_frame(self.relay, {
                     "kind": "result", "attempt": self.attempt.nonce,
                     "status": status, "reason": reason,
+                    "outcome": self.attempt.pending_outcome if reason == "COMPLETED" else None,
                 })
             except OSError:
                 self.relay_alive = False
+
+    def _begin_publication(self, *, terminal: bool) -> None:
+        """Fork one bounded filesystem helper only after kernel ECHILD.
+
+        Cancellation revisions wait in memory until old writers drain, then
+        publish in order before a replacement worker can receive any grant.
+        """
+        if terminal:
+            self.completing = True
+            self.worker_identity = None
+            self.attempt._change("drained")
+            self.completion_grant = self.attempt.grant("lease-publish", 10 * NS)
+        else:
+            now = time.monotonic_ns()
+            assert self.attempt.hard_end is not None
+            end = min(now + 10 * NS, self.attempt.hard_end)
+            if end <= now:
+                reject("WAIT_REFUSED")
+            self.completion_grant = Grant(
+                secrets.token_hex(16), "lease-publish", end, self.attempt.nonce, self.attempt.role,
+            )
+        snapshot = self.lease_snapshots[min(self.lease_snapshots)]
+        self.completion_snapshot = snapshot
+        self.completion_ack = None
+        self.completion_status = None
+        parent, child = socket_pair()
+        assert self.lock_fd is not None
+        pid = os.fork()
+        if pid == 0:
+            try:
+                parent.close()
+                response = os.dup(child.fileno())
+                if response == 9:
+                    response = os.dup(response)
+                os.dup2(self.lock_fd, 9, inheritable=True)
+                _close_except({9, response})
+                from test_vps_timepad_state import publish_execution_lease
+                acknowledgment = publish_execution_lease(self.root, snapshot, deploy_lock_fd=9)
+                with socket.socket(fileno=response) as channel:
+                    send_frame(channel, acknowledgment)
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        child.close()
+        self.completion_channel, self.completion_pid = parent, pid
+        self._notify_clock()
+
+    def _completion_response(self) -> None:
+        assert self.completion_channel is not None
+        acknowledgment, _ = receive_frame(self.completion_channel)
+        assert self.completion_snapshot is not None
+        if set(acknowledgment) != {"attempt", "revision", "digest"} or \
+                acknowledgment["attempt"] != self.attempt.nonce or \
+                acknowledgment["revision"] != self.completion_snapshot["revision"] or \
+                not isinstance(acknowledgment["digest"], str) or \
+                DIGEST.fullmatch(acknowledgment["digest"]) is None:
+            reject()
+        self.completion_ack = acknowledgment
+        self.completion_channel.close()
+        self.completion_channel = None
 
     def run(self) -> int:
         for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -967,6 +1101,8 @@ class Supervisor:
                 self.attempt.poll()
                 childless = self.children.reap()
                 statuses = self.children.statuses
+                if self.completion_pid in statuses:
+                    self.completion_status = statuses[self.completion_pid]
                 if self.worker_pid in statuses:
                     status = statuses[self.worker_pid]
                     if self.worker is not None:
@@ -982,10 +1118,31 @@ class Supervisor:
                             self.attempt.pending_terminal = None
                             self.attempt._change("draining")
                             self.attempt.begin_drain()
-                if childless and self.attempt.pending_terminal is not None:
-                    self.attempt.finish_childless()
-                    self._report()
-                    return self.attempt.result[0]  # type: ignore[index]
+                if self.completion_pid is not None and self.completion_grant is not None and \
+                        now >= self.completion_grant.end_ns and \
+                        self.attempt.lifecycle != "quiescence-unconfirmed":
+                    self.children.signal_owned(signal.SIGKILL)
+                    self.attempt.unconfirmed()
+                if childless and self.completion_pid is not None:
+                    if self.completion_status != 0 or (
+                        self.completing and self.attempt.pending_terminal is None
+                    ):
+                        self.attempt.unconfirmed()
+                    elif self.completion_ack is not None:
+                        assert self.completion_grant is not None
+                        revision = self.completion_ack["revision"]
+                        self._published(revision)
+                        if self.completing:
+                            self.attempt.complete(self.completion_grant.grant_id)
+                            self.attempt.acknowledge_lease(revision, self.completion_ack["digest"])
+                            self.attempt.finish_childless()
+                            self._report()
+                            return self.attempt.result[0]  # type: ignore[index]
+                        self.completion_pid = None
+                        self.completion_grant = None
+                elif childless and self.attempt.pending_terminal is not None:
+                    self._begin_publication(terminal=True)
+                    childless = False
                 if self.attempt.lifecycle == "quiescence-unconfirmed":
                     self._report()
                     if childless:
@@ -996,10 +1153,14 @@ class Supervisor:
                     continue
                 if self.attempt.draining:
                     if childless:
-                        if self.attempt.after_drain() is not None:
+                        if self.completion_pid is not None:
+                            pass  # A completed helper's acknowledgment is still queued.
+                        elif self.lease_snapshots:
+                            self._begin_publication(terminal=False)
+                        elif self.attempt.after_drain() is not None:
                             self.spawn()
                             self._notify_clock()
-                    else:
+                    elif self.completion_pid is None or self.completing:
                         self.children.signal_owned(
                             signal.SIGKILL if self.attempt.term_end is not None and now >= self.attempt.term_end
                             else signal.SIGTERM
@@ -1013,10 +1174,14 @@ class Supervisor:
                         selector.register(self.relay, selectors.EVENT_READ, "relay")
                     if self.worker is not None:
                         selector.register(self.worker, selectors.EVENT_READ, "worker")
+                    if self.completion_channel is not None:
+                        selector.register(self.completion_channel, selectors.EVENT_READ, "completion")
                     for event, _ in selector.select(0.1):
                         try:
                             if event.data == "relay":
                                 self._relay_message()
+                            elif event.data == "completion":
+                                self._completion_response()
                             else:
                                 self._rpc()
                         except (OSError, SupervisorError):
@@ -1024,6 +1189,8 @@ class Supervisor:
                                 self.relay_alive = False
                                 self.attempt.cancel("TRANSPORT_LOST")
                                 self._notify_clock()
+                            elif event.data == "completion":
+                                self.attempt.unconfirmed()
                             elif self.attempt.pending_terminal is None:
                                 if self.worker is not None:
                                     self.worker.close()
@@ -1071,6 +1238,7 @@ def relay(root: str, operation: str, arguments: list[str]) -> int:
     previous = {number: signal.signal(number, initiating) for number in (
         signal.SIGTERM, signal.SIGINT, signal.SIGHUP,
     )}
+    supervisor_reaped = False
     try:
         _wait_readable(parent, time.monotonic_ns() + 5 * NS)
         hello, _ = receive_frame(parent)
@@ -1112,7 +1280,9 @@ def relay(root: str, operation: str, arguments: list[str]) -> int:
                     reject()
                 hard_end = end
                 watch_end = _integer(frame["watchEndNs"], 1)
-            elif frame.get("kind") == "result" and set(frame) == {"kind", "attempt", "status", "reason"}:
+            elif frame.get("kind") == "result" and set(frame) == {
+                "kind", "attempt", "status", "reason", "outcome",
+            }:
                 if frame["reason"] not in {
                     "COMPLETED", "FAILED", "ROLLED_BACK", "RECOVERY_REQUIRED", "QUIESCENCE_UNCONFIRMED",
                 }:
@@ -1122,6 +1292,30 @@ def relay(root: str, operation: str, arguments: list[str]) -> int:
                     reject()
                 if status == 86 and frame["reason"] != "ROLLED_BACK":
                     reject()
+                if status == 0:
+                    # A subsequent replay must not race the retiring keeper's
+                    # live identity or FD9. No blocking waitpid is used.
+                    end = time.monotonic_ns() + 5 * NS
+                    if hard_end is not None:
+                        end = min(end, hard_end)
+                    while True:
+                        reaped, child_status = os.waitpid(pid, os.WNOHANG)
+                        if reaped:
+                            supervisor_reaped = True
+                            if os.waitstatus_to_exitcode(child_status) != 0:
+                                reject()
+                            break
+                        if time.monotonic_ns() >= end:
+                            reject("PROTOCOL_TIMEOUT")
+                        time.sleep(0.01)
+                outcome = frame["outcome"]
+                if outcome is not None:
+                    if not isinstance(outcome, str) or outcome not in SUCCESS_OUTCOMES or \
+                            SUCCESS_OUTCOMES[outcome][0] != operation or \
+                            status != 0 or frame["reason"] != "COMPLETED":
+                        reject()
+                    print("schema_guard=" + SUCCESS_OUTCOMES[outcome][1], flush=True)
+                    print("operation_outcome=" + outcome, flush=True)
                 print("schema_guard=" + frame["reason"], flush=True)
                 return status
             else:
@@ -1133,7 +1327,8 @@ def relay(root: str, operation: str, arguments: list[str]) -> int:
         parent.close()  # EOF cancels the supervisor, not a false lock-release proof.
         for number, handler in previous.items():
             signal.signal(number, handler)
-        os.waitpid(pid, os.WNOHANG)
+        if not supervisor_reaped:
+            os.waitpid(pid, os.WNOHANG)
 
 
 def _cli() -> argparse.ArgumentParser:
@@ -1153,6 +1348,9 @@ def _cli() -> argparse.ArgumentParser:
     grant.add_argument("seconds")
     complete = calls.add_parser("complete")
     complete.add_argument("grant_id")
+    validate = calls.add_parser("validate-grant")
+    validate.add_argument("grant_id")
+    validate.add_argument("end_ns", type=int)
     ack = calls.add_parser("lease-ack")
     ack.add_argument("revision", type=int)
     ack.add_argument("digest")
@@ -1161,6 +1359,7 @@ def _cli() -> argparse.ArgumentParser:
     cancel.add_argument("status", type=int)
     terminal = calls.add_parser("terminal")
     terminal.add_argument("status", type=int)
+    terminal.add_argument("--outcome", choices=sorted(SUCCESS_OUTCOMES))
     return parser
 
 
@@ -1179,12 +1378,14 @@ def main(argv: list[str] | None = None) -> int:
                 fields = {"name": args.name, "localNs": _seconds(args.seconds)}
             elif args.call == "complete":
                 fields = {"grantId": _nonce(args.grant_id)}
+            elif args.call == "validate-grant":
+                fields = {"grantId": _nonce(args.grant_id), "endNs": args.end_ns}
             elif args.call == "lease-ack":
                 fields = {"revision": args.revision, "digest": args.digest}
             elif args.call == "cancel":
                 fields = {"reason": args.reason, "status": args.status}
             elif args.call == "terminal":
-                fields = {"status": args.status}
+                fields = {"status": args.status, "outcome": args.outcome}
             print(json.dumps(client.request(args.call, **fields), separators=(",", ":"), sort_keys=True))
             return 0
         finally:

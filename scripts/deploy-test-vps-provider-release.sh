@@ -667,40 +667,46 @@ timepad_contract=$script_dir/test-vps-timepad-release-contracts.json
 command -v python3 >/dev/null 2>&1 && [ -f "$timepad_helper" ] &&
   [ ! -L "$timepad_helper" ] && [ -f "$timepad_contract" ] &&
   [ ! -L "$timepad_contract" ] || fail "TIMEPAD_GUARD_UNAVAILABLE"
-timeout 15s python3 "$timepad_helper" check-contract \
-  --contract "$timepad_contract" >/dev/null ||
-  fail "TIMEPAD_CONTRACT_INVALID"
-for command_name in docker curl jq flock python3 timeout; do
+if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ]; then
+  timeout 15s python3 "$timepad_helper" check-contract \
+    --contract "$timepad_contract" >/dev/null ||
+    fail "TIMEPAD_CONTRACT_INVALID"
+fi
+for command_name in docker jq python3 timeout; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "$command_name is required"
 done
-timeout_status=0
-timeout_status=$(timeout 1s sh -c 'sleep 2' >/dev/null 2>&1; echo "$?")
-[ "$timeout_status" -eq 124 ] ||
-  fail "timeout capability is unavailable"
 [ "$(id -u)" -eq 0 ] || fail "the test VPS deploy must run as root"
-[ -d "$root" ] || fail "deployment root is unavailable"
-[ -s "$root/.env.production" ] || fail "existing production environment is unavailable"
-[ -s "$root/docker-compose.production.yml" ] ||
-  fail "existing production Compose file is unavailable"
-[ -s "$base_compose" ] || fail "reviewed target Compose file is unavailable"
-verify_production_env_settings "$root/.env.production" ||
-  fail "PROVIDER_STATE_INVALID"
+if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ]; then
+  for command_name in curl flock; do
+    command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"
+  done
+  timeout_status=0
+  timeout_status=$(timeout 1s sh -c 'sleep 2' >/dev/null 2>&1; echo "$?")
+  [ "$timeout_status" -eq 124 ] || fail "timeout capability is unavailable"
+  [ -d "$root" ] || fail "deployment root is unavailable"
+  [ -s "$root/.env.production" ] || fail "existing production environment is unavailable"
+  [ -s "$root/docker-compose.production.yml" ] ||
+    fail "existing production Compose file is unavailable"
+  [ -s "$base_compose" ] || fail "reviewed target Compose file is unavailable"
+  verify_production_env_settings "$root/.env.production" || fail "PROVIDER_STATE_INVALID"
+fi
 
 compose_script=$script_dir/production-compose.sh
 update_script=$script_dir/update-production-release.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
 safety_hook=$script_dir/verify-test-vps-closed-beta-state.sh
 provider_helper=$script_dir/test-vps-provider-credential.py
-[ -x "$compose_script" ] || fail "reviewed Compose wrapper is unavailable"
-[ -x "$update_script" ] || fail "reviewed release updater is unavailable"
-[ -r "$runtime_helper" ] || fail "runtime invariant helper is unavailable"
-[ -f "$provider_helper" ] && [ ! -L "$provider_helper" ] && [ -r "$provider_helper" ] ||
-  fail "provider credential helper is unavailable"
-timeout 30s python3 "$provider_helper" check >/dev/null ||
-  fail "PREREQUISITE_MISSING"
-# shellcheck source=/dev/null
-source "$runtime_helper"
+if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ]; then
+  [ -x "$compose_script" ] || fail "reviewed Compose wrapper is unavailable"
+  [ -x "$update_script" ] || fail "reviewed release updater is unavailable"
+  [ -r "$runtime_helper" ] || fail "runtime invariant helper is unavailable"
+  [ -f "$provider_helper" ] && [ ! -L "$provider_helper" ] && [ -r "$provider_helper" ] ||
+    fail "provider credential helper is unavailable"
+  timeout 30s python3 "$provider_helper" check >/dev/null || fail "PREREQUISITE_MISSING"
+  # shellcheck source=/dev/null
+  source "$runtime_helper"
+fi
 
 supervisor_enabled=false
 supervisor_client() {
@@ -709,15 +715,20 @@ supervisor_client() {
 }
 supervisor_publish_lease() {
   [ "$supervisor_enabled" = true ] || return 0
-  local grant lease revision attempt publication digest grant_id
+  local grant lease snapshot revision attempt publication digest grant_id
   grant=$(supervisor_client grant lease-publish 10) || return 1
   lease=$(mktemp "$state_root/.timepad-execution.$TIMEPAD_ATTEMPT.XXXXXX") ||
     return 1
-  command timeout 5s python3 "$script_dir/test_vps_timepad_supervisor.py" \
-    client --root "$state_root" lease >"$lease" || {
+  snapshot=$(supervisor_client lease) || {
       rm -f -- "$lease"
       return 1
     }
+  # CLI output ends with a newline; the state helper accepts canonical lease
+  # bytes only. Command substitution removes that transport delimiter.
+  printf '%s' "$snapshot" >"$lease" || {
+    rm -f -- "$lease"
+    return 1
+  }
   chmod 600 "$lease" || {
     rm -f -- "$lease"
     return 1
@@ -764,6 +775,15 @@ supervisor_publish_lease() {
   }
   rm -f -- "$lease"
 }
+supervisor_complete() {
+  [ "$supervisor_enabled" = true ] ||
+    fail "EXECUTION_SUPERVISOR_REQUIRED"
+  supervisor_client prepare-terminal >/dev/null ||
+    fail "EXECUTION_TERMINAL_PREPARE_FAILED"
+  supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  supervisor_client terminal 0 --outcome "$1" >/dev/null ||
+    fail "EXECUTION_TERMINAL_ACK_FAILED"
+}
 supervisor_timeout() {
   local options=() local_bound executable wait_name grant grant_id end_ns bounded status
   while [ "$#" -gt 0 ]; do
@@ -797,9 +817,44 @@ supervisor_timeout() {
       ;;
     *) wait_name=preflight ;;
   esac
+  if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" = fail-closed-worker ]; then
+    case "$executable:${2:-}" in
+      python3:"$timepad_helper")
+        case "${3:-}" in
+          read-state) wait_name=cleanup-stop ;;
+          retain-unresolved) wait_name=cleanup-publish ;;
+          *) return 1 ;;
+        esac
+        ;;
+      docker:inspect|docker:stop) wait_name=cleanup-stop ;;
+      docker:update)
+        [ "${3:-}" = --restart=no ] || return 1
+        wait_name=cleanup-stop
+        ;;
+      *) return 1 ;;
+    esac
+  fi
   grant=$(supervisor_client grant "$wait_name" "${local_bound%s}") || return 124
   grant_id=$(jq -er '.grantId | strings' <<<"$grant") || return 1
   end_ns=$(jq -er '.endNs | numbers' <<<"$grant") || return 1
+  if [ "$executable" = python3 ] && [ "${2:-}" = "$provider_helper" ]; then
+    # The private socket grants authority; the helper independently checks the
+    # same durable lease and absolute deadline under inherited FD9.
+    case "${3:-}" in
+      prepare|verify|finish|prepare-finalization|finish-committed-resume|\
+      live-resume|absence-resume|prepare-transition-proof|state-publish|\
+      retention-list|retention-check|retention-delete)
+        set -- "$@" --execution-attempt "$TIMEPAD_ATTEMPT" --deadline-ns "$end_ns"
+        ;;
+    esac
+  elif [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ]; then
+    case "${3:-}" in
+      bootstrap|publish-state|prepare|advance|claim-rollback|retain-unresolved|stop-owned-child)
+        set -- "$@" --execution-attempt "$TIMEPAD_ATTEMPT" \
+          --execution-grant "$grant_id" --deadline-ns "$end_ns"
+        ;;
+    esac
+  fi
   bounded=$(command timeout 3s python3 - "$end_ns" <<'PY'
 import sys
 import time
@@ -820,6 +875,52 @@ PY
   fi
   supervisor_client complete "$grant_id" >/dev/null || return 1
   return "$status"
+}
+
+fail_closed_owned_backend() {
+  # Entry is private and runs only after the supervisor's ECHILD proof. The
+  # incident must already bind this attempt; rejected recovery selectors must
+  # never gain stop authority merely by entering the cleanup role.
+  local current container image_id config_hash inspection
+  current=$(timeout 10s python3 "$timepad_helper" read-state \
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  jq -e --arg attempt "$TIMEPAD_ATTEMPT" '
+    .executionAttempt == $attempt and
+    (.phase == "CUTOVER_POSSIBLE" or .phase == "VERIFYING" or
+     .phase == "COMMITTING" or .phase == "RECOVERY_REQUIRED" or
+     .phase == "FORWARD_RECOVERING" or .phase == "ROLLING_BACK") and
+    (.containerId | type == "string" and test("^[a-f0-9]{64}$")) and
+    (.configHash | type == "string" and test("^[a-f0-9]{64}$"))
+  ' <<<"$current" >/dev/null || return 1
+  container=$(jq -er '.containerId' <<<"$current") || return 1
+  image_id=$(jq -er '.target.tuple.platformImageId' <<<"$current") || return 1
+  config_hash=$(jq -er '.configHash' <<<"$current") || return 1
+  inspection=$(timeout 10s docker inspect "$container" 2>/dev/null) || return 1
+  jq -e --arg id "$container" --arg image "sha256:$image_id" --arg hash "$config_hash" '
+    type == "array" and length == 1 and .[0].Id == $id and .[0].Image == $image and
+    .[0].Config.Labels["com.docker.compose.project"] == "meet-production" and
+    .[0].Config.Labels["com.docker.compose.service"] == "backend" and
+    .[0].Config.Labels["com.docker.compose.config-hash"] == $hash
+  ' <<<"$inspection" >/dev/null || return 1
+  timeout 10s docker update --restart=no "$container" >/dev/null 2>&1 || return 1
+  timeout 20s docker stop --time 10 "$container" >/dev/null 2>&1 || return 1
+  inspection=$(timeout 10s docker inspect "$container" 2>/dev/null) || return 1
+  jq -e --arg id "$container" --arg image "sha256:$image_id" --arg hash "$config_hash" '
+    type == "array" and length == 1 and .[0].Id == $id and .[0].Image == $image and
+    .[0].Config.Labels["com.docker.compose.project"] == "meet-production" and
+    .[0].Config.Labels["com.docker.compose.service"] == "backend" and
+    .[0].Config.Labels["com.docker.compose.config-hash"] == $hash and
+    .[0].State.Running == false and .[0].HostConfig.RestartPolicy.Name == "no"
+  ' <<<"$inspection" >/dev/null || return 1
+  # Suppression/stop is bounded best effort, not daemon-request quiescence.
+  # No terminal acknowledgment, rollback, provider cleanup or lease clearing is
+  # authorized until that separate evidence is implemented.
+  return 1
+}
+
+fail_closed_publish_unresolved() {
+  timeout 10s python3 "$timepad_helper" retain-unresolved \
+    --root "$state_root" --deploy-lock-fd 9 >/dev/null
 }
 
 docker_image_inspect() {
@@ -1478,6 +1579,8 @@ state_suffix=final-deploy
 [ "$mode" = rollback-drill ] && state_suffix=rollback-drill
 state=$state_root/$run_key-$state_suffix
 if [ ! -e "$state_root" ] && [ ! -L "$state_root" ]; then
+  [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ] ||
+    fail "QUIESCENCE_UNCONFIRMED"
   install -d -m 700 "$state_root"
 fi
 [ -d "$state_root" ] && [ ! -L "$state_root" ] ||
@@ -1493,12 +1596,20 @@ else
   esac
   [ -e /proc/self/fd/9 ] || fail "PRIVATE_WORKER_REQUIRED"
 fi
-timeout 15s python3 "$timepad_helper" lock-check \
-  --root "$state_root" --deploy-lock-fd 9 >/dev/null ||
-  fail "DEPLOY_LOCK_INVALID"
-if [ "${TIMEPAD_WORKER_MODE:-}" = controller-worker ]; then
+if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ]; then
+  timeout 15s python3 "$timepad_helper" lock-check \
+    --root "$state_root" --deploy-lock-fd 9 >/dev/null ||
+    fail "DEPLOY_LOCK_INVALID"
+fi
+if [ "${TIMEPAD_WORKER_MODE:-}" = controller-worker ] ||
+  [ "${TIMEPAD_WORKER_MODE:-}" = fail-closed-worker ]; then
   supervisor_enabled=true
   supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  if [ "$TIMEPAD_WORKER_MODE" = fail-closed-worker ]; then
+    fail_closed_owned_backend || :
+    fail_closed_publish_unresolved || :
+    fail "QUIESCENCE_UNCONFIRMED"
+  fi
   if [ "$operation" = forward-recover ]; then
     supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
     supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
@@ -1536,6 +1647,7 @@ if [ "$operation" = bootstrap-guard ]; then
   jq -e --arg id "$bootstrap_id" '.bootstrapId == $id' \
     "$bootstrap_authority" >/dev/null ||
     fail "BOOTSTRAP_AUTHORITY_MISMATCH"
+  recovery_budget_arm
   bootstrap_result=$(timeout 30s python3 "$timepad_helper" bootstrap \
     --root "$state_root" --authority "$bootstrap_authority" \
     --observed "$bootstrap_observed" --deploy-lock-fd 9 2>/dev/null) ||
@@ -1546,8 +1658,7 @@ if [ "$operation" = bootstrap-guard ]; then
     (.epoch == 0) and (.originDigest | test("^[a-f0-9]{64}$"))
   ' \
     <<<"$bootstrap_result" >/dev/null || fail "BOOTSTRAP_EVIDENCE_INVALID"
-  echo "schema_guard=ready"
-  echo "operation_outcome=$(jq -er '.outcome' <<<"$bootstrap_result")"
+  supervisor_complete "$(jq -er '.outcome' <<<"$bootstrap_result")"
   exit 0
 fi
 if [ "$operation" = forward-recover ]; then
@@ -1642,6 +1753,11 @@ if [ "$operation" = forward-recover ]; then
       ;;
     *) fail "RECOVERY_PHASE_REFUSED" ;;
   esac
+  # Only read-only terminal replay has a complete success handoff in this
+  # slice. Exact retries/finalization still need daemon-quiescence and cleanup
+  # worker integration before any mutation may be released.
+  [ "$recovery_phase" = COMMITTED ] ||
+    fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"
   if [ "$recovery_phase" = COMMITTED ]; then
     jq -e '.ownedChild == null' <<<"$recovery_state" >/dev/null ||
       fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
@@ -1809,8 +1925,7 @@ if [ "$operation" = forward-recover ]; then
     [ "$recovery_receipt_digest" = \
       "$(jq -er '.terminalReceipt | strings' <<<"$recovery_state")" ] ||
       fail "RECOVERY_TERMINAL_RECEIPT_MISMATCH"
-    echo "schema_guard=committed"
-    echo "operation_outcome=already-completed"
+    supervisor_complete already-completed
     exit 0
   fi
 
@@ -2147,6 +2262,9 @@ PY
   echo "operation_outcome=deployment-completed"
   exit 0
 fi
+# Rollback reconstruction and daemon quiescence are not yet integrated.
+# Do not allow an ordinary deploy to reach its first writer.
+fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"
 if [ "$closed_beta_safety" = true ]; then
   [ -f "$safety_hook" ] && [ ! -L "$safety_hook" ] && [ -x "$safety_hook" ] ||
     fail "closed-beta safety hook is unavailable"
@@ -3094,8 +3212,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
       controller-worker|rollback-worker|fail-closed-worker|retention-worker) ;;
       *) fail "PRIVATE_WORKER_REQUIRED" ;;
     esac
-    [ "$worker_mode" = controller-worker ] ||
-      fail "PRIVATE_WORKER_MODE_UNAVAILABLE"
     shift 2
     private_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
     private_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -3103,6 +3219,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     timeout 10s python3 "$private_script_dir/test_vps_timepad_supervisor.py" \
         client --root "$private_root" hello >/dev/null ||
       fail "PRIVATE_WORKER_REQUIRED"
+    case "$worker_mode" in
+      controller-worker|fail-closed-worker) ;;
+      *) fail "PRIVATE_WORKER_MODE_UNAVAILABLE" ;;
+    esac
     provider_release_main "$@"
   else
     supervisor_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}

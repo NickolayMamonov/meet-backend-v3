@@ -9,13 +9,16 @@ No production CLI or environment deadline override is used.
 from __future__ import annotations
 
 import argparse
-import hashlib
+import ast
+from contextlib import nullcontext
 import importlib.util
 import json
 import os
 from pathlib import Path
 import signal
 import socket
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -88,6 +91,8 @@ class AttemptTests(unittest.TestCase):
         self.clock.advance(3)
         self.assertEqual(attempt.after_drain(), "rollback-worker")
         acknowledged(attempt)
+        admission = attempt.grant("rollback-admission", NS)
+        attempt.complete(admission.grant_id)
         attempt.admit_rollback()
         acknowledged(attempt)
         attempt.grant("rollback-remaining-work", 600 * NS)
@@ -273,6 +278,8 @@ class AttemptTests(unittest.TestCase):
         attempt.cancel("TERM", 143)
         attempt.after_drain()
         acknowledged(attempt)
+        admission = attempt.grant("rollback-admission", NS)
+        attempt.complete(admission.grant_id)
         attempt.admit_rollback()
         acknowledged(attempt)
         attempt.grant("rollback-remaining-work", NS)
@@ -303,6 +310,129 @@ class AttemptTests(unittest.TestCase):
         self.assertIsNone(attempt.result)
         attempt.finish_childless()
         self.assertEqual(attempt.result, (0, "COMPLETED"))
+
+    def test_bootstrap_must_arm_before_terminal_intent(self):
+        acknowledged(self.attempt)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "TERMINAL_REFUSED"):
+            self.attempt.prepare_terminal()
+        self.attempt.arm()
+        acknowledged(self.attempt)
+        self.attempt.prepare_terminal()
+        acknowledged(self.attempt)
+        self.attempt.terminal(0, "bootstrapped")
+        self.assertIsNone(self.attempt.result)
+        self.assertEqual(self.attempt.pending_outcome, "bootstrapped")
+
+    def test_terminal_outcomes_are_fixed_and_operation_scoped(self):
+        for operation, outcome in (
+            ("deploy", "already-completed"), ("forward-recover", "bootstrapped"),
+            ("deploy", "private-canary"), ("deploy", []),
+        ):
+            with self.subTest(operation=operation, outcome=outcome):
+                attempt = supervisor.Attempt(operation, clock=self.clock)
+                acknowledged(attempt)
+                attempt.arm()
+                acknowledged(attempt)
+                attempt.prepare_terminal()
+                acknowledged(attempt)
+                with self.assertRaisesRegex(supervisor.SupervisorError, "TERMINAL_REFUSED"):
+                    attempt.terminal(0, outcome)
+                self.assertIsNone(attempt.pending_outcome)
+
+    def test_terminal_publication_cannot_reset_or_consume_cleanup_reserve(self):
+        attempt = self.armed()
+        original = (attempt.t0, attempt.work_end, attempt.hard_end)
+        attempt.prepare_terminal()
+        acknowledged(attempt)
+        attempt.terminal(0, "bootstrapped")
+        self.clock.advance(539)
+        attempt._change("drained")  # supervisor-owned post-ECHILD revision
+        publication = attempt.grant("lease-publish", 10 * NS)
+        self.assertEqual(publication.end_ns, original[1])
+        self.clock.advance(1)
+        attempt.poll()
+        self.assertIsNone(attempt.pending_terminal)
+        self.assertIsNone(attempt.pending_outcome)
+        self.assertEqual((attempt.t0, attempt.work_end, attempt.hard_end), original)
+        with self.assertRaises(supervisor.SupervisorError):
+            attempt.complete(publication.grant_id)
+        with self.assertRaises(supervisor.SupervisorError):
+            attempt.finish_childless()
+
+    def test_expired_publication_does_not_signal_after_passive_keeper_transition(self):
+        source = (SCRIPTS / "test_vps_timepad_supervisor.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        expiry = next(
+            node.test for node in ast.walk(tree) if isinstance(node, ast.If)
+            and "now >= self.completion_grant.end_ns" in ast.unparse(node.test)
+        )
+        condition = compile(ast.Expression(expiry), "<publication-expiry>", "eval")
+        instance = supervisor.Supervisor.__new__(supervisor.Supervisor)
+        instance.attempt = self.attempt
+        instance.completion_pid = 123
+        instance.completion_grant = supervisor.Grant(
+            "a" * 32, "lease-publish", 10, self.attempt.nonce, self.attempt.role,
+        )
+        self.assertTrue(eval(condition, {}, {"self": instance, "now": 10}))
+        self.attempt.unconfirmed()
+        self.assertFalse(eval(condition, {}, {"self": instance, "now": 10}))
+
+    def test_cancellation_snapshots_are_ordered_bounded_and_do_not_share_worker_lists(self):
+        instance = supervisor.Supervisor.__new__(supervisor.Supervisor)
+        instance.attempt = self.attempt
+        instance.identity = {
+            "pid": 123, "startTicks": 456,
+            "bootId": "01234567-89ab-cdef-0123-456789abcdef",
+        }
+        instance.worker_identity = {**instance.identity, "pid": 124}
+        instance.worker_identities = [{"mode": "controller-worker", **instance.worker_identity}]
+        instance.lease_snapshots = {}
+        self.attempt.on_change = instance._record_lease
+        instance._record_lease()
+        self.attempt.cancel("TERM", 143)
+        self.assertEqual(list(instance.lease_snapshots), [0, 1, 2, 3])
+        self.assertEqual([row["lifecycle"] for row in instance.lease_snapshots.values()],
+                         ["registered", "armed", "cancel-forward", "drain-forward"])
+        snapshots = list(instance.lease_snapshots.values())
+        for before, after in zip(snapshots, snapshots[1:]):
+            state._validate_lease_successor(before, after)
+        instance.worker_identities.append({"mode": "rollback-worker", **instance.identity, "pid": 125})
+        self.assertTrue(all(len(row["workers"]) == 1 for row in snapshots))
+        instance._published(1)
+        self.assertEqual(list(instance.lease_snapshots), [2, 3])
+        self.attempt.unconfirmed()
+        revision = self.attempt.revision
+        self.attempt.unconfirmed()
+        self.assertEqual(self.attempt.revision, revision)
+
+    def test_post_echild_publication_is_the_only_new_execution_site(self):
+        # The event-loop branch is driven by waitpid's ECHILD result. Draining
+        # cannot fork a metadata writer while a prior writer is still alive.
+        source = (SCRIPTS / "test_vps_timepad_supervisor.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        run = next(
+            method for node in tree.body if isinstance(node, ast.ClassDef)
+            and node.name == "Supervisor" for method in node.body
+            if isinstance(method, ast.FunctionDef) and method.name == "run"
+        )
+
+        def publication_calls(node, guards=()):
+            if isinstance(node, ast.If):
+                yield from publication_calls(node.test, guards)
+                for child in node.body:
+                    yield from publication_calls(child, (*guards, ast.unparse(node.test)))
+                for child in node.orelse:
+                    yield from publication_calls(child, guards)
+            else:
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                        node.func.attr == "_begin_publication":
+                    yield guards
+                for child in ast.iter_child_nodes(node):
+                    yield from publication_calls(child, guards)
+
+        calls = list(publication_calls(run))
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(any("childless" in guard for guard in guards) for guards in calls))
 
     def test_drill_86_only_after_successful_admitted_rollback(self):
         attempt = self.armed()
@@ -343,6 +473,40 @@ class AttemptTests(unittest.TestCase):
             with self.subTest(duration=duration), self.assertRaises(supervisor.SupervisorError):
                 attempt.grant("docker", duration)
 
+    def test_private_grant_validation_never_renews_or_revives_authority(self):
+        attempt = self.armed()
+        grant = attempt.grant("state-publish", 2 * NS)
+        idle_end = attempt.idle_end
+        for _ in range(3):
+            self.assertEqual(grant, attempt.validate_grant(grant.grant_id, grant.end_ns))
+            self.assertEqual(idle_end, attempt.idle_end)
+        for grant_id, end in (
+            ("f" * 32, grant.end_ns), (grant.grant_id, grant.end_ns + 1),
+            (grant.grant_id, True),
+        ):
+            with self.subTest(grant_id=grant_id, end=end), self.assertRaises(supervisor.SupervisorError):
+                attempt.validate_grant(grant_id, end)
+        self.clock.advance(2)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "GRANT_REVOKED"):
+            attempt.validate_grant(grant.grant_id, grant.end_ns)
+        attempt.poll()
+        self.assertEqual(attempt.first_reason, "WAIT_EXPIRED")
+        self.assertEqual(attempt.after_drain(), "rollback-worker")
+        acknowledged(attempt)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "GRANT_REVOKED"):
+            attempt.validate_grant(grant.grant_id, grant.end_ns)
+
+    def test_completed_or_unacknowledged_grant_cannot_admit_a_state_writer(self):
+        attempt = self.armed()
+        grant = attempt.grant("state-publish", NS)
+        attempt.acked_revision = -1
+        with self.assertRaisesRegex(supervisor.SupervisorError, "GRANT_REVOKED"):
+            attempt.validate_grant(grant.grant_id, grant.end_ns)
+        acknowledged(attempt)
+        attempt.complete(grant.grant_id)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "GRANT_REVOKED"):
+            attempt.validate_grant(grant.grant_id, grant.end_ns)
+
     def test_cleanup_failure_cannot_start_a_second_cleanup_worker(self):
         attempt = self.armed()
         attempt.cancel("EXIT")
@@ -360,28 +524,265 @@ class AttemptTests(unittest.TestCase):
         self.assertEqual(attempt.result, (1, "QUIESCENCE_UNCONFIRMED"))
 
 
+class ControllerLifecycleTests(unittest.TestCase):
+    """Execute actual shell functions with private deterministic RPC boundaries."""
+
+    def function(self, name):
+        import re
+        source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
+        match = re.search(r"^" + re.escape(name) + r"\(\) \{\n.*?^\}", source, re.M | re.S)
+        self.assertIsNotNone(match)
+        return match.group()
+
+    def shell(self, script, *arguments):
+        bash = shutil.which("bash")
+        if os.name == "nt":
+            bash = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+        self.assertIsNotNone(bash)
+        return subprocess.run(
+            [bash, "-s", "--", *arguments],
+            input="set -euo pipefail\n" + script,
+            capture_output=True, text=True, timeout=60 if os.name == "nt" else 15, check=False,
+        )
+
+    def test_terminal_handshake_ack_order_and_each_refusal(self):
+        script = self.function("supervisor_complete") + r"""
+supervisor_enabled=true
+fail() { echo "$1" >&2; exit 91; }
+supervisor_client() {
+  echo "$*" >&2
+  [ "$1" != "$failure" ]
+}
+supervisor_publish_lease() {
+  echo publish-and-ack >&2
+  [ "$failure" != publish ]
+}
+failure=$1
+supervisor_complete bootstrapped
+"""
+        for failure, events in (
+            ("none", ["prepare-terminal", "publish-and-ack", "terminal 0 --outcome bootstrapped"]),
+            ("prepare-terminal", ["prepare-terminal", "EXECUTION_TERMINAL_PREPARE_FAILED"]),
+            ("publish", ["prepare-terminal", "publish-and-ack", "EXECUTION_LEASE_PUBLICATION_FAILED"]),
+            ("terminal", ["prepare-terminal", "publish-and-ack", "terminal 0 --outcome bootstrapped",
+                          "EXECUTION_TERMINAL_ACK_FAILED"]),
+        ):
+            with self.subTest(failure=failure):
+                result = self.shell(script, failure)
+                self.assertEqual(0 if failure == "none" else 91, result.returncode, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), events)
+                self.assertEqual(result.stdout, "")
+
+    def test_provider_wait_binds_only_locking_helpers_to_attempt_and_grant(self):
+        script = self.function("supervisor_timeout") + r"""
+provider_helper=/fixture/provider.py
+timepad_helper=/fixture/state.py
+TIMEPAD_ATTEMPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+supervisor_client() {
+  case "$1" in
+    grant) echo '{"grantId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","endNs":123456789}' ;;
+    complete) ;;
+    *) exit 90 ;;
+  esac
+}
+command() {
+  if [ "$1" = timeout ] && [ "$2" = 3s ]; then
+    echo 1s
+  else
+    printf '%s\n' "$@"
+  fi
+}
+supervisor_timeout 30s python3 "$provider_helper" "$1" --deploy-lock-fd 9
+"""
+        for operation in ("live-resume", "finish-committed-resume", "check-image", "observe"):
+            with self.subTest(operation=operation):
+                result = self.shell(script, operation)
+                self.assertEqual(0, result.returncode, result.stderr)
+                arguments = result.stdout.splitlines()
+                self.assertEqual(arguments[:7], [
+                    "timeout", "1s", "python3", "/fixture/provider.py", operation,
+                    "--deploy-lock-fd", "9",
+                ])
+                self.assertEqual(arguments[7:], [
+                    "--execution-attempt", "a" * 32, "--deadline-ns", "123456789",
+                ] if operation in {"live-resume", "finish-committed-resume"} else [])
+
+    def test_state_mutations_carry_the_live_grant_and_cleanup_cannot_launch_writers(self):
+        script = self.function("supervisor_timeout") + r"""
+provider_helper=/fixture/provider.py
+timepad_helper=/fixture/state.py
+TIMEPAD_ATTEMPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+TIMEPAD_WORKER_MODE=$1
+supervisor_client() {
+  case "$1" in
+    grant)
+      echo "grant:$2" >&2
+      echo '{"grantId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","endNs":123456789}' ;;
+    complete) ;;
+    *) exit 90 ;;
+  esac
+}
+command() {
+  if [ "$1" = timeout ] && [ "$2" = 3s ]; then echo 1s
+  else printf '%s\n' "$@"; fi
+}
+shift
+supervisor_timeout 30s "$@"
+"""
+        for role, argv, wait_name, permitted in (
+            ("controller-worker", ["python3", "/fixture/state.py", "prepare"], "state-publish", True),
+            ("controller-worker", ["python3", "/fixture/state.py", "read-state"], "state-publish", True),
+            ("fail-closed-worker", ["python3", "/fixture/state.py", "retain-unresolved"], "cleanup-publish", True),
+            ("fail-closed-worker", ["python3", "/fixture/state.py", "read-state"], "cleanup-stop", True),
+            ("fail-closed-worker", ["docker", "inspect", "fixture-container"], "cleanup-stop", True),
+            ("fail-closed-worker", ["docker", "update", "--restart=no", "fixture-container"], "cleanup-stop", True),
+            ("fail-closed-worker", ["docker", "start", "fixture-container"], None, False),
+            ("fail-closed-worker", ["docker", "update", "--restart=unless-stopped", "fixture-container"], None, False),
+            ("fail-closed-worker", ["python3", "/fixture/state.py", "bootstrap"], None, False),
+            ("fail-closed-worker", ["python3", "/fixture/provider.py", "finish"], None, False),
+        ):
+            with self.subTest(role=role, argv=argv):
+                result = self.shell(script, role, *argv)
+                self.assertEqual(0 if permitted else 1, result.returncode, result.stderr)
+                self.assertEqual("grant:" + wait_name if permitted else "", result.stderr.strip())
+                expected = ["timeout", "1s", *argv] if permitted else []
+                if permitted and argv[:2] == ["python3", "/fixture/state.py"] and argv[2] in {
+                    "prepare", "retain-unresolved",
+                }:
+                    expected += [
+                        "--execution-attempt", "a" * 32, "--execution-grant", "b" * 32,
+                        "--deadline-ns", "123456789",
+                    ]
+                self.assertEqual(expected, result.stdout.splitlines())
+
+    def test_stop_only_worker_matches_exact_incident_and_never_claims_quiescence(self):
+        current = {
+            "executionAttempt": "a" * 32, "phase": "VERIFYING", "containerId": "b" * 64,
+            "configHash": "c" * 64, "target": {"tuple": {"platformImageId": "d" * 64}},
+        }
+        inspection = [{
+            "Id": "b" * 64, "Image": "sha256:" + "d" * 64,
+            "Config": {"Labels": {
+                "com.docker.compose.project": "meet-production",
+                "com.docker.compose.service": "backend", "com.docker.compose.config-hash": "c" * 64,
+            }},
+            "State": {"Running": False}, "HostConfig": {"RestartPolicy": {"Name": "no"}},
+        }]
+        cases = [
+            ("exact", current, inspection, ["inspect", "update", "stop", "inspect"]),
+            ("foreign-attempt", {**current, "executionAttempt": "e" * 32}, inspection, []),
+            ("prepared", {**current, "phase": "PREPARED"}, inspection, []),
+            ("terminal", {**current, "phase": "COMMITTED"}, inspection, []),
+            ("unbound", {**current, "containerId": None}, inspection, []),
+            ("wrong-image", current, [{**inspection[0], "Image": "sha256:" + "e" * 64}], ["inspect"]),
+            ("wrong-id", current, [{**inspection[0], "Id": "e" * 64}], ["inspect"]),
+            ("extra-container", current, inspection * 2, ["inspect"]),
+            ("update-failure", current, inspection, ["inspect", "update"]),
+            ("stop-failure", current, inspection, ["inspect", "update", "stop"]),
+            ("still-running", current, [{**inspection[0], "State": {"Running": True}}],
+             ["inspect", "update", "stop", "inspect"]),
+        ]
+        script = self.function("fail_closed_owned_backend") + r"""
+state_root=$1
+TIMEPAD_ATTEMPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+timepad_helper=/fixture/state.py
+current_json=$2
+inspection_json=$3
+fault=$4
+timeout() { shift; "$@"; }
+python3() { printf '{"current":%s}\n' "$current_json"; }
+docker() {
+  echo "$1" >>"$state_root/trace"
+  case "$1" in
+    inspect) printf '%s\n' "$inspection_json" ;;
+    update)
+      [ "$2" = --restart=no ] && [ "$3" = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ]
+      [ "$fault" != update-failure ] ;;
+    stop)
+      [ "$2:$3" = --time:10 ] && [ "$4" = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ]
+      [ "$fault" != stop-failure ] ;;
+    *) return 90 ;;
+  esac
+}
+fail_closed_owned_backend
+"""
+        for fault, state_value, runtime, events in cases:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                result = self.shell(script, Path(directory).as_posix(),
+                                    json.dumps(state_value), json.dumps(runtime), fault)
+                self.assertEqual(1, result.returncode, result.stderr)
+                trace = Path(directory, "trace")
+                self.assertEqual(events, trace.read_text().splitlines() if trace.exists() else [])
+                self.assertEqual("", result.stdout)
+
+    def test_stop_only_worker_attempts_unresolved_publication_even_when_stop_refuses(self):
+        source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
+        branch = source[source.index('  if [ "$TIMEPAD_WORKER_MODE" = fail-closed-worker ]; then'):]
+        branch = branch[:branch.index("\n  fi") + 5]
+        script = r"""
+TIMEPAD_WORKER_MODE=fail-closed-worker
+fail_closed_owned_backend() { echo stop >&2; return 1; }
+fail_closed_publish_unresolved() { echo retain-unresolved >&2; return 1; }
+fail() { echo "$1" >&2; exit 91; }
+""" + branch
+        result = self.shell(script)
+        self.assertEqual(91, result.returncode)
+        self.assertEqual(["stop", "retain-unresolved", "QUIESCENCE_UNCONFIRMED"], result.stderr.splitlines())
+        self.assertEqual("", result.stdout)
+
+    def test_bootstrap_arm_and_normal_deploy_gate_precede_writers(self):
+        source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
+        bootstrap = source[source.index('if [ "$operation" = bootstrap-guard ]; then'):]
+        self.assertLess(bootstrap.index("recovery_budget_arm"), bootstrap.index("bootstrap_result="))
+        self.assertIn('supervisor_complete "$(jq -er', bootstrap)
+        normal_gate = source.index('fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"\n')
+        self.assertLess(normal_gate, source.index('"$provider_helper" state-publish'))
+        self.assertIn('[ "$recovery_phase" = COMMITTED ] ||\n'
+                      '    fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"', source)
+        private_dispatch = source[source.index('    case "$worker_mode" in\n',
+                                              source.index("if [[")):]
+        self.assertIn("controller-worker|fail-closed-worker) ;;", private_dispatch)
+        self.assertIn('*) fail "PRIVATE_WORKER_MODE_UNAVAILABLE"', private_dispatch)
+
+    def test_lease_transport_newline_is_not_published_as_durable_bytes(self):
+        script = self.function("supervisor_publish_lease") + r"""
+state_root=$1
+timepad_helper=/fixture/state.py
+TIMEPAD_ATTEMPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+supervisor_enabled=true
+snapshot_bytes='{"attempt":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","revision":0}'
+supervisor_client() {
+  case "$1" in
+    grant) echo '{"grantId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' ;;
+    lease) printf '%s\n' "$snapshot_bytes" ;;
+    complete|lease-ack) echo "$*" >&2 ;;
+    *) return 90 ;;
+  esac
+}
+command() {
+  [ "$1" = timeout ] && [ "$5" = publish-lease ] || return 91
+  cmp -s "$9" <(printf '%s' "$snapshot_bytes") || return 92
+  echo '{"revision":0,"digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+}
+supervisor_publish_lease
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.shell(script, Path(directory).as_posix())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr.splitlines(), [
+                "complete " + "b" * 32, "lease-ack 0 " + "c" * 64,
+            ])
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+
 def fixture_publish(client, directory):
     snapshot = client.request("lease")
     state._execution_lease(snapshot)
     grant = client.request("grant", name="lease-publish", localNs=10 * NS)
-    data = supervisor.encode(snapshot)
-    target = Path(directory) / "fixture-execution.json"
-    temporary = Path(directory) / "fixture-execution.tmp"
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(temporary, target)
-    parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(parent)
-    finally:
-        os.close(parent)
+    acknowledgment = state.publish_execution_lease(directory, snapshot, deploy_lock_fd=9)
     client.request("complete", grantId=grant["grantId"])
     client.request(
-        "lease-ack", revision=snapshot["revision"], digest=hashlib.sha256(data).hexdigest(),
+        "lease-ack", revision=acknowledgment["revision"], digest=acknowledgment["digest"],
     )
 
 
@@ -431,11 +832,15 @@ class FixtureSupervisor(supervisor.Supervisor):
         self.worker_hello = False
         self.worker_handshake_end = time.monotonic_ns() + self.attempt.timing.handshake_ns
         self.attempt.idle_end = self.worker_handshake_end
+        self._record_lease()
 
 
 class LinuxSupervisorTests(unittest.TestCase):
-    def run_fixture(self, behavior, *, operation="deploy", timing=None, timeout=15, disconnect=False):
-        with tempfile.TemporaryDirectory() as directory:
+    def run_fixture(
+        self, behavior, *, operation="deploy", timing=None, timeout=15, disconnect=False,
+        directory=None, observe=None,
+    ):
+        with tempfile.TemporaryDirectory() if directory is None else nullcontext(directory) as directory:
             os.chmod(directory, 0o700)
             relay, child = supervisor.socket_pair()
             pid = os.fork()
@@ -468,6 +873,8 @@ class LinuxSupervisorTests(unittest.TestCase):
                 if disconnect:
                     relay.close()
                 while time.monotonic() < end:
+                    if observe is not None:
+                        observe(directory, frames)
                     reaped, status = os.waitpid(pid, os.WNOHANG)
                     if reaped:
                         if not disconnect:
@@ -517,6 +924,173 @@ class LinuxSupervisorTests(unittest.TestCase):
 
         result, _ = self.run_fixture(behavior)
         self.assertEqual((result["status"], result["reason"]), (0, "COMPLETED"))
+
+    def test_state_helper_bootstrap_requires_actual_live_grant_and_rejects_completed_grant(self):
+        def behavior(client, directory, mode):
+            if mode != "controller-worker":
+                os._exit(5)
+            fixture_publish(client, directory)
+            client.request("arm")
+            fixture_publish(client, directory)
+            authority = {
+                "rootId": "test-root", "bootstrapId": "bootstrap-1",
+                "initialRuntime": "a" * 64, "initialConfig": "b" * 64,
+                "initialSchema": "c" * 64, "initialStartupInventory": "d" * 64,
+                "schemaHistoryProvenance": True,
+            }
+            observed = {
+                "rootId": "test-root", "runtime": "a" * 64, "config": "b" * 64,
+                "schema": "c" * 64, "startupInventory": "d" * 64,
+                "schemaHistoryProvenance": True,
+            }
+            try:
+                state.bootstrap_guard(directory, authority=authority, observed=observed, deploy_lock_fd=9)
+            except state.GuardError:
+                if Path(directory, "timepad-guard").exists():
+                    os._exit(6)
+            else:
+                os._exit(7)
+            granted = client.request("grant", name="state-publish", localNs=10 * NS)
+            capability = state.ExecutionGrant(granted["attempt"], granted["grantId"], granted["endNs"])
+            result = state.bootstrap_guard(
+                directory, authority=authority, observed=observed,
+                deploy_lock_fd=9, execution_grant=capability,
+            )
+            if result["outcome"] != "bootstrapped":
+                os._exit(8)
+            original = state.read_guard(directory, deploy_lock_fd=9)
+            client.request("complete", grantId=granted["grantId"])
+            Path(directory, "grant-checks-passed").write_bytes(
+                Path(directory, "timepad-guard/current.json").read_bytes(),
+            )
+            try:
+                state.bootstrap_guard(
+                    directory, authority=authority, observed=observed,
+                    deploy_lock_fd=9, execution_grant=capability,
+                )
+            except state.GuardError as error:
+                if error.reason != "EXECUTION_GRANT_REVOKED":
+                    os._exit(9)
+                if state.read_guard(directory, deploy_lock_fd=9) != original:
+                    os._exit(10)
+            else:
+                os._exit(11)
+            # Rejection revokes the controller protocol; it cannot finalize or
+            # obtain more work, and its durable lease remains unresolved.
+            os._exit(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = self.run_fixture(
+                behavior, directory=directory, timing=supervisor.Timing(
+                    work_ns=12 * NS, hard_ns=18 * NS, handshake_ns=NS,
+                    idle_ns=2 * NS, drain_ns=NS, term_ns=NS // 4,
+                    stop_ns=NS, publish_ns=NS,
+                ), timeout=25,
+            )
+            self.assertNotEqual(result["status"], 0)
+            self.assertEqual("QUIESCENCE_UNCONFIRMED", result["reason"])
+            self.assertEqual(
+                Path(directory, "grant-checks-passed").read_bytes(),
+                Path(directory, "timepad-guard/current.json").read_bytes(),
+            )
+            lease = state._read_execution_lease_locked(directory)
+            self.assertEqual("PROTOCOL_INVALID", lease["firstFailure"])
+
+    def test_completed_attempt_can_replay_only_after_final_childless_publication(self):
+        def behavior(client, directory, mode):
+            if mode != "controller-worker":
+                os._exit(5)
+            fixture_publish(client, directory)
+            client.request("arm")
+            fixture_publish(client, directory)
+            client.request("prepare-terminal")
+            fixture_publish(client, directory)
+            client.request("terminal", status=0, outcome="already-initialized")
+
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            authority = {
+                "rootId": "test-root", "bootstrapId": "bootstrap-1",
+                "initialRuntime": "a" * 64, "initialConfig": "b" * 64,
+                "initialSchema": "c" * 64, "initialStartupInventory": "d" * 64,
+                "schemaHistoryProvenance": True,
+            }
+            observed = {
+                "rootId": "test-root", "runtime": "a" * 64, "config": "b" * 64,
+                "schema": "c" * 64, "startupInventory": "d" * 64,
+                "schemaHistoryProvenance": True,
+            }
+            state.bootstrap_guard(directory, authority=authority, observed=observed)
+            original = state.read_guard(directory)
+            attempts = []
+            for _ in range(2):
+                result, _ = self.run_fixture(behavior, directory=directory)
+                self.assertEqual((result["status"], result["reason"], result["outcome"]),
+                                 (0, "COMPLETED", "already-initialized"))
+                lease = state._read_execution_lease_locked(directory)
+                self.assertEqual((lease["revision"], lease["lifecycle"], lease["worker"]),
+                                 (3, "drained", None))
+                self.assertTrue(all(state._execution_process_exited(identity) for identity in (
+                    lease["supervisor"], *lease["workers"],
+                )))
+                attempts.append(lease["attempt"])
+                self.assertEqual(state.read_guard(directory), original)
+            self.assertNotEqual(attempts[0], attempts[1])
+
+    def test_unrecorded_descendant_closing_fd9_blocks_completion_and_competing_attempt(self):
+        import fcntl
+        checked = []
+
+        def behavior(client, directory, mode):
+            if mode != "controller-worker":
+                os._exit(5)
+            fixture_publish(client, directory)
+            client.request("arm")
+            fixture_publish(client, directory)
+            descendant = os.fork()
+            if descendant == 0:
+                os.close(9)
+                os.setsid()
+                Path(directory, "descendant-ready").write_bytes(b"")
+                gate = os.open(Path(directory, "release"), os.O_RDONLY)
+                supervisor._close_except({gate})
+                os.read(gate, 1)
+                os._exit(0)
+            fixture_terminal(client, directory, 0)
+
+        def observe(directory, frames):
+            if checked or not Path(directory, "descendant-ready").exists():
+                return
+            lease = state._read_execution_lease_locked(directory)
+            if lease is None or lease["lifecycle"] != "drained" or \
+                    not all(state._execution_process_exited(worker) for worker in lease["workers"]):
+                return
+            self.assertIsNotNone(lease["worker"], "live unrecorded descendant got a childless marker")
+            self.assertFalse(any(frame.get("kind") == "result" for frame in frames))
+            fd = os.open(Path(directory, ".deploy.lock"), os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(state.GuardError, "DEPLOY_LOCK_BUSY"):
+                    with state.deploy_lock(directory):
+                        self.fail("competing attempt acquired the keeper lock")
+            finally:
+                os.close(fd)
+            gate = os.open(Path(directory, "release"), os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(gate, b"x")
+            finally:
+                os.close(gate)
+            checked.append(True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            os.mkfifo(Path(directory, "release"), 0o600)
+            result, _ = self.run_fixture(behavior, directory=directory, observe=observe)
+            self.assertEqual(checked, [True])
+            self.assertEqual((result["status"], result["reason"]), (0, "COMPLETED"))
+            lease = state._read_execution_lease_locked(directory)
+            self.assertIsNone(lease["worker"])
 
     def test_recovery_registration_arm_and_terminal_use_actual_durable_state(self):
         def behavior(client, directory, mode):
@@ -824,7 +1398,9 @@ def main():
                 print("SUPERVISOR_FIXTURES_BLOCKED: isolation launcher required", file=sys.stderr)
                 return 77
         supervisor.linux_preflight()
-    classes = [AttemptTests] if options.portable else [AttemptTests, LinuxKernelTests, LinuxSupervisorTests]
+    classes = [AttemptTests, ControllerLifecycleTests]
+    if not options.portable:
+        classes += [LinuxKernelTests, LinuxSupervisorTests]
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls) for cls in classes)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if options.portable:

@@ -6,9 +6,22 @@ filesystem operations are deliberately Linux-only; parsing and admission are
 portable and independently testable.
 
 CLI mutation schemas:
+* When an execution lease exists, schema/bootstrap/owned-child mutations
+  require ``--execution-attempt``, ``--execution-grant`` and ``--deadline-ns``.
+  The helper validates the live private RPC grant and rechecks revocation and
+  the same absolute deadline at durable-write boundaries. FD9/nonce alone is
+  not write authority.
+* ``retain-unresolved`` is exclusive to the fixed fail-closed worker's
+  ``cleanup-publish`` grant. It changes only the fixed unresolved reason/phase,
+  preserving COMMITTING, all proof and child ownership; it never reports stop
+  confirmation or success.
 * ``publish-lease --lease`` accepts the fixed supervisor lease snapshot only,
   publishes it atomically under inherited FD9, and returns its exact revision
   and SHA-256 only after fsync and readback. A lease is never auto-cleared.
+  A drained snapshot with ``worker=null`` is published only by the supervisor's
+  sole direct filesystem child after all original workers have exited. A new
+  authenticated attempt can replace that completed lease only with intact
+  terminal guard state and definitive exit of every recorded old process.
 * ``check-lease --attempt`` is the read-only interlock for provider and
   retention callers; callers must pass their already-held FD9.
 * ``prepare --evidence`` accepts exactly ``rootId``, ``targetId``,
@@ -47,9 +60,10 @@ import stat
 import sys
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 try:
     import fcntl
@@ -167,6 +181,105 @@ def _text(value: Any, *, pattern: re.Pattern[str] | None = None, maximum: int = 
 
 def _digest(value: Any) -> str:
     return _text(value, pattern=HEX_256, maximum=64)
+
+
+@dataclass(frozen=True)
+class ExecutionGrant:
+    attempt: str
+    grant_id: str
+    end_ns: int
+
+    def __post_init__(self) -> None:
+        _text(self.attempt, pattern=LEASE_NONCE, maximum=32)
+        _text(self.grant_id, pattern=LEASE_NONCE, maximum=32)
+        if type(self.end_ns) is not int or not 0 < self.end_ns < 1 << 63:
+            _reject("EXECUTION_GRANT_INVALID")
+
+
+_EXECUTION_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
+    "timepad_execution_check", default=None,
+)
+
+
+def _execution_check() -> None:
+    check = _EXECUTION_CHECK.get()
+    if check is not None:
+        check()
+
+
+@contextmanager
+def _execution_mutation(
+    root: str | os.PathLike[str], deploy_lock_fd: int | None,
+    grant: ExecutionGrant | None,
+    *, cleanup_only: bool = False,
+) -> Iterator[None]:
+    """Validate the live capability, not only the last durable lease snapshot."""
+    lease = _read_execution_lease_locked(root)
+    if lease is None:
+        if grant is not None:
+            _reject("EXECUTION_GRANT_INVALID")
+        yield
+        return
+    if deploy_lock_fd is None:
+        _reject("EXECUTION_LEASE_FD_REQUIRED")
+    if grant is None or grant.attempt != lease["attempt"] or \
+            not _execution_lease_supervisor_is_live(lease):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    role = lease["workerMode"]
+    cleanup = role == "fail-closed-worker"
+    if cleanup != cleanup_only:
+        _reject("EXECUTION_LEASE_STOP_ONLY")
+    end = lease["hardEndNs"] if cleanup else lease["workEndNs"]
+    if end is None or grant.end_ns > end:
+        _reject("EXECUTION_GRANT_INVALID")
+    expected_name = "cleanup-publish" if cleanup else "state-publish"
+    if (
+        cleanup and lease["lifecycle"] != "draining"
+        or role == "controller-worker" and (
+            lease["lifecycle"] != "armed" or lease["firstFailure"] is not None
+        )
+        or role == "rollback-worker" and (
+            lease["operation"] != "deploy" or lease["lifecycle"] != "rolling-back"
+            or not lease["rollbackIssued"]
+        )
+        or role not in {"controller-worker", "rollback-worker", "fail-closed-worker"}
+    ):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    from test_vps_timepad_supervisor import SupervisorError, WorkerClient
+
+    client = None
+    token = None
+    try:
+        client = WorkerClient(str(root))
+        if client.attempt != grant.attempt or client.role != role or \
+                client.supervisor != lease["supervisor"]:
+            _reject("EXECUTION_GRANT_INVALID")
+
+        def check() -> None:
+            if time.monotonic_ns() >= grant.end_ns:
+                _reject("EXECUTION_GRANT_EXPIRED")
+            response = client.request(
+                "validate-grant", grantId=grant.grant_id, endNs=grant.end_ns,
+            )
+            if response != {
+                "attempt": grant.attempt, "grantId": grant.grant_id,
+                "endNs": grant.end_ns, "role": role, "name": expected_name,
+            }:
+                _reject("EXECUTION_GRANT_INVALID")
+            if time.monotonic_ns() >= grant.end_ns:
+                _reject("EXECUTION_GRANT_EXPIRED")
+
+        token = _EXECUTION_CHECK.set(check)
+        check()
+        yield
+        check()
+    except SupervisorError:
+        _reject("EXECUTION_GRANT_REVOKED")
+    finally:
+        if token is not None:
+            _EXECUTION_CHECK.reset(token)
+        if client is not None:
+            client.close()
 
 
 def _execution_lease(value: Any) -> dict[str, Any]:
@@ -553,6 +666,10 @@ def _current(value: Any) -> dict[str, Any]:
         _child_attempt_sequence(obj["latestAttemptId"], obj["incidentId"])
         if obj["phase"] == "PREPARED":
             _reject("STATE_CHILD_PHASE")
+    if obj["phase"] == "PREPARED" and any(
+        obj[key] is not None for key in ("containerId", "configHash", "commitSubstep", "terminalReceipt")
+    ):
+        _reject("STATE_PREPARED_RUNTIME_CONFLICT")
     if obj["executionAttempt"] is not None:
         _text(obj["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
     for key in (
@@ -707,7 +824,7 @@ def new_prepared_state(
 PHASE_EDGES = {
     "READY": frozenset({"PREPARED"}),
     "PREPARED": frozenset({
-        "CUTOVER_POSSIBLE", "VERIFYING", "ROLLING_BACK", "RECOVERY_REQUIRED", "FORWARD_RECOVERING",
+        "CUTOVER_POSSIBLE", "ROLLING_BACK", "RECOVERY_REQUIRED",
     }),
     "CUTOVER_POSSIBLE": frozenset({"VERIFYING", "ROLLING_BACK", "RECOVERY_REQUIRED", "FORWARD_RECOVERING"}),
     "VERIFYING": frozenset({"COMMITTING", "ROLLING_BACK", "RECOVERY_REQUIRED", "FORWARD_RECOVERING"}),
@@ -749,11 +866,13 @@ def validate_state_transition(old: Mapping[str, Any], new: Mapping[str, Any]) ->
         if previous["phase"] in {"READY", *TERMINAL}:
             if candidate != previous:
                 _reject("STATE_TERMINAL_CONFLICT")
-    elif candidate["phase"] not in PHASE_EDGES[previous["phase"]]:
-        _reject("STATE_PHASE_CONFLICT")
-    if previous["phase"] == "PREPARED" and previous["transitionId"] is not None and \
-            candidate["phase"] == "VERIFYING":
+    if previous["phase"] == "PREPARED" and candidate["phase"] in {
+        "VERIFYING", "FORWARD_RECOVERING",
+    }:
         _reject("CUTOVER_BARRIER_REQUIRED")
+    if candidate["phase"] != previous["phase"] and \
+            candidate["phase"] not in PHASE_EDGES[previous["phase"]]:
+        _reject("STATE_PHASE_CONFLICT")
     if candidate["phase"] == "ROLLING_BACK" and previous["phase"] in {
         "CUTOVER_POSSIBLE", "VERIFYING", "FORWARD_RECOVERING",
     } and previous["predecessorDisposition"] != "post-barrier-compatible":
@@ -969,15 +1088,19 @@ def stop_owned_child(
     *,
     deploy_lock_fd: int | None,
     term_grace_seconds: float = 5.0,
+    execution_grant: ExecutionGrant | None = None,
 ) -> dict[str, str]:
     """Stop only the persisted group leader's owned process group, then prove quiescence."""
     if not 0 <= term_grace_seconds <= 10:
         _reject("OWNED_CHILD_UNVERIFIABLE")
-    with deploy_lock(root, deploy_lock_fd):
+    with deploy_lock(root, deploy_lock_fd), _execution_mutation(root, deploy_lock_fd, execution_grant):
         _, current = _read_guard_locked(root)
         child = current["ownedChild"]
         if child is None:
             return {"outcome": "already-quiescent"}
+        if _read_execution_lease_locked(root) is not None and \
+                (execution_grant is None or current["executionAttempt"] != execution_grant.attempt):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
         if not owned_child_is_same_process(child):
             # A dead or reused leader is never authority to signal a numeric PID.
             try:
@@ -988,11 +1111,13 @@ def stop_owned_child(
                 _reject("OWNED_CHILD_UNVERIFIABLE")
             _reject("OWNED_CHILD_UNVERIFIABLE")
         try:
+            _execution_check()
             os.killpg(child["processGroup"], 15)
         except ProcessLookupError:
             return {"outcome": "already-quiescent"}
         deadline = time.monotonic() + term_grace_seconds
         while time.monotonic() < deadline:
+            _execution_check()
             try:
                 os.killpg(child["processGroup"], 0)
             except ProcessLookupError:
@@ -1006,11 +1131,13 @@ def stop_owned_child(
                 return {"outcome": "terminated"}
             _reject("OWNED_CHILD_UNVERIFIABLE")
         try:
+            _execution_check()
             os.killpg(child["processGroup"], 9)
         except ProcessLookupError:
             return {"outcome": "terminated"}
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
+            _execution_check()
             try:
                 os.killpg(child["processGroup"], 0)
             except ProcessLookupError:
@@ -1220,6 +1347,89 @@ def _execution_lease_supervisor_is_live(lease: Mapping[str, Any]) -> bool:
     )
 
 
+def _execution_process_record(identity: Mapping[str, Any]) -> tuple[str, int, int] | None:
+    """Read one kernel identity; absence is distinct from an unreadable /proc."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii") as stream:
+            boot = stream.read(65).strip()
+        if BOOT_ID.fullmatch(boot) is None:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        try:
+            with open(f"/proc/{identity['pid']}/stat", "rb") as stream:
+                raw = stream.read(4097)
+        except FileNotFoundError:
+            return None
+        if len(raw) > 4096 or not raw.endswith(b"\n") or b")" not in raw:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        fields = raw.rsplit(b")", 1)[1].split()
+        if len(fields) < 20:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        return boot, int(fields[19]), int(fields[1])
+    except (OSError, ValueError, IndexError):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+
+
+def _execution_process_exited(identity: Mapping[str, Any]) -> bool:
+    record = _execution_process_record(identity)
+    return record is None or record[:2] != (identity["bootId"], identity["startTicks"])
+
+
+def _validate_childless_lease_publication(candidate: Mapping[str, Any]) -> None:
+    """Only the sole new direct helper can attest the post-worker ECHILD step."""
+    if candidate["worker"] is not None or candidate["lifecycle"] != "drained" or \
+            not candidate["workers"] or os.getppid() != candidate["supervisor"]["pid"]:
+        _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+    if any(not _execution_process_exited(worker) for worker in candidate["workers"]):
+        _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+    parent = candidate["supervisor"]["pid"]
+    try:
+        with open(f"/proc/{parent}/task/{parent}/children", "rb") as stream:
+            children = stream.read(8193)
+        if len(children) > 8192 or children.split() != [str(os.getpid()).encode("ascii")]:
+            _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+    except OSError:
+        _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+
+
+def _validate_terminal_lease_successor(
+    root: str | os.PathLike[str], previous: Mapping[str, Any], candidate: Mapping[str, Any],
+) -> None:
+    # "drained" from a still-live controller is only terminal intent. The
+    # worker-null revision is the separate supervisor-owned ECHILD completion.
+    if previous["lifecycle"] != "drained" or previous["worker"] is not None or \
+            not previous["workers"] or previous["firstFailure"] is not None:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if any(not _execution_process_exited(identity) for identity in (
+        previous["supervisor"], *previous["workers"],
+    )):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if candidate["revision"] != 0 or candidate["lifecycle"] != "registered" or \
+            candidate["firstFailure"] is not None or candidate["rollbackIssued"] or \
+            candidate["worker"] is None or len(candidate["workers"]) != 1:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    worker = candidate["worker"]
+    if candidate["workers"] != [{"mode": candidate["workerMode"], **worker}] or \
+            candidate["workerMode"] != "controller-worker":
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    record = _execution_process_record(worker)
+    if record != (worker["bootId"], worker["startTicks"], candidate["supervisor"]["pid"]):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    # Current-state validation checks origin, epoch, exact image/config and
+    # terminal receipt bindings. Runtime/authorization revalidation remains a
+    # mandatory read-only controller step before terminal replay is reported.
+    _, current = _read_guard_locked(root)
+    if current["phase"] not in TERMINAL | {"READY"} or current["ownedChild"] is not None:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    root_fd = _open_root(root)
+    try:
+        names = set(os.listdir(root_fd))
+        if names & {".provider-transaction.current", ".smtp-transaction.current"} or \
+                any(name.startswith(".timepad-bootstrap-") for name in names):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+    finally:
+        os.close(root_fd)
+
+
 def _validate_lease_successor(previous: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
     immutable = ("attempt", "operation", "supervisor")
     if any(previous[key] != candidate[key] for key in immutable):
@@ -1291,11 +1501,20 @@ def publish_execution_lease(
             ):
                 _reject("EXECUTION_LEASE_UNRESOLVED")
         else:
-            if not _execution_lease_supervisor_is_live(previous):
-                _reject("EXECUTION_LEASE_UNRESOLVED")
-            _validate_lease_successor(previous, candidate)
+            if candidate["attempt"] != previous["attempt"] and candidate["revision"] == 0:
+                _validate_terminal_lease_successor(root, previous, candidate)
+            else:
+                if not _execution_lease_supervisor_is_live(previous):
+                    _reject("EXECUTION_LEASE_UNRESOLVED")
+                # A publication may reach disk just before its worker loses
+                # the acknowledgment channel. Re-ack only identical bytes;
+                # perform fsync/readback again, never advance over a revision.
+                if previous != candidate:
+                    _validate_lease_successor(previous, candidate)
         if not _execution_lease_supervisor_is_live(candidate):
             _reject("EXECUTION_LEASE_UNRESOLVED")
+        if candidate["lifecycle"] == "drained" and candidate["worker"] is None:
+            _validate_childless_lease_publication(candidate)
         root_fd = _open_root(root)
         try:
             _atomic_write(root_fd, EXECUTION_LEASE_NAME, raw,
@@ -1342,6 +1561,7 @@ def _require_execution_lease_descriptor(
 
 
 def _atomic_write(dir_fd: int, name: str, data: bytes, limit: int, *, replace: bool) -> None:
+    _execution_check()
     if len(data) > limit:
         _reject("STATE_TOO_LARGE")
     if any(entry.startswith(".tmp-") for entry in os.listdir(dir_fd)):
@@ -1357,17 +1577,21 @@ def _atomic_write(dir_fd: int, name: str, data: bytes, limit: int, *, replace: b
         _require_no_acl(fd)
         view = memoryview(data)
         while view:
+            _execution_check()
             written = os.write(fd, view)
             if written <= 0:
                 _reject("STATE_WRITE_FAILED")
             view = view[written:]
+        _execution_check()
         os.fsync(fd)
+        _execution_check()
     except Exception:
         os.close(fd)
         os.unlink(temp, dir_fd=dir_fd)
         raise
     os.close(fd)
     try:
+        _execution_check()
         if replace:
             existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
             if not stat.S_ISREG(existing.st_mode) or existing.st_uid != 0 or existing.st_nlink != 1 or \
@@ -1377,7 +1601,9 @@ def _atomic_write(dir_fd: int, name: str, data: bytes, limit: int, *, replace: b
         else:
             os.link(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
             os.unlink(temp, dir_fd=dir_fd)
+        _execution_check()
         os.fsync(dir_fd)
+        _execution_check()
     except Exception:
         try:
             os.unlink(temp, dir_fd=dir_fd)
@@ -1387,6 +1613,7 @@ def _atomic_write(dir_fd: int, name: str, data: bytes, limit: int, *, replace: b
 
 
 def _rename_noreplace(dir_fd: int, source: str, destination: str) -> None:
+    _execution_check()
     try:
         renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
     except AttributeError:
@@ -1447,6 +1674,7 @@ def read_guard(
 
 
 def _publish_current_locked(root: str | os.PathLike[str], state: Mapping[str, Any]) -> dict[str, Any]:
+    _execution_check()
     validated = _current(dict(state))
     root_fd = _open_root(root)
     try:
@@ -1475,12 +1703,13 @@ def _publish_current_locked(root: str | os.PathLike[str], state: Mapping[str, An
             ):
                 _reject("EXECUTION_LEASE_UNRESOLVED")
             if lease is not None:
+                if _EXECUTION_CHECK.get() is None:
+                    _reject("EXECUTION_GRANT_REQUIRED")
                 if validated["executionAttempt"] != lease["attempt"]:
                     _reject("EXECUTION_LEASE_UNRESOLVED")
                 if not _execution_lease_supervisor_is_live(lease):
                     _reject("EXECUTION_LEASE_UNRESOLVED")
-                if lease["lifecycle"] == "quiescence-unconfirmed":
-                    _reject("EXECUTION_LEASE_UNRESOLVED")
+                _validate_execution_state_write(lease, old, validated, time.monotonic_ns())
             validate_state_transition(old, validated)
             old_child, new_child = old["ownedChild"], validated["ownedChild"]
             if old_child is not None and (
@@ -1501,13 +1730,48 @@ def _publish_current_locked(root: str | os.PathLike[str], state: Mapping[str, An
         os.close(root_fd)
 
 
+def _validate_execution_state_write(
+    lease: Mapping[str, Any], previous: Mapping[str, Any], candidate: Mapping[str, Any], now_ns: int,
+) -> None:
+    """A live inherited FD/nonce does not revive revoked forward authority."""
+    if candidate["executionAttempt"] != lease["attempt"]:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    role, lifecycle = lease["workerMode"], lease["lifecycle"]
+    if role == "fail-closed-worker":
+        if lifecycle != "draining" or lease["hardEndNs"] is None or now_ns >= lease["hardEndNs"]:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        # Reserve permits only retaining the unresolved incident. It cannot
+        # clear child ownership, restore config, finalize provider cleanup or
+        # publish a successful schema outcome.
+        unresolved_phase = "COMMITTING" if previous["phase"] == "COMMITTING" else "RECOVERY_REQUIRED"
+        if candidate["phase"] != unresolved_phase or any(
+            candidate[key] != previous[key] for key in previous if key not in {"phase", "reason"}
+        ):
+            _reject("EXECUTION_LEASE_STOP_ONLY")
+        return
+    if lease["workEndNs"] is None or now_ns >= lease["workEndNs"]:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if role == "rollback-worker":
+        if lease["operation"] != "deploy" or lifecycle != "rolling-back" or \
+                not lease["rollbackIssued"] or candidate["phase"] not in {
+                    "ROLLING_BACK", "ROLLED_BACK", "RECOVERY_REQUIRED",
+                }:
+            _reject("EXECUTION_LEASE_ROLLBACK_REQUIRED")
+    elif role != "controller-worker" or lifecycle != "armed" or \
+            lease["firstFailure"] is not None:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if candidate["phase"] in {"ROLLING_BACK", "ROLLED_BACK"} and role != "rollback-worker":
+        _reject("EXECUTION_LEASE_ROLLBACK_REQUIRED")
+
+
 def publish_current(
     root: str | os.PathLike[str],
     state: Mapping[str, Any],
     *,
     deploy_lock_fd: int | None = None,
+    execution_grant: ExecutionGrant | None = None,
 ) -> dict[str, Any]:
-    with deploy_lock(root, deploy_lock_fd):
+    with deploy_lock(root, deploy_lock_fd), _execution_mutation(root, deploy_lock_fd, execution_grant):
         _require_execution_lease_descriptor(root, deploy_lock_fd)
         return _publish_current_locked(root, state)
 
@@ -1600,11 +1864,15 @@ def _bootstrap_guard_locked(
                         ))
                         if staged_current != current:
                             _reject("BOOTSTRAP_CONFLICT")
+                _execution_check()
                 os.fsync(stage_fd)
+                _execution_check()
             finally:
                 os.close(stage_fd)
             _rename_noreplace(root_fd, staging, GUARD_DIR)
+            _execution_check()
             os.fsync(root_fd)
+            _execution_check()
             published_fd = os.open(GUARD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
             try:
                 if _read_at(published_fd, "origin.json", MAX_ORIGIN_BYTES) != origin_raw or \
@@ -1646,8 +1914,9 @@ def bootstrap_guard(
     authority: Mapping[str, Any],
     observed: Mapping[str, Any],
     deploy_lock_fd: int | None = None,
+    execution_grant: ExecutionGrant | None = None,
 ) -> dict[str, Any]:
-    with deploy_lock(root, deploy_lock_fd):
+    with deploy_lock(root, deploy_lock_fd), _execution_mutation(root, deploy_lock_fd, execution_grant):
         return _bootstrap_guard_locked(root, authority=authority, observed=observed)
 
 
@@ -1777,6 +2046,9 @@ def _cli() -> argparse.ArgumentParser:
     claim_rollback = sub.add_parser("claim-rollback")
     claim_rollback.add_argument("--root", required=True)
     claim_rollback.add_argument("--deploy-lock-fd", type=int, required=True)
+    unresolved = sub.add_parser("retain-unresolved")
+    unresolved.add_argument("--root", required=True)
+    unresolved.add_argument("--deploy-lock-fd", type=int, required=True)
     lock = sub.add_parser("lock-check")
     lock.add_argument("--root", required=True)
     lock.add_argument("--deploy-lock-fd", type=int)
@@ -1788,12 +2060,28 @@ def _cli() -> argparse.ArgumentParser:
     stop_child.add_argument("--root", required=True)
     stop_child.add_argument("--deploy-lock-fd", type=int, required=True)
     stop_child.add_argument("--term-grace-seconds", type=float, default=5.0)
+    for mutation in (bootstrap, publish, prepare, advance, claim_rollback, unresolved, stop_child):
+        mutation.add_argument("--execution-attempt")
+        mutation.add_argument("--execution-grant")
+        mutation.add_argument("--deadline-ns", type=int)
     return parser
+
+
+def _cli_execution_grant(args: argparse.Namespace) -> ExecutionGrant | None:
+    values = tuple(getattr(args, key, None) for key in (
+        "execution_attempt", "execution_grant", "deadline_ns",
+    ))
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        _reject("EXECUTION_GRANT_INVALID")
+    return ExecutionGrant(*values)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _cli().parse_args(argv)
     try:
+        execution_grant = _cli_execution_grant(args)
         if args.command == "check-contract":
             contract = parse_contract(_read_input(args.contract, MAX_CONTRACT_BYTES))
             result: Any = {"outcome": "valid", "active": contract["active"]}
@@ -1832,10 +2120,14 @@ def main(argv: list[str] | None = None) -> int:
             result = bootstrap_guard(
                 args.root, authority=authority, observed=observed,
                 deploy_lock_fd=args.deploy_lock_fd,
+                execution_grant=execution_grant,
             )
         elif args.command == "publish-state":
             state = parse_json(_read_input(args.state, MAX_CURRENT_BYTES), MAX_CURRENT_BYTES)
-            result = publish_current(args.root, state, deploy_lock_fd=args.deploy_lock_fd)
+            result = publish_current(
+                args.root, state, deploy_lock_fd=args.deploy_lock_fd,
+                execution_grant=execution_grant,
+            )
         elif args.command == "publish-lease":
             lease = _read_input(args.lease, MAX_EXECUTION_LEASE_BYTES)
             result = publish_execution_lease(
@@ -1854,7 +2146,8 @@ def main(argv: list[str] | None = None) -> int:
                  "operation", "runId", "incidentId", "ownedRun", "toolingDigest",
                  "preparedProofDigest"},
             )
-            with deploy_lock(args.root, args.deploy_lock_fd):
+            with deploy_lock(args.root, args.deploy_lock_fd), \
+                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):
                 origin, current = _read_guard_locked(args.root)
                 admission = admit(
                     contract, root_id=evidence["rootId"], target_id=evidence["targetId"],
@@ -1912,7 +2205,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             if not isinstance(changes, dict) or not changes.keys() <= allowed_changes:
                 _reject("STATE_CHANGE_UNSUPPORTED")
-            with deploy_lock(args.root, args.deploy_lock_fd):
+            with deploy_lock(args.root, args.deploy_lock_fd), \
+                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):
                 _require_execution_lease_descriptor(args.root, args.deploy_lock_fd)
                 _, current = _read_guard_locked(args.root)
                 advanced = advance_state(current, args.phase, **changes)
@@ -1924,7 +2218,8 @@ def main(argv: list[str] | None = None) -> int:
                     "result": published["phase"],
                 }
         elif args.command == "claim-rollback":
-            with deploy_lock(args.root, args.deploy_lock_fd):
+            with deploy_lock(args.root, args.deploy_lock_fd), \
+                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):
                 _require_execution_lease_descriptor(args.root, args.deploy_lock_fd)
                 _, current = _read_guard_locked(args.root)
                 disposition = current["predecessorDisposition"]
@@ -1953,6 +2248,20 @@ def main(argv: list[str] | None = None) -> int:
                     "epoch": published["operationEpoch"],
                     "incidentId": published["incidentId"],
                 }
+        elif args.command == "retain-unresolved":
+            with deploy_lock(args.root, args.deploy_lock_fd), \
+                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant, cleanup_only=True):
+                lease = _read_execution_lease_locked(args.root)
+                if lease is None or lease["workerMode"] != "fail-closed-worker":
+                    _reject("EXECUTION_LEASE_STOP_ONLY")
+                _, current = _read_guard_locked(args.root)
+                phase = "COMMITTING" if current["phase"] == "COMMITTING" else "RECOVERY_REQUIRED"
+                unresolved = advance_state(current, phase, reason="QUIESCENCE_UNCONFIRMED")
+                published = _publish_current_locked(args.root, unresolved)
+                result = {
+                    "result": "QUIESCENCE_UNCONFIRMED", "epoch": published["operationEpoch"],
+                    "incidentId": published["incidentId"],
+                }
         elif args.command == "capture-child":
             result = capture_owned_child(
                 args.pid,
@@ -1964,6 +2273,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.root,
                 deploy_lock_fd=args.deploy_lock_fd,
                 term_grace_seconds=args.term_grace_seconds,
+                execution_grant=execution_grant,
             )
         else:
             with deploy_lock(args.root, args.deploy_lock_fd):
