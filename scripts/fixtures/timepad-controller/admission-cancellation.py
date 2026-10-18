@@ -45,6 +45,16 @@ def no_starts(case: pathlib.Path) -> None:
     ), "cancelled/refused case attempted a target or predecessor start")
 
 
+def no_runtime_mutations(case: pathlib.Path) -> None:
+    no_starts(case)
+    log = case / "docker.log"
+    lines = log.read_text().splitlines() if log.exists() else []
+    require(not any(
+        line.startswith(("update:", "stop:", "rm:", "compose:create", "compose:stop", "compose:rm"))
+        for line in lines
+    ), "read-only admission acquired runtime mutation authority")
+
+
 def environment(case: pathlib.Path) -> dict[str, str]:
     source = recovery.SOURCE / "fixtures/timepad-controller"
     runtime_bin = case / "bin"
@@ -233,6 +243,7 @@ def cancellation_case(name: str) -> None:
     case = BASE.with_name(BASE.name + "-cancel-" + name.lower())
     recovery.setup(case, "CUTOVER_POSSIBLE", "intact", compatible=False)
     before = snapshot(case)
+    runtime_before = (case / "runtime.json").read_bytes()
     current = json.loads(before["current.json"])
     require(current["predecessorDisposition"] == "pre-barrier-only", "fixture predecessor is not incompatible")
     for fifo in ("ready", "release"):
@@ -284,7 +295,10 @@ def cancellation_case(name: str) -> None:
         require(not terminal["rollbackIssued"] and
                 all(worker["mode"] != "rollback-worker" for worker in terminal["workers"]),
                 "forward recovery received predecessor rollback authority")
-        require(terminal["lifecycle"] == "drained", "cancellation did not publish drained completion")
+        require(b"schema_guard=QUIESCENCE_UNCONFIRMED" in output and
+                terminal["lifecycle"] in {"draining", "quiescence-unconfirmed"} and
+                terminal["worker"] is not None,
+                "read-only cancellation fabricated successful runtime/childless completion")
         for worker in terminal["workers"]:
             process_stat = pathlib.Path(f'/proc/{worker["pid"]}/stat')
             try:
@@ -292,11 +306,21 @@ def cancellation_case(name: str) -> None:
             except FileNotFoundError:
                 continue
             require(int(fields[19]) != worker["startTicks"], "cancelled controller worker survived drain")
-        require(snapshot(case)["origin.json"] == before["origin.json"], "cancellation changed origin")
-        require(json.loads(snapshot(case)["current.json"])["phase"] != "COMMITTED",
-                "cancelled admission committed")
-        require(not json.loads((case / "runtime.json").read_bytes())["State"]["Running"],
-                "cancelled admission left the candidate running")
+        require(snapshot(case) == before, "cancelled read-only admission changed the incident")
+        require((case / "runtime.json").read_bytes() == runtime_before,
+                "unadopted incident gained runtime stop/update authority")
+        no_runtime_mutations(case)
+        # Kernel drain and the relay's nonzero result do not authorize adoption
+        # of an old incident or replacement of its unresolved lease. Exact
+        # selectors still have to refuse on a subsequent invocation.
+        lease_before = lease_path.read_bytes()
+        retry = execute(case, command)
+        require(retry.returncode != 0 and b"QUIESCENCE_UNCONFIRMED" in retry.stdout,
+                "unresolved cancellation lease allowed recovery replay")
+        require(lease_path.read_bytes() == lease_before and snapshot(case) == before and
+                (case / "runtime.json").read_bytes() == runtime_before,
+                "recovery replay replaced unresolved lease/state/runtime")
+        no_runtime_mutations(case)
         print("CONTROLLER_CANCELLATION_PASS: forward-recover fault=" + name +
               " target_starts=0 predecessor_starts=0", flush=True)
     finally:
@@ -306,7 +330,7 @@ def cancellation_case(name: str) -> None:
                 process.communicate(timeout=5)
         finally:
             os.close(ready)
-            no_starts(case)
+            no_runtime_mutations(case)
 
 
 if __name__ == "__main__":

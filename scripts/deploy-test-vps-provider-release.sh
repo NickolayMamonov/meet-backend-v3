@@ -714,6 +714,19 @@ supervisor_client() {
   command timeout 10s python3 "$script_dir/test_vps_timepad_supervisor.py" \
     client --root "$state_root" "$@"
 }
+supervisor_cancel_exit() {
+  local status=$1 reason=${2:-EXIT}
+  trap - EXIT
+  trap '' TERM INT HUP
+  if [ "$status" -ne 0 ]; then
+    [ "$status" -ne 86 ] || reason=DRILL
+    # Notify before closing the private channel. Socket EOF can otherwise
+    # reach the event loop before waitpid exposes the initiating exit status.
+    # Only the supervisor may drain writers and dispatch a cleanup worker.
+    supervisor_client cancel "$reason" "$status" >/dev/null 2>&1 || :
+  fi
+  exit "$status"
+}
 supervisor_publish_lease() {
   [ "$supervisor_enabled" = true ] || return 0
   local grant lease snapshot revision attempt publication digest grant_id
@@ -1178,7 +1191,11 @@ recovery_absent_candidate() {
   # An unbound create-intent is deliberately unresolved on crash re-entry.
   timepad_advance FORWARD_RECOVERING EXACT_IMAGE_REPLACEMENT
   timepad_advance FORWARD_RECOVERING "" "" "" "" "" replacement-create-intent
-  trap 'status=$?; trap - EXIT; complete_owned_child true || status=1; exit "$status"' EXIT
+  if [ "${supervisor_enabled:-false}" = true ]; then
+    trap 'supervisor_cancel_exit "$?"' EXIT
+  else
+    trap 'status=$?; trap - EXIT; complete_owned_child true || status=1; exit "$status"' EXIT
+  fi
   trap 'trap "" TERM INT HUP; exit 143' TERM INT HUP
   inventory=$(recovery_backend_inventory) ||
     fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
@@ -1655,6 +1672,7 @@ if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ]; then
 fi
 if [ -n "${TIMEPAD_WORKER_MODE:-}" ]; then
   supervisor_enabled=true
+  trap 'supervisor_cancel_exit "$?"' EXIT
   if [ "$TIMEPAD_WORKER_MODE" = controller-worker ] && [ "$operation" = forward-recover ]; then
     supervisor_register_recovery || fail "RECOVERY_REGISTRATION_REFUSED"
     recovery_admission_only=true
@@ -2028,6 +2046,9 @@ if [ "$operation" = forward-recover ]; then
   recovery_finalization_started=true
   on_recovery_exit() {
     local status=$?
+    if [ "${supervisor_enabled:-false}" = true ]; then
+      supervisor_cancel_exit "$status"
+    fi
     trap - EXIT
     trap '' TERM INT HUP
     if [ -n "$owned_child_pid" ]; then
@@ -2809,11 +2830,17 @@ dispatch_failure() {
 }
 on_signal() {
   failure_signal=$1
+  if [ "${supervisor_enabled:-false}" = true ]; then
+    supervisor_cancel_exit 143 "$failure_signal"
+  fi
   trap '' TERM INT HUP
   exit 143
 }
 on_exit() {
   local status=$?
+  if [ "${supervisor_enabled:-false}" = true ]; then
+    supervisor_cancel_exit "$status"
+  fi
   trap - EXIT
   trap '' TERM INT HUP
   if [ -n "$owned_child_pid" ]; then

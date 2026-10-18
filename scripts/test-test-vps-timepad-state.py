@@ -369,6 +369,87 @@ class ExecutionGrantTests(unittest.TestCase):
                 self.assertEqual("QUIESCENCE_UNCONFIRMED", json.loads(output.getvalue())["result"])
 
 
+class LeasePublicationAuthorityTests(unittest.TestCase):
+    """A live supervisor PID/FD9 is not a lease-publication capability."""
+
+    def setUp(self):
+        self.lease = execution_lease()
+        self.lease["worker"] = {**self.lease["supervisor"], "pid": 102}
+        self.lease["workers"] = [{"mode": "controller-worker", **self.lease["worker"]}]
+        self.client = mock.Mock(
+            attempt=self.lease["attempt"], role="controller-worker",
+            supervisor=self.lease["supervisor"],
+        )
+        self.client.request.return_value = self.lease
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(
+            state.os, "getppid", return_value=self.lease["supervisor"]["pid"] + 1,
+        ))
+        self.stack.enter_context(mock.patch.object(
+            state, "_execution_lease_supervisor_is_live", return_value=True,
+        ))
+        self.client_factory = self.stack.enter_context(mock.patch.object(
+            supervisor, "WorkerClient", return_value=self.client,
+        ))
+
+    def test_private_snapshot_is_rechecked_at_each_write_boundary_and_context_is_cleared(self):
+        with state._execution_lease_publication("/fixture", self.lease):
+            for _ in range(3):
+                state._execution_check()
+        self.assertEqual(5, self.client.request.call_count)
+        self.assertTrue(all(call == mock.call("lease") for call in self.client.request.call_args_list))
+        self.client.close.assert_called_once()
+        self.assertIsNone(state._EXECUTION_CHECK.get())
+
+    def test_fabricated_snapshot_role_identity_and_worker_null_are_not_publication_authority(self):
+        for field, value in (
+            ("attempt", "f" * 32), ("supervisor", {**self.lease["supervisor"], "startTicks": 999}),
+            ("workerMode", "rollback-worker"), ("worker", None),
+            ("lifecycle", "drained"), ("revision", 5),
+        ):
+            candidate = {**self.lease, field: value}
+            with self.subTest(field=field), self.assertRaises(state.GuardError), \
+                    state._execution_lease_publication("/fixture", candidate):
+                self.fail("fabricated lease gained publication authority")
+            self.assertIsNone(state._EXECUTION_CHECK.get())
+
+    def test_revocation_or_snapshot_drift_during_publication_cannot_acknowledge_success(self):
+        for response in (
+            {**self.lease, "lifecycle": "drain-forward"},
+            supervisor.SupervisorError("PRIVATE_REQUEST_REFUSED"),
+        ):
+            self.client.request.side_effect = [self.lease, response]
+            with self.subTest(response=response), self.assertRaises(state.GuardError):
+                with state._execution_lease_publication("/fixture", self.lease):
+                    state._execution_check()
+            self.assertIsNone(state._EXECUTION_CHECK.get())
+
+    def test_no_private_channel_refuses_before_any_filesystem_publication(self):
+        self.client_factory.side_effect = supervisor.SupervisorError("PRIVATE_WORKER_REQUIRED")
+        with mock.patch.object(state, "deploy_lock", return_value=nullcontext(9)), \
+                mock.patch.object(state, "_publish_execution_lease_locked") as publish, \
+                self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_PUBLISHER_REQUIRED"):
+            state.publish_execution_lease("/fixture", self.lease, deploy_lock_fd=9)
+        publish.assert_not_called()
+        self.assertIsNone(state._EXECUTION_CHECK.get())
+
+    def test_supervisor_filesystem_child_requires_all_workers_exited_and_sole_child_at_each_boundary(self):
+        self.lease.update(lifecycle="drain-forward", revision=3)
+        with mock.patch.object(
+            state.os, "getppid", return_value=self.lease["supervisor"]["pid"],
+        ), mock.patch.object(state.os, "getpid", return_value=300), \
+                mock.patch.object(state, "_execution_process_exited", return_value=True), \
+                mock.patch("builtins.open", side_effect=lambda *args: io.BytesIO(b"300 ")):
+            with state._execution_lease_publication("/fixture", self.lease):
+                state._execution_check()
+                self.client_factory.assert_not_called()
+                with mock.patch("builtins.open", return_value=io.BytesIO(b"300 999 ")), \
+                        self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_PUBLISHER_REQUIRED"):
+                    state._execution_check()
+        self.assertIsNone(state._EXECUTION_CHECK.get())
+
+
 class RecoveryRegistrationTests(unittest.TestCase):
     """Portable authorization/protocol checks, not Linux lease/fsync evidence."""
 
@@ -530,14 +611,52 @@ class RecoveryRegistrationTests(unittest.TestCase):
             self.assertIsNone(state._EXECUTION_CHECK.get())
 
     def test_registration_does_not_reconcile_an_existing_unresolved_lease(self):
-        previous = execution_lease(attempt="f" * 32, revision=2, lifecycle="drain-forward")
-        with mock.patch.object(state, "_read_execution_lease_locked", return_value=previous), \
-                mock.patch.object(state, "_atomic_write") as writer, \
-                self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
-            self.real_publisher(
-                "/fixture", self.lease, state._canonical(self.lease), recovery_registration=True,
-            )
-        writer.assert_not_called()
+        for lifecycle in (
+            "registered", "armed", "cancel-forward", "drain-forward",
+            "rollback-admission", "rolling-back", "draining", "quiescence-unconfirmed", "drained",
+        ):
+            previous = execution_lease(attempt="f" * 32, revision=2, lifecycle=lifecycle)
+            previous.update(firstFailure="TERM", firstStatus=143)
+            previous["workers"] = [{"mode": "controller-worker", **previous["supervisor"]}]
+            with self.subTest(lifecycle=lifecycle), mock.patch.object(
+                state, "_read_execution_lease_locked", return_value=previous,
+            ), mock.patch.object(state, "_execution_process_exited", return_value=True), \
+                    mock.patch.object(state, "_atomic_write") as writer, \
+                    self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                self.real_publisher(
+                    "/fixture", self.lease, state._canonical(self.lease), recovery_registration=True,
+                )
+            writer.assert_not_called()
+
+    def test_old_kernel_childlessness_does_not_authorize_nonterminal_incident_succession(self):
+        previous = execution_lease(attempt="f" * 32, revision=3, lifecycle="drained")
+        previous["workers"] = [{"mode": "controller-worker", **previous["supervisor"]}]
+        worker = self.lease["worker"]
+        cutover = state.advance_state(self.current, "CUTOVER_POSSIBLE")
+        verifying = state.advance_state(cutover, "VERIFYING", containerId=digest("d"), configHash=digest("e"))
+        committing = state.advance_state(
+            verifying, "COMMITTING", commitWitnessDigest=digest("b"),
+            providerFinalizationDigest=digest("c"), commitSubstep="provider-cleanup",
+        )
+        states = [
+            self.current, cutover, verifying, committing,
+            state.advance_state(cutover, "ROLLING_BACK"),
+            state.advance_state(cutover, "RECOVERY_REQUIRED"),
+            state.advance_state(cutover, "FORWARD_RECOVERING"),
+        ]
+        for current in states:
+            with self.subTest(phase=current["phase"]), mock.patch.object(
+                state, "_read_execution_lease_locked", return_value=previous,
+            ), mock.patch.object(state, "_execution_process_exited", return_value=True), \
+                    mock.patch.object(state, "_execution_process_record", return_value=(
+                        worker["bootId"], worker["startTicks"], self.lease["supervisor"]["pid"],
+                    )), mock.patch.object(state, "_read_guard_locked", return_value=(self.origin, current)), \
+                    mock.patch.object(state, "_atomic_write") as writer, \
+                    self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                self.real_publisher(
+                    "/fixture", self.lease, state._canonical(self.lease), recovery_registration=True,
+                )
+            writer.assert_not_called()
 
     def test_registration_cannot_reconstruct_a_missing_owned_execution_lease(self):
         for attempt in (self.lease["attempt"], "f" * 32):
@@ -1930,7 +2049,11 @@ class TimepadStateTests(unittest.TestCase):
             root = pathlib.Path(parent) / "deploy"
             root.mkdir(mode=0o700)
             first = execution_lease()
-            with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True):
+            # Exercise filesystem sequencing independently of private publisher
+            # authentication, covered by LeasePublicationAuthorityTests and the
+            # actual Linux supervisor/worker fixtures.
+            with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True), \
+                    mock.patch.object(state, "_execution_lease_publication", return_value=nullcontext()):
                 with state.deploy_lock(root) as lock_fd:
                     os.set_inheritable(lock_fd, True)
                     lease_path = pathlib.Path(parent) / "lease.json"
@@ -1943,8 +2066,10 @@ class TimepadStateTests(unittest.TestCase):
                          "--deploy-lock-fd", str(lock_fd)],
                         capture_output=True, text=True, check=False, pass_fds=(lock_fd,),
                     )
-                    self.assertEqual(0, published.returncode, published.stderr)
-                    ack = json.loads(published.stdout)
+                    self.assertEqual(2, published.returncode, published.stderr)
+                    self.assertEqual("EXECUTION_LEASE_PUBLISHER_REQUIRED", published.stderr.strip())
+                    self.assertFalse((root / state.EXECUTION_LEASE_NAME).exists())
+                    ack = state.publish_execution_lease(root, first, deploy_lock_fd=lock_fd)
                     raw = (root / state.EXECUTION_LEASE_NAME).read_bytes()
                     self.assertEqual(0o600, (root / state.EXECUTION_LEASE_NAME).stat().st_mode & 0o777)
                     self.assertEqual(hashlib.sha256(raw).hexdigest(), ack["digest"])
@@ -1997,6 +2122,8 @@ class TimepadStateTests(unittest.TestCase):
             lease = execution_lease()
             with mock.patch.object(
                 state, "_execution_lease_supervisor_is_live", return_value=True,
+            ), mock.patch.object(
+                state, "_execution_lease_publication", return_value=nullcontext(),
             ), state.deploy_lock(root) as lock_fd:
                 os.set_inheritable(lock_fd, True)
                 state.publish_execution_lease(root, lease, deploy_lock_fd=lock_fd)
@@ -2084,7 +2211,8 @@ class TimepadStateTests(unittest.TestCase):
                 "schemaHistoryProvenance": True,
             }
             state.bootstrap_guard(root, authority=authority, observed=observed)
-            with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True):
+            with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True), \
+                    mock.patch.object(state, "_execution_lease_publication", return_value=nullcontext()):
                 with state.deploy_lock(root) as lock_fd:
                     os.set_inheritable(lock_fd, True)
                     state.publish_execution_lease(root, lease, deploy_lock_fd=lock_fd)

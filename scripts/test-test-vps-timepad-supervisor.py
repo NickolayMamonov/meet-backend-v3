@@ -610,6 +610,39 @@ supervisor_complete bootstrapped
                 self.assertEqual(result.stderr.splitlines(), events)
                 self.assertEqual(result.stdout, "")
 
+    def test_worker_exit_notifies_before_channel_close_preserves_status_and_never_runs_cleanup(self):
+        script = self.function("supervisor_cancel_exit") + r"""
+supervisor_client() {
+  printf '%s\n' "$*" >>"$trace"
+  [ "$fault" = none ]
+}
+complete_owned_child() { echo unexpected-reap; }
+dispatch_failure() { echo unexpected-rollback; }
+trace=$1
+fault=$2
+supervisor_cancel_exit "$3" "$4"
+"""
+        for status, reason, expected in (
+            (0, "EXIT", []), (1, "EXIT", ["cancel EXIT 1"]),
+            (86, "EXIT", ["cancel DRILL 86"]), (143, "TERM", ["cancel TERM 143"]),
+        ):
+            for fault in ("none", "revoked"):
+                with self.subTest(status=status, reason=reason, fault=fault), \
+                        tempfile.TemporaryDirectory() as directory:
+                    trace = Path(directory, "trace")
+                    result = self.shell(script, trace.as_posix(), fault, str(status), reason)
+                    self.assertEqual(status, result.returncode, result.stderr)
+                    self.assertEqual("", result.stdout + result.stderr)
+                    self.assertEqual(expected, trace.read_text().splitlines() if trace.exists() else [])
+
+        source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
+        private_entry = source[source.index('if [ -n "${TIMEPAD_WORKER_MODE:-}" ]; then'):]
+        self.assertLess(private_entry.index("trap 'supervisor_cancel_exit"),
+                        private_entry.index("supervisor_register_recovery"))
+        for handler in ("on_exit", "on_recovery_exit"):
+            body = source[source.index(handler + "() {"):].split("trap - EXIT", 1)[0]
+            self.assertIn('supervisor_cancel_exit "$status"', body)
+
     def test_provider_wait_binds_only_locking_helpers_to_attempt_and_grant(self):
         script = self.function("supervisor_timeout") + r"""
 provider_helper=/fixture/provider.py
@@ -1076,6 +1109,78 @@ class LinuxSupervisorTests(unittest.TestCase):
 
         result, _ = self.run_fixture(behavior)
         self.assertEqual((result["status"], result["reason"]), (0, "COMPLETED"))
+
+    def test_live_worker_cannot_fabricate_drained_or_foreign_lease_snapshots(self):
+        def behavior(client, directory, mode):
+            if mode != "controller-worker":
+                os._exit(5)
+            fixture_publish(client, directory)
+            client.request("arm")
+            fixture_publish(client, directory)
+            actual = client.request("lease")
+            path = Path(directory, state.EXECUTION_LEASE_NAME)
+            before = path.read_bytes()
+            for field, value in (
+                ("attempt", "f" * 32), ("revision", actual["revision"] + 1),
+                ("lifecycle", "drained"), ("worker", None),
+                ("workerMode", "rollback-worker"),
+            ):
+                try:
+                    state.publish_execution_lease(
+                        directory, {**actual, field: value}, deploy_lock_fd=9,
+                    )
+                except state.GuardError:
+                    if path.read_bytes() != before:
+                        os._exit(6)
+                else:
+                    os._exit(7)
+            Path(directory, "publisher-refusals").write_bytes(b"5")
+            fixture_terminal(client, directory, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = self.run_fixture(behavior, directory=directory)
+            self.assertEqual((result["status"], result["reason"]), (0, "COMPLETED"))
+            self.assertEqual(Path(directory, "publisher-refusals").read_bytes(), b"5")
+            self.assertIsNone(state._read_execution_lease_locked(directory)["worker"])
+
+    def test_cancellation_during_worker_lease_fsync_revokes_publication_before_rename(self):
+        def behavior(client, directory, mode):
+            if mode != "controller-worker":
+                fixture_publish(client, directory)
+                os._exit(1)  # No runtime-quiescence proof; preserve refusal.
+            fixture_publish(client, directory)
+            client.request("arm")
+            fixture_publish(client, directory)
+            snapshot = client.request("lease")
+            before = Path(directory, state.EXECUTION_LEASE_NAME).read_bytes()
+            client.request("grant", name="lease-publish", localNs=NS)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            original_fsync = state.os.fsync
+
+            def cancel_at_fsync(fd):
+                client.request("cancel", reason="EXIT", status=1)
+                original_fsync(fd)
+
+            try:
+                with mock.patch.object(state.os, "fsync", side_effect=cancel_at_fsync):
+                    state.publish_execution_lease(directory, snapshot, deploy_lock_fd=9)
+            except state.GuardError:
+                if Path(directory, state.EXECUTION_LEASE_NAME).read_bytes() != before:
+                    os._exit(6)
+                if any(path.name.startswith(".tmp-") for path in Path(directory).iterdir()):
+                    os._exit(7)
+                Path(directory, "revoked-before-rename").write_bytes(b"checked")
+                os._exit(0)
+            os._exit(8)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = self.run_fixture(behavior, directory=directory)
+            self.assertEqual((result["status"], result["reason"]), (1, "QUIESCENCE_UNCONFIRMED"))
+            self.assertEqual(Path(directory, "revoked-before-rename").read_bytes(), b"checked")
+            lease = state._read_execution_lease_locked(directory)
+            self.assertEqual("EXIT", lease["firstFailure"])
+            self.assertIsNotNone(lease["worker"])
+            self.assertNotEqual("drained", lease["lifecycle"])
 
     def test_state_helper_bootstrap_requires_actual_live_grant_and_rejects_completed_grant(self):
         def behavior(client, directory, mode):

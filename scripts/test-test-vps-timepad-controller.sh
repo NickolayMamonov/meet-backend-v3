@@ -103,6 +103,15 @@ assert_refusal() {
   else
     status=$?
   fi
+  if [ "$reason" = ROLLBACK_DRILL_UNSAFE ]; then
+    # The public relay deliberately exposes only its sanitized terminal
+    # classification when the private worker refuses before mutation.
+    [ "$status" -eq 1 ] &&
+      [ "$output" = "schema_guard=QUIESCENCE_UNCONFIRMED" ] || {
+      fail "controller refusal contract expected=sanitized-supervisor-refusal status=$status"
+    }
+    return
+  fi
   [ "$status" -eq 1 ] &&
     [ "$output" = "test VPS deployment failed: $reason" ] || {
     fail "controller refusal contract expected=$reason status=$status"

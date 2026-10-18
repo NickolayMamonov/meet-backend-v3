@@ -17,7 +17,10 @@ CLI mutation schemas:
   confirmation or success.
 * ``publish-lease --lease`` accepts the fixed supervisor lease snapshot only,
   publishes it atomically under inherited FD9, and returns its exact revision
-  and SHA-256 only after fsync and readback. A lease is never auto-cleared.
+  and SHA-256 only after fsync and readback. Each worker publication revalidates
+  the exact live private snapshot at durable-write boundaries; a live PID and
+  FD9 alone cannot fabricate a drained lease or authorize lease succession.
+  A lease is never auto-cleared.
   A drained snapshot with ``worker=null`` is published only by the supervisor's
   sole direct filesystem child after all original workers have exited. A new
   authenticated attempt can replace that completed lease only with intact
@@ -1382,21 +1385,80 @@ def _execution_process_exited(identity: Mapping[str, Any]) -> bool:
     return record is None or record[:2] != (identity["bootId"], identity["startTicks"])
 
 
-def _validate_childless_lease_publication(candidate: Mapping[str, Any]) -> None:
-    """Only the sole new direct helper can attest the post-worker ECHILD step."""
-    if candidate["worker"] is not None or candidate["lifecycle"] != "drained" or \
-            not candidate["workers"] or os.getppid() != candidate["supervisor"]["pid"]:
-        _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+def _validate_supervisor_lease_publisher(candidate: Mapping[str, Any]) -> None:
+    """Authenticate the sole post-ECHILD filesystem child, not a worker assertion."""
+    if not candidate["workers"] or os.getppid() != candidate["supervisor"]["pid"]:
+        _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
     if any(not _execution_process_exited(worker) for worker in candidate["workers"]):
-        _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+        _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
     parent = candidate["supervisor"]["pid"]
     try:
         with open(f"/proc/{parent}/task/{parent}/children", "rb") as stream:
             children = stream.read(8193)
         if len(children) > 8192 or children.split() != [str(os.getpid()).encode("ascii")]:
-            _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+            _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
     except OSError:
+        _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
+
+
+def _validate_childless_lease_publication(candidate: Mapping[str, Any]) -> None:
+    """Only the sole new direct helper can attest the post-worker ECHILD step."""
+    if candidate["worker"] is not None or candidate["lifecycle"] != "drained":
         _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+    try:
+        _validate_supervisor_lease_publisher(candidate)
+    except GuardError:
+        _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+
+
+@contextmanager
+def _execution_lease_publication(
+    root: str | os.PathLike[str], candidate: Mapping[str, Any],
+) -> Iterator[None]:
+    """Bind publication to the live private snapshot or the sole drained helper.
+
+    The supervisor's filesystem child publishes queued cancellation revisions
+    after ECHILD. Ordinary workers must instead fetch the identical current
+    snapshot over their private channel; cancellation revokes that channel.
+    Neither path interprets process exit as daemon-request quiescence.
+    """
+    from test_vps_timepad_supervisor import SupervisorError, WorkerClient
+
+    client = None
+    token = None
+    try:
+        if os.getppid() == candidate["supervisor"]["pid"] and candidate["workers"] and all(
+            _execution_process_exited(worker) for worker in candidate["workers"]
+        ):
+            def publisher_check() -> None:
+                _validate_supervisor_lease_publisher(candidate)
+        else:
+            client = WorkerClient(str(root))
+            if client.attempt != candidate["attempt"] or \
+                    client.supervisor != candidate["supervisor"] or \
+                    client.role != candidate["workerMode"] or candidate["worker"] is None:
+                _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
+
+            def publisher_check() -> None:
+                if client.request("lease") != candidate:
+                    _reject("EXECUTION_LEASE_SNAPSHOT_CONFLICT")
+
+        def check() -> None:
+            if not _execution_lease_supervisor_is_live(candidate):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            publisher_check()
+
+        token = _EXECUTION_CHECK.set(check)
+        check()
+        yield
+        check()
+    except SupervisorError:
+        _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
+    finally:
+        if token is not None:
+            _EXECUTION_CHECK.reset(token)
+        if client is not None:
+            client.close()
 
 
 def _validate_terminal_lease_successor(
@@ -1543,7 +1605,7 @@ def publish_execution_lease(
         raw = _canonical(candidate)
     if len(raw) > MAX_EXECUTION_LEASE_BYTES:
         _reject("INPUT_TOO_LARGE")
-    with deploy_lock(root, deploy_lock_fd):
+    with deploy_lock(root, deploy_lock_fd), _execution_lease_publication(root, candidate):
         return _publish_execution_lease_locked(root, candidate, raw)
 
 
