@@ -807,6 +807,7 @@ recovery_retry_runtime_refusal() {
 supervisor_register_recovery() {
   local grant grant_id deadline publication lease_revision digest
   local current container inspection global_ids compose_ids runtime_evidence=
+  local registration_result
   local -a evidence_args=()
   grant=$(supervisor_client grant recovery-registration 30) || return 1
   grant_id=$(jq -er '.grantId | strings' <<<"$grant") || return 1
@@ -845,13 +846,20 @@ supervisor_register_recovery() {
     ') || return 1
     evidence_args=(--runtime-evidence)
   fi
-  publication=$(command timeout 30s python3 "$timepad_helper" register-recovery \
+  registration_result=$(command timeout 30s python3 "$timepad_helper" register-recovery \
     --root "$state_root" --contract "$timepad_contract" --deploy-lock-fd 9 \
     --run-id "$recovery_run_key" --incident-id "${recovery_incident,,}" \
     --epoch "$recovery_epoch" --binding-digest "$recovery_binding_digest" \
     --repository-digest "${image##*@sha256:}" --revision "$revision" --version "$version" \
     --execution-attempt "$TIMEPAD_ATTEMPT" --execution-grant "$grant_id" \
-    --deadline-ns "$deadline" "${evidence_args[@]}" <<<"$runtime_evidence") || return 1
+    --deadline-ns "$deadline" "${evidence_args[@]}" <<<"$runtime_evidence" 2>&1) || {
+      if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] &&
+        [[ "$registration_result" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+        echo "fixture_timepad_guard=$registration_result" >&2
+      fi
+      return 1
+    }
+  publication=$registration_result
   jq -e --arg attempt "$TIMEPAD_ATTEMPT" '
     .attempt == $attempt and .revision == 0 and
     (.digest | type == "string" and test("^[a-f0-9]{64}$"))

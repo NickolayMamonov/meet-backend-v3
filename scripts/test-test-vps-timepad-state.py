@@ -2427,6 +2427,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "TIMEPAD_FIXTURE_CASE": str(case),
                     "TIMEPAD_FIXTURE_ADAPTER_DIR": str(ROOT / "fixtures/timepad-controller"),
                     "TIMEPAD_FIXTURE_DOCKER_LOG": str(case / "docker.log"),
+                    "TIMEPAD_FIXTURE_DIAGNOSTICS": "1",
                     "TEST_VPS_STATE_ROOT": str(state_root),
                 })
                 if fault == "stop-fails":
@@ -2593,6 +2594,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "TIMEPAD_FIXTURE_CASE": str(case),
                     "TIMEPAD_FIXTURE_ADAPTER_DIR": str(ROOT / "fixtures/timepad-controller"),
                     "TIMEPAD_FIXTURE_DOCKER_LOG": str(case / "docker.log"),
+                    "TIMEPAD_FIXTURE_DIAGNOSTICS": "1",
                     "TEST_VPS_STATE_ROOT": str(state_root),
                 })
                 before = (current_path.read_bytes(), lease_path.read_bytes())
