@@ -1801,11 +1801,12 @@ class ExecutionInterlockTests(unittest.TestCase):
         now = time.monotonic_ns()
         args = helper._parser().parse_args([
             "prepare", "--deploy-lock-fd", "9", "--execution-attempt", "a" * 32,
+            "--execution-grant", "b" * 32,
             "--deadline-ns", str(now + 10_000_000_000),
         ])
         lease = {
             "attempt": "a" * 32, "lifecycle": "armed", "workEndNs": now + 20_000_000_000,
-            "workerMode": "controller-worker",
+            "workerMode": "controller-worker", "firstFailure": None,
         }
         with (
             mock.patch.object(helper.os, "stat"),
@@ -1816,6 +1817,7 @@ class ExecutionInterlockTests(unittest.TestCase):
             check.assert_called_once_with(args.state_root, attempt="a" * 32, deploy_lock_fd=9)
             for field, replacement in (
                 ("deploy_lock_fd", None), ("execution_attempt", None),
+                ("execution_grant", None),
                 ("deadline_ns", None), ("deadline_ns", now + 21_000_000_000),
             ):
                 changed = helper._parser().parse_args(["prepare"])
@@ -1833,6 +1835,47 @@ class ExecutionInterlockTests(unittest.TestCase):
             check.side_effect = module.GuardError("EXECUTION_LEASE_UNRESOLVED")
             with self.assertRaises(helper.ProviderError):
                 helper._execution_interlock(args, 9)
+
+    def test_grant_bundle_is_exact_and_rejected_before_lock_or_root_creation(self) -> None:
+        valid = [
+            "--execution-attempt", "a" * 32, "--execution-grant", "b" * 32,
+            "--deadline-ns", str(time.monotonic_ns() + 10_000_000_000),
+        ]
+        for options in (
+            valid[:2], valid[2:4], valid[4:], valid[:4],
+            valid[:2] + valid[4:], valid[2:],
+            ["--execution-attempt", "../escape"] + valid[2:],
+            valid[:2] + ["--execution-grant", "B" * 32] + valid[4:],
+            valid[:4] + ["--deadline-ns", str(1 << 63)],
+        ):
+            with (
+                self.subTest(options=options),
+                mock.patch.object(helper, "_deploy_lock") as lock,
+                mock.patch.object(helper, "_dispatch") as dispatch,
+                contextlib.redirect_stderr(io.StringIO()) as error,
+            ):
+                self.assertEqual(1, helper.main(["state-publish"] + options))
+            self.assertEqual("RECOVERY_REQUIRED\n", error.getvalue())
+            lock.assert_not_called()
+            dispatch.assert_not_called()
+        for command in ("check", "check-image", "observe"):
+            with (
+                self.subTest(command=command),
+                mock.patch.object(helper, "_dispatch") as dispatch,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(1, helper.main([command] + valid))
+            dispatch.assert_not_called()
+
+    def test_no_lease_preserves_public_api_but_cannot_accept_a_grant(self) -> None:
+        args = helper._parser().parse_args(["prepare"])
+        with mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError):
+            self.assertIsNone(helper._execution_interlock(args, 9))
+            args.execution_attempt, args.execution_grant = "a" * 32, "b" * 32
+            args.deadline_ns = time.monotonic_ns() + 10_000_000_000
+            with self.assertRaises(helper.ProviderError):
+                helper._execution_interlock(args, 9)
+        self.assertIsNone(helper._EXECUTION_CHECK.get())
 
     def test_deadline_never_resets_nested_budget_or_launches_expired_work(self) -> None:
         with mock.patch.object(helper.time, "monotonic_ns", return_value=100):
@@ -1887,6 +1930,402 @@ class ExecutionInterlockTests(unittest.TestCase):
             self.assertRaises(helper.ProviderError),
         ):
             helper._timepad_publication_guard("/state")
+
+
+class ProviderLiveGrantTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import test_vps_timepad_supervisor
+
+        self.supervisor = test_vps_timepad_supervisor
+        self.module = helper._timepad_state_module()
+        self.args = helper._parser().parse_args([
+            "prepare", "--deploy-lock-fd", "9", "--execution-attempt", "a" * 32,
+            "--execution-grant", "b" * 32, "--deadline-ns", "200",
+        ])
+        self.lease = {
+            "attempt": self.args.execution_attempt, "workerMode": "controller-worker",
+            "lifecycle": "armed", "workEndNs": 300, "hardEndNs": 400,
+            "supervisor": {"pid": 101, "startTicks": 10, "bootId": "fixture"},
+            "operation": "deploy", "firstFailure": None, "rollbackIssued": False,
+        }
+        self.client = mock.Mock(
+            attempt=self.args.execution_attempt, role=self.lease["workerMode"],
+            supervisor=self.lease["supervisor"],
+        )
+        self.reply = {
+            "attempt": self.args.execution_attempt, "grantId": self.args.execution_grant,
+            "endNs": self.args.deadline_ns, "role": self.lease["workerMode"],
+            "name": "provider",
+        }
+        self.client.request.return_value = self.reply
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(helper.time, "monotonic_ns", return_value=100))
+        self.stack.enter_context(mock.patch.object(helper.os, "stat"))
+        self.stack.enter_context(mock.patch.object(
+            self.module, "_read_execution_lease_locked", side_effect=lambda root: self.lease,
+        ))
+        self.stack.enter_context(mock.patch.object(self.module, "check_execution_lease"))
+        self.factory = self.stack.enter_context(mock.patch.object(
+            self.supervisor, "WorkerClient", return_value=self.client,
+        ))
+
+    @contextlib.contextmanager
+    def authority(self):
+        with helper._operation_deadline(self.args.deadline_ns):
+            lease = helper._execution_interlock(self.args, 9)
+            with helper._execution_mutation(self.args, lease):
+                yield
+
+    def revoke(self, *args, **kwargs):
+        self.client.request.side_effect = self.supervisor.SupervisorError("private-canary")
+
+    def test_live_grant_is_checked_at_entry_each_boundary_and_exit_without_renewal(self) -> None:
+        with self.authority():
+            for _ in range(3):
+                helper._deadline_check()
+        self.assertEqual(5, self.client.request.call_count)
+        self.assertEqual([mock.call(
+            "validate-grant", grantId="b" * 32, endNs=200,
+        )] * 5, self.client.request.call_args_list)
+        self.factory.assert_called_once_with(self.args.state_root)
+        self.client.close.assert_called_once()
+        self.assertIsNone(helper._EXECUTION_CHECK.get())
+        self.assertIsNone(helper._DEADLINE_NS.get())
+
+    def test_stale_durable_lease_cannot_publish_after_live_revocation(self) -> None:
+        with (
+            mock.patch.object(helper.os, "open") as opened,
+            mock.patch.object(helper.os, "write") as written,
+            mock.patch.object(helper, "_check_ancestors"),
+            self.assertRaises(helper.ProviderError) as error,
+        ):
+            with self.authority():
+                self.revoke()
+                helper._write_private("/private/output", b"fixture", 0o600)
+        self.assertEqual("RECOVERY_REQUIRED", error.exception.category)
+        opened.assert_not_called()
+        written.assert_not_called()
+        self.assertEqual("armed", self.lease["lifecycle"])
+        self.client.close.assert_called_once()
+        self.assertIsNone(helper._EXECUTION_CHECK.get())
+
+    def test_mismatched_live_identity_and_every_grant_binding_refuse(self) -> None:
+        for field, replacement in (
+            ("attempt", "c" * 32), ("role", "rollback-worker"),
+            ("supervisor", {"pid": 999}),
+        ):
+            original = getattr(self.client, field)
+            setattr(self.client, field, replacement)
+            with self.subTest(identity=field), self.assertRaises(helper.ProviderError):
+                with self.authority():
+                    self.fail("mismatched private identity entered")
+            setattr(self.client, field, original)
+        for field, replacement in (
+            ("attempt", "c" * 32), ("grantId", "c" * 32), ("endNs", 201),
+            ("role", "rollback-worker"), ("name", "state-publish"), ("extra", True),
+        ):
+            self.client.request.return_value = dict(self.reply, **{field: replacement})
+            with self.subTest(binding=field), self.assertRaises(helper.ProviderError):
+                with self.authority():
+                    self.fail("mismatched live grant entered")
+        self.assertIsNone(helper._EXECUTION_CHECK.get())
+
+    def test_refused_private_channel_and_deadline_crossing_are_fixed_failures(self) -> None:
+        self.factory.side_effect = self.supervisor.SupervisorError("private-canary")
+        with self.assertRaises(helper.ProviderError) as error:
+            with self.authority():
+                self.fail("missing private channel entered")
+        self.assertEqual("RECOVERY_REQUIRED", error.exception.category)
+        self.factory.side_effect = None
+
+        def expiry(*args, **kwargs):
+            helper.time.monotonic_ns.return_value = 200
+            return self.reply
+
+        self.client.request.side_effect = expiry
+        with self.assertRaises(helper.ProviderError):
+            with self.authority():
+                self.fail("reply past absolute deadline entered")
+        self.client.close.assert_called_once()
+        self.assertIsNone(helper._EXECUTION_CHECK.get())
+
+    def test_registered_budget_is_not_reset_and_cleanup_reserve_is_never_provider_work(self) -> None:
+        self.lease.update(lifecycle="registered", workEndNs=None)
+        with self.authority():
+            self.assertEqual(200, helper._DEADLINE_NS.get())
+        for changes in (
+            {"lifecycle": "armed", "workEndNs": 199},
+            {"lifecycle": "draining", "workEndNs": 199, "workerMode": "fail-closed-worker"},
+            {"lifecycle": "armed", "workEndNs": 300, "firstFailure": "TERM"},
+            {"lifecycle": "rolling-back", "workEndNs": 300, "workerMode": "controller-worker"},
+        ):
+            self.lease.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(helper.ProviderError):
+                with self.authority():
+                    self.fail("reserve/cancelled authority entered")
+
+    def test_rollback_admission_stays_read_only_and_admitted_rollback_uses_its_own_grant(self) -> None:
+        self.lease.update(
+            workerMode="rollback-worker", lifecycle="rollback-admission",
+            firstFailure="TERM", rollbackIssued=True,
+        )
+        self.client.role = self.reply["role"] = "rollback-worker"
+        self.reply["name"] = "rollback-admission"
+        for command in ("verify", "live-resume", "absence-resume"):
+            self.args.command = command
+            with self.subTest(command=command), self.authority():
+                helper._deadline_check()
+        for command in ("prepare", "finish", "state-publish", "prepare-finalization",
+                        "finish-committed-resume", "prepare-transition-proof", "retention-delete"):
+            self.args.command = command
+            with self.subTest(command=command), self.assertRaises(helper.ProviderError):
+                with self.authority():
+                    self.fail("read-only admission authorized mutation")
+        self.lease["lifecycle"] = "rolling-back"
+        self.args.command = "finish"
+        self.reply["name"] = "provider"
+        with self.authority():
+            helper._deadline_check()
+        for changes in ({"operation": "forward-recover"}, {"rollbackIssued": False}):
+            self.lease.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(helper.ProviderError):
+                with self.authority():
+                    self.fail("unadmitted rollback entered")
+
+    def test_retention_worker_only_has_existing_retention_commands(self) -> None:
+        self.lease.update(workerMode="retention-worker", operation="retention")
+        self.client.role = self.reply["role"] = "retention-worker"
+        for command in ("retention-list", "retention-check", "retention-delete"):
+            self.args.command = command
+            with self.subTest(command=command), self.authority():
+                helper._deadline_check()
+        self.args.command = "prepare"
+        with self.assertRaises(helper.ProviderError):
+            with self.authority():
+                self.fail("retention authorized provider preparation")
+
+    def test_all_dispatched_commands_require_live_grant_before_dispatch(self) -> None:
+        @contextlib.contextmanager
+        def locked(*args, **kwargs):
+            self.assertFalse(kwargs["create_state_root"])
+            yield 9
+
+        for command in (
+            "prepare", "verify", "finish", "prepare-finalization", "finish-committed-resume",
+            "live-resume", "absence-resume", "prepare-transition-proof", "state-publish",
+            "retention-list", "retention-check", "retention-delete",
+        ):
+            options = [
+                command, "--deploy-lock-fd", "9", "--execution-attempt", "a" * 32,
+                "--execution-grant", "b" * 32, "--deadline-ns", "200",
+            ]
+            for revoked in (False, True):
+                self.client.request.side_effect = (
+                    self.supervisor.SupervisorError("private-canary") if revoked else None
+                )
+                with (
+                    self.subTest(command=command, revoked=revoked),
+                    mock.patch.object(helper, "_deploy_lock", locked),
+                    mock.patch.object(helper, "_dispatch") as dispatch,
+                    contextlib.redirect_stderr(io.StringIO()) as error,
+                ):
+                    self.assertEqual(1 if revoked else 0, helper.main(options))
+                if revoked:
+                    dispatch.assert_not_called()
+                    self.assertEqual("RECOVERY_REQUIRED\n", error.getvalue())
+                else:
+                    dispatch.assert_called_once()
+                self.assertIsNone(helper._EXECUTION_CHECK.get())
+
+    def test_no_success_output_after_revocation_and_context_closes_after_failure(self) -> None:
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            self.assertRaises(helper.ProviderError),
+        ):
+            with self.authority():
+                self.revoke()
+                helper._result(False, False, False, "committed")
+        self.assertEqual("", output.getvalue())
+        self.client.close.assert_called_once()
+        self.assertIsNone(helper._EXECUTION_CHECK.get())
+
+    def test_private_writes_recheck_between_each_syscall_and_never_resume_after_revocation(self) -> None:
+        for descriptor_relative in (False, True):
+            for stop in ("open", "write", "fsync", "fchown", "fchmod", "acl"):
+                events = []
+                self.client.request.side_effect = None
+
+                def boundary(name, result=None):
+                    def invoke(*args, **kwargs):
+                        events.append(name)
+                        if name == stop:
+                            self.revoke()
+                        return result
+                    return invoke
+
+                with self.subTest(relative=descriptor_relative, stop=stop), contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.multiple(
+                        helper.os, O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+                    ))
+                    stack.enter_context(mock.patch.object(helper, "_check_ancestors"))
+                    stack.enter_context(mock.patch.object(helper.os, "open", side_effect=boundary("open", 12)))
+                    stack.enter_context(mock.patch.object(helper.os, "close", side_effect=boundary("close")))
+                    stack.enter_context(mock.patch.object(helper.os, "write", side_effect=boundary("write", 7)))
+                    for name in ("fsync", "fchown", "fchmod"):
+                        stack.enter_context(mock.patch.object(
+                            helper.os, name, side_effect=boundary(name), create=True,
+                        ))
+                    stack.enter_context(mock.patch.object(helper, "_acl_is_safe", side_effect=boundary("acl")))
+                    with self.assertRaises(helper.ProviderError):
+                        with self.authority():
+                            if descriptor_relative:
+                                helper._write_private_at(11, "snapshot", b"fixture", 0o600)
+                            else:
+                                helper._write_private("/private/snapshot", b"fixture", 0o600)
+                order = ["open", "write", "fsync", "fchown", "fchmod", "acl"]
+                self.assertEqual(order[:order.index(stop) + 1] + ["close"], events)
+
+    def test_pipe_wait_polls_live_revocation_and_checks_again_before_read(self) -> None:
+        stream = mock.Mock()
+        stream.buffer.fileno.return_value = 12
+        info = mock.Mock(st_mode=stat.S_IFIFO)
+        for readable in (False, True):
+            self.client.request.side_effect = None
+
+            def waiting(read, write, error, seconds):
+                self.assertLessEqual(seconds, 0.1)
+                self.revoke()
+                return ([12] if readable else [], [], [])
+
+            with (
+                self.subTest(readable=readable),
+                mock.patch.object(helper.sys, "stdin", stream),
+                mock.patch.object(helper.os, "fstat", return_value=info),
+                mock.patch.object(helper.select, "select", side_effect=waiting) as poll,
+                mock.patch.object(helper.os, "read") as read,
+                self.assertRaises(helper.ProviderError),
+            ):
+                with self.authority():
+                    helper._bounded_stdin(4096)
+            poll.assert_called_once()
+            read.assert_not_called()
+
+    def test_rename_revalidates_after_boundary_before_calling_libc(self) -> None:
+        renameat2 = mock.Mock(return_value=0)
+        with (
+            mock.patch.object(helper, "_rename_noreplace_boundary", side_effect=self.revoke),
+            mock.patch.object(helper.ctypes, "CDLL", return_value=mock.Mock(renameat2=renameat2)),
+            self.assertRaises(helper.ProviderError),
+        ):
+            with self.authority():
+                helper._rename_noreplace(11, "temporary", "published")
+        renameat2.assert_not_called()
+
+    def test_terminal_publication_cannot_rename_after_revoked_temporary_write(self) -> None:
+        for publish in (helper._publish_terminal_record, helper._publish_finalization_terminal):
+            self.client.request.side_effect = None
+            with (
+                self.subTest(publish=publish.__name__),
+                self.assertRaises(helper.ProviderError),
+                self.authority(),
+                mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError),
+                mock.patch.object(helper, "_write_private_at", side_effect=self.revoke),
+                mock.patch.object(helper.ctypes, "CDLL") as libc,
+                mock.patch.object(helper.os, "fsync") as fsync,
+            ):
+                publish(11, finalization_witness())
+            libc.assert_not_called()
+            fsync.assert_not_called()
+
+    def test_pointer_removal_revalidates_after_identity_read_and_before_directory_fsync(self) -> None:
+        witness = finalization_witness()
+        info = mock.Mock(
+            st_dev=1, st_ino=2, st_uid=0, st_mode=stat.S_IFREG | 0o600,
+            st_nlink=1, st_mtime_ns=3, st_ctime_ns=4,
+        )
+        for remove in (helper._unlink_finalizing_pointer, helper._remove_finalizing_pointer):
+            for stop in ("stat", "unlink"):
+                self.client.request.side_effect = None
+                reads = 0
+
+                def pointer_stat(name, **kwargs):
+                    nonlocal reads
+                    if name == ".provider-transaction.current":
+                        reads += 1
+                        if reads == 2 and stop == "stat":
+                            self.revoke()
+                    return info
+
+                with self.subTest(remove=remove.__name__, stop=stop), contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.multiple(
+                        helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                        O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+                    ))
+                    stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
+                    stack.enter_context(mock.patch.object(helper.os, "open", return_value=11))
+                    stack.enter_context(mock.patch.object(helper.os, "close"))
+                    stack.enter_context(mock.patch.object(helper.os, "stat", side_effect=pointer_stat))
+                    stack.enter_context(mock.patch.object(helper.os, "fstat", return_value=info))
+                    stack.enter_context(mock.patch.object(helper, "_marker", return_value=witness["pointer"]))
+                    stack.enter_context(mock.patch.object(
+                        helper, "_open_private_state_file_at",
+                        return_value=(12, info, json.dumps(witness["pointer"]).encode()),
+                    ))
+                    unlink = stack.enter_context(mock.patch.object(helper.os, "unlink", side_effect=self.revoke))
+                    fsync = stack.enter_context(mock.patch.object(helper.os, "fsync"))
+                    with self.assertRaises(helper.ProviderError):
+                        with self.authority():
+                            remove("/state", witness["runKey"], witness)
+                self.assertEqual(int(stop == "unlink"), unlink.call_count)
+                fsync.assert_not_called()
+
+    def test_quarantine_resume_revalidates_before_unlink_and_fsync(self) -> None:
+        data = b"synthetic fixture"
+        record = dict(
+            finalization_witness(True)["transaction"]["entries"][0]["identity"],
+            sha256=helper._finalization_digest(data),
+        )
+        info = mock.Mock(
+            st_dev=record["device"], st_ino=record["inode"], st_uid=record["uid"],
+            st_gid=record["gid"], st_mode=stat.S_IFREG | record["mode"],
+            st_size=record["size"], st_mtime_ns=record["mtimeNs"], st_nlink=1,
+        )
+        entry = {
+            "name": "identity.json", "quarantineName": ".provider-cleanup-fixture",
+            "identity": record,
+        }
+        for stop in ("read", "unlink"):
+            self.client.request.side_effect = None
+
+            def file_stat(name, **kwargs):
+                if name == entry["name"]:
+                    raise FileNotFoundError
+                return info
+
+            def read(*args, **kwargs):
+                if stop == "read":
+                    self.revoke()
+                return data
+
+            with self.subTest(stop=stop), contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.multiple(
+                    helper.os, O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0),
+                    O_NONBLOCK=getattr(os, "O_NONBLOCK", 0), create=True,
+                ))
+                stack.enter_context(mock.patch.object(helper.os, "stat", side_effect=file_stat))
+                stack.enter_context(mock.patch.object(helper.os, "fstat", return_value=info))
+                stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+                stack.enter_context(mock.patch.object(helper.os, "close"))
+                stack.enter_context(mock.patch.object(helper, "_acl_is_safe"))
+                stack.enter_context(mock.patch.object(helper, "_read_fd_bounded", side_effect=read))
+                unlink = stack.enter_context(mock.patch.object(helper.os, "unlink", side_effect=self.revoke))
+                fsync = stack.enter_context(mock.patch.object(helper.os, "fsync"))
+                with self.assertRaises(helper.ProviderError):
+                    with self.authority():
+                        helper._resume_quarantined_child(11, entry, link_count=1)
+            self.assertEqual(int(stop == "unlink"), unlink.call_count)
+            fsync.assert_not_called()
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux descriptor semantics")

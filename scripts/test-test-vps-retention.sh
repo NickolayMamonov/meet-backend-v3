@@ -585,7 +585,9 @@ rm -r -- "$unresolved_state"
 
 hard_state="$state_root/18-1-final-deploy"
 fixture_install_dir 700 "$hard_state"
-hard_witness="$fixture_root/operator-owned-terminal.json"
+# The isolated /tmp and /var/lib mounts are distinct filesystems. Keep this
+# external link outside the retained state, in a fixture-owned /var/lib root.
+hard_witness="$production_root/operator-owned-terminal.json"
 fixture_write "$hard_witness" 600 <<'EOF'
 {"schemaVersion":1,"runKey":"18-1","outcome":"committed","providerEnabled":false}
 EOF

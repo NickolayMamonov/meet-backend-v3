@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Private, fail-closed Firebase credential reconciliation for the release lane.
 
-This module deliberately has no network, Docker, shell, or environment mutation
+This module deliberately has no external network, Docker, shell, or environment mutation
 capability.  Bash owns deployment ordering and recovery; this process only
 validates bounded private observations and performs the fixed-path credential
 transaction.
+
+Controller-dispatched operations bind --execution-attempt, --execution-grant
+and --deadline-ns to the inherited private supervisor channel. The durable
+lease and deploy lock do not replace live revocation checks at mutation/wait
+boundaries. Direct public operations without a lease retain their ordinary API.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ import select
 import stat
 import sys
 import time
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 try:
     import fcntl
@@ -55,6 +60,9 @@ PREPARED_INPUT_SCHEMA = "meet-backend/test-vps-timepad-prepared-input/v1"
 PREPARED_SCHEMA = "meet-backend/test-vps-timepad-prepared/v1"
 _DEADLINE_NS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "provider_deadline_ns", default=None
+)
+_EXECUTION_CHECK: contextvars.ContextVar[Callable[[], None] | None] = contextvars.ContextVar(
+    "provider_execution_check", default=None
 )
 MAX_LIVE_RESUME_BYTES = MAX_INSPECTION_BYTES + 32768
 STATE_KINDS = frozenset(("final-deploy", "rollback-drill"))
@@ -106,6 +114,9 @@ def _deadline_check() -> None:
     deadline = _DEADLINE_NS.get()
     if deadline is not None and time.monotonic_ns() >= deadline:
         _fail("recovery")
+    check = _EXECUTION_CHECK.get()
+    if check is not None:
+        check()
 
 
 @contextlib.contextmanager
@@ -137,16 +148,33 @@ def _lock_directory(fd: int) -> None:
         _fail("recovery")
 
 
-def _execution_interlock(args: argparse.Namespace, lock_fd: int) -> None:
+def _validate_execution_arguments(args: argparse.Namespace) -> bool:
+    values = (args.execution_attempt, args.execution_grant, args.deadline_ns)
+    supplied = any(value is not None for value in values)
+    if supplied and (
+        any(value is None for value in values)
+        or any(
+            not isinstance(value, str) or re.fullmatch(r"[a-f0-9]{32}", value) is None
+            for value in values[:2]
+        )
+        or type(args.deadline_ns) is not int
+        or not 0 < args.deadline_ns < 1 << 63
+    ):
+        _fail("recovery")
+    return supplied
+
+
+def _execution_interlock(args: argparse.Namespace, lock_fd: int) -> dict[str, Any] | None:
     """An inherited lock is necessary, but not sufficient, to reuse a lease."""
     _deadline_check()
+    supplied = _validate_execution_arguments(args)
     try:
         os.stat(
             os.path.join(args.state_root, ".timepad-execution.json"),
             follow_symlinks=False,
         )
     except FileNotFoundError:
-        if args.execution_attempt is not None or args.deadline_ns is not None:
+        if supplied:
             _fail("recovery")
         return
     module = _timepad_state_module()
@@ -157,6 +185,7 @@ def _execution_interlock(args: argparse.Namespace, lock_fd: int) -> None:
         if (
             args.deploy_lock_fd is None
             or args.execution_attempt is None
+            or args.execution_grant is None
             or args.deadline_ns is None
         ):
             _fail("recovery")
@@ -175,11 +204,83 @@ def _execution_interlock(args: argparse.Namespace, lock_fd: int) -> None:
             "verify", "live-resume", "absence-resume",
         }:
             _fail("recovery")
-        if lease["workerMode"] == "fail-closed-worker":
+        role = lease["workerMode"]
+        if (
+            role == "controller-worker" and (
+                lease["lifecycle"] not in {"registered", "armed"}
+                or lease["firstFailure"] is not None
+            )
+            or role == "rollback-worker" and (
+                lease["operation"] != "deploy" or not lease["rollbackIssued"]
+                or lease["lifecycle"] not in {"rollback-admission", "rolling-back"}
+            )
+            or role == "retention-worker" and (
+                lease["operation"] != "retention"
+                or lease["lifecycle"] not in {"registered", "armed"}
+                or lease["firstFailure"] is not None
+                or args.command not in {"retention-list", "retention-check", "retention-delete"}
+            )
+            or role not in {"controller-worker", "rollback-worker", "retention-worker"}
+        ):
             _fail("recovery")
     except (module.GuardError, OSError, ValueError, TypeError, KeyError):
         _fail("recovery")
     _deadline_check()
+    return lease
+
+
+@contextlib.contextmanager
+def _execution_mutation(
+    args: argparse.Namespace, lease: dict[str, Any] | None,
+) -> Iterator[None]:
+    """Keep the private grant authoritative at every mutation and bounded wait."""
+    if lease is None:
+        yield
+        return
+    from test_vps_timepad_supervisor import SupervisorError, WorkerClient
+
+    client = None
+    token = None
+    try:
+        client = WorkerClient(args.state_root)
+        role = lease["workerMode"]
+        if (
+            client.attempt != args.execution_attempt
+            or client.attempt != lease["attempt"]
+            or client.role != role
+            or client.supervisor != lease["supervisor"]
+        ):
+            _fail("recovery")
+        expected_name = (
+            "rollback-admission" if lease["lifecycle"] == "rollback-admission"
+            else "provider"
+        )
+
+        def check() -> None:
+            if time.monotonic_ns() >= args.deadline_ns:
+                _fail("recovery")
+            response = client.request(
+                "validate-grant", grantId=args.execution_grant, endNs=args.deadline_ns,
+            )
+            if response != {
+                "attempt": args.execution_attempt, "grantId": args.execution_grant,
+                "endNs": args.deadline_ns, "role": role, "name": expected_name,
+            }:
+                _fail("recovery")
+            if time.monotonic_ns() >= args.deadline_ns:
+                _fail("recovery")
+
+        token = _EXECUTION_CHECK.set(check)
+        _deadline_check()
+        yield
+        _deadline_check()
+    except SupervisorError:
+        _fail("recovery")
+    finally:
+        if token is not None:
+            _EXECUTION_CHECK.reset(token)
+        if client is not None:
+            client.close()
 
 
 @contextlib.contextmanager
@@ -206,6 +307,7 @@ def _deploy_lock(
         _validate_retention_state_root_fd(root_fd)
         if owns_fd:
             try:
+                _deadline_check()
                 lock_fd = os.open(
                     ".deploy.lock",
                     os.O_RDWR
@@ -216,7 +318,9 @@ def _deploy_lock(
                     0o600,
                     dir_fd=root_fd,
                 )
+                _deadline_check()
                 os.fsync(lock_fd)
+                _deadline_check()
                 os.fsync(root_fd)
             except FileExistsError:
                 try:
@@ -290,9 +394,12 @@ def _bounded_stdin(limit: int) -> bytes:
         while len(chunks) <= limit:
             _deadline_check()
             if not regular and not select.select(
-                [fd], [], [], max(0, (deadline - time.monotonic_ns()) / 1_000_000_000),
+                [fd], [], [], min(
+                    0.1, max(0, (deadline - time.monotonic_ns()) / 1_000_000_000),
+                ),
             )[0]:
-                _fail("recovery")
+                continue
+            _deadline_check()
             chunk = os.read(fd, min(65536, limit + 1 - len(chunks)))
             if not chunk:
                 break
@@ -1507,6 +1614,7 @@ def _store_finalization_witness(run_fd: int, data: bytes) -> None:
         _fail("recovery")
     _write_private_at(run_fd, temporary, data, 0o600)
     _rename_noreplace(run_fd, temporary, name)
+    _deadline_check()
     os.fsync(run_fd)
 
 
@@ -1733,6 +1841,7 @@ def _resume_quarantined_child(
             _fail("recovery")
         _deadline_check()
         os.unlink(quarantine_name, dir_fd=directory_fd)
+        _deadline_check()
         os.fsync(directory_fd)
     finally:
         os.close(fd)
@@ -1845,6 +1954,7 @@ def _cleanup_transaction_from_witness(
                         ),
                     )
                     names.remove(original)
+                    _deadline_check()
                     os.fsync(tx_fd)
                 else:
                     _fail("recovery")
@@ -1855,7 +1965,9 @@ def _cleanup_transaction_from_witness(
         current_tx = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_inode(current_tx, tx_info):
             _fail("recovery")
+        _deadline_check()
         os.rmdir(name, dir_fd=parent_fd)
+        _deadline_check()
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
@@ -1910,6 +2022,7 @@ def _publish_terminal_record(run_fd: int, witness: dict[str, Any]) -> None:
             _fail("recovery")
         _write_private_at(run_fd, temporary, expected, 0o600)
         _rename_noreplace(run_fd, temporary, "terminal.json")
+        _deadline_check()
         os.fsync(run_fd)
         return
     except OSError:
@@ -1977,7 +2090,9 @@ def _unlink_finalizing_pointer(
                 or _identity(final) != _identity(os.fstat(pointer_fd))
             ):
                 _fail("recovery")
+            _deadline_check()
             os.unlink(".provider-transaction.current", dir_fd=root_fd)
+            _deadline_check()
             os.fsync(root_fd)
         finally:
             os.close(pointer_fd)
@@ -2180,13 +2295,16 @@ def _finalize_tx_residual(
                         entry["identity"]
                     ),
                 )
+                _deadline_check()
                 os.fsync(tx_fd)
         finally:
             os.close(tx_fd)
         final_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_inode(final_info, tx_info):
             _fail("recovery")
+        _deadline_check()
         os.rmdir(name, dir_fd=parent_fd)
+        _deadline_check()
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
@@ -2245,6 +2363,7 @@ def _publish_finalization_terminal(
             _fail("recovery")
         _write_private_at(run_fd, temporary, expected, 0o600)
         _rename_noreplace(run_fd, temporary, "terminal.json")
+        _deadline_check()
         os.fsync(run_fd)
         return
     except OSError:
@@ -2341,7 +2460,9 @@ def _remove_finalizing_pointer(
                 or _identity(latest_path) != _identity(os.fstat(fd))
             ):
                 _fail("recovery")
+            _deadline_check()
             os.unlink(".provider-transaction.current", dir_fd=root_fd)
+            _deadline_check()
             os.fsync(root_fd)
         finally:
             os.close(fd)
@@ -3053,6 +3174,7 @@ def _prepare_transition_proof(
             except FileNotFoundError:
                 _write_private_at(run_fd, ".timepad-prepared.tmp", data, 0o600)
                 _rename_noreplace(run_fd, ".timepad-prepared.tmp", "timepad-prepared.json")
+                _deadline_check()
                 os.fsync(run_fd)
             current["preparedProofDigest"] = _finalization_digest(data)
             if _prepared_proof(run_fd, current) != proof:
@@ -3611,8 +3733,11 @@ def _ensure_parent(parent: str) -> None:
             _fail("credential")
     else:
         _check_ancestors(parent)
+        _deadline_check()
         os.mkdir(parent, 0o700)
+        _deadline_check()
         os.chown(parent, 0, 0)
+        _deadline_check()
         os.chmod(parent, 0o700)
     _check_ancestors(parent)
     _acl_is_safe(parent)
@@ -3622,16 +3747,22 @@ def _write_private(path: str, data: bytes, mode: int, gid: int = 0) -> None:
     _deadline_check()
     _check_ancestors(path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    _deadline_check()
     fd = os.open(path, flags, mode)
     try:
         offset = 0
         while offset < len(data):
             _deadline_check()
             offset += os.write(fd, data[offset:])
+        _deadline_check()
         os.fsync(fd)
+        _deadline_check()
         os.fchown(fd, 0, gid)
+        _deadline_check()
         os.fchmod(fd, mode)
+        _deadline_check()
         _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True)
+        _deadline_check()
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -3647,6 +3778,7 @@ def _write_private_at(
     _deadline_check()
     if not name or "/" in name or "\x00" in name:
         _fail("recovery")
+    _deadline_check()
     fd = os.open(
         name,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -3658,10 +3790,15 @@ def _write_private_at(
         while offset < len(data):
             _deadline_check()
             offset += os.write(fd, data[offset:])
+        _deadline_check()
         os.fsync(fd)
+        _deadline_check()
         os.fchown(fd, 0, gid)
+        _deadline_check()
         os.fchmod(fd, mode)
+        _deadline_check()
         _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+        _deadline_check()
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -3724,6 +3861,7 @@ def _rename_noreplace(
         ctypes.c_uint,
     )
     renameat2.restype = ctypes.c_int
+    _deadline_check()
     result = renameat2(
         directory_fd,
         os.fsencode(source),
@@ -3882,8 +4020,11 @@ def _ensure_state_root(state_root: str) -> os.stat_result:
             _fail("recovery")
     else:
         _check_ancestors(state_root, category="recovery")
+        _deadline_check()
         os.mkdir(state_root, 0o700)
+        _deadline_check()
         os.chown(state_root, 0, 0)
+        _deadline_check()
         os.chmod(state_root, 0o700)
     _check_ancestors(state_root, category="recovery")
     _acl_is_safe(state_root, category="recovery")
@@ -3911,6 +4052,7 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
             except FileNotFoundError:
                 continue
             _fail("recovery")
+        _deadline_check()
         os.mkdir(temporary, 0o700, dir_fd=parent_fd)
         temporary_fd = os.open(
             temporary,
@@ -3918,7 +4060,9 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
             dir_fd=parent_fd,
         )
         try:
+            _deadline_check()
             os.fchown(temporary_fd, 0, 0)
+            _deadline_check()
             os.fchmod(temporary_fd, 0o700)
             temporary_inode = (
                 os.fstat(temporary_fd).st_dev,
@@ -3930,7 +4074,9 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
                 _state_marker(run_key, state_kind),
                 0o600,
             )
+            _deadline_check()
             os.fsync(temporary_fd)
+            _deadline_check()
             os.fsync(parent_fd)
             _retention_interlocks_fd(
                 "",
@@ -3977,6 +4123,7 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
                 _revalidate_retention_state_root_path(state_root, expected_root)
             finally:
                 os.close(published_fd)
+            _deadline_check()
             os.fsync(parent_fd)
         finally:
             os.close(temporary_fd)
@@ -4062,6 +4209,7 @@ def _record(tx: str, predecessor: dict[str, int], durable: dict[str, int]) -> No
     _write_private(os.path.join(tx, "identity.json"), encoded, 0o600)
     fd = os.open(tx, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        _deadline_check()
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -4123,14 +4271,17 @@ def _update_marker_disposition(
         _fail("recovery")
     _write_private(temporary, encoded, 0o600)
     try:
+        _deadline_check()
         os.replace(temporary, marker_path)
         fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
+            _deadline_check()
             os.fsync(fd)
         finally:
             os.close(fd)
     except OSError:
         if os.path.lexists(temporary):
+            _deadline_check()
             os.unlink(temporary)
         _fail("recovery")
 
@@ -4341,6 +4492,7 @@ def _witnessed_unlink(
                     _fail("recovery")
                 _deadline_check()
                 os.unlink(quarantine, dir_fd=directory_fd)
+                _deadline_check()
                 os.fsync(directory_fd)
                 return
             finally:
@@ -4467,6 +4619,7 @@ def _witnessed_unlink(
             if quarantine is None:
                 _fail("recovery")
         _rename_noreplace(directory_fd, name, quarantine)
+        _deadline_check()
         os.fsync(directory_fd)
         quarantine_info = os.stat(
             quarantine,
@@ -4478,6 +4631,7 @@ def _witnessed_unlink(
                 os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
                 try:
+                    _deadline_check()
                     os.rename(
                         quarantine,
                         name,
@@ -4515,6 +4669,7 @@ def _witnessed_unlink(
                 os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
                 try:
+                    _deadline_check()
                     os.rename(
                         quarantine,
                         name,
@@ -4524,6 +4679,7 @@ def _witnessed_unlink(
                 except OSError:
                     pass
             _fail("recovery")
+        _deadline_check()
         os.fsync(directory_fd)
         try:
             os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
@@ -4559,6 +4715,7 @@ def _remove_created_destination(
             mode=0o440,
             link_count=2,
         )
+        _deadline_check()
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
@@ -4626,7 +4783,9 @@ def _remove_transaction(
         final_tx_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_inode(final_tx_info, tx_info):
             _fail("recovery")
+        _deadline_check()
         os.rmdir(name, dir_fd=parent_fd)
+        _deadline_check()
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
@@ -4664,8 +4823,11 @@ def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> t
         tx = _transaction(parent, run_key)
         if os.path.lexists(tx):
             _fail("durable")
+        _deadline_check()
         os.mkdir(tx, 0o700)
+        _deadline_check()
         os.chown(tx, 0, 0)
+        _deadline_check()
         os.chmod(tx, 0o700)
         try:
             _write_private(os.path.join(tx, "snapshot"), source_data, 0o600)
@@ -4682,6 +4844,7 @@ def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> t
                 publication = os.path.join(tx, "publication")
                 _write_private(publication, source_data, 0o440, gid=10001)
                 try:
+                    _deadline_check()
                     os.link(publication, destination, follow_symlinks=False)
                 except FileExistsError:
                     _fail("durable")
@@ -4700,6 +4863,7 @@ def _prepare(run_key: str, state_root: str, root: str, inspect_data: bytes) -> t
             _record(tx, source_identity, durable_identity)
             fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
+                _deadline_check()
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -5087,8 +5251,10 @@ def _owned_state_fd(
 
 
 def _iter_directory_fd_names(directory_fd: int) -> Iterable[str]:
+    _deadline_check()
     with os.scandir(f"/proc/self/fd/{directory_fd}") as entries:
         for entry in entries:
+            _deadline_check()
             yield entry.name
 
 
@@ -5729,6 +5895,7 @@ def _retention_delete(
                 protected_state_witnesses,
             )
             _rename_noreplace(parent_fd, name, quarantine)
+            _deadline_check()
             os.fsync(parent_fd)
             _retention_interlocks_fd(
                 "",
@@ -5769,6 +5936,7 @@ def _retention_delete(
                         mode=0o600,
                         link_count=1,
                     )
+                    _deadline_check()
                     os.fsync(quarantine_fd)
                 child_identity, child_data = witnesses[OWNER_MARKER]
                 _witnessed_unlink(
@@ -5781,12 +5949,15 @@ def _retention_delete(
                     mode=0o600,
                     link_count=1,
                 )
+                _deadline_check()
                 os.fsync(quarantine_fd)
                 if next(_iter_directory_fd_names(quarantine_fd), None) is not None:
                     _fail("recovery")
             finally:
                 os.close(quarantine_fd)
+            _deadline_check()
             os.rmdir(quarantine, dir_fd=parent_fd)
+            _deadline_check()
             os.fsync(parent_fd)
         finally:
             _close_owned_witnesses(witnesses.values())
@@ -5828,6 +5999,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-kind", default="")
     parser.add_argument("--deploy-lock-fd", type=int)
     parser.add_argument("--execution-attempt")
+    parser.add_argument("--execution-grant")
     parser.add_argument("--deadline-ns", type=int)
     return parser
 
@@ -5935,6 +6107,7 @@ def _dispatch(args: argparse.Namespace) -> None:
 def main(argv: Iterable[str] | None = None) -> int:
     try:
         args = _parser().parse_args(list(argv) if argv is not None else None)
+        execution_supplied = _validate_execution_arguments(args)
         lock_commands = {
             "prepare",
             "verify",
@@ -5963,13 +6136,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                 with _deploy_lock(
                     args.state_root,
                     args.deploy_lock_fd,
-                    create_state_root=args.command == "state-publish",
+                    create_state_root=args.command == "state-publish" and not execution_supplied,
                 ) as active_deploy_lock_fd:
                     args.active_deploy_lock_fd = active_deploy_lock_fd
-                    _execution_interlock(args, active_deploy_lock_fd)
-                    _dispatch(args)
+                    lease = _execution_interlock(args, active_deploy_lock_fd)
+                    with _execution_mutation(args, lease):
+                        _dispatch(args)
         else:
-            if args.execution_attempt is not None or args.deadline_ns is not None:
+            if (
+                args.execution_attempt is not None or args.execution_grant is not None
+                or args.deadline_ns is not None
+            ):
                 _fail("recovery")
             _dispatch(args)
         return 0

@@ -1653,7 +1653,14 @@ publication_interlock_name = "123456791-1-final-deploy"
 original_publication_interlocks = helper._retention_interlocks_fd
 publication_interlock_calls = [0]
 
-def inject_publication_interlock(root, state_root_fd, **kwargs):
+def inject_publication_interlock(
+    root,
+    state_root_fd,
+    *,
+    state_root=None,
+    deploy_lock_fd=None,
+    allowed_temporary=None,
+):
     publication_interlock_calls[0] += 1
     if publication_interlock_calls[0] == 2:
         helper._write_private_at(
@@ -1662,7 +1669,13 @@ def inject_publication_interlock(root, state_root_fd, **kwargs):
             b"publication-interlock-race",
             0o600,
         )
-    return original_publication_interlocks(root, state_root_fd, **kwargs)
+    return original_publication_interlocks(
+        root,
+        state_root_fd,
+        state_root=state_root,
+        deploy_lock_fd=deploy_lock_fd,
+        allowed_temporary=allowed_temporary,
+    )
 
 helper._retention_interlocks_fd = inject_publication_interlock
 try:
@@ -2545,11 +2558,25 @@ root_swap_before = retention_snapshot(root_swap_state)
 swapped_root = fixture / "retention-root-swapped-away"
 original_interlocks_fd = helper._retention_interlocks_fd
 
-def swap_root_after_interlocks(root, state_root_fd):
-    original_interlocks_fd(root, state_root_fd)
+def swap_root_after_interlocks(
+    root,
+    state_root_fd,
+    *,
+    state_root=None,
+    deploy_lock_fd=None,
+    allowed_temporary=None,
+):
+    latest_run = original_interlocks_fd(
+        root,
+        state_root_fd,
+        state_root=state_root,
+        deploy_lock_fd=deploy_lock_fd,
+        allowed_temporary=allowed_temporary,
+    )
     os.rename(retention_root, swapped_root)
     retention_root.mkdir(mode=0o700)
     os.chown(retention_root, 0, 0)
+    return latest_run
 
 helper._retention_interlocks_fd = swap_root_after_interlocks
 expect_provider_error(
@@ -2740,11 +2767,24 @@ def assert_retention_witness_descriptor_cleanup():
     original_interlocks = helper._retention_interlocks_fd
     calls = [0]
 
-    def fail_after_witness_acquisition(root, state_root_fd, **kwargs):
+    def fail_after_witness_acquisition(
+        root,
+        state_root_fd,
+        *,
+        state_root=None,
+        deploy_lock_fd=None,
+        allowed_temporary=None,
+    ):
         calls[0] += 1
         if calls[0] == 2:
             raise OSError(5, "retention interlock fault")
-        return original_interlocks(root, state_root_fd, **kwargs)
+        return original_interlocks(
+            root,
+            state_root_fd,
+            state_root=state_root,
+            deploy_lock_fd=deploy_lock_fd,
+            allowed_temporary=allowed_temporary,
+        )
 
     helper._retention_interlocks_fd = fail_after_witness_acquisition
     try:
@@ -2984,7 +3024,14 @@ interlock_race_before = retention_snapshot(interlock_race_state)
 original_interlocks_fd = helper._retention_interlocks_fd
 interlock_calls = [0]
 
-def inject_interlock_before_quarantine(root, state_root_fd):
+def inject_interlock_before_quarantine(
+    root,
+    state_root_fd,
+    *,
+    state_root=None,
+    deploy_lock_fd=None,
+    allowed_temporary=None,
+):
     interlock_calls[0] += 1
     if interlock_calls[0] == 2:
         helper._write_private_at(
@@ -2993,7 +3040,13 @@ def inject_interlock_before_quarantine(root, state_root_fd):
             b"interlock-race",
             0o600,
         )
-    return original_interlocks_fd(root, state_root_fd)
+    return original_interlocks_fd(
+        root,
+        state_root_fd,
+        state_root=state_root,
+        deploy_lock_fd=deploy_lock_fd,
+        allowed_temporary=allowed_temporary,
+    )
 
 helper._retention_interlocks_fd = inject_interlock_before_quarantine
 expect_provider_error(

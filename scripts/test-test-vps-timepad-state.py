@@ -369,6 +369,256 @@ class ExecutionGrantTests(unittest.TestCase):
                 self.assertEqual("QUIESCENCE_UNCONFIRMED", json.loads(output.getvalue())["result"])
 
 
+class RecoveryRegistrationTests(unittest.TestCase):
+    """Portable authorization/protocol checks, not Linux lease/fsync evidence."""
+
+    def setUp(self):
+        self.current = prepared_state()
+        self.origin = {"rootId": "test-root", "originDigest": self.current["originDigest"]}
+        target = self.current["target"]
+        self.authority = {
+            "schema": state.RECOVERY_AUTH_SCHEMA, "rootId": "test-root",
+            "originDigest": self.current["originDigest"], "originalOperation": "deploy",
+            "runId": self.current["runId"], "operationEpoch": self.current["operationEpoch"],
+            "incidentId": self.current["incidentId"], "evidenceDigest": self.current["evidenceDigest"],
+            "targetId": target["id"], "revision": target["tuple"]["revision"],
+            "version": target["tuple"]["version"], "repositoryDigest": target["tuple"]["repositoryDigest"],
+            "platformImageId": target["tuple"]["platformImageId"], "action": "retry-exact-candidate",
+        }
+        self.selectors = {key: self.authority[key] for key in (
+            "runId", "incidentId", "operationEpoch", "evidenceDigest", "repositoryDigest",
+            "revision", "version",
+        )}
+        self.lease = execution_lease(operation="forward-recover")
+        self.lease.update(
+            t0Ns=LEASE_START_NS, workEndNs=LEASE_START_NS + 540_000_000_000,
+            hardEndNs=LEASE_START_NS + 600_000_000_000,
+        )
+        self.lease["worker"] = {**self.lease["supervisor"], "pid": 102}
+        self.lease["workers"] = [{"mode": "controller-worker", **self.lease["worker"]}]
+        self.grant = state.ExecutionGrant(
+            self.lease["attempt"], "b" * 32, LEASE_START_NS + 10_000_000_000,
+        )
+        self.client = mock.Mock(
+            attempt=self.grant.attempt, role="controller-worker", supervisor=self.lease["supervisor"],
+        )
+        self.response = {
+            "attempt": self.grant.attempt, "grantId": self.grant.grant_id,
+            "endNs": self.grant.end_ns, "role": "controller-worker", "name": "recovery-registration",
+        }
+        self.client.request.side_effect = (
+            lambda kind, **fields: self.lease if kind == "lease" else self.response
+        )
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(state, "deploy_lock", return_value=nullcontext(9)))
+        self.stack.enter_context(mock.patch.object(supervisor, "WorkerClient", return_value=self.client))
+        self.stack.enter_context(mock.patch.object(
+            state, "_read_guard_locked", return_value=(self.origin, self.current),
+        ))
+        self.stack.enter_context(mock.patch.object(state, "_open_root", return_value=55))
+        self.stack.enter_context(mock.patch.object(state.os, "close"))
+        self.reader = self.stack.enter_context(mock.patch.object(
+            state, "_read_at", side_effect=lambda *args: json.dumps(self.authority).encode(),
+        ))
+        self.stack.enter_context(mock.patch.object(
+            state.time, "monotonic_ns", return_value=LEASE_START_NS + 1,
+        ))
+        self.real_publisher = state._publish_execution_lease_locked
+        self.publisher = self.stack.enter_context(mock.patch.object(
+            state, "_publish_execution_lease_locked",
+            side_effect=lambda *args, **kwargs: {
+                "attempt": self.lease["attempt"], "revision": 0, "digest": digest("c"),
+            },
+        ))
+
+    def register(self):
+        return state.register_recovery(
+            "/fixture", contract=contract(), selectors=self.selectors,
+            deploy_lock_fd=9, execution_grant=self.grant,
+        )
+
+    def test_exact_authority_registers_only_execution_ownership_with_live_rechecks(self):
+        before = json.dumps(self.current, sort_keys=True)
+        result = self.register()
+        self.assertEqual({"attempt": self.grant.attempt, "revision": 0, "digest": digest("c")}, result)
+        self.publisher.assert_called_once_with(
+            "/fixture", self.lease, state._canonical(self.lease), recovery_registration=True,
+        )
+        self.reader.assert_called_once_with(
+            55, "timepad-recovery-authorization.json", state.MAX_AUTHORIZATION_BYTES,
+        )
+        self.assertEqual(before, json.dumps(self.current, sort_keys=True))
+        self.assertIsNone(state._EXECUTION_CHECK.get())
+        self.assertEqual(4, self.client.request.call_count)
+        self.client.close.assert_called_once()
+
+    def test_each_dispatch_selector_must_match_before_lease_publication(self):
+        for key, original in list(self.selectors.items()):
+            for wrong in (True if type(original) is int else "private-canary", None):
+                self.selectors[key] = wrong
+                with self.subTest(key=key, wrong=wrong), self.assertRaisesRegex(
+                    state.GuardError, "RECOVERY_SELECTOR_MISMATCH",
+                ) as error:
+                    self.register()
+                self.assertNotIn("private-canary", str(error.exception))
+                self.publisher.assert_not_called()
+            self.selectors[key] = original
+
+    def test_wrong_authority_stale_epoch_and_contract_drift_never_publish(self):
+        for key, wrong in (
+            ("schema", "unsupported"), ("rootId", "other-root"),
+            ("originDigest", digest("9")), ("originalOperation", "rollback-drill"),
+            ("operationEpoch", 2), ("incidentId", "f" * 32),
+            ("platformImageId", digest("9")), ("action", "restore-predecessor"),
+        ):
+            original = self.authority[key]
+            self.authority[key] = wrong
+            with self.subTest(key=key), self.assertRaises(state.GuardError):
+                self.register()
+            self.publisher.assert_not_called()
+            self.authority[key] = original
+        changed = contract()
+        changed["transitions"][0]["compatiblePredecessors"] = []
+        with self.assertRaisesRegex(state.GuardError, "RECOVERY_EVIDENCE_CHANGED"):
+            state._recovery_registration_authority(
+                self.origin, self.current, changed, json.dumps(self.authority).encode(), self.selectors,
+            )
+        self.publisher.assert_not_called()
+
+    def test_registration_rejects_wrong_role_attempt_lifecycle_and_clock(self):
+        for key, wrong in (
+            ("operation", "deploy"), ("workerMode", "rollback-worker"),
+            ("lifecycle", "armed"), ("revision", 1), ("attempt", "f" * 32),
+            ("worker", None), ("workers", []),
+            ("workEndNs", self.lease["workEndNs"] + 1),
+            ("hardEndNs", self.lease["hardEndNs"] + 1),
+        ):
+            original = self.lease[key]
+            self.lease[key] = wrong
+            with self.subTest(key=key), self.assertRaises(state.GuardError):
+                self.register()
+            self.publisher.assert_not_called()
+            self.lease[key] = original
+
+    def test_missing_authorization_and_revocation_do_not_publish_or_leak_context(self):
+        self.reader.side_effect = FileNotFoundError()
+        with self.assertRaises(FileNotFoundError):
+            self.register()
+        self.publisher.assert_not_called()
+        self.assertIsNone(state._EXECUTION_CHECK.get())
+        self.reader.side_effect = lambda *args: json.dumps(self.authority).encode()
+        for position in (1, 2, 3):
+            checks = 0
+
+            def response(kind, **fields):
+                nonlocal checks
+                if kind == "lease":
+                    return self.lease
+                checks += 1
+                if checks == position:
+                    raise supervisor.SupervisorError("GRANT_REVOKED")
+                return self.response
+
+            self.client.request.side_effect = response
+            with self.subTest(position=position), self.assertRaisesRegex(
+                state.GuardError, "EXECUTION_GRANT_REVOKED",
+            ):
+                self.register()
+            self.assertEqual(1 if position == 3 else 0, self.publisher.call_count)
+            self.publisher.reset_mock()
+            self.assertIsNone(state._EXECUTION_CHECK.get())
+
+    def test_registration_does_not_reconcile_an_existing_unresolved_lease(self):
+        previous = execution_lease(attempt="f" * 32, revision=2, lifecycle="drain-forward")
+        with mock.patch.object(state, "_read_execution_lease_locked", return_value=previous), \
+                mock.patch.object(state, "_atomic_write") as writer, \
+                self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+            self.real_publisher(
+                "/fixture", self.lease, state._canonical(self.lease), recovery_registration=True,
+            )
+        writer.assert_not_called()
+
+    def test_registration_cannot_reconstruct_a_missing_owned_execution_lease(self):
+        for attempt in (self.lease["attempt"], "f" * 32):
+            with self.subTest(attempt=attempt), mock.patch.object(
+                state, "_read_execution_lease_locked", return_value=None,
+            ), mock.patch.object(
+                state, "_read_guard_locked",
+                return_value=(self.origin, {**self.current, "executionAttempt": attempt}),
+            ), mock.patch.object(state, "_atomic_write") as writer, \
+                    self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                self.real_publisher(
+                    "/fixture", self.lease, state._canonical(self.lease), recovery_registration=True,
+                )
+            writer.assert_not_called()
+
+    def test_rollback_state_admission_is_not_provider_or_daemon_proof(self):
+        current = {**self.current, "executionAttempt": self.lease["attempt"]}
+        lease = execution_lease(
+            revision=4, lifecycle="rollback-admission", rollback_issued=True,
+        )
+        lease["workerMode"] = "rollback-worker"
+        state.rollback_state_admission(current, lease)
+        barrier = state.advance_state(current, "CUTOVER_POSSIBLE")
+        state.rollback_state_admission(barrier, lease)
+        verifying = state.advance_state(barrier, "VERIFYING", containerId=digest("d"), configHash=digest("e"))
+        waiting = state.advance_state(
+            verifying, "VERIFYING", ownedChild=owned_child(), latestAttemptId=owned_child()["attemptId"],
+        )
+        for invalid in (
+            {**current, "executionAttempt": "f" * 32},
+            {**current, "rollbackIssued": True},
+            {**barrier, "predecessorDisposition": "pre-barrier-only"},
+            {**barrier, "phase": "RECOVERY_REQUIRED"},
+            {**barrier, "phase": "FORWARD_RECOVERING"},
+            waiting,
+        ):
+            with self.subTest(phase=invalid["phase"]), self.assertRaises(state.GuardError):
+                state.rollback_state_admission(invalid, lease)
+        for field, wrong in (
+            ("operation", "forward-recover"), ("lifecycle", "rolling-back"),
+            ("rollbackIssued", False), ("workerMode", "controller-worker"),
+        ):
+            with self.subTest(field=field), self.assertRaises(state.GuardError):
+                state.rollback_state_admission(current, {**lease, field: wrong})
+
+    def test_rollback_cli_validates_live_capability_and_never_publishes_state(self):
+        self.lease.update(
+            operation="deploy", workerMode="rollback-worker",
+            lifecycle="rollback-admission", rollbackIssued=True,
+        )
+        self.current["executionAttempt"] = self.grant.attempt
+        self.client.role = "rollback-worker"
+        self.response.update(role="rollback-worker", name="rollback-admission")
+        argv = [
+            "rollback-admission", "--root", "/fixture", "--deploy-lock-fd", "9",
+            "--execution-attempt", self.grant.attempt, "--execution-grant", self.grant.grant_id,
+            "--deadline-ns", str(self.grant.end_ns),
+        ]
+        before = json.dumps(self.current, sort_keys=True)
+        with mock.patch.object(
+            state, "_read_execution_lease_locked", return_value=self.lease,
+        ), mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(0, state.main(argv))
+        self.assertEqual({"result": "state-admitted", "epoch": 1}, json.loads(output.getvalue()))
+        self.assertEqual(before, json.dumps(self.current, sort_keys=True))
+        self.assertEqual(2, self.client.request.call_count)
+        self.publisher.assert_not_called()
+        for position in (1, 2):
+            self.client.request.side_effect = (
+                [supervisor.SupervisorError("GRANT_REVOKED")]
+                if position == 1 else [self.response, supervisor.SupervisorError("GRANT_REVOKED")]
+            )
+            with self.subTest(position=position), mock.patch.object(
+                state, "_read_execution_lease_locked", return_value=self.lease,
+            ), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                self.assertEqual(2, state.main(argv))
+            self.assertEqual("EXECUTION_GRANT_REVOKED", error.getvalue().strip())
+            self.publisher.assert_not_called()
+            self.assertEqual(before, json.dumps(self.current, sort_keys=True))
+
+
 class ControllerRecoveryContractTests(unittest.TestCase):
     """Execute controller functions with private, deterministic shell boundaries.
 
@@ -447,8 +697,9 @@ command() {
     [ "$1" = --kill-after=5s ] && [ "$2" = 0.5s ] &&
       [ "$3" = python3 ] && [ "$4" = "$provider_helper" ] &&
       [ "$5" = verify ] && [ "$6" = --execution-attempt ] &&
-      [ "$7" = "$TIMEPAD_ATTEMPT" ] && [ "$8" = --deadline-ns ] &&
-      [ "$9" = 1000000000 ] && [ "$#" -eq 9 ] || return 94
+      [ "$7" = "$TIMEPAD_ATTEMPT" ] && [ "$8" = --execution-grant ] &&
+      [ "$9" = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ] && [ "${10}" = --deadline-ns ] &&
+      [ "${11}" = 1000000000 ] && [ "$#" -eq 11 ] || return 94
     [ "$fault" != command ] || return 23
   fi
 }

@@ -17,6 +17,11 @@ Worker contract (also exposed by WorkerClient):
 * Publish/ack the initial ``registered`` lease before ``arm`` immediately
   before PREPARED. Forward-recover charges its clock at supervisor entry,
   including registration, then arms without resetting that clock.
+  Its exclusive <=30-second ``recovery-registration`` grant lets the state
+  helper validate protected authority/selectors before publishing the initial
+  lease. After ack, ``recovery-admission`` grants permit only fixed read-only
+  controller calls while registered; neither grant authorizes runtime mutation
+  or unresolved old-lease replacement.
 * ``lease`` obtains the current immutable publication snapshot/revision.
   Publish it durably using the state helper under a ``lease-publish`` grant,
   complete that grant, then ``lease-ack REV DIGEST``. No other work grant is
@@ -78,6 +83,7 @@ WAIT_NAMES = frozenset({
     "preflight", "state-publish", "provider", "runtime", "docker", "curl",
     "health", "child-handshake", "rollback-admission", "rollback-remaining-work",
     "cleanup-stop", "cleanup-publish", "lease-publish", "terminal-verify",
+    "recovery-registration", "recovery-admission",
 })
 FAILURES = frozenset({
     "TERM", "INT", "HUP", "EXIT", "DRILL", "WAIT_EXPIRED", "WORK_EXHAUSTED",
@@ -300,10 +306,21 @@ class Attempt:
             reject("WAIT_REFUSED")
         if self.draining or self.lifecycle == "quiescence-unconfirmed":
             reject("WAIT_REFUSED")
-        if name != "lease-publish" and self.acked_revision != self.revision:
+        if any(grant.name == "recovery-registration" for grant in self.grants.values()):
+            reject("WAIT_REFUSED")
+        registration = name == "recovery-registration"
+        admission = name == "recovery-admission"
+        if registration or admission:
+            if self.operation != "forward-recover" or self.role != "controller-worker" or \
+                    self.lifecycle != "registered" or self.first_reason is not None or \
+                    registration and (self.revision != 0 or self.grants):
+                reject("WAIT_REFUSED")
+            local_ns = min(local_ns, 30 * NS)
+        if name not in {"lease-publish", "recovery-registration"} and \
+                self.acked_revision != self.revision:
             reject("LEASE_ACK_REQUIRED")
         if self.operation == "forward-recover" and self.lifecycle == "registered" \
-                and name != "lease-publish":
+                and name not in {"lease-publish", "recovery-registration", "recovery-admission"}:
             reject("WAIT_REFUSED")
         if self.lifecycle == "drained" and name != "lease-publish":
             reject("WAIT_REFUSED")
@@ -353,7 +370,8 @@ class Attempt:
                 self.draining or self.lifecycle == "quiescence-unconfirmed" or \
                 self.pending_terminal is not None:
             reject("GRANT_REVOKED")
-        if grant.name != "lease-publish" and self.acked_revision != self.revision:
+        if grant.name not in {"lease-publish", "recovery-registration"} and \
+                self.acked_revision != self.revision:
             reject("GRANT_REVOKED")
         return grant
 
@@ -930,6 +948,8 @@ class Supervisor:
                     reject()
                 if self.attempt.acked_revision != self.attempt.revision:
                     reject("LEASE_ACK_REQUIRED")
+                if self.attempt.grants:
+                    reject("WAIT_REFUSED")
                 self.attempt.arm()
                 value = self._lease()
                 self._notify_clock()

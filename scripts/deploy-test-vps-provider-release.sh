@@ -709,6 +709,7 @@ if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ]; then
 fi
 
 supervisor_enabled=false
+recovery_admission_only=false
 supervisor_client() {
   command timeout 10s python3 "$script_dir/test_vps_timepad_supervisor.py" \
     client --root "$state_root" "$@"
@@ -784,6 +785,27 @@ supervisor_complete() {
   supervisor_client terminal 0 --outcome "$1" >/dev/null ||
     fail "EXECUTION_TERMINAL_ACK_FAILED"
 }
+supervisor_register_recovery() {
+  local grant grant_id deadline publication lease_revision digest
+  grant=$(supervisor_client grant recovery-registration 30) || return 1
+  grant_id=$(jq -er '.grantId | strings' <<<"$grant") || return 1
+  deadline=$(jq -er '.endNs | numbers' <<<"$grant") || return 1
+  publication=$(command timeout 30s python3 "$timepad_helper" register-recovery \
+    --root "$state_root" --contract "$timepad_contract" --deploy-lock-fd 9 \
+    --run-id "$recovery_run_key" --incident-id "${recovery_incident,,}" \
+    --epoch "$recovery_epoch" --binding-digest "$recovery_binding_digest" \
+    --repository-digest "${image##*@sha256:}" --revision "$revision" --version "$version" \
+    --execution-attempt "$TIMEPAD_ATTEMPT" --execution-grant "$grant_id" \
+    --deadline-ns "$deadline") || return 1
+  jq -e --arg attempt "$TIMEPAD_ATTEMPT" '
+    .attempt == $attempt and .revision == 0 and
+    (.digest | type == "string" and test("^[a-f0-9]{64}$"))
+  ' <<<"$publication" >/dev/null || return 1
+  lease_revision=$(jq -er '.revision | numbers' <<<"$publication") || return 1
+  digest=$(jq -er '.digest | strings' <<<"$publication") || return 1
+  supervisor_client complete "$grant_id" >/dev/null || return 1
+  supervisor_client lease-ack "$lease_revision" "$digest" >/dev/null || return 1
+}
 supervisor_timeout() {
   local options=() local_bound executable wait_name grant grant_id end_ns bounded status
   while [ "$#" -gt 0 ]; do
@@ -817,6 +839,23 @@ supervisor_timeout() {
       ;;
     *) wait_name=preflight ;;
   esac
+  if [ "${recovery_admission_only:-false}" = true ]; then
+    case "$executable:${2:-}" in
+      docker:image) [ "${3:-}" = inspect ] || return 1 ;;
+      python3:"$timepad_helper")
+        case "${3:-}" in read-state|authorize-recovery) ;; *) return 1 ;; esac ;;
+      python3:"$provider_helper") [ "${3:-}" = check-image ] || return 1 ;;
+      python3:-) ;; # Fixed controller's bounded private-input stat validation.
+      *) return 1 ;;
+    esac
+    wait_name=recovery-admission
+  elif [ "${TIMEPAD_WORKER_MODE:-controller-worker}" = rollback-worker ]; then
+    # Reconstruction and daemon proof are still required. Admission is
+    # read-only: no config/provider/state writer can enter under this grant.
+    [ "$executable:${2:-}:${3:-}" = "python3:$timepad_helper:rollback-admission" ] ||
+      return 1
+    wait_name=rollback-admission
+  fi
   if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" = fail-closed-worker ]; then
     case "$executable:${2:-}" in
       python3:"$timepad_helper")
@@ -844,12 +883,13 @@ supervisor_timeout() {
       prepare|verify|finish|prepare-finalization|finish-committed-resume|\
       live-resume|absence-resume|prepare-transition-proof|state-publish|\
       retention-list|retention-check|retention-delete)
-        set -- "$@" --execution-attempt "$TIMEPAD_ATTEMPT" --deadline-ns "$end_ns"
+        set -- "$@" --execution-attempt "$TIMEPAD_ATTEMPT" \
+          --execution-grant "$grant_id" --deadline-ns "$end_ns"
         ;;
     esac
   elif [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ]; then
     case "${3:-}" in
-      bootstrap|publish-state|prepare|advance|claim-rollback|retain-unresolved|stop-owned-child)
+      bootstrap|publish-state|prepare|advance|claim-rollback|retain-unresolved|stop-owned-child|rollback-admission)
         set -- "$@" --execution-attempt "$TIMEPAD_ATTEMPT" \
           --execution-grant "$grant_id" --deadline-ns "$end_ns"
         ;;
@@ -923,6 +963,16 @@ fail_closed_publish_unresolved() {
     --root "$state_root" --deploy-lock-fd 9 >/dev/null
 }
 
+rollback_worker_admission() {
+  timeout 15s python3 "$timepad_helper" rollback-admission \
+    --root "$state_root" --deploy-lock-fd 9 >/dev/null ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  # State compatibility and kernel ECHILD do not prove an interrupted Docker
+  # request has completed. Keep mutation closed until daemon/config/provider
+  # reconstruction is implemented and independently verified.
+  fail "ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED"
+}
+
 docker_image_inspect() {
   timeout 30s docker image inspect "$@" 2>/dev/null
 }
@@ -963,7 +1013,8 @@ recovery_budget_arm() {
   if [ "$supervisor_enabled" = true ]; then
     local lease
     lease=$(supervisor_client lease) || fail "RECOVERY_REQUIRED"
-    if [ "$(jq -er '.lifecycle | strings' <<<"$lease")" = registered ]; then
+    if [ "$(jq -er '.lifecycle | strings' <<<"$lease")" = registered ] &&
+      [ "${recovery_admission_only:-false}" != true ]; then
       supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
       supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
       lease=$(supervisor_client lease) || fail "RECOVERY_REQUIRED"
@@ -1535,7 +1586,8 @@ timepad_publish_prepared_transition() {
       command timeout 30s python3 "$provider_helper" prepare-transition-proof \
         --run-key "$run_key" --state-root "$state_root" \
         --state-kind "$state_suffix" --deploy-lock-fd 9 \
-        --execution-attempt "$TIMEPAD_ATTEMPT" --deadline-ns "$deadline") || {
+        --execution-attempt "$TIMEPAD_ATTEMPT" --execution-grant "$grant_id" \
+        --deadline-ns "$deadline") || {
           supervisor_client complete "$grant_id" >/dev/null || :
           fail "PROVIDER_STATE_INVALID"
         }
@@ -1601,18 +1653,21 @@ if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ]; then
     --root "$state_root" --deploy-lock-fd 9 >/dev/null ||
     fail "DEPLOY_LOCK_INVALID"
 fi
-if [ "${TIMEPAD_WORKER_MODE:-}" = controller-worker ] ||
-  [ "${TIMEPAD_WORKER_MODE:-}" = fail-closed-worker ]; then
+if [ -n "${TIMEPAD_WORKER_MODE:-}" ]; then
   supervisor_enabled=true
-  supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  if [ "$TIMEPAD_WORKER_MODE" = controller-worker ] && [ "$operation" = forward-recover ]; then
+    supervisor_register_recovery || fail "RECOVERY_REGISTRATION_REFUSED"
+    recovery_admission_only=true
+  else
+    supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  fi
   if [ "$TIMEPAD_WORKER_MODE" = fail-closed-worker ]; then
     fail_closed_owned_backend || :
     fail_closed_publish_unresolved || :
     fail "QUIESCENCE_UNCONFIRMED"
   fi
-  if [ "$operation" = forward-recover ]; then
-    supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
-    supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  if [ "$TIMEPAD_WORKER_MODE" = rollback-worker ]; then
+    rollback_worker_admission
   fi
 fi
 validate_timepad_input() {
@@ -1758,6 +1813,9 @@ if [ "$operation" = forward-recover ]; then
   # worker integration before any mutation may be released.
   [ "$recovery_phase" = COMMITTED ] ||
     fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"
+  recovery_admission_only=false
+  supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
+  supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
   if [ "$recovery_phase" = COMMITTED ]; then
     jq -e '.ownedChild == null' <<<"$recovery_state" >/dev/null ||
       fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
@@ -3220,7 +3278,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         client --root "$private_root" hello >/dev/null ||
       fail "PRIVATE_WORKER_REQUIRED"
     case "$worker_mode" in
-      controller-worker|fail-closed-worker) ;;
+      controller-worker|rollback-worker|fail-closed-worker) ;;
       *) fail "PRIVATE_WORKER_MODE_UNAVAILABLE" ;;
     esac
     provider_release_main "$@"

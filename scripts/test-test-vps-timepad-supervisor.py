@@ -153,6 +153,43 @@ class AttemptTests(unittest.TestCase):
         self.assertEqual(attempt.after_drain(), "fail-closed-worker")
         self.assertFalse(attempt.rollback_issued)
 
+    def test_recovery_registration_is_exclusive_bounded_and_does_not_need_a_prior_lease_ack(self):
+        attempt = supervisor.Attempt("forward-recover", clock=self.clock)
+        original = (attempt.t0, attempt.work_end, attempt.hard_end, attempt.revision)
+        grant = attempt.grant("recovery-registration", 600 * NS)
+        self.assertEqual(grant.end_ns, self.clock.now + 30 * NS)
+        self.assertEqual(grant, attempt.validate_grant(grant.grant_id, grant.end_ns))
+        with self.assertRaisesRegex(supervisor.SupervisorError, "WAIT_REFUSED"):
+            attempt.grant("recovery-registration", NS)
+        for name in supervisor.WAIT_NAMES - {"recovery-registration"}:
+            with self.subTest(name=name), self.assertRaises(supervisor.SupervisorError):
+                attempt.grant(name, NS)
+        attempt.complete(grant.grant_id)
+        acknowledged(attempt)
+        admission = attempt.grant("recovery-admission", 600 * NS)
+        self.assertEqual(admission.end_ns, self.clock.now + 30 * NS)
+        self.assertEqual(original, (attempt.t0, attempt.work_end, attempt.hard_end, attempt.revision))
+        with self.assertRaises(supervisor.SupervisorError):
+            attempt.prepare_terminal()
+        attempt.cancel("TERM", 143)
+        with self.assertRaises(supervisor.SupervisorError):
+            attempt.validate_grant(admission.grant_id, admission.end_ns)
+        self.assertEqual("fail-closed-worker", attempt.after_drain())
+        self.assertFalse(attempt.rollback_issued)
+
+    def test_recovery_registration_grants_cannot_be_used_by_other_operations_or_roles(self):
+        for operation in ("deploy", "retention", "forward-recover"):
+            attempt = supervisor.Attempt(operation, clock=self.clock)
+            acknowledged(attempt)
+            if operation == "forward-recover":
+                attempt.arm()
+                acknowledged(attempt)
+            for name in ("recovery-registration", "recovery-admission"):
+                with self.subTest(operation=operation, name=name), self.assertRaises(
+                    supervisor.SupervisorError,
+                ):
+                    attempt.grant(name, NS)
+
     def test_lease_must_be_published_before_work_and_after_arm(self):
         attempt = self.attempt
         with self.assertRaisesRegex(supervisor.SupervisorError, "LEASE_ACK_REQUIRED"):
@@ -604,7 +641,8 @@ supervisor_timeout 30s python3 "$provider_helper" "$1" --deploy-lock-fd 9
                     "--deploy-lock-fd", "9",
                 ])
                 self.assertEqual(arguments[7:], [
-                    "--execution-attempt", "a" * 32, "--deadline-ns", "123456789",
+                    "--execution-attempt", "a" * 32, "--execution-grant", "b" * 32,
+                    "--deadline-ns", "123456789",
                 ] if operation in {"live-resume", "finish-committed-resume"} else [])
 
     def test_state_mutations_carry_the_live_grant_and_cleanup_cannot_launch_writers(self):
@@ -741,8 +779,122 @@ fail() { echo "$1" >&2; exit 91; }
                       '    fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"', source)
         private_dispatch = source[source.index('    case "$worker_mode" in\n',
                                               source.index("if [[")):]
-        self.assertIn("controller-worker|fail-closed-worker) ;;", private_dispatch)
+        self.assertIn("controller-worker|rollback-worker|fail-closed-worker) ;;", private_dispatch)
         self.assertIn('*) fail "PRIVATE_WORKER_MODE_UNAVAILABLE"', private_dispatch)
+
+    def test_recovery_registration_checks_dispatch_before_publication_and_acks_once(self):
+        script = self.function("supervisor_register_recovery") + r"""
+state_root=/fixture/root
+timepad_helper=/fixture/state.py
+timepad_contract=/fixture/contract.json
+TIMEPAD_ATTEMPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+recovery_run_key=original-run
+recovery_incident=DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
+recovery_epoch=7
+recovery_binding_digest=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+image=repo@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+revision=cccccccccccccccccccccccccccccccccccccccc
+version=1.4.1
+fault=$1
+supervisor_client() {
+  echo "$*" >&2
+  case "$1" in
+    grant) echo '{"grantId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","endNs":123456789}' ;;
+    complete|lease-ack) [ "$1" != "$fault" ] ;;
+    *) return 90 ;;
+  esac
+}
+command() {
+  echo "$*" >&2
+  [ "$fault" != publication ] || return 91
+  echo '{"attempt":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","revision":0,"digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+}
+supervisor_register_recovery
+"""
+        for fault in ("none", "publication", "complete", "lease-ack"):
+            with self.subTest(fault=fault):
+                result = self.shell(script, fault)
+                self.assertEqual(fault == "none", result.returncode == 0, result.stderr)
+                events = result.stderr.splitlines()
+                self.assertEqual(events[0], "grant recovery-registration 30")
+                self.assertIn("register-recovery --root /fixture/root", events[1])
+                for value in (
+                    "--run-id original-run", "--incident-id " + "d" * 32, "--epoch 7",
+                    "--binding-digest " + "e" * 64, "--repository-digest " + "f" * 64,
+                    "--revision " + "c" * 40, "--version 1.4.1",
+                    "--execution-attempt " + "a" * 32, "--execution-grant " + "b" * 32,
+                    "--deadline-ns 123456789",
+                ):
+                    self.assertIn(value, events[1])
+                self.assertEqual(len(events), {"none": 4, "publication": 2, "complete": 3,
+                                               "lease-ack": 4}[fault])
+
+    def test_read_only_recovery_and_rollback_waits_cannot_launch_mutation(self):
+        script = self.function("supervisor_timeout") + r"""
+provider_helper=/fixture/provider.py
+timepad_helper=/fixture/state.py
+TIMEPAD_ATTEMPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+TIMEPAD_WORKER_MODE=$1
+recovery_admission_only=$2
+supervisor_client() {
+  case "$1" in
+    grant)
+      echo "grant:$2" >&2
+      echo '{"grantId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","endNs":123456789}' ;;
+    complete) ;;
+    *) return 90 ;;
+  esac
+}
+command() {
+  if [ "$1:$2" = timeout:3s ]; then echo 1s
+  else printf '%s\n' "$@"; fi
+}
+shift 2
+supervisor_timeout 30s "$@"
+"""
+        for role, admission, argv, name in (
+            ("controller-worker", "true", ["docker", "image", "inspect", "image"], "recovery-admission"),
+            ("controller-worker", "true", ["python3", "/fixture/state.py", "read-state"], "recovery-admission"),
+            ("controller-worker", "true", ["python3", "/fixture/provider.py", "check-image"], "recovery-admission"),
+            ("controller-worker", "true", ["docker", "start", "container"], None),
+            ("controller-worker", "true", ["python3", "/fixture/provider.py", "prepare"], None),
+            ("controller-worker", "true", ["python3", "/fixture/state.py", "advance"], None),
+            ("controller-worker", "true", ["bash", "arbitrary"], None),
+            ("rollback-worker", "false", ["python3", "/fixture/state.py", "rollback-admission"], "rollback-admission"),
+            ("rollback-worker", "false", ["python3", "/fixture/state.py", "claim-rollback"], None),
+            ("rollback-worker", "false", ["docker", "start", "predecessor"], None),
+            ("rollback-worker", "false", ["python3", "/fixture/provider.py", "finish"], None),
+        ):
+            with self.subTest(role=role, argv=argv):
+                result = self.shell(script, role, admission, *argv)
+                self.assertEqual(0 if name else 1, result.returncode, result.stderr)
+                self.assertEqual("grant:" + name if name else "", result.stderr.strip())
+                if not name:
+                    self.assertEqual("", result.stdout)
+                if name == "rollback-admission":
+                    self.assertEqual(result.stdout.splitlines()[-6:], [
+                        "--execution-attempt", "a" * 32, "--execution-grant", "b" * 32,
+                        "--deadline-ns", "123456789",
+                    ])
+
+    def test_rollback_state_proof_never_releases_mutation_without_daemon_proof(self):
+        script = self.function("rollback_worker_admission") + r"""
+timepad_helper=/fixture/state.py
+state_root=/fixture/root
+fault=$1
+timeout() { echo "$*" >&2; [ "$fault" != state ]; }
+fail() { echo "$1" >&2; exit 91; }
+supervisor_client() { echo unexpected-admit-rollback; return 92; }
+rollback_worker_admission
+"""
+        for fault in ("none", "state"):
+            result = self.shell(script, fault)
+            self.assertEqual(91, result.returncode, result.stderr)
+            self.assertEqual("", result.stdout)
+            self.assertEqual(result.stderr.splitlines(), [
+                "15s python3 /fixture/state.py rollback-admission --root /fixture/root --deploy-lock-fd 9",
+                "ROLLBACK_NOT_ADMITTED" if fault == "state" else "ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED",
+            ])
 
     def test_lease_transport_newline_is_not_published_as_durable_bytes(self):
         script = self.function("supervisor_publish_lease") + r"""
@@ -1124,6 +1276,104 @@ class LinuxSupervisorTests(unittest.TestCase):
 
         result, _ = self.run_fixture(behavior, operation="forward-recover")
         self.assertEqual((result["status"], result["reason"]), (0, "COMPLETED"))
+
+    def test_authorized_unleased_incident_registers_without_adopting_state_or_runtime(self):
+        evidence = {
+            "repositoryDigest": "a" * 64, "platformImageId": "b" * 64,
+            "revision": "c" * 40, "version": "1.4.1", "migrationInventoryDigest": "d" * 64,
+            "migrationResources": ["migration:synthetic"], "beforeSchema": "e" * 64,
+            "afterSchema": "f" * 64, "guardEvidence": "1" * 64, "dependencyPolicy": "resolved",
+            "dependencyFloor": "2" * 64, "recoveryEvidence": "3" * 64,
+            "retryExact": True, "unknownTransitionCovered": True,
+        }
+        target = {"id": "target", "tuple": evidence, "domain": "advanced"}
+        previous = {
+            "id": "previous", "tuple": {**evidence, "repositoryDigest": "4" * 64,
+                                       "afterSchema": "e" * 64}, "domain": "initial",
+        }
+        approved = {
+            "schema": state.CONTRACT_SCHEMA, "formatVersion": 1, "controller": state.CONTROLLER,
+            "active": True, "rootId": "test-root", "initialDomain": [],
+            "images": [target, previous], "transitions": [{
+                "id": "first-timepad", "targetId": "target", "beforeSchema": "e" * 64,
+                "afterSchema": "f" * 64, "compatiblePredecessors": [],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            authority = {
+                "rootId": "test-root", "bootstrapId": "bootstrap-1", "initialRuntime": "a" * 64,
+                "initialConfig": "b" * 64, "initialSchema": "c" * 64,
+                "initialStartupInventory": "d" * 64, "schemaHistoryProvenance": True,
+            }
+            observed = {
+                "rootId": "test-root", "runtime": "a" * 64, "config": "b" * 64,
+                "schema": "c" * 64, "startupInventory": "d" * 64, "schemaHistoryProvenance": True,
+            }
+            state.bootstrap_guard(directory, authority=authority, observed=observed)
+            origin, ready = state.read_guard(directory)
+            prepared = state.new_prepared_state(
+                ready, operation="deploy", run_id="original-run", incident_id="a" * 32,
+                admission=state.admit(
+                    approved, root_id="test-root", target_id="target", predecessor_id="previous",
+                    transition_id="first-timepad", target_tuple=evidence, predecessor_tuple=previous["tuple"],
+                ),
+                target=target, predecessor=previous, predecessor_container_id="b" * 64,
+                transition_id="first-timepad", owned_run="original-run-final-deploy",
+                tooling_digest="5" * 64, prepared_proof_digest="6" * 64,
+            )
+            current = state.advance_state(prepared, "CUTOVER_POSSIBLE")
+            state.publish_current(directory, prepared)
+            state.publish_current(directory, current)
+            authorization = {
+                "schema": state.RECOVERY_AUTH_SCHEMA, "rootId": "test-root",
+                "originDigest": origin["originDigest"], "originalOperation": "deploy",
+                "runId": current["runId"], "operationEpoch": current["operationEpoch"],
+                "incidentId": current["incidentId"], "evidenceDigest": current["evidenceDigest"],
+                "targetId": "target", "revision": evidence["revision"], "version": evidence["version"],
+                "repositoryDigest": evidence["repositoryDigest"], "platformImageId": evidence["platformImageId"],
+                "action": "retry-exact-candidate",
+            }
+            selectors = {key: authorization[key] for key in (
+                "runId", "operationEpoch", "incidentId", "evidenceDigest",
+                "revision", "version", "repositoryDigest",
+            )}
+            path = Path(directory, "timepad-recovery-authorization.json")
+            path.write_bytes(json.dumps(authorization).encode())
+            path.chmod(0o600)
+            before = Path(directory, "timepad-guard/current.json").read_bytes()
+
+            def behavior(client, root, mode):
+                if mode != "controller-worker":
+                    fixture_publish(client, root)
+                    os._exit(1)  # No invented runtime-quiescence proof.
+                grant = client.request("grant", name="recovery-registration", localNs=30 * NS)
+                registered = state.register_recovery(
+                    root, contract=approved, selectors=selectors, deploy_lock_fd=9,
+                    execution_grant=state.ExecutionGrant(grant["attempt"], grant["grantId"], grant["endNs"]),
+                )
+                client.request("complete", grantId=grant["grantId"])
+                client.request("lease-ack", revision=registered["revision"], digest=registered["digest"])
+                admission = client.request("grant", name="recovery-admission", localNs=NS)
+                if state.read_guard(root, deploy_lock_fd=9)[1] != current:
+                    os._exit(6)
+                client.request("complete", grantId=admission["grantId"])
+                Path(root, "registration-checked").write_bytes(b"checked")
+                client.request("cancel", reason="EXIT", status=1)
+                signal.pause()
+
+            result, _ = self.run_fixture(
+                behavior, directory=directory, operation="forward-recover", timing=supervisor.Timing(),
+                timeout=25,
+            )
+            self.assertEqual((result["status"], result["reason"]), (1, "QUIESCENCE_UNCONFIRMED"))
+            self.assertEqual(b"checked", Path(directory, "registration-checked").read_bytes())
+            self.assertEqual(before, Path(directory, "timepad-guard/current.json").read_bytes())
+            lease = state._read_execution_lease_locked(directory)
+            self.assertFalse(lease["rollbackIssued"])
+            self.assertEqual("EXIT", lease["firstFailure"])
+            self.assertEqual(540 * NS, lease["workEndNs"] - lease["t0Ns"])
+            self.assertEqual(60 * NS, lease["hardEndNs"] - lease["workEndNs"])
+            self.assertNotIn("rollback-worker", [worker["mode"] for worker in lease["workers"]])
 
     def test_local_expiry_drains_forward_before_single_remaining_work_rollback(self):
         def behavior(client, directory, mode):

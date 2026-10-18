@@ -24,6 +24,14 @@ CLI mutation schemas:
   terminal guard state and definitive exit of every recorded old process.
 * ``check-lease --attempt`` is the read-only interlock for provider and
   retention callers; callers must pass their already-held FD9.
+* ``register-recovery`` consumes a private ``recovery-registration`` grant
+  before its initial lease exists. It checks the fixed protected authorization
+  file, exact dispatch selectors and frozen contract under FD9 before lease
+  publication. It never changes current state or reconciles an unresolved old
+  lease. Registered recovery permits bounded read-only admission, not retry.
+* ``rollback-admission`` checks the private fixed worker/grant and frozen state
+  without writes. Its ``state-admitted`` result is not daemon/provider/config
+  proof and cannot release a rollback or predecessor start by itself.
 * ``prepare --evidence`` accepts exactly ``rootId``, ``targetId``,
   ``predecessorId``, ``predecessorContainerId``, ``transitionId``, ``target``, ``predecessor``,
   ``operation``, ``runId``, ``incidentId``, ``ownedRun`` and ``toolingDigest``.
@@ -1468,6 +1476,56 @@ def _validate_lease_successor(previous: Mapping[str, Any], candidate: Mapping[st
         _reject("EXECUTION_LEASE_WORKER_CONFLICT")
 
 
+def _publish_execution_lease_locked(
+    root: str | os.PathLike[str],
+    candidate: Mapping[str, Any],
+    raw: bytes,
+    *,
+    recovery_registration: bool = False,
+) -> dict[str, Any]:
+    previous = _read_execution_lease_locked(root)
+    if previous is None:
+        if candidate["revision"] != 0 or candidate["lifecycle"] != "registered":
+            _reject("EXECUTION_LEASE_REVISION_CONFLICT")
+        try:
+            _, current = _read_guard_locked(root)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (
+            current["executionAttempt"] is not None
+            or not recovery_registration and current["phase"] not in TERMINAL | {"READY"}
+        ):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+    else:
+        if candidate["attempt"] != previous["attempt"] and candidate["revision"] == 0:
+            # Admission-only registration is not stale-lease reconciliation.
+            # Even valid selectors cannot replace an unresolved old attempt.
+            _validate_terminal_lease_successor(root, previous, candidate)
+        else:
+            if not _execution_lease_supervisor_is_live(previous):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            # Lost acknowledgments can repeat only the identical snapshot.
+            if previous != candidate:
+                _validate_lease_successor(previous, candidate)
+    if not _execution_lease_supervisor_is_live(candidate):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if candidate["lifecycle"] == "drained" and candidate["worker"] is None:
+        _validate_childless_lease_publication(candidate)
+    root_fd = _open_root(root)
+    try:
+        _atomic_write(root_fd, EXECUTION_LEASE_NAME, raw,
+                      MAX_EXECUTION_LEASE_BYTES, replace=previous is not None)
+        if _read_at(root_fd, EXECUTION_LEASE_NAME, MAX_EXECUTION_LEASE_BYTES) != raw:
+            _reject("EXECUTION_LEASE_READBACK_FAILED")
+    finally:
+        os.close(root_fd)
+    return {
+        "attempt": candidate["attempt"],
+        "revision": candidate["revision"],
+        "digest": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def publish_execution_lease(
     root: str | os.PathLike[str],
     lease: Mapping[str, Any] | bytes,
@@ -1486,48 +1544,125 @@ def publish_execution_lease(
     if len(raw) > MAX_EXECUTION_LEASE_BYTES:
         _reject("INPUT_TOO_LARGE")
     with deploy_lock(root, deploy_lock_fd):
-        previous = _read_execution_lease_locked(root)
-        if previous is None:
-            if candidate["revision"] != 0 or candidate["lifecycle"] != "registered":
-                _reject("EXECUTION_LEASE_REVISION_CONFLICT")
-            try:
-                _, current = _read_guard_locked(root)
-            except FileNotFoundError:
-                current = None
-            if current is not None and (
-                current["phase"] not in TERMINAL | {"READY"}
-                or current["executionAttempt"] is not None
-                and current["executionAttempt"] != candidate["attempt"]
-            ):
-                _reject("EXECUTION_LEASE_UNRESOLVED")
-        else:
-            if candidate["attempt"] != previous["attempt"] and candidate["revision"] == 0:
-                _validate_terminal_lease_successor(root, previous, candidate)
-            else:
-                if not _execution_lease_supervisor_is_live(previous):
-                    _reject("EXECUTION_LEASE_UNRESOLVED")
-                # A publication may reach disk just before its worker loses
-                # the acknowledgment channel. Re-ack only identical bytes;
-                # perform fsync/readback again, never advance over a revision.
-                if previous != candidate:
-                    _validate_lease_successor(previous, candidate)
-        if not _execution_lease_supervisor_is_live(candidate):
-            _reject("EXECUTION_LEASE_UNRESOLVED")
-        if candidate["lifecycle"] == "drained" and candidate["worker"] is None:
-            _validate_childless_lease_publication(candidate)
-        root_fd = _open_root(root)
+        return _publish_execution_lease_locked(root, candidate, raw)
+
+
+def _recovery_registration_authority(
+    origin: Mapping[str, Any], current: Mapping[str, Any],
+    contract: Mapping[str, Any], authorization: bytes,
+    selectors: Mapping[str, Any],
+) -> None:
+    """Read-only admission: exact protected authority, dispatch and reviewed evidence."""
+    auth = parse_json(authorization, MAX_AUTHORIZATION_BYTES)
+    authorize_recovery(auth, root_id=origin["rootId"], current=current)
+    selected = _object(dict(selectors), {
+        "runId", "incidentId", "operationEpoch", "evidenceDigest",
+        "repositoryDigest", "revision", "version",
+    })
+    if any(type(value) is not type(auth[key]) or value != auth[key]
+           for key, value in selected.items()):
+        _reject("RECOVERY_SELECTOR_MISMATCH")
+    parsed = parse_contract(contract)
+    admission = admit(
+        parsed, root_id=origin["rootId"], target_id=current["target"]["id"],
+        predecessor_id=current["predecessor"]["id"], transition_id=current["transitionId"],
+        target_tuple=current["target"]["tuple"], predecessor_tuple=current["predecessor"]["tuple"],
+    )
+    if admission.disposition != current["predecessorDisposition"] or \
+            admission.contract_digest != current["evidenceDigest"]:
+        _reject("RECOVERY_EVIDENCE_CHANGED")
+
+
+def register_recovery(
+    root: str | os.PathLike[str], *, contract: Mapping[str, Any],
+    selectors: Mapping[str, Any], deploy_lock_fd: int,
+    execution_grant: ExecutionGrant,
+) -> dict[str, Any]:
+    """Register bounded read-only recovery without adopting the incident or old lease.
+
+    Only the private registered controller may publish this initial execution
+    ownership. Schema/config/provider writes and stale-lease reconciliation
+    remain forbidden until their separate runtime and ownership proofs exist.
+    """
+    from test_vps_timepad_supervisor import SupervisorError, WorkerClient
+
+    client = None
+    token = None
+    with deploy_lock(root, deploy_lock_fd):
         try:
-            _atomic_write(root_fd, EXECUTION_LEASE_NAME, raw,
-                          MAX_EXECUTION_LEASE_BYTES, replace=previous is not None)
-            if _read_at(root_fd, EXECUTION_LEASE_NAME, MAX_EXECUTION_LEASE_BYTES) != raw:
-                _reject("EXECUTION_LEASE_READBACK_FAILED")
+            client = WorkerClient(str(root))
+            candidate = _execution_lease(client.request("lease"))
+            if (
+                client.attempt != execution_grant.attempt
+                or client.role != "controller-worker"
+                or candidate["attempt"] != execution_grant.attempt
+                or candidate["supervisor"] != client.supervisor
+                or candidate["operation"] != "forward-recover"
+                or candidate["workerMode"] != client.role
+                or candidate["lifecycle"] != "registered" or candidate["revision"] != 0
+                or candidate["firstFailure"] is not None or candidate["rollbackIssued"]
+                or candidate["worker"] is None
+                or candidate["workers"] != [{"mode": client.role, **candidate["worker"]}]
+                or candidate["workEndNs"] is None
+                or candidate["workEndNs"] - candidate["t0Ns"] != 540_000_000_000
+                or candidate["hardEndNs"] - candidate["workEndNs"] != 60_000_000_000
+                or execution_grant.end_ns > candidate["workEndNs"]
+            ):
+                _reject("RECOVERY_REGISTRATION_REFUSED")
+
+            def check() -> None:
+                if time.monotonic_ns() >= execution_grant.end_ns:
+                    _reject("EXECUTION_GRANT_EXPIRED")
+                if client.request(
+                    "validate-grant", grantId=execution_grant.grant_id, endNs=execution_grant.end_ns,
+                ) != {
+                    "attempt": execution_grant.attempt, "grantId": execution_grant.grant_id,
+                    "endNs": execution_grant.end_ns, "role": client.role,
+                    "name": "recovery-registration",
+                }:
+                    _reject("EXECUTION_GRANT_INVALID")
+                if time.monotonic_ns() >= execution_grant.end_ns:
+                    _reject("EXECUTION_GRANT_EXPIRED")
+
+            token = _EXECUTION_CHECK.set(check)
+            check()
+            origin, current = _read_guard_locked(root)
+            root_fd = _open_root(root)
+            try:
+                authorization = _read_at(
+                    root_fd, "timepad-recovery-authorization.json", MAX_AUTHORIZATION_BYTES,
+                )
+            finally:
+                os.close(root_fd)
+            _recovery_registration_authority(origin, current, contract, authorization, selectors)
+            check()
+            result = _publish_execution_lease_locked(
+                root, candidate, _canonical(candidate), recovery_registration=True,
+            )
+            check()
+            return result
+        except SupervisorError:
+            _reject("EXECUTION_GRANT_REVOKED")
         finally:
-            os.close(root_fd)
-    return {
-        "attempt": candidate["attempt"],
-        "revision": candidate["revision"],
-        "digest": hashlib.sha256(raw).hexdigest(),
-    }
+            if token is not None:
+                _EXECUTION_CHECK.reset(token)
+            if client is not None:
+                client.close()
+
+
+def rollback_state_admission(current: Mapping[str, Any], lease: Mapping[str, Any]) -> None:
+    """Pure state half of admission; never attests daemon/config/provider quiescence."""
+    state = _current(dict(current))
+    if (
+        lease["operation"] != "deploy" or lease["workerMode"] != "rollback-worker"
+        or lease["lifecycle"] != "rollback-admission" or not lease["rollbackIssued"]
+        or state["executionAttempt"] != lease["attempt"] or state["rollbackIssued"]
+        or state["phase"] not in {"PREPARED", "CUTOVER_POSSIBLE", "VERIFYING"}
+        or state["ownedChild"] is not None or state["commitWitnessDigest"] is not None
+        or state["providerFinalizationDigest"] is not None
+        or state["phase"] != "PREPARED" and state["predecessorDisposition"] != "post-barrier-compatible"
+    ):
+        _reject("ROLLBACK_NOT_ADMITTED")
 
 
 def check_execution_lease(
@@ -2016,6 +2151,17 @@ def _cli() -> argparse.ArgumentParser:
     recovery.add_argument("--root", required=True)
     recovery.add_argument("--authorization", required=True)
     recovery.add_argument("--deploy-lock-fd", type=int)
+    registration = sub.add_parser("register-recovery")
+    registration.add_argument("--root", required=True)
+    registration.add_argument("--contract", required=True)
+    registration.add_argument("--deploy-lock-fd", type=int, required=True)
+    registration.add_argument("--run-id", required=True)
+    registration.add_argument("--incident-id", required=True)
+    registration.add_argument("--epoch", type=int, required=True)
+    registration.add_argument("--binding-digest", required=True)
+    registration.add_argument("--repository-digest", required=True)
+    registration.add_argument("--revision", required=True)
+    registration.add_argument("--version", required=True)
     bootstrap = sub.add_parser("bootstrap")
     bootstrap.add_argument("--root", required=True)
     bootstrap.add_argument("--authority", required=True)
@@ -2046,6 +2192,9 @@ def _cli() -> argparse.ArgumentParser:
     claim_rollback = sub.add_parser("claim-rollback")
     claim_rollback.add_argument("--root", required=True)
     claim_rollback.add_argument("--deploy-lock-fd", type=int, required=True)
+    rollback_admission = sub.add_parser("rollback-admission")
+    rollback_admission.add_argument("--root", required=True)
+    rollback_admission.add_argument("--deploy-lock-fd", type=int, required=True)
     unresolved = sub.add_parser("retain-unresolved")
     unresolved.add_argument("--root", required=True)
     unresolved.add_argument("--deploy-lock-fd", type=int, required=True)
@@ -2060,7 +2209,8 @@ def _cli() -> argparse.ArgumentParser:
     stop_child.add_argument("--root", required=True)
     stop_child.add_argument("--deploy-lock-fd", type=int, required=True)
     stop_child.add_argument("--term-grace-seconds", type=float, default=5.0)
-    for mutation in (bootstrap, publish, prepare, advance, claim_rollback, unresolved, stop_child):
+    for mutation in (bootstrap, publish, prepare, advance, claim_rollback, unresolved, stop_child,
+                     registration, rollback_admission):
         mutation.add_argument("--execution-attempt")
         mutation.add_argument("--execution-grant")
         mutation.add_argument("--deadline-ns", type=int)
@@ -2114,6 +2264,54 @@ def main(argv: list[str] | None = None) -> int:
                 result = authorize_recovery(
                     authorization, root_id=origin["rootId"], current=current
                 )
+        elif args.command == "register-recovery":
+            if execution_grant is None:
+                _reject("EXECUTION_GRANT_REQUIRED")
+            result = register_recovery(
+                args.root, contract=parse_contract(_read_input(args.contract, MAX_CONTRACT_BYTES)),
+                selectors={
+                    "runId": args.run_id, "incidentId": args.incident_id,
+                    "operationEpoch": args.epoch, "evidenceDigest": args.binding_digest,
+                    "repositoryDigest": args.repository_digest,
+                    "revision": args.revision, "version": args.version,
+                },
+                deploy_lock_fd=args.deploy_lock_fd, execution_grant=execution_grant,
+            )
+        elif args.command == "rollback-admission":
+            from test_vps_timepad_supervisor import SupervisorError, WorkerClient
+
+            with deploy_lock(args.root, args.deploy_lock_fd):
+                lease = _read_execution_lease_locked(args.root)
+                if execution_grant is None or lease is None or \
+                        lease["attempt"] != execution_grant.attempt or \
+                        lease["workEndNs"] is None or execution_grant.end_ns > lease["workEndNs"] or \
+                        time.monotonic_ns() >= execution_grant.end_ns:
+                    _reject("ROLLBACK_NOT_ADMITTED")
+                client = None
+                try:
+                    client = WorkerClient(str(args.root))
+                    if client.attempt != execution_grant.attempt or \
+                            client.role != "rollback-worker" or client.supervisor != lease["supervisor"]:
+                        _reject("ROLLBACK_NOT_ADMITTED")
+                    expected = {
+                        "attempt": execution_grant.attempt, "grantId": execution_grant.grant_id,
+                        "endNs": execution_grant.end_ns, "role": client.role, "name": "rollback-admission",
+                    }
+                    if client.request("validate-grant", grantId=execution_grant.grant_id,
+                                      endNs=execution_grant.end_ns) != expected:
+                        _reject("ROLLBACK_NOT_ADMITTED")
+                    _, current = _read_guard_locked(args.root)
+                    rollback_state_admission(current, lease)
+                    if client.request("validate-grant", grantId=execution_grant.grant_id,
+                                      endNs=execution_grant.end_ns) != expected or \
+                            time.monotonic_ns() >= execution_grant.end_ns:
+                        _reject("ROLLBACK_NOT_ADMITTED")
+                    result = {"result": "state-admitted", "epoch": current["operationEpoch"]}
+                except SupervisorError:
+                    _reject("EXECUTION_GRANT_REVOKED")
+                finally:
+                    if client is not None:
+                        client.close()
         elif args.command == "bootstrap":
             authority = parse_json(_read_input(args.authority, MAX_AUTHORIZATION_BYTES), MAX_AUTHORIZATION_BYTES)
             observed = parse_json(_read_input(args.observed, MAX_AUTHORIZATION_BYTES), MAX_AUTHORIZATION_BYTES)
