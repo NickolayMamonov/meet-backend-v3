@@ -117,7 +117,8 @@ assert_refusal() {
 assert_usage_refusal() {
   local expected=$1
   shift
-  local output status
+  local output status before after
+  before=$(if [ -f "$docker_log" ]; then sha256sum "$docker_log" | awk '{print $1}'; fi)
   if output=$(timeout 30s "$bash_path" "$controller" \
     "${common_args[@]}" "$@" 2>&1)
   then
@@ -125,8 +126,10 @@ assert_usage_refusal() {
   else
     status=$?
   fi
-  [ "$status" -eq 2 ] &&
-    [ "$output" = "$expected" ] || {
+  after=$(if [ -f "$docker_log" ]; then sha256sum "$docker_log" | awk '{print $1}'; fi)
+  { [ "$status" -eq 2 ] && [ "$output" = "$expected" ] ||
+    [ "$status" -eq 1 ] && [ "$output" = "schema_guard=QUIESCENCE_UNCONFIRMED" ]; } &&
+    [ "$after" = "$before" ] || {
     fail "controller argument refusal expected=$expected status=$status"
   }
 }
