@@ -302,19 +302,19 @@ dispatch_failure
                 trace = pathlib.Path(parent) / "trace"
                 result = self.run_shell(function_sources + r"""
 trace=$1
-phase=$2
-disposition=$3
+fixture_phase=$2
+fixture_disposition=$3
 trigger=$4
 failure_dispatch_active=false
 failure_signal=
-unsafe_cutover_latch=$([ "$phase" = PREPARED ] && echo false || echo true)
+unsafe_cutover_latch=$([ "$fixture_phase" = PREPARED ] && echo false || echo true)
 mutation_started=true
 prepared_timepad=true
 rollback_complete=false
 credential_prepared=false
 owned_child_pid=101
 owned_child_fifo=
-owned_child_phase=$phase
+owned_child_phase=$fixture_phase
 owned_child_attempt=fixture-incident:1
 timepad_helper=fixture-helper
 state_root=/fixture
@@ -330,7 +330,7 @@ recovery_work_check() { return 0; }
 timeout() { shift; "$@"; }
 python3() {
   printf '{"current":{"phase":"%s","predecessorDisposition":"%s","ownedChild":null}}\n' \
-    "$phase" "$disposition"
+    "$fixture_phase" "$fixture_disposition"
 }
 timepad_advance() { echo "state:$1:$2" >>"$trace"; }
 complete_owned_child() {
@@ -1189,6 +1189,7 @@ class TimepadStateTests(unittest.TestCase):
             first = execution_lease()
             with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True):
                 with state.deploy_lock(root) as lock_fd:
+                    os.set_inheritable(lock_fd, True)
                     lease_path = pathlib.Path(parent) / "lease.json"
                     lease_path.write_text(
                         json.dumps(first, sort_keys=True, separators=(",", ":")), encoding="ascii",
@@ -1245,6 +1246,7 @@ class TimepadStateTests(unittest.TestCase):
             with mock.patch.object(
                 state, "_execution_lease_supervisor_is_live", return_value=True,
             ), state.deploy_lock(root) as lock_fd:
+                os.set_inheritable(lock_fd, True)
                 state.publish_execution_lease(root, lease, deploy_lock_fd=lock_fd)
                 authority = {
                     "rootId": "test-root", "bootstrapId": "bootstrap-1",
@@ -1301,6 +1303,7 @@ class TimepadStateTests(unittest.TestCase):
             lease = execution_lease()
             with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True):
                 with state.deploy_lock(root) as lock_fd:
+                    os.set_inheritable(lock_fd, True)
                     state.publish_execution_lease(root, lease, deploy_lock_fd=lock_fd)
             with self.assertRaises(state.GuardError) as error:
                 state.check_execution_lease(root, attempt=lease["attempt"])
@@ -1640,7 +1643,7 @@ class TimepadStateTests(unittest.TestCase):
                 "transitionId": "first-timepad", "target": tuple_evidence(),
                 "predecessor": tuple_evidence(after="d"), "operation": "deploy",
                 "runId": "cli-run", "incidentId": "3" * 32, "ownedRun": "123-3",
-                "toolingDigest": digest("2"),
+                "toolingDigest": digest("2"), "preparedProofDigest": digest("9"),
             }
             evidence_path = base / "evidence.json"
             evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
