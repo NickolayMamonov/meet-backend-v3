@@ -809,17 +809,37 @@ supervisor_register_recovery() {
   local current container inspection global_ids compose_ids runtime_evidence=
   local registration_result
   local -a evidence_args=()
-  grant=$(supervisor_client grant recovery-registration 30) || return 1
-  grant_id=$(jq -er '.grantId | strings' <<<"$grant") || return 1
-  deadline=$(jq -er '.endNs | numbers' <<<"$grant") || return 1
+  grant=$(supervisor_client grant recovery-registration 30) || {
+    [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+      echo "fixture_timepad_guard=SUPERVISOR_GRANT_REFUSED" >&2
+    return 1
+  }
+  grant_id=$(jq -er '.grantId | strings' <<<"$grant") || {
+    [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+      echo "fixture_timepad_guard=SUPERVISOR_GRANT_INVALID" >&2
+    return 1
+  }
+  deadline=$(jq -er '.endNs | numbers' <<<"$grant") || {
+    [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+      echo "fixture_timepad_guard=SUPERVISOR_DEADLINE_INVALID" >&2
+    return 1
+  }
   current=$(command timeout 5s python3 "$timepad_helper" read-state \
-    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || {
+      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+        echo "fixture_timepad_guard=RECOVERY_CURRENT_READ_FAILED" >&2
+      return 1
+    }
   if jq -e '.executionAttempt != null and
     (.phase != "COMMITTED" and .phase != "ROLLED_BACK" and .phase != "READY")' \
     <<<"$current" >/dev/null; then
     command timeout 5s python3 "$timepad_helper" authorize-recovery \
       --root "$state_root" --authorization "$state_root/timepad-recovery-authorization.json" \
-      --deploy-lock-fd 9 >/dev/null || return 1
+      --deploy-lock-fd 9 >/dev/null || {
+        [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+          echo "fixture_timepad_guard=RECOVERY_AUTHORIZATION_REFUSED" >&2
+        return 1
+      }
     jq -e --arg run "$recovery_run_key" --arg incident "${recovery_incident,,}" \
       --arg epoch "$recovery_epoch" --arg binding "$recovery_binding_digest" \
       --arg repository "${image##*@sha256:}" --arg revision "$revision" --arg version "$version" '
@@ -827,23 +847,47 @@ supervisor_register_recovery() {
       (.operationEpoch | tostring) == $epoch and .evidenceDigest == $binding and
       .target.tuple.repositoryDigest == $repository and
       .target.tuple.revision == $revision and .target.tuple.version == $version
-    ' <<<"$current" >/dev/null || return 1
+    ' <<<"$current" >/dev/null || {
+      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+        echo "fixture_timepad_guard=RECOVERY_SELECTOR_MISMATCH" >&2
+      return 1
+    }
     container=$(jq -er '.containerId | strings | select(test("^[a-f0-9]{64}$"))' \
-      <<<"$current") || return 1
-    inspection=$(command timeout 5s docker inspect "$container") || return 1
+      <<<"$current") || {
+        [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+          echo "fixture_timepad_guard=RECOVERY_CONTAINER_INVALID" >&2
+        return 1
+      }
+    inspection=$(command timeout 5s docker inspect "$container") || {
+      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+        echo "fixture_timepad_guard=RECOVERY_INSPECTION_FAILED" >&2
+      return 1
+    }
     global_ids=$(command timeout 5s docker ps --all --quiet \
       --filter label=com.docker.compose.project=meet-production \
-      --filter label=com.docker.compose.service=backend) || return 1
+      --filter label=com.docker.compose.service=backend) || {
+        [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+          echo "fixture_timepad_guard=RECOVERY_DOCKER_INVENTORY_FAILED" >&2
+        return 1
+      }
     compose_ids=$(command timeout 5s bash -c '
       set -euo pipefail
       source "$1"
       runtime_compose "$2" "$3" ps -aq backend
-    ' _ "$runtime_helper" "$root" "$compose_script") || return 1
+    ' _ "$runtime_helper" "$root" "$compose_script") || {
+      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+        echo "fixture_timepad_guard=RECOVERY_COMPOSE_INVENTORY_FAILED" >&2
+      return 1
+    }
     runtime_evidence=$(jq -cn --argjson inspection "$inspection" \
       --arg global "$global_ids" --arg compose "$compose_ids" '
       {inspection:$inspection,backendInventory:($global | split("\n")),
        composeInventory:($compose | split("\n"))}
-    ') || return 1
+    ') || {
+      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+        echo "fixture_timepad_guard=RECOVERY_EVIDENCE_ENCODE_FAILED" >&2
+      return 1
+    }
     evidence_args=(--runtime-evidence)
   fi
   registration_result=$(command timeout 30s python3 "$timepad_helper" register-recovery \
