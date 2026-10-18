@@ -200,6 +200,8 @@ python3() {
   case "$2" in
     absence-resume)
       echo proof >>"$state/trace"
+      proof_input=$(</dev/stdin)
+      printf 'proof-input:%s\n' "$proof_input" >>"$state/trace"
       [ "$fault" != proof ] ;;
     read-state) echo '{"current":{"phase":"FORWARD_RECOVERING"}}' ;;
     *) return 90 ;;
@@ -235,6 +237,17 @@ echo "bound:$recovery_container"
 """, path.as_posix(), fault,
                 )
                 trace = (path / "trace").read_text().splitlines() if (path / "trace").exists() else []
+                proof_lines = [line.removeprefix("proof-input:") for line in trace
+                               if line.startswith("proof-input:")]
+                trace = [line for line in trace if not line.startswith("proof-input:")]
+                if fault == "none":
+                    self.assertEqual(1, len(proof_lines))
+                    proof_payload = json.loads(proof_lines[0])
+                    self.assertEqual(
+                        "meet-backend/test-vps-provider-absence-resume/v1",
+                        proof_payload["schema"],
+                    )
+                    self.assertEqual([], proof_payload["backendInventory"])
                 if fault == "none":
                     self.assertEqual(0, result.returncode, f"{result.stderr}; trace={trace!r}")
                     self.assertEqual([
@@ -1301,6 +1314,14 @@ class TimepadStateTests(unittest.TestCase):
             root = pathlib.Path(parent) / "deploy"
             root.mkdir(mode=0o700)
             lease = execution_lease()
+            authority = {"schema": state.AUTHORITY_SCHEMA, "fixture": "lease-test"}
+            observed = {
+                "schema": state.digest("fixture-schema"),
+                "backendImage": state.digest("fixture-image"),
+                "backendRevision": "fixture-revision",
+                "providerImage": state.digest("provider-image"),
+            }
+            state.bootstrap_guard(root, authority=authority, observed=observed)
             with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True):
                 with state.deploy_lock(root) as lock_fd:
                     os.set_inheritable(lock_fd, True)

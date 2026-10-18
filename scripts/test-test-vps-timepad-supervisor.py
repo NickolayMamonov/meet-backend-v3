@@ -59,6 +59,17 @@ class AttemptTests(unittest.TestCase):
         self.attempt.arm()
         return acknowledged(self.attempt)
 
+    def test_worker_lease_identity_matches_state_schema(self):
+        identity = supervisor.ProcessIdentity(123, 1, 456, 0)
+        with mock.patch.object(supervisor, "boot_id", return_value="01234567-89ab-cdef-0123-456789abcdef"):
+            lease_identity = supervisor.lease_identity(identity)
+        self.assertEqual(
+            {"pid": 123, "startTicks": 456, "bootId": "01234567-89ab-cdef-0123-456789abcdef"},
+            lease_identity,
+        )
+        self.assertNotIn("parentPid", lease_identity)
+        self.assertNotIn("uid", lease_identity)
+
     def test_fixed_production_deadlines_and_no_reset(self):
         attempt = self.armed()
         original = (attempt.nonce, attempt.t0, attempt.work_end, attempt.hard_end)

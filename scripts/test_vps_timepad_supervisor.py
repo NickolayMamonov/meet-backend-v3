@@ -470,6 +470,15 @@ def boot_id() -> str:
     return value
 
 
+def lease_identity(identity: ProcessIdentity) -> dict[str, Any]:
+    """Project proc identity onto the strict durable lease schema."""
+    return {
+        "pid": identity.pid,
+        "startTicks": identity.start,
+        "bootId": boot_id(),
+    }
+
+
 def linux_preflight() -> None:
     if sys.platform != "linux" or not hasattr(os, "pidfd_open") or \
             not hasattr(signal, "pidfd_send_signal"):
@@ -689,7 +698,7 @@ class Supervisor:
         self.lock_fd: int | None = None
         self.worker_pid: int | None = None
         self.worker: socket.socket | None = None
-        self.worker_identity: dict[str, int] | None = None
+        self.worker_identity: dict[str, Any] | None = None
         self.worker_identities: list[dict[str, Any]] = []
         self.worker_hello = False
         self.worker_handshake_end: int | None = None
@@ -782,7 +791,7 @@ class Supervisor:
         child.close()
         self.worker, self.worker_pid = parent, pid
         try:
-            self.worker_identity = process_identity(pid).frame()
+            self.worker_identity = lease_identity(process_identity(pid))
         except (FileNotFoundError, ProcessLookupError):
             self.worker_identity = None
         if self.worker_identity is not None:
