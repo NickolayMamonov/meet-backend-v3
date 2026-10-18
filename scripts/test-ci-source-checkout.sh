@@ -131,6 +131,10 @@ require 'push:' 'dev push trigger'
 require '    branches: [dev]' 'dev-only push branch'
 require 'source_sha, release_tag, release_version, and release_id must be supplied together' \
   'release tuple validation'
+require 'python3 -B "$TOOLING_SCRIPTS/test-test-vps-timepad-supervisor.py"' \
+  'isolated Linux supervisor acceptance command'
+require 'timeout 900s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh"' \
+  'bounded isolated supervisor fixture launcher'
 
 if grep -Eq 'actions/checkout@(v|[0-9]+([.][0-9]+){0,2})($|[^0-9a-f])' "$WORKFLOW"; then
   echo "CI workflow contains an unpinned checkout action" >&2
