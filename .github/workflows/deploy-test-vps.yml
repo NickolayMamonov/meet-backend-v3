@@ -337,6 +337,7 @@ jobs:
             scripts/deploy-test-vps-provider-release.sh
             scripts/test-vps-provider-credential.py
             scripts/test_vps_timepad_state.py
+            scripts/test_vps_timepad_supervisor.py
             scripts/test-vps-timepad-release-contracts.json
           )
           for file in "${files[@]}"; do
@@ -763,6 +764,11 @@ jobs:
           fi
           exec 9<"$state_root/.deploy.lock"
           flock -n 9
+          execution_lease="$state_root/.timepad-execution.json"
+          if [ -e "$execution_lease" ] || [ -L "$execution_lease" ]; then
+            echo "RECOVERY_REQUIRED" >&2
+            exit 1
+          fi
           guard_helper="$tooling/scripts/test_vps_timepad_state.py"
           protected_refs=()
           protected_states=()

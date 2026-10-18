@@ -6,6 +6,11 @@ filesystem operations are deliberately Linux-only; parsing and admission are
 portable and independently testable.
 
 CLI mutation schemas:
+* ``publish-lease --lease`` accepts the fixed supervisor lease snapshot only,
+  publishes it atomically under inherited FD9, and returns its exact revision
+  and SHA-256 only after fsync and readback. A lease is never auto-cleared.
+* ``check-lease --attempt`` is the read-only interlock for provider and
+  retention callers; callers must pass their already-held FD9.
 * ``prepare --evidence`` accepts exactly ``rootId``, ``targetId``,
   ``predecessorId``, ``predecessorContainerId``, ``transitionId``, ``target``, ``predecessor``,
   ``operation``, ``runId``, ``incidentId``, ``ownedRun`` and ``toolingDigest``.
@@ -52,7 +57,7 @@ except ImportError:  # Parsing/admission remain portable; filesystem operations 
     fcntl = None
 
 CONTRACT_SCHEMA = "meet-backend/test-vps-timepad-release-contracts/v1"
-STATE_SCHEMA = "meet-backend/test-vps-timepad-state/v2"
+STATE_SCHEMA = "meet-backend/test-vps-timepad-state/v3"
 ORIGIN_SCHEMA = "meet-backend/test-vps-timepad-origin/v1"
 CONTROLLER = "timepad-cutover-v1"
 MAX_CONTRACT_BYTES = 64 * 1024
@@ -60,6 +65,7 @@ MAX_AUTHORIZATION_BYTES = 32 * 1024
 MAX_ORIGIN_BYTES = 4 * 1024
 MAX_CURRENT_BYTES = 16 * 1024
 MAX_CHANGES_BYTES = 4 * 1024
+MAX_EXECUTION_LEASE_BYTES = 4 * 1024
 MAX_JSON_DEPTH = 8
 MAX_IMAGES = 8
 MAX_STR = 128
@@ -68,6 +74,7 @@ MAX_KEY = 64
 MAX_U64 = (1 << 64) - 1
 GUARD_DIR = "timepad-guard"
 LOCK_NAME = ".deploy.lock"
+EXECUTION_LEASE_NAME = ".timepad-execution.json"
 RENAME_NOREPLACE = 1
 HEX_256 = re.compile(r"^[a-f0-9]{64}$")
 REVISION = re.compile(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
@@ -75,6 +82,7 @@ VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$")
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ROOT_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 BOOT_ID = re.compile(r"^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$")
+LEASE_NONCE = re.compile(r"^[a-f0-9]{32}$")
 CHILD_ATTEMPT_ID = re.compile(r"^([a-f0-9]{32}):([1-9][0-9]{0,19})$")
 CHILD_LIFECYCLES = frozenset({"waiting", "released", "reaped"})
 CHILD_ACTIVE_PHASES = frozenset({
@@ -159,6 +167,70 @@ def _text(value: Any, *, pattern: re.Pattern[str] | None = None, maximum: int = 
 
 def _digest(value: Any) -> str:
     return _text(value, pattern=HEX_256, maximum=64)
+
+
+def _execution_lease(value: Any) -> dict[str, Any]:
+    """Validate one bounded snapshot emitted by the fixed execution supervisor."""
+    fields = {
+        "format", "attempt", "operation", "t0Ns", "workEndNs", "hardEndNs",
+        "firstFailure", "firstStatus", "rollbackIssued", "lifecycle", "revision",
+        "supervisor", "worker", "workerMode", "workers",
+    }
+    lease = _object(value, fields)
+    if type(lease["format"]) is not int or lease["format"] != 1:
+        _reject("EXECUTION_LEASE_INVALID")
+    _text(lease["attempt"], pattern=LEASE_NONCE, maximum=32)
+    _text(lease["operation"], pattern=re.compile(r"^(?:deploy|forward-recover|retention)$"), maximum=32)
+    _text(lease["lifecycle"], pattern=re.compile(
+        r"^(?:registered|armed|cancel-forward|drain-forward|rollback-admission|rolling-back|"
+        r"draining|quiescence-unconfirmed|drained)$"
+    ), maximum=32)
+    _uint(lease["revision"])
+    _bool(lease["rollbackIssued"])
+    deadlines = tuple(lease[key] for key in ("t0Ns", "workEndNs", "hardEndNs"))
+    if any(item is None for item in deadlines):
+        if not all(item is None for item in deadlines):
+            _reject("EXECUTION_LEASE_INVALID")
+    else:
+        start, work_end, hard_end = (_uint(item) for item in deadlines)
+        if not start <= work_end <= hard_end:
+            _reject("EXECUTION_LEASE_INVALID")
+    if lease["firstFailure"] is not None:
+        _text(lease["firstFailure"], pattern=re.compile(r"^[A-Z][A-Z0-9_]{0,63}$"))
+    if lease["firstStatus"] is not None and (
+        type(lease["firstStatus"]) is not int or not 1 <= lease["firstStatus"] <= 255
+    ):
+        _reject("EXECUTION_LEASE_INVALID")
+    if (lease["firstFailure"] is None) != (lease["firstStatus"] is None):
+        _reject("EXECUTION_LEASE_INVALID")
+    _text(lease["workerMode"], pattern=re.compile(
+        r"^(?:controller-worker|rollback-worker|fail-closed-worker|retention-worker)$"
+    ), maximum=32)
+
+    def identity(raw: Any, *, nullable: bool = False) -> dict[str, Any] | None:
+        if nullable and raw is None:
+            return None
+        row = _object(raw, {"pid", "startTicks", "bootId"})
+        if type(row["pid"]) is not int or not 1 < row["pid"] <= (1 << 31) - 1:
+            _reject("EXECUTION_LEASE_INVALID")
+        if type(row["startTicks"]) is not int or not 0 < row["startTicks"] <= MAX_U64:
+            _reject("EXECUTION_LEASE_INVALID")
+        _text(row["bootId"], pattern=BOOT_ID, maximum=36)
+        return row
+
+    identity(lease["supervisor"])
+    identity(lease["worker"], nullable=True)
+    if not isinstance(lease["workers"], list) or len(lease["workers"]) > 3:
+        _reject("EXECUTION_LEASE_INVALID")
+    for worker in lease["workers"]:
+        worker = _object(worker, {"mode", "pid", "startTicks", "bootId"})
+        _text(worker["mode"], pattern=re.compile(
+            r"^(?:controller-worker|rollback-worker|fail-closed-worker|retention-worker)$"
+        ), maximum=32)
+        identity({key: worker[key] for key in ("pid", "startTicks", "bootId")})
+    if lease["rollbackIssued"] and lease["operation"] == "retention":
+        _reject("EXECUTION_LEASE_INVALID")
+    return lease
 
 
 def _bool(value: Any) -> bool:
@@ -442,8 +514,11 @@ def _current(value: Any) -> dict[str, Any]:
         "toolingDigest", "containerId", "configHash", "ownedChild", "commitWitnessDigest",
         "providerFinalizationDigest",
         "commitSubstep", "terminalReceipt", "latestAttemptId", "rollbackIssued",
+        "executionAttempt", "preparedProofDigest",
     }
-    obj = _object(value, keys)
+    if not isinstance(value, dict) or value.keys() != keys:
+        _reject()
+    obj = dict(value)
     if obj["schema"] != STATE_SCHEMA or obj["controller"] != CONTROLLER:
         _reject("STATE_INVALID")
     _bool(obj["rollbackIssued"])
@@ -478,9 +553,11 @@ def _current(value: Any) -> dict[str, Any]:
         _child_attempt_sequence(obj["latestAttemptId"], obj["incidentId"])
         if obj["phase"] == "PREPARED":
             _reject("STATE_CHILD_PHASE")
+    if obj["executionAttempt"] is not None:
+        _text(obj["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
     for key in (
         "evidenceDigest", "toolingDigest", "configHash", "commitWitnessDigest",
-        "providerFinalizationDigest", "terminalReceipt",
+        "providerFinalizationDigest", "terminalReceipt", "preparedProofDigest",
     ):
         if obj[key] is not None:
             _digest(obj[key])
@@ -516,6 +593,8 @@ def _current(value: Any) -> dict[str, Any]:
             "ownedChild", "commitWitnessDigest", "providerFinalizationDigest",
             "commitSubstep", "terminalReceipt",
             "latestAttemptId",
+            "executionAttempt",
+            "preparedProofDigest",
         )):
             _reject("STATE_INVALID")
         if obj["rollbackIssued"]:
@@ -524,6 +603,7 @@ def _current(value: Any) -> dict[str, Any]:
         "operation", "runId", "incidentId", "target", "predecessor", "transitionId",
         "predecessorContainerId",
         "evidenceDigest", "predecessorDisposition", "ownedRun", "toolingDigest",
+        "preparedProofDigest",
     )):
         _reject("STATE_INVALID")
     if obj["phase"] in {"COMMITTING", "COMMITTED"} and any(
@@ -561,6 +641,7 @@ def new_ready_state(origin_digest: str) -> dict[str, Any]:
         "ownedChild": None, "commitWitnessDigest": None,
         "providerFinalizationDigest": None, "commitSubstep": None,
         "terminalReceipt": None, "latestAttemptId": None, "rollbackIssued": False,
+        "executionAttempt": None, "preparedProofDigest": None,
     }
 
 
@@ -577,6 +658,8 @@ def new_prepared_state(
     transition_id: str | None,
     owned_run: str,
     tooling_digest: str,
+    prepared_proof_digest: str,
+    execution_attempt: str | None = None,
 ) -> dict[str, Any]:
     prior = _current(dict(ready))
     if prior["phase"] not in TERMINAL | {"READY"} or prior["operationEpoch"] == MAX_U64:
@@ -606,12 +689,17 @@ def new_prepared_state(
             maximum=64,
         ),
         "evidenceDigest": _digest(admission.contract_digest),
+        "preparedProofDigest": _digest(prepared_proof_digest),
         "predecessorDisposition": admission.disposition,
         "ownedRun": _text(owned_run, pattern=ROOT_KEY), "toolingDigest": _digest(tooling_digest),
         "containerId": None, "configHash": None, "ownedChild": None,
         "commitWitnessDigest": None, "providerFinalizationDigest": None,
         "commitSubstep": None, "terminalReceipt": None,
         "latestAttemptId": None, "rollbackIssued": False,
+        "executionAttempt": (
+            _text(execution_attempt, pattern=LEASE_NONCE, maximum=32)
+            if execution_attempt is not None else prior["executionAttempt"]
+        ),
     })
     return _current(result)
 
@@ -636,7 +724,7 @@ PHASE_EDGES = {
 INCIDENT_BINDING_FIELDS = (
     "originDigest", "operation", "runId", "incidentId", "target", "predecessor",
     "predecessorContainerId", "transitionId", "evidenceDigest",
-    "predecessorDisposition", "ownedRun", "toolingDigest",
+    "predecessorDisposition", "ownedRun", "toolingDigest", "preparedProofDigest",
 )
 
 
@@ -654,6 +742,9 @@ def validate_state_transition(old: Mapping[str, Any], new: Mapping[str, Any]) ->
         return
     if new_epoch != old_epoch:
         _reject("STATE_EPOCH_CONFLICT")
+    if previous["executionAttempt"] is not None and \
+            candidate["executionAttempt"] != previous["executionAttempt"]:
+        _reject("STATE_EXECUTION_ATTEMPT_CONFLICT")
     if candidate["phase"] == previous["phase"]:
         if previous["phase"] in {"READY", *TERMINAL}:
             if candidate != previous:
@@ -1085,6 +1176,171 @@ def _read_at(dir_fd: int, name: str, limit: int, mode: int = 0o600) -> bytes:
         os.close(fd)
 
 
+def _read_execution_lease_locked(root: str | os.PathLike[str]) -> dict[str, Any] | None:
+    root_fd = _open_root(root)
+    try:
+        try:
+            raw = _read_at(root_fd, EXECUTION_LEASE_NAME, MAX_EXECUTION_LEASE_BYTES)
+        except FileNotFoundError:
+            return None
+        lease = _execution_lease(parse_json(raw, MAX_EXECUTION_LEASE_BYTES))
+        if _canonical(lease) != raw:
+            _reject("EXECUTION_LEASE_INVALID")
+        return lease
+    finally:
+        os.close(root_fd)
+
+
+def _execution_lease_supervisor_is_live(lease: Mapping[str, Any]) -> bool:
+    """A matching nonce alone never revives a lease after its supervisor exits."""
+    supervisor = lease["supervisor"]
+    if not isinstance(supervisor, Mapping):
+        return False
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii") as stream:
+            boot_id = stream.read(129).strip()
+        with open(f"/proc/{supervisor['pid']}/stat", "rb") as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096 or not raw.endswith(b"\n"):
+            return False
+        end = raw.rfind(b")")
+        if end < 0:
+            return False
+        fields = raw[end + 2:-1].split()
+        if len(fields) < 20:
+            return False
+        start_ticks = int(fields[19])
+    except (OSError, ValueError):
+        return False
+    return (
+        type(supervisor.get("pid")) is int
+        and type(supervisor.get("startTicks")) is int
+        and start_ticks == supervisor["startTicks"]
+        and boot_id == supervisor.get("bootId")
+    )
+
+
+def _validate_lease_successor(previous: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
+    immutable = ("attempt", "operation", "supervisor")
+    if any(previous[key] != candidate[key] for key in immutable):
+        _reject("EXECUTION_LEASE_CONFLICT")
+    if candidate["revision"] != previous["revision"] + 1:
+        _reject("EXECUTION_LEASE_REVISION_CONFLICT")
+    if previous["rollbackIssued"] and not candidate["rollbackIssued"]:
+        _reject("EXECUTION_LEASE_ROLLBACK_CONFLICT")
+    if previous["firstFailure"] is not None and any(
+        previous[key] != candidate[key] for key in ("firstFailure", "firstStatus")
+    ):
+        _reject("EXECUTION_LEASE_FAILURE_CONFLICT")
+    if previous["t0Ns"] is not None and any(
+        previous[key] != candidate[key] for key in ("t0Ns", "workEndNs", "hardEndNs")
+    ):
+        _reject("EXECUTION_LEASE_DEADLINE_CONFLICT")
+    lifecycle_edges = {
+        "registered": {"registered", "armed", "draining"},
+        "armed": {"armed", "cancel-forward", "drain-forward", "rollback-admission",
+                  "draining", "quiescence-unconfirmed", "drained"},
+        "cancel-forward": {"cancel-forward", "drain-forward", "draining",
+                           "rollback-admission", "quiescence-unconfirmed", "drained"},
+        "drain-forward": {"drain-forward", "rollback-admission", "draining",
+                          "quiescence-unconfirmed", "drained"},
+        "rollback-admission": {"rollback-admission", "rolling-back", "draining",
+                               "quiescence-unconfirmed", "drained"},
+        "rolling-back": {"rolling-back", "draining", "quiescence-unconfirmed", "drained"},
+        "draining": {"draining", "quiescence-unconfirmed", "drained"},
+        "quiescence-unconfirmed": {"quiescence-unconfirmed", "drained"},
+        "drained": {"drained"},
+    }
+    if candidate["lifecycle"] not in lifecycle_edges[previous["lifecycle"]]:
+        _reject("EXECUTION_LEASE_LIFECYCLE_CONFLICT")
+    old_workers, new_workers = previous["workers"], candidate["workers"]
+    if new_workers[:len(old_workers)] != old_workers:
+        _reject("EXECUTION_LEASE_WORKER_CONFLICT")
+
+
+def publish_execution_lease(
+    root: str | os.PathLike[str],
+    lease: Mapping[str, Any] | bytes,
+    *,
+    deploy_lock_fd: int,
+) -> dict[str, Any]:
+    """Atomically publish one supervisor lease revision while holding inherited FD9."""
+    if isinstance(lease, bytes):
+        candidate = _execution_lease(parse_json(lease, MAX_EXECUTION_LEASE_BYTES))
+        raw = lease
+        if _canonical(candidate) != raw:
+            _reject("EXECUTION_LEASE_INVALID")
+    else:
+        candidate = _execution_lease(dict(lease))
+        raw = _canonical(candidate)
+    if len(raw) > MAX_EXECUTION_LEASE_BYTES:
+        _reject("INPUT_TOO_LARGE")
+    with deploy_lock(root, deploy_lock_fd):
+        previous = _read_execution_lease_locked(root)
+        if previous is None:
+            if candidate["revision"] != 0 or candidate["lifecycle"] != "registered":
+                _reject("EXECUTION_LEASE_REVISION_CONFLICT")
+            try:
+                _, current = _read_guard_locked(root)
+            except FileNotFoundError:
+                current = None
+            if current is not None and (
+                current["phase"] not in TERMINAL | {"READY"}
+                or current["executionAttempt"] is not None
+                and current["executionAttempt"] != candidate["attempt"]
+            ):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+        else:
+            if not _execution_lease_supervisor_is_live(previous):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            _validate_lease_successor(previous, candidate)
+        if not _execution_lease_supervisor_is_live(candidate):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        root_fd = _open_root(root)
+        try:
+            _atomic_write(root_fd, EXECUTION_LEASE_NAME, raw,
+                          MAX_EXECUTION_LEASE_BYTES, replace=previous is not None)
+            if _read_at(root_fd, EXECUTION_LEASE_NAME, MAX_EXECUTION_LEASE_BYTES) != raw:
+                _reject("EXECUTION_LEASE_READBACK_FAILED")
+        finally:
+            os.close(root_fd)
+    return {
+        "attempt": candidate["attempt"],
+        "revision": candidate["revision"],
+        "digest": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def check_execution_lease(
+    root: str | os.PathLike[str],
+    *,
+    attempt: str | None = None,
+    deploy_lock_fd: int | None = None,
+) -> dict[str, Any]:
+    """Read-only writer/retention interlock; never removes or reconciles a lease."""
+    with deploy_lock(root, deploy_lock_fd):
+        lease = _read_execution_lease_locked(root)
+        if lease is None:
+            return {"outcome": "unleased"}
+        if deploy_lock_fd is None:
+            _reject("EXECUTION_LEASE_FD_REQUIRED")
+        if not _execution_lease_supervisor_is_live(lease):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if attempt is None or attempt != lease["attempt"]:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if lease["lifecycle"] in {"quiescence-unconfirmed", "drained"}:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        return {"attempt": lease["attempt"], "revision": lease["revision"], "outcome": "matched"}
+
+
+def _require_execution_lease_descriptor(
+    root: str | os.PathLike[str],
+    deploy_lock_fd: int | None,
+) -> None:
+    if _read_execution_lease_locked(root) is not None and deploy_lock_fd is None:
+        _reject("EXECUTION_LEASE_FD_REQUIRED")
+
+
 def _atomic_write(dir_fd: int, name: str, data: bytes, limit: int, *, replace: bool) -> None:
     if len(data) > limit:
         _reject("STATE_TOO_LARGE")
@@ -1213,6 +1469,18 @@ def _publish_current_locked(root: str | os.PathLike[str], state: Mapping[str, An
             old = _current(parse_json(current_raw, MAX_CURRENT_BYTES))
             if origin["originDigest"] != old["originDigest"]:
                 _reject("GUARD_STATE_LOST")
+            lease = _read_execution_lease_locked(root)
+            if lease is None and (
+                old["executionAttempt"] is not None or validated["executionAttempt"] is not None
+            ):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            if lease is not None:
+                if validated["executionAttempt"] != lease["attempt"]:
+                    _reject("EXECUTION_LEASE_UNRESOLVED")
+                if not _execution_lease_supervisor_is_live(lease):
+                    _reject("EXECUTION_LEASE_UNRESOLVED")
+                if lease["lifecycle"] == "quiescence-unconfirmed":
+                    _reject("EXECUTION_LEASE_UNRESOLVED")
             validate_state_transition(old, validated)
             old_child, new_child = old["ownedChild"], validated["ownedChild"]
             if old_child is not None and (
@@ -1240,6 +1508,7 @@ def publish_current(
     deploy_lock_fd: int | None = None,
 ) -> dict[str, Any]:
     with deploy_lock(root, deploy_lock_fd):
+        _require_execution_lease_descriptor(root, deploy_lock_fd)
         return _publish_current_locked(root, state)
 
 
@@ -1487,6 +1756,14 @@ def _cli() -> argparse.ArgumentParser:
     publish.add_argument("--root", required=True)
     publish.add_argument("--state", required=True)
     publish.add_argument("--deploy-lock-fd", type=int)
+    lease = sub.add_parser("publish-lease")
+    lease.add_argument("--root", required=True)
+    lease.add_argument("--lease", required=True)
+    lease.add_argument("--deploy-lock-fd", type=int, required=True)
+    lease_check = sub.add_parser("check-lease")
+    lease_check.add_argument("--root", required=True)
+    lease_check.add_argument("--attempt")
+    lease_check.add_argument("--deploy-lock-fd", type=int, required=True)
     prepare = sub.add_parser("prepare")
     prepare.add_argument("--root", required=True)
     prepare.add_argument("--contract", required=True)
@@ -1559,13 +1836,23 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "publish-state":
             state = parse_json(_read_input(args.state, MAX_CURRENT_BYTES), MAX_CURRENT_BYTES)
             result = publish_current(args.root, state, deploy_lock_fd=args.deploy_lock_fd)
+        elif args.command == "publish-lease":
+            lease = _read_input(args.lease, MAX_EXECUTION_LEASE_BYTES)
+            result = publish_execution_lease(
+                args.root, lease, deploy_lock_fd=args.deploy_lock_fd,
+            )
+        elif args.command == "check-lease":
+            result = check_execution_lease(
+                args.root, attempt=args.attempt, deploy_lock_fd=args.deploy_lock_fd,
+            )
         elif args.command == "prepare":
             contract = parse_contract(_read_input(args.contract, MAX_CONTRACT_BYTES))
             evidence = _object(
                 parse_json(_read_input(args.evidence, MAX_AUTHORIZATION_BYTES), MAX_AUTHORIZATION_BYTES),
                 {"rootId", "targetId", "predecessorId", "predecessorContainerId",
                  "transitionId", "target", "predecessor",
-                 "operation", "runId", "incidentId", "ownedRun", "toolingDigest"},
+                 "operation", "runId", "incidentId", "ownedRun", "toolingDigest",
+                 "preparedProofDigest"},
             )
             with deploy_lock(args.root, args.deploy_lock_fd):
                 origin, current = _read_guard_locked(args.root)
@@ -1601,6 +1888,10 @@ def main(argv: list[str] | None = None) -> int:
                     predecessor_container_id=evidence["predecessorContainerId"],
                     transition_id=evidence["transitionId"], owned_run=evidence["ownedRun"],
                     tooling_digest=evidence["toolingDigest"],
+                    prepared_proof_digest=evidence["preparedProofDigest"],
+                    execution_attempt=(
+                        (lease["attempt"] if lease is not None else None)
+                    ) if (lease := _read_execution_lease_locked(args.root)) is not None else None,
                 )
                 published = _publish_current_locked(args.root, prepared)
                 if _read_guard_locked(args.root)[1] != published:
@@ -1622,6 +1913,7 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(changes, dict) or not changes.keys() <= allowed_changes:
                 _reject("STATE_CHANGE_UNSUPPORTED")
             with deploy_lock(args.root, args.deploy_lock_fd):
+                _require_execution_lease_descriptor(args.root, args.deploy_lock_fd)
                 _, current = _read_guard_locked(args.root)
                 advanced = advance_state(current, args.phase, **changes)
                 published = _publish_current_locked(args.root, advanced)
@@ -1633,6 +1925,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
         elif args.command == "claim-rollback":
             with deploy_lock(args.root, args.deploy_lock_fd):
+                _require_execution_lease_descriptor(args.root, args.deploy_lock_fd)
                 _, current = _read_guard_locked(args.root)
                 disposition = current["predecessorDisposition"]
                 if (

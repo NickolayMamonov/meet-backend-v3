@@ -391,6 +391,13 @@ remote_content=$(awk '
   prerequisite_missing
 fixture_write "$remote_script" 700 <<<"$remote_content"
 grep -Fq 'exec 9<"$state_root/.deploy.lock"' "$remote_script"
+grep -Fq 'flock -n 9' "$remote_script"
+grep -Fq 'execution_lease="$state_root/.timepad-execution.json"' "$remote_script"
+grep -Fq '[ -e "$execution_lease" ] || [ -L "$execution_lease" ]' "$remote_script"
+[ "$(grep -nF 'flock -n 9' "$remote_script" | cut -d: -f1)" -lt \
+  "$(grep -nF 'if [ -e "$execution_lease" ]' "$remote_script" | cut -d: -f1)" ]
+[ "$(grep -nF 'if [ -e "$execution_lease" ]' "$remote_script" | cut -d: -f1)" -lt \
+  "$(grep -nF 'retention-list --state-root "$state_root"' "$remote_script" | head -n 1 | cut -d: -f1)" ]
 grep -Fq -- '--deploy-lock-fd 9' "$remote_script"
 [ "$(grep -Fc -- '--deploy-lock-fd 9' "$remote_script")" -eq 4 ]
 [ "$(grep -Fc 'provider_args+=(--deploy-lock-fd 9)' "$remote_script")" -eq 2 ]
@@ -523,6 +530,32 @@ PATH="$fake_bin:$PATH" bash "$remote_script" \
 [ -f "$state_root/17-1-final-deploy/unknown-before-race.txt" ]
 [ ! -e "$state_root/17-1-final-deploy/concurrent-unknown.txt" ]
 [ ! -e "$tooling_root" ]
+
+lease_blocked_state="$state_root/20-1-final-deploy"
+fixture_install_dir 700 "$lease_blocked_state"
+fixture_write "$lease_blocked_state/terminal.json" 600 <<'EOF'
+{"schemaVersion":1,"runKey":"20-1","outcome":"committed","providerEnabled":false}
+EOF
+write_owner_marker "$lease_blocked_state"
+fixture_touch -d '@1799999950.123456789' "$lease_blocked_state"
+lease_blocked_before=$(owned_digest "$lease_blocked_state")
+fixture_write "$state_root/.timepad-execution.json" 600 <<'EOF'
+unresolved synthetic execution lease
+EOF
+lease_before=$(sha256sum "$state_root/.timepad-execution.json")
+set +e
+lease_output=$(PATH="$fake_bin:$PATH" bash "$remote_script" \
+  "$production_root" 1 1 "$production_root/.missing-tooling" 2>&1)
+lease_status=$?
+set -e
+[ "$lease_status" -eq 1 ]
+grep -Fxq 'RECOVERY_REQUIRED' <<<"$lease_output"
+[ -f "$state_root/.timepad-execution.json" ]
+test "$lease_before" = "$(sha256sum "$state_root/.timepad-execution.json")"
+[ -d "$lease_blocked_state" ]
+test "$lease_blocked_before" = "$(owned_digest "$lease_blocked_state")"
+rm -f -- "$state_root/.timepad-execution.json"
+rm -r -- "$lease_blocked_state"
 
 ln -s "$state_root/12-1-final-deploy" "$state_root/13-1-final-deploy"
 set +e

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import pathlib
@@ -70,7 +71,7 @@ def prepared_state() -> dict:
         incident_id="a" * 32, admission=admission, target=approved["images"][0],
         predecessor=approved["images"][2], predecessor_container_id="f" * 64,
         transition_id="first-timepad",
-        owned_run="123-5", tooling_digest=digest("2"),
+        owned_run="123-5", tooling_digest=digest("2"), prepared_proof_digest=digest("9"),
     )
 
 
@@ -80,6 +81,34 @@ def owned_child(*, sequence: int = 1, lifecycle: str = "waiting", pid: int = 101
         "bootId": "01234567-89ab-cdef-0123-456789abcdef",
         "startTicks": 123456, "commandDigest": digest("3"),
         "attemptId": "a" * 32 + f":{sequence}", "lifecycle": lifecycle,
+    }
+
+
+def execution_lease(
+    *, attempt: str = "a" * 32, revision: int = 0, lifecycle: str = "registered",
+    operation: str = "deploy", rollback_issued: bool = False,
+) -> dict:
+    started = lifecycle != "registered"
+    supervisor = {
+        "pid": 101, "startTicks": 456,
+        "bootId": "01234567-89ab-cdef-0123-456789abcdef",
+    }
+    if os.name == "posix":
+        pid = os.getpid()
+        with open(f"/proc/{pid}/stat", "rb") as stream:
+            fields = stream.read(4097).rsplit(b")", 1)[1].split()
+        with open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii") as stream:
+            boot_id = stream.read(129).strip()
+        supervisor = {"pid": pid, "startTicks": int(fields[19]), "bootId": boot_id}
+    return {
+        "format": 1, "attempt": attempt, "operation": operation,
+        "t0Ns": 1_000 if started else None,
+        "workEndNs": 540_000_001_000 if started else None,
+        "hardEndNs": 600_000_001_000 if started else None,
+        "firstFailure": None, "firstStatus": None,
+        "rollbackIssued": rollback_issued, "lifecycle": lifecycle, "revision": revision,
+        "supervisor": supervisor,
+        "worker": None, "workerMode": "controller-worker", "workers": [],
     }
 
 
@@ -625,7 +654,7 @@ class OwnedChildStateTests(unittest.TestCase):
             incident_id="a" * 32, admission=incompatible_admission,
             target=contract()["images"][0], predecessor=contract()["images"][1],
             predecessor_container_id="f" * 64, transition_id="first-timepad",
-            owned_run="123-5", tooling_digest=digest("2"),
+            owned_run="123-5", tooling_digest=digest("2"), prepared_proof_digest=digest("9"),
         )
         incompatible = state.advance_state(incompatible, "CUTOVER_POSSIBLE")
         with self.assertRaises(state.GuardError):
@@ -904,6 +933,7 @@ class OwnedChildStateTests(unittest.TestCase):
             admission=admission, target=approved["images"][0], predecessor=approved["images"][2],
             predecessor_container_id="f" * 64,
             transition_id="first-timepad", owned_run="123-6", tooling_digest=digest("2"),
+            prepared_proof_digest=digest("9"),
         )
         state.validate_state_transition(terminal, prepared)
         self.assertIsNone(prepared["latestAttemptId"])
@@ -1116,6 +1146,195 @@ fi
 
 
 class TimepadStateTests(unittest.TestCase):
+    def test_execution_lease_parser_is_exact_bounded_and_sanitized(self) -> None:
+        lease = execution_lease()
+        state._execution_lease(lease)
+        invalid = (
+            {**lease, "extra": "private"},
+            {**lease, "attempt": "not-a-nonce"},
+            {**lease, "revision": True},
+            {**lease, "supervisor": {**lease["supervisor"], "pid": 1}},
+            {**lease, "t0Ns": 5, "workEndNs": 4, "hardEndNs": 6},
+            {**lease, "workers": [{}]},
+        )
+        for candidate in invalid:
+            with self.subTest(candidate=candidate), self.assertRaises(state.GuardError):
+                state._execution_lease(candidate)
+        with self.assertRaises(state.GuardError):
+            state.parse_json(b" " * (state.MAX_EXECUTION_LEASE_BYTES + 1),
+                             state.MAX_EXECUTION_LEASE_BYTES)
+
+    def test_execution_lease_lifecycle_and_rollback_latches_are_monotonic(self) -> None:
+        armed = execution_lease(revision=1, lifecycle="armed")
+        cancelled = execution_lease(revision=2, lifecycle="cancel-forward")
+        state._validate_lease_successor(armed, cancelled)
+        rollback = execution_lease(
+            revision=3, lifecycle="rollback-admission", rollback_issued=True,
+        )
+        state._validate_lease_successor(cancelled, rollback)
+        for candidate in (
+            execution_lease(revision=4, lifecycle="rolling-back", rollback_issued=False),
+            execution_lease(revision=3, lifecycle="rolling-back", rollback_issued=True),
+            execution_lease(revision=4, lifecycle="armed", rollback_issued=True),
+        ):
+            with self.subTest(candidate=candidate), self.assertRaises(state.GuardError):
+                state._validate_lease_successor(rollback, candidate)
+
+    def test_execution_lease_publication_is_durable_sequenced_and_non_replayable(self) -> None:
+        if not hasattr(os, "geteuid") or os.geteuid() != 0 or os.name != "posix":
+            self.skipTest("root-owned lease filesystem checks require Linux root")
+        with tempfile.TemporaryDirectory() as parent:
+            root = pathlib.Path(parent) / "deploy"
+            root.mkdir(mode=0o700)
+            first = execution_lease()
+            with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True):
+                with state.deploy_lock(root) as lock_fd:
+                    lease_path = pathlib.Path(parent) / "lease.json"
+                    lease_path.write_text(
+                        json.dumps(first, sort_keys=True, separators=(",", ":")), encoding="ascii",
+                    )
+                    published = subprocess.run(
+                        [sys.executable, str(ROOT / "test_vps_timepad_state.py"),
+                         "publish-lease", "--root", str(root), "--lease", str(lease_path),
+                         "--deploy-lock-fd", str(lock_fd)],
+                        capture_output=True, text=True, check=False, pass_fds=(lock_fd,),
+                    )
+                    self.assertEqual(0, published.returncode, published.stderr)
+                    ack = json.loads(published.stdout)
+                    raw = (root / state.EXECUTION_LEASE_NAME).read_bytes()
+                    self.assertEqual(0o600, (root / state.EXECUTION_LEASE_NAME).stat().st_mode & 0o777)
+                    self.assertEqual(hashlib.sha256(raw).hexdigest(), ack["digest"])
+                    self.assertEqual((first["attempt"], first["revision"]),
+                                     (ack["attempt"], ack["revision"]))
+                    armed = execution_lease(revision=1, lifecycle="armed")
+                    ack = state.publish_execution_lease(
+                        root, armed, deploy_lock_fd=lock_fd,
+                    )
+                    self.assertEqual(1, ack["revision"])
+                    self.assertEqual(
+                        {"attempt": first["attempt"], "revision": 1, "outcome": "matched"},
+                        state.check_execution_lease(
+                            root, attempt=first["attempt"], deploy_lock_fd=lock_fd,
+                        ),
+                    )
+                    with self.assertRaises(state.GuardError) as error:
+                        state.publish_execution_lease(
+                            root, execution_lease(revision=3, lifecycle="armed"),
+                            deploy_lock_fd=lock_fd,
+                        )
+                    self.assertEqual("EXECUTION_LEASE_REVISION_CONFLICT", error.exception.reason)
+                    with self.assertRaises(state.GuardError) as error:
+                        state.publish_execution_lease(
+                            root, execution_lease(attempt="b" * 32, revision=2, lifecycle="armed"),
+                            deploy_lock_fd=lock_fd,
+                        )
+                    self.assertEqual("EXECUTION_LEASE_CONFLICT", error.exception.reason)
+                    with self.assertRaises(state.GuardError) as error:
+                        state.check_execution_lease(
+                            root, attempt="b" * 32, deploy_lock_fd=lock_fd,
+                        )
+                    self.assertEqual("EXECUTION_LEASE_UNRESOLVED", error.exception.reason)
+
+    def test_execution_lease_interlocks_state_writes_but_keeps_bootstrap_independent(self) -> None:
+        if not hasattr(os, "geteuid") or os.geteuid() != 0 or os.name != "posix":
+            self.skipTest("root-owned lease filesystem checks require Linux root")
+        with tempfile.TemporaryDirectory() as parent:
+            root = pathlib.Path(parent) / "deploy"
+            root.mkdir(mode=0o700)
+            lease = execution_lease()
+            with mock.patch.object(
+                state, "_execution_lease_supervisor_is_live", return_value=True,
+            ), state.deploy_lock(root) as lock_fd:
+                state.publish_execution_lease(root, lease, deploy_lock_fd=lock_fd)
+                authority = {
+                    "rootId": "test-root", "bootstrapId": "bootstrap-1",
+                    "initialRuntime": digest("a"), "initialConfig": digest("b"),
+                    "initialSchema": digest("c"), "initialStartupInventory": digest("d"),
+                    "schemaHistoryProvenance": True,
+                }
+                observed = {
+                    "rootId": "test-root", "runtime": digest("a"), "config": digest("b"),
+                    "schema": digest("c"), "startupInventory": digest("d"),
+                    "schemaHistoryProvenance": True,
+                }
+                state.bootstrap_guard(root, authority=authority, observed=observed, deploy_lock_fd=lock_fd)
+                with self.assertRaises(state.GuardError) as error:
+                    state.publish_current(root, prepared_state(), deploy_lock_fd=lock_fd)
+                self.assertEqual("EXECUTION_LEASE_UNRESOLVED", error.exception.reason)
+                admission = state.admit(
+                    contract(), root_id="test-root", target_id="target", predecessor_id="old",
+                    transition_id="first-timepad", target_tuple=tuple_evidence(),
+                    predecessor_tuple=tuple_evidence(after="d"),
+                )
+                prepared = state.new_prepared_state(
+                    state.read_guard(root, deploy_lock_fd=lock_fd)[1],
+                    operation="deploy", run_id="lease-bound-run", incident_id="3" * 32,
+                    admission=admission, target=contract()["images"][0],
+                    predecessor=contract()["images"][1], predecessor_container_id="f" * 64,
+                    transition_id="first-timepad", owned_run="123-lease",
+                    tooling_digest=digest("2"), prepared_proof_digest=digest("9"),
+                    execution_attempt=lease["attempt"],
+                )
+                state.publish_current(root, prepared, deploy_lock_fd=lock_fd)
+                armed = execution_lease(revision=1, lifecycle="armed")
+                state.publish_execution_lease(root, armed, deploy_lock_fd=lock_fd)
+                advanced = state.advance_state(prepared, "CUTOVER_POSSIBLE")
+                self.assertEqual(lease["attempt"], advanced["executionAttempt"])
+                self.assertEqual(advanced, state.publish_current(root, advanced, deploy_lock_fd=lock_fd))
+                unresolved = execution_lease(revision=2, lifecycle="quiescence-unconfirmed")
+                state.publish_execution_lease(root, unresolved, deploy_lock_fd=lock_fd)
+                with self.assertRaises(state.GuardError) as error:
+                    state.publish_current(
+                        root, state.advance_state(advanced, "VERIFYING"), deploy_lock_fd=lock_fd,
+                    )
+                self.assertEqual("EXECUTION_LEASE_UNRESOLVED", error.exception.reason)
+                with self.assertRaises(state.GuardError) as error:
+                    state.check_execution_lease(root, attempt=lease["attempt"], deploy_lock_fd=lock_fd)
+                self.assertEqual("EXECUTION_LEASE_UNRESOLVED", error.exception.reason)
+
+    def test_unheld_or_stale_lease_blocks_writer_and_retention_interlock(self) -> None:
+        if not hasattr(os, "geteuid") or os.geteuid() != 0 or os.name != "posix":
+            self.skipTest("root-owned lease filesystem checks require Linux root")
+        with tempfile.TemporaryDirectory() as parent:
+            root = pathlib.Path(parent) / "deploy"
+            root.mkdir(mode=0o700)
+            lease = execution_lease()
+            with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True):
+                with state.deploy_lock(root) as lock_fd:
+                    state.publish_execution_lease(root, lease, deploy_lock_fd=lock_fd)
+            with self.assertRaises(state.GuardError) as error:
+                state.check_execution_lease(root, attempt=lease["attempt"])
+            self.assertEqual("EXECUTION_LEASE_FD_REQUIRED", error.exception.reason)
+            with state.deploy_lock(root) as reacquired_fd:
+                with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=False):
+                    with self.assertRaises(state.GuardError) as error:
+                        state.check_execution_lease(
+                            root, attempt=lease["attempt"], deploy_lock_fd=reacquired_fd,
+                        )
+                    self.assertEqual("EXECUTION_LEASE_UNRESOLVED", error.exception.reason)
+                    with self.assertRaises(state.GuardError) as error:
+                        state.publish_current(root, prepared_state(), deploy_lock_fd=reacquired_fd)
+                    self.assertEqual("EXECUTION_LEASE_UNRESOLVED", error.exception.reason)
+
+    def test_execution_lease_read_detects_descriptor_replacement_race(self) -> None:
+        if not hasattr(os, "geteuid") or os.geteuid() != 0 or os.name != "posix":
+            self.skipTest("root-owned lease filesystem checks require Linux root")
+        with tempfile.TemporaryDirectory() as parent:
+            root = pathlib.Path(parent)
+            path = root / state.EXECUTION_LEASE_NAME
+            path.write_text("{}", encoding="ascii")
+            path.chmod(0o600)
+            os.chown(path, 0, 0)
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch.object(state.os, "fstat", return_value=object()):
+                    with self.assertRaises(state.GuardError) as error:
+                        state._read_at(root_fd, state.EXECUTION_LEASE_NAME,
+                                       state.MAX_EXECUTION_LEASE_BYTES)
+                self.assertEqual("STATE_RACE", error.exception.reason)
+            finally:
+                os.close(root_fd)
+
     def test_contract_cli_emits_only_fixed_validation_summary(self) -> None:
         result = subprocess.run(
             [sys.executable, str(ROOT / "test_vps_timepad_state.py"), "check-contract",
@@ -1207,9 +1426,13 @@ class TimepadStateTests(unittest.TestCase):
             admission=admission, target=contract()["images"][0],
             predecessor=contract()["images"][1], predecessor_container_id="f" * 64,
             transition_id="first-timepad",
-            owned_run="123-1", tooling_digest=digest("2"),
+            owned_run="123-1", tooling_digest=digest("2"), prepared_proof_digest=digest("9"),
         )
         self.assertEqual((1, "PREPARED"), (prepared["operationEpoch"], prepared["phase"]))
+        with self.assertRaises(state.GuardError):
+            state.advance_state(
+                prepared, "PREPARED", preparedProofDigest=digest("8"),
+            )
         with self.assertRaises(state.GuardError) as error:
             state.advance_state(prepared, "VERIFYING")
         self.assertEqual("CUTOVER_BARRIER_REQUIRED", error.exception.reason)
@@ -1239,14 +1462,15 @@ class TimepadStateTests(unittest.TestCase):
                                      admission=state.Admission("refuse", "x", "", None, None),
                                      target=contract()["images"][0], predecessor=contract()["images"][1],
                                      predecessor_container_id="f" * 64,
-                                     transition_id="first-timepad", owned_run="123-1", tooling_digest=digest("2"))
+                                     transition_id="first-timepad", owned_run="123-1", tooling_digest=digest("2"),
+                                     prepared_proof_digest=digest("9"))
         with self.assertRaises(state.GuardError) as error:
             state.new_prepared_state(
                 ready, operation="rollback-drill", run_id="drill-1", incident_id="2" * 32,
                 admission=admission, target=contract()["images"][0],
                 predecessor=contract()["images"][1], predecessor_container_id="f" * 64,
                 transition_id="first-timepad",
-                owned_run="123-2", tooling_digest=digest("2"),
+                owned_run="123-2", tooling_digest=digest("2"), prepared_proof_digest=digest("9"),
             )
         self.assertEqual("ROLLBACK_DRILL_UNSAFE", error.exception.reason)
         ready["operationEpoch"] = state.MAX_U64
@@ -1255,7 +1479,8 @@ class TimepadStateTests(unittest.TestCase):
                                      admission=admission, target=contract()["images"][0],
                                      predecessor=contract()["images"][1], transition_id="first-timepad",
                                      predecessor_container_id="f" * 64,
-                                     owned_run="123-1", tooling_digest=digest("2"))
+                                     owned_run="123-1", tooling_digest=digest("2"),
+                                     prepared_proof_digest=digest("9"))
 
     def test_committing_requires_an_immutable_provider_finalization_digest(self) -> None:
         admission = state.admit(
@@ -1279,6 +1504,7 @@ class TimepadStateTests(unittest.TestCase):
             transition_id="first-timepad",
             owned_run="123-4-final-deploy",
             tooling_digest=digest("2"),
+            prepared_proof_digest=digest("9"),
         )
         barrier = state.advance_state(
             prepared,
@@ -1361,7 +1587,7 @@ class TimepadStateTests(unittest.TestCase):
                 admission=admission, target=contract()["images"][0],
                 predecessor=contract()["images"][1], predecessor_container_id="f" * 64,
                 transition_id="first-timepad",
-                owned_run="123-1", tooling_digest=digest("2"),
+                owned_run="123-1", tooling_digest=digest("2"), prepared_proof_digest=digest("9"),
             )
             self.assertEqual(prepared, state.publish_current(root, prepared))
             with self.assertRaises(state.GuardError):

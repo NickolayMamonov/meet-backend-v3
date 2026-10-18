@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import ctypes
 import errno
 import hashlib
@@ -20,8 +21,10 @@ import os
 import pathlib
 import re
 import secrets
+import select
 import stat
 import sys
+import time
 from typing import Any, Iterable, Iterator
 
 try:
@@ -34,6 +37,7 @@ MAX_INSPECTION_BYTES = 8 * 1024 * 1024
 MAX_CREDENTIAL_BYTES = 1024 * 1024
 MAX_WITNESS_BYTES = 16 * 1024 * 1024
 MAX_FINALIZATION_BYTES = 8 * 1024
+MAX_PREPARED_BYTES = 8 * 1024
 MAX_JSON_DEPTH = 32
 MAX_OWNER_BYTES = 4096
 CONTAINER_CREDENTIAL_PATH = "/run/secrets/meet-firebase-service-account.json"
@@ -47,6 +51,11 @@ OWNER = "meet-test-vps-provider"
 FINALIZATION_SCHEMA = "meet-backend/test-vps-provider-finalization/v1"
 LIVE_RESUME_SCHEMA = "meet-backend/test-vps-provider-live-resume/v1"
 ABSENCE_RESUME_SCHEMA = "meet-backend/test-vps-provider-absence-resume/v1"
+PREPARED_INPUT_SCHEMA = "meet-backend/test-vps-timepad-prepared-input/v1"
+PREPARED_SCHEMA = "meet-backend/test-vps-timepad-prepared/v1"
+_DEADLINE_NS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "provider_deadline_ns", default=None
+)
 MAX_LIVE_RESUME_BYTES = MAX_INSPECTION_BYTES + 32768
 STATE_KINDS = frozenset(("final-deploy", "rollback-drill"))
 RENAME_NOREPLACE = 1
@@ -93,10 +102,84 @@ def _fail(category: str) -> None:
     raise ProviderError(ERRORS[category])
 
 
+def _deadline_check() -> None:
+    deadline = _DEADLINE_NS.get()
+    if deadline is not None and time.monotonic_ns() >= deadline:
+        _fail("recovery")
+
+
+@contextlib.contextmanager
+def _operation_deadline(deadline_ns: int | None) -> Iterator[None]:
+    if deadline_ns is not None and (
+        type(deadline_ns) is not int or not 0 < deadline_ns < 1 << 63
+    ):
+        _fail("recovery")
+    inherited = _DEADLINE_NS.get()
+    end = deadline_ns if deadline_ns is not None else time.monotonic_ns() + 30_000_000_000
+    if inherited is not None:
+        end = min(end, inherited)
+    token = _DEADLINE_NS.set(end)
+    try:
+        _deadline_check()
+        yield
+        _deadline_check()
+    finally:
+        _DEADLINE_NS.reset(token)
+
+
 def _lock_directory(fd: int) -> None:
+    _deadline_check()
     if fcntl is None:
         _fail("prerequisite")
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _fail("recovery")
+
+
+def _execution_interlock(args: argparse.Namespace, lock_fd: int) -> None:
+    """An inherited lock is necessary, but not sufficient, to reuse a lease."""
+    _deadline_check()
+    try:
+        os.stat(
+            os.path.join(args.state_root, ".timepad-execution.json"),
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        if args.execution_attempt is not None or args.deadline_ns is not None:
+            _fail("recovery")
+        return
+    module = _timepad_state_module()
+    try:
+        lease = module._read_execution_lease_locked(args.state_root)
+        if lease is None:
+            _fail("recovery")
+        if (
+            args.deploy_lock_fd is None
+            or args.execution_attempt is None
+            or args.deadline_ns is None
+        ):
+            _fail("recovery")
+        module.check_execution_lease(
+            args.state_root, attempt=args.execution_attempt, deploy_lock_fd=lock_fd
+        )
+        # Provider work cannot consume the stop-only cleanup reserve.
+        end = lease["workEndNs"]
+        if end is None:
+            end = time.monotonic_ns() + 30_000_000_000
+        if args.deadline_ns > end or lease["lifecycle"] not in {
+            "registered", "armed", "rollback-admission", "rolling-back",
+        }:
+            _fail("recovery")
+        if lease["lifecycle"] == "rollback-admission" and args.command not in {
+            "verify", "live-resume", "absence-resume",
+        }:
+            _fail("recovery")
+        if lease["workerMode"] == "fail-closed-worker":
+            _fail("recovery")
+    except (module.GuardError, OSError, ValueError, TypeError, KeyError):
+        _fail("recovery")
+    _deadline_check()
 
 
 @contextlib.contextmanager
@@ -196,7 +279,26 @@ def _deploy_lock(
 
 
 def _bounded_stdin(limit: int) -> bytes:
-    data = sys.stdin.buffer.read(limit + 1)
+    _deadline_check()
+    deadline = _DEADLINE_NS.get()
+    if deadline is None:
+        data = sys.stdin.buffer.read(limit + 1)
+    else:
+        fd = sys.stdin.buffer.fileno()
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        chunks = bytearray()
+        while len(chunks) <= limit:
+            _deadline_check()
+            if not regular and not select.select(
+                [fd], [], [], max(0, (deadline - time.monotonic_ns()) / 1_000_000_000),
+            )[0]:
+                _fail("recovery")
+            chunk = os.read(fd, min(65536, limit + 1 - len(chunks)))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        data = bytes(chunks)
+    _deadline_check()
     if len(data) > limit:
         _fail("provider")
     return data
@@ -242,6 +344,7 @@ def _run_key(value: str) -> str:
 
 
 def _result(enabled: bool, present: bool, read_only: bool, outcome: str) -> None:
+    _deadline_check()
     print(
         json.dumps(
             {
@@ -346,6 +449,7 @@ def _check_ancestors(path: str, *, category: str = "credential") -> None:
 
 
 def _open_regular(path: str, *, max_bytes: int, source: bool = False) -> tuple[int, os.stat_result, bytes]:
+    _deadline_check()
     _check_ancestors(path)
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     if hasattr(os, "O_NOATIME"):
@@ -367,6 +471,7 @@ def _open_regular(path: str, *, max_bytes: int, source: bool = False) -> tuple[i
             _fail("credential")
         data = bytearray()
         while len(data) <= max_bytes:
+            _deadline_check()
             chunk = os.read(fd, min(65536, max_bytes + 1 - len(data)))
             if not chunk:
                 break
@@ -379,6 +484,7 @@ def _open_regular(path: str, *, max_bytes: int, source: bool = False) -> tuple[i
         os.lseek(fd, 0, os.SEEK_SET)
         reread = bytearray()
         while len(reread) <= max_bytes:
+            _deadline_check()
             chunk = os.read(fd, min(65536, max_bytes + 1 - len(reread)))
             if not chunk:
                 break
@@ -425,9 +531,11 @@ def _stable_entry_identity(info: os.stat_result) -> tuple[int, ...]:
 
 
 def _read_fd_bounded(fd: int, limit: int) -> bytes:
+    _deadline_check()
     os.lseek(fd, 0, os.SEEK_SET)
     data = bytearray()
     while len(data) <= limit:
+        _deadline_check()
         chunk = os.read(fd, min(65536, limit + 1 - len(data)))
         if not chunk:
             break
@@ -954,6 +1062,9 @@ def _file_record(
             follow_symlinks=True,
             category="recovery",
         )
+        path_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if _stable_entry_identity(path_info) != _stable_entry_identity(info):
+            _fail("recovery")
         return {
             "device": int(info.st_dev),
             "inode": int(info.st_ino),
@@ -988,6 +1099,9 @@ def _read_child_file(directory_fd: int, name: str, limit: int) -> tuple[dict[str
             follow_symlinks=True,
             category="recovery",
         )
+        path_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if _stable_entry_identity(path_info) != _stable_entry_identity(info):
+            _fail("recovery")
         record = {
             "device": int(info.st_dev),
             "inode": int(info.st_ino),
@@ -1617,6 +1731,7 @@ def _resume_quarantined_child(
             or after.st_nlink != link_count
         ):
             _fail("recovery")
+        _deadline_check()
         os.unlink(quarantine_name, dir_fd=directory_fd)
         os.fsync(directory_fd)
     finally:
@@ -1871,6 +1986,7 @@ def _unlink_finalizing_pointer(
 
 
 def _finalization_result(digest: str, outcome: str) -> None:
+    _deadline_check()
     if (
         re.fullmatch(r"[0-9a-f]{64}", digest) is None
         or outcome != "witness-prepared"
@@ -2326,9 +2442,12 @@ def _live_resume_authority(
     run_key: str,
     state_kind: str,
 ) -> tuple[dict[str, Any], str]:
+    keys = {"schema", "authorization", "inspection", "stage"}
+    if current.get("phase") == "PREPARED":
+        keys |= {"imageInspection", "targetConfiguration", "backendInventory"}
     if (
         not isinstance(value, dict)
-        or set(value) != {"schema", "authorization", "inspection", "stage"}
+        or set(value) != keys
         or value["schema"] != LIVE_RESUME_SCHEMA
         or value["stage"] not in ("admission", "runtime", "quiescence")
         or value["stage"] == "quiescence" and (
@@ -2363,6 +2482,12 @@ def _live_resume_authority(
         except (module.GuardError, OSError):
             _fail("recovery")
     inspect = _inspect(json.dumps(value["inspection"], separators=(",", ":")).encode())
+    if current["phase"] == "PREPARED" and (
+        value["stage"] != "admission"
+        or value["backendInventory"] != [current["predecessorContainerId"]]
+        or inspect.get("Id") != current["predecessorContainerId"]
+    ):
+        _fail("recovery")
     return inspect, value["stage"]
 
 
@@ -2435,7 +2560,10 @@ def _live_resume_runtime(
     ):
         _fail("recovery")
     target = current["target"]["tuple"]
-    exact_target = inspect.get("Image") == "sha256:" + target["platformImageId"]
+    exact_target = (
+        current["phase"] != "PREPARED"
+        and inspect.get("Image") == "sha256:" + target["platformImageId"]
+    )
     expected_tuple = target
     if exact_target:
         if (
@@ -2494,36 +2622,452 @@ def _live_resume_runtime(
 
 
 def _live_resume_config(run_fd: int, current: dict[str, Any]) -> None:
+    if current["phase"] == "PREPARED":
+        _prepared_proof(run_fd, current)
+        return
     names = ("config.env.target", "config.base-compose.yml")
     for name in names:
-        record, data = _read_child_file(run_fd, name, MAX_CREDENTIAL_BYTES)
-        identity_name = name + ".identity"
-        if name == "config.env.target" and current["phase"] == "PREPARED":
-            # Target identity is recorded only after applying it. PREPARED may
-            # prove the original snapshots, never an invented post-cutover one.
-            identity_name = "config.env.production.identity"
-            _read_child_file(run_fd, "config.env.production", MAX_CREDENTIAL_BYTES)
-        _, identity = _read_child_file(run_fd, identity_name, MAX_OWNER_BYTES)
-        match = re.fullmatch(
-            rb"([0-9]+):([0-9]+):([0-9]+):([0-9]+):([0-9]+):"
-            rb"([0-9]+):([0-9]+):([0-9]+):([0-9a-f]{64})\n?",
-            identity,
-        )
-        if match is None:
+        _snapshot_source_identity(run_fd, name)
+
+
+def _snapshot_source_identity(run_fd: int, name: str) -> None:
+    record, data = _read_child_file(run_fd, name, MAX_CREDENTIAL_BYTES)
+    _, identity = _read_child_file(run_fd, name + ".identity", MAX_OWNER_BYTES)
+    match = re.fullmatch(
+        rb"([0-9]+):([0-9]+):([0-9]+):([0-9]+):([0-9]+):"
+        rb"([0-9]+):([0-9]+):([0-9]+):([0-9a-f]{64})\n?",
+        identity,
+    )
+    if match is None:
+        _fail("recovery")
+    fields = match.groups()
+    if (
+        int(fields[3]) != 0
+        or not stat.S_ISREG(int(fields[2]))
+        or stat.S_IMODE(int(fields[2])) & 0o022
+        or int(fields[5]) != len(data)
+        or fields[8].decode("ascii") != record["sha256"]
+    ):
+        _fail("recovery")
+
+
+PREPARED_CONFIG = (
+    "config.env.production", "config.env.production.identity",
+    "config.base-compose.yml", "config.base-compose.yml.identity",
+    "config.env.target", "config.env.previous", "target-runtime.override.yml",
+)
+PREPARED_BINDING = (
+    "originDigest", "operationEpoch", "operation", "runId", "incidentId",
+    "ownedRun", "target", "transitionId", "evidenceDigest", "toolingDigest",
+    "predecessorContainerId",
+)
+
+
+def _prepared_no_commit_files(run_fd: int) -> None:
+    for name in (
+        "timepad-commit-witness.json", "provider-finalization.json", "terminal.json",
+    ):
+        try:
+            os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        _fail("recovery")
+
+
+def _prepared_environment(run_fd: int, current: dict[str, Any]) -> None:
+    _, source = _read_child_file(run_fd, "config.env.production", MAX_CREDENTIAL_BYTES)
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError:
+        _fail("recovery")
+    for name, binding, reference in (
+        (
+            "config.env.target", current["target"],
+            "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:"
+            + current["target"]["tuple"]["repositoryDigest"],
+        ),
+        (
+            "config.env.previous", current["predecessor"],
+            _read_child_file(run_fd, "previous-image", MAX_OWNER_BYTES)[1].decode("ascii").rstrip("\n"),
+        ),
+    ):
+        replacements = {
+            "BACKEND_IMAGE": reference,
+            "BACKEND_REVISION": binding["tuple"]["revision"],
+            "BACKEND_VERSION": binding["tuple"]["version"],
+        }
+        seen = set()
+        lines = []
+        for line in text.splitlines(keepends=True):
+            match = re.match(r"^(BACKEND_IMAGE|BACKEND_REVISION|BACKEND_VERSION)=", line)
+            if match:
+                key = match.group(1)
+                if key in seen:
+                    _fail("recovery")
+                seen.add(key)
+                ending = line[len(line.rstrip("\r\n")):]
+                line = f"{key}={replacements[key]}{ending}"
+            lines.append(line)
+        _, actual = _read_child_file(run_fd, name, MAX_CREDENTIAL_BYTES)
+        if seen != set(replacements) or actual != "".join(lines).encode("utf-8"):
             _fail("recovery")
-        fields = match.groups()
-        if name == "config.env.target" and current["phase"] == "PREPARED":
-            record, data = _read_child_file(
-                run_fd, "config.env.production", MAX_CREDENTIAL_BYTES
-            )
+
+
+def _prepared_config_records(run_fd: int) -> list[dict[str, Any]]:
+    names = list(PREPARED_CONFIG)
+    for kind in ("compose", "runtime"):
+        group = (
+            f"had-active-{kind}", f"previous-active-{kind}.yml",
+            f"previous-active-{kind}.identity",
+        )
+        present = []
+        for name in group:
+            try:
+                os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            present.append(name)
+        if present and tuple(present) != group:
+            _fail("recovery")
+        names.extend(present)
+    return [{"name": name, "identity": _file_record(run_fd, name)} for name in names]
+
+
+def _prepared_transaction(
+    run_key: str, state_root: str, inspect: dict[str, Any],
+) -> dict[str, Any]:
+    marker = _live_resume_transaction(run_key, state_root, inspect, predecessor=True)
+    if marker["phase"] not in {"prepared", "applying"}:
+        _fail("recovery")
+    result: dict[str, Any] = {
+        "providerEnabled": marker["providerEnabled"],
+        "durableDisposition": marker["durableDisposition"],
+        "transaction": None,
+    }
+    if not marker["providerEnabled"]:
+        return result
+    parent_fd = _open_optional_directory_reference(HOST_CREDENTIAL_PARENT)
+    if parent_fd is None:
+        _fail("recovery")
+    try:
+        tx_fd = os.open(
+            ".transaction-" + run_key, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            _lock_directory(tx_fd)
+            names = ["identity.json", "snapshot"]
+            if marker["durableDisposition"] == "created":
+                names.append("publication")
+            result["transaction"] = {
+                "parent": _directory_record(os.fstat(parent_fd)),
+                "directory": _directory_record(os.fstat(tx_fd)),
+                "entries": [
+                    {"name": name, "identity": _file_record(
+                        tx_fd, name, gid=10001 if name == "publication" else 0,
+                        mode=0o440 if name == "publication" else 0o600,
+                        links=2 if name == "publication" else 1,
+                    )}
+                    for name in names
+                ],
+            }
+        finally:
+            os.close(tx_fd)
+    finally:
+        os.close(parent_fd)
+    return result
+
+
+def _prepared_proof(run_fd: int, current: dict[str, Any]) -> dict[str, Any]:
+    try:
+        os.stat(".timepad-prepared.tmp", dir_fd=run_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        _fail("recovery")
+    _, data = _read_child_file(run_fd, "timepad-prepared.json", MAX_PREPARED_BYTES)
+    if _finalization_digest(data) != current.get("preparedProofDigest"):
+        _fail("recovery")
+    proof = _json(data, "recovery")
+    if (
+        not isinstance(proof, dict)
+        or set(proof) != {
+            "schema", "binding", "config", "provider", "targetConfigurationDigest",
+            "effectiveProviderDigest",
+        }
+        or proof["schema"] != PREPARED_SCHEMA
+        or proof["binding"] != {key: current[key] for key in PREPARED_BINDING}
+        or proof["config"] != _prepared_config_records(run_fd)
+    ):
+        _fail("recovery")
+    for field in ("targetConfigurationDigest", "effectiveProviderDigest"):
+        if not isinstance(proof[field], str) or re.fullmatch(
+            r"[0-9a-f]{64}", proof[field]
+        ) is None:
+            _fail("recovery")
+    provider = proof["provider"]
+    if (
+        not isinstance(provider, dict)
+        or set(provider) != {"providerEnabled", "durableDisposition", "transaction"}
+        or type(provider["providerEnabled"]) is not bool
+    ):
+        _fail("recovery")
+    transaction = provider["transaction"]
+    if not provider["providerEnabled"]:
+        if provider["durableDisposition"] != "none" or transaction is not None:
+            _fail("recovery")
+    else:
         if (
-            int(fields[3]) != 0
-            or not stat.S_ISREG(int(fields[2]))
-            or stat.S_IMODE(int(fields[2])) & 0o022
-            or int(fields[5]) != len(data)
-            or fields[8].decode("ascii") != record["sha256"]
+            provider["durableDisposition"] not in {"created", "reused"}
+            or not isinstance(transaction, dict)
+            or set(transaction) != {"parent", "directory", "entries"}
         ):
             _fail("recovery")
+        _validate_finalization_directory_record(transaction["parent"])
+        _validate_finalization_directory_record(transaction["directory"])
+        names = ["identity.json", "snapshot"]
+        if provider["durableDisposition"] == "created":
+            names.append("publication")
+        if (
+            not isinstance(transaction["entries"], list)
+            or len(transaction["entries"]) != len(names)
+        ):
+            _fail("recovery")
+        for name, entry in zip(names, transaction["entries"]):
+            if (
+                not isinstance(entry, dict) or set(entry) != {"name", "identity"}
+                or entry["name"] != name
+            ):
+                _fail("recovery")
+            _validate_finalization_file_record(entry["identity"])
+    return proof
+
+
+def _configuration_digest(configuration: Any) -> str:
+    return _finalization_digest(json.dumps(
+        configuration, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode())
+
+
+def _prepared_target(
+    run_fd: int, current: dict[str, Any], image_value: Any, configuration: Any,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    proof = _prepared_proof(run_fd, current)
+    image = _inspect(json.dumps(image_value, separators=(",", ":")).encode())
+    effective = _absence_target_tuple(image, configuration, current)
+    if (
+        proof["targetConfigurationDigest"] != _configuration_digest(configuration)
+        or proof["effectiveProviderDigest"] != _configuration_digest(effective)
+    ):
+        _fail("recovery")
+    return proof, effective
+
+
+def _prepared_absent_transaction(
+    run_key: str, state_root: str, proof: dict[str, Any],
+) -> None:
+    """Validate intact target inputs without inventing an observed container."""
+    expected = proof["provider"]
+    marker = _marker(state_root, run_key)
+    if (
+        marker["phase"] not in {"prepared", "applying"}
+        or marker["providerEnabled"] != expected["providerEnabled"]
+        or marker["durableDisposition"] != expected["durableDisposition"]
+    ):
+        _fail("recovery")
+    tx = _transaction(HOST_CREDENTIAL_PARENT, run_key)
+    if not expected["providerEnabled"]:
+        if os.path.lexists(tx) or expected["transaction"] is not None:
+            _fail("recovery")
+        return
+    _validate_transaction(tx)
+    parent_fd = _open_optional_directory_reference(HOST_CREDENTIAL_PARENT)
+    if parent_fd is None:
+        _fail("recovery")
+    try:
+        tx_fd = os.open(tx, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            _lock_directory(tx_fd)
+            transaction = expected["transaction"]
+            if (
+                _directory_record(os.fstat(parent_fd)) != transaction["parent"]
+                or _directory_record(os.fstat(tx_fd)) != transaction["directory"]
+                or set(_iter_directory_fd_names(tx_fd)) != {
+                    entry["name"] for entry in transaction["entries"]
+                }
+            ):
+                _fail("recovery")
+            for entry in transaction["entries"]:
+                name = entry["name"]
+                if _file_record(
+                    tx_fd, name, gid=10001 if name == "publication" else 0,
+                    mode=0o440 if name == "publication" else 0o600,
+                    links=2 if name == "publication" else 1,
+                ) != entry["identity"]:
+                    _fail("recovery")
+            _, identity_data = _read_child_file(tx_fd, "identity.json", MAX_OWNER_BYTES)
+            _, snapshot = _read_child_file(tx_fd, "snapshot", MAX_CREDENTIAL_BYTES)
+            identity = _json(identity_data, "recovery")
+            _validate_identity(identity)
+            _validate_credential(snapshot)
+            durable_identity, durable = _read_existing(HOST_CREDENTIAL_PATH)
+            if durable_identity != identity["durable"] or durable != snapshot:
+                _fail("recovery")
+            if marker["durableDisposition"] == "created":
+                _verify_created_publication(tx, HOST_CREDENTIAL_PATH, identity, snapshot)
+            elif os.stat(HOST_CREDENTIAL_PATH, follow_symlinks=False).st_nlink != 1:
+                _fail("recovery")
+        finally:
+            os.close(tx_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _prepare_transition_proof(
+    run_key: str, state_root: str, state_kind: str, input_data: bytes,
+    deploy_lock_fd: int,
+) -> None:
+    if state_kind not in STATE_KINDS:
+        _fail("recovery")
+    value = _json(input_data, "recovery")
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "evidence", "predecessorInspection", "imageInspection",
+        "targetConfiguration",
+    } or value["schema"] != PREPARED_INPUT_SCHEMA:
+        _fail("recovery")
+    evidence = value["evidence"]
+    required = {
+        "rootId", "targetId", "predecessorId", "predecessorContainerId",
+        "transitionId", "target", "predecessor", "operation", "runId",
+        "incidentId", "ownedRun", "toolingDigest",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != required:
+        _fail("recovery")
+    root_fd = _open_deploy_state_root(state_root)
+    try:
+        _lock_directory(root_fd)
+        module, origin, previous = _timepad_current(state_root, deploy_lock_fd)
+        try:
+            contract = module.parse_contract(module._read_input(
+                pathlib.Path(__file__).with_name("test-vps-timepad-release-contracts.json"),
+                module.MAX_CONTRACT_BYTES,
+            ))
+            admission = module.admit(
+                contract, root_id=origin["rootId"], target_id=evidence["targetId"],
+                predecessor_id=evidence["predecessorId"],
+                transition_id=evidence["transitionId"], target_tuple=evidence["target"],
+                predecessor_tuple=evidence["predecessor"],
+            )
+            target = next(item for item in contract["images"] if item["id"] == evidence["targetId"])
+            predecessor = next(item for item in contract["images"] if item["id"] == evidence["predecessorId"])
+        except (module.GuardError, OSError, ValueError, TypeError, KeyError, StopIteration):
+            _fail("recovery")
+        if (
+            previous["phase"] not in {"READY", "COMMITTED", "ROLLED_BACK"}
+            or previous["operationEpoch"] >= (1 << 64) - 1
+            or evidence["rootId"] != origin["rootId"]
+            or evidence["runId"] != run_key
+            or evidence["ownedRun"] != f"{run_key}-{state_kind}"
+            or evidence["runId"] == previous.get("runId")
+            or evidence["incidentId"] == previous.get("incidentId")
+            or evidence["operation"] != (
+                "deploy" if state_kind == "final-deploy" else "rollback-drill"
+            )
+            or admission.disposition not in {"pre-barrier-only", "post-barrier-compatible"}
+            or evidence["operation"] == "rollback-drill"
+            and evidence["transitionId"] is not None
+            and admission.disposition != "post-barrier-compatible"
+        ):
+            _fail("recovery")
+        current = dict(
+            evidence, originDigest=origin["originDigest"],
+            operationEpoch=previous["operationEpoch"] + 1, target=target,
+            predecessor=predecessor, evidenceDigest=admission.contract_digest,
+            phase="PREPARED", containerId=None, configHash=None, ownedChild=None,
+            providerFinalizationDigest=None,
+        )
+        for field, pattern in (
+            ("incidentId", r"[a-f0-9]{32}"), ("toolingDigest", r"[a-f0-9]{64}"),
+            ("predecessorContainerId", r"[a-f0-9]{12,64}"),
+        ):
+            if not isinstance(current[field], str) or re.fullmatch(pattern, current[field]) is None:
+                _fail("recovery")
+        run_fd = os.open(
+            evidence["ownedRun"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        credential_parent = None
+        try:
+            _lock_directory(run_fd)
+            _validate_state_directory_fd(run_fd, evidence["ownedRun"])
+            credential_parent = _open_optional_directory_reference(HOST_CREDENTIAL_PARENT)
+            if credential_parent is not None:
+                _lock_directory(credential_parent)
+                if any(
+                    name.startswith(".transaction-") and name != ".transaction-" + run_key
+                    for name in _iter_directory_fd_names(credential_parent)
+                ):
+                    _fail("recovery")
+            for name in _iter_directory_fd_names(root_fd):
+                if name == ".smtp-transaction.current" or (
+                    name.startswith((".provider-transaction.", ".provider-state."))
+                    and name != ".provider-transaction.current"
+                ):
+                    _fail("recovery")
+            inspect = _inspect(json.dumps(value["predecessorInspection"]).encode())
+            if _live_resume_runtime(inspect, current, "admission")[0]:
+                _fail("recovery")
+            _live_resume_predecessor(run_fd, current, inspect)
+            image = _inspect(json.dumps(value["imageInspection"]).encode())
+            effective = _absence_target_tuple(image, value["targetConfiguration"], current)
+            if effective != _effective_tuple(inspect):
+                _fail("recovery")
+            provider = _prepared_transaction(run_key, state_root, inspect)
+            _prepared_no_commit_files(run_fd)
+            _prepared_environment(run_fd, current)
+            for name in ("config.env.production", "config.base-compose.yml"):
+                _snapshot_source_identity(run_fd, name)
+            proof = {
+                "schema": PREPARED_SCHEMA,
+                "binding": {key: current[key] for key in PREPARED_BINDING},
+                "config": _prepared_config_records(run_fd),
+                "provider": provider,
+                "targetConfigurationDigest": _configuration_digest(value["targetConfiguration"]),
+                "effectiveProviderDigest": _configuration_digest(effective),
+            }
+            data = json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
+            if len(data) > MAX_PREPARED_BYTES:
+                _fail("recovery")
+            for entry in proof["config"]:
+                fd = os.open(
+                    entry["name"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=run_fd,
+                )
+                try:
+                    _deadline_check()
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            try:
+                os.stat("timepad-prepared.json", dir_fd=run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                _write_private_at(run_fd, ".timepad-prepared.tmp", data, 0o600)
+                _rename_noreplace(run_fd, ".timepad-prepared.tmp", "timepad-prepared.json")
+                os.fsync(run_fd)
+            current["preparedProofDigest"] = _finalization_digest(data)
+            if _prepared_proof(run_fd, current) != proof:
+                _fail("recovery")
+            _deadline_check()
+            sys.stdout.write(json.dumps({
+                "schemaVersion": 1, "preparedProofDigest": current["preparedProofDigest"],
+                "outcome": "proof-prepared",
+            }, separators=(",", ":")) + "\n")
+        finally:
+            if credential_parent is not None:
+                os.close(credential_parent)
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _live_resume_predecessor(
@@ -2917,7 +3461,20 @@ def _absence_resume(
                     if name.startswith(".transaction-") and name != ".transaction-" + run_key:
                         _fail("recovery")
             _live_resume_config(run_fd, current)
-            _absence_receipt(root_fd, run_fd, state_root, current, origin, effective)
+            if current["phase"] == "PREPARED":
+                if any(current.get(key) is not None for key in (
+                    "containerId", "configHash", "ownedChild", "latestAttemptId",
+                    "commitWitnessDigest", "providerFinalizationDigest",
+                    "commitSubstep", "terminalReceipt",
+                )):
+                    _fail("recovery")
+                proof, _ = _prepared_target(
+                    run_fd, current, value["imageInspection"], value["targetConfiguration"],
+                )
+                _prepared_absent_transaction(run_key, state_root, proof)
+                _prepared_no_commit_files(run_fd)
+            else:
+                _absence_receipt(root_fd, run_fd, state_root, current, origin, effective)
             _, final_origin, final_current = _timepad_current(state_root, deploy_lock_fd)
             if final_origin != origin or final_current != current:
                 _fail("recovery")
@@ -2946,8 +3503,9 @@ def _live_resume(
     try:
         _lock_directory(root_fd)
         module, origin, current = _timepad_current(state_root, deploy_lock_fd)
+        value = _json(input_data, "recovery")
         inspect, stage = _live_resume_authority(
-            _json(input_data, "recovery"), module=module, origin=origin,
+            value, module=module, origin=origin,
             current=current, run_key=run_key, state_kind=state_kind,
         )
         exact_target, healthy = _live_resume_runtime(inspect, current, stage)
@@ -2977,12 +3535,14 @@ def _live_resume(
             if not exact_target:
                 _live_resume_predecessor(run_fd, current, inspect)
             if current["phase"] == "PREPARED":
-                for name in ("timepad-commit-witness.json", "provider-finalization.json"):
-                    try:
-                        os.stat(name, dir_fd=run_fd, follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
+                proof, effective = _prepared_target(
+                    run_fd, current, value["imageInspection"], value["targetConfiguration"],
+                )
+                if effective != _effective_tuple(inspect) or proof["provider"] != (
+                    _prepared_transaction(run_key, state_root, inspect)
+                ):
                     _fail("recovery")
+                _prepared_no_commit_files(run_fd)
             enabled, _ = _provider_state(inspect)
             present, read_only, _ = _provider_mount(
                 inspect, enabled, allow_external_source=not exact_target
@@ -3059,12 +3619,14 @@ def _ensure_parent(parent: str) -> None:
 
 
 def _write_private(path: str, data: bytes, mode: int, gid: int = 0) -> None:
+    _deadline_check()
     _check_ancestors(path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     fd = os.open(path, flags, mode)
     try:
         offset = 0
         while offset < len(data):
+            _deadline_check()
             offset += os.write(fd, data[offset:])
         os.fsync(fd)
         os.fchown(fd, 0, gid)
@@ -3082,6 +3644,7 @@ def _write_private_at(
     mode: int,
     gid: int = 0,
 ) -> None:
+    _deadline_check()
     if not name or "/" in name or "\x00" in name:
         _fail("recovery")
     fd = os.open(
@@ -3093,6 +3656,7 @@ def _write_private_at(
     try:
         offset = 0
         while offset < len(data):
+            _deadline_check()
             offset += os.write(fd, data[offset:])
         os.fsync(fd)
         os.fchown(fd, 0, gid)
@@ -3119,6 +3683,7 @@ def _rename_noreplace(
     expected_source_fd: int | None = None,
     expected_source_inode: tuple[int, int] | None = None,
 ) -> None:
+    _deadline_check()
     if (
         not source
         or not destination
@@ -3338,6 +3903,7 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
         if not _same_inode(os.fstat(parent_fd), expected_root):
             _fail("recovery")
         _validate_retention_state_root_fd(parent_fd)
+        _timepad_publication_guard(state_root)
         _retention_interlocks_fd("", parent_fd)
         for candidate in (temporary, name):
             try:
@@ -3384,6 +3950,7 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
             ):
                 _fail("recovery")
             _validate_state_directory_fd(temporary_fd, name)
+            _timepad_publication_guard(state_root)
             _rename_noreplace(
                 parent_fd,
                 temporary,
@@ -3432,12 +3999,14 @@ def _revalidate_open_source(
     before: os.stat_result,
     expected: bytes,
 ) -> None:
+    _deadline_check()
     current = os.fstat(fd)
     if _identity(current) != _identity(before) or current.st_size != len(expected):
         _fail("changed")
     os.lseek(fd, 0, os.SEEK_SET)
     data = bytearray()
     while len(data) <= MAX_CREDENTIAL_BYTES:
+        _deadline_check()
         chunk = os.read(fd, min(65536, MAX_CREDENTIAL_BYTES + 1 - len(data)))
         if not chunk:
             break
@@ -3454,6 +4023,7 @@ def _revalidate_open_source(
 
 
 def _read_private(path: str) -> bytes:
+    _deadline_check()
     _check_ancestors(path, category="recovery")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -3470,6 +4040,7 @@ def _read_private(path: str) -> bytes:
         )
         data = bytearray()
         while len(data) <= MAX_CREDENTIAL_BYTES:
+            _deadline_check()
             chunk = os.read(fd, min(65536, MAX_CREDENTIAL_BYTES + 1 - len(data)))
             if not chunk:
                 break
@@ -3661,6 +4232,7 @@ def _witnessed_unlink(
     expected_data_digest: str | None = None,
     expected_stable_identity: tuple[int, ...] | None = None,
 ) -> None:
+    _deadline_check()
     witness_fd = (
         expected_identity.pop("_witnessFd", None)
         if expected_identity is not None
@@ -3767,6 +4339,7 @@ def _witnessed_unlink(
                     or _stable_entry_identity(final_info) != expected_stable
                 ):
                     _fail("recovery")
+                _deadline_check()
                 os.unlink(quarantine, dir_fd=directory_fd)
                 os.fsync(directory_fd)
                 return
@@ -3935,6 +4508,7 @@ def _witnessed_unlink(
         ) != expected_data_digest:
             _fail("recovery")
         try:
+            _deadline_check()
             os.unlink(quarantine, dir_fd=directory_fd)
         except OSError:
             try:
@@ -4667,6 +5241,26 @@ def _timepad_retention_guard(
     return owned_run
 
 
+def _timepad_publication_guard(state_root: str) -> None:
+    """A new run cannot obscure an unresolved incident or bootstrap attempt."""
+    guard_present = False
+    with os.scandir(state_root) as entries:
+        for entry in entries:
+            _deadline_check()
+            if entry.name.startswith(".timepad-bootstrap-"):
+                _fail("recovery")
+            guard_present |= entry.name == "timepad-guard"
+    if not guard_present:
+        return
+    module = _timepad_state_module()
+    try:
+        _, current = module._read_guard_locked(state_root)
+    except (module.GuardError, OSError, ValueError, TypeError, KeyError):
+        _fail("recovery")
+    if current["phase"] not in {"READY", "COMMITTED", "ROLLED_BACK"}:
+        _fail("recovery")
+
+
 def _retention_guard_protects_state(name: str, latest_run: str | None) -> bool:
     return latest_run is not None and name == latest_run
 
@@ -4898,6 +5492,7 @@ def _retention_list(
     ).encode()
     if len(encoded) > MAX_INSPECTION_BYTES:
         _fail("recovery")
+    _deadline_check()
     sys.stdout.buffer.write(encoded + b"\n")
 
 
@@ -4923,6 +5518,8 @@ RETENTION_CHILDREN = frozenset(
         "terminal.json",
         OWNER_MARKER,
         "provider-finalization.json",
+        "timepad-prepared.json",
+        "timepad-commit-witness.json",
         "previous-active-compose.yml",
         "previous-active-compose.identity",
         "previous-active-runtime.yml",
@@ -5214,6 +5811,7 @@ def _parser() -> argparse.ArgumentParser:
             "finish-committed-resume",
             "live-resume",
             "absence-resume",
+            "prepare-transition-proof",
             "state-publish",
             "retention-list",
             "retention-check",
@@ -5229,6 +5827,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--retention-state", default="")
     parser.add_argument("--state-kind", default="")
     parser.add_argument("--deploy-lock-fd", type=int)
+    parser.add_argument("--execution-attempt")
+    parser.add_argument("--deadline-ns", type=int)
     return parser
 
 
@@ -5298,6 +5898,12 @@ def _dispatch(args: argparse.Namespace) -> None:
             args.run_key, args.state_root, args.state_kind,
             _bounded_stdin(MAX_LIVE_RESUME_BYTES), args.active_deploy_lock_fd,
         )
+    elif args.command == "prepare-transition-proof":
+        _run_key(args.run_key)
+        _prepare_transition_proof(
+            args.run_key, args.state_root, args.state_kind,
+            _bounded_stdin(MAX_LIVE_RESUME_BYTES), args.active_deploy_lock_fd,
+        )
     elif args.command == "state-publish":
         _state_publish(args.state_root, args.run_key, args.state_kind)
     elif args.command == "retention-list":
@@ -5337,6 +5943,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "finish-committed-resume",
             "live-resume",
             "absence-resume",
+            "prepare-transition-proof",
             "state-publish",
             "retention-list",
             "retention-check",
@@ -5344,22 +5951,26 @@ def main(argv: Iterable[str] | None = None) -> int:
         }
         if args.deploy_lock_fd is not None and args.command not in lock_commands:
             _fail("recovery")
-        if args.command in {"live-resume", "absence-resume"} and args.deploy_lock_fd is None:
+        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof"} and args.deploy_lock_fd is None:
             _fail("recovery")
-        if args.command in {"live-resume", "absence-resume"} and (
+        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof"} and (
             args.phase or args.outcome or args.protected_path
             or args.protected_state or args.retention_state
         ):
             _fail("recovery")
         if args.command in lock_commands:
-            with _deploy_lock(
-                args.state_root,
-                args.deploy_lock_fd,
-                create_state_root=args.command == "state-publish",
-            ) as active_deploy_lock_fd:
-                args.active_deploy_lock_fd = active_deploy_lock_fd
-                _dispatch(args)
+            with _operation_deadline(args.deadline_ns):
+                with _deploy_lock(
+                    args.state_root,
+                    args.deploy_lock_fd,
+                    create_state_root=args.command == "state-publish",
+                ) as active_deploy_lock_fd:
+                    args.active_deploy_lock_fd = active_deploy_lock_fd
+                    _execution_interlock(args, active_deploy_lock_fd)
+                    _dispatch(args)
         else:
+            if args.execution_attempt is not None or args.deadline_ns is not None:
+                _fail("recovery")
             _dispatch(args)
         return 0
     except ProviderError as exc:

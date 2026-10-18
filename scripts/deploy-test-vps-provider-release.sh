@@ -702,6 +702,120 @@ timeout 30s python3 "$provider_helper" check >/dev/null ||
 # shellcheck source=/dev/null
 source "$runtime_helper"
 
+supervisor_enabled=false
+supervisor_client() {
+  command timeout 10s python3 "$script_dir/test_vps_timepad_supervisor.py" \
+    client --root "$state_root" "$@"
+}
+supervisor_publish_lease() {
+  [ "$supervisor_enabled" = true ] || return 0
+  local grant lease revision attempt publication digest grant_id
+  grant=$(supervisor_client grant lease-publish 10) || return 1
+  lease=$(mktemp "$state_root/.timepad-execution.$TIMEPAD_ATTEMPT.XXXXXX") ||
+    return 1
+  command timeout 5s python3 "$script_dir/test_vps_timepad_supervisor.py" \
+    client --root "$state_root" lease >"$lease" || {
+      rm -f -- "$lease"
+      return 1
+    }
+  chmod 600 "$lease" || {
+    rm -f -- "$lease"
+    return 1
+  }
+  revision=$(jq -er '.revision | numbers' "$lease") || {
+    rm -f -- "$lease"
+    return 1
+  }
+  attempt=$(jq -er '.attempt | strings | select(test("^[a-f0-9]{32}$"))' \
+    "$lease") || {
+      rm -f -- "$lease"
+      return 1
+    }
+  [ "$attempt" = "$TIMEPAD_ATTEMPT" ] || {
+    rm -f -- "$lease"
+    return 1
+  }
+  publication=$(command timeout 10s python3 "$timepad_helper" publish-lease \
+    --root "$state_root" --lease "$lease" --deploy-lock-fd 9) || {
+      rm -f -- "$lease"
+      return 1
+    }
+  digest=$(jq -er '.digest | strings | select(test("^[a-f0-9]{64}$"))' \
+    <<<"$publication") || {
+      rm -f -- "$lease"
+      return 1
+    }
+  [ "$(jq -er '.revision | numbers' <<<"$publication")" = "$revision" ] ||
+    {
+      rm -f -- "$lease"
+      return 1
+    }
+  grant_id=$(jq -er '.grantId | strings' <<<"$grant") || {
+    rm -f -- "$lease"
+    return 1
+  }
+  supervisor_client complete "$grant_id" >/dev/null || {
+    rm -f -- "$lease"
+    return 1
+  }
+  supervisor_client lease-ack "$revision" "$digest" >/dev/null || {
+    rm -f -- "$lease"
+    return 1
+  }
+  rm -f -- "$lease"
+}
+timeout() {
+  local options=() local_bound executable wait_name grant grant_id end_ns bounded status
+  while [ "$#" -gt 0 ] && [[ "$1" = --* ]]; do
+    options+=("$1")
+    shift
+    case "${options[${#options[@]}-1]}" in
+      --kill-after|--signal) [ "$#" -gt 0 ] || return 2; options+=("$1"); shift ;;
+    esac
+  done
+  [ "$#" -ge 2 ] || return 2
+  local_bound=$1
+  shift
+  if [ "$supervisor_enabled" != true ]; then
+    command timeout "${options[@]}" "$local_bound" "$@"
+    return
+  fi
+  executable=${1##*/}
+  case "$executable" in
+    docker) wait_name=docker ;;
+    curl) wait_name=curl ;;
+    bash|sh) wait_name=runtime ;;
+    python3)
+      case " $* " in
+        *" test-vps-provider-credential.py "*) wait_name=provider ;;
+        *" test_vps_timepad_state.py "*) wait_name=runtime ;;
+        *) wait_name=preflight ;;
+      esac
+      ;;
+    *) wait_name=${TIMEPAD_WAIT_NAME:-preflight} ;;
+  esac
+  grant=$(supervisor_client grant "$wait_name" "${local_bound%s}") || return 124
+  grant_id=$(jq -er '.grantId | strings' <<<"$grant") || return 1
+  end_ns=$(jq -er '.endNs | numbers' <<<"$grant") || return 1
+  bounded=$(command timeout 3s python3 - "$end_ns" <<'PY'
+import sys
+import time
+
+remaining = (int(sys.argv[1]) - time.monotonic_ns()) / 1_000_000_000
+if remaining <= 0:
+    raise SystemExit(1)
+print(f"{remaining:.9f}s")
+PY
+  ) || {
+    supervisor_client complete "$grant_id" >/dev/null || :
+    return 124
+  }
+  command timeout "${options[@]}" "$bounded" "$@"
+  status=$?
+  supervisor_client complete "$grant_id" >/dev/null || return 1
+  return "$status"
+}
+
 docker_image_inspect() {
   timeout 30s docker image inspect "$@" 2>/dev/null
 }
@@ -1224,6 +1338,12 @@ timepad_prepare_transition() {
   local incident_id evidence_file admission_file output
   incident_id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$incident_id" =~ ^[0-9a-f]{32}$ ]] || fail "GUARD_STATE_LOST"
+  if [ "$supervisor_enabled" = true ]; then
+    supervisor_client arm >/dev/null ||
+      fail "EXECUTION_SUPERVISOR_ARM_FAILED"
+    supervisor_publish_lease ||
+      fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  fi
   evidence_file=$state/.timepad-prepare.json
   admission_file=$state/.timepad-admission.json
   [ ! -e "$evidence_file" ] && [ ! -L "$evidence_file" ] &&
@@ -1262,6 +1382,54 @@ timepad_prepare_transition() {
     rm -f -- "$evidence_file" "$admission_file"
     return 0
   fi
+  timepad_admitted=true
+}
+
+timepad_publish_prepared_transition() {
+  [ "$timepad_admitted" = true ] || return 0
+  local evidence_file=$state/.timepad-prepare.json
+  local admission_file=$state/.timepad-admission.json
+  local proof_input proof_output proof_digest grant grant_id deadline output
+  proof_input=$(jq -cn --slurpfile evidence "$evidence_file" \
+    --argjson predecessor_inspection "$previous_inspect" \
+    --argjson image_inspection "$target_image_inspect" \
+    --argjson target_configuration "$target_config" '
+      {schema:"meet-backend/test-vps-timepad-prepared-input/v1",
+       evidence:$evidence[0],predecessorInspection:$predecessor_inspection,
+       imageInspection:$image_inspection,targetConfiguration:$target_configuration}
+    ') || fail "PROVIDER_STATE_INVALID"
+  if [ "$supervisor_enabled" = true ]; then
+    grant=$(supervisor_client grant provider 30) ||
+      fail "PROVIDER_STATE_INVALID"
+    grant_id=$(jq -er '.grantId | strings' <<<"$grant") ||
+      fail "PROVIDER_STATE_INVALID"
+    deadline=$(jq -er '.endNs | numbers' <<<"$grant") ||
+      fail "PROVIDER_STATE_INVALID"
+    proof_output=$(printf '%s' "$proof_input" |
+      command timeout 30s python3 "$provider_helper" prepare-transition-proof \
+        --run-key "$run_key" --state-root "$state_root" \
+        --state-kind "$state_suffix" --deploy-lock-fd 9 \
+        --execution-attempt "$TIMEPAD_ATTEMPT" --deadline-ns "$deadline") || {
+          supervisor_client complete "$grant_id" >/dev/null || :
+          fail "PROVIDER_STATE_INVALID"
+        }
+    supervisor_client complete "$grant_id" >/dev/null ||
+      fail "PROVIDER_STATE_INVALID"
+  else
+    proof_output=$(printf '%s' "$proof_input" |
+      timeout 30s python3 "$provider_helper" prepare-transition-proof \
+        --run-key "$run_key" --state-root "$state_root" \
+        --state-kind "$state_suffix" --deploy-lock-fd 9) ||
+      fail "PROVIDER_STATE_INVALID"
+  fi
+  proof_digest=$(jq -er \
+    '.preparedProofDigest | strings | select(test("^[a-f0-9]{64}$"))' \
+    <<<"$proof_output") || fail "PROVIDER_STATE_INVALID"
+  jq -e --arg digest "$proof_digest" '.preparedProofDigest=$digest' \
+    "$evidence_file" >"$state/.timepad-prepare.next" ||
+    fail "PROVIDER_STATE_INVALID"
+  chmod 600 "$state/.timepad-prepare.next"
+  mv -f -- "$state/.timepad-prepare.next" "$evidence_file"
   output=$(timeout 15s python3 "$timepad_helper" prepare \
     --root "$state_root" --contract "$timepad_contract" \
     --evidence "$evidence_file" --deploy-lock-fd 9 2>/dev/null) ||
@@ -1290,11 +1458,23 @@ fi
 [ -d "$state_root" ] && [ ! -L "$state_root" ] ||
   fail "DEPLOY_LOCK_INVALID"
 umask 077
-exec 9>>"$state_root/.deploy.lock"
-flock -n 9 || fail "another test VPS deployment is active"
+if [ -z "${TIMEPAD_WORKER_MODE:-}" ]; then
+  exec 9>>"$state_root/.deploy.lock"
+  flock -n 9 || fail "another test VPS deployment is active"
+else
+  case "$TIMEPAD_WORKER_MODE" in
+    controller-worker|rollback-worker|fail-closed-worker|retention-worker) ;;
+    *) fail "PRIVATE_WORKER_REQUIRED" ;;
+  esac
+  [ -e /proc/self/fd/9 ] || fail "PRIVATE_WORKER_REQUIRED"
+fi
 timeout 15s python3 "$timepad_helper" lock-check \
   --root "$state_root" --deploy-lock-fd 9 >/dev/null ||
   fail "DEPLOY_LOCK_INVALID"
+if [ "${TIMEPAD_WORKER_MODE:-}" = controller-worker ]; then
+  supervisor_enabled=true
+  supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+fi
 validate_timepad_input() {
   timeout 10s python3 - "$1" "$2" <<'PY'
 import os
@@ -2277,6 +2457,7 @@ updater_completed=false
 cleanup_inspect=
 unsafe_cutover_latch=false
 prepared_timepad=false
+timepad_admitted=false
 admission_disposition=unknown
 candidate_container=
 failure_signal=
@@ -2626,6 +2807,7 @@ else
 fi
 write_provider_marker prepared "$durable_disposition"
 credential_prepared=true
+timepad_publish_prepared_transition
 
 restore_previous_active_files() {
   restore_active_file "$active_compose" compose || fail "RECOVERY_REQUIRED"
@@ -2879,5 +3061,50 @@ echo "operation_outcome=deployment-completed"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  provider_release_main "$@"
+  if [ "${1:-}" = --timepad-private-worker ]; then
+    [ "$#" -ge 3 ] || usage
+    worker_mode=$2
+    case "$worker_mode" in
+      controller-worker|rollback-worker|fail-closed-worker|retention-worker) ;;
+      *) fail "PRIVATE_WORKER_REQUIRED" ;;
+    esac
+    [ "$worker_mode" = controller-worker ] ||
+      fail "PRIVATE_WORKER_MODE_UNAVAILABLE"
+    shift 2
+    private_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
+    private_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    export TIMEPAD_WORKER_MODE=$worker_mode
+    timeout 10s python3 "$private_script_dir/test_vps_timepad_supervisor.py" \
+        client --root "$private_root" hello >/dev/null ||
+      fail "PRIVATE_WORKER_REQUIRED"
+    provider_release_main "$@"
+  else
+    supervisor_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
+    [[ "$supervisor_root" = /* ]] || fail "DEPLOY_LOCK_INVALID"
+    if [ ! -e "$supervisor_root" ] && [ ! -L "$supervisor_root" ]; then
+      timeout 10s install -d -m 700 "$supervisor_root" ||
+        fail "DEPLOY_LOCK_INVALID"
+    fi
+    [ -d "$supervisor_root" ] && [ ! -L "$supervisor_root" ] ||
+      fail "DEPLOY_LOCK_INVALID"
+    supervisor_operation=deploy
+    supervisor_args=("$@")
+    for ((index = 0; index < ${#supervisor_args[@]}; index++)); do
+      case "${supervisor_args[index]}" in
+        --operation)
+          ((index + 1 < ${#supervisor_args[@]})) || usage
+          case "${supervisor_args[index + 1]}" in
+            deploy|bootstrap-guard) supervisor_operation=deploy ;;
+            forward-recover) supervisor_operation=forward-recover ;;
+            *) usage ;;
+          esac
+          ((index += 1))
+          ;;
+        *) ;;
+      esac
+    done
+    supervisor_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    exec python3 "$supervisor_script_dir/test_vps_timepad_supervisor.py" \
+      relay --root "$supervisor_root" --operation "$supervisor_operation" -- "${supervisor_args[@]}"
+  fi
 fi

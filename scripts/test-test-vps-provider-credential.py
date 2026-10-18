@@ -17,6 +17,7 @@ import pathlib
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -208,6 +209,7 @@ def live_context(phase: str = "VERIFYING") -> tuple:
         predecessor=contract["images"][1], transition_id="first-timepad",
         owned_run="31885558214-1-final-deploy", tooling_digest="e" * 64,
         predecessor_container_id="f" * 64,
+        prepared_proof_digest="9" * 64,
     )
     if phase != "PREPARED":
         current.update(
@@ -261,6 +263,24 @@ def live_context(phase: str = "VERIFYING") -> tuple:
         "schema": helper.LIVE_RESUME_SCHEMA, "authorization": auth,
         "inspection": [observed], "stage": "admission",
     }
+    if phase == "PREPARED":
+        envelope.update(
+            imageInspection=[{
+                "Id": "sha256:" + image["platformImageId"],
+                "Config": dict(observed["Config"], Labels=dict(
+                    observed["Config"]["Labels"],
+                    **{
+                        "org.opencontainers.image.revision": image["revision"],
+                        "org.opencontainers.image.version": image["version"],
+                    },
+                )),
+            }],
+            targetConfiguration={"services": {"backend": {
+                "image": "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:"
+                + image["repositoryDigest"],
+            }}},
+            backendInventory=[current["predecessorContainerId"]],
+        )
     return module, contract, origin, current, envelope
 
 
@@ -307,6 +327,18 @@ class LiveResumeTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(helper, "_iter_directory_fd_names", return_value=()))
             stack.enter_context(mock.patch.object(helper, "_open_optional_directory_reference", return_value=None))
             config = stack.enter_context(mock.patch.object(helper, "_live_resume_config"))
+            stack.enter_context(mock.patch.object(
+                helper, "_prepared_target", return_value=(
+                    {"provider": {"providerEnabled": False, "durableDisposition": "none",
+                                  "transaction": None}},
+                    helper._effective_tuple(envelope["inspection"][0]),
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                helper, "_prepared_transaction", return_value={
+                    "providerEnabled": False, "durableDisposition": "none", "transaction": None,
+                },
+            ))
             stack.enter_context(mock.patch.object(helper, "_live_resume_predecessor"))
             transaction = stack.enter_context(mock.patch.object(
                 helper, "_live_resume_transaction", return_value=marker,
@@ -1308,6 +1340,676 @@ class LiveResumeTests(unittest.TestCase):
             with self.assertRaises(helper.ProviderError) as error:
                 helper._json(data, "recovery")
             self.assertEqual("RECOVERY_REQUIRED", error.exception.category)
+
+
+def prepared_proof(current: dict) -> dict:
+    record = finalization_witness()["config"][0]["identity"]
+    return {
+        "schema": helper.PREPARED_SCHEMA,
+        "binding": {key: current[key] for key in helper.PREPARED_BINDING},
+        "config": [
+            {"name": name, "identity": dict(record, inode=index)}
+            for index, name in enumerate(helper.PREPARED_CONFIG, start=100)
+        ],
+        "provider": {
+            "providerEnabled": False, "durableDisposition": "none", "transaction": None,
+        },
+        "targetConfigurationDigest": "1" * 64,
+        "effectiveProviderDigest": "2" * 64,
+    }
+
+
+class PreparedProofTests(unittest.TestCase):
+    def validate(self, proof: dict, current: dict, *, records: list | None = None) -> dict:
+        data = json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
+        current["preparedProofDigest"] = helper._finalization_digest(data)
+        with (
+            mock.patch.object(helper, "_read_child_file", return_value=({}, data)),
+            mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError),
+            mock.patch.object(
+                helper, "_prepared_config_records",
+                return_value=proof["config"] if records is None else records,
+            ),
+            mock.patch.object(helper.os, "write") as write,
+            mock.patch.object(helper.os, "unlink") as unlink,
+        ):
+            result = helper._prepared_proof(12, current)
+        write.assert_not_called()
+        unlink.assert_not_called()
+        return result
+
+    def test_frozen_proof_binds_every_operation_identity_and_config_record(self) -> None:
+        current = live_context("PREPARED")[3]
+        proof = prepared_proof(current)
+        self.assertEqual(proof, self.validate(proof, current))
+        self.assertLessEqual(len(json.dumps(proof).encode()), helper.MAX_PREPARED_BYTES)
+        for key in helper.PREPARED_BINDING:
+            changed = json.loads(json.dumps(proof))
+            changed["binding"][key] = None
+            with self.subTest(binding=key), self.assertRaises(helper.ProviderError):
+                self.validate(changed, current)
+        changed_records = json.loads(json.dumps(proof["config"]))
+        for field in ("device", "inode", "uid", "mode", "links", "mtimeNs", "sha256"):
+            changed_records[0]["identity"][field] = "tampered"
+            with self.subTest(identity=field), self.assertRaises(helper.ProviderError):
+                self.validate(proof, current, records=changed_records)
+        data = json.dumps(proof).encode()
+        current["preparedProofDigest"] = "0" * 64
+        with (
+            mock.patch.object(helper, "_read_child_file", return_value=({}, data)),
+            mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError),
+            mock.patch.object(helper, "_prepared_config_records") as config,
+            self.assertRaises(helper.ProviderError),
+        ):
+            helper._prepared_proof(12, current)
+        config.assert_not_called()
+
+    def test_proof_rejects_unknown_schema_fields_and_provider_shapes(self) -> None:
+        current = live_context("PREPARED")[3]
+        for field, replacement in (
+            ("schema", "unknown"), ("extra", True),
+            ("targetConfigurationDigest", "bad"),
+            ("effectiveProviderDigest", True),
+            ("provider", None),
+            ("provider", {"providerEnabled": False, "durableDisposition": "created",
+                          "transaction": None}),
+            ("provider", {"providerEnabled": True, "durableDisposition": "created",
+                          "transaction": {"parent": {}, "directory": {}, "entries": []}}),
+        ):
+            proof = dict(prepared_proof(current), **{field: replacement})
+            with self.subTest(field=field, replacement=replacement), self.assertRaises(helper.ProviderError):
+                self.validate(proof, current)
+
+    def test_missing_conflicting_temporary_and_commit_artifacts_refuse(self) -> None:
+        current = live_context("PREPARED")[3]
+        with (
+            mock.patch.object(helper.os, "stat", return_value=mock.Mock()),
+            mock.patch.object(helper, "_read_child_file") as read,
+            self.assertRaises(helper.ProviderError),
+        ):
+            helper._prepared_proof(12, current)
+        read.assert_not_called()
+        with (
+            mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError),
+            mock.patch.object(
+                helper, "_read_child_file", side_effect=helper.ProviderError("RECOVERY_REQUIRED"),
+            ),
+            self.assertRaises(helper.ProviderError),
+        ):
+            helper._prepared_proof(12, current)
+        for artifact in (
+            "timepad-commit-witness.json", "provider-finalization.json", "terminal.json",
+        ):
+            def file_stat(name, **kwargs):
+                if name != artifact:
+                    raise FileNotFoundError
+                return mock.Mock()
+            with (
+                self.subTest(artifact=artifact),
+                mock.patch.object(helper.os, "stat", side_effect=file_stat),
+                self.assertRaises(helper.ProviderError),
+            ):
+                helper._prepared_no_commit_files(12)
+
+    def test_intended_target_is_validated_independently_of_predecessor_runtime(self) -> None:
+        context = live_context("PREPARED")
+        current, envelope = context[3], context[4]
+        proof = prepared_proof(current)
+        image = helper._inspect(json.dumps(envelope["imageInspection"]).encode())
+        config = envelope["targetConfiguration"]
+        effective = helper._absence_target_tuple(image, config, current)
+        proof.update(
+            targetConfigurationDigest=helper._configuration_digest(config),
+            effectiveProviderDigest=helper._configuration_digest(effective),
+        )
+        with (
+            mock.patch.object(helper, "_prepared_proof", return_value=proof),
+            mock.patch.object(helper, "_live_resume_runtime") as runtime,
+        ):
+            self.assertEqual((proof, effective), helper._prepared_target(
+                12, current, envelope["imageInspection"], config,
+            ))
+            for replacement in (
+                dict(config, unexpected=True),
+                {"services": {"backend": {
+                    "image": config["services"]["backend"]["image"],
+                    "environment": {"APP_PUSH_DISCOVERY_ENABLED": "true"},
+                }}},
+            ):
+                with self.subTest(config=replacement), self.assertRaises(helper.ProviderError):
+                    helper._prepared_target(12, current, envelope["imageInspection"], replacement)
+        runtime.assert_not_called()
+
+    def test_prepared_inventory_missing_extra_unknown_or_target_runtime_refuses(self) -> None:
+        suite = LiveResumeTests()
+        for inventory in ([], None, ["unknown"], ["f" * 64, "a" * 64]):
+            context = live_context("PREPARED")
+            context[4]["backendInventory"] = inventory
+            with self.subTest(inventory=inventory), self.assertRaises(helper.ProviderError):
+                suite.authority(context)
+        for key in ("imageInspection", "targetConfiguration", "backendInventory"):
+            context = live_context("PREPARED")
+            del context[4][key]
+            with self.subTest(missing=key), self.assertRaises(helper.ProviderError):
+                suite.authority(context)
+        context = live_context("PREPARED")
+        observed = context[4]["inspection"][0]
+        observed["Image"] = "sha256:" + context[3]["target"]["tuple"]["platformImageId"]
+        with self.assertRaises(helper.ProviderError):
+            helper._live_resume_runtime(observed, context[3], "admission")
+
+    def test_prepared_same_image_predecessor_is_not_fabricated_target_runtime(self) -> None:
+        context = live_context("PREPARED")
+        current, observed = context[3], context[4]["inspection"][0]
+        current["predecessor"]["tuple"] = dict(current["target"]["tuple"])
+        observed["Image"] = "sha256:" + current["target"]["tuple"]["platformImageId"]
+        observed["Config"]["Labels"].update({
+            "org.opencontainers.image.revision": current["target"]["tuple"]["revision"],
+            "org.opencontainers.image.version": current["target"]["tuple"]["version"],
+        })
+        self.assertEqual((False, False), helper._live_resume_runtime(
+            observed, current, "admission",
+        ))
+        self.assertIsNone(current["containerId"])
+        self.assertIsNone(current["configHash"])
+
+    def test_config_validation_reads_frozen_target_not_original_substitution(self) -> None:
+        with (
+            mock.patch.object(helper, "_prepared_proof", side_effect=helper.ProviderError("RECOVERY_REQUIRED")) as proof,
+            mock.patch.object(helper, "_read_child_file") as read,
+            self.assertRaises(helper.ProviderError),
+        ):
+            helper._live_resume_config(12, {"phase": "PREPARED"})
+        proof.assert_called_once()
+        read.assert_not_called()
+
+    def test_environment_allows_only_exact_three_release_replacements(self) -> None:
+        current = live_context("PREPARED")[3]
+        original = (
+            b"BACKEND_IMAGE=fixture.invalid/backend@sha256:" + b"a" * 64
+            + b"\r\nBACKEND_REVISION=" + b"b" * 40
+            + b"\r\nBACKEND_VERSION=1.2.2\r\nPRIVATE_CANARY=untouched\r\n"
+        )
+        previous_ref = b"fixture.invalid/backend@sha256:" + b"a" * 64 + b"\n"
+        records = {"config.env.production": original, "previous-image": previous_ref}
+        for name, target, reference in (
+            ("config.env.target", current["target"]["tuple"],
+             "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:"
+             + current["target"]["tuple"]["repositoryDigest"]),
+            ("config.env.previous", current["predecessor"]["tuple"],
+             previous_ref.decode().rstrip("\n")),
+        ):
+            records[name] = (
+                f"BACKEND_IMAGE={reference}\r\nBACKEND_REVISION={target['revision']}"
+                f"\r\nBACKEND_VERSION={target['version']}\r\nPRIVATE_CANARY=untouched\r\n"
+            ).encode()
+
+        def read(fd, name, limit):
+            return {}, records[name]
+
+        with mock.patch.object(helper, "_read_child_file", side_effect=read):
+            helper._prepared_environment(12, current)
+            records["config.env.target"] = records["config.env.target"].replace(
+                b"untouched", b"changed",
+            )
+            with self.assertRaises(helper.ProviderError):
+                helper._prepared_environment(12, current)
+
+    def test_atomic_immutable_publication_and_exact_readback(self) -> None:
+        module, contract, origin, current, envelope = live_context("PREPARED")
+        proof = prepared_proof(current)
+        evidence = {
+            "rootId": origin["rootId"], "targetId": current["target"]["id"],
+            "predecessorId": current["predecessor"]["id"],
+            "predecessorContainerId": current["predecessorContainerId"],
+            "transitionId": current["transitionId"],
+            "target": current["target"]["tuple"], "predecessor": current["predecessor"]["tuple"],
+            "operation": current["operation"], "runId": current["runId"],
+            "incidentId": current["incidentId"], "ownedRun": current["ownedRun"],
+            "toolingDigest": current["toolingDigest"],
+        }
+        payload = dict(
+            schema=helper.PREPARED_INPUT_SCHEMA, evidence=evidence,
+            predecessorInspection=envelope["inspection"],
+            imageInspection=envelope["imageInspection"],
+            targetConfiguration=envelope["targetConfiguration"],
+        )
+        files = {}
+        events = []
+
+        def file_stat(name, **kwargs):
+            if name not in files:
+                raise FileNotFoundError
+            return mock.Mock()
+
+        def write(fd, name, data, mode):
+            if name in files:
+                raise FileExistsError
+            events.append("write")
+            files[name] = data
+
+        def rename(fd, source, target):
+            events.append("rename")
+            files[target] = files.pop(source)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(module, "_read_input", return_value=json.dumps(contract).encode()))
+            stack.enter_context(mock.patch.object(
+                helper, "_timepad_current", return_value=(
+                    module, origin, dict(
+                        current, phase="READY", operationEpoch=0, runId=None, incidentId=None,
+                    ),
+                ),
+            ))
+            stack.enter_context(mock.patch.multiple(
+                helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0),
+                O_NONBLOCK=getattr(os, "O_NONBLOCK", 0), create=True,
+            ))
+            stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
+            stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+            stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+            stack.enter_context(mock.patch.object(helper.os, "close"))
+            stack.enter_context(mock.patch.object(helper.os, "stat", side_effect=file_stat))
+            stack.enter_context(mock.patch.object(helper.os, "fsync", side_effect=lambda fd: events.append("fsync")))
+            stack.enter_context(mock.patch.object(helper, "_validate_state_directory_fd"))
+            stack.enter_context(mock.patch.object(helper, "_open_optional_directory_reference", return_value=None))
+            stack.enter_context(mock.patch.object(helper, "_iter_directory_fd_names", return_value=[]))
+            stack.enter_context(mock.patch.object(helper, "_live_resume_predecessor"))
+            stack.enter_context(mock.patch.object(helper, "_prepared_environment"))
+            stack.enter_context(mock.patch.object(helper, "_snapshot_source_identity"))
+            stack.enter_context(mock.patch.object(helper, "_prepared_transaction", return_value=proof["provider"]))
+            stack.enter_context(mock.patch.object(helper, "_prepared_config_records", return_value=proof["config"]))
+            stack.enter_context(mock.patch.object(helper, "_write_private_at", side_effect=write))
+            stack.enter_context(mock.patch.object(helper, "_rename_noreplace", side_effect=rename))
+            stack.enter_context(mock.patch.object(
+                helper, "_read_child_file", side_effect=lambda fd, name, limit: ({}, files[name]),
+            ))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            for _ in range(2):
+                helper._prepare_transition_proof(
+                    current["runId"], "/state", "final-deploy", json.dumps(payload).encode(), 9,
+                )
+            replies = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(replies[0], replies[1])
+            self.assertEqual("proof-prepared", replies[0]["outcome"])
+            self.assertEqual(
+                helper._finalization_digest(files["timepad-prepared.json"]),
+                replies[0]["preparedProofDigest"],
+            )
+            self.assertLessEqual(len(files["timepad-prepared.json"]), 8192)
+            self.assertEqual(1, events.count("write"))
+            self.assertEqual(1, events.count("rename"))
+            self.assertEqual("fsync", events[events.index("rename") + 1])
+            files["timepad-prepared.json"] += b" "
+            with self.assertRaises(helper.ProviderError):
+                helper._prepare_transition_proof(
+                    current["runId"], "/state", "final-deploy", json.dumps(payload).encode(), 9,
+                )
+        self.assertNotIn("PRIVATE_CANARY", output.getvalue())
+
+    def test_absence_prepared_validates_frozen_inputs_without_runtime_fabrication(self) -> None:
+        context = live_context("PREPARED")
+        _, _, _, current, live = context
+        envelope = dict(
+            schema=helper.ABSENCE_RESUME_SCHEMA, authorization=live["authorization"],
+            imageInspection=live["imageInspection"], targetConfiguration=live["targetConfiguration"],
+            backendInventory=[],
+        )
+        with (
+            mock.patch.object(helper, "_prepared_absent_transaction") as transaction,
+            mock.patch.object(helper, "_live_resume_runtime") as runtime,
+            mock.patch.object(helper, "_absence_receipt") as receipt,
+        ):
+            result = LiveResumeTests().run_proof(context, absence_envelope=envelope)[0]
+        self.assertEqual("retry-exact-candidate", result["outcome"])
+        transaction.assert_called_once()
+        runtime.assert_not_called()
+        receipt.assert_not_called()
+        self.assertEqual("PREPARED", current["phase"])
+        self.assertIsNone(current["containerId"])
+        self.assertIsNone(current["configHash"])
+
+    def test_enabled_absence_requires_every_frozen_transaction_identity_and_content(self) -> None:
+        credential = json.dumps({
+            "type": "service_account", "project_id": helper.EXPECTED_PROJECT,
+            "client_email": "fixture@example.invalid", "client_id": "fixture",
+            "private_key_id": "fixture", "token_uri": "https://example.invalid/token",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----",
+        }).encode()
+        durable = {"device": 1, "inode": 2, "mtimeNs": 3, "ctimeNs": 4}
+        identity = {"schemaVersion": 1, "predecessor": dict(durable, inode=5), "durable": durable}
+        for disposition in ("created", "reused"):
+            current = live_context("PREPARED")[3]
+            proof = prepared_proof(current)
+            frozen = finalization_witness(True)["transaction"]
+            names = ["identity.json", "snapshot"]
+            if disposition == "created":
+                names.append("publication")
+            entries = [
+                {"name": entry["name"], "identity": entry["identity"]}
+                for entry in frozen["entries"] if entry["name"] in names
+            ]
+            transaction = dict(frozen, entries=entries)
+            proof["provider"] = {
+                "providerEnabled": True, "durableDisposition": disposition,
+                "transaction": transaction,
+            }
+            self.validate(proof, current)
+            for failure in (None, "wrong-inode", "missing-snapshot", "wrong-durable", "extra-link"):
+                marker = {
+                    "phase": "applying", "providerEnabled": True,
+                    "durableDisposition": disposition,
+                }
+                actual_names = list(names)
+                if failure == "missing-snapshot":
+                    actual_names.remove("snapshot")
+
+                def record(fd, name, **kwargs):
+                    value = dict(next(e["identity"] for e in entries if e["name"] == name))
+                    if failure == "wrong-inode":
+                        value["inode"] += 100
+                    return value
+
+                def read(fd, name, limit):
+                    return {}, json.dumps(identity).encode() if name == "identity.json" else credential
+
+                with self.subTest(disposition=disposition, failure=failure), contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.multiple(
+                        helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                        O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+                    ))
+                    stack.enter_context(mock.patch.object(helper, "_marker", return_value=marker))
+                    stack.enter_context(mock.patch.object(helper, "_validate_transaction"))
+                    stack.enter_context(mock.patch.object(helper, "_open_optional_directory_reference", return_value=13))
+                    stack.enter_context(mock.patch.object(helper.os, "open", return_value=14))
+                    stack.enter_context(mock.patch.object(helper.os, "close"))
+                    stack.enter_context(mock.patch.object(helper.os, "fstat"))
+                    stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+                    stack.enter_context(mock.patch.object(
+                        helper, "_directory_record",
+                        side_effect=[transaction["parent"], transaction["directory"]],
+                    ))
+                    stack.enter_context(mock.patch.object(helper, "_iter_directory_fd_names", return_value=actual_names))
+                    stack.enter_context(mock.patch.object(helper, "_file_record", side_effect=record))
+                    stack.enter_context(mock.patch.object(helper, "_read_child_file", side_effect=read))
+                    stack.enter_context(mock.patch.object(
+                        helper, "_read_existing", return_value=(
+                            dict(durable, inode=99) if failure == "wrong-durable" else durable,
+                            credential,
+                        ),
+                    ))
+                    stack.enter_context(mock.patch.object(
+                        helper.os, "stat", return_value=mock.Mock(
+                            st_nlink=2 if failure == "extra-link" else 1,
+                        ),
+                    ))
+                    publication = stack.enter_context(mock.patch.object(
+                        helper, "_verify_created_publication",
+                        side_effect=helper.ProviderError("RECOVERY_REQUIRED")
+                        if failure == "extra-link" else None,
+                    ))
+                    write = stack.enter_context(mock.patch.object(helper.os, "write"))
+                    unlink = stack.enter_context(mock.patch.object(helper.os, "unlink"))
+                    if failure is None:
+                        helper._prepared_absent_transaction(current["runId"], "/state", proof)
+                        self.assertEqual(disposition == "created", publication.called)
+                    else:
+                        with self.assertRaises(helper.ProviderError):
+                            helper._prepared_absent_transaction(current["runId"], "/state", proof)
+                write.assert_not_called()
+                unlink.assert_not_called()
+
+
+class ExecutionInterlockTests(unittest.TestCase):
+    def test_all_public_writers_and_recovery_check_lease_under_lock(self) -> None:
+        events = []
+
+        @contextlib.contextmanager
+        def locked(*args, **kwargs):
+            events.append("lock")
+            yield 9
+            events.append("unlock")
+
+        for command in (
+            "prepare", "verify", "finish", "state-publish", "prepare-finalization",
+            "finish-committed-resume", "live-resume", "absence-resume",
+            "prepare-transition-proof", "retention-list", "retention-check", "retention-delete",
+        ):
+            events.clear()
+            with (
+                self.subTest(command=command),
+                mock.patch.object(helper, "_deploy_lock", locked),
+                mock.patch.object(
+                    helper, "_execution_interlock", side_effect=lambda args, fd: events.append("lease"),
+                ),
+                mock.patch.object(helper, "_dispatch", side_effect=lambda args: events.append("dispatch")),
+            ):
+                self.assertEqual(0, helper.main([command, "--deploy-lock-fd", "9"]))
+            self.assertEqual(["lock", "lease", "dispatch", "unlock"], events)
+        with (
+            mock.patch.object(helper, "_deploy_lock", locked),
+            mock.patch.object(helper, "_execution_interlock", side_effect=helper.ProviderError("RECOVERY_REQUIRED")),
+            mock.patch.object(helper, "_dispatch") as dispatch,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(1, helper.main(["state-publish"]))
+        dispatch.assert_not_called()
+
+    def test_lease_requires_inherited_lock_live_attempt_and_work_deadline(self) -> None:
+        module = helper._timepad_state_module()
+        now = time.monotonic_ns()
+        args = helper._parser().parse_args([
+            "prepare", "--deploy-lock-fd", "9", "--execution-attempt", "a" * 32,
+            "--deadline-ns", str(now + 10_000_000_000),
+        ])
+        lease = {
+            "attempt": "a" * 32, "lifecycle": "armed", "workEndNs": now + 20_000_000_000,
+            "workerMode": "controller-worker",
+        }
+        with (
+            mock.patch.object(helper.os, "stat"),
+            mock.patch.object(module, "_read_execution_lease_locked", return_value=lease),
+            mock.patch.object(module, "check_execution_lease") as check,
+        ):
+            helper._execution_interlock(args, 9)
+            check.assert_called_once_with(args.state_root, attempt="a" * 32, deploy_lock_fd=9)
+            for field, replacement in (
+                ("deploy_lock_fd", None), ("execution_attempt", None),
+                ("deadline_ns", None), ("deadline_ns", now + 21_000_000_000),
+            ):
+                changed = helper._parser().parse_args(["prepare"])
+                vars(changed).update(vars(args))
+                setattr(changed, field, replacement)
+                with self.subTest(field=field), self.assertRaises(helper.ProviderError):
+                    helper._execution_interlock(changed, 9)
+            for lifecycle in (
+                "cancel-forward", "drain-forward", "draining", "quiescence-unconfirmed", "drained",
+            ):
+                lease["lifecycle"] = lifecycle
+                with self.subTest(lifecycle=lifecycle), self.assertRaises(helper.ProviderError):
+                    helper._execution_interlock(args, 9)
+            lease["lifecycle"] = "armed"
+            check.side_effect = module.GuardError("EXECUTION_LEASE_UNRESOLVED")
+            with self.assertRaises(helper.ProviderError):
+                helper._execution_interlock(args, 9)
+
+    def test_deadline_never_resets_nested_budget_or_launches_expired_work(self) -> None:
+        with mock.patch.object(helper.time, "monotonic_ns", return_value=100):
+            with helper._operation_deadline(200):
+                with helper._operation_deadline(300):
+                    self.assertEqual(200, helper._DEADLINE_NS.get())
+                self.assertEqual(200, helper._DEADLINE_NS.get())
+            self.assertIsNone(helper._DEADLINE_NS.get())
+            for deadline in (0, 99, 100, True, -1, 1 << 63):
+                with self.subTest(deadline=deadline), self.assertRaises(helper.ProviderError):
+                    with helper._operation_deadline(deadline):
+                        self.fail("expired or invalid deadline entered")
+            with (
+                mock.patch.object(helper, "_deploy_lock") as lock,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(1, helper.main(["state-publish", "--deadline-ns", "99"]))
+            lock.assert_not_called()
+
+    def test_directory_lock_contention_is_nonblocking_and_fail_closed(self) -> None:
+        flock = mock.Mock()
+        with mock.patch.object(helper, "fcntl", mock.Mock(
+            flock=flock, LOCK_EX=2, LOCK_NB=4,
+        )):
+            helper._lock_directory(9)
+            flock.assert_called_once_with(9, 6)
+            flock.side_effect = BlockingIOError()
+            with self.assertRaises(helper.ProviderError):
+                helper._lock_directory(9)
+
+    def test_new_run_publication_refuses_unresolved_or_lost_guard(self) -> None:
+        module = helper._timepad_state_module()
+        scan = mock.MagicMock()
+        scan.__enter__.return_value = [pathlib.Path("timepad-guard")]
+        with (
+            mock.patch.object(helper.os, "scandir", return_value=scan),
+            mock.patch.object(module, "_read_guard_locked") as read,
+        ):
+            for phase in ("READY", "COMMITTED", "ROLLED_BACK"):
+                read.return_value = ({}, {"phase": phase})
+                helper._timepad_publication_guard("/state")
+            for phase in ("PREPARED", "CUTOVER_POSSIBLE", "COMMITTING", "RECOVERY_REQUIRED"):
+                read.return_value = ({}, {"phase": phase})
+                with self.subTest(phase=phase), self.assertRaises(helper.ProviderError):
+                    helper._timepad_publication_guard("/state")
+            read.side_effect = module.GuardError("GUARD_STATE_LOST")
+            with self.assertRaises(helper.ProviderError):
+                helper._timepad_publication_guard("/state")
+        scan.__enter__.return_value = [pathlib.Path(".timepad-bootstrap-fixture")]
+        with (
+            mock.patch.object(helper.os, "scandir", return_value=scan),
+            self.assertRaises(helper.ProviderError),
+        ):
+            helper._timepad_publication_guard("/state")
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux descriptor semantics")
+class LinuxProviderDescriptorTests(unittest.TestCase):
+    def test_directory_flock_contention_fails_without_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            first = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            second = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                helper._lock_directory(first)
+                with self.assertRaises(helper.ProviderError):
+                    helper._lock_directory(second)
+                os.close(first)
+                first = None
+                helper._lock_directory(second)
+            finally:
+                if first is not None:
+                    os.close(first)
+                os.close(second)
+
+    def test_descriptor_record_rejects_path_replacement_after_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            original = directory / "snapshot"
+            original.write_bytes(b"synthetic snapshot")
+            original.chmod(0o600)
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            capture = helper._child_witness
+
+            def replacing(fd, name, **kwargs):
+                result = capture(fd, name, **kwargs)
+                original.rename(directory / "old-snapshot")
+                original.write_bytes(b"synthetic replacement")
+                original.chmod(0o600)
+                return result
+
+            try:
+                with (
+                    mock.patch.object(helper, "_child_witness", side_effect=replacing),
+                    self.assertRaises(helper.ProviderError),
+                ):
+                    helper._file_record(
+                        directory_fd, "snapshot", uid=os.getuid(), gid=os.getgid(),
+                    )
+            finally:
+                os.close(directory_fd)
+
+    def test_quarantine_resume_ignores_only_rename_ctime_and_preserves_durable_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            publication = directory / "publication"
+            durable = directory / "durable"
+            publication.write_bytes(b"synthetic credential only")
+            publication.chmod(0o440)
+            os.link(publication, durable)
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                record = helper._file_record(
+                    directory_fd, "publication", uid=os.getuid(), gid=os.getgid(),
+                    mode=0o440, links=2,
+                )
+                kwargs = dict(
+                    expected_identity=helper._finalization_expected_identity(record),
+                    uid=os.getuid(), gid=os.getgid(), mode=0o440, link_count=2,
+                    quarantine_name=".provider-cleanup-fixture-publication",
+                    expected_data_digest=record["sha256"],
+                    expected_stable_identity=helper._finalization_stable_identity(record),
+                )
+                with (
+                    mock.patch.object(
+                        helper.os, "unlink", side_effect=helper.ProviderError("RECOVERY_REQUIRED"),
+                    ),
+                    self.assertRaises(helper.ProviderError),
+                ):
+                    helper._witnessed_unlink(directory_fd, "publication", **kwargs)
+                self.assertFalse(publication.exists())
+                self.assertTrue((directory / kwargs["quarantine_name"]).exists())
+                helper._witnessed_unlink(directory_fd, "publication", **kwargs)
+                self.assertEqual(b"synthetic credential only", durable.read_bytes())
+                self.assertEqual(1, durable.stat().st_nlink)
+                self.assertEqual(["durable"], os.listdir(directory))
+            finally:
+                os.close(directory_fd)
+
+    def test_extra_link_refuses_before_quarantine_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            original = directory / "snapshot"
+            original.write_bytes(b"synthetic input")
+            original.chmod(0o600)
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                record = helper._file_record(
+                    directory_fd, "snapshot", uid=os.getuid(), gid=os.getgid(),
+                )
+                os.link(original, directory / "foreign-link")
+                with self.assertRaises(helper.ProviderError):
+                    helper._witnessed_unlink(
+                        directory_fd, "snapshot",
+                        expected_identity=helper._finalization_expected_identity(record),
+                        uid=os.getuid(), gid=os.getgid(), mode=0o600, link_count=1,
+                        quarantine_name=".provider-cleanup-fixture-snapshot",
+                        expected_data_digest=record["sha256"],
+                        expected_stable_identity=helper._finalization_stable_identity(record),
+                    )
+                self.assertEqual({"snapshot", "foreign-link"}, set(os.listdir(directory)))
+            finally:
+                os.close(directory_fd)
+
+    def test_unclosed_stdin_pipe_expires_at_absolute_deadline(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            stream = mock.Mock()
+            stream.buffer.fileno.return_value = read_fd
+            with (
+                mock.patch.object(helper.sys, "stdin", stream),
+                self.assertRaises(helper.ProviderError),
+            ):
+                with helper._operation_deadline(time.monotonic_ns() + 20_000_000):
+                    helper._bounded_stdin(4096)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
 
 
 class ProviderCredentialTests(unittest.TestCase):

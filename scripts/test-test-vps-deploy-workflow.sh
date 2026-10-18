@@ -61,6 +61,7 @@ for text in \
   'recovery_binding_digest:' \
   'first transition requires explicit proof and drill=false' \
   'scripts/test_vps_timepad_state.py' \
+  'scripts/test_vps_timepad_supervisor.py' \
   'scripts/test-vps-timepad-release-contracts.json' \
   'check-contract --contract scripts/test-vps-timepad-release-contracts.json' \
   'contract_check" >/dev/null' \
@@ -104,6 +105,9 @@ done
 for text in \
   '--deploy-lock-fd 9' \
   'exec 9<"$state_root/.deploy.lock"' \
+  'execution_lease="$state_root/.timepad-execution.json"' \
+  'if [ -e "$execution_lease" ] || [ -L "$execution_lease" ]; then' \
+  'echo "RECOVERY_REQUIRED" >&2' \
   '--operation deploy' \
   '--rollout-domain "$ROLLOUT_DOMAIN"' \
   '--bootstrap-id "$BOOTSTRAP_ID"' \
