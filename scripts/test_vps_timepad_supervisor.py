@@ -14,7 +14,9 @@ replace it or FD9. Each shell/helper RPC uses its own SCM_RIGHTS reply socket;
 concurrent command substitutions cannot consume one another's replies.
 
 Worker contract (also exposed by WorkerClient):
-* ``arm`` immediately before PREPARED; forward-recover is armed at entry.
+* Publish/ack the initial ``registered`` lease before ``arm`` immediately
+  before PREPARED. Forward-recover charges its clock at supervisor entry,
+  including registration, then arms without resetting that clock.
 * ``lease`` obtains the current immutable publication snapshot/revision.
   Publish it durably using the state helper under a ``lease-publish`` grant,
   complete that grant, then ``lease-ack REV DIGEST``. No other work grant is
@@ -210,7 +212,7 @@ class Attempt:
         self.pending_terminal: int | None = None
         self.result: tuple[int, str] | None = None
         if operation == "forward-recover":
-            self.arm()
+            self._start_clock()
 
     def _change(self, lifecycle: str) -> None:
         self.lifecycle = lifecycle
@@ -218,12 +220,17 @@ class Attempt:
         self.acked_revision = -1
         self.lease_digest = None
 
-    def arm(self) -> None:
+    def _start_clock(self) -> None:
         if self.t0 is not None:
             return
         self.t0 = self.clock()
         self.work_end = self.t0 + self.timing.work_ns
         self.hard_end = self.t0 + self.timing.hard_ns
+
+    def arm(self) -> None:
+        if self.lifecycle != "registered":
+            return
+        self._start_clock()
         self._change("armed")
 
     def cancel(self, reason: str, status: int = 1) -> None:
@@ -282,6 +289,9 @@ class Attempt:
             reject("WAIT_REFUSED")
         if name != "lease-publish" and self.acked_revision != self.revision:
             reject("LEASE_ACK_REQUIRED")
+        if self.operation == "forward-recover" and self.lifecycle == "registered" \
+                and name != "lease-publish":
+            reject("WAIT_REFUSED")
         if self.lifecycle == "drained" and name != "lease-publish":
             reject("WAIT_REFUSED")
         if self.role == "fail-closed-worker":
@@ -356,6 +366,8 @@ class Attempt:
 
     def prepare_terminal(self) -> None:
         if self.grants or self.acked_revision != self.revision:
+            reject("TERMINAL_REFUSED")
+        if self.operation == "forward-recover" and self.lifecycle == "registered":
             reject("TERMINAL_REFUSED")
         if self.role == "rollback-worker" and not self.rollback_admitted:
             reject("TERMINAL_REFUSED")
@@ -846,6 +858,8 @@ class Supervisor:
             elif kind == "arm":
                 if self.attempt.role not in {"controller-worker", "retention-worker"}:
                     reject()
+                if self.attempt.acked_revision != self.attempt.revision:
+                    reject("LEASE_ACK_REQUIRED")
                 self.attempt.arm()
                 value = self._lease()
                 self._notify_clock()

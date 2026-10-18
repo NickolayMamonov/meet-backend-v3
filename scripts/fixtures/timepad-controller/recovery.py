@@ -65,10 +65,12 @@ def require_isolated(case: pathlib.Path) -> None:
         raise SystemExit("fixture fixed-path isolation is unproved")
 
 
-def setup(case: pathlib.Path, phase: str, fault: str) -> None:
+def setup(case: pathlib.Path, phase: str, fault: str, *, compatible: bool = True) -> None:
     require_isolated(case)
     fixtures = load("provider_recovery_fixtures", SOURCE / "test-test-vps-provider-credential.py")
     module, contract, _, template, envelope = fixtures.live_context(phase)
+    if not compatible:
+        contract["transitions"][0]["compatiblePredecessors"] = []
     root, state_root, tools = (case / name for name in ("root", "state", "tools"))
     for directory in (case, root, state_root, tools):
         directory.mkdir(mode=0o700)
@@ -76,6 +78,7 @@ def setup(case: pathlib.Path, phase: str, fault: str) -> None:
         "deploy-test-vps-provider-release.sh", "production-compose.sh",
         "update-production-release.sh", "test-vps-runtime-invariants.sh",
         "test-vps-provider-credential.py", "test_vps_timepad_state.py",
+        "test_vps_timepad_supervisor.py",
     ):
         shutil.copy2(SOURCE / name, tools / name)
     private(tools / "test-vps-timepad-release-contracts.json", json.dumps(contract).encode())
@@ -105,6 +108,7 @@ def setup(case: pathlib.Path, phase: str, fault: str) -> None:
         target=template["target"], predecessor=template["predecessor"],
         predecessor_container_id="e" * 64, transition_id="first-timepad",
         owned_run=template["ownedRun"], tooling_digest=template["toolingDigest"],
+        prepared_proof_digest=template["preparedProofDigest"],
     )
     module.publish_current(state_root, current)
     if phase != "PREPARED":
@@ -145,7 +149,10 @@ def setup(case: pathlib.Path, phase: str, fault: str) -> None:
                 module.publish_current(state_root, current)
                 current = module.advance_state(current, current["phase"], ownedChild=None)
                 module.publish_current(state_root, current)
-    auth = dict(envelope["authorization"], originDigest=origin["originDigest"])
+    auth = dict(
+        envelope["authorization"], originDigest=origin["originDigest"],
+        evidenceDigest=current["evidenceDigest"],
+    )
     private(state_root / "timepad-recovery-authorization.json", json.dumps(auth).encode())
     image = current["target"]["tuple"]
     env = (

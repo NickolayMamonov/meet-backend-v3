@@ -764,35 +764,38 @@ supervisor_publish_lease() {
   }
   rm -f -- "$lease"
 }
-timeout() {
+supervisor_timeout() {
   local options=() local_bound executable wait_name grant grant_id end_ns bounded status
-  while [ "$#" -gt 0 ] && [[ "$1" = --* ]]; do
-    options+=("$1")
-    shift
-    case "${options[${#options[@]}-1]}" in
-      --kill-after|--signal) [ "$#" -gt 0 ] || return 2; options+=("$1"); shift ;;
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --kill-after=*|--signal=*|--preserve-status|--foreground|--verbose)
+        options+=("$1")
+        shift ;;
+      -k|-s|--kill-after|--signal)
+        [ "$#" -ge 2 ] || return 2
+        options+=("$1" "$2")
+        shift 2 ;;
+      *) break ;;
     esac
   done
   [ "$#" -ge 2 ] || return 2
   local_bound=$1
   shift
-  if [ "$supervisor_enabled" != true ]; then
-    command timeout "${options[@]}" "$local_bound" "$@"
-    return
-  fi
   executable=${1##*/}
   case "$executable" in
     docker) wait_name=docker ;;
     curl) wait_name=curl ;;
     bash|sh) wait_name=runtime ;;
     python3)
-      case " $* " in
-        *" test-vps-provider-credential.py "*) wait_name=provider ;;
-        *" test_vps_timepad_state.py "*) wait_name=runtime ;;
-        *) wait_name=preflight ;;
-      esac
+      if [ "${2:-}" = "$provider_helper" ]; then
+        wait_name=provider
+      elif [ "${2:-}" = "$timepad_helper" ]; then
+        wait_name="state-publish"
+      else
+        wait_name=preflight
+      fi
       ;;
-    *) wait_name=${TIMEPAD_WAIT_NAME:-preflight} ;;
+    *) wait_name=preflight ;;
   esac
   grant=$(supervisor_client grant "$wait_name" "${local_bound%s}") || return 124
   grant_id=$(jq -er '.grantId | strings' <<<"$grant") || return 1
@@ -810,8 +813,11 @@ PY
     supervisor_client complete "$grant_id" >/dev/null || :
     return 124
   }
-  command timeout "${options[@]}" "$bounded" "$@"
-  status=$?
+  if command timeout "${options[@]}" "$bounded" "$@"; then
+    status=0
+  else
+    status=$?
+  fi
   supervisor_client complete "$grant_id" >/dev/null || return 1
   return "$status"
 }
@@ -853,6 +859,26 @@ recovery_work_end_ns=
 recovery_hard_end_ns=
 recovery_budget_arm() {
   [ -n "$recovery_t0_ns" ] && return 0
+  if [ "$supervisor_enabled" = true ]; then
+    local lease
+    lease=$(supervisor_client lease) || fail "RECOVERY_REQUIRED"
+    if [ "$(jq -er '.lifecycle | strings' <<<"$lease")" = registered ]; then
+      supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
+      supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+      lease=$(supervisor_client lease) || fail "RECOVERY_REQUIRED"
+    fi
+    jq -e --arg attempt "$TIMEPAD_ATTEMPT" '
+      .attempt == $attempt and .t0Ns != null and .workEndNs != null and
+      .hardEndNs != null
+    ' <<<"$lease" >/dev/null || fail "RECOVERY_REQUIRED"
+    recovery_t0_ns=$(jq -er '.t0Ns | numbers' <<<"$lease") ||
+      fail "RECOVERY_REQUIRED"
+    recovery_work_end_ns=$(jq -er '.workEndNs | numbers' <<<"$lease") ||
+      fail "RECOVERY_REQUIRED"
+    recovery_hard_end_ns=$(jq -er '.hardEndNs | numbers' <<<"$lease") ||
+      fail "RECOVERY_REQUIRED"
+    return 0
+  fi
   recovery_t0_ns=$(command timeout 2s python3 -B -c \
     'import time; print(time.monotonic_ns())') || fail "RECOVERY_REQUIRED"
   [[ "$recovery_t0_ns" =~ ^[0-9]+$ ]] || fail "RECOVERY_REQUIRED"
@@ -901,6 +927,10 @@ recovery_health_window_open() {
 }
 
 timeout() {
+  if [ "$supervisor_enabled" = true ]; then
+    supervisor_timeout "$@"
+    return
+  fi
   local -a options=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -1338,12 +1368,6 @@ timepad_prepare_transition() {
   local incident_id evidence_file admission_file output
   incident_id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$incident_id" =~ ^[0-9a-f]{32}$ ]] || fail "GUARD_STATE_LOST"
-  if [ "$supervisor_enabled" = true ]; then
-    supervisor_client arm >/dev/null ||
-      fail "EXECUTION_SUPERVISOR_ARM_FAILED"
-    supervisor_publish_lease ||
-      fail "EXECUTION_LEASE_PUBLICATION_FAILED"
-  fi
   evidence_file=$state/.timepad-prepare.json
   admission_file=$state/.timepad-admission.json
   [ ! -e "$evidence_file" ] && [ ! -L "$evidence_file" ] &&
@@ -1387,6 +1411,7 @@ timepad_prepare_transition() {
 
 timepad_publish_prepared_transition() {
   [ "$timepad_admitted" = true ] || return 0
+  recovery_budget_arm
   local evidence_file=$state/.timepad-prepare.json
   local admission_file=$state/.timepad-admission.json
   local proof_input proof_output proof_digest grant grant_id deadline output
@@ -1474,6 +1499,10 @@ timeout 15s python3 "$timepad_helper" lock-check \
 if [ "${TIMEPAD_WORKER_MODE:-}" = controller-worker ]; then
   supervisor_enabled=true
   supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  if [ "$operation" = forward-recover ]; then
+    supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
+    supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  fi
 fi
 validate_timepad_input() {
   timeout 10s python3 - "$1" "$2" <<'PY'
@@ -2673,9 +2702,6 @@ else
     fail "TIMEPAD_ADMISSION_REFUSED"
 fi
 prepared_timepad=false
-if [ "$operation" = deploy ]; then
-  recovery_budget_arm
-fi
 timepad_prepare_transition "$target_timepad_binding" \
   "$predecessor_timepad_binding" "$timepad_transition_id"
 echo "schema_guard=$admission_disposition"

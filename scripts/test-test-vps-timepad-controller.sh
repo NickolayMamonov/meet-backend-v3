@@ -51,7 +51,7 @@ done
   exit 1
 }
 awk 'NR > 1 { exit 1 }' /proc/net/route &&
-  awk 'NF { exit 1 }' /proc/net/ipv6_route || {
+  awk 'NF { if (NF != 10 || $10 != "lo") bad = 1 } END { exit bad }' /proc/net/ipv6_route || {
   echo "fixture network namespace has a route" >&2
   exit 1
 }
@@ -64,6 +64,7 @@ controller=scripts/deploy-test-vps-provider-release.sh
 bash_path=$(command -v bash)
 safe_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 fixture_bin=$ROOT_DIR/scripts/fixtures/timepad-controller
+runtime_bin=/var/lib/timepad-fixture/bin
 state_root=/var/lib/timepad-fixture/state
 root=/var/lib/timepad-fixture/root
 base_compose=/var/lib/timepad-fixture/compose.yml
@@ -72,10 +73,16 @@ install -d -m 700 "$root" "$state_root"
 install -m 600 "$fixture_bin/root-env" "$root/.env.production"
 install -m 600 "$fixture_bin/compose.yml" "$root/docker-compose.production.yml"
 install -m 600 "$root/docker-compose.production.yml" "$base_compose"
+install -d -m 700 "$runtime_bin"
+install -m 700 "$fixture_bin/docker" "$fixture_bin/curl" "$runtime_bin"
 export DOCKER_HOST=
 export TIMEPAD_FIXTURE_DOCKER_LOG=$docker_log
 export TEST_VPS_STATE_ROOT=$state_root
-export PATH="$fixture_bin:$safe_path"
+export TIMEPAD_FIXTURE_ADAPTER_DIR=$fixture_bin
+export PATH="$runtime_bin:$safe_path"
+export PYTHONDONTWRITEBYTECODE=1
+timeout --kill-after=5s 600s python3 -B "$fixture_bin/admission-cancellation.py" bootstrap
+timeout --kill-after=5s 360s python3 -B "$fixture_bin/admission-cancellation.py" cancellation
 common_args=(
   --root "$root"
   --base-compose "$base_compose"

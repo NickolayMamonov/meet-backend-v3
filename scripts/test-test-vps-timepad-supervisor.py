@@ -30,6 +30,13 @@ assert SPEC is not None and SPEC.loader is not None
 supervisor = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = supervisor
 SPEC.loader.exec_module(supervisor)
+STATE_SPEC = importlib.util.spec_from_file_location(
+    "test_vps_timepad_state", SCRIPTS / "test_vps_timepad_state.py",
+)
+assert STATE_SPEC is not None and STATE_SPEC.loader is not None
+state = importlib.util.module_from_spec(STATE_SPEC)
+sys.modules[STATE_SPEC.name] = state
+STATE_SPEC.loader.exec_module(state)
 NS = supervisor.NS
 ACK = "a" * 64
 
@@ -89,11 +96,55 @@ class AttemptTests(unittest.TestCase):
     def test_forward_recovery_charges_authorization_before_any_grant(self):
         attempt = supervisor.Attempt("forward-recover", clock=self.clock)
         original = attempt.t0
+        self.assertEqual((attempt.revision, attempt.lifecycle), (0, "registered"))
+        acknowledged(attempt)
+        with self.assertRaises(supervisor.SupervisorError):
+            attempt.grant("provider", NS)
+        with self.assertRaises(supervisor.SupervisorError):
+            attempt.prepare_terminal()
+        attempt.arm()
         self.clock.advance(530)
         acknowledged(attempt)
         grant = attempt.grant("provider", 30 * NS)
         self.assertEqual(grant.end_ns, original + 540 * NS)
         attempt.cancel("EXIT", 1)
+        self.assertEqual(attempt.after_drain(), "fail-closed-worker")
+        self.assertFalse(attempt.rollback_issued)
+
+    def test_recovery_registration_and_arm_match_actual_state_lease_contract(self):
+        instance = supervisor.Supervisor.__new__(supervisor.Supervisor)
+        instance.attempt = supervisor.Attempt("forward-recover", clock=self.clock)
+        instance.identity = {
+            "pid": 123, "startTicks": 456,
+            "bootId": "01234567-89ab-cdef-0123-456789abcdef",
+        }
+        instance.worker_identity = {**instance.identity, "pid": 124}
+        instance.worker_identities = [
+            {"mode": "controller-worker", **instance.worker_identity},
+        ]
+        registered = state._execution_lease(instance._lease())
+        self.assertEqual((registered["revision"], registered["lifecycle"]), (0, "registered"))
+        self.assertEqual(registered["workEndNs"], self.clock.now + 540 * NS)
+        self.assertEqual(registered["hardEndNs"], self.clock.now + 600 * NS)
+        acknowledged(instance.attempt)
+        self.clock.advance(20)
+        instance.attempt.arm()
+        armed = state._execution_lease(instance._lease())
+        state._validate_lease_successor(registered, armed)
+        self.assertEqual((armed["revision"], armed["lifecycle"]), (1, "armed"))
+        for field in ("t0Ns", "workEndNs", "hardEndNs"):
+            self.assertEqual(registered[field], armed[field])
+
+    def test_registration_publication_consumes_recovery_budget(self):
+        attempt = supervisor.Attempt("forward-recover", clock=self.clock)
+        self.clock.advance(539)
+        publication = attempt.grant("lease-publish", 10 * NS)
+        self.assertEqual(publication.end_ns, attempt.work_end)
+        self.clock.advance(1)
+        attempt.poll()
+        self.assertEqual(attempt.first_reason, "WORK_EXHAUSTED")
+        with self.assertRaises(supervisor.SupervisorError):
+            attempt.complete(publication.grant_id)
         self.assertEqual(attempt.after_drain(), "fail-closed-worker")
         self.assertFalse(attempt.rollback_issued)
 
@@ -311,6 +362,7 @@ class AttemptTests(unittest.TestCase):
 
 def fixture_publish(client, directory):
     snapshot = client.request("lease")
+    state._execution_lease(snapshot)
     grant = client.request("grant", name="lease-publish", localNs=10 * NS)
     data = supervisor.encode(snapshot)
     target = Path(directory) / "fixture-execution.json"
@@ -374,7 +426,7 @@ class FixtureSupervisor(supervisor.Supervisor):
                 os._exit(2)
         child.close()
         self.worker, self.worker_pid = parent, pid
-        self.worker_identity = supervisor.process_identity(pid).frame()
+        self.worker_identity = supervisor.lease_identity(supervisor.process_identity(pid))
         self.worker_identities.append({"mode": mode, **self.worker_identity})
         self.worker_hello = False
         self.worker_handshake_end = time.monotonic_ns() + self.attempt.timing.handshake_ns
@@ -456,6 +508,7 @@ class LinuxSupervisorTests(unittest.TestCase):
         def behavior(client, directory, mode):
             if mode != "controller-worker":
                 os._exit(5)
+            fixture_publish(client, directory)
             client.request("arm")
             fixture_publish(client, directory)
             grant = client.request("grant", name="runtime", localNs=NS)
@@ -463,6 +516,39 @@ class LinuxSupervisorTests(unittest.TestCase):
             fixture_terminal(client, directory, 0)
 
         result, _ = self.run_fixture(behavior)
+        self.assertEqual((result["status"], result["reason"]), (0, "COMPLETED"))
+
+    def test_recovery_registration_arm_and_terminal_use_actual_durable_state(self):
+        def behavior(client, directory, mode):
+            if mode != "controller-worker":
+                os._exit(5)
+
+            def publish(expected_phase):
+                snapshot = client.request("lease")
+                if snapshot["lifecycle"] != expected_phase:
+                    os._exit(6)
+                grant = client.request("grant", name="lease-publish", localNs=NS)
+                acknowledgment = state.publish_execution_lease(
+                    directory, snapshot, deploy_lock_fd=9,
+                )
+                client.request("complete", grantId=grant["grantId"])
+                client.request(
+                    "lease-ack", revision=acknowledgment["revision"],
+                    digest=acknowledgment["digest"],
+                )
+                return snapshot
+
+            registered = publish("registered")
+            client.request("arm")
+            armed = publish("armed")
+            for key in ("t0Ns", "workEndNs", "hardEndNs"):
+                if registered[key] != armed[key]:
+                    os._exit(7)
+            client.request("prepare-terminal")
+            publish("drained")
+            client.request("terminal", status=0)
+
+        result, _ = self.run_fixture(behavior, operation="forward-recover")
         self.assertEqual((result["status"], result["reason"]), (0, "COMPLETED"))
 
     def test_local_expiry_drains_forward_before_single_remaining_work_rollback(self):
@@ -496,6 +582,8 @@ class LinuxSupervisorTests(unittest.TestCase):
         def behavior(client, directory, mode):
             fixture_publish(client, directory)
             if mode == "controller-worker":
+                client.request("arm")
+                fixture_publish(client, directory)
                 client.request("grant", name="preflight", localNs=NS)
                 signal.pause()
             else:
@@ -513,6 +601,8 @@ class LinuxSupervisorTests(unittest.TestCase):
         def behavior(client, directory, mode):
             fixture_publish(client, directory)
             if mode == "controller-worker":
+                client.request("arm")
+                fixture_publish(client, directory)
                 client.request("grant", name="docker", localNs=600 * NS)
             elif mode == "fail-closed-worker":
                 snapshot = client.request("lease")

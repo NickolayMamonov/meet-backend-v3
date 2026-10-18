@@ -137,6 +137,115 @@ class ControllerRecoveryContractTests(unittest.TestCase):
             text=True, capture_output=True, check=False, timeout=20,
         )
 
+    def test_effective_timeout_dispatches_to_supervisor_without_shadowing(self) -> None:
+        source = (ROOT / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
+        self.assertEqual(1, len(re.findall(r"^timeout\(\) \{", source, re.M)))
+        result = self.run_shell(controller_function("timeout") + r"""
+supervisor_enabled=true
+supervisor_timeout() { printf '%s\n' "$@"; }
+timeout --kill-after=5s 30s fixture-command
+supervisor_enabled=false
+recovery_t0_ns=
+if timeout 5s bash -c 'exit 23'; then exit 90; else [ "$?" -eq 23 ]; fi
+""")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            ["--kill-after=5s", "30s", "fixture-command"], result.stdout.splitlines(),
+        )
+
+    def test_supervised_wait_completes_failed_commands_and_refuses_revoked_success(self) -> None:
+        for fault, expected_status, expected_trace in (
+            ("command", 23, ["grant:provider:30", "run:--kill-after=5s:0.5s", "complete"]),
+            ("revoked", 1, ["grant:provider:30", "run:--kill-after=5s:0.5s", "complete"]),
+            ("refused", 124, ["grant:provider:30"]),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as parent:
+                path = pathlib.Path(parent)
+                result = self.run_shell(controller_function("supervisor_timeout") + r"""
+trace=$1/trace
+fault=$2
+provider_helper=/fixture/provider.py
+timepad_helper=/fixture/state.py
+supervisor_client() {
+  case "$1" in
+    grant)
+      echo "grant:$2:$3" >>"$trace"
+      [ "$fault" != refused ] || return 1
+      echo '{"grantId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","endNs":1000000000}' ;;
+    complete)
+      echo complete >>"$trace"
+      [ "$fault" != revoked ] ;;
+    *) return 90 ;;
+  esac
+}
+jq() {
+  case "$*" in
+    *grantId*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+    *endNs*) echo 1000000000 ;;
+    *) return 91 ;;
+  esac
+}
+command() {
+  [ "$1" = timeout ] || return 92
+  shift
+  if [ "$1" = 3s ]; then
+    [ "$2" = python3 ] || return 93
+    echo 0.5s
+  else
+    echo "run:$1:$2" >>"$trace"
+    [ "$1" = --kill-after=5s ] && [ "$2" = 0.5s ] &&
+      [ "$3" = python3 ] && [ "$4" = "$provider_helper" ] &&
+      [ "$5" = verify ] || return 94
+    [ "$fault" != command ] || return 23
+  fi
+}
+supervisor_timeout --kill-after=5s 30s python3 "$provider_helper" verify
+echo unexpected-success
+""", path.as_posix(), fault)
+                self.assertEqual(expected_status, result.returncode, result.stderr)
+                self.assertEqual(expected_trace, (path / "trace").read_text().splitlines())
+                self.assertNotIn("unexpected-success", result.stdout)
+
+    def test_budget_cache_uses_supervisor_clock_and_does_not_rearm_recovery(self) -> None:
+        for lifecycle in ("registered", "armed"):
+            with self.subTest(lifecycle=lifecycle):
+                result = self.run_shell(controller_function("recovery_budget_arm") + r"""
+supervisor_enabled=true
+TIMEPAD_ATTEMPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+recovery_t0_ns=
+recovery_work_end_ns=
+recovery_hard_end_ns=
+fixture_lifecycle=$1
+supervisor_client() {
+  case "$1" in
+    lease) echo '{"attempt":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' ;;
+    arm) fixture_lifecycle=armed; echo arm ;;
+    *) return 90 ;;
+  esac
+}
+supervisor_publish_lease() { echo publish; }
+fail() { echo "$1" >&2; exit 91; }
+jq() {
+  case "$*" in
+    *lifecycle*) echo "$fixture_lifecycle" ;;
+    *--arg*) return 0 ;;
+    *.t0Ns*) echo 1000 ;;
+    *.workEndNs*) echo 540000001000 ;;
+    *.hardEndNs*) echo 600000001000 ;;
+    *) return 92 ;;
+  esac
+}
+recovery_budget_arm
+recovery_budget_arm
+echo "$recovery_t0_ns:$recovery_work_end_ns:$recovery_hard_end_ns"
+""", lifecycle)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(
+                    (["publish"] if lifecycle == "registered" else []) +
+                    ["1000:540000001000:600000001000"],
+                    result.stdout.splitlines(),
+                )
+
     def test_ordinary_runtime_wrapper_passes_exactly_six_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             runtime = pathlib.Path(parent) / "runtime.sh"
@@ -1314,12 +1423,16 @@ class TimepadStateTests(unittest.TestCase):
             root = pathlib.Path(parent) / "deploy"
             root.mkdir(mode=0o700)
             lease = execution_lease()
-            authority = {"schema": state.AUTHORITY_SCHEMA, "fixture": "lease-test"}
+            authority = {
+                "rootId": "test-root", "bootstrapId": "bootstrap-1",
+                "initialRuntime": digest("a"), "initialConfig": digest("b"),
+                "initialSchema": digest("c"), "initialStartupInventory": digest("d"),
+                "schemaHistoryProvenance": True,
+            }
             observed = {
-                "schema": state.digest("fixture-schema"),
-                "backendImage": state.digest("fixture-image"),
-                "backendRevision": "fixture-revision",
-                "providerImage": state.digest("provider-image"),
+                "rootId": "test-root", "runtime": digest("a"), "config": digest("b"),
+                "schema": digest("c"), "startupInventory": digest("d"),
+                "schemaHistoryProvenance": True,
             }
             state.bootstrap_guard(root, authority=authority, observed=observed)
             with mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True):
