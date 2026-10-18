@@ -2614,8 +2614,34 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 self.assertTrue(all(line == "start-id:" + current["containerId"] for line in starts))
                 self.assertEqual(1, result.returncode, result.stdout + result.stderr)
                 if fault in {"none", "acknowledged"}:
-                    self.assertEqual(1, len(starts), result.stdout + result.stderr + repr(log))
                     after = state._read_guard_locked(state_root)[1]
+                    lease_after = state._read_execution_lease_locked(state_root)
+                    diagnostic = {
+                        "status": result.returncode,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "phase": after["phase"],
+                        "executionAttempt": after["executionAttempt"],
+                        "requestOperation": (
+                            after["runtimeRequest"]["operation"]
+                            if after["runtimeRequest"] is not None else None
+                        ),
+                        "requestLifecycle": (
+                            after["runtimeRequest"]["lifecycle"]
+                            if after["runtimeRequest"] is not None else None
+                        ),
+                        "leaseLifecycle": (
+                            lease_after["lifecycle"] if lease_after is not None else None
+                        ),
+                        "leaseWorkerMode": (
+                            lease_after["workerMode"] if lease_after is not None else None
+                        ),
+                        "leaseFailure": (
+                            lease_after["firstFailure"] if lease_after is not None else None
+                        ),
+                        "dockerOperations": log,
+                    }
+                    self.assertEqual(1, len(starts), json.dumps(diagnostic, sort_keys=True))
                     self.assertEqual(current["incidentId"], after["incidentId"])
                     self.assertEqual(1, after["operationEpoch"])
                     self.assertNotEqual(old["attempt"], after["executionAttempt"])
