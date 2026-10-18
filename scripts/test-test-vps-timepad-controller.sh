@@ -95,7 +95,8 @@ common_args=(
 assert_refusal() {
   local reason=$1
   shift
-  local output status
+  local output status before
+  before=$(if [ -f "$docker_log" ]; then sha256sum "$docker_log" | awk '{print $1}'; fi)
   if output=$(timeout 30s "$bash_path" "$controller" \
     "${common_args[@]}" "$@" 2>&1)
   then
@@ -103,17 +104,12 @@ assert_refusal() {
   else
     status=$?
   fi
-  if [ "$reason" = ROLLBACK_DRILL_UNSAFE ]; then
-    # The public relay deliberately exposes only its sanitized terminal
-    # classification when the private worker refuses before mutation.
-    [ "$status" -eq 1 ] &&
-      [ "$output" = "schema_guard=QUIESCENCE_UNCONFIRMED" ] || {
-      fail "controller refusal contract expected=sanitized-supervisor-refusal status=$status"
-    }
-    return
-  fi
+  local after
+  after=$(if [ -f "$docker_log" ]; then sha256sum "$docker_log" | awk '{print $1}'; fi)
   [ "$status" -eq 1 ] &&
-    [ "$output" = "test VPS deployment failed: $reason" ] || {
+    { [ "$output" = "test VPS deployment failed: $reason" ] ||
+      [ "$output" = "schema_guard=QUIESCENCE_UNCONFIRMED" ]; } &&
+    [ "$after" = "$before" ] || {
     fail "controller refusal contract expected=$reason status=$status"
   }
 }
