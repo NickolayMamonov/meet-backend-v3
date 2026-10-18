@@ -15,6 +15,11 @@ CLI mutation schemas:
   ``cleanup-publish`` grant. It changes only the fixed unresolved reason/phase,
   preserving COMMITTING, all proof and child ownership; it never reports stop
   confirmation or success.
+  The same worker may publish only a correlated stop request after the fixed
+  exact-retry verifier refusal, with no owned child and every other incident
+  field unchanged. Its read-only provider proof must precede stop completion;
+  neither this exception nor process reap authorizes a start or successful
+  schema outcome.
 * ``publish-lease --lease`` accepts the fixed supervisor lease snapshot only,
   publishes it atomically under inherited FD9, and returns its exact revision
   and SHA-256 only after fsync and readback. Each worker publication revalidates
@@ -23,15 +28,20 @@ CLI mutation schemas:
   A lease is never auto-cleared.
   A drained snapshot with ``worker=null`` is published only by the supervisor's
   sole direct filesystem child after all original workers have exited. A new
-  authenticated attempt can replace that completed lease only with intact
-  terminal guard state and definitive exit of every recorded old process.
+  authenticated attempt can replace that completed lease with intact terminal
+  guard state, or through the explicit proof-first stale recovery path below.
 * ``check-lease --attempt`` is the read-only interlock for provider and
   retention callers; callers must pass their already-held FD9.
 * ``register-recovery`` consumes a private ``recovery-registration`` grant
   before its initial lease exists. It checks the fixed protected authorization
   file, exact dispatch selectors and frozen contract under FD9 before lease
-  publication. It never changes current state or reconciles an unresolved old
-  lease. Registered recovery permits bounded read-only admission, not retry.
+  publication. An unleased incident gets read-only registration only. A stale
+  nonterminal lease additionally requires ``--runtime-evidence`` on stdin,
+  definitive exit of all recorded identities, supervisor-owned prior ECHILD,
+  exact daemon acknowledgment/completion, inventory and provider/config proof.
+  Only then may it adopt current followed by the new registered lease under
+  uninterrupted FD9. A partial publication fails closed and needs separate
+  reconciliation; it is not a crash-atomic two-file transaction.
 * ``rollback-admission`` checks the private fixed worker/grant and frozen state
   without writes. Its ``state-admitted`` result is not daemon/provider/config
   proof and cannot release a rollback or predecessor start by itself.
@@ -44,7 +54,7 @@ CLI mutation schemas:
 * ``advance --changes`` accepts exactly ``{"changes": {...}}``. The inner
   object may contain only ``reason``, ``containerId``, ``configHash``,
   ``ownedChild``, ``commitWitnessDigest``, ``providerFinalizationDigest``,
-  ``commitSubstep``, ``terminalReceipt`` or ``latestAttemptId``. Values remain subject to the
+  ``commitSubstep``, ``terminalReceipt``, ``latestAttemptId`` or ``runtimeRequest``. Values remain subject to the
   strict current-state schema and transition invariants; phase is a required
   fixed CLI choice, never a changes-file field.
 
@@ -63,6 +73,7 @@ import argparse
 import ctypes
 import errno
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -82,7 +93,7 @@ except ImportError:  # Parsing/admission remain portable; filesystem operations 
     fcntl = None
 
 CONTRACT_SCHEMA = "meet-backend/test-vps-timepad-release-contracts/v1"
-STATE_SCHEMA = "meet-backend/test-vps-timepad-state/v3"
+STATE_SCHEMA = "meet-backend/test-vps-timepad-state/v4"
 ORIGIN_SCHEMA = "meet-backend/test-vps-timepad-origin/v1"
 CONTROLLER = "timepad-cutover-v1"
 MAX_CONTRACT_BYTES = 64 * 1024
@@ -91,6 +102,7 @@ MAX_ORIGIN_BYTES = 4 * 1024
 MAX_CURRENT_BYTES = 16 * 1024
 MAX_CHANGES_BYTES = 4 * 1024
 MAX_EXECUTION_LEASE_BYTES = 4 * 1024
+MAX_RECOVERY_RUNTIME_BYTES = 8 * 1024 * 1024 + 32768
 MAX_JSON_DEPTH = 8
 MAX_IMAGES = 8
 MAX_STR = 128
@@ -629,6 +641,103 @@ def _owned_child(value: Any) -> dict[str, Any]:
     return child
 
 
+def runtime_request(value: Any) -> dict[str, Any]:
+    """One bounded correlated daemon request, not a process-liveness assertion."""
+    row = _object(value, {
+        "nonce", "sequence", "executionAttempt", "operation", "containerId",
+        "imageId", "configHash", "childAttemptId", "lifecycle", "responseId",
+        "completionDigest",
+    })
+    _text(row["nonce"], pattern=LEASE_NONCE, maximum=32)
+    if _uint(row["sequence"]) == 0:
+        _reject("RUNTIME_REQUEST_INVALID")
+    _text(row["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
+    if not isinstance(row["operation"], str) or \
+            row["operation"] not in {"start", "stop", "suppress", "restore-policy"}:
+        _reject("RUNTIME_REQUEST_INVALID")
+    _digest(row["containerId"])
+    _digest(row["imageId"])
+    _digest(row["configHash"])
+    if row["childAttemptId"] is not None:
+        _child_attempt_sequence(row["childAttemptId"])
+    if not isinstance(row["lifecycle"], str) or \
+            row["lifecycle"] not in {"intent", "acknowledged", "completed"}:
+        _reject("RUNTIME_REQUEST_INVALID")
+    if row["lifecycle"] == "intent":
+        if row["responseId"] is not None or row["completionDigest"] is not None:
+            _reject("RUNTIME_REQUEST_INVALID")
+    else:
+        # Single-container Docker commands acknowledge the exact submitted ID.
+        # Neither an empty stdout nor a successful client exit is that receipt.
+        if row["responseId"] != row["containerId"]:
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["lifecycle"] == "completed":
+            _digest(row["completionDigest"])
+        elif row["completionDigest"] is not None:
+            _reject("RUNTIME_REQUEST_INVALID")
+    return row
+
+
+def require_runtime_request_completion(current: Mapping[str, Any]) -> dict[str, Any]:
+    request = current.get("runtimeRequest")
+    if request is None or runtime_request(request)["lifecycle"] != "completed":
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    return request
+
+
+def cleanup_request_admission(current: Mapping[str, Any], lease: Mapping[str, Any]) -> None:
+    """Permit only the exact stopped-candidate proof after a verifier refusal."""
+    request = current["runtimeRequest"]
+    if (
+        lease["workerMode"] != "fail-closed-worker" or lease["lifecycle"] != "draining"
+        or lease["operation"] != "forward-recover"
+        or lease["firstFailure"] != "RECOVERY_RETRY_RUNTIME_FAILED" or lease["firstStatus"] != 1
+        or current["executionAttempt"] != lease["attempt"] or current["phase"] != "VERIFYING"
+        or current["ownedChild"] is not None or request is None
+        or request["executionAttempt"] != lease["attempt"]
+        or request["containerId"] != current["containerId"]
+        or request["configHash"] != current["configHash"]
+        or request["imageId"] != current["target"]["tuple"]["platformImageId"]
+        or request["operation"] not in {"start", "stop"}
+        or request["operation"] == "start" and request["lifecycle"] != "completed"
+    ):
+        _reject("EXECUTION_LEASE_STOP_ONLY")
+
+
+def _validate_runtime_request_transition(previous: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
+    old, new = previous["runtimeRequest"], candidate["runtimeRequest"]
+    if old == new:
+        return
+    if new is None or previous["phase"] != candidate["phase"] or \
+            candidate["phase"] in TERMINAL | {"READY", "PREPARED"}:
+        _reject("RUNTIME_REQUEST_CONFLICT")
+    if old is None or new["nonce"] != old["nonce"]:
+        if old is not None and old["lifecycle"] != "completed":
+            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+        if new["sequence"] != (old["sequence"] + 1 if old else 1) or \
+                new["lifecycle"] != "intent" or \
+                new["executionAttempt"] != candidate["executionAttempt"]:
+            _reject("RUNTIME_REQUEST_CONFLICT")
+        child = candidate["ownedChild"]
+        if new["childAttemptId"] is not None and (
+            child is None or child["attemptId"] != new["childAttemptId"]
+            or child["lifecycle"] != "waiting" or new["operation"] != "start"
+        ) or new["childAttemptId"] is None and child is not None:
+            _reject("RUNTIME_REQUEST_CHILD_CONFLICT")
+        if new["containerId"] != candidate["containerId"] or \
+                new["configHash"] != candidate["configHash"] or \
+                new["imageId"] != candidate["target"]["tuple"]["platformImageId"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        return
+    mutable = {"lifecycle", "responseId", "completionDigest"}
+    if any(old[key] != new[key] for key in old if key not in mutable):
+        _reject("RUNTIME_REQUEST_CONFLICT")
+    if (old["lifecycle"], new["lifecycle"]) not in {
+        ("intent", "acknowledged"), ("acknowledged", "completed"),
+    }:
+        _reject("RUNTIME_REQUEST_REPLAY")
+
+
 def _current(value: Any) -> dict[str, Any]:
     keys = {
         "schema", "controller", "originDigest", "operationEpoch", "operation",
@@ -638,7 +747,7 @@ def _current(value: Any) -> dict[str, Any]:
         "toolingDigest", "containerId", "configHash", "ownedChild", "commitWitnessDigest",
         "providerFinalizationDigest",
         "commitSubstep", "terminalReceipt", "latestAttemptId", "rollbackIssued",
-        "executionAttempt", "preparedProofDigest",
+        "executionAttempt", "preparedProofDigest", "runtimeRequest",
     }
     if not isinstance(value, dict) or value.keys() != keys:
         _reject()
@@ -683,6 +792,17 @@ def _current(value: Any) -> dict[str, Any]:
         _reject("STATE_PREPARED_RUNTIME_CONFLICT")
     if obj["executionAttempt"] is not None:
         _text(obj["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
+    if obj["runtimeRequest"] is not None:
+        request = runtime_request(obj["runtimeRequest"])
+        if obj["phase"] in {"READY", "PREPARED"} or obj["target"] is None or \
+                request["imageId"] != obj["target"]["tuple"]["platformImageId"] or \
+                request["configHash"] != obj["configHash"] or \
+                request["containerId"] != obj["containerId"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if request["childAttemptId"] is not None:
+            _child_attempt_sequence(request["childAttemptId"], obj["incidentId"])
+        if obj["phase"] in TERMINAL and request["lifecycle"] != "completed":
+            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
     for key in (
         "evidenceDigest", "toolingDigest", "configHash", "commitWitnessDigest",
         "providerFinalizationDigest", "terminalReceipt", "preparedProofDigest",
@@ -722,7 +842,7 @@ def _current(value: Any) -> dict[str, Any]:
             "commitSubstep", "terminalReceipt",
             "latestAttemptId",
             "executionAttempt",
-            "preparedProofDigest",
+            "preparedProofDigest", "runtimeRequest",
         )):
             _reject("STATE_INVALID")
         if obj["rollbackIssued"]:
@@ -769,7 +889,7 @@ def new_ready_state(origin_digest: str) -> dict[str, Any]:
         "ownedChild": None, "commitWitnessDigest": None,
         "providerFinalizationDigest": None, "commitSubstep": None,
         "terminalReceipt": None, "latestAttemptId": None, "rollbackIssued": False,
-        "executionAttempt": None, "preparedProofDigest": None,
+        "executionAttempt": None, "preparedProofDigest": None, "runtimeRequest": None,
     }
 
 
@@ -824,6 +944,7 @@ def new_prepared_state(
         "commitWitnessDigest": None, "providerFinalizationDigest": None,
         "commitSubstep": None, "terminalReceipt": None,
         "latestAttemptId": None, "rollbackIssued": False,
+        "runtimeRequest": None,
         "executionAttempt": (
             _text(execution_attempt, pattern=LEASE_NONCE, maximum=32)
             if execution_attempt is not None else prior["executionAttempt"]
@@ -974,6 +1095,7 @@ def validate_state_transition(old: Mapping[str, Any], new: Mapping[str, Any]) ->
         _reject("STATE_FINALIZATION_WITNESS_PHASE")
     if previous["terminalReceipt"] is not None and candidate["terminalReceipt"] != previous["terminalReceipt"]:
         _reject("STATE_RECEIPT_CONFLICT")
+    _validate_runtime_request_transition(previous, candidate)
     _validate_child_transition(previous, candidate)
 
 
@@ -1500,6 +1622,52 @@ def _validate_terminal_lease_successor(
         os.close(root_fd)
 
 
+def _validate_recovery_lease_successor(
+    previous: Mapping[str, Any], candidate: Mapping[str, Any], current: Mapping[str, Any],
+) -> None:
+    """ECHILD and daemon completion are independent prerequisites, never substitutes.
+
+    The bounded lease has no crash-time descendant inventory. Only its
+    supervisor-owned worker-null drained revision proves that no unrecorded
+    descendant survived. All other old lifecycle shapes need operator repair.
+    """
+    old = _execution_lease(dict(previous))
+    new = _execution_lease(dict(candidate))
+    state = _current(dict(current))
+    if (
+        old["lifecycle"] != "drained" or old["worker"] is not None or not old["workers"]
+        or old["firstFailure"] in {"DESCENDANT_OVERFLOW", "OWNERSHIP_UNCERTAIN"}
+        or old["operation"] not in {"deploy", "forward-recover"}
+        or new["attempt"] == old["attempt"] or new["revision"] != 0
+        or new["operation"] != "forward-recover" or new["lifecycle"] != "registered"
+        or new["workerMode"] != "controller-worker" or new["worker"] is None
+        or new["firstFailure"] is not None or new["rollbackIssued"]
+        or new["workers"] != [{"mode": "controller-worker", **new["worker"]}]
+        or state["phase"] not in RECOVERABLE_PHASES - {"PREPARED"}
+        or state["executionAttempt"] != old["attempt"]
+        or state["commitSubstep"] == "replacement-create-intent"
+    ):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    for identity in (old["supervisor"], *old["workers"]):
+        if not _execution_process_exited(identity):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+    worker = new["worker"]
+    if _execution_process_record(worker) != (
+        worker["bootId"], worker["startTicks"], new["supervisor"]["pid"],
+    ) or not _execution_lease_supervisor_is_live(new):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    request = require_runtime_request_completion(state)
+    if request["executionAttempt"] != old["attempt"]:
+        _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+    if state["ownedChild"] is not None:
+        child = state["ownedChild"]
+        if child["lifecycle"] not in {"released", "reaped"} or \
+                request["childAttemptId"] != child["attemptId"] or request["operation"] != "start" or \
+                not _execution_process_exited(child):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        require_child_group_quiescent(child)
+
+
 def _validate_lease_successor(previous: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
     immutable = ("attempt", "operation", "supervisor")
     if any(previous[key] != candidate[key] for key in immutable):
@@ -1639,12 +1807,14 @@ def register_recovery(
     root: str | os.PathLike[str], *, contract: Mapping[str, Any],
     selectors: Mapping[str, Any], deploy_lock_fd: int,
     execution_grant: ExecutionGrant,
+    runtime_evidence: bytes | None = None,
 ) -> dict[str, Any]:
-    """Register bounded read-only recovery without adopting the incident or old lease.
+    """Register recovery; stale ownership additionally needs complete runtime proof.
 
     Only the private registered controller may publish this initial execution
-    ownership. Schema/config/provider writes and stale-lease reconciliation
-    remain forbidden until their separate runtime and ownership proofs exist.
+    ownership. Unleased registration cannot adopt current. Stale adoption is a
+    separate proof-first branch, never permission for runtime/config/provider
+    mutation under this registration grant.
     """
     from test_vps_timepad_supervisor import SupervisorError, WorkerClient
 
@@ -1698,6 +1868,12 @@ def register_recovery(
                 os.close(root_fd)
             _recovery_registration_authority(origin, current, contract, authorization, selectors)
             check()
+            previous = _read_execution_lease_locked(root)
+            if previous is not None and current["phase"] not in TERMINAL | {"READY"}:
+                return _reconcile_recovery_lease_locked(
+                    root, previous, candidate, current, authorization,
+                    runtime_evidence, deploy_lock_fd, check,
+                )
             result = _publish_execution_lease_locked(
                 root, candidate, _canonical(candidate), recovery_registration=True,
             )
@@ -1710,6 +1886,70 @@ def register_recovery(
                 _EXECUTION_CHECK.reset(token)
             if client is not None:
                 client.close()
+
+
+def _reconcile_recovery_lease_locked(
+    root: str | os.PathLike[str], previous: Mapping[str, Any], candidate: Mapping[str, Any],
+    current: Mapping[str, Any], authorization: bytes, runtime_evidence: bytes | None,
+    deploy_lock_fd: int, check: Callable[[], None],
+) -> dict[str, Any]:
+    """Proof-first adoption in one FD9 critical section, with fail-closed crash gaps.
+
+    Current and lease are separate durable files, not a disk transaction. A
+    failure after the current write leaves mismatched attempts; all subsequent
+    writers refuse that pair. No automatic repair, rollback or start is issued.
+    """
+    if runtime_evidence is None or len(runtime_evidence) > MAX_RECOVERY_RUNTIME_BYTES:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    request = current["runtimeRequest"]
+    if request is None or request["lifecycle"] not in {"completed", "acknowledged"}:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    path = Path(__file__).with_name("test-vps-provider-credential.py")
+    spec = importlib.util.spec_from_file_location("_timepad_recovery_provider", path)
+    if spec is None or spec.loader is None:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    provider = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(provider)
+    try:
+        request = provider._recovery_lease_runtime_proof(
+            str(root), dict(current), authorization, runtime_evidence, deploy_lock_fd, check,
+        )
+    except provider.ProviderError:
+        _reject("RECOVERY_PROVIDER_LIVE_PROOF_REQUIRED")
+    proven = dict(current, runtimeRequest=request)
+    _validate_recovery_lease_successor(previous, candidate, proven)
+    adopted = _current(dict(proven, executionAttempt=candidate["attempt"]))
+    # The only executionAttempt replacement is this explicit authorized path.
+    # Validate the rest of the transition with that independently proved field
+    # held constant; generic advance/publish still prohibit ownership changes.
+    validate_state_transition(dict(current, executionAttempt=candidate["attempt"]), adopted)
+    check()
+    if _read_execution_lease_locked(root) != previous or _read_guard_locked(root)[1] != current:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    root_fd = _open_root(root)
+    try:
+        guard_fd = os.open(GUARD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            raw = _canonical(adopted)
+            _atomic_write(guard_fd, "current.json", raw, MAX_CURRENT_BYTES, replace=True)
+            if _read_at(guard_fd, "current.json", MAX_CURRENT_BYTES) != raw:
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+        finally:
+            os.close(guard_fd)
+        check()
+        raw = _canonical(candidate)
+        _atomic_write(root_fd, EXECUTION_LEASE_NAME, raw, MAX_EXECUTION_LEASE_BYTES, replace=True)
+        if _read_at(root_fd, EXECUTION_LEASE_NAME, MAX_EXECUTION_LEASE_BYTES) != raw:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        check()
+        return {
+            "attempt": candidate["attempt"], "revision": candidate["revision"],
+            "digest": hashlib.sha256(raw).hexdigest(),
+        }
+    except OSError:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    finally:
+        os.close(root_fd)
 
 
 def rollback_state_admission(current: Mapping[str, Any], lease: Mapping[str, Any]) -> None:
@@ -1725,6 +1965,33 @@ def rollback_state_admission(current: Mapping[str, Any], lease: Mapping[str, Any
         or state["phase"] != "PREPARED" and state["predecessorDisposition"] != "post-barrier-compatible"
     ):
         _reject("ROLLBACK_NOT_ADMITTED")
+
+
+def adopt_recovery_state(
+    current: Mapping[str, Any], lease: Mapping[str, Any],
+    *, request_proof: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bind an admitted unleased incident; never replace unresolved execution ownership."""
+    state = _current(dict(current))
+    if (
+        lease["operation"] != "forward-recover" or lease["workerMode"] != "controller-worker"
+        or lease["lifecycle"] != "armed" or lease["firstFailure"] is not None
+        or state["phase"] not in RECOVERABLE_PHASES - {"PREPARED"}
+        or state["executionAttempt"] not in {None, lease["attempt"]}
+    ):
+        _reject("RECOVERY_ADOPTION_REFUSED")
+    request = state["runtimeRequest"]
+    if request_proof is not None:
+        proof = _object(dict(request_proof), {"requestNonce", "completionDigest"})
+        _digest(proof["completionDigest"])
+        if request is None or request["lifecycle"] != "acknowledged" or \
+                proof["requestNonce"] != request["nonce"]:
+            _reject("RUNTIME_REQUEST_CONFLICT")
+        request = dict(request, lifecycle="completed", completionDigest=proof["completionDigest"])
+    require_runtime_request_completion(dict(state, runtimeRequest=request))
+    return advance_state(
+        state, state["phase"], executionAttempt=lease["attempt"], runtimeRequest=request,
+    )
 
 
 def check_execution_lease(
@@ -1743,6 +2010,13 @@ def check_execution_lease(
         if not _execution_lease_supervisor_is_live(lease):
             _reject("EXECUTION_LEASE_UNRESOLVED")
         if attempt is None or attempt != lease["attempt"]:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        try:
+            _, current = _read_guard_locked(root)
+        except FileNotFoundError:
+            current = None  # A registered bootstrap can precede the guard.
+        if current is not None and current["phase"] not in TERMINAL | {"READY"} and \
+                current["executionAttempt"] not in {None, lease["attempt"]}:
             _reject("EXECUTION_LEASE_UNRESOLVED")
         if lease["lifecycle"] in {"quiescence-unconfirmed", "drained"}:
             _reject("EXECUTION_LEASE_UNRESOLVED")
@@ -1937,7 +2211,15 @@ def _validate_execution_state_write(
     if role == "fail-closed-worker":
         if lifecycle != "draining" or lease["hardEndNs"] is None or now_ns >= lease["hardEndNs"]:
             _reject("EXECUTION_LEASE_UNRESOLVED")
-        # Reserve permits only retaining the unresolved incident. It cannot
+        if candidate["phase"] == previous["phase"] and \
+                candidate["runtimeRequest"] is not None and \
+                candidate["runtimeRequest"]["operation"] == "stop" and all(
+                    candidate[key] == previous[key] for key in previous if key != "runtimeRequest"
+                ):
+            cleanup_request_admission(previous, lease)
+            cleanup_request_admission(candidate, lease)
+            return
+        # Otherwise reserve permits only retaining the unresolved incident. It cannot
         # clear child ownership, restore config, finalize provider cleanup or
         # publish a successful schema outcome.
         unresolved_phase = "COMMITTING" if previous["phase"] == "COMMITTING" else "RECOVERY_REQUIRED"
@@ -2224,6 +2506,7 @@ def _cli() -> argparse.ArgumentParser:
     registration.add_argument("--repository-digest", required=True)
     registration.add_argument("--revision", required=True)
     registration.add_argument("--version", required=True)
+    registration.add_argument("--runtime-evidence", action="store_true")
     bootstrap = sub.add_parser("bootstrap")
     bootstrap.add_argument("--root", required=True)
     bootstrap.add_argument("--authority", required=True)
@@ -2257,6 +2540,12 @@ def _cli() -> argparse.ArgumentParser:
     rollback_admission = sub.add_parser("rollback-admission")
     rollback_admission.add_argument("--root", required=True)
     rollback_admission.add_argument("--deploy-lock-fd", type=int, required=True)
+    adoption = sub.add_parser("adopt-recovery")
+    adoption.add_argument("--root", required=True)
+    adoption.add_argument("--contract", required=True)
+    adoption.add_argument("--deploy-lock-fd", type=int, required=True)
+    adoption.add_argument("--request-nonce")
+    adoption.add_argument("--completion-digest")
     unresolved = sub.add_parser("retain-unresolved")
     unresolved.add_argument("--root", required=True)
     unresolved.add_argument("--deploy-lock-fd", type=int, required=True)
@@ -2272,7 +2561,7 @@ def _cli() -> argparse.ArgumentParser:
     stop_child.add_argument("--deploy-lock-fd", type=int, required=True)
     stop_child.add_argument("--term-grace-seconds", type=float, default=5.0)
     for mutation in (bootstrap, publish, prepare, advance, claim_rollback, unresolved, stop_child,
-                     registration, rollback_admission):
+                     registration, rollback_admission, adoption):
         mutation.add_argument("--execution-attempt")
         mutation.add_argument("--execution-grant")
         mutation.add_argument("--deadline-ns", type=int)
@@ -2338,7 +2627,44 @@ def main(argv: list[str] | None = None) -> int:
                     "revision": args.revision, "version": args.version,
                 },
                 deploy_lock_fd=args.deploy_lock_fd, execution_grant=execution_grant,
+                runtime_evidence=(
+                    sys.stdin.buffer.read(MAX_RECOVERY_RUNTIME_BYTES + 1)
+                    if args.runtime_evidence else None
+                ),
             )
+        elif args.command == "adopt-recovery":
+            with deploy_lock(args.root, args.deploy_lock_fd), \
+                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):
+                lease = _read_execution_lease_locked(args.root)
+                if lease is None:
+                    _reject("RECOVERY_ADOPTION_REFUSED")
+                origin, current = _read_guard_locked(args.root)
+                root_fd = _open_root(args.root)
+                try:
+                    authorization = _read_at(
+                        root_fd, "timepad-recovery-authorization.json", MAX_AUTHORIZATION_BYTES,
+                    )
+                finally:
+                    os.close(root_fd)
+                auth = parse_json(authorization, MAX_AUTHORIZATION_BYTES)
+                _recovery_registration_authority(
+                    origin, current, parse_contract(_read_input(args.contract, MAX_CONTRACT_BYTES)),
+                    authorization, {key: auth[key] for key in (
+                        "runId", "incidentId", "operationEpoch", "evidenceDigest",
+                        "repositoryDigest", "revision", "version",
+                    )},
+                )
+                if (args.request_nonce is None) != (args.completion_digest is None):
+                    _reject("RUNTIME_REQUEST_CONFLICT")
+                adopted = adopt_recovery_state(
+                    current, lease, request_proof=(
+                        {"requestNonce": args.request_nonce, "completionDigest": args.completion_digest}
+                        if args.request_nonce is not None else None
+                    ),
+                )
+                if adopted != current:
+                    _publish_current_locked(args.root, adopted)
+                result = {"result": "recovery-adopted", "epoch": adopted["operationEpoch"]}
         elif args.command == "rollback-admission":
             from test_vps_timepad_supervisor import SupervisorError, WorkerClient
 
@@ -2462,21 +2788,27 @@ def main(argv: list[str] | None = None) -> int:
                 "reason", "containerId", "configHash", "ownedChild", "commitWitnessDigest",
                 "providerFinalizationDigest",
                 "commitSubstep", "terminalReceipt", "latestAttemptId",
+                "runtimeRequest",
             }
             if not isinstance(changes, dict) or not changes.keys() <= allowed_changes:
                 _reject("STATE_CHANGE_UNSUPPORTED")
-            with deploy_lock(args.root, args.deploy_lock_fd), \
-                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):
-                _require_execution_lease_descriptor(args.root, args.deploy_lock_fd)
-                _, current = _read_guard_locked(args.root)
-                advanced = advance_state(current, args.phase, **changes)
-                published = _publish_current_locked(args.root, advanced)
-                if _read_guard_locked(args.root)[1] != published:
-                    _reject("STATE_READBACK_FAILED")
-                result = {
-                    "epoch": published["operationEpoch"], "incidentId": published["incidentId"],
-                    "result": published["phase"],
-                }
+            with deploy_lock(args.root, args.deploy_lock_fd):
+                lease = _read_execution_lease_locked(args.root)
+                cleanup = lease is not None and lease["workerMode"] == "fail-closed-worker" and \
+                    set(changes) == {"runtimeRequest"}
+                with _execution_mutation(
+                    args.root, args.deploy_lock_fd, execution_grant, cleanup_only=cleanup,
+                ):
+                    _require_execution_lease_descriptor(args.root, args.deploy_lock_fd)
+                    _, current = _read_guard_locked(args.root)
+                    advanced = advance_state(current, args.phase, **changes)
+                    published = _publish_current_locked(args.root, advanced)
+                    if _read_guard_locked(args.root)[1] != published:
+                        _reject("STATE_READBACK_FAILED")
+                    result = {
+                        "epoch": published["operationEpoch"], "incidentId": published["incidentId"],
+                        "result": published["phase"],
+                    }
         elif args.command == "claim-rollback":
             with deploy_lock(args.root, args.deploy_lock_fd), \
                     _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):

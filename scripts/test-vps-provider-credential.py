@@ -192,12 +192,17 @@ def _execution_interlock(args: argparse.Namespace, lock_fd: int) -> dict[str, An
         module.check_execution_lease(
             args.state_root, attempt=args.execution_attempt, deploy_lock_fd=lock_fd
         )
-        # Provider work cannot consume the stop-only cleanup reserve.
-        end = lease["workEndNs"]
+        cleanup = lease["workerMode"] == "fail-closed-worker"
+        if cleanup:
+            if args.command != "runtime-request-proof":
+                _fail("recovery")
+            module.cleanup_request_admission(module._read_guard_locked(args.state_root)[1], lease)
+        # Only read-only correlated stop proof may use the cleanup reserve.
+        end = lease["hardEndNs"] if cleanup else lease["workEndNs"]
         if end is None:
             end = time.monotonic_ns() + 30_000_000_000
         if args.deadline_ns > end or lease["lifecycle"] not in {
-            "registered", "armed", "rollback-admission", "rolling-back",
+            "registered", "armed", "rollback-admission", "rolling-back", "draining",
         }:
             _fail("recovery")
         if lease["lifecycle"] == "rollback-admission" and args.command not in {
@@ -220,7 +225,7 @@ def _execution_interlock(args: argparse.Namespace, lock_fd: int) -> dict[str, An
                 or lease["firstFailure"] is not None
                 or args.command not in {"retention-list", "retention-check", "retention-delete"}
             )
-            or role not in {"controller-worker", "rollback-worker", "retention-worker"}
+            or role not in {"controller-worker", "rollback-worker", "retention-worker", "fail-closed-worker"}
         ):
             _fail("recovery")
     except (module.GuardError, OSError, ValueError, TypeError, KeyError):
@@ -252,9 +257,16 @@ def _execution_mutation(
         ):
             _fail("recovery")
         expected_name = (
-            "rollback-admission" if lease["lifecycle"] == "rollback-admission"
+            "cleanup-stop" if role == "fail-closed-worker"
+            else "rollback-admission" if lease["lifecycle"] == "rollback-admission"
+            else "recovery-admission" if lease["operation"] == "forward-recover"
+            and lease["lifecycle"] == "registered"
             else "provider"
         )
+        if expected_name == "recovery-admission" and args.command not in {
+            "live-resume", "absence-resume", "runtime-request-proof",
+        }:
+            _fail("recovery")
 
         def check() -> None:
             if time.monotonic_ns() >= args.deadline_ns:
@@ -1344,6 +1356,10 @@ def _finalization_context(
         and isinstance(current.get("commitSubstep"), str)
         and current["commitSubstep"].startswith("replacement-")
     ):
+        _fail("recovery")
+    try:
+        module.require_runtime_request_completion(current)
+    except module.GuardError:
         _fail("recovery")
     try:
         _validate_state_directory(os.path.join(state_root, run_name), run_name)
@@ -2742,6 +2758,96 @@ def _live_resume_runtime(
     return exact_target, healthy
 
 
+def _runtime_request_proof(
+    current: dict[str, Any], inspect: dict[str, Any],
+) -> dict[str, Any]:
+    """Revalidate the effect of an explicitly acknowledged single-container RPC.
+
+    An inspect/ps result cannot complete an intent: the original synchronous
+    daemon response must already be durable. The digest covers only sanitized
+    correlation/runtime fields, never environment or provider payloads.
+    """
+    module = _timepad_state_module()
+    try:
+        request = module.runtime_request(current["runtimeRequest"])
+    except (module.GuardError, TypeError, KeyError):
+        _fail("recovery")
+    if request["lifecycle"] != "acknowledged":
+        _fail("recovery")
+    if request["childAttemptId"] is not None and current["ownedChild"] is not None:
+        if request["childAttemptId"] != current["ownedChild"]["attemptId"]:
+            _fail("recovery")
+        try:
+            module.require_child_group_quiescent(current["ownedChild"])
+        except (module.GuardError, OSError):
+            _fail("recovery")
+    exact, _ = _live_resume_runtime(inspect, current, "runtime")
+    if (
+        not exact or inspect["Id"] != request["containerId"]
+        or inspect["Image"] != "sha256:" + request["imageId"]
+        or inspect["Config"]["Labels"]["com.docker.compose.config-hash"] != request["configHash"]
+    ):
+        _fail("recovery")
+    running = inspect["State"]["Running"]
+    policy = inspect["HostConfig"]["RestartPolicy"]["Name"]
+    operation = request["operation"]
+    if (
+        operation == "start" and (not running or policy != "no")
+        or operation == "stop" and (running or policy != "no")
+        or operation == "suppress" and policy != "no"
+        or operation == "restore-policy" and (not running or policy != "unless-stopped")
+    ):
+        _fail("recovery")
+    return {
+        "requestNonce": request["nonce"],
+        "completionDigest": _configuration_digest({
+            "request": request, "originDigest": current["originDigest"],
+            "incidentId": current["incidentId"], "operationEpoch": current["operationEpoch"],
+            "evidenceDigest": current["evidenceDigest"],
+            "running": running, "restartPolicy": policy,
+        }),
+    }
+
+
+def _runtime_request_completion(
+    run_key: str, state_root: str, state_kind: str, input_data: bytes, deploy_lock_fd: int,
+) -> None:
+    """Fixed read-only adapter; publication remains under the controller's state grant."""
+    value = _json(input_data, "recovery")
+    if not isinstance(value, dict) or set(value) != {"requestNonce", "inspection"}:
+        _fail("recovery")
+    root_fd = _open_deploy_state_root(state_root)
+    try:
+        _lock_directory(root_fd)
+        _, _, current = _timepad_current(state_root, deploy_lock_fd)
+        if (
+            state_kind not in STATE_KINDS or current["runId"] != run_key
+            or current["ownedRun"] != f"{run_key}-{state_kind}"
+            or current["runtimeRequest"] is None
+            or value["requestNonce"] != current["runtimeRequest"]["nonce"]
+        ):
+            _fail("recovery")
+        run_fd = os.open(
+            current["ownedRun"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd,
+        )
+        try:
+            _lock_directory(run_fd)
+            _validate_state_directory_fd(run_fd, current["ownedRun"])
+            _live_resume_config(run_fd, current)
+            result = _runtime_request_proof(current, _inspect(
+                json.dumps(value["inspection"], separators=(",", ":")).encode(),
+            ))
+            _, _, final = _timepad_current(state_root, deploy_lock_fd)
+            if final != current:
+                _fail("recovery")
+            _deadline_check()
+            print(json.dumps(result, separators=(",", ":")))
+        finally:
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
+
+
 def _live_resume_config(run_fd: int, current: dict[str, Any]) -> None:
     if current["phase"] == "PREPARED":
         _prepared_proof(run_fd, current)
@@ -3570,6 +3676,11 @@ def _absence_resume(
         try:
             _lock_directory(run_fd)
             _validate_state_directory_fd(run_fd, current["ownedRun"])
+            if current["phase"] != "PREPARED":
+                try:
+                    module.require_runtime_request_completion(current)
+                except module.GuardError:
+                    _fail("recovery")
             for name in _iter_directory_fd_names(root_fd):
                 if name == ".smtp-transaction.current" or (
                     name.startswith((".provider-transaction.", ".provider-state."))
@@ -3615,6 +3726,14 @@ def _live_resume(
     input_data: bytes, deploy_lock_fd: int,
 ) -> None:
     """Private, read-only proof; the controller owns reconciliation and retries."""
+    _result(*_validate_live_resume(run_key, state_root, state_kind, input_data, deploy_lock_fd))
+
+
+def _validate_live_resume(
+    run_key: str, state_root: str, state_kind: str,
+    input_data: bytes, deploy_lock_fd: int,
+) -> tuple[bool, bool, bool, str]:
+    """Shared read-only admission; no lease, schema, configuration or runtime writes."""
     if (
         type(deploy_lock_fd) is not int or deploy_lock_fd < 0
         or state_kind not in STATE_KINDS
@@ -3639,6 +3758,15 @@ def _live_resume(
         try:
             _lock_directory(run_fd)
             _validate_state_directory_fd(run_fd, current["ownedRun"])
+            if current["phase"] != "PREPARED":
+                try:
+                    if current["runtimeRequest"] is not None and \
+                            current["runtimeRequest"]["lifecycle"] == "acknowledged":
+                        _runtime_request_proof(current, inspect)
+                    else:
+                        module.require_runtime_request_completion(current)
+                except module.GuardError:
+                    _fail("recovery")
             for name in _iter_directory_fd_names(root_fd):
                 if name == ".smtp-transaction.current" or (
                     name.startswith((".provider-transaction.", ".provider-state."))
@@ -3684,9 +3812,15 @@ def _live_resume(
                 )
                 # Applying is published before target configuration writes,
                 # while the schema phase remains PREPARED until the barrier.
-                if current["phase"] == "PREPARED" and marker["phase"] not in {
-                    "prepared", "applying",
-                }:
+                allowed_phases = {
+                    "PREPARED": {"prepared", "applying"},
+                    "CUTOVER_POSSIBLE": {"prepared", "applying", "verifying"},
+                    "ROLLING_BACK": {"prepared", "applying", "verifying", "rolling-back"},
+                    "VERIFYING": {"verifying"},
+                    "RECOVERY_REQUIRED": {"verifying"},
+                    "FORWARD_RECOVERING": {"verifying"},
+                }
+                if marker["phase"] not in allowed_phases.get(current["phase"], set()):
                     _fail("recovery")
                 outcome = (
                     "finalization-only"
@@ -3701,13 +3835,61 @@ def _live_resume(
             _, final_origin, final_current = _timepad_current(state_root, deploy_lock_fd)
             if final_origin != origin or final_current != current:
                 _fail("recovery")
-            _result(enabled, present, read_only, outcome)
+            return enabled, present, read_only, outcome
         finally:
             if credential_parent is not None:
                 os.close(credential_parent)
             os.close(run_fd)
     finally:
         os.close(root_fd)
+
+
+def _recovery_lease_runtime_proof(
+    state_root: str, current: dict[str, Any], authorization: bytes,
+    input_data: bytes, deploy_lock_fd: int, check: Callable[[], None],
+) -> dict[str, Any]:
+    """Fixed registration-only proof before replacing stale execution ownership.
+
+    Inventories constrain ownership, but cannot complete an intent. The old
+    request must have its durable synchronous daemon acknowledgment first.
+    """
+    module = _timepad_state_module()
+    value = _json(input_data, "recovery")
+    if not isinstance(value, dict) or set(value) != {
+        "inspection", "backendInventory", "composeInventory",
+    } or value["backendInventory"] != [current["containerId"]] or \
+            value["composeInventory"] != value["backendInventory"]:
+        _fail("recovery")
+    if current["phase"] == "PREPARED" or current["containerId"] is None or \
+            current["runtimeRequest"] is None:
+        _fail("recovery")
+    inspect = _inspect(json.dumps(value["inspection"], separators=(",", ":")).encode())
+    exact, _ = _live_resume_runtime(inspect, current, "runtime")
+    if not exact:
+        _fail("recovery")
+    request = current["runtimeRequest"]
+    if request["lifecycle"] == "acknowledged":
+        proof = _runtime_request_proof(current, inspect)
+        request = dict(request, lifecycle="completed", completionDigest=proof["completionDigest"])
+    else:
+        try:
+            module.require_runtime_request_completion(current)
+        except (ValueError, TypeError, KeyError, module.GuardError):
+            _fail("recovery")
+    run_key = current["runId"]
+    state_kind = current["ownedRun"].removeprefix(run_key + "-")
+    payload = json.dumps({
+        "schema": LIVE_RESUME_SCHEMA, "authorization": _json(authorization, "recovery"),
+        "inspection": value["inspection"], "stage": "runtime",
+    }, separators=(",", ":")).encode()
+    token = _EXECUTION_CHECK.set(check)
+    try:
+        check()
+        _validate_live_resume(run_key, state_root, state_kind, payload, deploy_lock_fd)
+        check()
+    finally:
+        _EXECUTION_CHECK.reset(token)
+    return request
 
 
 def _rooted(path: str, root: str | None) -> str:
@@ -5983,6 +6165,7 @@ def _parser() -> argparse.ArgumentParser:
             "live-resume",
             "absence-resume",
             "prepare-transition-proof",
+            "runtime-request-proof",
             "state-publish",
             "retention-list",
             "retention-check",
@@ -6076,6 +6259,12 @@ def _dispatch(args: argparse.Namespace) -> None:
             args.run_key, args.state_root, args.state_kind,
             _bounded_stdin(MAX_LIVE_RESUME_BYTES), args.active_deploy_lock_fd,
         )
+    elif args.command == "runtime-request-proof":
+        _run_key(args.run_key)
+        _runtime_request_completion(
+            args.run_key, args.state_root, args.state_kind,
+            _bounded_stdin(MAX_INSPECTION_BYTES), args.active_deploy_lock_fd,
+        )
     elif args.command == "state-publish":
         _state_publish(args.state_root, args.run_key, args.state_kind)
     elif args.command == "retention-list":
@@ -6117,6 +6306,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "live-resume",
             "absence-resume",
             "prepare-transition-proof",
+            "runtime-request-proof",
             "state-publish",
             "retention-list",
             "retention-check",
@@ -6124,9 +6314,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         }
         if args.deploy_lock_fd is not None and args.command not in lock_commands:
             _fail("recovery")
-        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof"} and args.deploy_lock_fd is None:
+        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof", "runtime-request-proof"} and args.deploy_lock_fd is None:
             _fail("recovery")
-        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof"} and (
+        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof", "runtime-request-proof"} and (
             args.phase or args.outcome or args.protected_path
             or args.protected_state or args.retention_state
         ):

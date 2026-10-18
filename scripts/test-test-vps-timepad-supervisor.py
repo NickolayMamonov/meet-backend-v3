@@ -69,6 +69,32 @@ class AttemptTests(unittest.TestCase):
         self.attempt.arm()
         return acknowledged(self.attempt)
 
+    def test_fixed_retry_refusal_keeps_first_failure_through_cleanup_terminal(self):
+        attempt = supervisor.Attempt("forward-recover", clock=self.clock)
+        attempt.arm()
+        acknowledged(attempt)
+        attempt.cancel("RECOVERY_RETRY_RUNTIME_FAILED", 1)
+        attempt.cancel("TERM", 143)
+        self.assertEqual("fail-closed-worker", attempt.after_drain())
+        acknowledged(attempt)
+        attempt.prepare_terminal()
+        acknowledged(attempt)
+        with self.assertRaises(supervisor.SupervisorError):
+            attempt.terminal(0)
+        attempt.terminal(1)
+        self.assertIsNone(attempt.result)
+        attempt.finish_childless()
+        self.assertEqual((1, "RECOVERY_REQUIRED"), attempt.result)
+        self.assertEqual("RECOVERY_RETRY_RUNTIME_FAILED", attempt.first_reason)
+        self.assertEqual(1, attempt.first_status)
+        for operation in ("deploy", "retention"):
+            with self.subTest(operation=operation), self.assertRaises(supervisor.SupervisorError):
+                supervisor.Attempt(operation, clock=self.clock).cancel("RECOVERY_RETRY_RUNTIME_FAILED", 1)
+        interrupted = supervisor.Attempt("forward-recover", clock=self.clock)
+        interrupted.cancel("TERM", 143)
+        interrupted.cancel("RECOVERY_RETRY_RUNTIME_FAILED", 1)
+        self.assertEqual(("TERM", 143), (interrupted.first_reason, interrupted.first_status))
+
     def test_worker_lease_identity_matches_state_schema(self):
         identity = supervisor.ProcessIdentity(123, 1, 456, 0)
         with mock.patch.object(supervisor, "boot_id", return_value="01234567-89ab-cdef-0123-456789abcdef"):
@@ -664,7 +690,10 @@ command() {
 }
 supervisor_timeout 30s python3 "$provider_helper" "$1" --deploy-lock-fd 9
 """
-        for operation in ("live-resume", "finish-committed-resume", "check-image", "observe"):
+        for operation in (
+            "live-resume", "runtime-request-proof", "finish-committed-resume",
+            "check-image", "observe",
+        ):
             with self.subTest(operation=operation):
                 result = self.shell(script, operation)
                 self.assertEqual(0, result.returncode, result.stderr)
@@ -676,7 +705,9 @@ supervisor_timeout 30s python3 "$provider_helper" "$1" --deploy-lock-fd 9
                 self.assertEqual(arguments[7:], [
                     "--execution-attempt", "a" * 32, "--execution-grant", "b" * 32,
                     "--deadline-ns", "123456789",
-                ] if operation in {"live-resume", "finish-committed-resume"} else [])
+                ] if operation in {
+                    "live-resume", "runtime-request-proof", "finish-committed-resume",
+                } else [])
 
     def test_state_mutations_carry_the_live_grant_and_cleanup_cannot_launch_writers(self):
         script = self.function("supervisor_timeout") + r"""
@@ -702,9 +733,12 @@ supervisor_timeout 30s "$@"
 """
         for role, argv, wait_name, permitted in (
             ("controller-worker", ["python3", "/fixture/state.py", "prepare"], "state-publish", True),
+            ("controller-worker", ["python3", "/fixture/state.py", "adopt-recovery"], "state-publish", True),
             ("controller-worker", ["python3", "/fixture/state.py", "read-state"], "state-publish", True),
             ("fail-closed-worker", ["python3", "/fixture/state.py", "retain-unresolved"], "cleanup-publish", True),
             ("fail-closed-worker", ["python3", "/fixture/state.py", "read-state"], "cleanup-stop", True),
+            ("fail-closed-worker", ["python3", "/fixture/state.py", "advance"], "cleanup-publish", True),
+            ("fail-closed-worker", ["python3", "/fixture/provider.py", "runtime-request-proof"], "cleanup-stop", True),
             ("fail-closed-worker", ["docker", "inspect", "fixture-container"], "cleanup-stop", True),
             ("fail-closed-worker", ["docker", "update", "--restart=no", "fixture-container"], "cleanup-stop", True),
             ("fail-closed-worker", ["docker", "start", "fixture-container"], None, False),
@@ -718,8 +752,13 @@ supervisor_timeout 30s "$@"
                 self.assertEqual("grant:" + wait_name if permitted else "", result.stderr.strip())
                 expected = ["timeout", "1s", *argv] if permitted else []
                 if permitted and argv[:2] == ["python3", "/fixture/state.py"] and argv[2] in {
-                    "prepare", "retain-unresolved",
+                    "prepare", "adopt-recovery", "retain-unresolved", "advance",
                 }:
+                    expected += [
+                        "--execution-attempt", "a" * 32, "--execution-grant", "b" * 32,
+                        "--deadline-ns", "123456789",
+                    ]
+                if permitted and argv[:3] == ["python3", "/fixture/provider.py", "runtime-request-proof"]:
                     expected += [
                         "--execution-attempt", "a" * 32, "--execution-grant", "b" * 32,
                         "--deadline-ns", "123456789",
@@ -792,6 +831,7 @@ fail_closed_owned_backend
         branch = branch[:branch.index("\n  fi") + 5]
         script = r"""
 TIMEPAD_WORKER_MODE=fail-closed-worker
+fail_closed_retry_refusal() { return 1; }
 fail_closed_owned_backend() { echo stop >&2; return 1; }
 fail_closed_publish_unresolved() { echo retain-unresolved >&2; return 1; }
 fail() { echo "$1" >&2; exit 91; }
@@ -808,8 +848,20 @@ fail() { echo "$1" >&2; exit 91; }
         self.assertIn('supervisor_complete "$(jq -er', bootstrap)
         normal_gate = source.index('fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"\n')
         self.assertLess(normal_gate, source.index('"$provider_helper" state-publish'))
-        self.assertIn('[ "$recovery_phase" = COMMITTED ] ||\n'
-                      '    fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"', source)
+        recovery = source[source.index("  # Intent without a daemon receipt"):]
+        ordering = [
+            "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED",
+            "recovery_live_result=$(recovery_live_proof)",
+            'if [ "$(jq -er \'.runtimeRequest.lifecycle\'',
+            "recovery_admission_only=false",
+            "supervisor_client arm",
+            "supervisor_publish_lease",
+            '"$timepad_helper" adopt-recovery',
+        ]
+        positions = [recovery.index(marker) for marker in ordering]
+        self.assertEqual(sorted(positions), positions)
+        self.assertIn('.runtimeRequest.lifecycle == "completed" or '
+                      '.runtimeRequest.lifecycle == "acknowledged"', recovery)
         private_dispatch = source[source.index('    case "$worker_mode" in\n',
                                               source.index("if [[")):]
         self.assertIn("controller-worker|rollback-worker|fail-closed-worker) ;;", private_dispatch)
@@ -839,6 +891,10 @@ supervisor_client() {
 }
 command() {
   echo "$*" >&2
+  if [ "${5:-}" = read-state ]; then
+    echo '{"current":{"executionAttempt":null,"phase":"CUTOVER_POSSIBLE"}}'
+    return 0
+  fi
   [ "$fault" != publication ] || return 91
   echo '{"attempt":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","revision":0,"digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
 }
@@ -850,7 +906,8 @@ supervisor_register_recovery
                 self.assertEqual(fault == "none", result.returncode == 0, result.stderr)
                 events = result.stderr.splitlines()
                 self.assertEqual(events[0], "grant recovery-registration 30")
-                self.assertIn("register-recovery --root /fixture/root", events[1])
+                self.assertIn("read-state --root /fixture/root", events[1])
+                self.assertIn("register-recovery --root /fixture/root", events[2])
                 for value in (
                     "--run-id original-run", "--incident-id " + "d" * 32, "--epoch 7",
                     "--binding-digest " + "e" * 64, "--repository-digest " + "f" * 64,
@@ -858,14 +915,16 @@ supervisor_register_recovery
                     "--execution-attempt " + "a" * 32, "--execution-grant " + "b" * 32,
                     "--deadline-ns 123456789",
                 ):
-                    self.assertIn(value, events[1])
-                self.assertEqual(len(events), {"none": 4, "publication": 2, "complete": 3,
-                                               "lease-ack": 4}[fault])
+                    self.assertIn(value, events[2])
+                self.assertEqual(len(events), {"none": 5, "publication": 3, "complete": 4,
+                                               "lease-ack": 5}[fault])
 
     def test_read_only_recovery_and_rollback_waits_cannot_launch_mutation(self):
         script = self.function("supervisor_timeout") + r"""
 provider_helper=/fixture/provider.py
 timepad_helper=/fixture/state.py
+provider_pointer=/fixture/root/.provider-transaction.current
+recovery_run_key=original-run
 TIMEPAD_ATTEMPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 TIMEPAD_WORKER_MODE=$1
 recovery_admission_only=$2
@@ -889,9 +948,22 @@ supervisor_timeout 30s "$@"
             ("controller-worker", "true", ["docker", "image", "inspect", "image"], "recovery-admission"),
             ("controller-worker", "true", ["python3", "/fixture/state.py", "read-state"], "recovery-admission"),
             ("controller-worker", "true", ["python3", "/fixture/provider.py", "check-image"], "recovery-admission"),
+            ("controller-worker", "true", ["python3", "/fixture/provider.py", "runtime-request-proof"], "recovery-admission"),
+            ("controller-worker", "true", [
+                "jq", "-er", "--arg", "run", "original-run", ".phase",
+                "/fixture/root/.provider-transaction.current",
+            ], "recovery-admission"),
+            ("controller-worker", "true", [
+                "jq", "-er", "--arg", "run", "foreign-run", ".phase",
+                "/fixture/root/.provider-transaction.current",
+            ], None),
+            ("controller-worker", "true", [
+                "jq", "-er", "--arg", "run", "original-run", ".phase", "/foreign/pointer",
+            ], None),
             ("controller-worker", "true", ["docker", "start", "container"], None),
             ("controller-worker", "true", ["python3", "/fixture/provider.py", "prepare"], None),
             ("controller-worker", "true", ["python3", "/fixture/state.py", "advance"], None),
+            ("controller-worker", "true", ["python3", "/fixture/state.py", "adopt-recovery"], None),
             ("controller-worker", "true", ["bash", "arbitrary"], None),
             ("rollback-worker", "false", ["python3", "/fixture/state.py", "rollback-admission"], "rollback-admission"),
             ("rollback-worker", "false", ["python3", "/fixture/state.py", "claim-rollback"], None),
@@ -1021,6 +1093,33 @@ class FixtureSupervisor(supervisor.Supervisor):
 
 
 class LinuxSupervisorTests(unittest.TestCase):
+    def test_failed_cleanup_terminal_publishes_childless_lease_before_fixed_refusal(self):
+        def behavior(client, directory, mode):
+            fixture_publish(client, directory)
+            if mode == "controller-worker":
+                client.request("arm")
+                fixture_publish(client, directory)
+                client.request("cancel", reason="RECOVERY_RETRY_RUNTIME_FAILED", status=1)
+                return
+            self.assertEqual("fail-closed-worker", mode)
+            client.request("prepare-terminal")
+            fixture_publish(client, directory)
+            client.request("terminal", status=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = self.run_fixture(behavior, directory=directory, operation="forward-recover")
+            self.assertEqual(1, result["status"])
+            self.assertEqual("RECOVERY_REQUIRED", result["reason"])
+            self.assertEqual("RECOVERY_RETRY_RUNTIME_FAILED", result["outcome"])
+            lease = state._read_execution_lease_locked(directory)
+            self.assertEqual("drained", lease["lifecycle"])
+            self.assertIsNone(lease["worker"])
+            self.assertEqual("RECOVERY_RETRY_RUNTIME_FAILED", lease["firstFailure"])
+            self.assertEqual(1, lease["firstStatus"])
+            self.assertEqual(["controller-worker", "fail-closed-worker"], [
+                worker["mode"] for worker in lease["workers"]
+            ])
+
     def run_fixture(
         self, behavior, *, operation="deploy", timing=None, timeout=15, disconnect=False,
         directory=None, observe=None,

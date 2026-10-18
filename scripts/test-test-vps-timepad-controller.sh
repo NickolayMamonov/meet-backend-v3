@@ -166,12 +166,39 @@ echo "CONTROLLER_ARGUMENT_PASS: mixed recovery selectors and missing rollout dom
 
 recovery_case_number=0
 assert_bound_recovery() {
-  local phase=$1 fault=$2 expected=$3 starts=$4
-  local case_dir output status before after allowed_start
+  local phase=$1 fault=$2 expected=$3 starts=$4 proof=${5:-legacy}
+  local case_dir output status before after allowed_start refusal_before=
   recovery_case_number=$((recovery_case_number + 1))
   case_dir=/var/lib/timepad-fixture/case-$recovery_case_number
-  timeout 30s python3 -B "$fixture_bin/recovery.py" setup "$case_dir" "$phase" "$fault"
+  timeout 30s python3 -B "$fixture_bin/recovery.py" setup "$case_dir" "$phase" "$fault" "$proof"
   before=$(sha256sum "$case_dir/state/timepad-guard/current.json" | awk '{print $1}')
+  if { [ "$phase" = CUTOVER_POSSIBLE ] &&
+    { [ "$fault" = foreign ] || [ "$fault" = foreign-provider ] ||
+      [ "$fault" = missing ] || [ "$fault" = missing-request-proof ]; }; } ||
+    { [ "$phase" = ROLLING_BACK ] &&
+      { [ "$fault" = foreign ] || [ "$fault" = missing ] || [ "$fault" = missing-input ]; }; } ||
+    { [ "$phase" = COMMITTING ] &&
+      { [ "$fault" = unknown-inventory ] || [ "$fault" = create-intent ]; }; }; then
+    refusal_before=$(timeout 10s python3 -B "$fixture_bin/recovery.py" refusal-snapshot "$case_dir")
+  fi
+  if [ "$fault" = foreign-provider ]; then
+    # The helper owns the specific private diagnostic. The public relay keeps
+    # its separate fixed, sanitized unconfirmed-quiescence contract.
+    timeout 15s python3 -B "$fixture_bin/recovery.py" assert-foreign-provider "$case_dir"
+  fi
+  if [ "$phase" = CUTOVER_POSSIBLE ] &&
+    { [ "$fault" = missing ] || [ "$fault" = missing-request-proof ]; }; then
+    timeout 15s python3 -B "$fixture_bin/recovery.py" assert-missing "$case_dir"
+  fi
+  if [ "$proof" = request-proof ]; then
+    timeout 10s python3 -B "$fixture_bin/recovery.py" assert-historical-request "$case_dir"
+  fi
+  if [ "$fault" = foreign ] || [ "$fault" = missing-input ]; then
+    timeout 15s python3 -B "$fixture_bin/recovery.py" assert-bound-refusal "$case_dir"
+  fi
+  if [ "$fault" = unknown-inventory ]; then
+    timeout 15s python3 -B "$fixture_bin/recovery.py" assert-unknown-inventory "$case_dir"
+  fi
   export TIMEPAD_FIXTURE_CASE=$case_dir
   export TIMEPAD_FIXTURE_DOCKER_LOG=$case_dir/docker.log
   export TEST_VPS_STATE_ROOT=$case_dir/state
@@ -206,8 +233,32 @@ assert_bound_recovery() {
       grep -v "^start-id:$allowed_start$" ||
       fail "recovery attempted a foreign/predecessor start"
   fi
-  [ "$status" -eq 1 ] && [[ "$output" == *"test VPS deployment failed: $expected"* ]] ||
-    fail "recovery phase=$phase fault=$fault status=$status expected=$expected"
+  if [ -n "$refusal_before" ]; then
+    ! grep -Eq '^((update|stop|start|rm|volume):|compose:(up|create|start|stop|update|rm)$)' \
+      "$case_dir/docker.log" || fail "ownership refusal attempted runtime mutation"
+    if [ "$fault" = foreign ] || [ "$fault" = missing-request-proof ]; then
+      [ "$(<"$case_dir/docker.log")" = "inspect:$allowed_start" ] ||
+        fail "runtime refusal passed exact ownership admission"
+    fi
+    if [ "$fault" = missing ]; then
+      # Registration is control-plane evidence. Validate its unresolved,
+      # exited-owner shape before excluding only that newly created lease.
+      after=$(timeout 10s python3 -B "$fixture_bin/recovery.py" unresolved-registration-snapshot "$case_dir")
+    else
+      after=$(timeout 10s python3 -B "$fixture_bin/recovery.py" refusal-snapshot "$case_dir")
+    fi
+    [ "$refusal_before" = "$after" ] ||
+      fail "recovery phase=$phase fault=$fault changed incident/provider/lease/configuration/runtime"
+  fi
+  [ "$status" -eq 1 ] && {
+    if [ "$expected" = QUIESCENCE_UNCONFIRMED ]; then
+      [ "$output" = "schema_guard=QUIESCENCE_UNCONFIRMED" ]
+    else
+      [[ "$output" == *"test VPS deployment failed: $expected"* ]] ||
+        { [ "$expected" = RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED ] &&
+          [ "$output" = "schema_guard=QUIESCENCE_UNCONFIRMED" ]; }
+    fi
+  } || fail "recovery phase=$phase fault=$fault status=$status expected=$expected output=$output"
   [ "$(grep -c '^start-id:' "$case_dir/docker.log" || true)" -eq "$starts" ] ||
     fail "recovery start count phase=$phase fault=$fault"
   if [ "$fault" = create-fails ]; then
@@ -227,14 +278,32 @@ assert_bound_recovery() {
       fail "unbound create-intent replay attempted another create"
   elif [ "$starts" -eq 0 ]; then
     after=$(sha256sum "$case_dir/state/timepad-guard/current.json" | awk '{print $1}')
-    if [ "$fault" = active-child-missing-input ]; then
+    if [[ "$fault" == active-child* ]]; then
       cmp -s "$case_dir/active-before" "$case_dir/state/timepad-guard/current.json" ||
         fail "refusal changed durable owned-child state"
+      echo "CONTROLLER_RECOVERY_LIVE_REFUSAL_PASS: child_still_live=1 incident_provider_config_runtime_unchanged=1 fixture_only_teardown=1"
     else
       [ "$before" = "$after" ] || fail "refusal changed durable incident state"
     fi
     ! grep -Eq '^((update|stop|start):|compose:(up|create)$)' "$case_dir/docker.log" ||
       fail "refusal mutated runtime"
+    if [ "$phase" = CUTOVER_POSSIBLE ] && [ "$fault" = missing ]; then
+      local replay_before replay_log
+      replay_before=$(timeout 10s python3 -B "$fixture_bin/recovery.py" refusal-snapshot "$case_dir")
+      replay_log=$(sha256sum "$case_dir/docker.log" | awk '{print $1}')
+      if output=$(timeout --kill-after=5s 130s "${recovery_command[@]}" 2>&1); then
+        status=0
+      else
+        status=$?
+      fi
+      [ "$status" -eq 1 ] && [ "$output" = "schema_guard=QUIESCENCE_UNCONFIRMED" ] ||
+        fail "unresolved registration replay did not refuse with the sanitized contract"
+      [ "$replay_before" = "$(timeout 10s python3 -B "$fixture_bin/recovery.py" refusal-snapshot "$case_dir")" ] &&
+        [ "$replay_log" = "$(sha256sum "$case_dir/docker.log" | awk '{print $1}')" ] &&
+        [ "$refusal_before" = "$(timeout 10s python3 -B "$fixture_bin/recovery.py" unresolved-registration-snapshot "$case_dir")" ] ||
+        fail "unresolved registration replay changed lease/incident/provider/configuration/runtime"
+      echo "CONTROLLER_RECOVERY_UNRESOLVED_PASS: missing-legacy replay_refused=1 lease_unchanged=1 live_writers=0 target_starts=0"
+    fi
   else
     jq -e --arg phase "$phase" '.current // . |
       .phase == (if $phase == "COMMITTING" then "COMMITTING" else "VERIFYING" end) and .ownedChild == null
@@ -242,6 +311,34 @@ assert_bound_recovery() {
       fail "retry lost incident/phase/child proof"
     jq -e '.State.Running == false and .HostConfig.RestartPolicy.Name == "no"' \
       "$case_dir/runtime.json" >/dev/null || fail "failed retry was not quiesced"
+    if [ "$proof" = request-proof ]; then
+      local request_sequence=3
+      [ "$fault" != reaped-child ] || request_sequence=4
+      jq -e --argjson sequence "$request_sequence" \
+        --arg phase "$phase" --slurpfile historical "$case_dir/historical-before" \
+        --slurpfile lease "$case_dir/state/.timepad-execution.json" '
+        $historical[0].phase == $phase and
+        .incidentId == $historical[0].incidentId and
+        .operationEpoch == $historical[0].operationEpoch and
+        .evidenceDigest == $historical[0].evidenceDigest and
+        .containerId == $historical[0].containerId and .configHash == $historical[0].configHash and
+        .target == $historical[0].target and .executionAttempt != $historical[0].executionAttempt and
+        .runtimeRequest.operation == "stop" and .runtimeRequest.lifecycle == "completed" and
+        .runtimeRequest.sequence == $sequence and .runtimeRequest.responseId == .containerId and
+        .runtimeRequest.executionAttempt == .executionAttempt and
+        .executionAttempt == $lease[0].attempt and $lease[0].lifecycle == "drained" and
+        $lease[0].worker == null and $lease[0].firstFailure == "RECOVERY_RETRY_RUNTIME_FAILED" and
+        $lease[0].firstStatus == 1
+      ' "$case_dir/state/timepad-guard/current.json" >/dev/null ||
+        fail "retry refusal lost completed stop or final childless lease"
+    fi
+    if [ "$fault" = reaped-child ]; then
+      [ -f "$case_dir/cleared-before-retry" ] &&
+        jq -e '.latestAttemptId == (.incidentId + ":2") and .ownedChild == null' \
+          "$case_dir/state/timepad-guard/current.json" >/dev/null ||
+        fail "retry did not clear and replace the positively reaped historical child"
+      echo "CONTROLLER_RECOVERY_REAPED_PASS: historical_start_ack=1 prior_echild=1 child_cleared_before_retry=1 exact_retry_starts=1"
+    fi
     if [ "$fault" = replace ]; then
       timeout 30s python3 -B "$fixture_bin/recovery.py" lose-replacement "$case_dir"
       before=$(sha256sum "$case_dir/state/timepad-guard/current.json" | awk '{print $1}')
@@ -260,23 +357,48 @@ assert_bound_recovery() {
   echo "CONTROLLER_RECOVERY_PASS: phase=$phase fault=$fault target_starts=$starts predecessor_starts=0"
 }
 
-for phase in CUTOVER_POSSIBLE ROLLING_BACK; do
-  assert_bound_recovery "$phase" intact RECOVERY_RETRY_RUNTIME_FAILED 1
-  if [ "$phase" = ROLLING_BACK ]; then
-    assert_bound_recovery "$phase" foreign PROVIDER_REPAIR_REQUIRED 0
-  else
-    assert_bound_recovery "$phase" foreign RECOVERY_PROVIDER_LIVE_PROOF_REQUIRED 0
-  fi
-  assert_bound_recovery "$phase" missing RECOVERY_OWNERSHIP_PROOF_REQUIRED 0
-  assert_bound_recovery "$phase" orphan-child RECOVERY_RETRY_RUNTIME_FAILED 1
-  assert_bound_recovery "$phase" active-child RECOVERY_RETRY_RUNTIME_FAILED 1
+# These synthetic legacy snapshots have no durable daemon acknowledgment.
+# Matching runtime inventories must not authorize adoption or any mutation.
+for phase in CUTOVER_POSSIBLE ROLLING_BACK VERIFYING COMMITTING; do
+  assert_bound_recovery "$phase" intact RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED 0
 done
-assert_bound_recovery ROLLING_BACK missing-input PROVIDER_REPAIR_REQUIRED 0
-assert_bound_recovery ROLLING_BACK active-child-missing-input PROVIDER_REPAIR_REQUIRED 0
-assert_bound_recovery COMMITTING unknown-inventory RECOVERY_OWNERSHIP_PROOF_REQUIRED 0
-assert_bound_recovery COMMITTING create-intent RECOVERY_REPLACEMENT_CREATE_UNRESOLVED 0
-assert_bound_recovery COMMITTING create-fails RECOVERY_REPLACEMENT_CREATE_FAILED 0
-assert_bound_recovery COMMITTING replace RECOVERY_RETRY_RUNTIME_FAILED 1
+
+# The historical fixture really executes/acknowledges the exact daemon start,
+# reaps its child and proves ECHILD before recording a drained old lease.
+# Recovery clears that stale child record before a new exact retry; this does
+# not prove recovery can drain a still-live child from an earlier attempt.
+assert_bound_recovery CUTOVER_POSSIBLE reaped-child RECOVERY_RETRY_RUNTIME_FAILED 1 request-proof
+
+# Intact retries in both phases and foreign/missing-proof cutover cases have
+# completed historical daemon requests and dead-owner leases. Others are legacy.
+for phase in CUTOVER_POSSIBLE ROLLING_BACK; do
+  assert_bound_recovery "$phase" intact RECOVERY_RETRY_RUNTIME_FAILED 1 request-proof
+  if [ "$phase" = ROLLING_BACK ]; then
+    assert_bound_recovery "$phase" foreign QUIESCENCE_UNCONFIRMED 0 request-proof
+  else
+    assert_bound_recovery "$phase" foreign QUIESCENCE_UNCONFIRMED 0
+    assert_bound_recovery "$phase" foreign-provider QUIESCENCE_UNCONFIRMED 0
+  fi
+  if [ "$phase" = CUTOVER_POSSIBLE ]; then
+    assert_bound_recovery "$phase" missing-request-proof QUIESCENCE_UNCONFIRMED 0
+    assert_bound_recovery "$phase" missing QUIESCENCE_UNCONFIRMED 0
+  else
+    assert_bound_recovery "$phase" missing QUIESCENCE_UNCONFIRMED 0
+  fi
+  # This legacy orphan snapshot has no correlated request or execution lease.
+  # Recovery must refuse its released-child record before runtime mutation.
+  assert_bound_recovery "$phase" orphan-child QUIESCENCE_UNCONFIRMED 0
+  assert_bound_recovery "$phase" active-child QUIESCENCE_UNCONFIRMED 0
+done
+assert_bound_recovery ROLLING_BACK missing-input QUIESCENCE_UNCONFIRMED 0 request-proof
+assert_bound_recovery ROLLING_BACK active-child-missing-input QUIESCENCE_UNCONFIRMED 0
+assert_bound_recovery COMMITTING unknown-inventory QUIESCENCE_UNCONFIRMED 0 request-proof
+# These required replacement rows remain assertions of the planned behavior.
+# Current exact-container-only registration cannot reach creation/replacement;
+# a sanitized early refusal is not a passing replacement acceptance result.
+assert_bound_recovery COMMITTING create-intent RECOVERY_REPLACEMENT_CREATE_UNRESOLVED 0 request-proof
+assert_bound_recovery COMMITTING create-fails RECOVERY_REPLACEMENT_CREATE_FAILED 0 request-proof
+assert_bound_recovery COMMITTING replace RECOVERY_RETRY_RUNTIME_FAILED 1 request-proof
 unset TIMEPAD_FIXTURE_CASE
 
 # These cases cover dispatch refusals and positively bound live recovery

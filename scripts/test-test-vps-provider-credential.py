@@ -216,6 +216,15 @@ def live_context(phase: str = "VERIFYING") -> tuple:
             phase=phase, containerId="f" * 64, configHash="0" * 64,
             latestAttemptId=current["incidentId"] + ":1",
         )
+        # Synthetic history for read-only adapter tests, not evidence that a
+        # real supervisor lease may be superseded.
+        current["runtimeRequest"] = {
+            "nonce": "a" * 32, "sequence": 1, "executionAttempt": "b" * 32,
+            "operation": "start", "containerId": current["containerId"],
+            "imageId": image["platformImageId"], "configHash": current["configHash"],
+            "childAttemptId": None, "lifecycle": "completed",
+            "responseId": current["containerId"], "completionDigest": "c" * 64,
+        }
     if phase in {"COMMITTING", "COMMITTED"}:
         current.update(
             commitWitnessDigest="1" * 64, providerFinalizationDigest="2" * 64,
@@ -284,6 +293,129 @@ def live_context(phase: str = "VERIFYING") -> tuple:
     return module, contract, origin, current, envelope
 
 
+class RuntimeRequestProofTests(unittest.TestCase):
+    def context(self):
+        context = live_context()
+        current, observed = context[3], context[4]["inspection"][0]
+        current["runtimeRequest"].update(lifecycle="acknowledged", completionDigest=None)
+        return current, observed
+
+    def test_explicit_acknowledgment_and_exact_effect_are_both_required(self):
+        for operation, running, policy, substep in (
+            ("start", True, "no", None),
+            ("stop", False, "no", None),
+            ("suppress", True, "no", None),
+            ("restore-policy", True, "unless-stopped", "terminal-policy-intent"),
+        ):
+            current, observed = self.context()
+            current["runtimeRequest"]["operation"] = operation
+            if substep is not None:
+                current.update(phase="COMMITTING", commitSubstep=substep)
+            observed["State"]["Running"] = running
+            observed["HostConfig"]["RestartPolicy"]["Name"] = policy
+            with self.subTest(operation=operation):
+                proof = helper._runtime_request_proof(current, observed)
+                self.assertEqual("a" * 32, proof["requestNonce"])
+                self.assertRegex(proof["completionDigest"], r"^[a-f0-9]{64}$")
+                self.assertEqual(proof, helper._runtime_request_proof(current, observed))
+                current["runtimeRequest"].update(
+                    lifecycle="intent", responseId=None, completionDigest=None,
+                )
+                with self.assertRaises(helper.ProviderError):
+                    helper._runtime_request_proof(current, observed)
+
+    def test_unknown_timeout_completed_replay_and_identity_mismatch_refuse(self):
+        for lifecycle in ("intent", "completed"):
+            current, observed = self.context()
+            current["runtimeRequest"].update(
+                lifecycle=lifecycle,
+                responseId=None if lifecycle == "intent" else current["containerId"],
+                completionDigest="c" * 64 if lifecycle == "completed" else None,
+            )
+            with self.subTest(lifecycle=lifecycle), self.assertRaises(helper.ProviderError):
+                helper._runtime_request_proof(current, observed)
+        for path, value in (
+            (("Id",), "e" * 64), (("Image",), "sha256:" + "e" * 64),
+            (("Config", "Labels", "com.docker.compose.config-hash"), "e" * 64),
+            (("State", "Running"), False),
+            (("HostConfig", "RestartPolicy", "Name"), "unless-stopped"),
+        ):
+            current, observed = self.context()
+            target = observed
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(helper.ProviderError):
+                helper._runtime_request_proof(current, observed)
+
+    def test_nonce_changes_digest_and_owned_group_requires_positive_quiescence(self):
+        current, observed = self.context()
+        first = helper._runtime_request_proof(current, observed)
+        current["runtimeRequest"]["nonce"] = "e" * 32
+        self.assertNotEqual(first, helper._runtime_request_proof(current, observed))
+        module = helper._timepad_state_module()
+        attempt = current["incidentId"] + ":1"
+        current["runtimeRequest"]["childAttemptId"] = attempt
+        current["ownedChild"] = {"attemptId": attempt}
+        with mock.patch.object(module, "require_child_group_quiescent") as quiescent:
+            helper._runtime_request_proof(current, observed)
+            quiescent.assert_called_once_with(current["ownedChild"])
+            quiescent.side_effect = module.GuardError("OWNED_CHILD_QUIESCENCE_UNCONFIRMED")
+            with self.assertRaises(helper.ProviderError):
+                helper._runtime_request_proof(current, observed)
+
+    def test_matching_inventory_never_completes_unknown_request(self):
+        context = live_context()
+        context[3]["runtimeRequest"].update(
+            lifecycle="intent", responseId=None, completionDigest=None,
+        )
+        with self.assertRaises(helper.ProviderError):
+            LiveResumeTests().run_proof(context)
+
+    def test_private_completion_adapter_rechecks_nonce_state_and_deadline_without_writes(self):
+        module = helper._timepad_state_module()
+        for fault in ("none", "wrong-nonce", "state-drift", "deadline"):
+            current, observed = self.context()
+            envelope = {
+                "requestNonce": "e" * 32 if fault == "wrong-nonce" else "a" * 32,
+                "inspection": [observed],
+            }
+            final = dict(current, reason="changed") if fault == "state-drift" else current
+            with self.subTest(fault=fault), contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
+                stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+                stack.enter_context(mock.patch.object(helper, "_timepad_current", side_effect=[
+                    (module, {}, current), (module, {}, final),
+                ]))
+                stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+                stack.enter_context(mock.patch.object(helper.os, "close"))
+                stack.enter_context(mock.patch.object(helper, "_validate_state_directory_fd"))
+                stack.enter_context(mock.patch.object(helper, "_live_resume_config"))
+                if fault == "deadline":
+                    stack.enter_context(mock.patch.object(
+                        helper, "_deadline_check", side_effect=helper.ProviderError("RECOVERY_REQUIRED"),
+                    ))
+                write = stack.enter_context(mock.patch.object(helper.os, "write"))
+                unlink = stack.enter_context(mock.patch.object(helper.os, "unlink"))
+                output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                def complete():
+                    helper._runtime_request_completion(
+                        current["runId"], "/state", "final-deploy", json.dumps(envelope).encode(), 9,
+                    )
+                if fault == "none":
+                    complete()
+                    self.assertEqual(
+                        helper._runtime_request_proof(current, observed),
+                        json.loads(output.getvalue()),
+                    )
+                else:
+                    with self.assertRaises(helper.ProviderError):
+                        complete()
+                    self.assertEqual("", output.getvalue())
+                write.assert_not_called()
+                unlink.assert_not_called()
+
+
 class LiveResumeTests(unittest.TestCase):
     def authority(self, context: tuple) -> tuple:
         module, contract, origin, current, envelope = context
@@ -292,6 +424,81 @@ class LiveResumeTests(unittest.TestCase):
                 envelope, module=module, origin=origin, current=current,
                 run_key="31885558214-1", state_kind="final-deploy",
             )
+
+    def test_stale_lease_proof_requires_exact_complete_inventories_and_known_request(self):
+        for lifecycle in ("completed", "acknowledged", "intent", None):
+            context = live_context()
+            current, envelope = context[3], context[4]
+            if lifecycle is None:
+                current["runtimeRequest"] = None
+            else:
+                current["runtimeRequest"].update(
+                    lifecycle=lifecycle,
+                    responseId=current["containerId"] if lifecycle != "intent" else None,
+                    completionDigest="e" * 64 if lifecycle == "completed" else None,
+                )
+            evidence = {
+                "inspection": envelope["inspection"],
+                "backendInventory": [current["containerId"]],
+                "composeInventory": [current["containerId"]],
+            }
+            for fault in ("none", "extra-global", "missing-compose", "foreign-runtime", "proof", "revoked"):
+                value = json.loads(json.dumps(evidence))
+                if fault == "extra-global":
+                    value["backendInventory"].append("e" * 64)
+                elif fault == "missing-compose":
+                    value["composeInventory"] = []
+                elif fault == "foreign-runtime":
+                    value["inspection"][0]["Image"] = "sha256:" + "e" * 64
+                check = mock.Mock()
+                if fault == "revoked":
+                    check.side_effect = helper.ProviderError("RECOVERY_REQUIRED")
+                with self.subTest(lifecycle=lifecycle, fault=fault), mock.patch.object(
+                    helper, "_validate_live_resume", return_value=(False, False, False, "retry-exact-candidate"),
+                ) as proof, mock.patch.object(helper.os, "write") as write, \
+                        mock.patch.object(helper.os, "unlink") as unlink:
+                    if fault == "proof":
+                        proof.side_effect = helper.ProviderError("RECOVERY_REQUIRED")
+
+                    def validate():
+                        return helper._recovery_lease_runtime_proof(
+                            "/state", current, json.dumps(envelope["authorization"]).encode(),
+                            json.dumps(value).encode(), 9, check,
+                        )
+
+                    if fault == "none" and lifecycle in {"completed", "acknowledged"}:
+                        request = validate()
+                        self.assertEqual("completed", request["lifecycle"])
+                        self.assertEqual(current["runtimeRequest"]["nonce"], request["nonce"])
+                        self.assertEqual(2, check.call_count)
+                        proof.assert_called_once()
+                        self.assertEqual(9, proof.call_args.args[-1])
+                        self.assertEqual("runtime", json.loads(proof.call_args.args[-2])["stage"])
+                    else:
+                        with self.assertRaises(helper.ProviderError):
+                            validate()
+                    write.assert_not_called()
+                    unlink.assert_not_called()
+                    self.assertIsNone(helper._EXECUTION_CHECK.get())
+
+    def test_live_marker_sequence_is_specific_to_the_persisted_schema_phase(self):
+        allowed = {
+            "PREPARED": {"prepared", "applying"},
+            "CUTOVER_POSSIBLE": {"prepared", "applying", "verifying"},
+            "ROLLING_BACK": {"prepared", "applying", "verifying", "rolling-back"},
+            "VERIFYING": {"verifying"},
+            "RECOVERY_REQUIRED": {"verifying"},
+            "FORWARD_RECOVERING": {"verifying"},
+        }
+        for phase, permitted in allowed.items():
+            for marker in ("prepared", "applying", "verifying", "rolling-back"):
+                with self.subTest(phase=phase, marker=marker):
+                    context = live_context(phase)
+                    if marker in permitted:
+                        self.run_proof(context, marker_phase=marker)
+                    else:
+                        with self.assertRaises(helper.ProviderError):
+                            self.run_proof(context, marker_phase=marker)
 
     def run_proof(
         self, context: tuple, *, receipt_error: bool = False,
@@ -944,7 +1151,9 @@ class LiveResumeTests(unittest.TestCase):
                         helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
                         O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
                     ),
-                    mock.patch.object(helper, "_timepad_current", return_value=(object(), origin, current)),
+                    mock.patch.object(helper, "_timepad_current", return_value=(
+                        helper._timepad_state_module(), origin, current,
+                    )),
                     mock.patch.object(helper, "_validate_state_directory"),
                     mock.patch.object(helper.os, "open", return_value=12),
                     mock.patch.object(helper.os, "fstat", return_value=info),
@@ -1980,6 +2189,38 @@ class ProviderLiveGrantTests(unittest.TestCase):
     def revoke(self, *args, **kwargs):
         self.client.request.side_effect = self.supervisor.SupervisorError("private-canary")
 
+    def test_cleanup_reserve_is_exclusive_to_read_only_stop_request_proof(self):
+        self.lease.update(
+            workerMode="fail-closed-worker", lifecycle="draining", operation="forward-recover",
+            firstFailure="RECOVERY_RETRY_RUNTIME_FAILED", firstStatus=1, workEndNs=150,
+        )
+        self.client.role = self.reply["role"] = "fail-closed-worker"
+        self.reply["name"] = "cleanup-stop"
+        current = {
+            "executionAttempt": self.args.execution_attempt, "phase": "VERIFYING", "ownedChild": None,
+            "containerId": "c" * 64, "configHash": "d" * 64,
+            "target": {"tuple": {"platformImageId": "e" * 64}},
+            "runtimeRequest": {
+                "executionAttempt": self.args.execution_attempt, "operation": "stop",
+                "containerId": "c" * 64, "configHash": "d" * 64, "imageId": "e" * 64,
+                "lifecycle": "acknowledged",
+            },
+        }
+        with mock.patch.object(self.module, "_read_guard_locked", return_value=({}, current)):
+            self.args.command = "runtime-request-proof"
+            with self.authority():
+                helper._deadline_check()
+            for command in ("prepare", "verify", "finish", "state-publish", "live-resume", "retention-delete"):
+                self.args.command = command
+                with self.subTest(command=command), self.assertRaises(helper.ProviderError):
+                    with self.authority():
+                        self.fail("cleanup admitted provider work")
+            self.args.command = "runtime-request-proof"
+            for field, value in (("phase", "COMMITTING"), ("executionAttempt", "f" * 32)):
+                with mock.patch.dict(current, {field: value}), self.assertRaises(helper.ProviderError):
+                    with self.authority():
+                        self.fail("unbound stop proof admitted")
+
     def test_live_grant_is_checked_at_entry_each_boundary_and_exit_without_renewal(self) -> None:
         with self.authority():
             for _ in range(3):
@@ -2064,6 +2305,24 @@ class ProviderLiveGrantTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(helper.ProviderError):
                 with self.authority():
                     self.fail("reserve/cancelled authority entered")
+
+    def test_registered_recovery_only_allows_read_only_request_reconciliation(self) -> None:
+        self.lease.update(operation="forward-recover", lifecycle="registered", workEndNs=None)
+        self.reply["name"] = "recovery-admission"
+        for command in ("live-resume", "absence-resume", "runtime-request-proof"):
+            self.args.command = command
+            with self.subTest(command=command), self.authority():
+                helper._deadline_check()
+        for command in ("prepare", "finish", "state-publish", "prepare-finalization"):
+            self.args.command = command
+            with self.subTest(command=command), self.assertRaises(helper.ProviderError):
+                with self.authority():
+                    self.fail("recovery admission authorized mutation")
+        self.args.command = "runtime-request-proof"
+        self.revoke()
+        with self.assertRaises(helper.ProviderError):
+            with self.authority():
+                self.fail("revoked reconciliation entered")
 
     def test_rollback_admission_stays_read_only_and_admitted_rollback_uses_its_own_grant(self) -> None:
         self.lease.update(

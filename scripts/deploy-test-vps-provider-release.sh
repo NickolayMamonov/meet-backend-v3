@@ -682,7 +682,7 @@ if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ]; then
     command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"
   done
   timeout_status=0
-  timeout_status=$(timeout 1s sh -c 'sleep 2' >/dev/null 2>&1; echo "$?")
+  timeout_status=$(command timeout 1s sh -c 'sleep 2' >/dev/null 2>&1; echo "$?")
   [ "$timeout_status" -eq 124 ] || fail "timeout capability is unavailable"
   [ -d "$root" ] || fail "deployment root is unavailable"
   [ -s "$root/.env.production" ] || fail "existing production environment is unavailable"
@@ -703,7 +703,7 @@ if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" != fail-closed-worker ]; then
   [ -r "$runtime_helper" ] || fail "runtime invariant helper is unavailable"
   [ -f "$provider_helper" ] && [ ! -L "$provider_helper" ] && [ -r "$provider_helper" ] ||
     fail "provider credential helper is unavailable"
-  timeout 30s python3 "$provider_helper" check >/dev/null || fail "PREREQUISITE_MISSING"
+  command timeout 30s python3 "$provider_helper" check >/dev/null || fail "PREREQUISITE_MISSING"
   # shellcheck source=/dev/null
   source "$runtime_helper"
 fi
@@ -798,18 +798,60 @@ supervisor_complete() {
   supervisor_client terminal 0 --outcome "$1" >/dev/null ||
     fail "EXECUTION_TERMINAL_ACK_FAILED"
 }
+recovery_retry_runtime_refusal() {
+  if [ "$supervisor_enabled" = true ]; then
+    supervisor_client cancel RECOVERY_RETRY_RUNTIME_FAILED 1 >/dev/null 2>&1 || :
+  fi
+  fail "RECOVERY_RETRY_RUNTIME_FAILED"
+}
 supervisor_register_recovery() {
   local grant grant_id deadline publication lease_revision digest
+  local current container inspection global_ids compose_ids runtime_evidence=
+  local -a evidence_args=()
   grant=$(supervisor_client grant recovery-registration 30) || return 1
   grant_id=$(jq -er '.grantId | strings' <<<"$grant") || return 1
   deadline=$(jq -er '.endNs | numbers' <<<"$grant") || return 1
+  current=$(command timeout 5s python3 "$timepad_helper" read-state \
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  if jq -e '.executionAttempt != null and
+    (.phase != "COMMITTED" and .phase != "ROLLED_BACK" and .phase != "READY")' \
+    <<<"$current" >/dev/null; then
+    command timeout 5s python3 "$timepad_helper" authorize-recovery \
+      --root "$state_root" --authorization "$state_root/timepad-recovery-authorization.json" \
+      --deploy-lock-fd 9 >/dev/null || return 1
+    jq -e --arg run "$recovery_run_key" --arg incident "${recovery_incident,,}" \
+      --arg epoch "$recovery_epoch" --arg binding "$recovery_binding_digest" \
+      --arg repository "${image##*@sha256:}" --arg revision "$revision" --arg version "$version" '
+      .runId == $run and .incidentId == $incident and
+      (.operationEpoch | tostring) == $epoch and .evidenceDigest == $binding and
+      .target.tuple.repositoryDigest == $repository and
+      .target.tuple.revision == $revision and .target.tuple.version == $version
+    ' <<<"$current" >/dev/null || return 1
+    container=$(jq -er '.containerId | strings | select(test("^[a-f0-9]{64}$"))' \
+      <<<"$current") || return 1
+    inspection=$(command timeout 5s docker inspect "$container") || return 1
+    global_ids=$(command timeout 5s docker ps --all --quiet \
+      --filter label=com.docker.compose.project=meet-production \
+      --filter label=com.docker.compose.service=backend) || return 1
+    compose_ids=$(command timeout 5s bash -c '
+      set -euo pipefail
+      source "$1"
+      runtime_compose "$2" "$3" ps -aq backend
+    ' _ "$runtime_helper" "$root" "$compose_script") || return 1
+    runtime_evidence=$(jq -cn --argjson inspection "$inspection" \
+      --arg global "$global_ids" --arg compose "$compose_ids" '
+      {inspection:$inspection,backendInventory:($global | split("\n")),
+       composeInventory:($compose | split("\n"))}
+    ') || return 1
+    evidence_args=(--runtime-evidence)
+  fi
   publication=$(command timeout 30s python3 "$timepad_helper" register-recovery \
     --root "$state_root" --contract "$timepad_contract" --deploy-lock-fd 9 \
     --run-id "$recovery_run_key" --incident-id "${recovery_incident,,}" \
     --epoch "$recovery_epoch" --binding-digest "$recovery_binding_digest" \
     --repository-digest "${image##*@sha256:}" --revision "$revision" --version "$version" \
     --execution-attempt "$TIMEPAD_ATTEMPT" --execution-grant "$grant_id" \
-    --deadline-ns "$deadline") || return 1
+    --deadline-ns "$deadline" "${evidence_args[@]}" <<<"$runtime_evidence") || return 1
   jq -e --arg attempt "$TIMEPAD_ATTEMPT" '
     .attempt == $attempt and .revision == 0 and
     (.digest | type == "string" and test("^[a-f0-9]{64}$"))
@@ -855,9 +897,17 @@ supervisor_timeout() {
   if [ "${recovery_admission_only:-false}" = true ]; then
     case "$executable:${2:-}" in
       docker:image) [ "${3:-}" = inspect ] || return 1 ;;
+      docker:inspect|docker:ps) ;;
+      bash:*-runtime-invariants.sh) ;;
+      bash:-c) ;; # Fixed read-only inventory wrapper in recovery_backend_inventory.
+      jq:-er)
+        [ "$#" -eq 7 ] && [ "$3" = --arg ] && [ "$4" = run ] &&
+          [ "$5" = "$recovery_run_key" ] && [ "$7" = "$provider_pointer" ] || return 1
+        ;;
       python3:"$timepad_helper")
         case "${3:-}" in read-state|authorize-recovery) ;; *) return 1 ;; esac ;;
-      python3:"$provider_helper") [ "${3:-}" = check-image ] || return 1 ;;
+      python3:"$provider_helper")
+        case "${3:-}" in check-image|live-resume|absence-resume|runtime-request-proof) ;; *) return 1 ;; esac ;;
       python3:-) ;; # Fixed controller's bounded private-input stat validation.
       *) return 1 ;;
     esac
@@ -874,9 +924,13 @@ supervisor_timeout() {
       python3:"$timepad_helper")
         case "${3:-}" in
           read-state) wait_name=cleanup-stop ;;
-          retain-unresolved) wait_name=cleanup-publish ;;
+          retain-unresolved|advance) wait_name=cleanup-publish ;;
           *) return 1 ;;
         esac
+        ;;
+      python3:"$provider_helper")
+        [ "${3:-}" = runtime-request-proof ] || return 1
+        wait_name=cleanup-stop
         ;;
       docker:inspect|docker:stop) wait_name=cleanup-stop ;;
       docker:update)
@@ -894,7 +948,7 @@ supervisor_timeout() {
     # same durable lease and absolute deadline under inherited FD9.
     case "${3:-}" in
       prepare|verify|finish|prepare-finalization|finish-committed-resume|\
-      live-resume|absence-resume|prepare-transition-proof|state-publish|\
+      live-resume|absence-resume|prepare-transition-proof|runtime-request-proof|state-publish|\
       retention-list|retention-check|retention-delete)
         set -- "$@" --execution-attempt "$TIMEPAD_ATTEMPT" \
           --execution-grant "$grant_id" --deadline-ns "$end_ns"
@@ -902,7 +956,7 @@ supervisor_timeout() {
     esac
   elif [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ]; then
     case "${3:-}" in
-      bootstrap|publish-state|prepare|advance|claim-rollback|retain-unresolved|stop-owned-child|rollback-admission)
+      bootstrap|publish-state|prepare|advance|adopt-recovery|claim-rollback|retain-unresolved|stop-owned-child|rollback-admission)
         set -- "$@" --execution-attempt "$TIMEPAD_ATTEMPT" \
           --execution-grant "$grant_id" --deadline-ns "$end_ns"
         ;;
@@ -974,6 +1028,40 @@ fail_closed_owned_backend() {
 fail_closed_publish_unresolved() {
   timeout 10s python3 "$timepad_helper" retain-unresolved \
     --root "$state_root" --deploy-lock-fd 9 >/dev/null
+}
+
+fail_closed_retry_refusal() {
+  local current lease container inspection state run_key state_suffix
+  lease=$(supervisor_client lease) || return 1
+  jq -e '.operation == "forward-recover" and
+    .firstFailure == "RECOVERY_RETRY_RUNTIME_FAILED" and .firstStatus == 1' \
+    <<<"$lease" >/dev/null || return 1
+  current=$(timeout 10s python3 "$timepad_helper" read-state \
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  jq -e --arg attempt "$TIMEPAD_ATTEMPT" '
+    .executionAttempt == $attempt and .phase == "VERIFYING" and .ownedChild == null and
+    .runtimeRequest.lifecycle == "completed" and .runtimeRequest.operation == "start" and
+    .runtimeRequest.executionAttempt == $attempt and
+    .runtimeRequest.containerId == .containerId
+  ' <<<"$current" >/dev/null || return 1
+  container=$(jq -er '.containerId' <<<"$current") || return 1
+  run_key=$(jq -er '.runId' <<<"$current") || return 1
+  state=$(jq -er --arg root "$state_root/" '$root + .ownedRun' <<<"$current") || return 1
+  state_suffix=${state#"$state_root/$run_key-"}
+  inspection=$(timeout 10s docker inspect "$container") || return 1
+  jq -e --arg id "$container" \
+    --arg image "sha256:$(jq -er '.target.tuple.platformImageId' <<<"$current")" \
+    --arg hash "$(jq -er '.configHash' <<<"$current")" '
+    type == "array" and length == 1 and .[0].Id == $id and .[0].Image == $image and
+    .[0].Config.Labels["com.docker.compose.project"] == "meet-production" and
+    .[0].Config.Labels["com.docker.compose.service"] == "backend" and
+    .[0].Config.Labels["com.docker.compose.config-hash"] == $hash and
+    .[0].HostConfig.RestartPolicy.Name == "no"
+  ' <<<"$inspection" >/dev/null || return 1
+  timepad_runtime_mutate stop "$container" || return 1
+  supervisor_client prepare-terminal >/dev/null || return 1
+  supervisor_publish_lease || return 1
+  supervisor_client terminal 1 >/dev/null || return 1
 }
 
 rollback_worker_admission() {
@@ -1313,11 +1401,97 @@ timepad_claim_rollback() {
     fail "ROLLBACK_NOT_ADMITTED"
 }
 
+timepad_request_publish() {
+  local request=$1 current phase changes=$state/.timepad-request-changes.json
+  current=$(timeout 10s python3 "$timepad_helper" read-state \
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  phase=$(jq -er '.phase' <<<"$current") || return 1
+  [ ! -e "$changes" ] && [ ! -L "$changes" ] || return 1
+  (umask 077; set -o noclobber
+    jq -cn --argjson request "$request" '{changes:{runtimeRequest:$request}}' >"$changes") ||
+    return 1
+  timeout 15s python3 "$timepad_helper" advance --root "$state_root" \
+    --phase "$phase" --changes "$changes" --deploy-lock-fd 9 >/dev/null || {
+      rm -f -- "$changes"
+      return 1
+    }
+  rm -f -- "$changes"
+}
+
+timepad_request_begin() {
+  local operation=$1 child=${2:-} expected_container=$3 current request nonce
+  current=$(timeout 10s python3 "$timepad_helper" read-state \
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  [[ "$nonce" =~ ^[a-f0-9]{32}$ ]] || return 1
+  request=$(jq -ce --arg operation "$operation" --arg nonce "$nonce" \
+    --arg attempt "$TIMEPAD_ATTEMPT" --arg child "$child" \
+    --arg container "$expected_container" '
+    select(.executionAttempt == $attempt and .containerId == $container) |
+    {nonce:$nonce,sequence:((.runtimeRequest.sequence // 0) + 1),
+     executionAttempt:$attempt,operation:$operation,containerId:.containerId,
+     imageId:.target.tuple.platformImageId,configHash:.configHash,
+     childAttemptId:(if $child == "" then null else $child end),
+     lifecycle:"intent",responseId:null,completionDigest:null}
+  ' <<<"$current") || return 1
+  timepad_request_publish "$request"
+}
+
+timepad_request_acknowledge() {
+  local response=$1 current request
+  current=$(timeout 10s python3 "$timepad_helper" read-state \
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  request=$(jq -ce --arg response "$response" '
+    .runtimeRequest | select(.lifecycle == "intent" and .containerId == $response) |
+    .lifecycle="acknowledged" | .responseId=$response
+  ' <<<"$current") || return 1
+  timepad_request_publish "$request"
+}
+
+timepad_request_complete() {
+  local current request container inspection proof digest nonce
+  current=$(timeout 10s python3 "$timepad_helper" read-state \
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  request=$(jq -ce '.runtimeRequest | select(.lifecycle == "acknowledged")' \
+    <<<"$current") || return 1
+  container=$(jq -er '.containerId' <<<"$request") || return 1
+  nonce=$(jq -er '.nonce' <<<"$request") || return 1
+  inspection=$(timeout 15s docker inspect "$container") || return 1
+  proof=$(jq -cn --arg nonce "$nonce" --argjson inspection "$inspection" \
+    '{requestNonce:$nonce,inspection:$inspection}' |
+    timeout 15s python3 "$provider_helper" runtime-request-proof \
+      --run-key "$run_key" --state-root "$state_root" \
+      --state-kind "$state_suffix" --deploy-lock-fd 9) || return 1
+  digest=$(jq -er --arg nonce "$nonce" '
+    select(.requestNonce == $nonce) |
+    .completionDigest | strings | select(test("^[a-f0-9]{64}$"))
+  ' <<<"$proof") || return 1
+  request=$(jq -ce --arg digest "$digest" \
+    '.lifecycle="completed" | .completionDigest=$digest' <<<"$request") || return 1
+  timepad_request_publish "$request"
+}
+
+timepad_runtime_mutate() {
+  local operation=$1 container=$2 response
+  shift 2
+  timepad_request_begin "$operation" "" "$container" || return 1
+  case "$operation" in
+    suppress) response=$(timeout 15s docker update --restart=no "$container") || return 1 ;;
+    restore-policy) response=$(timeout 15s docker update --restart=unless-stopped "$container") || return 1 ;;
+    stop) response=$(timeout 30s docker stop --time 10 "$container") || return 1 ;;
+    *) return 1 ;;
+  esac
+  [ "$#" -eq 0 ] && [ "$response" = "$container" ] || return 1
+  timepad_request_acknowledge "$response" && timepad_request_complete
+}
+
 owned_child_pid=
 owned_child_fifo=
 owned_child_phase=
 owned_child_attempt=
 owned_child_wait_status=0
+owned_child_response=
+owned_child_grant=
 next_owned_child_attempt() {
   local state_json
   state_json=$(timeout 10s python3 "$timepad_helper" read-state \
@@ -1375,6 +1549,13 @@ complete_owned_child() {
     timeout 5s python3 "$timepad_helper" stop-owned-child \
       --root "$state_root" --deploy-lock-fd 9 --term-grace-seconds 0 \
       >/dev/null || return 1
+    if [ -n "${owned_child_response:-}" ] && [ "$status" -eq 0 ]; then
+      # Only an exact synchronous daemon response can acknowledge the intent.
+      # Client death/nonzero/timeout leaves it unresolved even if inspect agrees.
+      local response
+      response=$(<"$owned_child_response")
+      timepad_request_acknowledge "$response" && timepad_request_complete || return 1
+    fi
     reaped_json=$(jq -ce '.lifecycle="reaped"' <<<"$child_json") ||
       return 1
     timepad_advance "$owned_child_phase" "" "" "" "" "" "" "" \
@@ -1383,17 +1564,29 @@ complete_owned_child() {
       null "$owned_child_attempt" || return 1
   fi
   [ -z "$owned_child_fifo" ] || rm -f -- "$owned_child_fifo"
+  [ -z "${owned_child_response:-}" ] || rm -f -- "$owned_child_response"
+  if [ -n "${owned_child_grant:-}" ]; then
+    supervisor_client complete "$owned_child_grant" >/dev/null || return 1
+  fi
   owned_child_pid=
   owned_child_fifo=
   owned_child_phase=
   owned_child_attempt=
+  owned_child_response=
+  owned_child_grant=
   owned_child_wait_status=$status
 }
 run_owned_child() {
   local phase=$1 attempt_id token fifo command_digest child_json
-  local released_json
+  local released_json grant handshake_grant noclobber_was_set=false
   shift
   [ "$#" -gt 0 ] || fail "OWNED_CHILD_INVALID"
+  # This slice admits exact-container synchronous start only. Compose creation
+  # needs its own positively correlated daemon completion before this gate can
+  # be widened; an empty inventory or client exit cannot supply that proof.
+  [ "$#" -eq 6 ] && [ "$1" = timeout ] && [ "$2" = --kill-after=5s ] &&
+    [ "$3" = 30s ] && [ "$4" = docker ] && [ "$5" = start ] &&
+    [[ "$6" =~ ^[a-f0-9]{64}$ ]] || fail "RUNTIME_REQUEST_CORRELATION_REQUIRED"
   attempt_id=$(next_owned_child_attempt) || fail "OWNED_CHILD_INVALID"
   [[ "$attempt_id" =~ ^[a-f0-9]{32}:[1-9][0-9]{0,19}$ ]] ||
     fail "OWNED_CHILD_INVALID"
@@ -1406,15 +1599,36 @@ run_owned_child() {
   mkfifo -m 600 -- "$fifo" || fail "OWNED_CHILD_INVALID"
   owned_child_fifo=$fifo
   owned_child_phase=$phase
+  owned_child_response=$state/.runtime-response-$attempt_id
+  [ ! -e "$owned_child_response" ] && [ ! -L "$owned_child_response" ] ||
+    fail "OWNED_CHILD_INVALID"
+  grant=$(supervisor_client grant child-handshake 5) || fail "OWNED_CHILD_GRANT_REQUIRED"
+  handshake_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
+  umask 077
+  case $- in *C*) noclobber_was_set=true ;; esac
+  set -o noclobber
   setsid bash -c '
+    set -euo pipefail
     exec {gate_fd}<>"$1"
-    IFS= read -r -t 10 gate <&"$gate_fd" || exit 125
+    IFS= read -r -t 5 gate <&"$gate_fd" || exit 125
     exec {gate_fd}>&-
     [ "$gate" = "$2" ] || exit 125
     shift 2
-    exec "$@"
-  ' _ "$fifo" "$token" "$@" &
+    set +e
+    "$@" | python3 -c '"'"'
+import re
+import sys
+data = sys.stdin.buffer.read(66)
+if re.fullmatch(rb"[a-f0-9]{64}\n", data) is None:
+    raise SystemExit(1)
+sys.stdout.buffer.write(data)
+'"'"'
+    statuses=("${PIPESTATUS[@]}")
+    [ "${statuses[0]}" -eq 0 ] || exit "${statuses[0]}"
+    exit "${statuses[1]}"
+  ' _ "$fifo" "$token" "$@" >"$owned_child_response" &
   owned_child_pid=$!
+  [ "$noclobber_was_set" = true ] || set +o noclobber
   child_json=
   for ((attempt = 0; attempt < 10; attempt++)); do
     child_json=$(timeout 1s python3 "$timepad_helper" capture-child \
@@ -1432,6 +1646,11 @@ run_owned_child() {
   owned_child_attempt=$attempt_id
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$child_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
+  timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
+  supervisor_client complete "$handshake_grant" >/dev/null ||
+    fail "OWNED_CHILD_GRANT_REQUIRED"
+  grant=$(supervisor_client grant docker 30) || fail "OWNED_CHILD_GRANT_REQUIRED"
+  owned_child_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
   released_json=$(jq -ce '.lifecycle="released"' <<<"$child_json") ||
     fail "OWNED_CHILD_CAPTURE_FAILED"
   timepad_advance "$phase" "" "" "" "" "" "" "" \
@@ -1680,6 +1899,11 @@ if [ -n "${TIMEPAD_WORKER_MODE:-}" ]; then
     supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
   fi
   if [ "$TIMEPAD_WORKER_MODE" = fail-closed-worker ]; then
+    if fail_closed_retry_refusal; then
+      # Cleanup succeeded; the supervisor still returns the initiating failure.
+      trap - EXIT
+      exit 0
+    fi
     fail_closed_owned_backend || :
     fail_closed_publish_unresolved || :
     fail "QUIESCENCE_UNCONFIRMED"
@@ -1826,14 +2050,13 @@ if [ "$operation" = forward-recover ]; then
       ;;
     *) fail "RECOVERY_PHASE_REFUSED" ;;
   esac
-  # Only read-only terminal replay has a complete success handoff in this
-  # slice. Exact retries/finalization still need daemon-quiescence and cleanup
-  # worker integration before any mutation may be released.
-  [ "$recovery_phase" = COMMITTED ] ||
-    fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"
-  recovery_admission_only=false
-  supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
-  supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  # Intent without a daemon receipt remains unknown, even after client exit,
+  # ECHILD, or agreeing inventories. Read-only provider/runtime admission must
+  # precede lease arming, adoption, owned-child stop and every retry writer.
+  jq -e '.runtimeRequest != null and
+    (.runtimeRequest.lifecycle == "completed" or .runtimeRequest.lifecycle == "acknowledged")' \
+    <<<"$recovery_state" >/dev/null ||
+    fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
   if [ "$recovery_phase" = COMMITTED ]; then
     jq -e '.ownedChild == null' <<<"$recovery_state" >/dev/null ||
       fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
@@ -1891,9 +2114,9 @@ if [ "$operation" = forward-recover ]; then
   [ "$recovery_substep" != replacement-create-intent ] ||
     fail "RECOVERY_REPLACEMENT_CREATE_UNRESOLVED"
   if ! recovery_inspect=$(timeout 30s docker inspect "$recovery_container" 2>/dev/null); then
-    recovery_absent_candidate
-    recovery_inspect=$(timeout 30s docker inspect "$recovery_container" 2>/dev/null) ||
-      fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
+    # The exact-container slice cannot correlate Compose create responses yet.
+    # Preserve the one-use replacement intent gate; absence is not completion.
+    fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
   fi
   [ "$(timeout 30s docker inspect "$recovery_container" \
     --format '{{.Image}}')" = "$recovery_target_id" ] &&
@@ -1948,6 +2171,30 @@ if [ "$operation" = forward-recover ]; then
     '.outcome | select(. == "already-completed" or . == "finalization-only" or . == "retry-exact-candidate")' \
     <<<"$recovery_live_result") || fail "RECOVERY_PROVIDER_LIVE_PROOF_REQUIRED"
   validate_configuration_boundary "$state/config.env.target"
+  recovery_request_proof=
+  if [ "$(jq -er '.runtimeRequest.lifecycle' <<<"$recovery_state")" = acknowledged ]; then
+    recovery_request_nonce=$(jq -er '.runtimeRequest.nonce' <<<"$recovery_state") ||
+      fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
+    recovery_request_proof=$(jq -cn --arg nonce "$recovery_request_nonce" \
+      --argjson inspection "$recovery_inspect" '{requestNonce:$nonce,inspection:$inspection}' |
+      timeout 15s python3 "$provider_helper" runtime-request-proof \
+        --run-key "$recovery_run_key" --state-root "$state_root" \
+        --state-kind "$recovery_state_suffix" --deploy-lock-fd 9) ||
+      fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
+  fi
+  recovery_admission_only=false
+  supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
+  supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  if [ "$recovery_phase" != COMMITTED ]; then
+    adoption_args=()
+    if [ -n "$recovery_request_proof" ]; then
+      adoption_args=(--request-nonce "$recovery_request_nonce" --completion-digest \
+        "$(jq -er '.completionDigest' <<<"$recovery_request_proof")")
+    fi
+    timeout 15s python3 "$timepad_helper" adopt-recovery \
+      --root "$state_root" --contract "$timepad_contract" --deploy-lock-fd 9 \
+      "${adoption_args[@]}" >/dev/null || fail "RECOVERY_ADOPTION_REFUSED"
+  fi
   recovery_child=$(jq -c '.ownedChild' <<<"$recovery_state") ||
     fail "GUARD_STATE_LOST"
   if [ "$recovery_child" != null ]; then
@@ -2147,10 +2394,10 @@ if [ "$operation" = forward-recover ]; then
   if [ "$recovery_retry_needed" = true ]; then
     timepad_advance FORWARD_RECOVERING EXACT_IMAGE_RETRY
     [ "$recovery_restart" = no ] ||
-      timeout 15s docker update --restart=no "$candidate_container" \
+      timepad_runtime_mutate suppress "$candidate_container" \
         >/dev/null || fail "RECOVERY_RETRY_QUIESCE_FAILED"
     if [ "$recovery_running" = true ]; then
-      timeout 30s docker stop --time 10 "$candidate_container" \
+      timepad_runtime_mutate stop "$candidate_container" \
         >/dev/null || fail "RECOVERY_RETRY_QUIESCE_FAILED"
     fi
     [ "$(timeout 30s docker inspect "$candidate_container" \
@@ -2201,11 +2448,11 @@ if [ "$operation" = forward-recover ]; then
       <<<"$recovery_state") || fail "GUARD_STATE_LOST"
     runtime_guarded_invariants_bounded "$recovery_target_id" "$revision" \
       "$version" "$recovery_hash" "$candidate_container" "$recovery_epoch_value" \
-      >/dev/null 2>&1 || fail "RECOVERY_RETRY_RUNTIME_FAILED"
+      >/dev/null 2>&1 || recovery_retry_runtime_refusal
     runtime_environment_bounded >/dev/null 2>&1 ||
-      fail "RECOVERY_RETRY_RUNTIME_FAILED"
+      recovery_retry_runtime_refusal
     (verify_public_contract "$public_url") ||
-      fail "RECOVERY_RETRY_RUNTIME_FAILED"
+      recovery_retry_runtime_refusal
     recovery_running=true
     recovery_health=healthy
     recovery_restart=no
@@ -2306,7 +2553,7 @@ PY
     esac
   fi
   if [ "$recovery_restart" = no ]; then
-    timeout 15s docker update --restart=unless-stopped "$candidate_container" \
+    timepad_runtime_mutate restore-policy "$candidate_container" \
       >/dev/null || fail "RECOVERY_POLICY_RESTORE_FAILED"
   fi
   [ "$(timeout 30s docker inspect "$candidate_container" \

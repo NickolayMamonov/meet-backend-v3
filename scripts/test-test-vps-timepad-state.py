@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import argparse
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, nullcontext, redirect_stdout
 import hashlib
 import io
 import json
@@ -497,6 +497,9 @@ class RecoveryRegistrationTests(unittest.TestCase):
         self.stack.enter_context(mock.patch.object(
             state, "_read_guard_locked", return_value=(self.origin, self.current),
         ))
+        self.stack.enter_context(mock.patch.object(
+            state, "_read_execution_lease_locked", return_value=None,
+        ))
         self.stack.enter_context(mock.patch.object(state, "_open_root", return_value=55))
         self.stack.enter_context(mock.patch.object(state.os, "close"))
         self.reader = self.stack.enter_context(mock.patch.object(
@@ -755,6 +758,47 @@ class ControllerRecoveryContractTests(unittest.TestCase):
             [bash, "-s", "--", *arguments], input="set -euo pipefail\n" + script,
             text=True, capture_output=True, check=False, timeout=60 if os.name == "nt" else 20,
         )
+
+    def test_runtime_mutation_requires_intent_exact_receipt_and_completion(self) -> None:
+        function = controller_function("timepad_runtime_mutate")
+        for fault, expected in (
+            ("none", ["intent:stop", "docker:stop", "acknowledged", "completed"]),
+            ("outstanding", ["intent:stop"]),
+            ("timeout", ["intent:stop", "docker:stop"]),
+            ("wrong-response", ["intent:stop", "docker:stop"]),
+            ("unknown-proof", ["intent:stop", "docker:stop", "acknowledged", "completed"]),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                log = pathlib.Path(temporary) / "events"
+                result = self.run_shell(r"""
+log=$1
+fault=$2
+container=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+timepad_request_begin() {
+  echo "intent:$1" >>"$log"
+  [ "$fault" != outstanding ]
+}
+timeout() {
+  [ "$*" = "30s docker stop --time 10 $container" ] || return 99
+  echo docker:stop >>"$log"
+  [ "$fault" != timeout ] || return 124
+  if [ "$fault" = wrong-response ]; then echo unknown; else echo "$container"; fi
+}
+timepad_request_acknowledge() {
+  [ "$1" = "$container" ] || return 98
+  echo acknowledged >>"$log"
+}
+timepad_request_complete() {
+  echo completed >>"$log"
+  [ "$fault" != unknown-proof ]
+}
+""" + function + r"""
+status=0
+timepad_runtime_mutate stop "$container" || status=$?
+if [ "$fault" = none ]; then [ "$status" -eq 0 ]; else [ "$status" -ne 0 ]; fi
+""", str(log), fault)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(expected, log.read_text().splitlines())
 
     def test_effective_timeout_dispatches_to_supervisor_without_shadowing(self) -> None:
         source = (ROOT / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
@@ -1215,13 +1259,17 @@ fail() { echo "$1" >&2; exit 99; }
         source = controller_function("run_owned_child")
         self.assertNotIn("exec 9", source)
         self.assertIn('exec {gate_fd}<>"$1"', source)
-        self.assertIn('read -r -t 10 gate', source)
+        self.assertIn('read -r -t 5 gate', source)
         self.assertLess(source.index('timepad_advance "$phase"'),
                         source.index('printf \'%s\\n\' "$token"'))
         # The phase is metadata; the command executable remains in argv.
         self.assertIn("\n  shift\n", source)
         self.assertNotIn("\n  shift 2\n", source)
-        self.assertIn('exec "$@"', source)
+        self.assertIn('"$@" | python3', source)
+        self.assertLess(source.index('timepad_request_begin start'),
+                        source.index('printf \'%s\\n\' "$token"'))
+        self.assertIn('supervisor_client grant child-handshake 5', source)
+        self.assertIn('supervisor_client grant docker 30', source)
 
     def test_healthy_unresolved_phases_normalize_before_verification_without_runtime_mutation(self) -> None:
         source = (ROOT / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
@@ -1289,6 +1337,10 @@ target_hash=fixture-hash
 public_url=
 fail() { echo "FAIL:$1" >&2; exit 99; }
 timepad_advance() { echo "advance:$1:${7:-}"; }
+timepad_runtime_mutate() {
+  [ "$1" = restore-policy ] && [ "$2" = "$candidate_container" ] || return 96
+  timeout 15s docker update --restart=unless-stopped "$2"
+}
 timeout() {
   shift
   case "$1:$2" in
@@ -1824,6 +1876,19 @@ class OwnedChildStateTests(unittest.TestCase):
             root.mkdir(mode=0o700)
             run = root / "fixture-run"
             run.mkdir(mode=0o700)
+            docker = run / "docker"
+            docker.write_text(
+                "#!/usr/bin/env python3\n"
+                "import fcntl, os, sys\n"
+                f"lock = os.stat({str(root / '.deploy.lock')!r})\n"
+                "inherited = os.fstat(9)\n"
+                "assert (lock.st_dev, lock.st_ino) == (inherited.st_dev, inherited.st_ino)\n"
+                "assert sys.argv[1:] == ['start', 'f' * 64]\n"
+                "fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "raise SystemExit(23)\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o700)
             authority = {
                 "rootId": "test-root", "bootstrapId": "bootstrap-1",
                 "initialRuntime": digest("a"), "initialConfig": digest("b"),
@@ -1853,22 +1918,28 @@ owned_child_fifo=
 owned_child_phase=
 owned_child_attempt=
 owned_child_wait_status=0
+owned_child_response=
+owned_child_grant=
 fail() { echo "$1" >&2; exit 99; }
 exec 9>>"$state_root/.deploy.lock"
 flock -n 9
+export PATH="$state:$PATH"
+supervisor_client() {
+  case "$1" in
+    grant) echo '{"grantId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' ;;
+    complete) : ;;
+    *) return 98 ;;
+  esac
+}
+# This fixture isolates child topology/FD9/exit propagation. Request state and
+# adapter proof have separate focused tests; the full controller matrix is blocked.
+timepad_request_begin() {
+  [ "$1" = start ] && [[ "$2" = *:1 ]] && [[ "$3" = f* ]]
+}
 """ + functions + r"""
 status=0
-run_owned_child CUTOVER_POSSIBLE timeout --kill-after=2s 5s python3 -B -c '
-import os
-import sys
-import fcntl
-lock = os.stat(sys.argv[1] + "/.deploy.lock")
-inherited = os.fstat(9)
-assert (lock.st_dev, lock.st_ino) == (inherited.st_dev, inherited.st_ino)
-fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
-print("CHILD_COMPLETED", flush=True)
-raise SystemExit(23)
-' "$state_root" || status=$?
+run_owned_child CUTOVER_POSSIBLE timeout --kill-after=5s 30s docker start \
+  "$(printf 'f%.0s' {1..64})" || status=$?
 [ "$status" -eq 23 ]
 [ -z "$owned_child_pid" ]
 # Child completion must not unlock the shared open-file description.
@@ -1882,12 +1953,680 @@ fi
                 capture_output=True, text=True, check=False, timeout=30,
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertEqual("CHILD_COMPLETED\n", result.stdout)
+            self.assertEqual("", result.stdout)
             current = state.read_guard(root)[1]
             self.assertIsNone(current["ownedChild"])
             self.assertEqual(prepared["incidentId"] + ":1", current["latestAttemptId"])
             self.assertEqual("CUTOVER_POSSIBLE", current["phase"])
-            self.assertEqual([], list(run.iterdir()))
+            self.assertEqual([docker], list(run.iterdir()))
+
+
+class CleanupRequestTests(unittest.TestCase):
+    def setUp(self):
+        self.lease = execution_lease(operation="forward-recover", revision=5, lifecycle="draining")
+        self.lease.update(
+            workerMode="fail-closed-worker", firstFailure="RECOVERY_RETRY_RUNTIME_FAILED", firstStatus=1,
+        )
+        current = prepared_state()
+        current = state.advance_state(current, "CUTOVER_POSSIBLE", containerId=digest("4"), configHash=digest("5"))
+        current = state.advance_state(current, "VERIFYING")
+        self.current = dict(current, executionAttempt=self.lease["attempt"], runtimeRequest={
+            "nonce": "6" * 32, "sequence": 1, "executionAttempt": self.lease["attempt"],
+            "operation": "start", "containerId": current["containerId"],
+            "imageId": current["target"]["tuple"]["platformImageId"], "configHash": current["configHash"],
+            "childAttemptId": None, "lifecycle": "completed",
+            "responseId": current["containerId"], "completionDigest": digest("7"),
+        })
+
+    def test_cleanup_can_publish_only_correlated_stop_intent_acknowledgment_and_completion(self):
+        previous = self.current
+        request = dict(
+            previous["runtimeRequest"], nonce="8" * 32, sequence=2, operation="stop",
+            lifecycle="intent", responseId=None, completionDigest=None,
+        )
+        for lifecycle in ("intent", "acknowledged", "completed"):
+            if lifecycle != "intent":
+                request = dict(request, lifecycle=lifecycle, responseId=previous["containerId"],
+                               completionDigest=digest("9") if lifecycle == "completed" else None)
+            candidate = state.advance_state(previous, previous["phase"], runtimeRequest=request)
+            state._validate_execution_state_write(self.lease, previous, candidate, LEASE_START_NS + 1)
+            previous = candidate
+        self.assertEqual("VERIFYING", previous["phase"])
+        self.assertEqual("stop", previous["runtimeRequest"]["operation"])
+
+    def test_cleanup_never_changes_incident_phase_child_or_other_request_operations(self):
+        request = dict(
+            self.current["runtimeRequest"], nonce="8" * 32, sequence=2, operation="stop",
+            lifecycle="intent", responseId=None, completionDigest=None,
+        )
+        candidate = dict(self.current, runtimeRequest=request)
+        for change in (
+            {"phase": "COMMITTED"}, {"operationEpoch": 2}, {"containerId": digest("a")},
+            {"ownedChild": owned_child()}, {"reason": "unreviewed"},
+            {"runtimeRequest": dict(request, operation="start")},
+            {"runtimeRequest": dict(request, operation="restore-policy")},
+            {"runtimeRequest": dict(request, operation="suppress")},
+        ):
+            with self.subTest(change=change), self.assertRaises(state.GuardError):
+                state._validate_execution_state_write(
+                    self.lease, self.current, dict(candidate, **change), LEASE_START_NS + 1,
+                )
+        for change in (
+            {"firstFailure": "TERM"}, {"firstStatus": 143}, {"operation": "deploy"},
+            {"lifecycle": "armed"}, {"attempt": "b" * 32},
+        ):
+            with self.subTest(change=change), self.assertRaises(state.GuardError):
+                state._validate_execution_state_write(
+                    dict(self.lease, **change), self.current, candidate, LEASE_START_NS + 1,
+                )
+        with self.assertRaises(state.GuardError):
+            state._validate_execution_state_write(
+                self.lease, self.current, candidate, self.lease["hardEndNs"],
+            )
+
+
+class RuntimeRequestTests(unittest.TestCase):
+    """Request completion is separate from child reap and inventory observations."""
+
+    def setUp(self):
+        self.current = state.advance_state(prepared_state(), "CUTOVER_POSSIBLE")
+        self.current = state.advance_state(
+            self.current, "CUTOVER_POSSIBLE", containerId=digest("c"), configHash=digest("d"),
+            executionAttempt="8" * 32,
+        )
+        self.request = {
+            "nonce": "9" * 32, "sequence": 1, "executionAttempt": "8" * 32,
+            "operation": "stop", "containerId": digest("c"), "imageId": digest("b"),
+            "configHash": digest("d"), "childAttemptId": None, "lifecycle": "intent",
+            "responseId": None, "completionDigest": None,
+        }
+
+    def change(self, current, request):
+        return state.advance_state(current, current["phase"], runtimeRequest=request)
+
+    def completed(self):
+        intent = self.change(self.current, self.request)
+        acknowledged = self.change(intent, dict(
+            self.request, lifecycle="acknowledged", responseId=digest("c"),
+        ))
+        return self.change(acknowledged, dict(
+            acknowledged["runtimeRequest"], lifecycle="completed", completionDigest=digest("e"),
+        ))
+
+    def test_intent_acknowledgment_revalidation_and_sequence_are_distinct(self):
+        intent = self.change(self.current, self.request)
+        with self.assertRaises(state.GuardError):
+            self.change(intent, dict(
+                self.request, lifecycle="completed", responseId=digest("c"), completionDigest=digest("e"),
+            ))
+        completed = self.completed()
+        self.assertEqual(completed["runtimeRequest"], state.require_runtime_request_completion(completed))
+        self.assertEqual(completed, self.change(completed, completed["runtimeRequest"]))
+        next_request = dict(self.request, nonce="7" * 32, sequence=2)
+        second = self.change(completed, next_request)
+        with self.assertRaises(state.GuardError):
+            self.change(second, completed["runtimeRequest"])
+
+    def test_unknown_timeout_and_client_reap_cannot_clear_or_replace_a_request(self):
+        intent = self.change(self.current, self.request)
+        acknowledged = self.change(intent, dict(
+            self.request, lifecycle="acknowledged", responseId=digest("c"),
+        ))
+        for current in (self.current, intent, acknowledged):
+            with self.subTest(lifecycle=current["runtimeRequest"]), self.assertRaisesRegex(
+                state.GuardError, "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED",
+            ), mock.patch.object(state, "require_child_group_quiescent"):
+                state.require_runtime_request_completion(current)
+        for current in (intent, acknowledged):
+            for request in (None, dict(self.request, nonce="7" * 32, sequence=2)):
+                with self.subTest(request=request), self.assertRaises(state.GuardError):
+                    self.change(current, request)
+            self.assertEqual(
+                current["runtimeRequest"],
+                state.advance_state(current, "RECOVERY_REQUIRED")["runtimeRequest"],
+            )
+
+    def test_request_identity_response_binding_types_and_completion_replay_are_strict(self):
+        intent = self.change(self.current, self.request)
+        for field, value in (
+            ("containerId", digest("f")), ("imageId", digest("f")),
+            ("configHash", digest("f")), ("executionAttempt", "7" * 32),
+            ("sequence", 2), ("sequence", True), ("sequence", 1 << 64),
+            ("nonce", "private-canary"), ("operation", []), ("lifecycle", []),
+            ("childAttemptId", "b" * 32 + ":1"),
+        ):
+            with self.subTest(field=field), self.assertRaises(state.GuardError) as error:
+                self.change(self.current, dict(self.request, **{field: value}))
+            self.assertNotIn("private-canary", str(error.exception))
+        with self.assertRaises(state.GuardError):
+            self.change(intent, dict(
+                self.request, lifecycle="acknowledged", responseId=digest("f"),
+            ))
+        completed = self.completed()
+        with self.assertRaises(state.GuardError):
+            self.change(completed, dict(completed["runtimeRequest"], completionDigest=digest("f")))
+        with self.assertRaises(state.GuardError):
+            self.change(completed, self.request)
+
+    def test_recovery_adoption_requires_completion_and_never_replaces_old_execution_ownership(self):
+        lease = execution_lease(attempt="6" * 32, lifecycle="armed", operation="forward-recover")
+        current = dict(self.completed(), executionAttempt=None)
+        adopted = state.adopt_recovery_state(current, lease)
+        self.assertEqual(lease["attempt"], adopted["executionAttempt"])
+        self.assertEqual(current["runtimeRequest"], adopted["runtimeRequest"])
+        self.assertEqual(adopted, state.adopt_recovery_state(adopted, lease))
+        for bad in (
+            dict(current, executionAttempt="5" * 32),
+            dict(current, runtimeRequest=None),
+            dict(current, runtimeRequest=self.request),
+        ):
+            with self.subTest(current=bad), self.assertRaises(state.GuardError):
+                state.adopt_recovery_state(bad, lease)
+        for field, value in (
+            ("operation", "deploy"), ("workerMode", "rollback-worker"),
+            ("lifecycle", "registered"), ("firstFailure", "TERM"),
+        ):
+            with self.subTest(field=field), self.assertRaises(state.GuardError):
+                state.adopt_recovery_state(current, dict(lease, **{field: value}))
+
+    def test_acknowledged_request_reconciliation_is_nonce_bound_not_an_intent_override(self):
+        lease = execution_lease(attempt="6" * 32, lifecycle="armed", operation="forward-recover")
+        intent = self.change(self.current, self.request)
+        acknowledged = self.change(intent, dict(
+            self.request, lifecycle="acknowledged", responseId=digest("c"),
+        ))
+        proof = {"requestNonce": self.request["nonce"], "completionDigest": digest("e")}
+        current = dict(acknowledged, executionAttempt=None)
+        adopted = state.adopt_recovery_state(current, lease, request_proof=proof)
+        self.assertEqual("completed", adopted["runtimeRequest"]["lifecycle"])
+        for bad_current, bad_proof in (
+            (dict(intent, executionAttempt=None), proof),
+            (current, dict(proof, requestNonce="7" * 32)),
+            (current, dict(proof, completionDigest=None)),
+        ):
+            with self.subTest(proof=bad_proof), self.assertRaises(state.GuardError):
+                state.adopt_recovery_state(bad_current, lease, request_proof=bad_proof)
+
+
+class StaleRecoveryLeaseTests(unittest.TestCase):
+    change = RuntimeRequestTests.change
+    completed = RuntimeRequestTests.completed
+
+    def setUp(self):
+        RuntimeRequestTests.setUp(self)
+        self.previous = execution_lease(attempt="8" * 32, lifecycle="drained", revision=4)
+        self.previous.update(firstFailure="EXIT", firstStatus=1)
+        self.previous["workers"] = [{
+            "mode": "controller-worker", **self.previous["supervisor"], "pid": 102,
+        }]
+        self.candidate = execution_lease(attempt="6" * 32, operation="forward-recover")
+        self.candidate["supervisor"] = {**self.previous["supervisor"], "pid": 201}
+        self.candidate["worker"] = {**self.candidate["supervisor"], "pid": 202}
+        self.candidate["workers"] = [{"mode": "controller-worker", **self.candidate["worker"]}]
+        self.current = self.completed()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.exited = self.stack.enter_context(mock.patch.object(
+            state, "_execution_process_exited", return_value=True,
+        ))
+        worker = self.candidate["worker"]
+        self.process = self.stack.enter_context(mock.patch.object(
+            state, "_execution_process_record", return_value=(
+                worker["bootId"], worker["startTicks"], self.candidate["supervisor"]["pid"],
+            ),
+        ))
+        self.live = self.stack.enter_context(mock.patch.object(
+            state, "_execution_lease_supervisor_is_live", return_value=True,
+        ))
+
+    def validate(self, previous=None, candidate=None, current=None):
+        state._validate_recovery_lease_successor(
+            self.previous if previous is None else previous,
+            self.candidate if candidate is None else candidate,
+            self.current if current is None else current,
+        )
+
+    def test_complete_kernel_request_and_same_incident_proofs_pass_without_mutation(self):
+        before = json.dumps((self.previous, self.candidate, self.current), sort_keys=True)
+        self.validate()
+        self.assertEqual(before, json.dumps((self.previous, self.candidate, self.current), sort_keys=True))
+        self.assertEqual(
+            [mock.call(identity) for identity in (
+                self.previous["supervisor"], *self.previous["workers"],
+            )], self.exited.call_args_list,
+        )
+
+    def test_missing_childlessness_overflow_and_unbound_descendants_never_admit(self):
+        for lifecycle in (
+            "registered", "armed", "cancel-forward", "drain-forward",
+            "rollback-admission", "rolling-back", "draining", "quiescence-unconfirmed",
+        ):
+            with self.subTest(lifecycle=lifecycle), self.assertRaises(state.GuardError):
+                self.validate(previous=dict(self.previous, lifecycle=lifecycle))
+        for changes in (
+            {"worker": self.previous["supervisor"]}, {"workers": []},
+            {"firstFailure": "DESCENDANT_OVERFLOW"}, {"firstFailure": "OWNERSHIP_UNCERTAIN"},
+            {"operation": "retention"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(state.GuardError):
+                self.validate(previous=dict(self.previous, **changes))
+
+    def test_every_recorded_process_must_have_definitively_exited(self):
+        for identity in (self.previous["supervisor"], *self.previous["workers"]):
+            self.exited.side_effect = lambda row: row != identity
+            with self.subTest(identity=identity), self.assertRaises(state.GuardError):
+                self.validate()
+        self.exited.side_effect = state.GuardError("EXECUTION_LEASE_UNRESOLVED")
+        with self.assertRaises(state.GuardError):
+            self.validate()
+
+    def test_new_worker_parent_supervisor_and_attempt_must_be_bound(self):
+        for record in (None, ("different-boot", 1, 201), (
+            self.candidate["worker"]["bootId"], self.candidate["worker"]["startTicks"], 999,
+        )):
+            self.process.return_value = record
+            with self.subTest(record=record), self.assertRaises(state.GuardError):
+                self.validate()
+        for changes in (
+            {"attempt": self.previous["attempt"]}, {"operation": "deploy"},
+            {"lifecycle": "armed"}, {"revision": 1}, {"worker": None},
+            {"workers": []}, {"workerMode": "rollback-worker"}, {"rollbackIssued": True},
+            {"firstFailure": "TERM", "firstStatus": 143},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(state.GuardError):
+                self.validate(candidate=dict(self.candidate, **changes))
+        worker = self.candidate["worker"]
+        self.process.return_value = (
+            worker["bootId"], worker["startTicks"], self.candidate["supervisor"]["pid"],
+        )
+        self.live.return_value = False
+        with self.assertRaises(state.GuardError):
+            self.validate()
+
+    def test_owned_child_requires_matching_request_exit_and_empty_process_group(self):
+        child = owned_child(lifecycle="released")
+        current = dict(
+            self.current, ownedChild=child, latestAttemptId=child["attemptId"],
+            runtimeRequest=dict(
+                self.current["runtimeRequest"], operation="start", childAttemptId=child["attemptId"],
+            ),
+        )
+        with mock.patch.object(state, "require_child_group_quiescent") as group:
+            self.validate(current=current)
+            group.assert_called_once_with(child)
+            for changes in (
+                {"operation": "stop"}, {"childAttemptId": None},
+                {"childAttemptId": current["incidentId"] + ":2"},
+            ):
+                with self.subTest(changes=changes), self.assertRaises(state.GuardError):
+                    self.validate(current=dict(
+                        current, runtimeRequest=dict(current["runtimeRequest"], **changes),
+                    ))
+            self.exited.side_effect = lambda row: row != child
+            with self.assertRaises(state.GuardError):
+                self.validate(current=current)
+            self.exited.side_effect = None
+            group.side_effect = state.GuardError("OWNED_CHILD_STILL_RUNNING")
+            with self.assertRaises(state.GuardError):
+                self.validate(current=current)
+
+    def test_missing_intent_acknowledged_and_foreign_attempt_requests_refuse(self):
+        for request in (
+            None, self.request,
+            dict(self.request, lifecycle="acknowledged", responseId=digest("c")),
+            dict(self.current["runtimeRequest"], executionAttempt="7" * 32),
+        ):
+            with self.subTest(request=request), self.assertRaises(state.GuardError):
+                self.validate(current=dict(self.current, runtimeRequest=request))
+        for changes in (
+            {"executionAttempt": None}, {"executionAttempt": "7" * 32},
+            {"phase": "PREPARED"}, {"phase": "COMMITTED"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(state.GuardError):
+                self.validate(current=dict(self.current, **changes))
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and hasattr(os, "geteuid") and os.geteuid() == 0,
+        "durable reconciliation requires isolated Linux root",
+    )
+    def test_durable_adoption_failures_never_unlock_a_partial_pair_or_issue_runtime_work(self):
+        authority = dict(
+            rootId="test-root", bootstrapId="reconcile-bootstrap",
+            initialRuntime=digest("a"), initialConfig=digest("b"),
+            initialSchema=digest("c"), initialStartupInventory=digest("d"),
+            schemaHistoryProvenance=True,
+        )
+        observed = dict(
+            rootId="test-root", runtime=digest("a"), config=digest("b"),
+            schema=digest("c"), startupInventory=digest("d"), schemaHistoryProvenance=True,
+        )
+        for fault in (
+            "none", "before-current", "after-current", "before-lease", "after-lease",
+            "current-file-fsync", "current-dir-fsync", "lease-file-fsync", "lease-dir-fsync",
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as parent, ExitStack() as stack:
+                root = pathlib.Path(parent) / "deploy"
+                root.mkdir(mode=0o700)
+                state.bootstrap_guard(root, authority=authority, observed=observed)
+                origin, _ = state.read_guard(root)
+                current = dict(self.current, originDigest=origin["originDigest"])
+                current_path = root / state.GUARD_DIR / "current.json"
+                lease_path = root / state.EXECUTION_LEASE_NAME
+                current_path.write_bytes(state._canonical(current))
+                lease_path.write_bytes(state._canonical(self.previous))
+                lease_path.chmod(0o600)
+                provider = SimpleNamespace(
+                    ProviderError=RuntimeError,
+                    _recovery_lease_runtime_proof=mock.Mock(return_value=current["runtimeRequest"]),
+                )
+                spec = SimpleNamespace(loader=mock.Mock())
+                stack.enter_context(mock.patch.object(
+                    state.importlib.util, "spec_from_file_location", return_value=spec,
+                ))
+                stack.enter_context(mock.patch.object(
+                    state.importlib.util, "module_from_spec", return_value=provider,
+                ))
+                runtime = stack.enter_context(mock.patch.object(subprocess, "run"))
+                real_write = state._atomic_write
+                real_fsync = state.os.fsync
+                syncs = 0
+
+                def sync(fd):
+                    nonlocal syncs
+                    syncs += 1
+                    boundary = {
+                        "current-file-fsync": 1, "current-dir-fsync": 2,
+                        "lease-file-fsync": 3, "lease-dir-fsync": 4,
+                    }.get(fault)
+                    if syncs == boundary:
+                        raise OSError("synthetic durability fault")
+                    real_fsync(fd)
+
+                def write(fd, name, data, limit, *, replace):
+                    boundary = "current" if name == "current.json" else "lease"
+                    if fault == "before-" + boundary:
+                        raise OSError("synthetic publication fault")
+                    real_write(fd, name, data, limit, replace=replace)
+                    if fault == "after-" + boundary:
+                        raise OSError("synthetic publication fault")
+
+                stack.enter_context(mock.patch.object(state, "_atomic_write", side_effect=write))
+                stack.enter_context(mock.patch.object(state.os, "fsync", side_effect=sync))
+                check = mock.Mock()
+                token = state._EXECUTION_CHECK.set(check)
+                try:
+                    with state.deploy_lock(root) as fd:
+                        os.set_inheritable(fd, True)
+                        def reconcile():
+                            return state._reconcile_recovery_lease_locked(
+                                root, self.previous, self.candidate, current, b"{}",
+                                b"{}", fd, check,
+                            )
+
+                        if fault == "none":
+                            result = reconcile()
+                            self.assertEqual(self.candidate["attempt"], result["attempt"])
+                        else:
+                            with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                                reconcile()
+                        actual = state._read_guard_locked(root)[1]
+                        lease = state._read_execution_lease_locked(root)
+                        self.assertEqual(1, actual["operationEpoch"])
+                        self.assertEqual(current["incidentId"], actual["incidentId"])
+                        self.assertEqual(current["phase"], actual["phase"])
+                        if actual["executionAttempt"] != lease["attempt"]:
+                            with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                                state.check_execution_lease(root, attempt=lease["attempt"], deploy_lock_fd=fd)
+                            with self.assertRaises(state.GuardError):
+                                reconcile()
+                        elif lease == self.previous:
+                            self.assertEqual(current, actual)
+                        else:
+                            self.assertEqual(self.candidate["attempt"], actual["executionAttempt"])
+                            self.assertEqual(self.candidate, lease)
+                        with self.assertRaises(state.GuardError):
+                            # Public retention/writers never inherit this
+                            # private registration grant, even after success.
+                            state.check_execution_lease(root)
+                        runtime.assert_not_called()
+                finally:
+                    state._EXECUTION_CHECK.reset(token)
+
+
+@unittest.skipUnless(
+    sys.platform == "linux" and hasattr(os, "geteuid") and os.geteuid() == 0
+    and os.environ.get("TIMEPAD_FIXTURE_PARENT_MOUNT_NS"),
+    "actual stale-recovery controller requires the isolated Linux fixture",
+)
+class StaleRecoveryControllerTests(unittest.TestCase):
+    def test_retry_refusal_requires_completed_stop_and_reentry_keeps_same_incident(self):
+        spec = importlib.util.spec_from_file_location(
+            "retry_refusal_fixture", ROOT / "fixtures/timepad-controller/recovery.py",
+        )
+        assert spec is not None and spec.loader is not None
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        fixture_root = pathlib.Path("/var/lib/timepad-fixture")
+        fixture_root.mkdir(mode=0o700, exist_ok=True)
+        for fault in ("none", "stop-fails"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(
+                prefix="case-refusal-", dir=fixture_root,
+            ) as temporary:
+                case = pathlib.Path(temporary) / "fixture"
+                with redirect_stdout(io.StringIO()):
+                    adapter.setup(case, "CUTOVER_POSSIBLE", "intact", request_proof=True)
+                state_root = case / "state"
+                _, original = state.read_guard(state_root)
+                bin_path = case / "bin"
+                bin_path.mkdir(mode=0o700)
+                for name in ("docker", "curl"):
+                    shutil.copy2(ROOT / "fixtures/timepad-controller" / name, bin_path / name)
+                environment = dict(os.environ, **{
+                    "PATH": str(bin_path) + ":" + os.environ["PATH"],
+                    "DOCKER_HOST": "", "PYTHONDONTWRITEBYTECODE": "1",
+                    "TIMEPAD_FIXTURE_CASE": str(case),
+                    "TIMEPAD_FIXTURE_ADAPTER_DIR": str(ROOT / "fixtures/timepad-controller"),
+                    "TIMEPAD_FIXTURE_DOCKER_LOG": str(case / "docker.log"),
+                    "TEST_VPS_STATE_ROOT": str(state_root),
+                })
+                if fault == "stop-fails":
+                    environment["TIMEPAD_FIXTURE_FAIL_AT"] = "stop:--time"
+                command = [
+                    "bash", str(case / "tools/deploy-test-vps-provider-release.sh"),
+                    "--root", str(case / "root"), "--base-compose", str(case / "compose.yml"),
+                    "--image", "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + "1" * 64,
+                    "--revision", "3" * 40, "--version", "1.2.3",
+                    "--run-key", "fixture-dispatch", "--mode", "deploy", "--operation", "forward-recover",
+                    "--recovery-run-key", original["runId"], "--recovery-incident", original["incidentId"],
+                    "--recovery-epoch", "1", "--recovery-binding-digest", original["evidenceDigest"],
+                    "--recovery-action", "retry-exact-candidate",
+                ]
+                attempts = []
+                for dispatch in range(1, 3):
+                    result = subprocess.run(
+                        command, env=environment, capture_output=True, text=True, timeout=130, check=False,
+                    )
+                    self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+                    _, after = state.read_guard(state_root)
+                    lease = state._read_execution_lease_locked(state_root)
+                    self.assertEqual(original["incidentId"], after["incidentId"])
+                    self.assertEqual(1, after["operationEpoch"])
+                    self.assertIsNone(after["ownedChild"])
+                    self.assertEqual(after["executionAttempt"], lease["attempt"])
+                    self.assertEqual("RECOVERY_RETRY_RUNTIME_FAILED", lease["firstFailure"])
+                    self.assertEqual(1, lease["firstStatus"])
+                    request = after["runtimeRequest"]
+                    self.assertEqual("stop", request["operation"])
+                    self.assertEqual(original["containerId"], request["containerId"])
+                    log = (case / "docker.log").read_text().splitlines()
+                    starts = [line for line in log if line.startswith("start-id:")]
+                    self.assertEqual(
+                        ["start-id:" + original["containerId"]] * (dispatch if fault == "none" else 1),
+                        starts,
+                    )
+                    if fault == "none":
+                        self.assertIn("test VPS deployment failed: RECOVERY_RETRY_RUNTIME_FAILED", result.stderr)
+                        self.assertEqual("schema_guard=RECOVERY_REQUIRED\n", result.stdout)
+                        self.assertEqual("VERIFYING", after["phase"])
+                        self.assertEqual("completed", request["lifecycle"])
+                        self.assertEqual(request["containerId"], request["responseId"])
+                        self.assertEqual(after["executionAttempt"], request["executionAttempt"])
+                        self.assertEqual(2 * dispatch + 1, request["sequence"])
+                        self.assertEqual(after["incidentId"] + f":{dispatch}", after["latestAttemptId"])
+                        self.assertEqual("drained", lease["lifecycle"])
+                        self.assertIsNone(lease["worker"])
+                        self.assertNotIn(lease["attempt"], attempts)
+                        attempts.append(lease["attempt"])
+                        runtime = json.loads((case / "runtime.json").read_bytes())
+                        self.assertFalse(runtime["State"]["Running"])
+                        self.assertEqual("no", runtime["HostConfig"]["RestartPolicy"]["Name"])
+                    else:
+                        self.assertEqual("schema_guard=QUIESCENCE_UNCONFIRMED\n", result.stdout)
+                        self.assertNotIn("RECOVERY_RETRY_RUNTIME_FAILED", result.stderr)
+                        self.assertEqual("intent", request["lifecycle"])
+                        self.assertIsNone(request["responseId"])
+                        self.assertIsNone(request["completionDigest"])
+                        snapshots = (
+                            (state_root / state.GUARD_DIR / "current.json").read_bytes(),
+                            (state_root / state.EXECUTION_LEASE_NAME).read_bytes(),
+                        )
+                        if dispatch == 1:
+                            before_reentry = snapshots
+                        else:
+                            self.assertEqual(before_reentry, snapshots)
+
+    def test_only_complete_stale_lease_and_daemon_proofs_release_exact_container_retry(self):
+        spec = importlib.util.spec_from_file_location(
+            "stale_recovery_fixture", ROOT / "fixtures/timepad-controller/recovery.py",
+        )
+        assert spec is not None and spec.loader is not None
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        fixture_root = pathlib.Path("/var/lib/timepad-fixture")
+        fixture_root.mkdir(mode=0o700, exist_ok=True)
+        for phase, fault in (
+            ("CUTOVER_POSSIBLE", "none"), ("ROLLING_BACK", "none"),
+            ("VERIFYING", "none"), ("COMMITTING", "none"),
+            ("RECOVERY_REQUIRED", "none"), ("FORWARD_RECOVERING", "none"),
+            ("CUTOVER_POSSIBLE", "acknowledged"),
+            ("CUTOVER_POSSIBLE", "live-worker"), ("CUTOVER_POSSIBLE", "live-supervisor"),
+            ("CUTOVER_POSSIBLE", "unbound"),
+            ("CUTOVER_POSSIBLE", "overflow"), ("CUTOVER_POSSIBLE", "intent"),
+            ("CUTOVER_POSSIBLE", "missing-request"), ("CUTOVER_POSSIBLE", "malformed"),
+            ("CUTOVER_POSSIBLE", "stale-epoch"), ("CUTOVER_POSSIBLE", "missing-config"),
+            ("CUTOVER_POSSIBLE", "foreign-inventory"),
+            ("CUTOVER_POSSIBLE", "partial-pair"),
+            ("VERIFYING", "wrong-marker"),
+        ):
+            with self.subTest(phase=phase, fault=fault), tempfile.TemporaryDirectory(
+                prefix="case-stale-", dir=fixture_root,
+            ) as temporary, ExitStack() as stack:
+                case = pathlib.Path(temporary) / "fixture"
+                with redirect_stdout(io.StringIO()):
+                    adapter.setup(case, phase, "intact")
+                state_root = case / "state"
+                _, current = state.read_guard(state_root)
+                old = execution_lease(attempt="8" * 32, revision=4, lifecycle="drained")
+                old.update(firstFailure="EXIT", firstStatus=1)
+                identities = []
+                for _ in range(2):
+                    process = subprocess.Popen(
+                        [sys.executable, "-B", "-c", "import sys; sys.stdin.buffer.read()"],
+                        stdin=subprocess.PIPE, start_new_session=True,
+                    )
+                    stack.callback(lambda process=process: process.poll() is not None or process.kill())
+                    identity = supervisor.lease_identity(supervisor.process_identity(process.pid))
+                    identities.append(identity)
+                    keep_live = fault == "live-worker" and len(identities) == 2 or \
+                        fault == "live-supervisor" and len(identities) == 1
+                    if not keep_live:
+                        process.communicate(timeout=5)
+                    else:
+                        stack.callback(process.communicate, timeout=5)
+                old["supervisor"] = identities[0]
+                old["workers"] = [{"mode": "controller-worker", **identities[1]}]
+                request = {
+                    "nonce": "9" * 32, "sequence": 1, "executionAttempt": old["attempt"],
+                    "operation": "stop", "containerId": current["containerId"],
+                    "imageId": current["target"]["tuple"]["platformImageId"],
+                    "configHash": current["configHash"], "childAttemptId": None,
+                    "lifecycle": "completed", "responseId": current["containerId"],
+                    "completionDigest": "a" * 64,
+                }
+                current.update(executionAttempt=old["attempt"], runtimeRequest=request)
+                if fault == "acknowledged":
+                    request.update(lifecycle="acknowledged", completionDigest=None)
+                elif fault == "intent":
+                    request.update(lifecycle="intent", responseId=None, completionDigest=None)
+                elif fault == "missing-request":
+                    current["runtimeRequest"] = None
+                elif fault == "unbound":
+                    old.update(lifecycle="armed", worker=identities[1])
+                elif fault == "overflow":
+                    old["firstFailure"] = "DESCENDANT_OVERFLOW"
+                elif fault == "partial-pair":
+                    current["executionAttempt"] = "7" * 32
+                current_path = state_root / state.GUARD_DIR / "current.json"
+                current_path.write_bytes(state._canonical(current))
+                lease_path = state_root / state.EXECUTION_LEASE_NAME
+                lease_path.write_bytes(b"{}" if fault == "malformed" else state._canonical(old))
+                lease_path.chmod(0o600)
+                if fault == "missing-config":
+                    (state_root / current["ownedRun"] / "config.env.target").unlink()
+                if fault == "foreign-inventory":
+                    runtime_path = case / "runtime.json"
+                    runtime = json.loads(runtime_path.read_bytes())
+                    runtime["Id"] = "e" * 64
+                    runtime_path.write_text(json.dumps(runtime))
+                if fault == "wrong-marker":
+                    marker_path = state_root / ".provider-transaction.current"
+                    marker = json.loads(marker_path.read_bytes())
+                    marker["phase"] = "applying"
+                    marker_path.write_text(json.dumps(marker))
+                bin_path = case / "bin"
+                bin_path.mkdir(mode=0o700)
+                for name in ("docker", "curl"):
+                    shutil.copy2(ROOT / "fixtures/timepad-controller" / name, bin_path / name)
+                environment = dict(os.environ, **{
+                    "PATH": str(bin_path) + ":" + os.environ["PATH"],
+                    "DOCKER_HOST": "", "PYTHONDONTWRITEBYTECODE": "1",
+                    "TIMEPAD_FIXTURE_CASE": str(case),
+                    "TIMEPAD_FIXTURE_ADAPTER_DIR": str(ROOT / "fixtures/timepad-controller"),
+                    "TIMEPAD_FIXTURE_DOCKER_LOG": str(case / "docker.log"),
+                    "TEST_VPS_STATE_ROOT": str(state_root),
+                })
+                before = (current_path.read_bytes(), lease_path.read_bytes())
+                result = subprocess.run([
+                    "bash", str(case / "tools/deploy-test-vps-provider-release.sh"),
+                    "--root", str(case / "root"), "--base-compose", str(case / "compose.yml"),
+                    "--image", "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + "1" * 64,
+                    "--revision", "3" * 40, "--version", "1.2.3",
+                    "--run-key", "fixture-dispatch", "--mode", "deploy",
+                    "--operation", "forward-recover", "--recovery-run-key", current["runId"],
+                    "--recovery-incident", current["incidentId"],
+                    "--recovery-epoch", "2" if fault == "stale-epoch" else "1",
+                    "--recovery-binding-digest", current["evidenceDigest"],
+                    "--recovery-action", "retry-exact-candidate",
+                ], env=environment, capture_output=True, text=True, timeout=130, check=False)
+                log_path = case / "docker.log"
+                log = log_path.read_text().splitlines() if log_path.exists() else []
+                starts = [line for line in log if line.startswith("start-id:")]
+                self.assertTrue(all(line == "start-id:" + current["containerId"] for line in starts))
+                self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+                if fault in {"none", "acknowledged"}:
+                    self.assertEqual(1, len(starts), result.stdout + result.stderr + repr(log))
+                    after = state._read_guard_locked(state_root)[1]
+                    self.assertEqual(current["incidentId"], after["incidentId"])
+                    self.assertEqual(1, after["operationEpoch"])
+                    self.assertNotEqual(old["attempt"], after["executionAttempt"])
+                    self.assertEqual(after["executionAttempt"], state._read_execution_lease_locked(state_root)["attempt"])
+                else:
+                    self.assertEqual([], starts)
+                    self.assertEqual(before, (current_path.read_bytes(), lease_path.read_bytes()))
+                    self.assertFalse(any(
+                        line.startswith(("start:", "stop:", "update:", "compose:up", "compose:create"))
+                        for line in log
+                    ))
 
 
 class TimepadStateTests(unittest.TestCase):

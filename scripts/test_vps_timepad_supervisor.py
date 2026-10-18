@@ -38,6 +38,10 @@ Worker contract (also exposed by WorkerClient):
   durable incident/terminal-result checks. Exit immediately. Success is not
   returned until kernel ECHILD and a final supervisor-owned durable drained
   revision with worker=null. A worker exit alone is never success.
+  A fail-closed worker acknowledges a proved stop with ``terminal 1`` and
+  exits zero to indicate cleanup completion; the operation retains its first
+  nonzero status. Only a fixed refusal code may cross the public relay, and
+  only after the final childless publication, never on unconfirmed cleanup.
 * ``cancel REASON STATUS`` revokes forward work. Traps never do rollback.
 
 Lease disk publication and semantic rollback/runtime admission belong to the
@@ -89,6 +93,7 @@ FAILURES = frozenset({
     "TERM", "INT", "HUP", "EXIT", "DRILL", "WAIT_EXPIRED", "WORK_EXHAUSTED",
     "HARD_DEADLINE", "TRANSPORT_LOST", "PROTOCOL_INVALID", "OWNERSHIP_UNCERTAIN",
     "DESCENDANT_OVERFLOW", "ROLLBACK_REFUSED", "ROLLBACK_FAILED",
+    "RECOVERY_RETRY_RUNTIME_FAILED",
 })
 NONCE = re.compile(r"^[a-f0-9]{32}$")
 DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -97,6 +102,7 @@ SUCCESS_OUTCOMES = {
     "already-initialized": ("deploy", "ready"),
     "already-completed": ("forward-recover", "committed"),
 }
+REFUSAL_OUTCOMES = {"RECOVERY_RETRY_RUNTIME_FAILED": "forward-recover"}
 
 
 class SupervisorError(Exception):
@@ -254,6 +260,11 @@ class Attempt:
         if not isinstance(reason, str) or reason not in FAILURES:
             reject()
         _integer(status, 1, 255)
+        if reason in REFUSAL_OUTCOMES and (
+            self.operation != REFUSAL_OUTCOMES[reason]
+            or self.role != "controller-worker" or status != 1
+        ):
+            reject()
         # Repeated signals do not revoke a separately issued rollback grant.
         if self.first_reason is not None:
             return
@@ -1033,7 +1044,11 @@ class Supervisor:
                 send_frame(self.relay, {
                     "kind": "result", "attempt": self.attempt.nonce,
                     "status": status, "reason": reason,
-                    "outcome": self.attempt.pending_outcome if reason == "COMPLETED" else None,
+                    "outcome": (
+                        self.attempt.pending_outcome if reason == "COMPLETED"
+                        else self.attempt.first_reason if reason == "RECOVERY_REQUIRED"
+                        and self.attempt.first_reason in REFUSAL_OUTCOMES else None
+                    ),
                 })
             except OSError:
                 self.relay_alive = False
@@ -1312,7 +1327,7 @@ def relay(root: str, operation: str, arguments: list[str]) -> int:
                     reject()
                 if status == 86 and frame["reason"] != "ROLLED_BACK":
                     reject()
-                if status == 0:
+                if frame["reason"] in {"COMPLETED", "ROLLED_BACK", "RECOVERY_REQUIRED"}:
                     # A subsequent replay must not race the retiring keeper's
                     # live identity or FD9. No blocking waitpid is used.
                     end = time.monotonic_ns() + 5 * NS
@@ -1322,7 +1337,7 @@ def relay(root: str, operation: str, arguments: list[str]) -> int:
                         reaped, child_status = os.waitpid(pid, os.WNOHANG)
                         if reaped:
                             supervisor_reaped = True
-                            if os.waitstatus_to_exitcode(child_status) != 0:
+                            if os.waitstatus_to_exitcode(child_status) != status:
                                 reject()
                             break
                         if time.monotonic_ns() >= end:
@@ -1330,6 +1345,13 @@ def relay(root: str, operation: str, arguments: list[str]) -> int:
                         time.sleep(0.01)
                 outcome = frame["outcome"]
                 if outcome is not None:
+                    if isinstance(outcome, str) and outcome in REFUSAL_OUTCOMES:
+                        if REFUSAL_OUTCOMES[outcome] != operation or status != 1 or \
+                                frame["reason"] != "RECOVERY_REQUIRED":
+                            reject()
+                        print("test VPS deployment failed: " + outcome, file=sys.stderr, flush=True)
+                        print("schema_guard=RECOVERY_REQUIRED", flush=True)
+                        return status
                     if not isinstance(outcome, str) or outcome not in SUCCESS_OUTCOMES or \
                             SUCCESS_OUTCOMES[outcome][0] != operation or \
                             status != 0 or frame["reason"] != "COMPLETED":
