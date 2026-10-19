@@ -534,7 +534,7 @@ class LeasePublicationAuthorityTests(unittest.TestCase):
             for phase in ("COMMITTING", "RECOVERY_REQUIRED"):
                 current["phase"] = phase
                 with self.subTest(phase=phase), self.assertRaisesRegex(
-                    state.GuardError, "EXECUTION_LEASE_UNRESOLVED",
+                    state.GuardError, "EXECUTION_LEASE_STOP_ONLY",
                 ):
                     state.check_execution_lease(
                         "/fixture", attempt=lease["attempt"], deploy_lock_fd=9,
@@ -542,7 +542,7 @@ class LeasePublicationAuthorityTests(unittest.TestCase):
                     )
             current["phase"] = "VERIFYING"
             lease["workerMode"] = "controller-worker"
-            with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+            with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_STOP_ONLY"):
                 state.check_execution_lease(
                     "/fixture", attempt=lease["attempt"], deploy_lock_fd=9,
                     purpose="cleanup-stop-proof",
