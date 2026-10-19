@@ -18,6 +18,24 @@ import time
 SOURCE = pathlib.Path(__file__).resolve().parents[2]
 
 
+def stage_tooling(tools: pathlib.Path) -> None:
+    for name in (
+        "deploy-test-vps-provider-release.sh", "production-compose.sh",
+        "update-production-release.sh", "test-vps-runtime-invariants.sh",
+        "test-vps-provider-credential.py", "test_vps_timepad_state.py",
+        "test_vps_timepad_supervisor.py", "test_vps_timepad_create.py",
+    ):
+        shutil.copy2(SOURCE / name, tools / name)
+
+
+def historical_lease(module, attempt, *, owner: dict, workers: list, worker=None) -> dict:
+    # These historical start/stop cases never executed a create request.
+    return module._execution_lease(dict(
+        attempt.lease(), supervisor=owner, worker=worker,
+        workerMode="controller-worker", workers=workers, createCompletion=None,
+    ))
+
+
 def load(name: str, path: pathlib.Path):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
@@ -108,13 +126,7 @@ def setup(
     root, state_root, tools = (case / name for name in ("root", "state", "tools"))
     for directory in (case, root, state_root, tools):
         directory.mkdir(mode=0o700)
-    for name in (
-        "deploy-test-vps-provider-release.sh", "production-compose.sh",
-        "update-production-release.sh", "test-vps-runtime-invariants.sh",
-        "test-vps-provider-credential.py", "test_vps_timepad_state.py",
-        "test_vps_timepad_supervisor.py",
-    ):
-        shutil.copy2(SOURCE / name, tools / name)
+    stage_tooling(tools)
     private(tools / "test-vps-timepad-release-contracts.json", json.dumps(contract).encode())
     provider = fixtures.helper
     with module.deploy_lock(state_root):
@@ -395,10 +407,9 @@ def setup_historical_request(
             attempt.revision, hashlib.sha256(module._canonical(attempt.lease())).hexdigest(),
         )
         attempt.prepare_terminal()
-        lease = module._execution_lease(dict(
-            attempt.lease(), supervisor=owner, worker=None,
-            workerMode="controller-worker", workers=[dict(mode="controller-worker", **worker)],
-        ))
+        lease = historical_lease(
+            module, attempt, owner=owner, workers=[dict(mode="controller-worker", **worker)],
+        )
         private(case / "state" / module.EXECUTION_LEASE_NAME, module._canonical(lease))
         private(case / "historical-before", module._canonical(current))
         # Setup exits before recovery; both actual recorded owners must be
@@ -671,12 +682,12 @@ def assert_missing_refusal(case: pathlib.Path) -> None:
             attempt = supervisor.Attempt("forward-recover", nonce="6" * 32)
             attempt.arm()
             worker = supervisor.lease_identity(supervisor.process_identity(os.getpid()))
-            candidate = module._execution_lease(dict(
-                attempt.lease(),
-                supervisor=supervisor.lease_identity(supervisor.process_identity(os.getppid())),
-                worker=worker, workerMode="controller-worker",
+            candidate = historical_lease(
+                module, attempt,
+                owner=supervisor.lease_identity(supervisor.process_identity(os.getppid())),
+                worker=worker,
                 workers=[dict(mode="controller-worker", **worker)],
-            ))
+            )
             reason = "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
             try:
                 # Unleased legacy recovery cannot adopt without a completed

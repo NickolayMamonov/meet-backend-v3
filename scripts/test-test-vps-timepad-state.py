@@ -3653,13 +3653,50 @@ class RecoveryCreateRegistrationTests(unittest.TestCase):
 
 
 class HistoricalRecoveryFixtureTests(unittest.TestCase):
-    def test_historical_binding_is_schema_validated_not_a_create_transition(self):
+    def setUp(self):
         spec = importlib.util.spec_from_file_location(
             "historical_recovery_fixture", ROOT / "fixtures/timepad-controller/recovery.py",
         )
         assert spec is not None and spec.loader is not None
-        adapter = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(adapter)
+        self.adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.adapter)
+
+    def test_staged_tooling_imports_without_source_tree_dependencies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.adapter.stage_tooling(pathlib.Path(temporary))
+            result = subprocess.run([
+                sys.executable, "-I", "-B", "-c",
+                "import pathlib, sys; sys.path.insert(0, sys.argv[1]); "
+                "import test_vps_timepad_supervisor, test_vps_timepad_create; "
+                "assert pathlib.Path(test_vps_timepad_create.__file__).parent == pathlib.Path(sys.argv[1])",
+                temporary,
+            ], capture_output=True, text=True, timeout=20, check=False)
+            self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_historical_non_create_lease_has_exact_persisted_schema(self):
+        attempt = supervisor.Attempt("deploy", nonce="8" * 32)
+        attempt.arm()
+        owner = execution_lease()["supervisor"]
+        workers = [dict(mode="controller-worker", **owner)]
+        armed = self.adapter.historical_lease(
+            state, attempt, owner=owner, worker=owner, workers=workers,
+        )
+        self.assertIsNone(armed["createCompletion"])
+        self.assertEqual("armed", armed["lifecycle"])
+        attempt.cancel("EXIT", 1)
+        attempt.acknowledge_lease(attempt.revision, digest("1"))
+        attempt.prepare_terminal()
+        drained = self.adapter.historical_lease(state, attempt, owner=owner, workers=workers)
+        self.assertEqual("drained", drained["lifecycle"])
+        self.assertIsNone(drained["worker"])
+        self.assertIsNone(drained["createCompletion"])
+        self.assertEqual(attempt.nonce, drained["attempt"])
+        self.assertEqual("EXIT", drained["firstFailure"])
+        with self.assertRaises(state.GuardError):
+            state._execution_lease({key: value for key, value in drained.items() if key != "createCompletion"})
+
+    def test_historical_binding_is_schema_validated_not_a_create_transition(self):
+        adapter = self.adapter
         prepared = prepared_state()
         before = state._canonical(prepared)
         current = adapter.historical_cutover_state(
