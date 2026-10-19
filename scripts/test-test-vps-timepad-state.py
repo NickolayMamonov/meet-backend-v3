@@ -3995,7 +3995,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         root, attempt=attempt, deploy_lock_fd=lock_fd,
                     )
                 except state.GuardError as blocked:
-                    self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason)
+                    self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.reason)
                 else:
                     _, current = state._read_guard_locked(root)
                     self.fail(json.dumps({
@@ -4008,7 +4008,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     }, sort_keys=True, separators=(",", ":")))
                 self.assertTrue(state._execution_process_exited(supervisor))
         except state.GuardError as busy:
-            self.assertEqual("DEPLOY_LOCK_BUSY", busy.exception.reason)
+            self.assertEqual("DEPLOY_LOCK_BUSY", busy.reason)
             self.assertFalse(state._execution_process_exited(supervisor))
         else:
             self.assertTrue(state._execution_process_exited(supervisor))
