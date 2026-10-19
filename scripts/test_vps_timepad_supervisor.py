@@ -359,6 +359,13 @@ class Attempt:
         self.revision += 1
         self.acked_revision = -1
         self.lease_digest = None
+        if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+            failure = self.first_reason if self.first_reason in FAILURES else "NONE"
+            print(
+                f"fixture_timepad_supervisor=attempt_transition lifecycle={lifecycle} "
+                f"failure={failure}",
+                file=sys.stderr, flush=True,
+            )
         if self.on_change is not None:
             self.on_change()
 
@@ -387,6 +394,12 @@ class Attempt:
         # Repeated signals do not revoke a separately issued rollback grant.
         if self.first_reason is not None:
             return
+        if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+            print(
+                f"fixture_timepad_supervisor=attempt_cancel reason={reason} "
+                f"status={status} lifecycle={self.lifecycle}",
+                file=sys.stderr, flush=True,
+            )
         self.first_reason, self.first_status = reason, status
         self.arm()
         self.grants.clear()
@@ -2161,6 +2174,11 @@ class Supervisor:
                 cancel_reason=(
                     frame["reason"] if kind == "cancel" and frame.get("reason") in FAILURES else "OTHER"
                 ),
+                existing_failure=(
+                    self.attempt.first_reason
+                    if self.attempt.first_reason in FAILURES else "NONE"
+                ),
+                lifecycle=self.attempt.lifecycle,
                 registration_pending=self.registration_ack is not None,
             )
             try:
