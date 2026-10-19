@@ -1108,6 +1108,19 @@ class Supervisor:
         if not self.pending_signals:
             self.pending_signals.append(number)
 
+    def _fixture_diagnostic(self, label: str, **fields: int | bool | str) -> None:
+        if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") != "1":
+            return
+        allowed = {
+            "registration_ack_children",
+            "registration_ack_reject",
+            "rpc_reject",
+        }
+        if label not in allowed:
+            reject("PROTOCOL_INVALID")
+        values = " ".join(f"{key}={value}" for key, value in sorted(fields.items()))
+        print(f"fixture_timepad_supervisor={label} {values}".rstrip(), file=sys.stderr, flush=True)
+
     def _lease(self) -> dict[str, Any]:
         return {
             **self.attempt.lease(), "supervisor": self.identity,
@@ -1215,6 +1228,14 @@ class Supervisor:
             reject("LEASE_ACK_INVALID")
         self.children.refresh()
         if any(pid != self.worker_pid for pid in self.children.tracked):
+            self._fixture_diagnostic(
+                "registration_ack_children",
+                extra_count=sum(pid != self.worker_pid for pid in self.children.tracked),
+                evidence_tracked=self.evidence_pid in self.children.tracked,
+                evidence_status_known=self.evidence_pid in self.children.statuses,
+                create_tracked=self.create_pid in self.children.tracked,
+                helper_tracked=self.create_helper_pid in self.children.tracked,
+            )
             reject("OWNERSHIP_UNCERTAIN")
         self.create_completion_evidence = snapshot["createCompletion"]
         self._record_lease()
@@ -2133,6 +2154,12 @@ class Supervisor:
             })
             self._notify_clock()
         except SupervisorError as error:
+            self._fixture_diagnostic(
+                "rpc_reject",
+                kind=kind if isinstance(kind, str) and kind in schemas else "unknown",
+                reason="OWNERSHIP_UNCERTAIN" if str(error) == "OWNERSHIP_UNCERTAIN" else "OTHER",
+                registration_pending=self.registration_ack is not None,
+            )
             try:
                 send_frame(reply, {
                     "ok": False, "attempt": self.attempt.nonce,
