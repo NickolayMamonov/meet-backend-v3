@@ -3849,6 +3849,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 bin_path.mkdir(mode=0o700)
                 for name in ("docker", "curl"):
                     shutil.copy2(ROOT / "fixtures/timepad-controller" / name, bin_path / name)
+                    (bin_path / name).chmod(0o700)
                 environment = dict(os.environ, **{
                     "PATH": str(bin_path) + ":" + os.environ["PATH"],
                     "DOCKER_HOST": "", "PYTHONDONTWRITEBYTECODE": "1",
@@ -4028,6 +4029,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 bin_path.mkdir(mode=0o700)
                 for name in ("docker", "curl"):
                     shutil.copy2(ROOT / "fixtures/timepad-controller" / name, bin_path / name)
+                    (bin_path / name).chmod(0o700)
                 environment = dict(os.environ, **{
                     "PATH": str(bin_path) + ":" + os.environ["PATH"],
                     "DOCKER_HOST": "", "PYTHONDONTWRITEBYTECODE": "1",
