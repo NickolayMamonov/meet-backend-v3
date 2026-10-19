@@ -892,8 +892,27 @@ def docker(case: pathlib.Path, arguments: list[str]) -> None:
     replacement = fault in {"replace", "create-fails", "create-intent"}
     exists = not replacement or (case / "created").exists()
     if op == "image" and arguments[1] == "inspect":
+        _, current = load(
+            "historical_image_state", SOURCE / "test_vps_timepad_state.py",
+        ).read_guard(case / "state")
+        target = current["target"]["tuple"]
+        if arguments[-1] != (
+            "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + target["repositoryDigest"]
+        ):
+            raise SystemExit(90)
+        image_labels = dict(labels)
+        image_labels.update({
+            "org.opencontainers.image.revision": target["revision"],
+            "org.opencontainers.image.version": target["version"],
+            "org.opencontainers.image.source": "https://github.com/NickolayMamonov/meet-backend-v3",
+        })
+        target_inspection = dict(observed, Id="sha256:" + target["platformImageId"])
+        target_inspection["Config"] = dict(observed["Config"], Labels=image_labels)
+        target_inspection["RepoDigests"] = [
+            "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + target["repositoryDigest"],
+        ]
         if "--format" not in arguments:
-            print(json.dumps([dict(observed, Id=image)]))
+            print(json.dumps([target_inspection]))
             return
     elif op == "ps":
         if fault == "unknown-inventory":
@@ -980,7 +999,7 @@ def docker(case: pathlib.Path, arguments: list[str]) -> None:
         raise SystemExit(90)
     form = arguments[arguments.index("--format") + 1]
     values = {
-        "{{.Id}}": image if op == "image" else observed["Id"],
+        "{{.Id}}": target_inspection["Id"] if op == "image" else observed["Id"],
         "{{.Image}}": image,
         "{{.Config.User}}": "10001:10001",
         "{{.State.Running}}": str(observed["State"]["Running"]).lower(),
@@ -990,7 +1009,7 @@ def docker(case: pathlib.Path, arguments: list[str]) -> None:
         # Deliberate real-verifier failure after the retry, not a fake verifier.
         "{{.HostConfig.ReadonlyRootfs}}": "false",
     }
-    for key, value in labels.items():
+    for key, value in (image_labels if op == "image" else labels).items():
         values['{{index .Config.Labels "' + key + '"}}'] = value
     if form not in values:
         raise SystemExit(90)
