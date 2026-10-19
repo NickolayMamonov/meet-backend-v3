@@ -365,6 +365,10 @@ def recover(case: Path, arguments: list[str]) -> int:
                 require(reaped, "historical terminal supervisor did not exit")
             private(case / ("recovery-relay-" + hello["attempt"] + ".json"), json.dumps({
                 "hello": hello, "result": frame, "reaped": reaped,
+                "transportEvents": (
+                    (case / "recovery-transport-events").read_text().splitlines()
+                    if (case / "recovery-transport-events").exists() else []
+                ),
             }, sort_keys=True).encode())
             outcome = frame["outcome"]
             require(outcome is None or (

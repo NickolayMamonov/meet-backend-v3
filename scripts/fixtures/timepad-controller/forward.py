@@ -118,6 +118,8 @@ class ForwardTransport:
     def identity(self, stage, context):
         import test_vps_timepad_create as create
 
+        if self.recovery_runtime is not None:
+            transport_event(self.case, "identity")
         no_socket()
         context.check_time()
         require(isinstance(stage, create.Stage), "unexpected tooling stage")
@@ -140,6 +142,8 @@ class ForwardTransport:
     def observe(self, context):
         import test_vps_timepad_create as create
 
+        if self.recovery_runtime is not None:
+            transport_event(self.case, "observe")
         no_socket()
         context.check_time()
         if self.recovery_runtime is not None:
@@ -196,6 +200,8 @@ class ForwardTransport:
     def spawn_create(self, context, control_fds):
         import test_vps_timepad_create as create
 
+        if self.recovery_runtime is not None:
+            transport_event(self.case, "spawn_create")
         no_socket()
         context.check_time()
         require(self.recovery_runtime is None, "historical recovery attempted create")
@@ -280,6 +286,14 @@ class ForwardTransport:
 def trace(case: Path, operation: str) -> None:
     with (case / "forward-effects").open("ab") as stream:
         require(stream.tell() < 65536, "fixture effect trace exceeded bound")
+        stream.write(operation.encode("ascii") + b"\n")
+
+
+def transport_event(case: Path, operation: str) -> None:
+    """Bounded fixture-only trace for constructor-injected recovery evidence."""
+    path = case / "recovery-transport-events"
+    with path.open("ab") as stream:
+        require(stream.tell() < 4096, "fixture transport trace exceeded bound")
         stream.write(operation.encode("ascii") + b"\n")
 
 

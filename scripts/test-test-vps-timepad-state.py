@@ -3723,6 +3723,16 @@ class HistoricalRecoveryFixtureTests(unittest.TestCase):
                           ".spawn =", ".waitpid =", ".publish_current", "_atomic_write"):
             self.assertNotIn(forbidden, source)
 
+    def test_historical_fixture_failure_cannot_pass_as_controller_refusal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run([
+                sys.executable, "-B", str(ROOT / "fixtures/timepad-controller/recovery.py"),
+                "run-controller", temporary,
+            ], capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertEqual("FIXTURE_RECOVERY_CHANNEL_FAILED\n", result.stderr)
+
     def test_historical_non_create_lease_has_exact_persisted_schema(self):
         attempt = supervisor.Attempt("deploy", nonce="8" * 32)
         attempt.arm()
@@ -3866,7 +3876,14 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     result = subprocess.run(
                         command, env=environment, capture_output=True, text=True, timeout=130, check=False,
                     )
-                    self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+                    transport_trace = (
+                        (case / "recovery-transport-events").read_text()
+                        if (case / "recovery-transport-events").exists() else "<no transport calls>"
+                    )
+                    self.assertEqual(
+                        1, result.returncode,
+                        result.stdout + result.stderr + "\ntransport=" + transport_trace,
+                    )
                     if fault == "none":
                         _, after = state.read_guard(state_root)
                     else:
@@ -4034,7 +4051,14 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 log = log_path.read_text().splitlines() if log_path.exists() else []
                 starts = [line for line in log if line.startswith("start-id:")]
                 self.assertTrue(all(line == "start-id:" + current["containerId"] for line in starts))
-                self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+                transport_trace = (
+                    (case / "recovery-transport-events").read_text()
+                    if (case / "recovery-transport-events").exists() else "<no transport calls>"
+                )
+                self.assertEqual(
+                    1, result.returncode,
+                    result.stdout + result.stderr + "\ntransport=" + transport_trace,
+                )
                 if fault in {"none", "acknowledged"}:
                     after = state._read_guard_locked(state_root)[1]
                     lease_after = state._read_execution_lease_locked(state_root)
