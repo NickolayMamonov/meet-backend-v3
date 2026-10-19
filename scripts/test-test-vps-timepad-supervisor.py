@@ -2162,7 +2162,7 @@ class LinuxSupervisorTests(unittest.TestCase):
 
                 result, _ = self.run_fixture(
                     behavior, directory=directory, operation="forward-recover",
-                    timing=supervisor.Timing(), timeout=25,
+                    timing=supervisor.Timing(), timeout=25, expect_keeper=fault != "none",
                 )
                 self.assertEqual(1, result["status"])
                 self.assertEqual("RECOVERY_REQUIRED" if fault == "none" else "QUIESCENCE_UNCONFIRMED", result["reason"])
@@ -2209,7 +2209,7 @@ class LinuxSupervisorTests(unittest.TestCase):
 
     def run_fixture(
         self, behavior, *, operation="deploy", timing=None, timeout=15, disconnect=False,
-        directory=None, observe=None,
+        directory=None, observe=None, expect_keeper=False,
     ):
         with tempfile.TemporaryDirectory() if directory is None else nullcontext(directory) as directory:
             os.chmod(directory, 0o700)
@@ -2265,6 +2265,19 @@ class LinuxSupervisorTests(unittest.TestCase):
                             frames.append(frame)
                             if frame.get("kind") == "result":
                                 result = frame
+                                if expect_keeper:
+                                    self.assertEqual("QUIESCENCE_UNCONFIRMED", result["reason"])
+                                    self.assertEqual((0, 0), os.waitpid(pid, os.WNOHANG))
+                                    identity = supervisor.process_identity(pid)
+                                    self.assertIsNotNone(identity)
+                                    self.assertEqual(
+                                        hello["supervisor"], supervisor.lease_identity(identity),
+                                    )
+                                    with self.assertRaisesRegex(
+                                        state.GuardError, "DEPLOY_LOCK_BUSY",
+                                    ), state.deploy_lock(directory):
+                                        pass
+                                    return result, frames
                         except (BlockingIOError, supervisor.SupervisorError):
                             pass
                     time.sleep(0.01)
