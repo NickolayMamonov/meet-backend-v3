@@ -4036,6 +4036,12 @@ class StaleRecoveryControllerTests(unittest.TestCase):
         except state.GuardError as busy:
             self.assertEqual("DEPLOY_LOCK_BUSY", busy.reason)
             self.assertFalse(state._execution_process_exited(supervisor))
+            evidence = self.timeout_evidence(root)
+            owner = evidence["ownership"].get("supervisor", {})
+            self.assertTrue(
+                owner.get("present") is True and owner.get("pipeCount") == 0,
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+            )
         else:
             assert_owner_quiescent()
 

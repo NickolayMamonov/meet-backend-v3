@@ -312,10 +312,10 @@ def recover(case: Path, arguments: list[str]) -> int:
             os.setsid()
             supervisor._close_except({child.fileno()})
             # Refused attempts can retain FD9 after the relay has returned.
-            # The passive keeper must not retain caller output, but the
-            # controller's fixed sanitized fixture diagnostics are preserved.
+            # Match the production relay: a passive keeper must not retain
+            # any caller output pipe.
             null = os.open("/dev/null", os.O_RDWR)
-            for fd in (0, 1):
+            for fd in (0, 1, 2):
                 os.dup2(null, fd)
             if null > 2:
                 os.close(null)
