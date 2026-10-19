@@ -77,6 +77,13 @@ def require_isolated(case: pathlib.Path) -> None:
         raise SystemExit("fixture fixed-path isolation is unproved")
 
 
+def historical_cutover_state(module, prepared: dict, *, container_id: str, config_hash: str) -> dict:
+    """Historical recovery input, not evidence of PREPARED → create execution."""
+    return module._current(dict(
+        prepared, phase="CUTOVER_POSSIBLE", containerId=container_id, configHash=config_hash,
+    ))
+
+
 def setup(
     case: pathlib.Path, phase: str, fault: str, *,
     compatible: bool = True, request_proof: bool = False,
@@ -137,13 +144,26 @@ def setup(
         owned_run=template["ownedRun"], tooling_digest=template["toolingDigest"],
         prepared_proof_digest=template["preparedProofDigest"],
     )
-    module.publish_current(state_root, current)
-    if phase != "PREPARED":
-        current = module.advance_state(
-            current, "CUTOVER_POSSIBLE", containerId=template["containerId"],
-            configHash=template["configHash"],
-        )
+    if phase == "PREPARED":
         module.publish_current(state_root, current)
+    else:
+        current = historical_cutover_state(
+            module, current, container_id=template["containerId"], config_hash=template["configHash"],
+        )
+        # Import a schema-validated historical snapshot for recovery tests.
+        # This is not a transition, a create completion, or a worker grant.
+        # Fresh PREPARED → create tests must use the actual controller path.
+        with module.deploy_lock(state_root):
+            guard_fd = os.open(
+                state_root / module.GUARD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                module._atomic_write(
+                    guard_fd, "current.json", module._canonical(current),
+                    module.MAX_CURRENT_BYTES, replace=True,
+                )
+            finally:
+                os.close(guard_fd)
         if phase != "CUTOVER_POSSIBLE":
             current = module.advance_state(current, "VERIFYING" if phase == "COMMITTING" else phase)
             module.publish_current(state_root, current)

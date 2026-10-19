@@ -1073,6 +1073,7 @@ if [ "$fault" = none ]; then [ "$status" -eq 0 ]; else [ "$status" -ne 0 ]; fi
         source = (ROOT / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
         self.assertEqual(1, len(re.findall(r"^timeout\(\) \{", source, re.M)))
         local_timeout = "" if os.name == "nt" else r"""
+supervisor_enabled=false
 recovery_t0_ns=
 if timeout 5s bash -c 'exit 23'; then exit 90; else [ "$?" -eq 23 ]; fi
 """
@@ -1087,6 +1088,21 @@ timeout --kill-after=5s 30s fixture-command
             ["--kill-after=5s", "30s", "fixture-command"], result.stdout.splitlines(),
         )
         self.assertIn('command timeout "${options[@]}" "$local_duration" "$@"', controller_function("timeout"))
+
+    def test_local_timeout_dispatch_preserves_options_and_status(self) -> None:
+        result = self.run_shell(controller_function("timeout") + r"""
+private_create_stage=
+supervisor_enabled=false
+recovery_t0_ns=
+supervisor_timeout() { return 99; }
+command() { printf '%s\n' "$@"; return 23; }
+if timeout --kill-after=5s 30s fixture-command; then exit 90; else [ "$?" -eq 23 ]; fi
+""")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            ["timeout", "--kill-after=5s", "30s", "fixture-command"],
+            result.stdout.splitlines(),
+        )
 
     def test_private_create_stage_reuses_original_context_and_authenticated_grant(self) -> None:
         # The shell stage was removed by §5e. These source contracts complement
@@ -3634,6 +3650,44 @@ class RecoveryCreateRegistrationTests(unittest.TestCase):
         self.assertEqual(self.successor, json.loads(written[state.EXECUTION_LEASE_NAME]))
         self.assertEqual(self.adopted, json.loads(written["current.json"]))
         self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+
+
+class HistoricalRecoveryFixtureTests(unittest.TestCase):
+    def test_historical_binding_is_schema_validated_not_a_create_transition(self):
+        spec = importlib.util.spec_from_file_location(
+            "historical_recovery_fixture", ROOT / "fixtures/timepad-controller/recovery.py",
+        )
+        assert spec is not None and spec.loader is not None
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        prepared = prepared_state()
+        before = state._canonical(prepared)
+        current = adapter.historical_cutover_state(
+            state, prepared, container_id=digest("1"), config_hash=digest("2"),
+        )
+        self.assertEqual(before, state._canonical(prepared))
+        self.assertEqual("CUTOVER_POSSIBLE", current["phase"])
+        self.assertEqual(digest("1"), current["containerId"])
+        self.assertEqual(digest("2"), current["configHash"])
+        self.assertIsNone(current["runtimeRequest"])
+        self.assertIsNone(current["executionAttempt"])
+        self.assertIsNone(current["ownedChild"])
+        with self.assertRaises(state.GuardError) as error:
+            state.validate_state_transition(prepared, current)
+        self.assertEqual("RUNTIME_REQUEST_BINDING_CONFLICT", error.exception.reason)
+        for changes in (
+            {"container_id": "invalid", "config_hash": digest("2")},
+            {"container_id": digest("1"), "config_hash": "invalid"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(state.GuardError):
+                adapter.historical_cutover_state(state, prepared, **changes)
+        for phase in (
+            "ROLLING_BACK", "VERIFYING", "RECOVERY_REQUIRED", "FORWARD_RECOVERING",
+        ):
+            with self.subTest(phase=phase):
+                successor = state.advance_state(current, phase)
+                self.assertEqual(phase, successor["phase"])
+                self.assertIsNone(successor["runtimeRequest"])
 
 
 @unittest.skipUnless(
