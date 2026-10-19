@@ -42,9 +42,11 @@ CLI mutation schemas:
   Only then may it adopt current followed by the new registered lease under
   uninterrupted FD9. A partial publication fails closed and needs separate
   reconciliation; it is not a crash-atomic two-file transaction.
-* ``rollback-admission`` checks the private fixed worker/grant and frozen state
-  without writes. Its ``state-admitted`` result is not daemon/provider/config
-  proof and cannot release a rollback or predecessor start by itself.
+* ``rollback-admission`` checks the private fixed worker/grant, frozen state
+  and owned snapshot/runtime/provider reconstruction without writes. Its
+  bounded proof is not a mutation capability. The dedicated rollback worker
+  must transition its lease and independently reconstruct again under the
+  current state-publish grant before ``claim-rollback`` can publish.
 * ``prepare --evidence`` accepts exactly ``rootId``, ``targetId``,
   ``predecessorId``, ``predecessorContainerId``, ``transitionId``, ``target``, ``predecessor``,
   ``operation``, ``runId``, ``incidentId``, ``ownedRun`` and ``toolingDigest``.
@@ -102,6 +104,8 @@ MAX_ORIGIN_BYTES = 4 * 1024
 MAX_CURRENT_BYTES = 16 * 1024
 MAX_CHANGES_BYTES = 4 * 1024
 MAX_EXECUTION_LEASE_BYTES = 4 * 1024
+MAX_CREATE_COMPLETION_BYTES = 4 * 1024
+CREATE_COMPLETION_SCHEMA = "meet-backend/test-vps-timepad-create-completion/v1"
 MAX_RECOVERY_RUNTIME_BYTES = 8 * 1024 * 1024 + 32768
 MAX_JSON_DEPTH = 8
 MAX_IMAGES = 8
@@ -222,6 +226,12 @@ class ExecutionGrant:
 _EXECUTION_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
     "timepad_execution_check", default=None,
 )
+_CREATE_COMPLETION_PUBLICATION: ContextVar[bool] = ContextVar(
+    "timepad_create_completion_publication", default=False,
+)
+_RECOVERY_CREATE_COMPLETION_PROOF: ContextVar[bool] = ContextVar(
+    "timepad_recovery_create_completion_proof", default=False,
+)
 
 
 def _execution_check() -> None:
@@ -234,12 +244,12 @@ def _execution_check() -> None:
 def _execution_mutation(
     root: str | os.PathLike[str], deploy_lock_fd: int | None,
     grant: ExecutionGrant | None,
-    *, cleanup_only: bool = False,
+    *, cleanup_only: bool = False, create_completion_only: bool = False,
 ) -> Iterator[None]:
     """Validate the live capability, not only the last durable lease snapshot."""
     lease = _read_execution_lease_locked(root)
     if lease is None:
-        if grant is not None:
+        if grant is not None or create_completion_only:
             _reject("EXECUTION_GRANT_INVALID")
         yield
         return
@@ -255,7 +265,12 @@ def _execution_mutation(
     end = lease["hardEndNs"] if cleanup else lease["workEndNs"]
     if end is None or grant.end_ns > end:
         _reject("EXECUTION_GRANT_INVALID")
-    expected_name = "cleanup-publish" if cleanup else "state-publish"
+    expected_name = ("create-completion" if create_completion_only
+                     else "cleanup-publish" if cleanup else "state-publish")
+    if create_completion_only and (
+        role != "controller-worker" or os.getppid() != lease["supervisor"]["pid"]
+    ):
+        _reject("EXECUTION_GRANT_INVALID")
     if (
         cleanup and lease["lifecycle"] != "draining"
         or role == "controller-worker" and (
@@ -310,7 +325,7 @@ def _execution_lease(value: Any) -> dict[str, Any]:
     fields = {
         "format", "attempt", "operation", "t0Ns", "workEndNs", "hardEndNs",
         "firstFailure", "firstStatus", "rollbackIssued", "lifecycle", "revision",
-        "supervisor", "worker", "workerMode", "workers",
+        "supervisor", "worker", "workerMode", "workers", "createCompletion",
     }
     lease = _object(value, fields)
     if type(lease["format"]) is not int or lease["format"] != 1:
@@ -366,6 +381,13 @@ def _execution_lease(value: Any) -> dict[str, Any]:
         identity({key: worker[key] for key in ("pid", "startTicks", "bootId")})
     if lease["rollbackIssued"] and lease["operation"] == "retention":
         _reject("EXECUTION_LEASE_INVALID")
+    if lease["createCompletion"] is not None:
+        completion = _create_completion_evidence(lease["createCompletion"])
+        if lease["operation"] == "retention" or (
+            completion["executionAttempt"] != lease["attempt"]
+            and not (lease["operation"] == "forward-recover" and completion["acknowledged"])
+        ):
+            _reject("EXECUTION_LEASE_INVALID")
     return lease
 
 
@@ -426,13 +448,41 @@ def _binding(value: Any) -> dict[str, Any]:
     return obj
 
 
+def _tooling(value: Any) -> dict[str, Any]:
+    obj = _object(value, {
+        "dockerCliVersion", "composeVersion", "composeCommit", "dockerCliPath",
+        "composePluginPath", "dockerCliSha256", "composePluginSha256", "platform", "provenanceRef",
+    })
+    for item in obj.values():
+        _text(item, maximum=512)
+    if (obj["dockerCliVersion"], obj["composeVersion"], obj["composeCommit"]) != (
+        "28.3.3", "2.39.4", "a32dc3da722e6b2e4fbfc72e40b1a697c4686460",
+    ) or obj["platform"] not in {"linux/amd64", "linux/arm64"}:
+        _reject("CONTRACT_UNSUPPORTED")
+    for key, basename in (("dockerCliPath", "docker"), ("composePluginPath", "docker-compose")):
+        path = obj[key]
+        if re.fullmatch(r"/[A-Za-z0-9._/-]+", path) is None or \
+                any(part in {"", ".", ".."} for part in path.split("/")[1:]) or \
+                path.rsplit("/", 1)[-1] != basename:
+            _reject()
+    for key in ("dockerCliSha256", "composePluginSha256"):
+        _digest(obj[key])
+    return obj
+
+
 def parse_contract(data: bytes | Mapping[str, Any]) -> dict[str, Any]:
     value = parse_json(data, MAX_CONTRACT_BYTES) if isinstance(data, bytes) else data
     obj = _object(
         value,
         {"schema", "formatVersion", "controller", "active", "rootId",
          "initialDomain", "transitions", "images"},
+        exact=False,
     )
+    if obj.keys() - {"schema", "formatVersion", "controller", "active", "rootId",
+                     "initialDomain", "transitions", "images", "tooling"}:
+        _reject()
+    if "tooling" in obj:
+        _tooling(obj["tooling"])
     if obj["schema"] != CONTRACT_SCHEMA or type(obj["formatVersion"]) is not int or obj["formatVersion"] != 1:
         _reject("CONTRACT_UNSUPPORTED")
     if obj["controller"] != CONTROLLER:
@@ -641,22 +691,80 @@ def _owned_child(value: Any) -> dict[str, Any]:
     return child
 
 
+CREATE_REQUEST_FIELDS = frozenset({
+    "originDigest", "operationEpoch", "incidentId", "operationToken",
+    "preparedProofDigest", "modelDigest", "toolingDigest", "role",
+    "priorContainerId", "childIdentity", "resourcesDigest", "resourceRequestDigest",
+})
+
+
 def runtime_request(value: Any) -> dict[str, Any]:
     """One bounded correlated daemon request, not a process-liveness assertion."""
-    row = _object(value, {
+    create = isinstance(value, dict) and value.get("operation") == "create"
+    predecessor = isinstance(value, dict) and value.get("role") == "predecessor"
+    fields = {
         "nonce", "sequence", "executionAttempt", "operation", "containerId",
         "imageId", "configHash", "childAttemptId", "lifecycle", "responseId",
         "completionDigest",
-    })
+    }
+    predecessor_fields = {
+        "role", "originDigest", "incidentId", "operationEpoch",
+        "preparedProofDigest", "evidenceDigest",
+    }
+    row = _object(value, fields | CREATE_REQUEST_FIELDS if create else
+                  fields | predecessor_fields if predecessor else fields)
     _text(row["nonce"], pattern=LEASE_NONCE, maximum=32)
     if _uint(row["sequence"]) == 0:
         _reject("RUNTIME_REQUEST_INVALID")
     _text(row["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
+    _digest(row["imageId"])
+    if predecessor:
+        if row["operation"] not in {"suppress", "stop"} or row["childAttemptId"] is not None:
+            _reject("RUNTIME_REQUEST_INVALID")
+        for key in ("originDigest", "preparedProofDigest", "evidenceDigest"):
+            _digest(row[key])
+        _text(row["incidentId"], pattern=LEASE_NONCE, maximum=32)
+        if _uint(row["operationEpoch"]) == 0:
+            _reject("RUNTIME_REQUEST_INVALID")
+    if create:
+        for key in ("originDigest", "preparedProofDigest", "modelDigest", "toolingDigest",
+                    "resourcesDigest", "resourceRequestDigest"):
+            _digest(row[key])
+        if _uint(row["operationEpoch"]) == 0:
+            _reject("RUNTIME_REQUEST_INVALID")
+        for key in ("incidentId", "operationToken"):
+            _text(row[key], pattern=LEASE_NONCE, maximum=32)
+        _child_attempt_sequence(row["childAttemptId"], row["incidentId"])
+        child = _object(row["childIdentity"], CHILD_IDENTITY_FIELDS)
+        _owned_child(dict(child, lifecycle="waiting"))
+        if child["attemptId"] != row["childAttemptId"]:
+            _reject("RUNTIME_REQUEST_CHILD_CONFLICT")
+        if row["role"] not in ("initial", "replacement"):
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["priorContainerId"] is not None:
+            _digest(row["priorContainerId"])
+        if (row["role"] == "initial") != (row["priorContainerId"] is None):
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["lifecycle"] not in ("intent", "normal-completed", "bound"):
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["lifecycle"] == "bound":
+            _digest(row["containerId"])
+            _digest(row["configHash"])
+            if row["responseId"] != row["containerId"] or \
+                    row["containerId"] == row["priorContainerId"]:
+                _reject("RUNTIME_REQUEST_INVALID")
+        elif any(row[key] is not None for key in ("containerId", "configHash", "responseId")):
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["lifecycle"] == "intent":
+            if row["completionDigest"] is not None:
+                _reject("RUNTIME_REQUEST_INVALID")
+        else:
+            _digest(row["completionDigest"])
+        return row
     if not isinstance(row["operation"], str) or \
             row["operation"] not in {"start", "stop", "suppress", "restore-policy"}:
         _reject("RUNTIME_REQUEST_INVALID")
     _digest(row["containerId"])
-    _digest(row["imageId"])
     _digest(row["configHash"])
     if row["childAttemptId"] is not None:
         _child_attempt_sequence(row["childAttemptId"])
@@ -680,9 +788,205 @@ def runtime_request(value: Any) -> dict[str, Any]:
 
 def require_runtime_request_completion(current: Mapping[str, Any]) -> dict[str, Any]:
     request = current.get("runtimeRequest")
-    if request is None or runtime_request(request)["lifecycle"] != "completed":
+    if request is None:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    request = runtime_request(request)
+    if request["operation"] == "create":
+        if request["lifecycle"] == "bound" or (
+            request["lifecycle"] == "normal-completed"
+            and _RECOVERY_CREATE_COMPLETION_PROOF.get()
+        ):
+            return request
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    if request["lifecycle"] != "completed":
         _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
     return request
+
+
+def require_create_normal_completion(current: Mapping[str, Any]) -> dict[str, Any]:
+    """Read-only binding is allowed only after durable normal completion, never intent."""
+    request = current.get("runtimeRequest")
+    if request is None:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    request = runtime_request(request)
+    if request["operation"] != "create" or request["lifecycle"] not in {"normal-completed", "bound"}:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    return request
+
+
+def _require_matching_create_child(current: Mapping[str, Any]) -> dict[str, Any]:
+    request = current.get("runtimeRequest")
+    child = current.get("ownedChild")
+    if request is None or child is None:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    request = runtime_request(request)
+    child = _owned_child(child)
+    if (
+        request["operation"] != "create"
+        or request["childAttemptId"] != child["attemptId"]
+        or child["lifecycle"] not in {"waiting", "released", "reaped"}
+        or any(child[key] != request["childIdentity"][key] for key in CHILD_IDENTITY_FIELDS)
+    ):
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    return child
+
+
+def create_request_digest(value: Mapping[str, Any]) -> str:
+    request = runtime_request(dict(value))
+    if request["operation"] != "create":
+        _reject("RUNTIME_REQUEST_INVALID")
+    intent = dict(request, lifecycle="intent", containerId=None, configHash=None,
+                  responseId=None, completionDigest=None)
+    return hashlib.sha256(_canonical(intent)).hexdigest()
+
+
+def _create_completion_evidence(value: Any) -> dict[str, Any]:
+    evidence = _object(value, {
+        "requestDigest", "receiptDigest", "executionAttempt", "childIdentity",
+        "waitStatus", "uncancelled", "descendantsDrained", "acknowledged",
+        "resourcesDigest", "resourceRequestDigest",
+    })
+    for key in ("requestDigest", "receiptDigest", "resourcesDigest", "resourceRequestDigest"):
+        _digest(evidence[key])
+    _text(evidence["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
+    _object(evidence["childIdentity"], CHILD_IDENTITY_FIELDS)
+    _owned_child(dict(evidence["childIdentity"], lifecycle="waiting"))
+    if type(evidence["waitStatus"]) is not int or evidence["waitStatus"] != 0 or \
+            evidence["uncancelled"] is not True or evidence["descendantsDrained"] is not True:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    _bool(evidence["acknowledged"])
+    return evidence
+
+
+def validate_create_completion(
+    current: Mapping[str, Any], lease: Mapping[str, Any], receipt: bytes,
+    *, acknowledged: bool,
+) -> None:
+    """Receipt fragments and inspection never repair a missing durable lease acknowledgment."""
+    request = require_create_normal_completion(current)
+    evidence = _create_completion_evidence(lease.get("createCompletion"))
+    expected = {
+        "schema": CREATE_COMPLETION_SCHEMA, "requestDigest": create_request_digest(request),
+        "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+        "resourcesDigest": request["resourcesDigest"],
+        "resourceRequestDigest": request["resourceRequestDigest"],
+        "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+    }
+    if (
+        parse_json(receipt, MAX_CREATE_COMPLETION_BYTES) != expected
+        or receipt != _canonical(expected)
+        or hashlib.sha256(receipt).hexdigest() != request["completionDigest"]
+        or evidence != {
+            **{key: value for key, value in expected.items() if key != "schema"},
+            "receiptDigest": request["completionDigest"], "acknowledged": acknowledged,
+        }
+        or lease["attempt"] != request["executionAttempt"] and not (
+            lease["operation"] == "forward-recover" and acknowledged
+            and evidence["executionAttempt"] == request["executionAttempt"]
+        )
+        or any(
+            evidence["childIdentity"][key] != request["childIdentity"][key]
+            for key in CHILD_IDENTITY_FIELDS
+        )
+    ):
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+
+
+def _require_create_completion_locked(
+    root: str | os.PathLike[str], current: Mapping[str, Any], *, acknowledged: bool,
+) -> None:
+    request = require_create_normal_completion(current)
+    lease = _read_execution_lease_locked(root)
+    if lease is None:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    root_fd = _open_root(root)
+    try:
+        run_fd = os.open(
+            _text(current["ownedRun"], pattern=ROOT_KEY),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd,
+        )
+        try:
+            info = os.fstat(run_fd)
+            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                _reject("STATE_PATH_UNSAFE")
+            _require_no_acl(run_fd, directory=True)
+            name = ("timepad-create-completion.json" if request["role"] == "initial"
+                    else "timepad-replacement-completion.json")
+            receipt = _read_at(run_fd, name, MAX_CREATE_COMPLETION_BYTES)
+            validate_create_completion(current, lease, receipt, acknowledged=acknowledged)
+        finally:
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
+
+
+def publish_create_completion(
+    root: str | os.PathLike[str], *, request_digest: str, supervisor_wait_evidence: bytes,
+    deploy_lock_fd: int, execution_grant: ExecutionGrant,
+) -> dict[str, Any]:
+    """Supervisor-only publication; every crash gap stays unacknowledged, never repaired."""
+    _digest(request_digest)
+    with deploy_lock(root, deploy_lock_fd), _execution_mutation(
+        root, deploy_lock_fd, execution_grant, create_completion_only=True,
+    ):
+        _, current = _read_guard_locked(root)
+        request = current["runtimeRequest"]
+        if (
+            request is None or request["operation"] != "create" or request["lifecycle"] != "intent"
+            or current["executionAttempt"] != execution_grant.attempt
+            or create_request_digest(request) != request_digest
+        ):
+            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+        _require_matching_create_child(current)
+        receipt = supervisor_wait_evidence
+        digest = hashlib.sha256(receipt).hexdigest()
+        lease = _read_execution_lease_locked(root)
+        if lease is None:
+            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+        token = _CREATE_COMPLETION_PUBLICATION.set(True)
+        try:
+            candidate = advance_state(
+                current, current["phase"], ownedChild=None, runtimeRequest=dict(
+                    request, lifecycle="normal-completed", completionDigest=digest,
+                ),
+            )
+            validate_create_completion(candidate, lease, receipt, acknowledged=False)
+            root_fd = _open_root(root)
+            try:
+                run_fd = os.open(
+                    current["ownedRun"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+                try:
+                    info = os.fstat(run_fd)
+                    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                        _reject("STATE_PATH_UNSAFE")
+                    _require_no_acl(run_fd, directory=True)
+                    name = ("timepad-create-completion.json" if request["role"] == "initial"
+                            else "timepad-replacement-completion.json")
+                    # Existing fragments, even identical bytes, are not permission
+                    # to repeat a completion that never received its acknowledgment.
+                    try:
+                        os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+                    _atomic_write(run_fd, name, receipt, MAX_CREATE_COMPLETION_BYTES, replace=False)
+                    if _read_at(run_fd, name, MAX_CREATE_COMPLETION_BYTES) != receipt:
+                        _reject("STATE_READBACK_FAILED")
+                finally:
+                    os.close(run_fd)
+            finally:
+                os.close(root_fd)
+            _publish_current_locked(root, candidate)
+            if _read_guard_locked(root)[1] != candidate:
+                _reject("STATE_READBACK_FAILED")
+            _require_create_completion_locked(root, candidate, acknowledged=False)
+            _execution_check()
+            return {"receiptDigest": digest, "sequence": request["sequence"]}
+        finally:
+            _CREATE_COMPLETION_PUBLICATION.reset(token)
 
 
 def cleanup_request_admission(current: Mapping[str, Any], lease: Mapping[str, Any]) -> None:
@@ -709,16 +1013,53 @@ def _validate_runtime_request_transition(previous: Mapping[str, Any], candidate:
     if old == new:
         return
     if new is None or previous["phase"] != candidate["phase"] or \
-            candidate["phase"] in TERMINAL | {"READY", "PREPARED"}:
+            candidate["phase"] in TERMINAL | {"READY"}:
         _reject("RUNTIME_REQUEST_CONFLICT")
     if old is None or new["nonce"] != old["nonce"]:
-        if old is not None and old["lifecycle"] != "completed":
+        if old is not None:
+            require_runtime_request_completion(previous)
+        if old is not None and old["lifecycle"] not in {"completed", "bound"}:
             _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
         if new["sequence"] != (old["sequence"] + 1 if old else 1) or \
                 new["lifecycle"] != "intent" or \
                 new["executionAttempt"] != candidate["executionAttempt"]:
             _reject("RUNTIME_REQUEST_CONFLICT")
         child = candidate["ownedChild"]
+        if new.get("role") == "predecessor":
+            if candidate["phase"] != "PREPARED" or child is not None or (
+                new["operation"] == "suppress" and old is not None
+                or new["operation"] == "stop" and (
+                    old is None or old.get("role") != "predecessor"
+                    or old["operation"] != "suppress" or old["lifecycle"] != "completed"
+                    or old["configHash"] != new["configHash"]
+                )
+            ):
+                _reject("RUNTIME_REQUEST_CONFLICT")
+            return
+        if candidate["phase"] == "PREPARED":
+            _reject("RUNTIME_REQUEST_CONFLICT")
+        if new["operation"] == "create":
+            if (
+                child is None or child["lifecycle"] != "waiting"
+                or new["childIdentity"] != {key: child[key] for key in CHILD_IDENTITY_FIELDS}
+                or new["role"] == "initial" and (
+                    candidate["phase"] != "CUTOVER_POSSIBLE"
+                    or candidate["containerId"] is not None or candidate["configHash"] is not None
+                )
+                or new["role"] == "replacement" and (
+                    candidate["phase"] not in {"COMMITTING", "FORWARD_RECOVERING"}
+                    or candidate["commitSubstep"] != "replacement-create-intent"
+                    or new["priorContainerId"] != candidate["containerId"]
+                )
+                or old is not None and old["operation"] == "create" and (
+                    old["role"] != "initial" or new["role"] != "replacement"
+                    or any(old[key] != new[key] for key in (
+                        "operationToken", "modelDigest", "toolingDigest", "preparedProofDigest",
+                    ))
+                )
+            ):
+                _reject("RUNTIME_REQUEST_CHILD_CONFLICT")
+            return
         if new["childAttemptId"] is not None and (
             child is None or child["attemptId"] != new["childAttemptId"]
             or child["lifecycle"] != "waiting" or new["operation"] != "start"
@@ -728,6 +1069,26 @@ def _validate_runtime_request_transition(previous: Mapping[str, Any], candidate:
                 new["configHash"] != candidate["configHash"] or \
                 new["imageId"] != candidate["target"]["tuple"]["platformImageId"]:
             _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        return
+    if old.keys() != new.keys() or old["operation"] != new["operation"]:
+        _reject("RUNTIME_REQUEST_CONFLICT")
+    if old["operation"] == "create":
+        mutable = {"lifecycle", "containerId", "configHash", "responseId", "completionDigest"}
+        if any(old[key] != new[key] for key in old if key not in mutable):
+            _reject("RUNTIME_REQUEST_CONFLICT")
+        if (old["lifecycle"], new["lifecycle"]) not in {
+            ("intent", "normal-completed"), ("normal-completed", "bound"),
+        }:
+            _reject("RUNTIME_REQUEST_REPLAY")
+        if candidate["ownedChild"] is not None:
+            _reject("RUNTIME_REQUEST_CHILD_CONFLICT")
+        if old["lifecycle"] == "intent":
+            if not _CREATE_COMPLETION_PUBLICATION.get():
+                _reject("CREATE_COMPLETION_SUPERVISOR_REQUIRED")
+            _require_matching_create_child(previous)
+        if old["lifecycle"] == "normal-completed":
+            if old["completionDigest"] != new["completionDigest"]:
+                _reject("RUNTIME_REQUEST_CONFLICT")
         return
     mutable = {"lifecycle", "responseId", "completionDigest"}
     if any(old[key] != new[key] for key in old if key not in mutable):
@@ -792,17 +1153,54 @@ def _current(value: Any) -> dict[str, Any]:
         _reject("STATE_PREPARED_RUNTIME_CONFLICT")
     if obj["executionAttempt"] is not None:
         _text(obj["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
+    if obj["target"] is not None:
+        _binding(obj["target"])
+    if obj["predecessor"] is not None:
+        _binding(obj["predecessor"])
     if obj["runtimeRequest"] is not None:
         request = runtime_request(obj["runtimeRequest"])
-        if obj["phase"] in {"READY", "PREPARED"} or obj["target"] is None or \
-                request["imageId"] != obj["target"]["tuple"]["platformImageId"] or \
-                request["configHash"] != obj["configHash"] or \
-                request["containerId"] != obj["containerId"]:
+        create = request["operation"] == "create"
+        predecessor = request.get("role") == "predecessor"
+        binding = obj["predecessor"] if predecessor else obj["target"]
+        if obj["phase"] == "READY" or obj["phase"] == "PREPARED" and not predecessor or \
+                binding is None or request["imageId"] != binding["tuple"]["platformImageId"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if predecessor and (
+            obj["phase"] not in {
+                "PREPARED", "CUTOVER_POSSIBLE", "RECOVERY_REQUIRED", "ROLLING_BACK", "ROLLED_BACK",
+            }
+            or request["containerId"] != obj["predecessorContainerId"]
+            or request["executionAttempt"] != obj["executionAttempt"]
+            or any(request[key] != obj[key] for key in (
+                "originDigest", "incidentId", "operationEpoch", "preparedProofDigest", "evidenceDigest",
+            ))
+            or obj["phase"] == "CUTOVER_POSSIBLE" and (
+                request["operation"] != "stop" or request["lifecycle"] != "completed"
+            )
+            or obj["phase"] == "ROLLED_BACK" and request["lifecycle"] != "completed"
+        ):
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if create and any(request[key] != obj[key] for key in (
+            "originDigest", "operationEpoch", "incidentId", "preparedProofDigest", "toolingDigest",
+        )):
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if create and request["lifecycle"] == "bound" and \
+                request["containerId"] == obj["predecessorContainerId"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if predecessor:
+            pass  # The independent provider proof binds the captured predecessor config hash.
+        elif not create or request["lifecycle"] == "bound":
+            if request["configHash"] != obj["configHash"] or request["containerId"] != obj["containerId"]:
+                _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        elif request["role"] == "initial":
+            if obj["containerId"] is not None or obj["configHash"] is not None:
+                _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        elif request["priorContainerId"] != obj["containerId"]:
             _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
         if request["childAttemptId"] is not None:
             _child_attempt_sequence(request["childAttemptId"], obj["incidentId"])
-        if obj["phase"] in TERMINAL and request["lifecycle"] != "completed":
-            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+        if obj["phase"] in TERMINAL:
+            require_runtime_request_completion(obj)
     for key in (
         "evidenceDigest", "toolingDigest", "configHash", "commitWitnessDigest",
         "providerFinalizationDigest", "terminalReceipt", "preparedProofDigest",
@@ -828,8 +1226,14 @@ def _current(value: Any) -> dict[str, Any]:
         child = _owned_child(obj["ownedChild"])
         if child["attemptId"] != obj["latestAttemptId"]:
             _reject("STATE_CHILD_ATTEMPT_CONFLICT")
+        replacement_child = (
+            obj["phase"] == "COMMITTING" and obj["commitSubstep"] == "replacement-create-intent"
+            and obj["runtimeRequest"] is not None and obj["runtimeRequest"]["operation"] == "create"
+            and obj["runtimeRequest"]["childAttemptId"] == child["attemptId"]
+        )
         if obj["phase"] in TERMINAL | {"READY", "PREPARED"} or (
             child["lifecycle"] != "reaped" and obj["phase"] not in CHILD_ACTIVE_PHASES
+            and not replacement_child
         ):
             _reject("STATE_CHILD_PHASE")
     if epoch == 0:
@@ -995,6 +1399,10 @@ def validate_state_transition(old: Mapping[str, Any], new: Mapping[str, Any]) ->
             candidate["executionAttempt"] != previous["executionAttempt"]:
         _reject("STATE_EXECUTION_ATTEMPT_CONFLICT")
     if candidate["phase"] == previous["phase"]:
+        if previous["phase"] == "PREPARED" and any(
+            candidate[key] != previous[key] for key in previous if key != "runtimeRequest"
+        ):
+            _reject("STATE_PREPARED_RUNTIME_CONFLICT")
         if previous["phase"] in {"READY", *TERMINAL}:
             if candidate != previous:
                 _reject("STATE_TERMINAL_CONFLICT")
@@ -1016,6 +1424,19 @@ def validate_state_transition(old: Mapping[str, Any], new: Mapping[str, Any]) ->
         _reject("COMMIT_ALREADY_BEGUN")
     if any(previous[field] != candidate[field] for field in INCIDENT_BINDING_FIELDS):
         _reject("STATE_INCIDENT_CONFLICT")
+    request = previous["runtimeRequest"]
+    if request is not None and request["operation"] == "create" and request["lifecycle"] != "bound":
+        if candidate["phase"] not in {previous["phase"], "RECOVERY_REQUIRED"}:
+            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    binding_changed = any(previous[key] != candidate[key] for key in ("containerId", "configHash"))
+    if binding_changed:
+        bound = candidate["runtimeRequest"]
+        if (
+            request is None or request["operation"] != "create"
+            or request["lifecycle"] != "normal-completed"
+            or bound is None or bound["operation"] != "create" or bound["lifecycle"] != "bound"
+        ):
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
     if previous["rollbackIssued"] and not candidate["rollbackIssued"]:
         _reject("STATE_ROLLBACK_LATCH_CONFLICT")
     if not previous["rollbackIssued"] and candidate["rollbackIssued"] and (
@@ -1076,7 +1497,12 @@ def validate_state_transition(old: Mapping[str, Any], new: Mapping[str, Any]) ->
         _reject("STATE_REPLACEMENT_INTENT_CONFLICT")
     if old_substep == "replacement-create-intent" and \
             new_substep == "replacement-container-authorized" and \
-            candidate["containerId"] == previous["containerId"]:
+            (
+                candidate["containerId"] == previous["containerId"]
+                or request is None or request["operation"] != "create"
+                or request["role"] != "replacement" or request["lifecycle"] != "normal-completed"
+                or candidate["runtimeRequest"]["lifecycle"] != "bound"
+            ):
         _reject("STATE_CONTAINER_CONFLICT")
     if new_substep in replacement_steps and candidate["phase"] not in {
         "COMMITTING", "FORWARD_RECOVERING", "RECOVERY_REQUIRED", "COMMITTED",
@@ -1102,7 +1528,13 @@ def validate_state_transition(old: Mapping[str, Any], new: Mapping[str, Any]) ->
 def _validate_child_transition(previous: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
     old_child, new_child = previous["ownedChild"], candidate["ownedChild"]
     if old_child is None and new_child is not None:
-        if candidate["phase"] not in CHILD_ACTIVE_PHASES or \
+        replacement_create = (
+            candidate["phase"] == "COMMITTING"
+            and candidate["commitSubstep"] == "replacement-create-intent"
+            and candidate["runtimeRequest"] is not None
+            and candidate["runtimeRequest"]["operation"] == "create"
+        )
+        if candidate["phase"] not in CHILD_ACTIVE_PHASES and not replacement_create or \
                 candidate["phase"] != previous["phase"]:
             _reject("STATE_CHILD_PHASE")
         if new_child["lifecycle"] != "waiting":
@@ -1123,7 +1555,16 @@ def _validate_child_transition(previous: Mapping[str, Any], candidate: Mapping[s
     if old_child is None:
         return
     if new_child is None:
-        if old_child["lifecycle"] != "reaped":
+        request = previous["runtimeRequest"]
+        create_completion = (
+            request is not None and request["operation"] == "create"
+            and request["lifecycle"] == "intent"
+        )
+        if create_completion:
+            if not _CREATE_COMPLETION_PUBLICATION.get():
+                _reject("CREATE_COMPLETION_SUPERVISOR_REQUIRED")
+            _require_matching_create_child(previous)
+        elif old_child["lifecycle"] != "reaped":
             _reject("STATE_CHILD_NOT_REAPED")
         return
     if any(old_child[field] != new_child[field] for field in CHILD_IDENTITY_FIELDS):
@@ -1136,7 +1577,14 @@ def _validate_child_transition(previous: Mapping[str, Any], candidate: Mapping[s
     if new_child["lifecycle"] not in edges[old_child["lifecycle"]]:
         _reject("STATE_CHILD_LIFECYCLE")
     if old_child["lifecycle"] == "waiting" and new_child["lifecycle"] == "released":
-        if previous["phase"] != candidate["phase"] or candidate["phase"] not in CHILD_ACTIVE_PHASES:
+        replacement_create = (
+            candidate["phase"] == "COMMITTING"
+            and candidate["commitSubstep"] == "replacement-create-intent"
+            and candidate["runtimeRequest"] is not None
+            and candidate["runtimeRequest"]["operation"] == "create"
+        )
+        if previous["phase"] != candidate["phase"] or \
+                candidate["phase"] not in CHILD_ACTIVE_PHASES and not replacement_create:
             _reject("STATE_CHILD_PHASE")
 
 
@@ -1645,7 +2093,6 @@ def _validate_recovery_lease_successor(
         or new["workers"] != [{"mode": "controller-worker", **new["worker"]}]
         or state["phase"] not in RECOVERABLE_PHASES - {"PREPARED"}
         or state["executionAttempt"] != old["attempt"]
-        or state["commitSubstep"] == "replacement-create-intent"
     ):
         _reject("EXECUTION_LEASE_UNRESOLVED")
     for identity in (old["supervisor"], *old["workers"]):
@@ -1659,6 +2106,26 @@ def _validate_recovery_lease_successor(
     request = require_runtime_request_completion(state)
     if request["executionAttempt"] != old["attempt"]:
         _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+    if state["commitSubstep"] == "replacement-create-intent" and not (
+        request["operation"] == "create" and request["role"] == "replacement"
+        and request["lifecycle"] == "normal-completed"
+    ):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if request["operation"] == "create" and request["lifecycle"] in {
+        "normal-completed", "bound",
+    }:
+        completion = _create_completion_evidence(old["createCompletion"])
+        if (
+            not completion["acknowledged"]
+            or completion != new["createCompletion"]
+            or completion["requestDigest"] != create_request_digest(request)
+            or completion["receiptDigest"] != request["completionDigest"]
+            or completion["executionAttempt"] != request["executionAttempt"]
+            or completion["childIdentity"] != request["childIdentity"]
+            or completion["resourcesDigest"] != request["resourcesDigest"]
+            or completion["resourceRequestDigest"] != request["resourceRequestDigest"]
+        ):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
     if state["ownedChild"] is not None:
         child = state["ownedChild"]
         if child["lifecycle"] not in {"released", "reaped"} or \
@@ -1704,6 +2171,16 @@ def _validate_lease_successor(previous: Mapping[str, Any], candidate: Mapping[st
     old_workers, new_workers = previous["workers"], candidate["workers"]
     if new_workers[:len(old_workers)] != old_workers:
         _reject("EXECUTION_LEASE_WORKER_CONFLICT")
+    old_completion, new_completion = previous["createCompletion"], candidate["createCompletion"]
+    if old_completion is not None and old_completion != new_completion:
+        if new_completion is None or (
+            old_completion["requestDigest"] == new_completion["requestDigest"]
+            and (old_completion["acknowledged"] or not new_completion["acknowledged"]
+                 or any(old_completion[key] != new_completion[key] for key in old_completion
+                        if key != "acknowledged"))
+        ) or old_completion["requestDigest"] != new_completion["requestDigest"] and \
+                not old_completion["acknowledged"]:
+            _reject("EXECUTION_LEASE_COMPLETION_CONFLICT")
 
 
 def _publish_execution_lease_locked(
@@ -1902,27 +2379,51 @@ def _reconcile_recovery_lease_locked(
     if runtime_evidence is None or len(runtime_evidence) > MAX_RECOVERY_RUNTIME_BYTES:
         _reject("EXECUTION_LEASE_UNRESOLVED")
     request = current["runtimeRequest"]
-    if request is None or request["lifecycle"] not in {"completed", "acknowledged"}:
+    create_completion_recovery = (
+        request is not None and request["operation"] == "create"
+        and request["lifecycle"] in {"normal-completed", "bound"}
+    )
+    if request is None or (
+        request["lifecycle"] not in {"completed", "acknowledged"}
+        and not create_completion_recovery
+    ):
         _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    if create_completion_recovery:
+        if candidate["createCompletion"] is not None:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if _read_execution_lease_locked(root) != previous:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        _require_create_completion_locked(root, current, acknowledged=True)
     path = Path(__file__).with_name("test-vps-provider-credential.py")
     spec = importlib.util.spec_from_file_location("_timepad_recovery_provider", path)
     if spec is None or spec.loader is None:
         _reject("EXECUTION_LEASE_UNRESOLVED")
     provider = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(provider)
+    recovery_token = _RECOVERY_CREATE_COMPLETION_PROOF.set(create_completion_recovery)
     try:
         request = provider._recovery_lease_runtime_proof(
             str(root), dict(current), authorization, runtime_evidence, deploy_lock_fd, check,
+            create_completion_recovery=create_completion_recovery,
+        )
+        if create_completion_recovery and request != current["runtimeRequest"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        proven = dict(current, runtimeRequest=request)
+        adopted_candidate = dict(
+            candidate,
+            createCompletion=previous["createCompletion"] if create_completion_recovery else None,
+        )
+        _validate_recovery_lease_successor(previous, adopted_candidate, proven)
+        adopted = _current(dict(proven, executionAttempt=adopted_candidate["attempt"]))
+        # Only this proof-first path may replace execution ownership. Hold that
+        # field constant while checking every other transition invariant.
+        validate_state_transition(
+            dict(current, executionAttempt=adopted_candidate["attempt"]), adopted,
         )
     except provider.ProviderError:
         _reject("RECOVERY_PROVIDER_LIVE_PROOF_REQUIRED")
-    proven = dict(current, runtimeRequest=request)
-    _validate_recovery_lease_successor(previous, candidate, proven)
-    adopted = _current(dict(proven, executionAttempt=candidate["attempt"]))
-    # The only executionAttempt replacement is this explicit authorized path.
-    # Validate the rest of the transition with that independently proved field
-    # held constant; generic advance/publish still prohibit ownership changes.
-    validate_state_transition(dict(current, executionAttempt=candidate["attempt"]), adopted)
+    finally:
+        _RECOVERY_CREATE_COMPLETION_PROOF.reset(recovery_token)
     check()
     if _read_execution_lease_locked(root) != previous or _read_guard_locked(root)[1] != current:
         _reject("EXECUTION_LEASE_UNRESOLVED")
@@ -1937,13 +2438,13 @@ def _reconcile_recovery_lease_locked(
         finally:
             os.close(guard_fd)
         check()
-        raw = _canonical(candidate)
+        raw = _canonical(adopted_candidate)
         _atomic_write(root_fd, EXECUTION_LEASE_NAME, raw, MAX_EXECUTION_LEASE_BYTES, replace=True)
         if _read_at(root_fd, EXECUTION_LEASE_NAME, MAX_EXECUTION_LEASE_BYTES) != raw:
             _reject("EXECUTION_LEASE_UNRESOLVED")
         check()
         return {
-            "attempt": candidate["attempt"], "revision": candidate["revision"],
+            "attempt": adopted_candidate["attempt"], "revision": adopted_candidate["revision"],
             "digest": hashlib.sha256(raw).hexdigest(),
         }
     except OSError:
@@ -1952,12 +2453,65 @@ def _reconcile_recovery_lease_locked(
         os.close(root_fd)
 
 
+def _read_recovery_registration_snapshot(
+    root: str | os.PathLike[str], expected: Mapping[str, Any], digest: str,
+    baseline: Mapping[str, Any], *, deploy_lock_fd: int,
+) -> dict[str, Any]:
+    """Read-only handoff from durable registration, never caller proof fragments."""
+    _digest(digest)
+    expected = _execution_lease(dict(expected))
+    baseline = _object(dict(baseline), {"lease", "currentDigest"})
+    if (
+        expected["operation"] != "forward-recover" or expected["revision"] != 0
+        or expected["lifecycle"] != "registered" or expected["createCompletion"] is not None
+    ):
+        _reject("RECOVERY_REGISTRATION_REFUSED")
+    with deploy_lock(root, deploy_lock_fd):
+        snapshot = _read_execution_lease_locked(root)
+        if snapshot is None or hashlib.sha256(_canonical(snapshot)).hexdigest() != digest or any(
+            snapshot[key] != expected[key] for key in expected if key != "createCompletion"
+        ):
+            _reject("EXECUTION_LEASE_SNAPSHOT_CONFLICT")
+        _, current = _read_guard_locked(root)
+        request = current["runtimeRequest"]
+        create_recovery = (
+            current["phase"] not in TERMINAL | {"READY"}
+            and request is not None and request["operation"] == "create"
+            and request["lifecycle"] in {"normal-completed", "bound"}
+        )
+        if create_recovery:
+            previous = _execution_lease(baseline["lease"])
+            prior_current = dict(current, executionAttempt=previous["attempt"])
+            if (
+                current["executionAttempt"] != snapshot["attempt"]
+                or baseline["currentDigest"] != hashlib.sha256(_canonical(prior_current)).hexdigest()
+            ):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            _require_create_completion_locked(root, current, acknowledged=True)
+            token = _RECOVERY_CREATE_COMPLETION_PROOF.set(True)
+            try:
+                _validate_recovery_lease_successor(previous, snapshot, prior_current)
+            finally:
+                _RECOVERY_CREATE_COMPLETION_PROOF.reset(token)
+        elif snapshot["createCompletion"] is not None:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if _read_execution_lease_locked(root) != snapshot or _read_guard_locked(root)[1] != current:
+            _reject("EXECUTION_LEASE_SNAPSHOT_CONFLICT")
+        return snapshot
+
+
 def rollback_state_admission(current: Mapping[str, Any], lease: Mapping[str, Any]) -> None:
     """Pure state half of admission; never attests daemon/config/provider quiescence."""
+    _rollback_state_admission(current, lease, "rollback-admission")
+
+
+def _rollback_state_admission(
+    current: Mapping[str, Any], lease: Mapping[str, Any], lifecycle: str,
+) -> None:
     state = _current(dict(current))
     if (
         lease["operation"] != "deploy" or lease["workerMode"] != "rollback-worker"
-        or lease["lifecycle"] != "rollback-admission" or not lease["rollbackIssued"]
+        or lease["lifecycle"] != lifecycle or not lease["rollbackIssued"]
         or state["executionAttempt"] != lease["attempt"] or state["rollbackIssued"]
         or state["phase"] not in {"PREPARED", "CUTOVER_POSSIBLE", "VERIFYING"}
         or state["ownedChild"] is not None or state["commitWitnessDigest"] is not None
@@ -1965,6 +2519,52 @@ def rollback_state_admission(current: Mapping[str, Any], lease: Mapping[str, Any
         or state["phase"] != "PREPARED" and state["predecessorDisposition"] != "post-barrier-compatible"
     ):
         _reject("ROLLBACK_NOT_ADMITTED")
+    if state["runtimeRequest"] is not None:
+        require_runtime_request_completion(state)
+
+
+def rollback_runtime_admission(
+    root: str | os.PathLike[str], current: Mapping[str, Any], lease: Mapping[str, Any],
+    grant: ExecutionGrant, check: Callable[[], None], *, claim: bool = False,
+) -> dict[str, Any]:
+    """Bind fixed provider reconstruction to the original private worker capability."""
+    _rollback_state_admission(current, lease, "rolling-back" if claim else "rollback-admission")
+    check()
+    path = Path(__file__).with_name("test-vps-provider-credential.py")
+    spec = importlib.util.spec_from_file_location("_timepad_rollback_provider", path)
+    if spec is None or spec.loader is None:
+        _reject("ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED")
+    provider = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(provider)
+    try:
+        with provider._operation_deadline(grant.end_ns):
+            evidence = provider._bounded_stdin(MAX_RECOVERY_RUNTIME_BYTES)
+            admitted = None
+            if claim:
+                envelope = parse_json(evidence, MAX_RECOVERY_RUNTIME_BYTES)
+                envelope = _object(envelope, {"admission", "runtime"})
+                admitted = envelope["admission"]
+                if not isinstance(admitted, dict):
+                    _reject("ROLLBACK_NOT_ADMITTED")
+                evidence = _canonical(envelope["runtime"])
+            proof = provider._rollback_runtime_proof(
+                str(root), dict(current), dict(lease), evidence, check, claim=claim,
+            )
+            if claim:
+                # Admission is not a bearer token: independently reconstruct
+                # under the current authenticated state-publish capability.
+                previous = dict(proof, leaseRevision=lease["revision"] - 1)
+                previous.pop("proofDigest")
+                previous["proofDigest"] = hashlib.sha256(_canonical(previous)).hexdigest()
+                if admitted != previous:
+                    _reject("ROLLBACK_NOT_ADMITTED")
+    except provider.ProviderError:
+        _reject("ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED")
+    check()
+    if _read_execution_lease_locked(root) != lease or _read_guard_locked(root)[1] != current:
+        _reject("ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED")
+    check()
+    return proof
 
 
 def adopt_recovery_state(
@@ -2182,6 +2782,16 @@ def _publish_current_locked(root: str | os.PathLike[str], state: Mapping[str, An
                     _reject("EXECUTION_LEASE_UNRESOLVED")
                 _validate_execution_state_write(lease, old, validated, time.monotonic_ns())
             validate_state_transition(old, validated)
+            request = validated["runtimeRequest"]
+            if request is not None and request["operation"] == "create":
+                previous_request = old["runtimeRequest"]
+                if request["lifecycle"] == "normal-completed" and \
+                        previous_request["lifecycle"] == "intent":
+                    if not _CREATE_COMPLETION_PUBLICATION.get():
+                        _reject("CREATE_COMPLETION_SUPERVISOR_REQUIRED")
+                    _require_create_completion_locked(root, validated, acknowledged=False)
+                elif request["lifecycle"] == "bound":
+                    _require_create_completion_locked(root, validated, acknowledged=True)
             old_child, new_child = old["ownedChild"], validated["ownedChild"]
             if old_child is not None and (
                 new_child is None
@@ -2194,6 +2804,10 @@ def _publish_current_locked(root: str | os.PathLike[str], state: Mapping[str, An
             _atomic_write(guard_fd, "current.json", raw, MAX_CURRENT_BYTES, replace=True)
             if _read_at(guard_fd, "current.json", MAX_CURRENT_BYTES) != raw:
                 _reject("STATE_READBACK_FAILED")
+            if request is not None and request["operation"] == "create" and \
+                    request["lifecycle"] == "normal-completed" and \
+                    old["runtimeRequest"]["lifecycle"] == "intent":
+                _require_create_completion_locked(root, validated, acknowledged=False)
             return validated
         finally:
             os.close(guard_fd)
@@ -2524,6 +3138,10 @@ def _cli() -> argparse.ArgumentParser:
     lease_check.add_argument("--root", required=True)
     lease_check.add_argument("--attempt")
     lease_check.add_argument("--deploy-lock-fd", type=int, required=True)
+    complete_create = sub.add_parser("publish-create-completion")
+    complete_create.add_argument("--root", required=True)
+    complete_create.add_argument("--request-digest", required=True)
+    complete_create.add_argument("--deploy-lock-fd", type=int, required=True)
     prepare = sub.add_parser("prepare")
     prepare.add_argument("--root", required=True)
     prepare.add_argument("--contract", required=True)
@@ -2531,7 +3149,7 @@ def _cli() -> argparse.ArgumentParser:
     prepare.add_argument("--deploy-lock-fd", type=int)
     advance = sub.add_parser("advance")
     advance.add_argument("--root", required=True)
-    advance.add_argument("--phase", required=True, choices=sorted(PHASES - {"READY", "PREPARED"}))
+    advance.add_argument("--phase", required=True, choices=sorted(PHASES - {"READY"}))
     advance.add_argument("--changes", required=True)
     advance.add_argument("--deploy-lock-fd", type=int)
     claim_rollback = sub.add_parser("claim-rollback")
@@ -2561,7 +3179,7 @@ def _cli() -> argparse.ArgumentParser:
     stop_child.add_argument("--deploy-lock-fd", type=int, required=True)
     stop_child.add_argument("--term-grace-seconds", type=float, default=5.0)
     for mutation in (bootstrap, publish, prepare, advance, claim_rollback, unresolved, stop_child,
-                     registration, rollback_admission, adoption):
+                     registration, rollback_admission, adoption, complete_create):
         mutation.add_argument("--execution-attempt")
         mutation.add_argument("--execution-grant")
         mutation.add_argument("--deadline-ns", type=int)
@@ -2690,11 +3308,20 @@ def main(argv: list[str] | None = None) -> int:
                         _reject("ROLLBACK_NOT_ADMITTED")
                     _, current = _read_guard_locked(args.root)
                     rollback_state_admission(current, lease)
+                    def check_rollback() -> None:
+                        if client.request("validate-grant", grantId=execution_grant.grant_id,
+                                          endNs=execution_grant.end_ns) != expected or \
+                                time.monotonic_ns() >= execution_grant.end_ns:
+                            _reject("ROLLBACK_NOT_ADMITTED")
+
+                    proof = rollback_runtime_admission(
+                        args.root, current, lease, execution_grant, check_rollback,
+                    )
                     if client.request("validate-grant", grantId=execution_grant.grant_id,
                                       endNs=execution_grant.end_ns) != expected or \
                             time.monotonic_ns() >= execution_grant.end_ns:
                         _reject("ROLLBACK_NOT_ADMITTED")
-                    result = {"result": "state-admitted", "epoch": current["operationEpoch"]}
+                    result = proof
                 except SupervisorError:
                     _reject("EXECUTION_GRANT_REVOKED")
                 finally:
@@ -2718,6 +3345,14 @@ def main(argv: list[str] | None = None) -> int:
             lease = _read_input(args.lease, MAX_EXECUTION_LEASE_BYTES)
             result = publish_execution_lease(
                 args.root, lease, deploy_lock_fd=args.deploy_lock_fd,
+            )
+        elif args.command == "publish-create-completion":
+            if execution_grant is None:
+                _reject("EXECUTION_GRANT_REQUIRED")
+            result = publish_create_completion(
+                args.root, request_digest=args.request_digest,
+                supervisor_wait_evidence=sys.stdin.buffer.read(MAX_CREATE_COMPLETION_BYTES + 1),
+                deploy_lock_fd=args.deploy_lock_fd, execution_grant=execution_grant,
             )
         elif args.command == "check-lease":
             result = check_execution_lease(
@@ -2792,6 +3427,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             if not isinstance(changes, dict) or not changes.keys() <= allowed_changes:
                 _reject("STATE_CHANGE_UNSUPPORTED")
+            if args.phase == "PREPARED" and set(changes) != {"runtimeRequest"}:
+                _reject("STATE_CHANGE_UNSUPPORTED")
             with deploy_lock(args.root, args.deploy_lock_fd):
                 lease = _read_execution_lease_locked(args.root)
                 cleanup = lease is not None and lease["workerMode"] == "fail-closed-worker" and \
@@ -2814,6 +3451,11 @@ def main(argv: list[str] | None = None) -> int:
                     _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):
                 _require_execution_lease_descriptor(args.root, args.deploy_lock_fd)
                 _, current = _read_guard_locked(args.root)
+                lease = _read_execution_lease_locked(args.root)
+                if lease is not None and lease["workerMode"] == "rollback-worker":
+                    rollback_runtime_admission(
+                        args.root, current, lease, execution_grant, _execution_check, claim=True,
+                    )
                 disposition = current["predecessorDisposition"]
                 if (
                     current["rollbackIssued"]

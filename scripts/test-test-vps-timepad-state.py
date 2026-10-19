@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import argparse
+import ast
 from contextlib import ExitStack, nullcontext, redirect_stdout
 import hashlib
 import io
@@ -93,6 +94,74 @@ def owned_child(*, sequence: int = 1, lifecycle: str = "waiting", pid: int = 101
     }
 
 
+def create_request(current: dict, child: dict, *, replacement: bool = False) -> dict:
+    old = current["runtimeRequest"]
+    return {
+        "nonce": "9" * 32 if old is None else "8" * 32,
+        "sequence": old["sequence"] + 1 if old else 1,
+        "executionAttempt": current["executionAttempt"], "operation": "create",
+        "containerId": None, "imageId": current["target"]["tuple"]["platformImageId"],
+        "configHash": None, "childAttemptId": child["attemptId"], "lifecycle": "intent",
+        "responseId": None, "completionDigest": None,
+        "originDigest": current["originDigest"], "operationEpoch": current["operationEpoch"],
+        "incidentId": current["incidentId"], "operationToken": "7" * 32,
+        "preparedProofDigest": current["preparedProofDigest"], "modelDigest": digest("6"),
+        "toolingDigest": current["toolingDigest"],
+        "resourcesDigest": digest("4"), "resourceRequestDigest": digest("0"),
+        "role": "replacement" if replacement else "initial",
+        "priorContainerId": current["containerId"] if replacement else None,
+        "childIdentity": {key: child[key] for key in state.CHILD_IDENTITY_FIELDS},
+    }
+
+
+def bind_created_state(current: dict, container: str, config_hash: str, *, replacement=False) -> dict:
+    """Synthetic acknowledged history for tests of later, unrelated transitions."""
+    if current["ownedChild"] is not None:
+        if current["ownedChild"]["lifecycle"] != "reaped":
+            current = state.advance_state(
+                current, current["phase"], ownedChild=dict(current["ownedChild"], lifecycle="reaped"),
+            )
+        if current["runtimeRequest"] is not None and \
+                current["runtimeRequest"]["operation"] == "create" and \
+                current["runtimeRequest"]["lifecycle"] == "intent":
+            token = state._CREATE_COMPLETION_PUBLICATION.set(True)
+            try:
+                current = state.advance_state(current, current["phase"], ownedChild=None)
+            finally:
+                state._CREATE_COMPLETION_PUBLICATION.reset(token)
+        else:
+            current = state.advance_state(current, current["phase"], ownedChild=None)
+    if current["executionAttempt"] is None:
+        current = state.advance_state(current, current["phase"], executionAttempt="8" * 32)
+    sequence = int(current["latestAttemptId"].split(":")[1]) + 1 if current["latestAttemptId"] else 1
+    child = dict(owned_child(sequence=sequence), attemptId=current["incidentId"] + f":{sequence}")
+    request = create_request(current, child, replacement=replacement)
+    current = state.advance_state(
+        current, current["phase"], ownedChild=child, latestAttemptId=child["attemptId"],
+        runtimeRequest=request,
+    )
+    for lifecycle in ("released", "reaped"):
+        current = state.advance_state(
+            current, current["phase"], ownedChild=dict(child, lifecycle=lifecycle),
+        )
+    token = state._CREATE_COMPLETION_PUBLICATION.set(True)
+    try:
+        current = state.advance_state(
+            current, current["phase"], ownedChild=None,
+            runtimeRequest=dict(request, lifecycle="normal-completed", completionDigest=digest("5")),
+        )
+    finally:
+        state._CREATE_COMPLETION_PUBLICATION.reset(token)
+    changes = {
+        "containerId": container, "configHash": config_hash,
+        "runtimeRequest": dict(current["runtimeRequest"], lifecycle="bound", containerId=container,
+                              configHash=config_hash, responseId=container),
+    }
+    if replacement:
+        changes["commitSubstep"] = "replacement-container-authorized"
+    return state.advance_state(current, current["phase"], **changes)
+
+
 def execution_lease(
     *, attempt: str = "a" * 32, revision: int = 0, lifecycle: str = "registered",
     operation: str = "deploy", rollback_issued: bool = False,
@@ -118,6 +187,7 @@ def execution_lease(
         "rollbackIssued": rollback_issued, "lifecycle": lifecycle, "revision": revision,
         "supervisor": supervisor,
         "worker": None, "workerMode": "controller-worker", "workers": [],
+        "createCompletion": None,
     }
 
 
@@ -165,6 +235,23 @@ class ExecutionGrantTests(unittest.TestCase):
             "validate-grant", grantId=self.grant.grant_id, endNs=self.grant.end_ns,
         )
         self.client.close.assert_called_once()
+
+    def test_create_completion_requires_direct_supervisor_parent_and_its_exclusive_live_grant(self):
+        with mock.patch.object(state.os, "getppid", return_value=self.lease["supervisor"]["pid"]):
+            with self.assertRaises(state.GuardError):
+                with state._execution_mutation("/fixture", 9, self.grant, create_completion_only=True):
+                    self.fail("ordinary state-publish grant authorized a completion")
+            self.client.request.return_value["name"] = "create-completion"
+            with state._execution_mutation("/fixture", 9, self.grant, create_completion_only=True):
+                state._execution_check()
+            with self.assertRaises(state.GuardError):
+                with state._execution_mutation("/fixture", 9, self.grant):
+                    self.fail("create completion grant authorized generic state mutation")
+        with mock.patch.object(state.os, "getppid", return_value=self.lease["supervisor"]["pid"] + 1):
+            with self.assertRaises(state.GuardError):
+                with state._execution_mutation("/fixture", 9, self.grant, create_completion_only=True):
+                    self.fail("controller child impersonated supervisor publisher")
+        self.assertIsNone(state._EXECUTION_CHECK.get())
 
     def test_missing_incomplete_or_unbound_authority_refuses_before_rpc(self):
         for fd, grant in (
@@ -338,7 +425,7 @@ class ExecutionGrantTests(unittest.TestCase):
         waiting = state.advance_state(
             barrier, "CUTOVER_POSSIBLE", ownedChild=child, latestAttemptId=child["attemptId"],
         )
-        verifying = state.advance_state(barrier, "VERIFYING", containerId=digest("c"), configHash=digest("d"))
+        verifying = state.advance_state(bind_created_state(barrier, digest("c"), digest("d")), "VERIFYING")
         committing = state.advance_state(
             verifying, "COMMITTING", commitWitnessDigest=digest("e"),
             providerFinalizationDigest=digest("f"), commitSubstep="provider-cleanup",
@@ -636,7 +723,7 @@ class RecoveryRegistrationTests(unittest.TestCase):
         previous["workers"] = [{"mode": "controller-worker", **previous["supervisor"]}]
         worker = self.lease["worker"]
         cutover = state.advance_state(self.current, "CUTOVER_POSSIBLE")
-        verifying = state.advance_state(cutover, "VERIFYING", containerId=digest("d"), configHash=digest("e"))
+        verifying = state.advance_state(bind_created_state(cutover, digest("d"), digest("e")), "VERIFYING")
         committing = state.advance_state(
             verifying, "COMMITTING", commitWitnessDigest=digest("b"),
             providerFinalizationDigest=digest("c"), commitSubstep="provider-cleanup",
@@ -684,9 +771,10 @@ class RecoveryRegistrationTests(unittest.TestCase):
         state.rollback_state_admission(current, lease)
         barrier = state.advance_state(current, "CUTOVER_POSSIBLE")
         state.rollback_state_admission(barrier, lease)
-        verifying = state.advance_state(barrier, "VERIFYING", containerId=digest("d"), configHash=digest("e"))
+        verifying = state.advance_state(bind_created_state(barrier, digest("d"), digest("e")), "VERIFYING")
         waiting = state.advance_state(
-            verifying, "VERIFYING", ownedChild=owned_child(), latestAttemptId=owned_child()["attemptId"],
+            verifying, "VERIFYING", ownedChild=owned_child(sequence=2),
+            latestAttemptId=owned_child(sequence=2)["attemptId"],
         )
         for invalid in (
             {**current, "executionAttempt": "f" * 32},
@@ -721,9 +809,11 @@ class RecoveryRegistrationTests(unittest.TestCase):
         before = json.dumps(self.current, sort_keys=True)
         with mock.patch.object(
             state, "_read_execution_lease_locked", return_value=self.lease,
-        ), mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+        ), mock.patch.object(state, "rollback_runtime_admission", return_value={
+            "proofDigest": "a" * 64,
+        }), mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(0, state.main(argv))
-        self.assertEqual({"result": "state-admitted", "epoch": 1}, json.loads(output.getvalue()))
+        self.assertEqual({"proofDigest": "a" * 64}, json.loads(output.getvalue()))
         self.assertEqual(before, json.dumps(self.current, sort_keys=True))
         self.assertEqual(2, self.client.request.call_count)
         self.publisher.assert_not_called()
@@ -734,11 +824,135 @@ class RecoveryRegistrationTests(unittest.TestCase):
             )
             with self.subTest(position=position), mock.patch.object(
                 state, "_read_execution_lease_locked", return_value=self.lease,
+            ), mock.patch.object(
+                state, "rollback_runtime_admission", return_value={"proofDigest": "a" * 64},
             ), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
                 self.assertEqual(2, state.main(argv))
             self.assertEqual("EXECUTION_GRANT_REVOKED", error.getvalue().strip())
             self.publisher.assert_not_called()
             self.assertEqual(before, json.dumps(self.current, sort_keys=True))
+
+
+class RollbackRuntimeAdmissionTests(unittest.TestCase):
+    """Read-only reconstruction adapter; no worker admission or mutation authority."""
+
+    def test_fixed_provider_receives_original_deadline_and_rechecks_durable_binding(self):
+        for fault in ("none", "provider", "current", "lease", "revoked-before", "revoked-after"):
+            with self.subTest(fault=fault), ExitStack() as stack:
+                current = prepared_state()
+                current["executionAttempt"] = "b" * 32
+                lease = {
+                    "attempt": "b" * 32, "operation": "deploy", "workerMode": "rollback-worker",
+                    "lifecycle": "rollback-admission", "rollbackIssued": True, "revision": 7,
+                }
+                grant = state.ExecutionGrant("b" * 32, "c" * 32, time.monotonic_ns() + 10**9)
+                proof = {"proofDigest": "d" * 64}
+
+                class ProviderError(Exception):
+                    pass
+
+                provider = SimpleNamespace(
+                    ProviderError=ProviderError,
+                    _operation_deadline=mock.Mock(return_value=nullcontext()),
+                    _bounded_stdin=mock.Mock(return_value=b"evidence"),
+                    _rollback_runtime_proof=mock.Mock(
+                        return_value=proof,
+                        side_effect=ProviderError() if fault == "provider" else None,
+                    ),
+                )
+                spec = SimpleNamespace(loader=mock.Mock())
+                find = stack.enter_context(mock.patch.object(
+                    state.importlib.util, "spec_from_file_location", return_value=spec,
+                ))
+                stack.enter_context(mock.patch.object(
+                    state.importlib.util, "module_from_spec", return_value=provider,
+                ))
+                stack.enter_context(mock.patch.object(
+                    state, "_read_execution_lease_locked",
+                    return_value=dict(lease, revision=8) if fault == "lease" else lease,
+                ))
+                stack.enter_context(mock.patch.object(
+                    state, "_read_guard_locked",
+                    return_value=({}, dict(current, reason="CHANGED") if fault == "current" else current),
+                ))
+                writer = stack.enter_context(mock.patch.object(state, "_atomic_write"))
+                check = mock.Mock(side_effect=(
+                    state.GuardError("EXECUTION_GRANT_REVOKED") if fault == "revoked-before"
+                    else [None, None, state.GuardError("EXECUTION_GRANT_REVOKED")]
+                    if fault == "revoked-after" else None
+                ))
+                if fault == "none":
+                    self.assertIs(proof, state.rollback_runtime_admission("/state", current, lease, grant, check))
+                    provider._operation_deadline.assert_called_once_with(grant.end_ns)
+                    provider._bounded_stdin.assert_called_once_with(state.MAX_RECOVERY_RUNTIME_BYTES)
+                    provider._rollback_runtime_proof.assert_called_once_with(
+                        "/state", current, lease, b"evidence", check, claim=False,
+                    )
+                    self.assertEqual(
+                        ROOT / "test-vps-provider-credential.py", find.call_args.args[1],
+                    )
+                    self.assertEqual(3, check.call_count)
+                else:
+                    with self.assertRaises(state.GuardError):
+                        state.rollback_runtime_admission("/state", current, lease, grant, check)
+                    if fault == "revoked-before":
+                        provider._bounded_stdin.assert_not_called()
+                        provider._rollback_runtime_proof.assert_not_called()
+                writer.assert_not_called()
+
+    def test_claim_reconstructs_again_and_requires_exact_admission_and_successor_lease(self):
+        for fault in ("none", "current", "attempt", "revision", "predecessor", "digest"):
+            with self.subTest(fault=fault), ExitStack() as stack:
+                current = prepared_state()
+                current["executionAttempt"] = "b" * 32
+                lease = {
+                    "attempt": "b" * 32, "operation": "deploy", "workerMode": "rollback-worker",
+                    "lifecycle": "rolling-back", "rollbackIssued": True, "revision": 8,
+                }
+                original = {
+                    "leaseRevision": 7, "currentDigest": hashlib.sha256(state._canonical(current)).hexdigest(),
+                    "executionAttempt": "b" * 32, "predecessor": current["predecessor"],
+                }
+                admitted = dict(original, proofDigest=hashlib.sha256(state._canonical(original)).hexdigest())
+                proof = dict(original, leaseRevision=8)
+                proof["proofDigest"] = hashlib.sha256(state._canonical(proof)).hexdigest()
+                key, wrong = {
+                    "current": ("currentDigest", "e" * 64),
+                    "attempt": ("executionAttempt", "e" * 32),
+                    "revision": ("leaseRevision", 6),
+                    "predecessor": ("predecessor", current["target"]),
+                    "digest": ("proofDigest", "e" * 64),
+                }.get(fault, ("unused", None))
+                if fault != "none":
+                    admitted[key] = wrong
+                provider = SimpleNamespace(
+                    ProviderError=RuntimeError, _operation_deadline=lambda end: nullcontext(),
+                    _bounded_stdin=mock.Mock(return_value=state._canonical({
+                        "admission": admitted, "runtime": {"inspection": []},
+                    })),
+                    _rollback_runtime_proof=mock.Mock(return_value=proof),
+                )
+                stack.enter_context(mock.patch.object(
+                    state.importlib.util, "spec_from_file_location",
+                    return_value=SimpleNamespace(loader=mock.Mock()),
+                ))
+                stack.enter_context(mock.patch.object(
+                    state.importlib.util, "module_from_spec", return_value=provider,
+                ))
+                stack.enter_context(mock.patch.object(state, "_read_execution_lease_locked", return_value=lease))
+                stack.enter_context(mock.patch.object(state, "_read_guard_locked", return_value=({}, current)))
+                writer = stack.enter_context(mock.patch.object(state, "_atomic_write"))
+                grant = state.ExecutionGrant("b" * 32, "c" * 32, time.monotonic_ns() + 10**9)
+                if fault == "none":
+                    self.assertEqual(proof, state.rollback_runtime_admission(
+                        "/state", current, lease, grant, mock.Mock(), claim=True,
+                    ))
+                else:
+                    with self.assertRaisesRegex(state.GuardError, "ROLLBACK_NOT_ADMITTED"):
+                        state.rollback_runtime_admission(
+                            "/state", current, lease, grant, mock.Mock(), claim=True,
+                        )
+                writer.assert_not_called()
 
 
 class ControllerRecoveryContractTests(unittest.TestCase):
@@ -747,6 +961,60 @@ class ControllerRecoveryContractTests(unittest.TestCase):
     These portable contracts are not Linux process-group, Docker, filesystem,
     or full-controller acceptance evidence.
     """
+
+    def test_fixed_rollback_continuation_reuses_owned_run_and_one_remaining_work_grant(self):
+        current = prepared_state()
+        proof = {
+            "runId": "123", "ownedRun": "123-final-deploy", "previousImage": "captured-reference",
+            "predecessor": current["predecessor"], "previousConfigHash": "d" * 64,
+            "providerEnabled": False, "durableDisposition": "none", "installedEnvironment": "target",
+        }
+        for fault, expected in (
+            ("none", ["admit-rollback", "lease", "budget", "grant", "rollback", "complete",
+                      "prepare-terminal", "lease", "terminal"]),
+            ("admit", ["admit-rollback"]),
+            ("grant", ["admit-rollback", "lease", "budget", "grant"]),
+            ("rollback", ["admit-rollback", "lease", "budget", "grant", "rollback"]),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                log = pathlib.Path(temporary) / "events"
+                result = self.run_shell(controller_function("rollback_worker_continue") + r'''
+rollback_admission_proof=$1
+fault=$2
+log=$3
+state_root=/owned
+TIMEPAD_WORKER_MODE=rollback-worker
+fail() { exit 1; }
+supervisor_client() {
+  case "$1" in
+    admit-rollback)
+      echo admit-rollback >>"$log"
+      [ "$fault" != admit ] ;;
+    grant)
+      echo grant >>"$log"
+      [ "$2" = rollback-remaining-work ] && [ "$3" = 540 ]
+      [ "$fault" != grant ] || return 1
+      echo '{"grantId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' ;;
+    complete) echo complete >>"$log" ;;
+    prepare-terminal) echo prepare-terminal >>"$log" ;;
+    terminal) [ "$2" = 0 ]; echo terminal >>"$log" ;;
+    *) exit 9 ;;
+  esac
+}
+supervisor_publish_lease() { echo lease >>"$log"; }
+recovery_budget_arm() { echo budget >>"$log"; }
+rollback() {
+  echo rollback >>"$log"
+  [ "$state" = /owned/123-final-deploy ] && [ "$state_suffix" = final-deploy ]
+  [ "$previous_image" = captured-reference ] && [ "$provider_enabled" = false ]
+  [ "$prepared_timepad" = true ] && [ "$updater_completed" = true ]
+  [ "$updater_started" = false ] && [ "$rollback_worker_admitted" = true ]
+  [ "$fault" != rollback ]
+}
+rollback_worker_continue
+''', json.dumps(proof), fault, str(log))
+                self.assertEqual(0 if fault == "none" else 1, result.returncode, result.stderr)
+                self.assertEqual(expected, log.read_text().splitlines())
 
     def run_shell(self, script: str, *arguments: str) -> subprocess.CompletedProcess:
         bash = shutil.which("bash")
@@ -778,6 +1046,7 @@ timepad_request_begin() {
   echo "intent:$1" >>"$log"
   [ "$fault" != outstanding ]
 }
+timepad_request_preflight() { :; } # Candidate path has no predecessor reconstruction.
 timeout() {
   [ "$*" = "30s docker stop --time 10 $container" ] || return 99
   echo docker:stop >>"$log"
@@ -803,18 +1072,39 @@ if [ "$fault" = none ]; then [ "$status" -eq 0 ]; else [ "$status" -ne 0 ]; fi
     def test_effective_timeout_dispatches_to_supervisor_without_shadowing(self) -> None:
         source = (ROOT / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
         self.assertEqual(1, len(re.findall(r"^timeout\(\) \{", source, re.M)))
+        local_timeout = "" if os.name == "nt" else r"""
+recovery_t0_ns=
+if timeout 5s bash -c 'exit 23'; then exit 90; else [ "$?" -eq 23 ]; fi
+"""
         result = self.run_shell(controller_function("timeout") + r"""
+private_create_stage=
 supervisor_enabled=true
 supervisor_timeout() { printf '%s\n' "$@"; }
 timeout --kill-after=5s 30s fixture-command
-supervisor_enabled=false
-recovery_t0_ns=
-if timeout 5s bash -c 'exit 23'; then exit 90; else [ "$?" -eq 23 ]; fi
-""")
+""" + local_timeout)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(
             ["--kill-after=5s", "30s", "fixture-command"], result.stdout.splitlines(),
         )
+        self.assertIn('command timeout "${options[@]}" "$local_duration" "$@"', controller_function("timeout"))
+
+    def test_private_create_stage_reuses_original_context_and_authenticated_grant(self) -> None:
+        # The shell stage was removed by §5e. These source contracts complement
+        # the actual isolated wait/grant tests; they are not runtime evidence.
+        tree = ast.parse((ROOT / "test_vps_timepad_supervisor.py").read_text())
+        stage = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "_fixed_create_stage")
+        source = ast.unparse(stage)
+        self.assertIn("end_ns=context.end_ns", source)
+        self.assertIn("CreateDriver(context, transport, client)", source)
+        self.assertIn('decode(environment[\'TIMEPAD_CREATE_GRANT\'].encode())', source)
+        self.assertIn("environment['TIMEPAD_CREATE_REQUEST_DIGEST']", source)
+        self.assertIn("driver.check_stage(", source)
+        self.assertIn("wait_create(transport.spawn_create(driver.context, (9,)), driver.context)", source)
+        self.assertLess(source.index("driver.check_stage("), source.index("transport.spawn_create("))
+        self.assertNotIn("execvpe", source)
+        self.assertNotIn("supervisor_timeout", source)
+        self.assertNotIn("timepad_private_create_grant", controller_function("timeout"))
 
     def test_supervised_wait_completes_failed_commands_and_refuses_revoked_success(self) -> None:
         for fault, expected_status, expected_trace in (
@@ -952,7 +1242,11 @@ validate_configuration_boundary() { :; }
 validate_timepad_input() { :; }
 active_file_identity() { echo fixture-identity; }
 cmp() { return 0; }
-env() { echo '{"services":{"backend":{}}}'; }
+timepad_create_action() {
+  [ "$*" = "verify-target replacement" ] || return 92
+  echo proof >>"$state/trace"
+  [ "$fault" != proof ]
+}
 recovery_backend_inventory() {
   if [ "$fault" = inventory ]; then echo foreign; return; fi
   [ ! -e "$state/created" ] || printf 'b%.0s' {1..64}
@@ -974,18 +1268,17 @@ docker() {
 }
 python3() {
   case "$2" in
-    absence-resume)
-      echo proof >>"$state/trace"
-      proof_input=$(</dev/stdin)
-      printf 'proof-input:%s\n' "$proof_input" >>"$state/trace"
-      [ "$fault" != proof ] ;;
     read-state) echo '{"current":{"phase":"FORWARD_RECOVERING"}}' ;;
     *) return 90 ;;
   esac
 }
 timepad_advance() { echo "state:$1:${7:-}" >>"$state/trace"; }
 run_owned_child() {
+  [ "$*" = "FORWARD_RECOVERING create replacement" ] || return 91
   echo "owned:$1" >>"$state/trace"
+  # This contract isolates absence admission and fixed delegation; the
+  # delegated create/bind/suppress protocol has separate controller tests.
+  candidate_container=$(printf 'b%.0s' {1..64})
   : >"$state/created"
 }
 complete_owned_child() { :; }
@@ -1013,23 +1306,12 @@ echo "bound:$recovery_container"
 """, path.as_posix(), fault,
                 )
                 trace = (path / "trace").read_text().splitlines() if (path / "trace").exists() else []
-                proof_lines = [line.removeprefix("proof-input:") for line in trace
-                               if line.startswith("proof-input:")]
-                trace = [line for line in trace if not line.startswith("proof-input:")]
-                if fault == "none":
-                    self.assertEqual(1, len(proof_lines))
-                    proof_payload = json.loads(proof_lines[0])
-                    self.assertEqual(
-                        "meet-backend/test-vps-provider-absence-resume/v1",
-                        proof_payload["schema"],
-                    )
-                    self.assertEqual([], proof_payload["backendInventory"])
                 if fault == "none":
                     self.assertEqual(0, result.returncode, f"{result.stderr}; trace={trace!r}")
                     self.assertEqual([
                         "proof", "state:FORWARD_RECOVERING:",
                         "state:FORWARD_RECOVERING:replacement-create-intent",
-                        "owned:FORWARD_RECOVERING", "update",
+                        "owned:FORWARD_RECOVERING",
                         "state:FORWARD_RECOVERING:replacement-container-authorized",
                     ], trace)
                     self.assertEqual("bound:" + "b" * 64, result.stdout.strip())
@@ -1635,12 +1917,12 @@ class OwnedChildStateTests(unittest.TestCase):
         reaped = state.advance_state(
             self.waiting, "CUTOVER_POSSIBLE", ownedChild={**self.child, "lifecycle": "reaped"},
         )
-        verifying = state.advance_state(reaped, "VERIFYING", containerId=digest("a"), configHash=digest("b"))
+        verifying = state.advance_state(bind_created_state(reaped, digest("b"), digest("b")), "VERIFYING")
         committing = state.advance_state(
             verifying, "COMMITTING", commitWitnessDigest=digest("c"),
             providerFinalizationDigest=digest("d"), commitSubstep="provider-cleanup",
         )
-        self.assertEqual("reaped", committing["ownedChild"]["lifecycle"])
+        self.assertIsNone(committing["ownedChild"])
         cleared_for_retry = state.advance_state(committing, "COMMITTING", ownedChild=None)
         with self.assertRaises(state.GuardError):
             state.advance_state(
@@ -1660,10 +1942,7 @@ class OwnedChildStateTests(unittest.TestCase):
         ):
             with self.subTest(changes=changes), self.assertRaises(state.GuardError):
                 state.advance_state(intent, "COMMITTING", **changes)
-        replacement = state.advance_state(
-            intent, "COMMITTING", containerId="e" * 64,
-            commitSubstep="replacement-container-authorized",
-        )
+        replacement = bind_created_state(intent, "e" * 64, intent["configHash"], replacement=True)
         self.assertEqual("e" * 64, replacement["containerId"])
         with self.assertRaises(state.GuardError):
             state.advance_state(
@@ -1707,7 +1986,8 @@ class OwnedChildStateTests(unittest.TestCase):
             state.advance_state(replacement_committed, "COMMITTED"),
         )
         self.assert_rejected(
-            committing, "COMMITTED", terminalReceipt=digest("e"), commitSubstep="policy-restored",
+            dict(committing, ownedChild=owned_child(sequence=2, lifecycle="reaped")),
+            "COMMITTED", terminalReceipt=digest("e"), commitSubstep="policy-restored",
         )
         cleared = state.advance_state(cleared_for_retry, "COMMITTING", ownedChild=None)
         committed = state.advance_state(
@@ -1968,7 +2248,8 @@ class CleanupRequestTests(unittest.TestCase):
             workerMode="fail-closed-worker", firstFailure="RECOVERY_RETRY_RUNTIME_FAILED", firstStatus=1,
         )
         current = prepared_state()
-        current = state.advance_state(current, "CUTOVER_POSSIBLE", containerId=digest("4"), configHash=digest("5"))
+        current = state.advance_state(current, "CUTOVER_POSSIBLE")
+        current = bind_created_state(current, digest("4"), digest("5"))
         current = state.advance_state(current, "VERIFYING")
         self.current = dict(current, executionAttempt=self.lease["attempt"], runtimeRequest={
             "nonce": "6" * 32, "sequence": 1, "executionAttempt": self.lease["attempt"],
@@ -2025,15 +2306,84 @@ class CleanupRequestTests(unittest.TestCase):
             )
 
 
+class PredecessorRuntimeRequestTests(unittest.TestCase):
+    def setUp(self):
+        self.current = dict(prepared_state(), executionAttempt="8" * 32)
+        self.request = {
+            "nonce": "9" * 32, "sequence": 1, "executionAttempt": "8" * 32,
+            "operation": "suppress", "containerId": self.current["predecessorContainerId"],
+            "imageId": self.current["predecessor"]["tuple"]["platformImageId"],
+            "configHash": digest("d"), "childAttemptId": None, "lifecycle": "intent",
+            "responseId": None, "completionDigest": None, "role": "predecessor",
+            **{key: self.current[key] for key in (
+                "originDigest", "incidentId", "operationEpoch", "preparedProofDigest", "evidenceDigest",
+            )},
+        }
+
+    def finish(self, current):
+        request = dict(current["runtimeRequest"], lifecycle="acknowledged",
+                       responseId=current["predecessorContainerId"])
+        acknowledged = state.advance_state(current, "PREPARED", runtimeRequest=request)
+        return state.advance_state(acknowledged, "PREPARED", runtimeRequest=dict(
+            request, lifecycle="completed", completionDigest=digest("c"),
+        ))
+
+    def test_verified_rollback_retains_completed_predecessor_history_not_unresolved_request(self):
+        suppress = self.finish(state.advance_state(self.current, "PREPARED", runtimeRequest=self.request))
+        stop = dict(self.request, nonce="7" * 32, sequence=2, operation="stop")
+        stopped = self.finish(state.advance_state(suppress, "PREPARED", runtimeRequest=stop))
+        for source in (suppress, stopped, state.advance_state(stopped, "CUTOVER_POSSIBLE")):
+            rolling = state.advance_state(
+                source, "ROLLING_BACK", reason="ROLLBACK_ADMITTED", rollbackIssued=True,
+            )
+            terminal = state.advance_state(
+                rolling, "ROLLED_BACK", reason="ROLLBACK_VERIFIED", terminalReceipt=digest("e"),
+            )
+            self.assertEqual(source["runtimeRequest"], terminal["runtimeRequest"])
+            self.assertEqual("completed", state.require_runtime_request_completion(terminal)["lifecycle"])
+            for lifecycle in ("intent", "acknowledged"):
+                request = dict(terminal["runtimeRequest"], lifecycle=lifecycle, completionDigest=None)
+                if lifecycle == "intent":
+                    request["responseId"] = None
+                with self.subTest(lifecycle=lifecycle), self.assertRaises(state.GuardError):
+                    state._current(dict(terminal, runtimeRequest=request))
+
+    def test_suppression_then_stop_requires_durable_response_and_completion_before_barrier(self):
+        suppress = state.advance_state(self.current, "PREPARED", runtimeRequest=self.request)
+        for current in (suppress, self.finish(suppress)):
+            with self.assertRaises(state.GuardError):
+                state.advance_state(current, "CUTOVER_POSSIBLE")
+        completed = self.finish(suppress)
+        stop = dict(self.request, nonce="7" * 32, sequence=2, operation="stop")
+        stopped = self.finish(state.advance_state(completed, "PREPARED", runtimeRequest=stop))
+        barrier = state.advance_state(stopped, "CUTOVER_POSSIBLE")
+        self.assertEqual("stop", state.require_runtime_request_completion(barrier)["operation"])
+        self.assertIsNone(barrier["containerId"])
+        self.assertIsNone(barrier["configHash"])
+
+    def test_wrong_identity_authority_operation_or_order_never_creates_request(self):
+        for key, value in (
+            ("containerId", digest("e")), ("imageId", digest("f")),
+            ("executionAttempt", "f" * 32), ("originDigest", digest("f")),
+            ("incidentId", "f" * 32), ("operationEpoch", 2),
+            ("preparedProofDigest", digest("f")), ("evidenceDigest", digest("f")),
+            ("operation", "start"), ("operation", "restore-policy"), ("operation", "stop"),
+            ("childAttemptId", "f" * 32 + ":1"), ("role", "candidate"),
+        ):
+            with self.subTest(key=key, value=value), self.assertRaises(state.GuardError):
+                state.advance_state(self.current, "PREPARED", runtimeRequest=dict(self.request, **{key: value}))
+        with self.assertRaises(state.GuardError):
+            state.advance_state(self.current, "PREPARED", reason="UNRELATED")
+
+
 class RuntimeRequestTests(unittest.TestCase):
     """Request completion is separate from child reap and inventory observations."""
 
     def setUp(self):
         self.current = state.advance_state(prepared_state(), "CUTOVER_POSSIBLE")
-        self.current = state.advance_state(
-            self.current, "CUTOVER_POSSIBLE", containerId=digest("c"), configHash=digest("d"),
-            executionAttempt="8" * 32,
-        )
+        self.current = bind_created_state(self.current, digest("c"), digest("d"))
+        # Existing-ID tests begin after the independent create/binding protocol.
+        self.current = dict(self.current, runtimeRequest=None)
         self.request = {
             "nonce": "9" * 32, "sequence": 1, "executionAttempt": "8" * 32,
             "operation": "stop", "containerId": digest("c"), "imageId": digest("b"),
@@ -2148,6 +2498,489 @@ class RuntimeRequestTests(unittest.TestCase):
                 state.adopt_recovery_state(bad_current, lease, request_proof=bad_proof)
 
 
+class CreateRequestTests(unittest.TestCase):
+    def setUp(self):
+        self.barrier = state.advance_state(
+            prepared_state(), "CUTOVER_POSSIBLE", executionAttempt="8" * 32,
+        )
+        self.child = owned_child()
+        self.request = create_request(self.barrier, self.child)
+        self.intent = state.advance_state(
+            self.barrier, self.barrier["phase"], ownedChild=self.child,
+            latestAttemptId=self.child["attemptId"], runtimeRequest=self.request,
+        )
+
+    def drained(self):
+        current = self.intent
+        for lifecycle in ("released", "reaped"):
+            current = state.advance_state(
+                current, current["phase"], ownedChild=dict(self.child, lifecycle=lifecycle),
+            )
+        return current
+
+    def normal_completed(self):
+        current = self.intent
+        token = state._CREATE_COMPLETION_PUBLICATION.set(True)
+        try:
+            return state.advance_state(
+                current, current["phase"], ownedChild=None, runtimeRequest=dict(
+                    self.request, lifecycle="normal-completed", completionDigest=digest("5"),
+                ),
+            )
+        finally:
+            state._CREATE_COMPLETION_PUBLICATION.reset(token)
+
+    def test_create_has_two_strict_edges_and_binds_only_after_normal_completion(self):
+        completed = self.normal_completed()
+        bound = bind_created_state(self.barrier, digest("c"), digest("d"))
+        self.assertEqual("bound", bound["runtimeRequest"]["lifecycle"])
+        self.assertEqual(bound["runtimeRequest"], state.require_runtime_request_completion(bound))
+        self.assertEqual(completed["runtimeRequest"], state.require_create_normal_completion(completed))
+        self.assertEqual(bound, state.advance_state(bound, bound["phase"]))
+        self.assertLess(len(state._canonical(bound)), state.MAX_CURRENT_BYTES)
+        self.assertLess(len(state._canonical({"changes": {"runtimeRequest": self.request}})),
+                        state.MAX_CHANGES_BYTES)
+        for current in (self.intent, self.drained(), completed):
+            with self.subTest(lifecycle=current["runtimeRequest"]["lifecycle"]), self.assertRaises(state.GuardError):
+                state.require_runtime_request_completion(current)
+        with self.assertRaises(state.GuardError):
+            state.require_create_normal_completion(self.intent)
+        with self.assertRaises(state.GuardError):
+            state.advance_state(
+                self.drained(), self.barrier["phase"], containerId=digest("c"), configHash=digest("d"),
+                runtimeRequest=dict(self.request, lifecycle="bound", containerId=digest("c"),
+                                    configHash=digest("d"), responseId=digest("c"), completionDigest=digest("5")),
+            )
+
+    def test_every_create_identity_is_immutable_and_must_match_the_incident(self):
+        completed = self.normal_completed()
+        for key, value in (
+            ("nonce", "6" * 32), ("sequence", 2), ("executionAttempt", "7" * 32),
+            ("originDigest", digest("f")), ("operationEpoch", 2), ("incidentId", "f" * 32),
+            ("operationToken", "6" * 32), ("modelDigest", digest("8")),
+            ("preparedProofDigest", digest("8")), ("toolingDigest", digest("8")),
+            ("resourcesDigest", digest("8")), ("resourceRequestDigest", digest("8")),
+            ("role", "replacement"), ("priorContainerId", digest("c")),
+            ("childAttemptId", self.child["attemptId"].replace(":1", ":2")),
+            ("childIdentity", dict(self.request["childIdentity"], startTicks=999)),
+            ("imageId", digest("c")), ("operation", "start"), ("extra", True),
+        ):
+            request = dict(completed["runtimeRequest"], **{key: value})
+            with self.subTest(key=key), self.assertRaises(state.GuardError):
+                state.advance_state(completed, completed["phase"], runtimeRequest=request)
+        for key in self.request:
+            request = dict(self.request)
+            request.pop(key)
+            with self.subTest(missing=key), self.assertRaises(state.GuardError):
+                state.runtime_request(request)
+
+    def test_resource_digests_are_required_lowercase_sha256_at_every_create_lifecycle(self):
+        completed = self.normal_completed()
+        bound = bind_created_state(self.barrier, digest("c"), digest("d"))
+        invalid = (None, True, 1, "", "a" * 63, "a" * 65, "A" * 64,
+                   "x" * 64, "a" * 64 + "\n", [], {}, "private-canary")
+        for current in (self.intent, completed, bound):
+            request = current["runtimeRequest"]
+            self.assertEqual(request, state.runtime_request(request))
+            for key in ("resourcesDigest", "resourceRequestDigest"):
+                missing = dict(request)
+                missing.pop(key)
+                with self.subTest(lifecycle=request["lifecycle"], missing=key), \
+                        self.assertRaises(state.GuardError):
+                    state.runtime_request(missing)
+                for value in invalid:
+                    with self.subTest(lifecycle=request["lifecycle"], key=key, value=value), \
+                            self.assertRaises(state.GuardError) as error:
+                        state.runtime_request(dict(request, **{key: value}))
+                    self.assertNotIn("private-canary", str(error.exception))
+
+    def test_resource_digests_are_immutable_across_completion_binding_and_replay(self):
+        drained = self.drained()
+        completed = self.normal_completed()
+        bound = bind_created_state(self.barrier, digest("c"), digest("d"))
+        for previous, candidate in (
+            (drained, completed), (completed, bound), (bound, bound),
+        ):
+            for key in ("resourcesDigest", "resourceRequestDigest"):
+                request = dict(candidate["runtimeRequest"], **{key: digest("f")})
+                with self.subTest(edge=(previous["runtimeRequest"]["lifecycle"],
+                                       candidate["runtimeRequest"]["lifecycle"]), key=key), \
+                        self.assertRaisesRegex(state.GuardError, "RUNTIME_REQUEST_CONFLICT"):
+                    state.advance_state(
+                        previous, candidate["phase"], runtimeRequest=request,
+                        containerId=candidate["containerId"], configHash=candidate["configHash"],
+                    )
+        for previous, candidate in ((completed, self.intent), (bound, completed)):
+            with self.subTest(replay=candidate["runtimeRequest"]["lifecycle"]), \
+                    self.assertRaises(state.GuardError):
+                state.advance_state(previous, previous["phase"], runtimeRequest=candidate["runtimeRequest"])
+
+    def test_create_request_digest_binds_both_opaque_resource_digests(self):
+        # State accepts the digest of private canonical membership bytes; its
+        # schema and Docker semantics belong to the provider comparator.
+        baseline = state._canonical({"members": ["postgres"], "endpoint": "fixture"})
+        request = dict(self.request, resourceRequestDigest=hashlib.sha256(baseline).hexdigest())
+        expected = hashlib.sha256(state._canonical(request)).hexdigest()
+        self.assertEqual(expected, state.create_request_digest(request))
+        completed = dict(request, lifecycle="normal-completed", completionDigest=digest("5"))
+        bound = dict(completed, lifecycle="bound", containerId=digest("c"),
+                     configHash=digest("d"), responseId=digest("c"))
+        for value in (completed, bound):
+            self.assertEqual(expected, state.create_request_digest(value))
+        for key in ("resourcesDigest", "resourceRequestDigest"):
+            self.assertNotEqual(
+                expected, state.create_request_digest(dict(request, **{key: digest("f")})),
+            )
+
+    def test_non_create_request_schema_does_not_accept_resource_binding_fields(self):
+        for operation in ("start", "stop", "suppress", "restore-policy"):
+            request = {
+                "nonce": "9" * 32, "sequence": 1, "executionAttempt": "8" * 32,
+                "operation": operation, "containerId": digest("c"), "imageId": digest("b"),
+                "configHash": digest("d"), "childAttemptId": None, "lifecycle": "intent",
+                "responseId": None, "completionDigest": None,
+            }
+            self.assertEqual(request, state.runtime_request(request))
+            for key in ("resourcesDigest", "resourceRequestDigest"):
+                with self.subTest(operation=operation, key=key), self.assertRaises(state.GuardError):
+                    state.runtime_request(dict(request, **{key: digest("f")}))
+
+    def test_same_nonce_cannot_change_request_schema_and_malformed_target_is_fixed_error(self):
+        old = self.normal_completed()
+        request = {
+            key: value for key, value in old["runtimeRequest"].items()
+            if key not in state.CREATE_REQUEST_FIELDS
+        }
+        request.update(operation="stop", lifecycle="intent", childAttemptId=None,
+                       containerId=digest("c"), configHash=digest("d"), completionDigest=None)
+        candidate = dict(old, runtimeRequest=request, containerId=digest("c"), configHash=digest("d"))
+        with self.assertRaises(state.GuardError):
+            state._validate_runtime_request_transition(old, candidate)
+        for target in ({}, {"tuple": {}}, [], "invalid"):
+            with self.subTest(target=target), self.assertRaises(state.GuardError):
+                state._current(dict(self.intent, target=target))
+
+    def test_unknown_cancelled_missing_or_late_acknowledgment_cannot_start_or_replace(self):
+        for current in (self.intent, self.drained(), self.normal_completed()):
+            for phase in ("VERIFYING", "ROLLING_BACK", "FORWARD_RECOVERING"):
+                with self.subTest(phase=phase), self.assertRaises(state.GuardError):
+                    state.advance_state(current, phase)
+            recovery = state.advance_state(current, "RECOVERY_REQUIRED")
+            self.assertEqual(current["runtimeRequest"], recovery["runtimeRequest"])
+            for request in (
+                None, dict(self.request, nonce="5" * 32, sequence=2),
+                dict(self.request, operation="stop", childAttemptId=None),
+            ):
+                with self.subTest(request=request), self.assertRaises(state.GuardError):
+                    state.advance_state(current, current["phase"], runtimeRequest=request)
+            with self.assertRaises(state.GuardError):
+                state.advance_state(current, current["phase"], containerId=digest("c"), configHash=digest("d"))
+        for lifecycle in ("acknowledged", "completed", "cancelled", "timeout", "late", None):
+            with self.subTest(lifecycle=lifecycle), self.assertRaises(state.GuardError):
+                state.runtime_request(dict(self.request, lifecycle=lifecycle))
+        with self.assertRaises(state.GuardError):
+            state.advance_state(self.intent, self.intent["phase"], runtimeRequest=dict(
+                self.request, lifecycle="normal-completed", completionDigest=digest("5"),
+            ))
+        completed = self.normal_completed()
+        with self.assertRaises(state.GuardError):
+            state.advance_state(completed, completed["phase"], runtimeRequest=dict(
+                completed["runtimeRequest"], completionDigest=digest("6"),
+            ))
+
+    def test_only_supervisor_completion_clears_the_matching_waiting_create_child(self):
+        waiting = self.intent
+        with self.assertRaisesRegex(state.GuardError, "CREATE_COMPLETION_SUPERVISOR_REQUIRED"):
+            state.advance_state(waiting, waiting["phase"], ownedChild=None)
+        with self.assertRaisesRegex(state.GuardError, "CREATE_COMPLETION_SUPERVISOR_REQUIRED"):
+            state.advance_state(
+                waiting, waiting["phase"], ownedChild=None,
+                runtimeRequest=dict(
+                    self.request, lifecycle="normal-completed", completionDigest=digest("5"),
+                ),
+            )
+        matching = state._require_matching_create_child(waiting)
+        self.assertEqual("waiting", matching["lifecycle"])
+        self.assertEqual(
+            self.request["childIdentity"],
+            {key: matching[key] for key in state.CHILD_IDENTITY_FIELDS},
+        )
+        mismatched = dict(waiting, runtimeRequest=dict(
+            self.request,
+            childIdentity=dict(self.request["childIdentity"], startTicks=self.child["startTicks"] + 1),
+        ))
+        with self.assertRaises(state.GuardError):
+            state._require_matching_create_child(mismatched)
+        released = dict(waiting, ownedChild=dict(self.child, lifecycle="released"))
+        self.assertEqual("released", state._require_matching_create_child(released)["lifecycle"])
+        token = state._CREATE_COMPLETION_PUBLICATION.set(True)
+        try:
+            completed = state.advance_state(
+                waiting, waiting["phase"], ownedChild=None, runtimeRequest=dict(
+                    self.request, lifecycle="normal-completed", completionDigest=digest("5"),
+                ),
+            )
+        finally:
+            state._CREATE_COMPLETION_PUBLICATION.reset(token)
+        self.assertIsNone(completed["ownedChild"])
+        self.assertEqual("normal-completed", completed["runtimeRequest"]["lifecycle"])
+
+    def test_binding_must_keep_completion_and_reject_predecessor_response_and_hash_mismatch(self):
+        completed = self.normal_completed()
+        request = dict(completed["runtimeRequest"], lifecycle="bound", containerId=digest("c"),
+                       configHash=digest("d"), responseId=digest("c"))
+        for changes in (
+            {"containerId": digest("e")}, {"configHash": digest("e")},
+            {"completionDigest": digest("e")}, {"responseId": digest("e")},
+            {"containerId": self.barrier["predecessorContainerId"],
+             "responseId": self.barrier["predecessorContainerId"]},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(state.GuardError):
+                state.advance_state(
+                    completed, completed["phase"], containerId=digest("c"), configHash=digest("d"),
+                    runtimeRequest=dict(request, **changes),
+                )
+
+    def test_replacement_authorization_requires_bound_publication_and_never_rewrites_witness(self):
+        current = bind_created_state(self.barrier, digest("c"), digest("d"))
+        current = state.advance_state(current, "VERIFYING")
+        current = state.advance_state(
+            current, "COMMITTING", commitWitnessDigest=digest("e"),
+            providerFinalizationDigest=digest("f"), commitSubstep="provider-cleanup",
+        )
+        current = state.advance_state(current, "COMMITTING", commitSubstep="replacement-create-intent")
+        with self.assertRaises(state.GuardError):
+            state.advance_state(current, current["phase"], containerId=digest("b"),
+                                commitSubstep="replacement-container-authorized")
+        replacement = bind_created_state(current, digest("b"), current["configHash"], replacement=True)
+        self.assertEqual("bound", replacement["runtimeRequest"]["lifecycle"])
+        self.assertEqual(current["commitWitnessDigest"], replacement["commitWitnessDigest"])
+        self.assertEqual(current["providerFinalizationDigest"], replacement["providerFinalizationDigest"])
+        self.assertEqual(current["configHash"], replacement["configHash"])
+        for key in ("operationToken", "modelDigest", "toolingDigest", "preparedProofDigest"):
+            self.assertEqual(current["runtimeRequest"][key], replacement["runtimeRequest"][key])
+        with self.assertRaises(state.GuardError):
+            bind_created_state(replacement, digest("e"), current["configHash"], replacement=True)
+
+    def test_completion_requires_canonical_receipt_exact_lease_evidence_and_final_acknowledgment(self):
+        current = self.normal_completed()
+        request = current["runtimeRequest"]
+        receipt = {
+            "schema": state.CREATE_COMPLETION_SCHEMA,
+            "requestDigest": state.create_request_digest(request),
+            "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+            "resourcesDigest": request["resourcesDigest"],
+            "resourceRequestDigest": request["resourceRequestDigest"],
+            "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+        }
+        raw = state._canonical(receipt)
+        request = dict(request, completionDigest=hashlib.sha256(raw).hexdigest())
+        current = dict(current, runtimeRequest=request)
+        lease = execution_lease(attempt=request["executionAttempt"], lifecycle="armed")
+        evidence = {
+            **{key: value for key, value in receipt.items() if key != "schema"},
+            "receiptDigest": request["completionDigest"], "acknowledged": False,
+        }
+        lease["createCompletion"] = evidence
+        state._execution_lease(lease)
+        state.validate_create_completion(current, lease, raw, acknowledged=False)
+        with self.assertRaises(state.GuardError):
+            state.validate_create_completion(current, lease, raw, acknowledged=True)
+        lease["createCompletion"] = dict(evidence, acknowledged=True)
+        state.validate_create_completion(current, lease, raw, acknowledged=True)
+        for changed_raw in (b"", b"{}", raw + b" ", raw.replace(b'"waitStatus":0', b'"waitStatus":1')):
+            with self.subTest(receipt=changed_raw), self.assertRaises(state.GuardError):
+                state.validate_create_completion(current, lease, changed_raw, acknowledged=True)
+        for field, value in (
+            ("receiptDigest", digest("0")), ("requestDigest", digest("0")),
+            ("resourcesDigest", digest("f")), ("resourceRequestDigest", digest("f")),
+            ("executionAttempt", "0" * 32), ("childIdentity", dict(request["childIdentity"], startTicks=1)),
+            ("waitStatus", True), ("waitStatus", 1), ("uncancelled", False),
+            ("descendantsDrained", False), ("acknowledged", False), ("extra", True),
+        ):
+            with self.subTest(field=field), self.assertRaises(state.GuardError):
+                state.validate_create_completion(
+                    current, dict(lease, createCompletion=dict(lease["createCompletion"], **{field: value})),
+                    raw, acknowledged=True,
+                )
+        with self.assertRaises(state.GuardError):
+            state.validate_create_completion(current, dict(lease, createCompletion=None), raw, acknowledged=True)
+        for changed in (
+            dict(lease["createCompletion"], acknowledged=False), None,
+            dict(lease["createCompletion"], receiptDigest=digest("0")),
+        ):
+            candidate = dict(lease, revision=lease["revision"] + 1, createCompletion=changed)
+            with self.subTest(evidence=changed), self.assertRaises(state.GuardError):
+                state._validate_lease_successor(lease, candidate)
+
+    def test_completion_receipt_and_lease_cannot_substitute_resource_bindings(self):
+        current = self.normal_completed()
+        request = current["runtimeRequest"]
+        receipt = {
+            "schema": state.CREATE_COMPLETION_SCHEMA,
+            "requestDigest": state.create_request_digest(request),
+            "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+            "resourcesDigest": request["resourcesDigest"],
+            "resourceRequestDigest": request["resourceRequestDigest"],
+            "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+        }
+
+        def completion_context(value, *, acknowledged=True):
+            raw = state._canonical(value)
+            completed = dict(current, runtimeRequest=dict(
+                request, completionDigest=hashlib.sha256(raw).hexdigest(),
+            ))
+            evidence = {
+                **{key: item for key, item in value.items() if key != "schema"},
+                "receiptDigest": completed["runtimeRequest"]["completionDigest"],
+                "acknowledged": acknowledged,
+            }
+            lease = execution_lease(attempt=request["executionAttempt"], lifecycle="armed")
+            return completed, dict(lease, createCompletion=evidence), raw
+
+        completed, lease, raw = completion_context(receipt)
+        state.validate_create_completion(completed, lease, raw, acknowledged=True)
+        for key in ("resourcesDigest", "resourceRequestDigest"):
+            for value in (None, True, "", "a" * 63, "A" * 64, "x" * 64):
+                bad_evidence = dict(lease["createCompletion"], **{key: value})
+                with self.subTest(key=key, value=value), self.assertRaises(state.GuardError):
+                    state._execution_lease(dict(lease, createCompletion=bad_evidence))
+            missing_evidence = dict(lease["createCompletion"])
+            missing_evidence.pop(key)
+            with self.subTest(missing=key), self.assertRaises(state.GuardError):
+                state._execution_lease(dict(lease, createCompletion=missing_evidence))
+            for wrong in (dict(receipt, **{key: digest("f")}),
+                          {name: value for name, value in receipt.items() if name != key}):
+                # Even internally consistent receipt/current/lease hashes cannot
+                # acknowledge resource evidence from a different request.
+                changed_current, changed_lease, changed_raw = completion_context(wrong)
+                with self.subTest(receipt=wrong, key=key), self.assertRaises(state.GuardError):
+                    state.validate_create_completion(
+                        changed_current, changed_lease, changed_raw, acknowledged=True,
+                    )
+            replayed_current = dict(completed, runtimeRequest=dict(
+                completed["runtimeRequest"], **{key: digest("f")},
+            ))
+            with self.subTest(replayed_request=key), self.assertRaises(state.GuardError):
+                state.validate_create_completion(replayed_current, lease, raw, acknowledged=True)
+            _, pending, _ = completion_context(receipt, acknowledged=False)
+            acknowledged = dict(pending, revision=pending["revision"] + 1, createCompletion=dict(
+                pending["createCompletion"], acknowledged=True,
+            ))
+            state._validate_lease_successor(pending, acknowledged)
+            for previous, candidate in ((pending, acknowledged), (lease, dict(
+                lease, revision=lease["revision"] + 1,
+            ))):
+                changed = dict(candidate, createCompletion=dict(
+                    candidate["createCompletion"], **{key: digest("f")},
+                ))
+                with self.subTest(lease_mutation=key, acknowledged=previous["createCompletion"]["acknowledged"]), \
+                        self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_COMPLETION_CONFLICT"):
+                    state._validate_lease_successor(previous, changed)
+
+    def test_supervisor_publication_stages_receipt_before_current_and_never_repairs_fragments(self):
+        for fault in (
+            "none", "existing", "wrong-evidence", "receipt-write", "receipt-readback", "state-write",
+        ):
+            current = self.intent
+            request = current["runtimeRequest"]
+            receipt = {
+                "schema": state.CREATE_COMPLETION_SCHEMA,
+                "requestDigest": state.create_request_digest(request),
+                "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+                "resourcesDigest": request["resourcesDigest"],
+                "resourceRequestDigest": request["resourceRequestDigest"],
+                "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+            }
+            raw = state._canonical(receipt)
+            receipt_digest = hashlib.sha256(raw).hexdigest()
+            lease = execution_lease(attempt=request["executionAttempt"], lifecycle="armed")
+            lease["createCompletion"] = {
+                **{key: value for key, value in receipt.items() if key != "schema"},
+                "receiptDigest": receipt_digest, "acknowledged": False,
+            }
+            if fault == "wrong-evidence":
+                lease["createCompletion"]["resourceRequestDigest"] = digest("f")
+            events = []
+            persisted = [current]
+
+            def write(*args, **kwargs):
+                events.append("receipt-write")
+                if fault == "receipt-write":
+                    raise OSError("synthetic")
+
+            def publish(root, candidate):
+                self.assertTrue(state._CREATE_COMPLETION_PUBLICATION.get())
+                self.assertIsNone(candidate["ownedChild"])
+                self.assertEqual("normal-completed", candidate["runtimeRequest"]["lifecycle"])
+                events.append("state-write")
+                if fault == "state-write":
+                    raise OSError("synthetic")
+                persisted[0] = candidate
+                return candidate
+
+            with self.subTest(fault=fault), ExitStack() as stack:
+                stack.enter_context(mock.patch.object(state, "deploy_lock", return_value=nullcontext(9)))
+                authority = stack.enter_context(mock.patch.object(
+                    state, "_execution_mutation", return_value=nullcontext(),
+                ))
+                stack.enter_context(mock.patch.object(state, "_read_guard_locked",
+                                                      side_effect=lambda root: ({}, persisted[0])))
+                stack.enter_context(mock.patch.object(state, "_read_execution_lease_locked", return_value=lease))
+                stack.enter_context(mock.patch.object(state, "_open_root", return_value=11))
+                stack.enter_context(mock.patch.multiple(
+                    state.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                    O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+                ))
+                stack.enter_context(mock.patch.object(state.os, "open", return_value=12))
+                stack.enter_context(mock.patch.object(state.os, "close"))
+                stack.enter_context(mock.patch.object(state.os, "fstat", return_value=SimpleNamespace(
+                    st_uid=0, st_mode=stat.S_IFDIR | 0o700,
+                )))
+                stack.enter_context(mock.patch.object(
+                    state.os, "stat", **({"return_value": mock.Mock()} if fault == "existing"
+                                        else {"side_effect": FileNotFoundError}),
+                ))
+                stack.enter_context(mock.patch.object(state, "_require_no_acl"))
+                stack.enter_context(mock.patch.object(state, "_atomic_write", side_effect=write))
+                stack.enter_context(mock.patch.object(state, "_read_at",
+                                                      return_value=b"bad" if fault == "receipt-readback" else raw))
+                stack.enter_context(mock.patch.object(state, "_publish_current_locked", side_effect=publish))
+                stack.enter_context(mock.patch.object(state, "_require_create_completion_locked"))
+                grant = state.ExecutionGrant(request["executionAttempt"], "1" * 32, 200)
+                if fault == "none":
+                    self.assertEqual({"receiptDigest": receipt_digest, "sequence": 1}, state.publish_create_completion(
+                        "/state", request_digest=receipt["requestDigest"],
+                        supervisor_wait_evidence=raw,
+                        deploy_lock_fd=9, execution_grant=grant,
+                    ))
+                    self.assertEqual(["receipt-write", "state-write"], events)
+                else:
+                    with self.assertRaises((state.GuardError, OSError)):
+                        state.publish_create_completion(
+                            "/state", request_digest=receipt["requestDigest"],
+                            supervisor_wait_evidence=raw,
+                            deploy_lock_fd=9, execution_grant=grant,
+                        )
+                    if fault == "wrong-evidence":
+                        self.assertEqual([], events)
+                authority.assert_called_once_with("/state", 9, grant, create_completion_only=True)
+                self.assertFalse(state._CREATE_COMPLETION_PUBLICATION.get())
+
+    def test_private_cli_refuses_incomplete_capability_before_reading_receipt(self):
+        args = ["publish-create-completion", "--root", "/state", "--deploy-lock-fd", "9",
+                "--request-digest", digest("1")]
+        for extra in ([], ["--execution-attempt", "1" * 32]):
+            with (
+                mock.patch.object(state, "publish_create_completion") as publish,
+                mock.patch.object(state.sys, "stdin") as stdin,
+                mock.patch.object(state.sys, "stderr", io.StringIO()),
+            ):
+                self.assertEqual(2, state.main(args + extra))
+            publish.assert_not_called()
+            stdin.buffer.read.assert_not_called()
+
+
 class StaleRecoveryLeaseTests(unittest.TestCase):
     change = RuntimeRequestTests.change
     completed = RuntimeRequestTests.completed
@@ -2195,6 +3028,128 @@ class StaleRecoveryLeaseTests(unittest.TestCase):
                 self.previous["supervisor"], *self.previous["workers"],
             )], self.exited.call_args_list,
         )
+
+    def test_acknowledged_create_reconciliation_keeps_proof_through_validation_only(self):
+        fixture = CreateRequestTests()
+        fixture.setUp()
+        completed = fixture.normal_completed()
+        request = completed["runtimeRequest"]
+        receipt = {
+            "schema": state.CREATE_COMPLETION_SCHEMA,
+            "requestDigest": state.create_request_digest(request),
+            "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+            "resourcesDigest": request["resourcesDigest"],
+            "resourceRequestDigest": request["resourceRequestDigest"],
+            "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+        }
+        raw = state._canonical(receipt)
+        completed = dict(completed, runtimeRequest=dict(
+            request, completionDigest=hashlib.sha256(raw).hexdigest(),
+        ))
+        previous = dict(self.previous, createCompletion={
+            **{key: value for key, value in receipt.items() if key != "schema"},
+            "receiptDigest": completed["runtimeRequest"]["completionDigest"], "acknowledged": True,
+        })
+        for fault in (
+            "none", "receipt", "unacknowledged", "erased", "changed-request", "provider",
+            "missing-runtime", "before-current", "before-lease", "successor-validation",
+        ):
+            with self.subTest(fault=fault), ExitStack() as stack:
+                for name in ("O_DIRECTORY", "O_NOFOLLOW"):
+                    stack.enter_context(mock.patch.object(
+                        state.os, name, getattr(state.os, name, 0), create=True,
+                    ))
+                lease = dict(previous)
+                if fault == "unacknowledged":
+                    lease["createCompletion"] = dict(lease["createCompletion"], acknowledged=False)
+                elif fault == "erased":
+                    lease["createCompletion"] = None
+                files = {"lease": lease, "current": completed}
+                writes = []
+                stack.enter_context(mock.patch.object(
+                    state, "_read_execution_lease_locked", side_effect=lambda _root: files["lease"],
+                ))
+                stack.enter_context(mock.patch.object(
+                    state, "_read_guard_locked", side_effect=lambda _root: ({}, files["current"]),
+                ))
+
+                def require(_root, current, *, acknowledged):
+                    state.validate_create_completion(
+                        current, files["lease"], b"{}" if fault == "receipt" else raw,
+                        acknowledged=acknowledged,
+                    )
+
+                stack.enter_context(mock.patch.object(
+                    state, "_require_create_completion_locked", side_effect=require,
+                ))
+                provider = SimpleNamespace(ProviderError=RuntimeError)
+
+                def proof(*args, **kwargs):
+                    self.assertTrue(kwargs.get("create_completion_recovery"))
+                    self.assertTrue(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+                    if fault == "provider":
+                        raise provider.ProviderError("private proof refused")
+                    if fault == "changed-request":
+                        return dict(completed["runtimeRequest"], resourcesDigest=digest("f"))
+                    return completed["runtimeRequest"]
+
+                provider._recovery_lease_runtime_proof = mock.Mock(side_effect=proof)
+                stack.enter_context(mock.patch.object(
+                    state.importlib.util, "spec_from_file_location",
+                    return_value=SimpleNamespace(loader=mock.Mock()),
+                ))
+                stack.enter_context(mock.patch.object(
+                    state.importlib.util, "module_from_spec", return_value=provider,
+                ))
+                if fault == "successor-validation":
+                    stack.enter_context(mock.patch.object(
+                        state, "_validate_recovery_lease_successor",
+                        side_effect=state.GuardError("EXECUTION_LEASE_UNRESOLVED"),
+                    ))
+                stack.enter_context(mock.patch.object(state, "_open_root", return_value=10))
+                stack.enter_context(mock.patch.object(state.os, "open", return_value=11))
+                stack.enter_context(mock.patch.object(state.os, "close"))
+
+                def write(_fd, name, data, _limit, **_kwargs):
+                    self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+                    key = "current" if name == "current.json" else "lease"
+                    if fault == "before-" + key:
+                        raise OSError("synthetic write failure")
+                    files[key] = json.loads(data)
+                    writes.append(key)
+
+                stack.enter_context(mock.patch.object(state, "_atomic_write", side_effect=write))
+                stack.enter_context(mock.patch.object(
+                    state, "_read_at", side_effect=lambda _fd, name, _limit: state._canonical(
+                        files["current" if name == "current.json" else "lease"],
+                    ),
+                ))
+                check = mock.Mock()
+                args = ("/fixture", lease, self.candidate, completed, b"{}", (
+                    None if fault == "missing-runtime" else b"{}"
+                ), 9, check)
+                if fault == "none":
+                    result = state._reconcile_recovery_lease_locked(*args)
+                    self.assertEqual(["current", "lease"], writes)
+                    self.assertEqual(self.candidate["attempt"], files["current"]["executionAttempt"])
+                    self.assertEqual(completed["runtimeRequest"], files["current"]["runtimeRequest"])
+                    self.assertIsNone(files["current"]["containerId"])
+                    self.assertEqual(previous["createCompletion"], files["lease"]["createCompletion"])
+                    self.assertEqual(hashlib.sha256(state._canonical(files["lease"])).hexdigest(),
+                                     result["digest"])
+                    state.validate_create_completion(
+                        files["current"], files["lease"], raw, acknowledged=True,
+                    )
+                    with self.assertRaises(state.GuardError):
+                        # A successful handoff cannot be replayed as old ownership.
+                        state._reconcile_recovery_lease_locked(*args)
+                else:
+                    with self.assertRaises(state.GuardError):
+                        state._reconcile_recovery_lease_locked(*args)
+                    self.assertEqual(["current"] if fault == "before-lease" else [], writes)
+                self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+                with self.assertRaises(state.GuardError):
+                    state.require_runtime_request_completion(completed)
 
     def test_missing_childlessness_overflow_and_unbound_descendants_never_admit(self):
         for lifecycle in (
@@ -2391,6 +3346,294 @@ class StaleRecoveryLeaseTests(unittest.TestCase):
                         runtime.assert_not_called()
                 finally:
                     state._EXECUTION_CHECK.reset(token)
+
+
+class RecoveryCreateRegistrationTests(unittest.TestCase):
+    """Registration handoff uses durable old proof and never repairs fragments."""
+
+    def setUp(self):
+        fixture = CreateRequestTests()
+        fixture.setUp()
+        self.current = fixture.normal_completed()
+        request = self.current["runtimeRequest"]
+        receipt = {
+            "schema": state.CREATE_COMPLETION_SCHEMA,
+            "requestDigest": state.create_request_digest(request),
+            "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+            "resourcesDigest": request["resourcesDigest"],
+            "resourceRequestDigest": request["resourceRequestDigest"],
+            "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+        }
+        self.receipt = state._canonical(receipt)
+        self.current["runtimeRequest"] = dict(
+            request, completionDigest=hashlib.sha256(self.receipt).hexdigest(),
+        )
+        self.previous = execution_lease(attempt="8" * 32, lifecycle="drained", revision=4)
+        self.previous.update(firstFailure="EXIT", firstStatus=1)
+        self.previous["workers"] = [{"mode": "controller-worker", **self.previous["supervisor"], "pid": 102}]
+        self.previous["createCompletion"] = {
+            **{key: value for key, value in receipt.items() if key != "schema"},
+            "receiptDigest": self.current["runtimeRequest"]["completionDigest"], "acknowledged": True,
+        }
+        self.candidate = execution_lease(attempt="6" * 32, operation="forward-recover")
+        self.candidate.update(t0Ns=1, workEndNs=540_000_000_001, hardEndNs=600_000_000_001)
+        self.candidate["supervisor"] = {**self.previous["supervisor"], "pid": 201}
+        self.candidate["worker"] = {**self.candidate["supervisor"], "pid": 202}
+        self.candidate["workers"] = [{"mode": "controller-worker", **self.candidate["worker"]}]
+        self.successor = dict(self.candidate, createCompletion=self.previous["createCompletion"])
+        self.adopted = dict(self.current, executionAttempt=self.candidate["attempt"])
+        self.baseline = {
+            "lease": self.previous,
+            "currentDigest": hashlib.sha256(state._canonical(self.current)).hexdigest(),
+        }
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        if not hasattr(state.os, "O_DIRECTORY"):
+            self.stack.enter_context(mock.patch.object(state.os, "O_DIRECTORY", 0x10000, create=True))
+        if not hasattr(state.os, "O_NOFOLLOW"):
+            self.stack.enter_context(mock.patch.object(state.os, "O_NOFOLLOW", 0x20000, create=True))
+        self.stack.enter_context(mock.patch.object(state, "deploy_lock", return_value=nullcontext(9)))
+        self.stack.enter_context(mock.patch.object(state, "_open_root", return_value=55))
+        self.stack.enter_context(mock.patch.object(state.os, "open", return_value=56))
+        self.stack.enter_context(mock.patch.object(state.os, "close"))
+        self.stack.enter_context(mock.patch.object(state.os, "fstat", return_value=SimpleNamespace(
+            st_uid=0, st_mode=stat.S_IFDIR | 0o700,
+        )))
+        self.stack.enter_context(mock.patch.object(state, "_require_no_acl"))
+        self.lease_reader = self.stack.enter_context(mock.patch.object(
+            state, "_read_execution_lease_locked", return_value=self.successor,
+        ))
+        self.current_reader = self.stack.enter_context(mock.patch.object(
+            state, "_read_guard_locked", return_value=({}, self.adopted),
+        ))
+        self.receipt_reader = self.stack.enter_context(mock.patch.object(
+            state, "_read_at", return_value=self.receipt,
+        ))
+        self.exited = self.stack.enter_context(mock.patch.object(
+            state, "_execution_process_exited", return_value=True,
+        ))
+        worker = self.candidate["worker"]
+        self.stack.enter_context(mock.patch.object(state, "_execution_process_record", return_value=(
+            worker["bootId"], worker["startTicks"], self.candidate["supervisor"]["pid"],
+        )))
+        self.stack.enter_context(mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True))
+
+    def read(self, *, digest_value=None):
+        return state._read_recovery_registration_snapshot(
+            "/fixture", self.candidate,
+            hashlib.sha256(state._canonical(self.successor)).hexdigest() if digest_value is None else digest_value,
+            self.baseline, deploy_lock_fd=9,
+        )
+
+    def test_exact_normal_completed_and_bound_snapshots_pass_without_mutation_or_context_leak(self):
+        for bound in (False, True):
+            if bound:
+                request = dict(self.current["runtimeRequest"], lifecycle="bound", containerId=digest("c"),
+                               configHash=digest("d"), responseId=digest("c"))
+                self.current = dict(self.current, runtimeRequest=request, containerId=digest("c"), configHash=digest("d"))
+                self.adopted = dict(self.current, executionAttempt=self.candidate["attempt"])
+                self.current_reader.return_value = ({}, self.adopted)
+                self.baseline["currentDigest"] = hashlib.sha256(state._canonical(self.current)).hexdigest()
+            before = state._canonical(self.successor)
+            with self.subTest(bound=bound):
+                self.assertEqual(self.successor, self.read())
+                self.assertEqual(before, state._canonical(self.successor))
+                self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+                if not bound:
+                    with self.assertRaises(state.GuardError):
+                        state.require_runtime_request_completion(self.adopted)
+
+    def test_missing_mutated_or_unacknowledged_completion_never_imports(self):
+        evidence = self.successor["createCompletion"]
+        for changed in (
+            None, dict(evidence, acknowledged=False), dict(evidence, requestDigest=digest("f")),
+            dict(evidence, receiptDigest=digest("f")), dict(evidence, resourcesDigest=digest("f")),
+            dict(evidence, childIdentity=dict(evidence["childIdentity"], startTicks=999)),
+            dict(evidence, executionAttempt="7" * 32),
+        ):
+            self.successor = dict(self.successor, createCompletion=changed)
+            self.lease_reader.return_value = self.successor
+            with self.subTest(completion=changed), self.assertRaises(state.GuardError):
+                self.read()
+            self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+
+    def test_wrong_digest_receipt_old_process_proof_and_incident_refuse(self):
+        with self.assertRaisesRegex(state.GuardError, "SNAPSHOT_CONFLICT"):
+            self.read(digest_value=digest("f"))
+        for raw in (b"", b"{}", self.receipt + b"\n", self.receipt.replace(b'"waitStatus":0', b'"waitStatus":1')):
+            self.receipt_reader.return_value = raw
+            with self.subTest(receipt=raw), self.assertRaises(state.GuardError):
+                self.read()
+        self.receipt_reader.return_value = self.receipt
+        for identity in (self.previous["supervisor"], *self.previous["workers"]):
+            self.exited.side_effect = lambda row: row != identity
+            with self.subTest(identity=identity), self.assertRaises(state.GuardError):
+                self.read()
+        self.exited.side_effect = None
+        for changed in (
+            dict(self.adopted, executionAttempt="7" * 32), dict(self.adopted, reason="DRIFT"),
+            dict(self.adopted, runtimeRequest=dict(self.adopted["runtimeRequest"], nonce="1" * 32)),
+        ):
+            self.current_reader.return_value = ({}, changed)
+            with self.subTest(current=changed), self.assertRaises(state.GuardError):
+                self.read()
+        self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+
+    def test_replayed_foreign_or_changed_registration_snapshot_refuses(self):
+        original = self.successor
+        for key, value in (
+            ("attempt", "7" * 32), ("revision", 1), ("lifecycle", "armed"),
+            ("supervisor", dict(original["supervisor"], startTicks=999)),
+            ("workers", []), ("workEndNs", original["workEndNs"] + 1),
+        ):
+            self.successor = dict(original, **{key: value})
+            self.lease_reader.return_value = self.successor
+            with self.subTest(field=key), self.assertRaises(state.GuardError):
+                self.read()
+        self.successor = original
+        self.lease_reader.return_value = None
+        with self.assertRaises(state.GuardError):
+            self.read()
+
+    def test_readback_races_and_later_erasure_refuse(self):
+        self.lease_reader.side_effect = [self.successor, self.successor, dict(self.successor, createCompletion=None)]
+        with self.assertRaises(state.GuardError):
+            self.read()
+        self.lease_reader.side_effect = None
+        self.current_reader.side_effect = [({}, self.adopted), ({}, dict(self.adopted, reason="DRIFT"))]
+        with self.assertRaises(state.GuardError):
+            self.read()
+        for completion in (None, dict(self.successor["createCompletion"], receiptDigest=digest("f"))):
+            with self.subTest(completion=completion), self.assertRaisesRegex(state.GuardError, "COMPLETION_CONFLICT"):
+                state._validate_lease_successor(
+                    self.successor, dict(self.successor, revision=1, lifecycle="armed", createCompletion=completion),
+                )
+
+    def test_non_create_registration_imports_nothing(self):
+        legacy = RuntimeRequestTests()
+        legacy.setUp()
+        self.adopted = dict(legacy.completed(), executionAttempt=self.candidate["attempt"])
+        self.current_reader.return_value = ({}, self.adopted)
+        self.successor = dict(self.candidate)
+        self.lease_reader.return_value = self.successor
+        self.assertEqual(self.candidate, self.read())
+        self.receipt_reader.assert_not_called()
+
+    def test_replacement_create_registration_requires_exact_acknowledged_receipt(self):
+        current = state.advance_state(prepared_state(), "CUTOVER_POSSIBLE")
+        current = bind_created_state(current, digest("c"), digest("d"))
+        current = state.advance_state(current, "VERIFYING")
+        current = state.advance_state(
+            current, "COMMITTING", commitWitnessDigest=digest("e"),
+            providerFinalizationDigest=digest("f"), commitSubstep="provider-cleanup",
+        )
+        current = state.advance_state(
+            current, "COMMITTING", commitSubstep="replacement-create-intent",
+        )
+        sequence = int(current["latestAttemptId"].split(":")[1]) + 1
+        child = dict(owned_child(sequence=sequence), attemptId=current["incidentId"] + f":{sequence}")
+        request = create_request(current, child, replacement=True)
+        current = state.advance_state(
+            current, "COMMITTING", ownedChild=child, latestAttemptId=child["attemptId"],
+            runtimeRequest=request,
+        )
+        intent = current
+        for lifecycle in ("released", "reaped"):
+            current = state.advance_state(
+                current, "COMMITTING", ownedChild=dict(child, lifecycle=lifecycle),
+            )
+        receipt = {
+            "schema": state.CREATE_COMPLETION_SCHEMA,
+            "requestDigest": state.create_request_digest(request),
+            "executionAttempt": request["executionAttempt"],
+            "childIdentity": request["childIdentity"],
+            "resourcesDigest": request["resourcesDigest"],
+            "resourceRequestDigest": request["resourceRequestDigest"],
+            "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+        }
+        raw = state._canonical(receipt)
+        token = state._CREATE_COMPLETION_PUBLICATION.set(True)
+        try:
+            completed = state.advance_state(
+                current, "COMMITTING", ownedChild=None,
+                runtimeRequest=dict(
+                    request, lifecycle="normal-completed",
+                    completionDigest=hashlib.sha256(raw).hexdigest(),
+                ),
+            )
+        finally:
+            state._CREATE_COMPLETION_PUBLICATION.reset(token)
+        completion = {
+            **{key: value for key, value in receipt.items() if key != "schema"},
+            "receiptDigest": completed["runtimeRequest"]["completionDigest"],
+            "acknowledged": True,
+        }
+        previous = dict(self.previous, createCompletion=completion)
+        candidate = dict(self.candidate)
+        successor = dict(candidate, createCompletion=completion)
+        adopted = dict(completed, executionAttempt=candidate["attempt"])
+        self.previous, self.candidate = previous, candidate
+        self.successor, self.adopted = successor, adopted
+        self.baseline = {
+            "lease": previous,
+            "currentDigest": hashlib.sha256(state._canonical(completed)).hexdigest(),
+        }
+        self.current_reader.return_value = ({}, adopted)
+        self.lease_reader.return_value = successor
+        self.receipt_reader.return_value = raw
+
+        with mock.patch.object(state, "_execution_process_record", return_value=(
+            candidate["worker"]["bootId"], candidate["worker"]["startTicks"],
+            candidate["supervisor"]["pid"],
+        )), mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True):
+            self.assertEqual(successor, self.read())
+
+            for fault, changed in (
+                ("intent", dict(successor, createCompletion=None)),
+                ("missing", successor | {"createCompletion": None}),
+                ("receipt", successor | {"createCompletion": dict(completion, receiptDigest=digest("f"))}),
+                ("acknowledgment", successor | {
+                    "createCompletion": dict(completion, acknowledged=False),
+                }),
+            ):
+                with self.subTest(fault=fault):
+                    self.lease_reader.return_value = changed
+                    self.current_reader.return_value = (
+                        ({}, dict(intent, executionAttempt=candidate["attempt"]))
+                        if fault == "intent" else ({}, adopted)
+                    )
+                    with self.assertRaises(state.GuardError):
+                        self.read()
+                    self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+
+    def test_reconcile_keeps_completion_exception_through_validation_only(self):
+        provider = SimpleNamespace(
+            ProviderError=RuntimeError,
+            _recovery_lease_runtime_proof=mock.Mock(return_value=self.current["runtimeRequest"]),
+        )
+        self.lease_reader.return_value = self.previous
+        self.current_reader.return_value = ({}, self.current)
+        spec = SimpleNamespace(loader=mock.Mock())
+        written = {}
+
+        def write(_fd, name, raw, _limit, *, replace):
+            self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+            written[name] = raw
+
+        def read(_fd, name, _limit):
+            return written.get(name, self.receipt)
+
+        with mock.patch.object(state.importlib.util, "spec_from_file_location", return_value=spec), \
+                mock.patch.object(state.importlib.util, "module_from_spec", return_value=provider), \
+                mock.patch.object(state, "_atomic_write", side_effect=write), \
+                mock.patch.object(state, "_read_at", side_effect=read):
+            result = state._reconcile_recovery_lease_locked(
+                "/fixture", self.previous, self.candidate, self.current, b"{}", b"{}", 9, mock.Mock(),
+            )
+        self.assertEqual(hashlib.sha256(written[state.EXECUTION_LEASE_NAME]).hexdigest(), result["digest"])
+        self.assertEqual(self.successor, json.loads(written[state.EXECUTION_LEASE_NAME]))
+        self.assertEqual(self.adopted, json.loads(written["current.json"]))
+        self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
 
 
 @unittest.skipUnless(
@@ -3036,6 +4279,41 @@ class TimepadStateTests(unittest.TestCase):
         )
         self.assertEqual(("refuse", "CONTRACT_INACTIVE_OR_WRONG_ROOT"), (result.disposition, result.reason))
 
+    def test_optional_tooling_schema_is_bounded_pinned_and_not_authority(self) -> None:
+        tooling = {
+            "dockerCliVersion": "28.3.3", "composeVersion": "2.39.4",
+            "composeCommit": "a32dc3da722e6b2e4fbfc72e40b1a697c4686460",
+            "dockerCliPath": "/opt/pinned/docker", "composePluginPath": "/opt/pinned/docker-compose",
+            "dockerCliSha256": "a" * 64, "composePluginSha256": "b" * 64,
+            "platform": "linux/amd64", "provenanceRef": "fixture-only-not-production-approval",
+        }
+        for active in (False, True):
+            approved = {**contract(active), "tooling": tooling}
+            self.assertEqual(approved, state.parse_contract(json.dumps(approved).encode()))
+        approved = {**contract(False), "tooling": tooling}
+        result = state.admit(
+            approved, root_id="test-root", target_id="x", predecessor_id="y",
+            transition_id=None, target_tuple=None, predecessor_tuple=None,
+        )
+        self.assertEqual("refuse", result.disposition)
+        for key in tooling:
+            with self.subTest(missing=key), self.assertRaises(state.GuardError):
+                state.parse_contract({**approved, "tooling": {k: v for k, v in tooling.items() if k != key}})
+        invalid = [None, {}, {**tooling, "unknown": "x"}]
+        invalid.extend({**tooling, key: value} for key, value in (
+            ("dockerCliVersion", "29.0.0"), ("composeVersion", "2.40.0"),
+            ("composeCommit", "f" * 40), ("dockerCliPath", "relative/docker"),
+            ("dockerCliPath", "/opt/../docker"), ("dockerCliPath", "/opt//docker"),
+            ("dockerCliPath", "/opt/docker/"), ("dockerCliPath", "/opt/not-docker"),
+            ("composePluginPath", "/opt/./docker-compose"),
+            ("dockerCliSha256", "A" * 64), ("composePluginSha256", "a" * 63),
+            ("platform", "linux/386"), ("provenanceRef", ""), ("provenanceRef", "x" * 513),
+            ("provenanceRef", "private\x00value"), ("dockerCliSha256", True),
+        ))
+        for value in invalid:
+            with self.subTest(invalid=value), self.assertRaises(state.GuardError):
+                state.parse_contract({**approved, "tooling": value})
+
     def test_strict_contract_rejects_duplicates_unknown_keys_and_incomplete_authority(self) -> None:
         valid = contract()
         state.parse_contract(valid)
@@ -3217,10 +4495,8 @@ class TimepadStateTests(unittest.TestCase):
             reason="CUTOVER_ACKNOWLEDGED",
         )
         verifying = state.advance_state(
-            barrier,
+            bind_created_state(barrier, "b" * 64, digest("3")),
             "VERIFYING",
-            containerId="a" * 64,
-            configHash=digest("3"),
         )
         commit_witness = digest("4")
         provider_witness = digest("5")

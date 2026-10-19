@@ -81,6 +81,100 @@ export TEST_VPS_STATE_ROOT=$state_root
 export TIMEPAD_FIXTURE_ADAPTER_DIR=$fixture_bin
 export PATH="$runtime_bin:$safe_path"
 export PYTHONDONTWRITEBYTECODE=1
+controller_create_contracts() {
+  # Portable function contracts complement, never replace, the actual isolated
+  # controller/supervisor rows below. Only external proof/runtime calls are fake.
+  python3 -B - "$controller" <<'PY'
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+def function(name):
+    match = re.search(r"^" + re.escape(name) + r"\(\) \{\n.*?^\}", source, re.M | re.S)
+    if match is None:
+        raise AssertionError(name)
+    return match.group()
+
+class CreateControllerContracts(unittest.TestCase):
+    def bash(self):
+        if os.name == "nt":
+            return str(pathlib.Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+        return shutil.which("bash")
+
+    def test_binding_delegates_to_fixed_authenticated_driver_action(self):
+        script = r"""
+set -euo pipefail
+timepad_create_action() {
+  [ "$*" = "reconcile-bound initial" ] || return 90
+  jq -cn '{containerId:("c" * 64),configHash:("d" * 64)}'
+}
+"""
+        script += function("timepad_request_bind_create")
+        script += r"""
+timepad_request_bind_create
+jq -en --arg id "$candidate_container" --arg hash "$target_hash" \
+  '$id == ("c" * 64) and $hash == ("d" * 64)' >/dev/null
+"""
+        result = subprocess.run([self.bash(), "-s"], input=script, text=True, capture_output=True, timeout=60)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_binding_and_child_intent_are_single_state_publications(self):
+        for role in ("initial", "replacement"):
+            for lifecycle in ("intent", "bound"):
+                request = {
+                    "operation": "create", "role": role, "lifecycle": lifecycle,
+                    "childAttemptId": "a" * 32 + ":1", "containerId": "b" * 64,
+                    "configHash": "c" * 64,
+                }
+                child = {"attemptId": request["childAttemptId"], "lifecycle": "waiting"}
+                with self.subTest(role=role, lifecycle=lifecycle), tempfile.TemporaryDirectory() as temporary:
+                    result = subprocess.run([self.bash(), "-s", "--",
+                        pathlib.Path(temporary).as_posix(), json.dumps(request), json.dumps(child)],
+                        input=r"""
+set -euo pipefail
+state=$1
+state_root=fixture-root
+timepad_helper=fixture-state
+timeout() {
+  case "$4" in
+    read-state) echo '{"current":{"phase":"FORWARD_RECOVERING"}}' ;;
+    advance) jq -c . "$state/.timepad-request-changes.json" >&2 ;;
+    *) return 90 ;;
+  esac
+}
+""" + function("timepad_request_publish") + '\ntimepad_request_publish "$2" "$3"\n',
+                        text=True, capture_output=True, timeout=60)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    changes = json.loads(result.stderr)["changes"]
+                    self.assertEqual(request, changes["runtimeRequest"])
+                    if lifecycle == "intent":
+                        self.assertEqual(child, changes["ownedChild"])
+                        self.assertEqual(request["childAttemptId"], changes["latestAttemptId"])
+                        self.assertNotIn("containerId", changes)
+                    else:
+                        self.assertEqual(request["containerId"], changes["containerId"])
+                        self.assertEqual(request["configHash"], changes["configHash"])
+                        self.assertNotIn("ownedChild", changes)
+                        if role == "replacement":
+                            self.assertEqual("replacement-container-authorized", changes["commitSubstep"])
+                        else:
+                            self.assertNotIn("commitSubstep", changes)
+
+unittest.main(argv=[sys.argv[0]])
+PY
+}
+controller_create_contracts
+timeout --kill-after=5s 120s python3 -B scripts/test-test-vps-timepad-create.py
+timeout --kill-after=5s 600s python3 -B "$fixture_bin/resource-matrix.py"
 timeout --kill-after=5s 600s python3 -B "$fixture_bin/admission-cancellation.py" bootstrap
 timeout --kill-after=5s 360s python3 -B "$fixture_bin/admission-cancellation.py" cancellation
 common_args=(

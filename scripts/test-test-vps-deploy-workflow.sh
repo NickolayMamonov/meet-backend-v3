@@ -62,6 +62,7 @@ for text in \
   'first transition requires explicit proof and drill=false' \
   'scripts/test_vps_timepad_state.py' \
   'scripts/test_vps_timepad_supervisor.py' \
+  'scripts/test_vps_timepad_create.py' \
   'scripts/test-vps-timepad-release-contracts.json' \
   'check-contract --contract scripts/test-vps-timepad-release-contracts.json' \
   'contract_check" >/dev/null' \

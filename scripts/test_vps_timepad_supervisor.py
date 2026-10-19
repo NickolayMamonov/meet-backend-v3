@@ -6,9 +6,10 @@ Public entry::
     python3 -B test_vps_timepad_supervisor.py relay --root ROOT \
         --operation deploy -- ORIGINAL_CONTROLLER_ARGUMENTS
 
-The only executable selected by this module is the sibling controller, invoked
-as ``bash SCRIPT --timepad-private-worker MODE ...``. MODE is one of the four
-WORKER_MODES below. That entry must call ``client --root ROOT hello`` before
+The shell executable selected by this module is the sibling controller's four
+fixed ``--timepad-private-worker MODE`` entries. Guarded create stages call the
+fixed private Python module directly after fork. No RPC supplies argv.
+The worker entry must call ``client --root ROOT hello`` before
 doing anything else. Environment variables bind the private socket but do not
 replace it or FD9. Each shell/helper RPC uses its own SCM_RIGHTS reply socket;
 concurrent command substitutions cannot consume one another's replies.
@@ -22,6 +23,9 @@ Worker contract (also exposed by WorkerClient):
   lease. After ack, ``recovery-admission`` grants permit only fixed read-only
   controller calls while registered; neither grant authorizes runtime mutation
   or unresolved old-lease replacement.
+  Initial registration ACK reads back the exact successor in a bounded
+  read-only child, retaining only its proved acknowledged create completion.
+  The event loop imports no caller-supplied completion fields.
 * ``lease`` obtains the current immutable publication snapshot/revision.
   Publish it durably using the state helper under a ``lease-publish`` grant,
   complete that grant, then ``lease-ack REV DIGEST``. No other work grant is
@@ -43,9 +47,18 @@ Worker contract (also exposed by WorkerClient):
   nonzero status. Only a fixed refusal code may cross the public relay, and
   only after the final childless publication, never on unconfirmed cleanup.
 * ``cancel REASON STATUS`` revokes forward work. Traps never do rollback.
+* ``create-launch`` returns the kernel-observed waiting launcher identity.
+  ``create-release`` admits the durable request and resource baseline through
+  a fixed read-only helper, then opens its gate once. ``create-result`` never
+  renews authority: ready requires the launcher's authenticated local ECHILD
+  result and the supervisor's independent exact zero wait, without adopted
+  descendants. ``create-completion`` parks only the authenticated controller
+  caller chain and refuses surviving publishers/other grants. The sole private
+  publisher validates supervisor wait evidence, clears ownedChild and publishes
+  receipt/current/lease readbacks before the chain resumes and ACK returns.
 
-Lease disk publication and semantic rollback/runtime admission belong to the
-fixed workers/state helper, not this event loop. This module never treats
+Disk publication and semantic rollback/runtime admission belong to the fixed
+workers/state helper or sole completion publisher, not this event loop. This module never treats
 process reap as proof that a Docker request finished. Its terminal message is
 an explicit worker acknowledgement of that separate proof.
 
@@ -59,6 +72,7 @@ import argparse
 import array
 import ctypes
 import errno
+import hashlib
 import json
 import math
 import os
@@ -74,6 +88,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+from test_vps_timepad_create import (
+    Action, CreateContext, CreateDriver, CreateError, RealTransport, Role, Selection,
+    Transport, canonical as create_canonical, read_evidence, wait_create, write_evidence,
+)
 
 NS = 1_000_000_000
 MAX_FRAME = 4096
@@ -103,6 +122,8 @@ SUCCESS_OUTCOMES = {
     "already-completed": ("forward-recover", "committed"),
 }
 REFUSAL_OUTCOMES = {"RECOVERY_RETRY_RUNTIME_FAILED": "forward-recover"}
+CREATE_STAGES = frozenset({"release-admission", "execute", "completion-admission"})
+CREATE_ATTEMPT = re.compile(r"^[a-f0-9]{32}:[1-9][0-9]{0,19}$")
 
 
 class SupervisorError(Exception):
@@ -197,6 +218,103 @@ class Grant:
         }
 
 
+@dataclass
+class RecoveryRegistrationAck:
+    """One bounded read-only child, not worker-supplied completion evidence."""
+
+    pid: int
+    reply: socket.socket
+    channel: socket.socket | None
+    digest: str
+    end_ns: int
+    status: int | None = None
+    snapshot: dict[str, Any] | None = None
+
+
+class CreateAttempt:
+    """One fixed launcher and one completion; caller assertions never supply waits."""
+
+    def __init__(self, role: str, attempt_id: str, grant: Grant):
+        if not isinstance(role, str) or role not in {"initial", "replacement"} or \
+                not isinstance(attempt_id, str) or \
+                CREATE_ATTEMPT.fullmatch(attempt_id) is None or \
+                int(attempt_id.split(":")[1]) >= 1 << 64:
+            reject()
+        self.role, self.attempt_id, self.grant = role, attempt_id, grant
+        self.identity: dict[str, Any] | None = None
+        self.request: dict[str, Any] | None = None
+        self.request_digest: str | None = None
+        self.phase = "waiting"
+        self.released = False
+        self.result: dict[str, Any] | None = None
+        self.wait_status: int | None = None
+        self.completion_issued = False
+
+    def bind_request(self, request: dict[str, Any], digest: str, identity: Any) -> None:
+        from test_vps_timepad_state import GuardError, create_request_digest, runtime_request
+
+        try:
+            request = runtime_request(request)
+            if self.phase != "checking-release" or self.released or \
+                    request["operation"] != "create" or request["lifecycle"] != "intent" or \
+                    request["role"] != self.role or request["executionAttempt"] != self.grant.attempt or \
+                    request["childAttemptId"] != self.attempt_id or \
+                    request["childIdentity"] != self.identity or identity != self.identity or \
+                    create_request_digest(request) != digest:
+                reject()
+        except GuardError:
+            reject()
+        self.request, self.request_digest = request, digest
+
+    def release(self) -> None:
+        if self.phase != "checking-release" or self.released or self.request is None:
+            reject()
+        self.released, self.phase = True, "running"
+
+    def observe_result(self, result: dict[str, Any]) -> None:
+        if self.phase != "running" or self.result is not None or \
+                type(result.get("waitStatus")) is not int or \
+                result.get("descendantsDrained") is not True or result != {
+            "kind": "create-result", "attempt": self.grant.attempt,
+            "requestDigest": self.request_digest, "childIdentity": self.identity,
+            "waitStatus": 0, "descendantsDrained": True,
+        }:
+            reject("OWNERSHIP_UNCERTAIN")
+        self.result = result
+
+    def ready(self, *, unexpected_children: bool, now: int) -> bool:
+        if self.phase == "ready":
+            if unexpected_children or now >= self.grant.end_ns:
+                reject("OWNERSHIP_UNCERTAIN")
+            return True
+        if self.phase != "running" or self.result is None or self.wait_status is None:
+            return False
+        if self.wait_status != 0 or unexpected_children or now >= self.grant.end_ns:
+            reject("OWNERSHIP_UNCERTAIN")
+        self.phase = "ready"
+        return True
+
+    def begin_completion(self, digest: str, identity: Any) -> None:
+        if self.phase != "ready" or self.completion_issued or \
+                digest != self.request_digest or identity != self.identity:
+            reject()
+        self.completion_issued, self.phase = True, "checking-completion"
+
+    def receipt(self) -> dict[str, Any]:
+        if self.phase not in {"checking-completion", "publishing", "completed"} or \
+                self.wait_status != 0 or self.result is None or self.request is None:
+            reject("OWNERSHIP_UNCERTAIN")
+        from test_vps_timepad_state import CREATE_COMPLETION_SCHEMA
+
+        return {
+            "schema": CREATE_COMPLETION_SCHEMA, "requestDigest": self.request_digest,
+            "executionAttempt": self.grant.attempt, "childIdentity": self.identity,
+            "resourcesDigest": self.request["resourcesDigest"],
+            "resourceRequestDigest": self.request["resourceRequestDigest"],
+            "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+        }
+
+
 class Attempt:
     """Single source of authority for clocks, cancellation and grant issuance."""
 
@@ -222,6 +340,7 @@ class Attempt:
         self.rollback_issued = False
         self.rollback_admitted = False
         self.rollback_admission_completed = False
+        self.recovery_registration_completed = False
         self.grants: dict[str, Grant] = {}
         self.idle_end = self.clock() + timing.idle_ns
         self.drain_end: int | None = None
@@ -324,7 +443,9 @@ class Attempt:
         if registration or admission:
             if self.operation != "forward-recover" or self.role != "controller-worker" or \
                     self.lifecycle != "registered" or self.first_reason is not None or \
-                    registration and (self.revision != 0 or self.grants):
+                    registration and (
+                        self.revision != 0 or self.grants or self.recovery_registration_completed
+                    ):
                 reject("WAIT_REFUSED")
             local_ns = min(local_ns, 30 * NS)
         if name not in {"lease-publish", "recovery-registration"} and \
@@ -371,6 +492,8 @@ class Attempt:
         del self.grants[grant_id]
         if grant.name == "rollback-admission":
             self.rollback_admission_completed = True
+        if grant.name == "recovery-registration":
+            self.recovery_registration_completed = True
         self.idle_end = self.clock() + self.timing.idle_ns
 
     def validate_grant(self, grant_id: str, end_ns: int) -> Grant:
@@ -586,6 +709,8 @@ def socket_pair() -> tuple[socket.socket, socket.socket]:
     pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     for endpoint in pair:
         endpoint.setblocking(False)
+        if hasattr(socket, "SO_PASSCRED"):
+            endpoint.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
     return pair
 
 
@@ -598,11 +723,22 @@ def send_frame(channel: socket.socket, frame: dict[str, Any], fd: int | None = N
         reject()
 
 
-def receive_frame(channel: socket.socket, *, accept_fd: bool = False) -> tuple[dict[str, Any], int | None]:
-    data, ancillary, flags, _ = channel.recvmsg(MAX_FRAME + 1, socket.CMSG_SPACE(4 * 4))
+def receive_frame(
+    channel: socket.socket, *, accept_fd: bool = False,
+    peer: list[ProcessIdentity] | None = None,
+) -> tuple[dict[str, Any], int | None]:
+    data, ancillary, flags, _ = channel.recvmsg(
+        MAX_FRAME + 1, socket.CMSG_SPACE(4 * 4) + socket.CMSG_SPACE(12),
+    )
     descriptors: list[int] = []
+    credentials = None
     try:
         for level, kind, raw in ancillary:
+            if level == socket.SOL_SOCKET and kind == getattr(socket, "SCM_CREDENTIALS", -1):
+                if credentials is not None or len(raw) != 12:
+                    reject()
+                credentials = struct.unpack("3i", raw)
+                continue
             if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
                 reject()
             values = array.array("i")
@@ -612,6 +748,13 @@ def receive_frame(channel: socket.socket, *, accept_fd: bool = False) -> tuple[d
                 len(descriptors) != (1 if accept_fd else 0):
             reject()
         frame = decode(data)
+        if peer is not None:
+            if credentials is None or credentials[2] != os.geteuid():
+                reject("PRIVATE_WORKER_REQUIRED")
+            actual = process_identity(_integer(credentials[0], 1))
+            if actual.uid != credentials[2]:
+                reject("PRIVATE_WORKER_REQUIRED")
+            peer.append(actual)
         fd = descriptors.pop() if descriptors else None
         if fd is not None:
             os.set_inheritable(fd, False)
@@ -714,10 +857,11 @@ class Children:
 class WorkerClient:
     """Private descriptor-capability RPC, usable by shell and Python helpers."""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, *, end_ns: int | None = None):
         from test_vps_timepad_state import GuardError, deploy_lock
 
         self.channel: socket.socket | None = None
+        self.end_ns = end_ns
         try:
             fd = int(os.environ["TIMEPAD_CONTROL_FD"])
             self.attempt = _nonce(os.environ["TIMEPAD_ATTEMPT"])
@@ -754,7 +898,17 @@ class WorkerClient:
                 "kind": kind, "attempt": self.attempt, "role": self.role, **fields,
             }, passed.fileno())
             passed.close()
-            _wait_readable(reply, time.monotonic_ns() + 5 * NS)
+            # Fixed read-only admission and completion include their existing
+            # bounded helper waits. Polling never changes the attempt clock.
+            wait = 45 if kind == "create-completion" else 35 if kind == "create-release" else 5
+            end = time.monotonic_ns() + wait * NS
+            if kind == "create-driver":
+                if self.end_ns is None:
+                    reject("PRIVATE_WORKER_REQUIRED")
+                end = self.end_ns
+            elif self.end_ns is not None:
+                end = min(end, self.end_ns)
+            _wait_readable(reply, end)
             response, _ = receive_frame(reply)
             if response.get("attempt") != self.attempt or response.get("supervisor") != self.supervisor:
                 reject()
@@ -765,19 +919,145 @@ class WorkerClient:
             reply.close()
             passed.close()
 
+    def recovery_evidence(self, root: str, arguments: list[str]) -> bytes:
+        """Read the single inherited pipe, not an unbounded RPC response."""
+        from test_vps_timepad_create import recovery_binding
+
+        if self.end_ns is None:
+            reject()
+        reply, passed = socket_pair()
+        evidence_fd = None
+        try:
+            assert self.channel is not None
+            peer = process_identity(os.getpid())
+            send_frame(self.channel, {
+                "kind": "recovery-evidence", "attempt": self.attempt, "role": self.role,
+            }, passed.fileno())
+            passed.close()
+            _wait_readable(reply, min(self.end_ns, time.monotonic_ns() + 5 * NS))
+            response, evidence_fd = receive_frame(reply, accept_fd=True)
+            if response != {
+                "ok": True, "attempt": self.attempt, "supervisor": self.supervisor,
+                "value": {"evidence": "private-pipe"},
+            } or evidence_fd is None:
+                reject()
+            context = CreateContext(root, Selection.from_arguments(arguments), self.end_ns, Role.INITIAL)
+            expected = recovery_binding(context, self.attempt)
+            expected["peer"] = peer.frame()
+            evidence = read_evidence(evidence_fd, expected, self.end_ns)
+            # Cancellation revocation, selectors and frozen input revalidation
+            # precede the registered worker's existing state/provider validators.
+            if recovery_binding(context, self.attempt) != {key: value for key, value in expected.items() if key != "peer"}:
+                reject("GRANT_REVOKED")
+            grant = decode(os.environ["TIMEPAD_RECOVERY_EVIDENCE_GRANT"].encode())
+            if self.request("validate-grant", grantId=grant["grantId"], endNs=grant["endNs"]) != grant:
+                reject("GRANT_REVOKED")
+            return evidence
+        finally:
+            if evidence_fd is not None:
+                os.close(evidence_fd)
+            reply.close()
+            passed.close()
+
     def close(self) -> None:
         if self.channel is not None:
             self.channel.close()
 
 
+def _create_environment(
+    control: int, attempt: str, identity: dict[str, Any], grant: Grant,
+    request_digest: str | None,
+) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.update({
+        "TIMEPAD_CONTROL_FD": str(control), "TIMEPAD_ATTEMPT": attempt,
+        "TIMEPAD_SUPERVISOR": encode(identity).decode(),
+        "TIMEPAD_WORKER_MODE": "controller-worker",
+        "TIMEPAD_CREATE_GRANT": encode(grant.frame()).decode(),
+        "TIMEPAD_CREATE_REQUEST_DIGEST": request_digest or "",
+    })
+    return environment
+
+
+def _fixed_create_stage(
+    stage: str, context: CreateContext, transport: Transport,
+    environment: dict[str, str],
+) -> dict[str, Any]:
+    """Read-only fixed module call; constructor transport survives every fork."""
+    if stage not in CREATE_STAGES:
+        reject()
+    linux_preflight()
+    os.environ.update(environment)
+    client = WorkerClient(context.state_root, end_ns=context.end_ns)
+    try:
+        driver = CreateDriver(context, transport, client)
+        result = driver.check_stage(
+            stage, decode(environment["TIMEPAD_CREATE_GRANT"].encode()),
+            environment["TIMEPAD_CREATE_REQUEST_DIGEST"],
+        )
+        if stage == "execute":
+            wait_create(transport.spawn_create(driver.context, (9,)), driver.context)
+            return {}
+        return result
+    except CreateError:
+        reject("OWNERSHIP_UNCERTAIN")
+    finally:
+        client.close()
+
+
+def _create_launcher(
+    channel: socket.socket, identity: dict[str, Any], attempt: str,
+    grant: Grant, context: CreateContext, transport: Transport,
+    environment: dict[str, str],
+) -> None:
+    linux_preflight()
+    os.setsid()
+    observed = process_identity(os.getpid())
+    identity = {
+        **identity, "pid": observed.pid, "processGroup": observed.pid,
+        "startTicks": observed.start, "bootId": boot_id(),
+    }
+    send_frame(channel, {
+        "kind": "create-hello", "attempt": attempt, "childIdentity": identity,
+    })
+    _wait_readable(channel, grant.end_ns)
+    release, _ = receive_frame(channel)
+    if set(release) != {"kind", "attempt", "requestDigest", "childIdentity"} or \
+            release["kind"] != "create-release" or release["attempt"] != attempt or \
+            release["childIdentity"] != identity or \
+            not isinstance(release["requestDigest"], str) or \
+            DIGEST.fullmatch(release["requestDigest"]) is None:
+        reject()
+    environment["TIMEPAD_CREATE_REQUEST_DIGEST"] = release["requestDigest"]
+    _fixed_create_stage("execute", context, transport, environment)
+    # wait_create requires the exact transport child status and kernel ECHILD.
+    send_frame(channel, {
+        "kind": "create-result", "attempt": attempt,
+        "requestDigest": release["requestDigest"], "childIdentity": identity,
+        "waitStatus": 0, "descendantsDrained": True,
+    })
+
+
 class Supervisor:
     def __init__(
         self, root: str, operation: str, arguments: list[str], relay: socket.socket,
-        *, timing: Timing = Timing(),
+        *, timing: Timing = Timing(), create_transport: Transport | None = None,
     ):
         linux_preflight()
         self.attempt = Attempt(operation, timing=timing)
         self.root, self.arguments, self.relay = root, arguments, relay
+        self.create_transport = RealTransport() if create_transport is None else create_transport
+        self.driver_pid: int | None = None
+        self.driver_identity: ProcessIdentity | None = None
+        self.driver_channel: socket.socket | None = None
+        self.driver_rpc: socket.socket | None = None
+        self.driver_reply: socket.socket | None = None
+        self.driver_result: dict[str, Any] | None = None
+        self.driver_status: int | None = None
+        self.driver_action: Action | None = None
+        self.driver_end: int | None = None
+        self.evidence_pid: int | None = None
+        self.evidence_used = False
         me = process_identity(os.getpid())
         self.identity = {"pid": me.pid, "startTicks": me.start, "bootId": boot_id()}
         self.children = Children()
@@ -800,6 +1080,28 @@ class Supervisor:
         self.completion_ack: dict[str, Any] | None = None
         self.completion_grant: Grant | None = None
         self.completion_snapshot: dict[str, Any] | None = None
+        self.create: CreateAttempt | None = None
+        self.create_channel: socket.socket | None = None
+        self.create_launcher_rpc: socket.socket | None = None
+        self.create_pid: int | None = None
+        self.create_pidfd: int | None = None
+        self.create_reply: socket.socket | None = None
+        self.create_caller: ProcessIdentity | None = None
+        self.create_handshake_end: int | None = None
+        self.create_helper_pid: int | None = None
+        self.create_helper_channel: socket.socket | None = None
+        self.create_helper_rpc: socket.socket | None = None
+        self.create_helper_identity: ProcessIdentity | None = None
+        self.create_helper_status: int | None = None
+        self.create_helper_result: dict[str, Any] | None = None
+        self.create_helper_stage: str | None = None
+        self.create_completion_evidence: dict[str, Any] | None = None
+        self.recovery_baseline: dict[str, Any] | None = None
+        self.registration_grant: Grant | None = None
+        self.registration_ack: RecoveryRegistrationAck | None = None
+        self.create_parked: list[tuple[ProcessIdentity, int]] = []
+        self.create_park_end: int | None = None
+        self.last_create_sequence = 0
         self.attempt.on_change = self._record_lease
 
     def _signal(self, number: int, _frame: Any) -> None:
@@ -811,6 +1113,7 @@ class Supervisor:
             **self.attempt.lease(), "supervisor": self.identity,
             "worker": self.worker_identity, "workerMode": self.attempt.role,
             "workers": list(self.worker_identities),
+            "createCompletion": getattr(self, "create_completion_evidence", None),
         }
 
     def _record_lease(self) -> None:
@@ -823,6 +1126,107 @@ class Supervisor:
             key: snapshot for key, snapshot in self.lease_snapshots.items() if key > revision
         }
 
+    def _begin_registration_ack(self, revision: int, digest: str, reply: socket.socket) -> None:
+        if (
+            revision != 0 or self.attempt.revision != 0
+            or self.attempt.lifecycle != "registered" or self.attempt.operation != "forward-recover"
+            or not self.attempt.recovery_registration_completed
+            or self.attempt.acked_revision != -1 or self.attempt.grants
+            or self.registration_ack is not None or self.create_completion_evidence is not None
+            or self.recovery_baseline is None
+            or self.registration_grant is None
+            or not isinstance(digest, str) or DIGEST.fullmatch(digest) is None
+        ):
+            reject("LEASE_ACK_INVALID")
+        assert self.lock_fd is not None and self.attempt.work_end is not None
+        end = min(
+            self.attempt.clock() + self.attempt.timing.handshake_ns, self.attempt.work_end,
+            self.registration_grant.end_ns,
+        )
+        if self.attempt.clock() >= end:
+            reject("LEASE_ACK_INVALID")
+        expected = self._lease()
+        parent, child = socket_pair()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                parent.close()
+                response = os.dup(child.fileno())
+                if response == 9:
+                    response = os.dup(response)
+                os.dup2(self.lock_fd, 9, inheritable=True)
+                _close_except({9, response})
+                from test_vps_timepad_state import _read_recovery_registration_snapshot
+
+                snapshot = _read_recovery_registration_snapshot(
+                    self.root, expected, digest, self.recovery_baseline, deploy_lock_fd=9,
+                )
+                with socket.socket(fileno=response) as channel:
+                    send_frame(channel, {"lease": snapshot})
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        child.close()
+        self.registration_ack = RecoveryRegistrationAck(pid, reply, parent, digest, end)
+
+    def _registration_response(self) -> None:
+        from test_vps_timepad_state import GuardError, _execution_lease
+
+        registration = self.registration_ack
+        assert registration is not None and registration.channel is not None
+        response, _ = receive_frame(registration.channel)
+        if set(response) != {"lease"} or not isinstance(response["lease"], dict):
+            reject("LEASE_ACK_INVALID")
+        try:
+            registration.snapshot = _execution_lease(response["lease"])
+        except GuardError:
+            reject("LEASE_ACK_INVALID")
+        registration.channel.close()
+        registration.channel = None
+
+    def _tick_registration(self, statuses: dict[int, int]) -> None:
+        registration = self.registration_ack
+        if registration is None:
+            return
+        if self.pending_signals:
+            number = self.pending_signals.pop()
+            self.attempt.cancel(signal.Signals(number).name.removeprefix("SIG"), 128 + number)
+            self._notify_clock()
+        if registration.pid in statuses:
+            registration.status = statuses[registration.pid]
+        if self.attempt.first_reason is not None or self.attempt.lifecycle != "registered":
+            if registration.channel is not None:
+                registration.channel.close()
+            registration.reply.close()
+            self.registration_ack = None
+            return  # Cancellation drains the read-only child with the worker.
+        if registration.status not in (None, 0) or self.attempt.clock() >= registration.end_ns:
+            reject("LEASE_ACK_INVALID")
+        if registration.status is None or registration.snapshot is None:
+            return
+        snapshot = registration.snapshot
+        expected = self._lease()
+        if (
+            self.attempt.grants or self.attempt.acked_revision != -1
+            or set(snapshot) != set(expected)
+            or any(snapshot[key] != expected[key] for key in expected if key != "createCompletion")
+            or hashlib.sha256(encode(snapshot)).hexdigest() != registration.digest
+        ):
+            reject("LEASE_ACK_INVALID")
+        self.children.refresh()
+        if any(pid != self.worker_pid for pid in self.children.tracked):
+            reject("OWNERSHIP_UNCERTAIN")
+        self.create_completion_evidence = snapshot["createCompletion"]
+        self._record_lease()
+        self.attempt.acknowledge_lease(0, registration.digest)
+        self._published(0)
+        send_frame(registration.reply, {
+            "ok": True, "attempt": self.attempt.nonce,
+            "supervisor": self.identity, "value": {},
+        })
+        registration.reply.close()
+        self.registration_ack = None
+
     def acquire_lock(self) -> None:
         parent, child = socket_pair()
         pid = os.fork()
@@ -830,11 +1234,23 @@ class Supervisor:
             try:
                 parent.close()
                 _close_except({child.fileno()})
-                from test_vps_timepad_state import deploy_lock
+                from test_vps_timepad_state import (
+                    _canonical, _read_execution_lease_locked, _read_guard_locked, deploy_lock,
+                )
                 context = deploy_lock(self.root)
                 fd = context.__enter__()
+                frame: dict[str, Any] = {"kind": "lock", "attempt": self.attempt.nonce}
+                if self.attempt.operation == "forward-recover":
+                    previous = _read_execution_lease_locked(self.root)
+                    frame["recoveryBaseline"] = {
+                        "lease": previous,
+                        "currentDigest": (
+                            hashlib.sha256(_canonical(_read_guard_locked(self.root)[1])).hexdigest()
+                            if previous is not None else None
+                        ),
+                    }
                 # Do not invoke __exit__: LOCK_UN would unlock the transferred OFD.
-                send_frame(child, {"kind": "lock", "attempt": self.attempt.nonce}, fd)
+                send_frame(child, frame, fd)
                 os._exit(0)
             except BaseException:
                 os._exit(1)
@@ -845,7 +1261,10 @@ class Supervisor:
                 end = min(end, self.attempt.hard_end)
             _wait_readable(parent, end)
             frame, fd = receive_frame(parent, accept_fd=True)
-            if frame != {"kind": "lock", "attempt": self.attempt.nonce}:
+            expected = {"kind", "attempt"}
+            if self.attempt.operation == "forward-recover":
+                expected.add("recoveryBaseline")
+            if set(frame) != expected or frame["kind"] != "lock" or frame["attempt"] != self.attempt.nonce:
                 if fd is not None:
                     os.close(fd)
                 reject()
@@ -855,6 +1274,8 @@ class Supervisor:
                 os.close(fd)
                 reject("DEPLOY_LOCK_INVALID")
             self.lock_fd = fd
+            if self.attempt.operation == "forward-recover":
+                self.recovery_baseline = frame["recoveryBaseline"]
             # The lock worker is part of owned children until WNOHANG proves exit.
             while not self.children.reap():
                 if time.monotonic_ns() >= end:
@@ -911,9 +1332,675 @@ class Supervisor:
         self.attempt.idle_end = end
         self._record_lease()
 
-    def _rpc(self) -> None:
-        assert self.worker is not None
-        frame, passed = receive_frame(self.worker, accept_fd=True)
+    def _create_authority(self, *, pending_lease: bool = False) -> None:
+        if self.pending_signals:
+            number = self.pending_signals.pop()
+            self.attempt.cancel(signal.Signals(number).name.removeprefix("SIG"), 128 + number)
+            self._notify_clock()
+        if self.attempt.role != "controller-worker" or self.attempt.lifecycle != "armed" or \
+                self.attempt.first_reason is not None or \
+                (not pending_lease and self.attempt.acked_revision != self.attempt.revision) or \
+                self.attempt.work_end is None or self.attempt.clock() >= self.attempt.work_end:
+            reject("GRANT_REVOKED")
+
+    def _create_peer_chain(self, peer: ProcessIdentity) -> list[ProcessIdentity]:
+        """Authenticate the sender's kernel ancestry, not frame-supplied PIDs."""
+        if self.worker_identity is None or self.worker_pid is None:
+            reject("PRIVATE_WORKER_REQUIRED")
+        chain = []
+        for _ in range(MAX_CHILDREN):
+            chain.append(peer)
+            if peer.uid != os.geteuid():
+                reject("PRIVATE_WORKER_REQUIRED")
+            if self.driver_pid is not None and peer.pid == self.driver_pid:
+                if peer != self.driver_identity:
+                    reject("PRIVATE_WORKER_REQUIRED")
+                return chain
+            if peer.pid == self.worker_pid:
+                if lease_identity(peer) != self.worker_identity:
+                    reject("PRIVATE_WORKER_REQUIRED")
+                return chain
+            if peer.parent <= 1 or peer.parent == os.getpid():
+                break
+            peer = process_identity(peer.parent)
+        reject("PRIVATE_WORKER_REQUIRED")
+
+    def _create_internal_grant(self, name: str, bound_ns: int) -> Grant:
+        self._create_authority()
+        now = self.attempt.clock()
+        assert self.attempt.work_end is not None
+        end = min(now + bound_ns, self.attempt.work_end)
+        grant = Grant(secrets.token_hex(16), name, end, self.attempt.nonce, self.attempt.role)
+        if end <= now or len(self.attempt.grants) >= MAX_GRANTS:
+            reject("WAIT_REFUSED")
+        self.attempt.grants[grant.grant_id] = grant
+        return grant
+
+    def _create_reply(self, value: dict[str, Any]) -> None:
+        if self.create_reply is None:
+            reject()
+        try:
+            send_frame(self.create_reply, {
+                "ok": True, "attempt": self.attempt.nonce,
+                "supervisor": self.identity, "value": value,
+            })
+        finally:
+            self.create_reply.close()
+            self.create_reply = None
+
+    def _driver_context(self, role: Role, end: int) -> CreateContext:
+        return CreateContext(self.root, Selection.from_arguments(self.arguments), end, role)
+
+    def _launch_driver(self, action: str, role: str, reply: socket.socket, peer: ProcessIdentity) -> None:
+        if self.pending_signals:
+            number = self.pending_signals.pop()
+            self.attempt.cancel(signal.Signals(number).name.removeprefix("SIG"), 128 + number)
+            self._notify_clock()
+        try:
+            selected, selected_role = Action(action), Role(role)
+        except ValueError:
+            reject()
+        self._create_peer_chain(peer)
+        if self.driver_pid is not None or self.evidence_pid is not None or self.attempt.grants or \
+                self.attempt.role != "controller-worker" or self.attempt.first_reason is not None or \
+                self.attempt.acked_revision != self.attempt.revision or \
+                self.create is not None and self.create.phase != "completed":
+            reject("WAIT_REFUSED")
+        if selected in {Action.CREATE, Action.RECONCILE_BOUND, Action.PUBLISH_PREPARED}:
+            self._create_authority()
+        elif self.attempt.lifecycle not in {"registered", "armed"}:
+            reject("GRANT_REVOKED")
+        if selected == Action.ADMIT_TARGET and self.attempt.operation != "deploy" or \
+                selected == Action.PUBLISH_PREPARED and self.attempt.operation != "deploy":
+            reject()
+        now = self.attempt.clock()
+        end = self.attempt.work_end if selected in {Action.CREATE, Action.RECONCILE_BOUND} else now + 30 * NS
+        if self.attempt.work_end is not None:
+            end = min(end, self.attempt.work_end)
+        if end is None or end <= now:
+            reject("WAIT_EXPIRED")
+        context = self._driver_context(selected_role, end)
+        parent, child = socket_pair()
+        rpc, control = socket_pair()
+        assert self.lock_fd is not None
+        pid = os.fork()
+        if pid == 0:
+            try:
+                parent.close()
+                rpc.close()
+                control_fd = os.dup(control.fileno())
+                if control_fd == 9:
+                    control_fd = os.dup(control_fd)
+                response = os.dup(child.fileno())
+                if response == 9:
+                    response = os.dup(response)
+                os.dup2(self.lock_fd, 9, inheritable=True)
+                _close_except({9, control_fd, response})
+                linux_preflight()
+                os.environ.update({
+                    "TIMEPAD_CONTROL_FD": str(control_fd), "TIMEPAD_ATTEMPT": self.attempt.nonce,
+                    "TIMEPAD_SUPERVISOR": encode(self.identity).decode(), "TIMEPAD_WORKER_MODE": "controller-worker",
+                })
+                client = WorkerClient(self.root, end_ns=end)
+                try:
+                    result = CreateDriver(context, self.create_transport, client).run(selected).frame()
+                finally:
+                    client.close()
+                with socket.socket(fileno=response) as channel:
+                    send_frame(channel, result)
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        child.close()
+        control.close()
+        self.driver_pid, self.driver_identity = pid, process_identity(pid)
+        self.driver_channel, self.driver_rpc, self.driver_reply = parent, rpc, reply
+        self.driver_action, self.driver_end = selected, end
+        self.driver_status = self.driver_result = None
+        self._notify_clock()
+
+    def _driver_response(self) -> None:
+        assert self.driver_channel is not None and self.driver_action is not None
+        if self.driver_result is not None:
+            reject()
+        result, _ = receive_frame(self.driver_channel)
+        if result.get("action") != self.driver_action.value or \
+                not {"action", "modelDigest", "toolingDigest"} <= result.keys() or \
+                result.keys() - {"action", "modelDigest", "toolingDigest", "containerId", "configHash", "preparedProofDigest"} or \
+                any(not isinstance(value, str) or DIGEST.fullmatch(value) is None
+                    for key, value in result.items() if key != "action"):
+            reject()
+        self.driver_result = result
+        self.driver_channel.close()
+        self.driver_channel = None
+
+    def _tick_driver(self, statuses: dict[int, int]) -> None:
+        if self.evidence_pid in statuses:
+            if statuses[self.evidence_pid] != 0:
+                reject("OWNERSHIP_UNCERTAIN")
+            self.evidence_pid = None
+        if self.driver_pid is None:
+            return
+        if self.driver_pid in statuses:
+            self.driver_status = statuses[self.driver_pid]
+        if self.attempt.first_reason is not None:
+            if self.driver_reply is not None:
+                self.driver_reply.close()
+                self.driver_reply = None
+            if self.driver_status is not None:
+                for channel in (self.driver_rpc, self.driver_channel):
+                    if channel is not None:
+                        channel.close()
+                self.driver_pid = self.driver_identity = self.driver_rpc = self.driver_channel = None
+                self.driver_action = self.driver_end = self.driver_status = self.driver_result = None
+            return
+        if self.driver_status not in (None, 0) or self.driver_end is None or self.attempt.clock() >= self.driver_end:
+            reject("OWNERSHIP_UNCERTAIN")
+        if self.driver_status is None or self.driver_result is None:
+            return
+        if self.attempt.grants or self.create is not None and self.create.phase != "completed":
+            reject("OWNERSHIP_UNCERTAIN")
+        self.children.refresh()
+        if any(pid != self.worker_pid for pid in self.children.tracked):
+            reject("OWNERSHIP_UNCERTAIN")
+        assert self.driver_reply is not None
+        send_frame(self.driver_reply, {
+            "ok": True, "attempt": self.attempt.nonce, "supervisor": self.identity, "value": self.driver_result,
+        })
+        self.driver_reply.close()
+        if self.driver_rpc is not None:
+            self.driver_rpc.close()
+        self.driver_pid = self.driver_identity = self.driver_reply = self.driver_rpc = None
+        self.driver_action = self.driver_end = self.driver_status = self.driver_result = None
+
+    def _launch_recovery_evidence(self, reply: socket.socket, peer: ProcessIdentity) -> None:
+        if self.pending_signals:
+            number = self.pending_signals.pop()
+            self.attempt.cancel(signal.Signals(number).name.removeprefix("SIG"), 128 + number)
+            self._notify_clock()
+        self._create_peer_chain(peer)
+        grant = self.registration_grant
+        if self.evidence_used or self.evidence_pid is not None or self.driver_pid is not None or \
+                self.attempt.operation != "forward-recover" or self.attempt.lifecycle != "registered" or \
+                self.attempt.first_reason is not None or grant is None or \
+                set(self.attempt.grants) != {grant.grant_id}:
+            reject("GRANT_REVOKED")
+        self.attempt.validate_grant(grant.grant_id, grant.end_ns)
+        context = self._driver_context(Role.INITIAL, grant.end_ns)
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+        assert self.lock_fd is not None
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(read_fd)
+                output = os.dup(write_fd)
+                if output == 9:
+                    output = os.dup(output)
+                os.dup2(self.lock_fd, 9, inheritable=True)
+                _close_except({9, output})
+                linux_preflight()
+                # Evidence collection has no authenticated mutation channel.
+                # The bound peer consumes it using the existing registration
+                # grant and existing state/provider validators.
+                class EvidenceClient:
+                    attempt = self.attempt.nonce
+                binding, evidence = CreateDriver(context, self.create_transport, EvidenceClient()).recovery_evidence()
+                binding["peer"] = peer.frame()
+                write_evidence(output, binding, evidence, context)
+                os.close(output)
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        os.close(write_fd)
+        self.evidence_pid, self.evidence_used = pid, True
+        try:
+            send_frame(reply, {
+                "ok": True, "attempt": self.attempt.nonce, "supervisor": self.identity,
+                "value": {"evidence": "private-pipe"},
+            }, read_fd)
+        finally:
+            os.close(read_fd)
+
+    def _launch_create(self, role: str, attempt_id: str) -> None:
+        if (self.create is not None and self.create.phase != "completed") or self.attempt.grants:
+            reject("WAIT_REFUSED")
+        grant = self._create_internal_grant("create-execute", 240 * NS)
+        create = CreateAttempt(role, attempt_id, grant)
+        if self.create is not None and (
+            self.create.role != "initial" or role != "replacement"
+            or int(attempt_id.split(":")[1]) <= int(self.create.attempt_id.split(":")[1])
+        ):
+            reject()
+        self.create = create
+        parent, child = socket_pair()
+        rpc, control = socket_pair()
+        assert self.lock_fd is not None
+        seed = {
+            "attemptId": attempt_id,
+            "commandDigest": hashlib.sha256(encode({
+                "module": "test_vps_timepad_create", "action": "fixed-no-start-create", "role": role,
+            })).hexdigest(),
+        }
+        context = self._driver_context(Role(role), grant.end_ns)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                parent.close()
+                rpc.close()
+                control_fd = os.dup(control.fileno())
+                if control_fd == 9:
+                    control_fd = os.dup(control_fd)
+                result_fd = os.dup(child.fileno())
+                if result_fd == 9:
+                    result_fd = os.dup(result_fd)
+                os.dup2(self.lock_fd, 9, inheritable=True)
+                _close_except({9, result_fd, control_fd})
+                environment = _create_environment(
+                    control_fd, self.attempt.nonce, self.identity, grant, None,
+                )
+                with socket.socket(fileno=result_fd) as channel:
+                    _create_launcher(
+                        channel, seed, self.attempt.nonce, grant, context, self.create_transport, environment,
+                    )
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        child.close()
+        control.close()
+        self.create_channel, self.create_launcher_rpc = parent, rpc
+        self.create_pid = pid
+        observed = process_identity(pid)
+        self.create_pidfd = os.pidfd_open(pid, 0)
+        if process_identity(pid) != observed or observed.parent != os.getpid():
+            reject("OWNERSHIP_UNCERTAIN")
+        create.identity = {
+            **seed, "pid": pid, "processGroup": pid,
+            "bootId": boot_id(), "startTicks": observed.start,
+        }
+        self.create_handshake_end = min(
+            self.attempt.clock() + self.attempt.timing.handshake_ns, grant.end_ns,
+        )
+
+    def _create_message(self) -> None:
+        assert self.create_channel is not None and self.create is not None
+        frame, _ = receive_frame(self.create_channel)
+        create = self.create
+        if self.create_handshake_end is not None:
+            if frame != {
+                "kind": "create-hello", "attempt": self.attempt.nonce,
+                "childIdentity": create.identity,
+            } or self.attempt.clock() >= self.create_handshake_end or \
+                    os.getpgid(self.create_pid) != self.create_pid:
+                reject("OWNERSHIP_UNCERTAIN")
+            self.create_handshake_end = None
+            self._create_reply({"childIdentity": create.identity})
+        else:
+            create.observe_result(frame)
+            self.create_channel.close()
+            self.create_channel = None
+
+    def _spawn_create_helper(self, stage: str) -> None:
+        assert self.create is not None and self.lock_fd is not None
+        if self.create_helper_pid is not None:
+            reject("OWNERSHIP_UNCERTAIN")
+        parent, child = socket_pair()
+        rpc, control = socket_pair()
+        create = self.create
+        grant = create.grant
+        snapshot = self._lease()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                parent.close()
+                rpc.close()
+                control_fd = os.dup(control.fileno())
+                if control_fd == 9:
+                    control_fd = os.dup(control_fd)
+                result_fd = os.dup(child.fileno())
+                if result_fd == 9:
+                    result_fd = os.dup(result_fd)
+                os.dup2(self.lock_fd, 9, inheritable=True)
+                _close_except({9, control_fd, result_fd})
+                environment = _create_environment(
+                    control_fd, self.attempt.nonce, self.identity, grant, create.request_digest,
+                )
+                os.environ.update(environment)
+                if stage == "publish":
+                    result = self._publish_create(snapshot, grant)
+                else:
+                    result = _fixed_create_stage(
+                        stage, self._driver_context(Role(create.role), min(grant.end_ns, time.monotonic_ns() + 30 * NS)),
+                        self.create_transport, environment,
+                    )
+                with socket.socket(fileno=result_fd) as channel:
+                    send_frame(channel, result)
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        child.close()
+        control.close()
+        self.create_helper_pid = pid
+        self.create_helper_identity = process_identity(pid)
+        self.create_helper_stage = stage
+        self.create_helper_status = self.create_helper_result = None
+        self.create_helper_channel, self.create_helper_rpc = parent, rpc
+
+    def _publish_create(self, snapshot: dict[str, Any], grant: Grant) -> dict[str, Any]:
+        """Only this authenticated fork publishes child clear/receipt/current/ACK."""
+        from test_vps_timepad_state import (
+            ExecutionGrant, publish_create_completion, publish_execution_lease,
+        )
+
+        assert self.create is not None
+        receipt = self.create.receipt()
+        encoded = encode(receipt)
+        acknowledgment = publish_execution_lease(self.root, snapshot, deploy_lock_fd=9)
+        # Advance the supervisor's authoritative snapshot only after readback.
+        client = WorkerClient(self.root)
+        try:
+            client.request("create-publisher-lease-ack", **acknowledgment)
+            result = publish_create_completion(
+                self.root, request_digest=self.create.request_digest,
+                supervisor_wait_evidence=encoded,
+                deploy_lock_fd=9,
+                execution_grant=ExecutionGrant(grant.attempt, grant.grant_id, grant.end_ns),
+            )
+            next_snapshot = client.request("create-publisher-ack-intent")
+            acknowledgment = publish_execution_lease(self.root, next_snapshot, deploy_lock_fd=9)
+            client.request("create-publisher-lease-ack", **acknowledgment)
+            return result
+        finally:
+            client.close()
+
+    def _create_helper_response(self) -> None:
+        assert self.create_helper_channel is not None
+        if self.create_helper_result is not None:
+            reject()
+        self.create_helper_result, _ = receive_frame(self.create_helper_channel)
+        self.create_helper_channel.close()
+        self.create_helper_channel = None
+
+    def _create_private_rpc(self, channel: socket.socket, *, publisher: bool) -> None:
+        peers: list[ProcessIdentity] = []
+        frame, fd = receive_frame(channel, accept_fd=True, peer=peers)
+        assert fd is not None and self.create is not None
+        with socket.socket(fileno=fd) as reply:
+            reply.setblocking(False)
+            if reply.family != socket.AF_UNIX or reply.type != socket.SOCK_SEQPACKET or \
+                    frame.get("attempt") != self.attempt.nonce or \
+                    frame.get("role") != "controller-worker":
+                reject()
+            self._create_authority(pending_lease=publisher and self.create_helper_stage == "publish")
+            if self.attempt.clock() >= self.create.grant.end_ns or \
+                    self.attempt.grants.get(self.create.grant.grant_id) != self.create.grant:
+                reject("GRANT_REVOKED")
+            peer = peers[0]
+            if publisher and self.create_helper_stage == "publish" and \
+                    peer != self.create_helper_identity:
+                reject("PRIVATE_WORKER_REQUIRED")
+            root_pid = self.create_helper_pid if publisher else self.create_pid
+            for _ in range(MAX_CHILDREN):
+                if peer.pid == root_pid:
+                    break
+                if peer.parent == os.getpid() or peer.parent <= 1:
+                    reject("PRIVATE_WORKER_REQUIRED")
+                peer = process_identity(peer.parent)
+            else:
+                reject("PRIVATE_WORKER_REQUIRED")
+            if publisher and self.create_helper_identity != peer or not publisher and (
+                self.create.identity is None or peer.start != self.create.identity["startTicks"]
+            ):
+                reject("PRIVATE_WORKER_REQUIRED")
+            kind = frame.get("kind")
+            base = {"kind", "attempt", "role"}
+            value: dict[str, Any] = {}
+            if kind == "hello" and set(frame) == base:
+                value = self._lease()
+            elif kind == "lease" and set(frame) == base:
+                value = self._lease()
+            elif kind == "validate-grant" and set(frame) == base | {"grantId", "endNs"}:
+                grant = self.create.grant
+                if frame["grantId"] != grant.grant_id or frame["endNs"] != grant.end_ns or \
+                        self.attempt.clock() >= grant.end_ns or \
+                        self.attempt.grants.get(grant.grant_id) != grant:
+                    reject("GRANT_REVOKED")
+                value = grant.frame()
+            elif publisher and self.create_helper_stage == "publish" and \
+                    kind == "create-publisher-lease-ack" and \
+                    set(frame) == base | {"revision", "digest"}:
+                revision = _integer(frame["revision"])
+                self.attempt.acknowledge_lease(revision, frame["digest"])
+                self._published(revision)
+            elif publisher and self.create_helper_stage == "publish" and \
+                    kind == "create-publisher-ack-intent" and set(frame) == base:
+                if self.create_completion_evidence is None or \
+                        self.create_completion_evidence["acknowledged"] or \
+                        self.attempt.acked_revision != self.attempt.revision:
+                    reject()
+                self.create_completion_evidence = dict(self.create_completion_evidence, acknowledged=True)
+                self.attempt._change("armed")
+                value = self._lease()
+            else:
+                reject()
+            send_frame(reply, {
+                "ok": True, "attempt": self.attempt.nonce,
+                "supervisor": self.identity, "value": value,
+            })
+
+    def _park_create_controller(self, peer: ProcessIdentity) -> None:
+        """Park just the authenticated caller chain; any other writer refuses."""
+        assert self.create is not None
+        chain = self._create_peer_chain(peer)
+        self.create_park_end = min(
+            self.attempt.clock() + self.attempt.timing.handshake_ns, self.create.grant.end_ns,
+        )
+        for identity in reversed(chain):
+            pidfd = os.pidfd_open(identity.pid, 0)
+            try:
+                if process_identity(identity.pid) != identity:
+                    reject("OWNERSHIP_UNCERTAIN")
+                signal.pidfd_send_signal(pidfd, signal.SIGSTOP)
+            except BaseException:
+                os.close(pidfd)
+                raise
+            self.create_parked.append((identity, pidfd))
+
+    def _create_controller_parked(self) -> bool:
+        assert self.create is not None and self.worker_pid is not None
+        allowed = {identity.pid for identity, _ in self.create_parked}
+        for identity, _ in self.create_parked:
+            if process_identity(identity.pid) != identity:
+                reject("OWNERSHIP_UNCERTAIN")
+            with open(f"/proc/{identity.pid}/stat", "rb", buffering=0) as source:
+                data = source.read(4097)
+            if len(data) > 4096 or b")" not in data:
+                reject("OWNERSHIP_UNCERTAIN")
+            if data.rsplit(b")", 1)[1].split()[0] != b"T":
+                return False
+            with open(f"/proc/{identity.pid}/task/{identity.pid}/children", "rb", buffering=0) as source:
+                raw = source.read(8193)
+            if len(raw) > 8192:
+                reject("DESCENDANT_OVERFLOW")
+            descendants = {int(value) for value in raw.split()}
+            if not descendants <= allowed:
+                # An old publisher still exists, or the controller has an
+                # unaccounted descendant. No filesystem publisher may overlap.
+                reject("OWNERSHIP_UNCERTAIN")
+        return True
+
+    def _resume_create_controller(self, *, cancel: bool) -> None:
+        for identity, pidfd in self.create_parked:
+            try:
+                if process_identity(identity.pid) != identity:
+                    reject("OWNERSHIP_UNCERTAIN")
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL if cancel else signal.SIGCONT)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+            finally:
+                os.close(pidfd)
+        self.create_parked.clear()
+        self.create_park_end = None
+
+    def _create_rpc(
+        self, kind: str, frame: dict[str, Any], reply: socket.socket, peer: ProcessIdentity,
+    ) -> dict[str, Any] | None:
+        self._create_authority()
+        self._create_peer_chain(peer)
+        if self.create_reply is not None:
+            reject()
+        if kind == "create-launch":
+            self._launch_create(frame["createRole"], frame["attemptId"])
+            self.create_reply = reply
+            return None
+        create = self.create
+        if create is None or not isinstance(frame["requestDigest"], str) or \
+                DIGEST.fullmatch(frame["requestDigest"]) is None:
+            reject()
+        if kind == "create-release":
+            if create.phase != "waiting" or self.create_handshake_end is not None or \
+                    frame["childIdentity"] != create.identity or \
+                    set(self.attempt.grants) != {create.grant.grant_id}:
+                reject()
+            create.request_digest = frame["requestDigest"]
+            create.phase = "checking-release"
+            self.create_reply = reply
+            self._spawn_create_helper("release-admission")
+            return None
+        if frame["requestDigest"] != create.request_digest:
+            reject()
+        if kind == "create-result":
+            if create.phase not in {"running", "ready"}:
+                reject()
+            return {"status": "ready" if create.phase == "ready" else "pending"}
+        if kind == "create-completion":
+            if set(self.attempt.grants) != {create.grant.grant_id}:
+                # Revoke rather than overlap a competing grant/publisher.
+                self.attempt.grants.clear()
+                reject("OWNERSHIP_UNCERTAIN")
+            create.begin_completion(frame["requestDigest"], frame["childIdentity"])
+            self.create_reply = reply
+            self._park_create_controller(peer)
+            return None
+        reject()
+
+    def _tick_create(self, statuses: dict[int, int]) -> None:
+        create = self.create
+        if create is None:
+            return
+        if self.create_pid in statuses:
+            create.wait_status = statuses[self.create_pid]
+            if self.create_pidfd is not None:
+                os.close(self.create_pidfd)
+                self.create_pidfd = None
+            if self.create_launcher_rpc is not None:
+                self.create_launcher_rpc.close()
+                self.create_launcher_rpc = None
+            if create.wait_status != 0:
+                reject("OWNERSHIP_UNCERTAIN")
+        if self.create_helper_pid in statuses:
+            self.create_helper_status = statuses[self.create_helper_pid]
+            if self.create_helper_rpc is not None:
+                self.create_helper_rpc.close()
+                self.create_helper_rpc = None
+            if self.create_helper_status != 0:
+                reject("OWNERSHIP_UNCERTAIN")
+        if self.attempt.first_reason is not None or self.attempt.lifecycle != "armed":
+            if self.create_parked:
+                self._resume_create_controller(cancel=True)
+            if self.create_reply is not None:
+                self.create_reply.close()
+                self.create_reply = None
+            for name in ("create_channel", "create_launcher_rpc", "create_helper_rpc",
+                         "create_helper_channel"):
+                channel = getattr(self, name)
+                if channel is not None:
+                    channel.close()
+                    setattr(self, name, None)
+            return
+        if create.phase == "completed":
+            return
+        now = self.attempt.clock()
+        if self.create_handshake_end is not None and now >= self.create_handshake_end:
+            reject("OWNERSHIP_UNCERTAIN")
+        self.children.refresh()
+        expected = {self.worker_pid}
+        if self.driver_pid is not None:
+            expected.add(self.driver_pid)
+        if create.wait_status is None:
+            expected.add(self.create_pid)
+        if self.create_helper_pid is not None and self.create_helper_status is None:
+            expected.add(self.create_helper_pid)
+        unexpected = any(pid not in expected for pid in self.children.tracked)
+        if unexpected:
+            reject("OWNERSHIP_UNCERTAIN")
+        create.ready(unexpected_children=unexpected, now=now)
+        if self.create_park_end is not None:
+            if now >= self.create_park_end:
+                reject("OWNERSHIP_UNCERTAIN")
+            if self._create_controller_parked():
+                self.create_park_end = None
+                self._spawn_create_helper("completion-admission")
+        if self.create_helper_pid is None or self.create_helper_status is None or \
+                self.create_helper_result is None:
+            return
+        stage, result = self.create_helper_stage, self.create_helper_result
+        self.create_helper_pid = self.create_helper_identity = None
+        if self.create_helper_rpc is not None:
+            self.create_helper_rpc.close()
+            self.create_helper_rpc = None
+        if stage in {"release-admission", "completion-admission"}:
+            self._create_authority()
+            self.attempt.validate_grant(create.grant.grant_id, create.grant.end_ns)
+            if set(result) != {"request"}:
+                reject()
+            if stage == "release-admission":
+                create.bind_request(result["request"], create.request_digest, create.identity)
+                assert create.request is not None
+                if create.request["sequence"] <= self.last_create_sequence:
+                    reject()
+                self.last_create_sequence = create.request["sequence"]
+                create.release()
+                assert self.create_channel is not None
+                send_frame(self.create_channel, {
+                    "kind": "create-release", "attempt": self.attempt.nonce,
+                    "requestDigest": create.request_digest, "childIdentity": create.identity,
+                })
+                self._create_reply({})
+            else:
+                if result["request"] != create.request or not self._create_controller_parked():
+                    reject("OWNERSHIP_UNCERTAIN")
+                del self.attempt.grants[create.grant.grant_id]
+                create.grant = self._create_internal_grant("create-completion", 10 * NS)
+                create.phase = "publishing"
+                receipt = create.receipt()
+                self.create_completion_evidence = {
+                    **{key: value for key, value in receipt.items() if key != "schema"},
+                    "receiptDigest": hashlib.sha256(encode(receipt)).hexdigest(),
+                    "acknowledged": False,
+                }
+                self.attempt._change("armed")
+                self._spawn_create_helper("publish")
+        elif stage == "publish":
+            self._create_authority()
+            if self.create_completion_evidence is None or \
+                    self.create_completion_evidence["acknowledged"] is not True or \
+                    self.attempt.acked_revision != self.attempt.revision or result != {
+                        "receiptDigest": self.create_completion_evidence["receiptDigest"],
+                        "sequence": create.request["sequence"],
+                    }:
+                reject()
+            self.attempt.complete(create.grant.grant_id)
+            create.phase = "completed"
+            self._resume_create_controller(cancel=False)
+            self._create_reply(result)
+        else:
+            reject()
+
+    def _rpc(self, channel: socket.socket | None = None, *, driver: bool = False) -> None:
+        channel = self.worker if channel is None else channel
+        assert channel is not None
+        peers: list[ProcessIdentity] = []
+        frame, passed = receive_frame(channel, accept_fd=True, peer=peers)
         assert passed is not None
         try:
             reply = socket.socket(fileno=passed)
@@ -934,6 +2021,12 @@ class Supervisor:
                 "complete": {"grantId"}, "cancel": {"reason", "status"},
                 "validate-grant": {"grantId", "endNs"},
                 "admit-rollback": set(), "prepare-terminal": set(), "terminal": {"status"},
+                "create-launch": {"createRole", "attemptId"},
+                "create-release": {"requestDigest", "childIdentity"},
+                "create-result": {"requestDigest"},
+                "create-completion": {"requestDigest", "childIdentity"},
+                "create-driver": {"action", "createRole"},
+                "recovery-evidence": set(),
             }
             if kind == "terminal" and "outcome" in frame:
                 schemas["terminal"] = {"status", "outcome"}
@@ -944,10 +2037,42 @@ class Supervisor:
                 reject("GRANT_REVOKED")
             if self.attempt.pending_terminal is not None:
                 reject("TERMINAL_REFUSED")
+            if self.create_parked:
+                reject("GRANT_REVOKED")
+            if self.registration_ack is not None:
+                reject("LEASE_ACK_INVALID")
+            if driver:
+                chain = self._create_peer_chain(peers[0])
+                if self.driver_pid is None or chain[-1] != self.driver_identity or \
+                        kind not in {
+                            "lease", "grant", "complete", "validate-grant",
+                            "create-launch", "create-release", "create-result", "create-completion",
+                        }:
+                    reject("PRIVATE_WORKER_REQUIRED")
+            elif self.driver_pid is not None and kind != "cancel":
+                reject("GRANT_REVOKED")
+            if kind in {"create-launch", "create-release", "create-result", "create-completion"} and (
+                not driver or self.driver_action != Action.CREATE
+            ):
+                reject("PRIVATE_WORKER_REQUIRED")
             value: dict[str, Any] = {}
             if not self.worker_hello and kind != "hello":
                 reject("PRIVATE_WORKER_REQUIRED")
-            if kind == "hello":
+            if kind == "create-driver":
+                if driver:
+                    reject()
+                self._launch_driver(frame["action"], frame["createRole"], reply, peers[0])
+                return
+            elif kind == "recovery-evidence":
+                if driver:
+                    reject()
+                self._launch_recovery_evidence(reply, peers[0])
+                return
+            elif kind.startswith("create-"):
+                value = self._create_rpc(kind, frame, reply, peers[0])
+                if value is None:
+                    return
+            elif kind == "hello":
                 if self.worker_hello:
                     reject()
                 self.worker_hello = True
@@ -967,13 +2092,29 @@ class Supervisor:
             elif kind == "lease":
                 value = self._lease()
             elif kind == "lease-ack":
-                self.attempt.acknowledge_lease(_integer(frame["revision"]), frame["digest"])
-                self._published(frame["revision"])
+                revision = _integer(frame["revision"])
+                if self.registration_grant is not None and self.attempt.revision == 0:
+                    self._begin_registration_ack(revision, frame["digest"], reply)
+                    return
+                self.attempt.acknowledge_lease(revision, frame["digest"])
+                self._published(revision)
             elif kind == "grant":
-                value = self.attempt.grant(frame["name"], _integer(frame["localNs"], 1)).frame()
+                local = _integer(frame["localNs"], 1)
+                if driver:
+                    if self.driver_end is None:
+                        reject()
+                    local = min(local, self.driver_end - self.attempt.clock())
+                grant = self.attempt.grant(frame["name"], local)
+                if grant.name == "recovery-registration":
+                    self.registration_grant = grant
+                value = grant.frame()
             elif kind == "complete":
+                if self.create is not None and frame["grantId"] == self.create.grant.grant_id:
+                    reject("GRANT_REVOKED")
                 self.attempt.complete(frame["grantId"])
             elif kind == "validate-grant":
+                if self.create is not None and frame["grantId"] == self.create.grant.grant_id:
+                    reject("GRANT_REVOKED")
                 value = self.attempt.validate_grant(frame["grantId"], frame["endNs"]).frame()
             elif kind == "cancel":
                 self.attempt.cancel(frame["reason"], _integer(frame["status"], 1, 255))
@@ -1001,15 +2142,21 @@ class Supervisor:
                 pass
             # Invalid/revoked messages cannot buy another grant or reset time.
             if self.attempt.first_reason is None:
-                self.attempt.cancel("PROTOCOL_INVALID")
+                self.attempt.cancel("OWNERSHIP_UNCERTAIN" if str(error) == "OWNERSHIP_UNCERTAIN"
+                                    else "PROTOCOL_INVALID")
         finally:
-            reply.close()
+            if self.create_reply is not reply and self.driver_reply is not reply and (
+                self.registration_ack is None or self.registration_ack.reply is not reply
+            ):
+                reply.close()
 
     def _notify_clock(self) -> None:
         watch_end = max(
             (grant.end_ns for grant in self.attempt.grants.values()),
             default=self.attempt.idle_end,
         )
+        if self.driver_end is not None:
+            watch_end = max(watch_end, self.driver_end)
         clock = (self.attempt.hard_end, watch_end)
         if clock == self.last_clock:
             return
@@ -1136,6 +2283,9 @@ class Supervisor:
                 self.attempt.poll()
                 childless = self.children.reap()
                 statuses = self.children.statuses
+                self._tick_driver(statuses)
+                self._tick_create(statuses)
+                self._tick_registration(statuses)
                 if self.completion_pid in statuses:
                     self.completion_status = statuses[self.completion_pid]
                 if self.worker_pid in statuses:
@@ -1211,12 +2361,40 @@ class Supervisor:
                         selector.register(self.worker, selectors.EVENT_READ, "worker")
                     if self.completion_channel is not None:
                         selector.register(self.completion_channel, selectors.EVENT_READ, "completion")
+                    if self.registration_ack is not None and self.registration_ack.channel is not None:
+                        selector.register(self.registration_ack.channel, selectors.EVENT_READ, "registration")
+                    if self.create_channel is not None:
+                        selector.register(self.create_channel, selectors.EVENT_READ, "create")
+                    if self.create_launcher_rpc is not None:
+                        selector.register(self.create_launcher_rpc, selectors.EVENT_READ, "create-launcher-rpc")
+                    if self.create_helper_channel is not None:
+                        selector.register(self.create_helper_channel, selectors.EVENT_READ, "create-helper")
+                    if self.create_helper_rpc is not None:
+                        selector.register(self.create_helper_rpc, selectors.EVENT_READ, "create-helper-rpc")
+                    if self.driver_channel is not None:
+                        selector.register(self.driver_channel, selectors.EVENT_READ, "create-driver-result")
+                    if self.driver_rpc is not None:
+                        selector.register(self.driver_rpc, selectors.EVENT_READ, "create-driver-rpc")
                     for event, _ in selector.select(0.1):
                         try:
                             if event.data == "relay":
                                 self._relay_message()
                             elif event.data == "completion":
                                 self._completion_response()
+                            elif event.data == "registration":
+                                self._registration_response()
+                            elif event.data == "create":
+                                self._create_message()
+                            elif event.data == "create-helper":
+                                self._create_helper_response()
+                            elif event.data == "create-driver-result":
+                                self._driver_response()
+                            elif event.data == "create-driver-rpc":
+                                self._rpc(event.fileobj, driver=True)
+                            elif event.data in {"create-launcher-rpc", "create-helper-rpc"}:
+                                self._create_private_rpc(
+                                    event.fileobj, publisher=event.data == "create-helper-rpc",
+                                )
                             else:
                                 self._rpc()
                         except (OSError, SupervisorError):
@@ -1224,8 +2402,12 @@ class Supervisor:
                                 self.relay_alive = False
                                 self.attempt.cancel("TRANSPORT_LOST")
                                 self._notify_clock()
-                            elif event.data == "completion":
+                            elif event.data in {"completion", "registration"}:
                                 self.attempt.unconfirmed()
+                            elif event.data.startswith("create"):
+                                self.attempt.cancel("OWNERSHIP_UNCERTAIN")
+                                if self.create_parked:
+                                    self._resume_create_controller(cancel=True)
                             elif self.attempt.pending_terminal is None:
                                 if self.worker is not None:
                                     self.worker.close()
@@ -1233,7 +2415,14 @@ class Supervisor:
                                 self.attempt.cancel("PROTOCOL_INVALID")
             except (OSError, SupervisorError):
                 self.attempt.cancel("OWNERSHIP_UNCERTAIN")
+                if self.create_parked:
+                    self._resume_create_controller(cancel=True)
                 self.attempt.unconfirmed()
+
+
+def production_supervisor(root: str, operation: str, arguments: list[str], channel: socket.socket) -> Supervisor:
+    """The public entry has no transport selector, even indirectly."""
+    return Supervisor(root, operation, arguments, channel, create_transport=RealTransport())
 
 
 def relay(root: str, operation: str, arguments: list[str]) -> int:
@@ -1252,7 +2441,7 @@ def relay(root: str, operation: str, arguments: list[str]) -> int:
                 os.dup2(null, fd)
             if null > 2:
                 os.close(null)
-            supervisor = Supervisor(root, operation, arguments, child)
+            supervisor = production_supervisor(root, operation, arguments, child)
             result = supervisor.run()
             os._exit(result)
         except BaseException:
@@ -1402,6 +2591,21 @@ def _cli() -> argparse.ArgumentParser:
     terminal = calls.add_parser("terminal")
     terminal.add_argument("status", type=int)
     terminal.add_argument("--outcome", choices=sorted(SUCCESS_OUTCOMES))
+    launch = calls.add_parser("create-launch")
+    launch.add_argument("--role", choices=("initial", "replacement"), required=True)
+    launch.add_argument("--attempt-id", required=True)
+    action = calls.add_parser("create-driver")
+    action.add_argument("--action", choices=[item.value for item in Action], required=True)
+    action.add_argument("--role", choices=[item.value for item in Role], required=True)
+    action.add_argument("--end-ns", type=int, required=True)
+    evidence = calls.add_parser("recovery-evidence")
+    evidence.add_argument("--end-ns", type=int, required=True)
+    evidence.add_argument("arguments", nargs=argparse.REMAINDER)
+    for name in ("create-release", "create-result", "create-completion"):
+        call = calls.add_parser(name)
+        call.add_argument("--request-digest", required=True)
+        if name != "create-result":
+            call.add_argument("--child-identity-json", required=True)
     return parser
 
 
@@ -1413,7 +2617,12 @@ def main(argv: list[str] | None = None) -> int:
             if not arguments or arguments[0] != "--":
                 reject("CONTROLLER_ARGUMENTS_REQUIRED")
             return relay(args.root, args.operation, arguments[1:])
-        client = WorkerClient(args.root)
+        end = args.end_ns if args.call in {"create-driver", "recovery-evidence"} else None
+        if end is not None:
+            _integer(end, 1)
+            if time.monotonic_ns() >= end:
+                reject("WAIT_EXPIRED")
+        client = WorkerClient(args.root, end_ns=end)
         try:
             fields: dict[str, Any] = {}
             if args.call == "grant":
@@ -1428,11 +2637,26 @@ def main(argv: list[str] | None = None) -> int:
                 fields = {"reason": args.reason, "status": args.status}
             elif args.call == "terminal":
                 fields = {"status": args.status, "outcome": args.outcome}
+            elif args.call == "create-launch":
+                fields = {"createRole": args.role, "attemptId": args.attempt_id}
+            elif args.call == "create-driver":
+                fields = {"action": args.action, "createRole": args.role}
+            elif args.call == "recovery-evidence":
+                if not args.arguments or args.arguments[0] != "--":
+                    reject()
+                sys.stdout.buffer.write(client.recovery_evidence(args.root, args.arguments[1:]))
+                return 0
+            elif args.call in {"create-release", "create-result", "create-completion"}:
+                if DIGEST.fullmatch(args.request_digest) is None:
+                    reject()
+                fields = {"requestDigest": args.request_digest}
+                if args.call != "create-result":
+                    fields["childIdentity"] = decode(args.child_identity_json.encode())
             print(json.dumps(client.request(args.call, **fields), separators=(",", ":"), sort_keys=True))
             return 0
         finally:
             client.close()
-    except (SupervisorError, OSError) as error:
+    except (SupervisorError, CreateError, OSError) as error:
         reason = str(error) if isinstance(error, SupervisorError) else "SUPERVISOR_UNAVAILABLE"
         print("schema_guard=" + reason, file=sys.stderr)
         return 1

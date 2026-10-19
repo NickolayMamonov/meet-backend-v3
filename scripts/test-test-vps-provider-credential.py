@@ -293,7 +293,321 @@ def live_context(phase: str = "VERIFYING") -> tuple:
     return module, contract, origin, current, envelope
 
 
+class RollbackReconstructionTests(unittest.TestCase):
+    """Component proof only; this does not release the private rollback gate."""
+
+    def test_installed_configuration_requires_exact_snapshot_bytes_and_identity(self):
+        base = "/opt/tooling/compose.yml"
+        root = "/opt/meet"
+        for view in ("production", "target"):
+            for fault in ("none", "base-bytes", "base-identity", "env-bytes", "env-identity",
+                          "unrecorded-env", "active-bytes", "active-identity", "active-absent"):
+                with self.subTest(view=view, fault=fault), contextlib.ExitStack() as stack:
+                    snapshots = {
+                        "config.base-compose.yml": b"base",
+                        "config.base-compose.yml.identity": b"base-id",
+                        "config.env.production": b"original-env",
+                        "config.env.production.identity": b"original-id",
+                        "config.env.target": b"target-env",
+                        "config.env.target.identity": b"target-id",
+                        "previous-active-compose.yml": b"original-compose",
+                        "previous-active-compose.identity": b"original-compose-id",
+                        "candidate-active-compose.yml": b"target-compose",
+                        "candidate-active-compose.identity": b"target-compose-id",
+                    }
+                    prefix = "previous" if view == "production" else "candidate"
+                    live = {
+                        base: (b"base", b"base-id"),
+                        root + "/.env.production": (
+                            snapshots[f"config.env.{view}"], snapshots[f"config.env.{view}.identity"],
+                        ),
+                        "/var/lib/meet-production/active-compose.yml": (
+                            snapshots[f"{prefix}-active-compose.yml"],
+                            snapshots[f"{prefix}-active-compose.identity"],
+                        ),
+                    }
+                    if fault.startswith("base-"):
+                        live[base] = (b"wrong", b"base-id") if fault.endswith("bytes") else (b"base", b"wrong")
+                    if fault.startswith("env-"):
+                        data, identity = live[root + "/.env.production"]
+                        live[root + "/.env.production"] = (
+                            b"wrong" if fault.endswith("bytes") else data,
+                            b"wrong" if fault.endswith("identity") else identity,
+                        )
+                    if fault == "unrecorded-env":
+                        del snapshots[f"config.env.{view}.identity"]
+                    active = "/var/lib/meet-production/active-compose.yml"
+                    if fault.startswith("active-"):
+                        data, identity = live.pop(active)
+                        if fault != "active-absent":
+                            live[active] = (
+                                b"wrong" if fault.endswith("bytes") else data,
+                                b"wrong" if fault.endswith("identity") else identity,
+                            )
+
+                    def source(path):
+                        if path not in live:
+                            raise FileNotFoundError(path)
+                        return live[path]
+
+                    def snapshot(fd, name, limit):
+                        self.assertEqual(12, fd)
+                        if name not in snapshots:
+                            raise FileNotFoundError(name)
+                        return {}, snapshots[name]
+
+                    def marker(name, **kwargs):
+                        if name != "had-active-compose":
+                            raise FileNotFoundError(name)
+                        return mock.sentinel.marker
+
+                    stack.enter_context(mock.patch.object(helper, "_rollback_source", side_effect=source))
+                    stack.enter_context(mock.patch.object(helper, "_read_child_file", side_effect=snapshot))
+                    stack.enter_context(mock.patch.object(helper.os, "stat", side_effect=marker))
+                    writer = stack.enter_context(mock.patch.object(helper.os, "write"))
+                    unlink = stack.enter_context(mock.patch.object(helper.os, "unlink"))
+                    if fault == "none":
+                        self.assertEqual(view, helper._rollback_configuration(12, root, base))
+                    else:
+                        with self.assertRaises(helper.ProviderError):
+                            helper._rollback_configuration(12, root, base)
+                    writer.assert_not_called()
+                    unlink.assert_not_called()
+
+    def test_source_rejects_unsafe_metadata_races_and_expired_deadline(self):
+        fields = dict(
+            st_dev=1, st_ino=2, st_mode=stat.S_IFREG | 0o600, st_uid=0,
+            st_gid=0, st_nlink=1, st_size=4, st_mtime_ns=5, st_ctime_ns=6,
+        )
+        for fault in ("none", "fifo", "owner", "writable", "links", "oversize",
+                      "short-read", "descriptor-race", "path-race", "ctime-race", "acl", "deadline"):
+            with self.subTest(fault=fault), contextlib.ExitStack() as stack:
+                metadata = dict(fields)
+                if fault == "fifo":
+                    metadata["st_mode"] = stat.S_IFIFO | 0o600
+                if fault == "owner":
+                    metadata["st_uid"] = 1000
+                if fault == "writable":
+                    metadata["st_mode"] |= 0o020
+                if fault == "links":
+                    metadata["st_nlink"] = 2
+                if fault == "oversize":
+                    metadata["st_size"] = helper.MAX_CREDENTIAL_BYTES + 1
+                info = type("Info", (), metadata)()
+                replaced = type("Info", (), dict(metadata, st_ino=3))()
+                changed_time = type("Info", (), dict(metadata, st_ctime_ns=7))()
+                stack.enter_context(mock.patch.multiple(
+                    helper.os, O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0),
+                    O_NONBLOCK=getattr(os, "O_NONBLOCK", 0), create=True,
+                ))
+                stack.enter_context(mock.patch.object(helper, "_open_reference_parent", return_value=(11, "file")))
+                stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+                closed = stack.enter_context(mock.patch.object(helper.os, "close"))
+                stack.enter_context(mock.patch.object(
+                    helper.os, "fstat", side_effect=[
+                        info, replaced if fault == "descriptor-race"
+                        else changed_time if fault == "ctime-race" else info,
+                    ],
+                ))
+                stack.enter_context(mock.patch.object(
+                    helper.os, "stat", return_value=replaced if fault == "path-race" else info,
+                ))
+                stack.enter_context(mock.patch.object(
+                    helper.os, "read", side_effect=[b"bad" if fault == "short-read" else b"data", b""],
+                ))
+                for name, failing in (("_acl_is_safe", "acl"), ("_deadline_check", "deadline")):
+                    stack.enter_context(mock.patch.object(
+                        helper, name, side_effect=helper.ProviderError("RECOVERY_REQUIRED")
+                        if fault == failing else None,
+                    ))
+                writer = stack.enter_context(mock.patch.object(helper.os, "write"))
+                if fault == "none":
+                    data, identity = helper._rollback_source("/opt/meet/file")
+                    self.assertEqual(b"data", data)
+                    self.assertEqual(
+                        f"1:2:{fields['st_mode']}:0:0:4:5:6:{helper.hashlib.sha256(data).hexdigest()}\n".encode(),
+                        identity,
+                    )
+                else:
+                    with self.assertRaises(helper.ProviderError):
+                        helper._rollback_source("/opt/meet/file")
+                self.assertEqual([mock.call(12), mock.call(11)], closed.call_args_list)
+                writer.assert_not_called()
+
+    def test_present_predecessor_reconstruction_binds_frozen_state_and_refuses_uncertainty(self):
+        for fault in ("none", "inventory", "replaced", "request", "provider", "effective", "config", "deadline"):
+            current, envelope = live_context("PREPARED")[3:5]
+            observed = envelope["inspection"][0]
+            current["executionAttempt"] = "b" * 32
+            lease = {
+                "operation": "deploy", "workerMode": "rollback-worker",
+                "lifecycle": "rollback-admission", "rollbackIssued": True,
+                "attempt": "b" * 32, "revision": 7,
+            }
+            value = {
+                "deploymentRoot": "/opt/meet", "baseCompose": "/opt/tooling/compose.yml",
+                "backendInventory": [current["predecessorContainerId"]], "inspection": [observed],
+            }
+            if fault == "inventory":
+                value["backendInventory"] = []
+            if fault == "replaced":
+                current["containerId"], current["configHash"] = "e" * 64, "0" * 64
+                current["phase"] = "CUTOVER_POSSIBLE"
+            if fault == "request":
+                request_current, _ = RuntimeRequestProofTests().predecessor()
+                current["runtimeRequest"] = request_current["runtimeRequest"]
+            provider = {"providerEnabled": False, "durableDisposition": "none", "transaction": None}
+            proof = {
+                "provider": provider,
+                "effectiveProviderDigest": helper._configuration_digest(helper._effective_tuple(observed))
+                if fault != "effective" else "e" * 64,
+            }
+            with self.subTest(fault=fault), contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.multiple(
+                    helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                    O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+                ))
+                stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
+                stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+                stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+                stack.enter_context(mock.patch.object(helper.os, "close"))
+                stack.enter_context(mock.patch.object(helper, "_validate_state_directory_fd"))
+                stack.enter_context(mock.patch.object(helper, "_prepared_proof", return_value=proof))
+                stack.enter_context(mock.patch.object(helper, "_prepared_no_commit_files"))
+                stack.enter_context(mock.patch.object(helper, "_prepared_environment"))
+                stack.enter_context(mock.patch.object(helper, "_live_resume_predecessor"))
+                stack.enter_context(mock.patch.object(
+                    helper, "_intact_provider_record",
+                    return_value=provider if fault != "provider" else dict(provider, providerEnabled=True),
+                ))
+                stack.enter_context(mock.patch.object(
+                    helper, "_rollback_configuration", return_value="production",
+                    side_effect=helper.ProviderError("RECOVERY_REQUIRED") if fault == "config" else None,
+                ))
+                stack.enter_context(mock.patch.object(helper, "_read_child_file", return_value=({}, (
+                    "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:"
+                    + current["predecessor"]["tuple"]["repositoryDigest"] + "\n"
+                ).encode())))
+                check = mock.Mock(side_effect=helper.ProviderError("RECOVERY_REQUIRED") if fault == "deadline" else None)
+                write = stack.enter_context(mock.patch.object(helper.os, "write"))
+                unlink = stack.enter_context(mock.patch.object(helper.os, "unlink"))
+                if fault == "none":
+                    result = helper._rollback_runtime_proof("/state", current, lease, json.dumps(value).encode(), check)
+                    self.assertEqual(current["executionAttempt"], result["executionAttempt"])
+                    self.assertEqual(7, result["leaseRevision"])
+                    self.assertEqual("production", result["installedEnvironment"])
+                    self.assertRegex(result["proofDigest"], r"^[a-f0-9]{64}$")
+                    self.assertEqual(current["predecessor"], result["predecessor"])
+                else:
+                    with self.assertRaises((helper.ProviderError, helper._timepad_state_module().GuardError)):
+                        helper._rollback_runtime_proof("/state", current, lease, json.dumps(value).encode(), check)
+                write.assert_not_called()
+                unlink.assert_not_called()
+
+
 class RuntimeRequestProofTests(unittest.TestCase):
+    def predecessor(self, operation="suppress", lifecycle="intent"):
+        current, observed = live_context("PREPARED")[3:5]
+        observed = observed["inspection"][0]
+        current["executionAttempt"] = "b" * 32
+        current["runtimeRequest"] = {
+            "nonce": "a" * 32, "sequence": 1, "executionAttempt": "b" * 32,
+            "operation": operation, "containerId": current["predecessorContainerId"],
+            "imageId": current["predecessor"]["tuple"]["platformImageId"],
+            "configHash": observed["Config"]["Labels"]["com.docker.compose.config-hash"],
+            "childAttemptId": None, "lifecycle": lifecycle, "completionDigest": None,
+            "responseId": None if lifecycle == "intent" else observed["Id"],
+            "role": "predecessor",
+            **{key: current[key] for key in (
+                "originDigest", "incidentId", "operationEpoch", "preparedProofDigest", "evidenceDigest",
+            )},
+        }
+        return current, observed
+
+    def test_predecessor_preflight_and_effect_proof_are_distinct_and_exact(self):
+        for operation in ("suppress", "stop"):
+            current, observed = self.predecessor(operation)
+            if operation == "stop":
+                observed["HostConfig"]["RestartPolicy"]["Name"] = "no"
+            self.assertEqual({"requestNonce", "admissionDigest"},
+                             set(helper._runtime_request_proof(current, observed)))
+            current["runtimeRequest"].update(lifecycle="acknowledged", responseId=observed["Id"])
+            with self.assertRaises(helper.ProviderError):
+                helper._runtime_request_proof(current, observed)
+            observed["HostConfig"]["RestartPolicy"]["Name"] = "no"
+            if operation == "stop":
+                observed["State"]["Running"] = False
+            self.assertEqual({"requestNonce", "completionDigest"},
+                             set(helper._runtime_request_proof(current, observed)))
+
+    def test_predecessor_proof_refuses_changed_authority_identity_or_unknown_response(self):
+        for key, value in (
+            ("containerId", "e" * 64), ("imageId", "e" * 64),
+            ("configHash", "e" * 64), ("executionAttempt", "e" * 32),
+            ("originDigest", "e" * 64), ("incidentId", "e" * 32),
+            ("operationEpoch", 9), ("evidenceDigest", "e" * 64),
+            ("preparedProofDigest", "e" * 64), ("operation", "start"),
+            ("operation", "restore-policy"), ("responseId", "e" * 64),
+        ):
+            current, observed = self.predecessor()
+            current["runtimeRequest"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(helper.ProviderError):
+                helper._runtime_request_proof(current, observed)
+
+    def test_predecessor_adapter_reconstructs_frozen_provider_before_issuing_admission(self):
+        module = helper._timepad_state_module()
+        for fault in ("none", "config", "predecessor", "provider", "commit", "effective"):
+            current, observed = self.predecessor()
+            envelope = {"requestNonce": "a" * 32, "inspection": [observed]}
+            with self.subTest(fault=fault), contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.multiple(
+                    helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                    O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+                ))
+                stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
+                stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+                stack.enter_context(mock.patch.object(helper, "_timepad_current",
+                                                     return_value=(module, {}, current)))
+                stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+                stack.enter_context(mock.patch.object(helper.os, "close"))
+                stack.enter_context(mock.patch.object(helper, "_validate_state_directory_fd"))
+                def boundary(name):
+                    return mock.patch.object(
+                        helper, name, side_effect=helper.ProviderError("RECOVERY_REQUIRED")
+                        if fault == {"_live_resume_config": "config",
+                                     "_live_resume_predecessor": "predecessor",
+                                     "_prepared_no_commit_files": "commit"}.get(name)
+                        else None,
+                    )
+                for name in ("_live_resume_config", "_live_resume_predecessor", "_prepared_no_commit_files"):
+                    stack.enter_context(boundary(name))
+                stack.enter_context(mock.patch.object(helper, "_prepared_proof", return_value={
+                    "provider": {"frozen": True},
+                    "effectiveProviderDigest": helper._configuration_digest(helper._effective_tuple(observed))
+                    if fault != "effective" else "e" * 64,
+                }))
+                provider = stack.enter_context(mock.patch.object(
+                    helper, "_prepared_transaction",
+                    return_value={"frozen": fault != "provider"},
+                ))
+                write = stack.enter_context(mock.patch.object(helper.os, "write"))
+                unlink = stack.enter_context(mock.patch.object(helper.os, "unlink"))
+                output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                def admit():
+                    helper._runtime_request_completion(
+                        current["runId"], "/state", "final-deploy", json.dumps(envelope).encode(), 9,
+                    )
+                if fault == "none":
+                    admit()
+                    self.assertIn("admissionDigest", json.loads(output.getvalue()))
+                    provider.assert_called_once()
+                else:
+                    with self.assertRaises(helper.ProviderError):
+                        admit()
+                    self.assertEqual("", output.getvalue())
+                write.assert_not_called()
+                unlink.assert_not_called()
+
     def context(self):
         context = live_context()
         current, observed = context[3], context[4]["inspection"][0]
@@ -382,6 +696,10 @@ class RuntimeRequestProofTests(unittest.TestCase):
             }
             final = dict(current, reason="changed") if fault == "state-drift" else current
             with self.subTest(fault=fault), contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.multiple(
+                    helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                    O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+                ))
                 stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
                 stack.enter_context(mock.patch.object(helper, "_lock_directory"))
                 stack.enter_context(mock.patch.object(helper, "_timepad_current", side_effect=[
@@ -424,6 +742,203 @@ class LiveResumeTests(unittest.TestCase):
                 envelope, module=module, origin=origin, current=current,
                 run_key="31885558214-1", state_kind="final-deploy",
             )
+
+    def test_recovery_create_binding_uses_only_durable_completion_and_full_private_evidence(self):
+        context = stopped_create_context()
+        current, image, model, observed, proof, lease, receipt = context
+        module = helper._timepad_state_module()
+        evidence = {
+            "inspection": observed,
+            "backendInventory": [observed["Id"]],
+            "composeInventory": [observed["Id"], "9" * 64],
+            "imageInspection": image,
+            "targetConfiguration": model,
+            "resourceEvidence": {
+                "targetConfiguration": model,
+                "containerInspections": [observed],
+            },
+            "requestBaseline": {"fixture": True},
+        }
+        lease.update(operation="forward-recover", attempt="b" * 32)
+        with (
+            mock.patch.object(helper, "_open_deploy_state_root", return_value=11),
+            mock.patch.object(helper, "_lock_directory"),
+            mock.patch.object(helper, "_timepad_current", side_effect=[
+                (module, {}, current), (module, {}, current),
+            ]),
+            mock.patch.object(helper, "_resume_binding_authority") as authority,
+            mock.patch.object(module, "_read_execution_lease_locked", return_value=lease),
+            mock.patch.object(helper.os, "open", return_value=12),
+            mock.patch.object(helper.os, "close"),
+            mock.patch.object(helper, "_validate_state_directory_fd"),
+            mock.patch.object(
+                helper, "_read_child_file",
+                return_value=({}, json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()),
+            ) as read_receipt,
+            mock.patch.object(helper, "_stopped_create_binding", return_value={"containerId": observed["Id"]}) as bind,
+        ):
+            with mock.patch.multiple(
+                helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+            ):
+                with self.assertRaises(helper.ProviderError):
+                    helper._recovery_lease_runtime_proof(
+                        "/state", current, b"{}", json.dumps(evidence).encode(), 9, mock.Mock(),
+                    )
+                result = helper._recovery_lease_runtime_proof(
+                    "/state", current, b"{}", json.dumps(evidence).encode(), 9, mock.Mock(),
+                    create_completion_recovery=True,
+                )
+        self.assertIs(current["runtimeRequest"], result)
+        authority.assert_called_once()
+        read_receipt.assert_called_once_with(12, "timepad-create-completion.json",
+                                             module.MAX_CREATE_COMPLETION_BYTES)
+        bind.assert_called_once()
+        self.assertEqual(lease, bind.call_args.kwargs["completion_lease"])
+        self.assertEqual(evidence["requestBaseline"], bind.call_args.kwargs["request_baseline"])
+        self.assertNotIn("receipt", evidence)
+
+    def test_recovery_create_binding_refuses_unbound_drift_or_caller_supplied_receipt(self):
+        context = stopped_create_context()
+        current, image, model, observed, _, _, _ = context
+        module = helper._timepad_state_module()
+        base = {
+            "inspection": observed,
+            "backendInventory": [observed["Id"]],
+            "composeInventory": [observed["Id"]],
+            "imageInspection": image,
+            "targetConfiguration": model,
+            "resourceEvidence": {
+                "targetConfiguration": model,
+                "containerInspections": [observed],
+            },
+            "requestBaseline": {"fixture": True},
+        }
+        faults = []
+        missing = dict(base)
+        del missing["resourceEvidence"]
+        faults.append(("missing-resource-evidence", missing, None))
+        injected = dict(base, completionReceipt={"acknowledged": True})
+        faults.append(("caller-receipt", injected, None))
+        wrong_backend = dict(base, backendInventory=["e" * 64])
+        faults.append(("wrong-candidate", wrong_backend, None))
+        bound_claim = json.loads(json.dumps(base))
+        bound_claim["inspection"]["Id"] = "e" * 64
+        faults.append(("unbound-identity-drift", bound_claim, None))
+        for label, evidence, lifecycle in faults:
+            candidate = json.loads(json.dumps(current))
+            if lifecycle is not None:
+                candidate["runtimeRequest"]["lifecycle"] = lifecycle
+            with self.subTest(label=label):
+                with self.assertRaises(helper.ProviderError):
+                    helper._recovery_lease_runtime_proof(
+                        "/state", candidate, b"{}", json.dumps(evidence).encode(),
+                        9, mock.Mock(), create_completion_recovery=True,
+                    )
+
+    def test_recovery_create_bridge_is_explicit_across_distinct_state_module_instances(self):
+        context = stopped_create_context()
+        current, image, model, observed, _, lease, receipt = context
+        state_spec = importlib.util.spec_from_file_location(
+            "test_vps_timepad_state_for_provider_bridge_test",
+            ROOT / "test_vps_timepad_state.py",
+        )
+        self.assertIsNotNone(state_spec)
+        self.assertIsNotNone(state_spec.loader)
+        state_module = importlib.util.module_from_spec(state_spec)
+        sys.modules[state_spec.name] = state_module
+        state_spec.loader.exec_module(state_module)
+        provider_state = helper._timepad_state_module()
+        self.assertIsNot(state_module, provider_state)
+
+        evidence = {
+            "inspection": observed,
+            "backendInventory": [observed["Id"]],
+            "composeInventory": [observed["Id"]],
+            "imageInspection": image,
+            "targetConfiguration": model,
+            "resourceEvidence": {
+                "targetConfiguration": model,
+                "containerInspections": [observed],
+            },
+            "requestBaseline": {"fixture": True},
+        }
+        self.assertTrue(state_module._RECOVERY_CREATE_COMPLETION_PROOF.get() is False)
+        with mock.patch.multiple(
+                 helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                 O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+             ), \
+             mock.patch.object(helper, "_open_deploy_state_root", return_value=11), \
+             mock.patch.object(helper, "_lock_directory"), \
+             mock.patch.object(helper, "_timepad_current", side_effect=[
+                 (provider_state, {}, current), (provider_state, {}, current),
+             ]), \
+             mock.patch.object(helper, "_resume_binding_authority"), \
+             mock.patch.object(provider_state, "_read_execution_lease_locked", return_value=lease), \
+             mock.patch.object(helper.os, "open", return_value=12), \
+             mock.patch.object(helper.os, "close"), \
+             mock.patch.object(helper, "_validate_state_directory_fd"), \
+             mock.patch.object(helper, "_read_child_file", return_value=(
+                 {}, json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(),
+             )), \
+             mock.patch.object(helper, "_stopped_create_binding", return_value={"containerId": observed["Id"]}):
+            result = helper._recovery_lease_runtime_proof(
+                "/state", current, b"{}", json.dumps(evidence).encode(), 9, mock.Mock(),
+                create_completion_recovery=True,
+            )
+        self.assertIs(current["runtimeRequest"], result)
+
+    def test_replacement_create_recovery_keeps_old_current_id_until_read_only_bind(self):
+        current, image, model, observed, _, lease, receipt = stopped_create_context(replacement=True)
+        request = current["runtimeRequest"]
+        self.assertEqual(request["priorContainerId"], current["containerId"])
+        request["lifecycle"] = "normal-completed"
+        current["phase"] = "CUTOVER_POSSIBLE"
+        current["commitWitnessDigest"] = None
+        current["providerFinalizationDigest"] = None
+        current["commitSubstep"] = None
+        request["executionAttempt"] = current["executionAttempt"]
+        request["containerId"] = None
+        request["configHash"] = None
+        request["completionDigest"] = "3" * 64
+        lease["attempt"] = request["executionAttempt"]
+        lease["createCompletion"]["attempt"] = request["executionAttempt"]
+        evidence = {
+            "inspection": observed,
+            "backendInventory": [observed["Id"]],
+            "composeInventory": [observed["Id"]],
+            "imageInspection": image,
+            "targetConfiguration": model,
+            "resourceEvidence": {
+                "targetConfiguration": model,
+                "containerInspections": [observed],
+            },
+            "requestBaseline": {"fixture": True},
+        }
+        module = helper._timepad_state_module()
+        with mock.patch.multiple(
+                 helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                 O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+             ), \
+             mock.patch.object(helper, "_open_deploy_state_root", return_value=11), \
+             mock.patch.object(helper, "_lock_directory"), \
+             mock.patch.object(helper, "_timepad_current", side_effect=[
+                 (module, {}, current), (module, {}, current),
+             ]), \
+             mock.patch.object(helper, "_resume_binding_authority"), \
+             mock.patch.object(module, "_read_execution_lease_locked", return_value=lease), \
+             mock.patch.object(helper.os, "open", return_value=12), \
+             mock.patch.object(helper.os, "close"), \
+             mock.patch.object(helper, "_validate_state_directory_fd"), \
+             mock.patch.object(helper, "_read_child_file", return_value=(
+                 {}, json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(),
+             )), \
+             mock.patch.object(helper, "_stopped_create_binding", return_value={"containerId": observed["Id"]}) as bind:
+            helper._recovery_lease_runtime_proof(
+                "/state", current, b"{}", json.dumps(evidence).encode(), 9, mock.Mock(),
+                create_completion_recovery=True,
+            )
+        bind.assert_called_once()
 
     def test_stale_lease_proof_requires_exact_complete_inventories_and_known_request(self):
         for lifecycle in ("completed", "acknowledged", "intent", None):
@@ -1565,7 +2080,1462 @@ def prepared_proof(current: dict) -> dict:
         },
         "targetConfigurationDigest": "1" * 64,
         "effectiveProviderDigest": "2" * 64,
+        "operationToken": "a" * 32, "modelDigest": "1" * 64,
+        "toolingDigest": current["toolingDigest"],
+        "resourcesDigest": "6" * 64,
     }
+
+
+def stopped_create_context(*, replacement: bool = False, resource_only: bool = False) -> tuple:
+    module, _, _, current, envelope = live_context("PREPARED")
+    image = envelope["imageInspection"][0]
+    image["Config"].update(
+        Entrypoint=["java"], Cmd=["-jar", "app.jar"], WorkingDir="/app", StopSignal="SIGTERM",
+    )
+    token = "a" * 32
+    model = {
+        "name": "meet-production",
+        "services": {"backend": {
+            "image": envelope["targetConfiguration"]["services"]["backend"]["image"],
+            "environment": {"PRIVATE_CANARY": "never-print-me"},
+            "user": "10001:10001", "read_only": True, "init": True,
+            "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
+            "tmpfs": ["/tmp"], "restart": "unless-stopped", "mem_limit": 805306368,
+            "ports": [{"host_ip": "127.0.0.1", "target": 8080, "published": "18080",
+                       "protocol": "tcp", "mode": "ingress"}],
+            "volumes": [{"type": "volume", "source": "uploads_data", "target": "/data/uploads"}],
+            "logging": {"driver": "local", "options": {"max-size": "10m", "max-file": "5"}},
+            "labels": {"org.meet.timepad.operation": token},
+            "healthcheck": {"test": ["CMD", "curl", "--fail", "http://127.0.0.1:8080/meetings"],
+                            "interval": "30s", "timeout": "5s", "retries": 3, "start_period": "30s"},
+        }},
+        "volumes": {"uploads_data": {"name": "meet-production_uploads_data"}},
+        "networks": {"default": {"name": "meet-production_default"}},
+    }
+    current.update(
+        phase="CUTOVER_POSSIBLE", executionAttempt="b" * 32,
+        latestAttemptId=current["incidentId"] + ":1",
+    )
+    if replacement:
+        current.update(
+            phase="COMMITTING", containerId="c" * 64, configHash="0" * 64,
+            commitWitnessDigest="1" * 64, providerFinalizationDigest="2" * 64,
+            commitSubstep="replacement-create-intent",
+        )
+    current["runtimeRequest"] = {
+        "nonce": "e" * 32, "sequence": 1, "executionAttempt": current["executionAttempt"],
+        "operation": "create", "containerId": None, "configHash": None,
+        "responseId": None, "completionDigest": "3" * 64, "lifecycle": "normal-completed",
+        "imageId": current["target"]["tuple"]["platformImageId"],
+        "childAttemptId": current["latestAttemptId"],
+        "childIdentity": {
+            "pid": 101, "processGroup": 101, "bootId": "01234567-89ab-cdef-0123-456789abcdef",
+            "startTicks": 100, "commandDigest": "4" * 64, "attemptId": current["latestAttemptId"],
+        },
+        "originDigest": current["originDigest"], "operationEpoch": current["operationEpoch"],
+        "incidentId": current["incidentId"], "operationToken": token,
+        "preparedProofDigest": current["preparedProofDigest"], "modelDigest": helper._model_digest(model),
+        "toolingDigest": current["toolingDigest"],
+        "role": "replacement" if replacement else "initial",
+        "priorContainerId": current["containerId"],
+        "resourcesDigest": "6" * 64,
+        "resourceRequestDigest": helper._configuration_digest({"fixture": True}),
+    }
+    observed = {
+        "Id": "a" * 64, "Image": image["Id"], "RestartCount": 0,
+        "Config": json.loads(json.dumps(image["Config"])),
+        "State": {
+            "Status": "created", "Running": False, "Paused": False, "Restarting": False,
+            "Dead": False, "OOMKilled": False, "Pid": 0, "ExitCode": 0, "Error": "",
+            "StartedAt": "0001-01-01T00:00:00Z", "FinishedAt": "0001-01-01T00:00:00Z",
+        },
+        "HostConfig": {
+            "ReadonlyRootfs": True, "Init": True, "CapDrop": ["ALL"],
+            "SecurityOpt": ["no-new-privileges:true"], "Tmpfs": {"/tmp": ""},
+            "Memory": 805306368, "LogConfig": {"Type": "local", "Config": model["services"]["backend"]["logging"]["options"]},
+            "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
+            "NetworkMode": "meet-production_default", "Privileged": False,
+            "CapAdd": None, "Devices": None, "DeviceRequests": None, "PidMode": "", "UsernsMode": "",
+            "PortBindings": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18080"}]},
+            "Binds": ["meet-production_uploads_data:/data/uploads:rw"],
+        },
+        "Mounts": [{"Type": "volume", "Name": "meet-production_uploads_data",
+                    "Destination": "/data/uploads", "RW": True, "Propagation": ""}],
+        "NetworkSettings": {"Networks": {
+            "meet-production_default": {"Aliases": ["backend", "meet-production-backend-1"]},
+        }},
+    }
+    observed["Config"].update(
+        Env=image["Config"]["Env"] + ["PRIVATE_CANARY=never-print-me"],
+        Image=model["services"]["backend"]["image"], StopTimeout=30,
+        ExposedPorts={"8080/tcp": {}},
+        Healthcheck={"Test": model["services"]["backend"]["healthcheck"]["test"],
+                     "Interval": 30000000000, "Timeout": 5000000000, "Retries": 3,
+                     "StartPeriod": 30000000000},
+    )
+    observed["Config"]["Labels"].update({
+        "org.meet.timepad.operation": token,
+        "com.docker.compose.container-number": "1", "com.docker.compose.oneoff": "False",
+        "com.docker.compose.version": "2.39.4", "com.docker.compose.image": image["Id"],
+    })
+    proof = prepared_proof(current)
+    proof.update(
+        operationToken=token, modelDigest=helper._model_digest(model),
+        targetConfigurationDigest=helper._model_digest(model),
+        effectiveProviderDigest=helper._configuration_digest(helper._absence_target_tuple(image, model, current)),
+    )
+    if resource_only:
+        return current, image, model, observed, proof, None, None
+    request = current["runtimeRequest"]
+    receipt = {
+        "schema": module.CREATE_COMPLETION_SCHEMA, "requestDigest": module.create_request_digest(request),
+        "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+        "resourcesDigest": request["resourcesDigest"],
+        "resourceRequestDigest": request["resourceRequestDigest"],
+        "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+    }
+    request["completionDigest"] = helper._configuration_digest(receipt)
+    lease = {
+        "attempt": request["executionAttempt"],
+        "createCompletion": {
+            **{key: value for key, value in receipt.items() if key != "schema"},
+            "receiptDigest": request["completionDigest"], "acknowledged": True,
+        },
+    }
+    return current, image, model, observed, proof, lease, receipt
+
+
+def resource_context(stage: str = "prepared", *, baseline=None, request_baseline=None) -> dict:
+    """Independently shaped list/inspect fixtures; none are derived by admission."""
+    _, _, model, backend, _, _, _ = stopped_create_context(resource_only=True)
+    model["services"]["backend"]["environment"].update(
+        DB_NAME="meet", DB_USERNAME="meet", DB_PASSWORD="PRIVATE_DATABASE_CANARY",
+    )
+    backend["Config"]["Env"].extend([
+        "DB_NAME=meet", "DB_USERNAME=meet", "DB_PASSWORD=PRIVATE_DATABASE_CANARY",
+    ])
+    model["services"]["backend"]["depends_on"] = {
+        "postgres": {"condition": "service_healthy", "required": True},
+    }
+    model["volumes"]["postgres_data"] = {"name": "meet-production_postgres_data"}
+    postgres_model = {
+        "image": helper.POSTGRES_IMAGE,
+        "environment": {"POSTGRES_DB": "meet", "POSTGRES_USER": "meet",
+                        "POSTGRES_PASSWORD": "PRIVATE_DATABASE_CANARY"},
+        "volumes": [{"type": "volume", "source": "postgres_data", "target": "/var/lib/postgresql/data"}],
+        "restart": "unless-stopped", "security_opt": ["no-new-privileges:true"],
+        "logging": model["services"]["backend"]["logging"],
+        "healthcheck": {
+            "test": ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'],
+            "interval": "10s", "timeout": "5s", "retries": 10, "start_period": "10s",
+        },
+    }
+    model["services"]["postgres"] = postgres_model
+    network_id, postgres_id = "8" * 64, "9" * 64
+    backend_id = "a" * 64 if stage in {"post-create", "completion", "recovery"} else "f" * 64
+    network_labels = {
+        "com.docker.compose.project": "meet-production", "com.docker.compose.network": "default",
+        "com.docker.compose.version": "2.39.4",
+    }
+    network = {
+        "Id": network_id, "Name": "meet-production_default", "Created": "2026-10-01T00:00:00Z",
+        "Scope": "local", "Driver": "bridge", "EnableIPv4": True, "EnableIPv6": False,
+        "IPAM": {"Driver": "default", "Options": None,
+                 "Config": [{"Subnet": "172.25.0.0/16", "Gateway": "172.25.0.1"}]},
+        "Internal": False, "Attachable": False, "Ingress": False,
+        "ConfigFrom": {"Network": ""}, "ConfigOnly": False, "Containers": {},
+        "Options": {}, "Labels": network_labels,
+    }
+    volumes = [
+        {
+            "Name": name, "CreatedAt": "2026-10-01T00:00:00Z", "Driver": "local", "Scope": "local",
+            "Options": None, "Mountpoint": "/var/lib/docker/volumes/" + name + "/_data",
+            "Labels": {"com.docker.compose.project": "meet-production",
+                       "com.docker.compose.volume": logical, "com.docker.compose.version": "2.39.4"},
+        }
+        for logical, name in helper.RESOURCE_VOLUMES.items()
+    ]
+    def endpoint(service, identity, *, active=True):
+        return {
+            "NetworkID": network_id, "EndpointID": ("e" if service == "postgres" else "d") * 64 if active else "",
+            "IPAddress": "172.25.0." + ("2" if service == "postgres" else "3") if active else "",
+            "Gateway": "172.25.0.1" if active else "", "IPPrefixLen": 16 if active else 0,
+            "MacAddress": "02:42:ac:19:00:" + ("02" if service == "postgres" else "03") if active else "",
+            "Aliases": [service, "meet-production-" + service + "-1"],
+            "DNSNames": [service, "meet-production-" + service + "-1", identity[:12]],
+        }
+    postgres_image = {
+        "Id": "sha256:" + "7" * 64,
+        "RepoDigests": ["postgres@" + helper.POSTGRES_IMAGE.split("@", 1)[1]],
+        "Config": {
+            "Env": ["PATH=/usr/local/bin"], "User": "", "Entrypoint": ["docker-entrypoint.sh"],
+            "Cmd": ["postgres"], "WorkingDir": "", "StopSignal": "SIGINT",
+            "Volumes": {"/var/lib/postgresql/data": {}}, "ExposedPorts": {"5432/tcp": {}},
+            "Labels": None,
+        },
+    }
+    pg_config = dict(postgres_image["Config"])
+    pg_config.update(
+        Image=helper.POSTGRES_IMAGE,
+        Env=postgres_image["Config"]["Env"] + [
+            key + "=" + value for key, value in postgres_model["environment"].items()
+        ],
+        Hostname=postgres_id[:12],
+        Labels={
+            "com.docker.compose.project": "meet-production", "com.docker.compose.service": "postgres",
+            "com.docker.compose.container-number": "1", "com.docker.compose.oneoff": "False",
+            "com.docker.compose.version": "2.39.4", "com.docker.compose.image": postgres_image["Id"],
+            "com.docker.compose.config-hash": "0" * 64,
+        },
+        Healthcheck={
+            "Test": ["CMD-SHELL", 'pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}"'],
+            "Interval": 10000000000, "Timeout": 5000000000, "Retries": 10, "StartPeriod": 10000000000,
+        },
+    )
+    postgres = {
+        "Id": postgres_id, "Name": "/meet-production-postgres-1", "Image": postgres_image["Id"],
+        "Config": pg_config, "RestartCount": 0,
+        "HostConfig": {
+            "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
+            "SecurityOpt": ["no-new-privileges:true"], "NetworkMode": "meet-production_default",
+            "LogConfig": {"Type": "local", "Config": postgres_model["logging"]["options"]},
+            "Binds": ["meet-production_postgres_data:/var/lib/postgresql/data:rw"],
+            "Privileged": False, "CapAdd": None, "Devices": None, "DeviceRequests": None,
+            "PidMode": "", "UsernsMode": "",
+        },
+        "State": {
+            "Status": "running", "Running": True, "Paused": False, "Restarting": False,
+            "Dead": False, "OOMKilled": False, "Error": "", "Pid": 123,
+            "StartedAt": "2026-10-01T01:00:00Z", "Health": {"Status": "healthy", "Log": ["PRIVATE_HEALTH_CANARY"]},
+        },
+        "Mounts": [{
+            "Type": "volume", "Name": "meet-production_postgres_data", "Driver": "local",
+            "Source": volumes[1]["Mountpoint"], "Destination": "/var/lib/postgresql/data",
+            "RW": True, "Mode": "rw", "Propagation": "",
+        }],
+        "NetworkSettings": {"Networks": {"meet-production_default": endpoint("postgres", postgres_id)}},
+    }
+    backend.update(Id=backend_id, Name="/meet-production-backend-1")
+    backend["Mounts"][0].update(
+        Source=volumes[0]["Mountpoint"], Driver="local", Mode="rw",
+    )
+    if stage == "prepared":
+        backend["State"].update(
+            Status="running", Running=True, Pid=456, StartedAt="2026-10-01T01:00:00Z",
+        )
+        backend["Config"]["Labels"].pop("org.meet.timepad.operation")
+    elif stage == "pre-release":
+        backend["State"].update(Status="exited")
+        backend["HostConfig"]["RestartPolicy"] = {"Name": "no", "MaximumRetryCount": 0}
+        backend["Config"]["Labels"].pop("org.meet.timepad.operation")
+    elif stage == "recovery":
+        backend["State"].update(
+            Status="running", Running=True, Pid=789, StartedAt="2026-10-01T02:00:00Z",
+            Health={"Status": "healthy", "Log": ["PRIVATE_BACKEND_HEALTH_CANARY"]},
+        )
+        backend["HostConfig"]["RestartPolicy"] = {"Name": "no", "MaximumRetryCount": 0}
+    backend["NetworkSettings"]["Networks"]["meet-production_default"] = endpoint(
+        "backend", backend_id, active=stage in {"prepared", "recovery"},
+    )
+    for container in (postgres, backend):
+        ep = container["NetworkSettings"]["Networks"]["meet-production_default"]
+        if ep["EndpointID"]:
+            network["Containers"][container["Id"]] = {
+                "Name": container["Name"][1:], "EndpointID": ep["EndpointID"],
+                "MacAddress": ep["MacAddress"], "IPv4Address": ep["IPAddress"] + "/16", "IPv6Address": "",
+            }
+    observed = {
+        "targetConfiguration": model, "postgresImageInspection": postgres_image,
+        "projectInventory": [postgres_id, backend_id], "composeInventory": [backend_id, postgres_id],
+        "backendInventory": [backend_id],
+        "daemonInventory": [
+            {"Id": c["Id"], "Names": c["Name"][1:], "Labels": dict(c["Config"]["Labels"])}
+            for c in (postgres, backend)
+        ],
+        "containerInspections": [postgres, backend],
+        "networkInventory": [{"ID": network_id, "Name": network["Name"], "Labels": dict(network_labels)}],
+        "networkInspections": [network],
+        "volumeInventory": [
+            {key: volume[key] for key in ("Name", "Driver", "Labels")} for volume in volumes
+        ],
+        "volumeInspections": volumes,
+    }
+    return helper._resource_envelope(
+        stage=stage, baseline=baseline, request_baseline=request_baseline, observed=observed,
+        role={"operationToken": "a" * 32,
+              "backendContainerId": "a" * 64 if stage == "recovery" else "f" * 64,
+              "priorBackendContainerId": "f" * 64 if stage == "recovery" else None,
+              "allowEmptyBackend": False},
+    )
+
+
+class ResourceAdmissionTests(unittest.TestCase):
+    def admit(self, value):
+        before = json.dumps(value, sort_keys=True)
+        with (
+            mock.patch.object(helper.os, "write") as write,
+            mock.patch.object(helper.os, "unlink") as unlink,
+            mock.patch.object(helper.os, "open") as opened,
+        ):
+            result = helper._resource_admission(value)
+        write.assert_not_called()
+        unlink.assert_not_called()
+        opened.assert_not_called()
+        self.assertEqual(before, json.dumps(value, sort_keys=True))
+        self.assertLessEqual(len(helper._resource_bytes(result["baseline"], 16384)), 16384)
+        self.assertLessEqual(len(helper._resource_bytes(result["membership"], 4096)), 4096)
+        for secret in ("PRIVATE_DATABASE_CANARY", "PRIVATE_HEALTH_CANARY", "PRIVATE_CANARY"):
+            self.assertNotIn(secret, json.dumps(result))
+        return result
+
+    def prepared(self):
+        return self.admit(resource_context())
+
+    def sequence(self):
+        initial = self.prepared()
+        request = self.admit(resource_context("pre-release", baseline=initial["baseline"]))
+        post = resource_context(
+            "post-create", baseline=initial["baseline"], request_baseline=request["membership"],
+        )
+        return initial, request, post
+
+    def test_pinned_typed_resource_hash_vectors_and_unknown_shapes(self):
+        vectors = (
+            ("network", "meet-production_default", "651a5af4f59f899aca7027226897ea961dc4ba78e1393476a384a4c1fae14b93"),
+            ("volume", "meet-production_uploads_data", "78a0524f844d4a7831e437be30f8c0796c6961fff0747ffefccaa04e539210d8"),
+            ("volume", "meet-production_postgres_data", "c9794a292b1aa7332d8a736ead7de859b448c36f30412cc70375f35806251a74"),
+        )
+        for kind, name, digest in vectors:
+            self.assertEqual(digest, helper._resource_hash(kind, name))
+        for kind, name in (("service", "backend"), ("volume", "other"), ("network", "other")):
+            with self.assertRaises(helper.ProviderError):
+                helper._resource_hash(kind, name)
+
+    def test_missing_empty_and_present_hash_policy_preserves_label_presence(self):
+        for kind, index in (("network", 0), ("volume", 0), ("volume", 1)):
+            for hash_value in (None, "", "f" * 64, "expected"):
+                value = resource_context()
+                observed = value["observed"]
+                inspected = observed["networkInspections"][0] if kind == "network" else observed["volumeInspections"][index]
+                listed = observed["networkInventory"][0] if kind == "network" else observed["volumeInventory"][index]
+                name = inspected["Name"]
+                if hash_value is not None:
+                    actual = helper._resource_hash(kind, name) if hash_value == "expected" else hash_value
+                    inspected["Labels"]["com.docker.compose.config-hash"] = actual
+                    listed["Labels"]["com.docker.compose.config-hash"] = actual
+                with self.subTest(kind=kind, index=index, hash=hash_value):
+                    if hash_value in (None, "expected") or kind == "network" and hash_value == "":
+                        result = self.admit(value)
+                        projection = result["baseline"]["network"] if kind == "network" else \
+                            result["baseline"]["volumes"][list(helper.RESOURCE_VOLUMES)[index]]
+                        self.assertEqual(hash_value is not None, "com.docker.compose.config-hash" in projection["Labels"])
+                    else:
+                        with self.assertRaises(helper.ProviderError):
+                            self.admit(value)
+
+    def test_complete_create_delta_and_second_pre_release_equality(self):
+        initial, request, post = self.sequence()
+        value = resource_context("pre-release", baseline=initial["baseline"])
+        value["expectedMembershipDigest"] = request["membershipDigest"]
+        self.assertEqual(request, self.admit(value))
+        result = self.admit(post)
+        self.assertEqual(initial["baselineDigest"], result["baselineDigest"])
+        self.assertNotEqual(request["membershipDigest"], result["membershipDigest"])
+        post["stage"] = "completion"
+        self.assertEqual(result, self.admit(post))
+        value["expectedMembershipDigest"] = "0" * 64
+        with self.assertRaises(helper.ProviderError):
+            self.admit(value)
+
+    def test_recovery_revalidates_authorized_running_backend_and_full_resource_baseline(self):
+        initial = self.prepared()
+        request = self.admit(resource_context("pre-release", baseline=initial["baseline"]))
+        value = resource_context(
+            "recovery", baseline=initial["baseline"], request_baseline=request["membership"],
+        )
+        admitted = self.admit(value)
+        self.assertEqual("a" * 64, admitted["membership"]["backendContainerId"])
+        self.assertEqual(initial["baselineDigest"], admitted["baselineDigest"])
+        self.assertEqual(request["membership"]["endpoints"]["9" * 64],
+                         admitted["membership"]["endpoints"]["9" * 64])
+        for fault in ("backend-id", "backend-token", "postgres-endpoint", "network-id",
+                      "uploads-consumer", "empty-override"):
+            changed = json.loads(json.dumps(value))
+            if fault == "backend-id":
+                changed["role"]["backendContainerId"] = "f" * 64
+            elif fault == "backend-token":
+                changed["observed"]["containerInspections"][1]["Config"]["Labels"][
+                    "org.meet.timepad.operation"
+                ] = "b" * 32
+                changed["observed"]["daemonInventory"][1]["Labels"][
+                    "org.meet.timepad.operation"
+                ] = "b" * 32
+            elif fault == "postgres-endpoint":
+                changed["observed"]["containerInspections"][0]["NetworkSettings"]["Networks"][
+                    "meet-production_default"
+                ]["IPAddress"] = "172.25.0.8"
+            elif fault == "network-id":
+                changed["observed"]["networkInspections"][0]["Id"] = "1" * 64
+                changed["observed"]["networkInventory"][0]["ID"] = "1" * 64
+            elif fault == "uploads-consumer":
+                changed["observed"]["containerInspections"][1]["Mounts"][0]["Name"] = \
+                    "foreign-volume"
+            else:
+                changed["role"]["allowEmptyBackend"] = True
+            with self.subTest(fault=fault), self.assertRaises(helper.ProviderError):
+                self.admit(changed)
+
+    def test_recovery_without_create_request_requires_exact_frozen_backend_membership(self):
+        initial = self.prepared()
+        value = resource_context("prepared", baseline=initial["baseline"])
+        value["stage"] = "recovery"
+        value["baseline"] = initial["baseline"]
+        result = self.admit(value)
+        self.assertEqual("f" * 64, result["membership"]["backendContainerId"])
+        self.assertEqual(initial["baseline"]["membership"], result["membership"])
+        changed = json.loads(json.dumps(value))
+        changed["observed"]["networkInspections"][0]["Created"] = "2026-10-02T00:00:00Z"
+        with self.assertRaises(helper.ProviderError):
+            self.admit(changed)
+        empty = json.loads(json.dumps(value))
+        empty["role"]["allowEmptyBackend"] = True
+        with self.assertRaises(helper.ProviderError):
+            self.admit(empty)
+
+    def test_inventory_disagreement_duplicates_overflow_and_missing_inspections_refuse(self):
+        for field in ("projectInventory", "composeInventory", "backendInventory",
+                      "daemonInventory", "containerInspections", "networkInventory",
+                      "networkInspections", "volumeInventory", "volumeInspections"):
+            for fault in ("missing", "duplicate", "overflow"):
+                value = resource_context()
+                items = value["observed"][field]
+                value["observed"][field] = [] if fault == "missing" else \
+                    items + [items[0]] if fault == "duplicate" else [items[0]] * 257
+                with self.subTest(field=field, fault=fault), self.assertRaises(helper.ProviderError):
+                    self.admit(value)
+        value = resource_context()
+        value["observed"]["projectInventory"][0] = "1" * 64
+        with self.assertRaises(helper.ProviderError):
+            self.admit(value)
+        value = resource_context()
+        value["observed"]["containerInspections"][0]["Config"]["Env"].append("x=" + "x" * (8 * 1024 * 1024))
+        with self.assertRaises(helper.ProviderError):
+            self.admit(value)
+
+    def test_semantic_resource_and_model_changes_refuse_before_create(self):
+        changes = (
+            (("networkInspections", 0, "Internal"), True),
+            (("networkInspections", 0, "EnableIPv4"), False),
+            (("networkInspections", 0, "EnableIPv6"), True),
+            (("networkInspections", 0, "Options"), {"unsafe": "true"}),
+            (("networkInspections", 0, "Unknown"), False),
+            (("networkInspections", 0, "IPAM", "Config", 0, "Gateway"), "192.168.0.1"),
+            (("networkInspections", 0, "IPAM", "Config", 0, "IPRange"), "172.25.1.0/24"),
+            (("volumeInspections", 0, "Driver"), "plugin"),
+            (("volumeInspections", 0, "Options"), {"device": "/private"}),
+            (("volumeInspections", 0, "Status"), {}),
+            (("volumeInspections", 1, "Labels"), {}),
+            (("targetConfiguration", "volumes", "uploads_data", "external"), True),
+            (("targetConfiguration", "networks", "default", "driver"), "bridge"),
+            (("targetConfiguration", "services", "backend", "depends_on"), {}),
+            (("targetConfiguration", "services", "postgres", "command"), ["other"]),
+            (("targetConfiguration", "services", "postgres", "image"), "postgres:latest"),
+        )
+        for path, replacement in changes:
+            value = resource_context()
+            target = value["observed"]
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = replacement
+            with self.subTest(path=path), self.assertRaises(helper.ProviderError):
+                self.admit(value)
+
+    def test_postgres_identity_health_and_full_configuration_drift_refuse(self):
+        initial = self.prepared()
+        changes = (
+            (("RestartCount",), 1), (("State", "StartedAt"), "2026-10-02T00:00:00Z"),
+            (("State", "Pid"), 124), (("State", "Health", "Status"), "unhealthy"),
+            (("Config", "Cmd"), ["other"]), (("HostConfig", "Privileged"), True),
+            (("HostConfig", "RestartPolicy", "Name"), "no"),
+            (("Mounts", 0, "RW"), False), (("Mounts", 0, "Source"), "/other"),
+            (("Mounts", 0, "Destination"), "/other"),
+            (("NetworkSettings", "Networks", "meet-production_default", "NetworkID"), "1" * 64),
+        )
+        for path, replacement in changes:
+            value = resource_context("pre-release", baseline=initial["baseline"])
+            target = value["observed"]["containerInspections"][0]
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = replacement
+            with self.subTest(path=path), self.assertRaises(helper.ProviderError):
+                self.admit(value)
+        value = resource_context("pre-release", baseline=initial["baseline"])
+        value["observed"]["containerInspections"][0]["State"]["Health"]["Log"] = ["different-sample"]
+        self.admit(value)
+
+    def test_postgres_healthcheck_accepts_only_compose_render_and_engine_vectors(self):
+        rendered = {
+            "test": ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'],
+            "interval": "10s", "timeout": "5s", "retries": 10, "start_period": "10s",
+        }
+        engine = {
+            **rendered,
+            "test": ["CMD-SHELL", 'pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}"'],
+        }
+        for healthcheck in (rendered, engine):
+            with self.subTest(healthcheck=healthcheck):
+                value = resource_context()
+                value["observed"]["targetConfiguration"]["services"]["postgres"][
+                    "healthcheck"
+                ] = healthcheck
+                self.admit(value)
+
+        near_misses = (
+            {
+                **rendered,
+                "test": ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "${POSTGRES_DB}"'],
+            },
+            {
+                **rendered,
+                "test": ["CMD-SHELL", 'pg_isready -U "$$$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'],
+            },
+            {
+                **rendered,
+                "test": ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" '],
+            },
+            {**rendered, "retries": True},
+            {**rendered, "interval": "11s"},
+        )
+        for healthcheck in near_misses:
+            with self.subTest(healthcheck=healthcheck), self.assertRaises(helper.ProviderError):
+                value = resource_context()
+                value["observed"]["targetConfiguration"]["services"]["postgres"][
+                    "healthcheck"
+                ] = healthcheck
+                self.admit(value)
+
+    def test_foreign_stopped_consumers_names_orphans_and_endpoint_disagreement_refuse(self):
+        for fault in ("upload-consumer", "postgres-consumer", "network-consumer", "reserved-name",
+                      "orphan", "oneoff", "scaled", "daemon-label-disagreement", "network-view"):
+            value = resource_context()
+            observed = value["observed"]
+            if fault in ("oneoff", "scaled", "orphan", "daemon-label-disagreement"):
+                key, replacement = {
+                    "oneoff": ("com.docker.compose.oneoff", "True"),
+                    "scaled": ("com.docker.compose.container-number", "2"),
+                    "orphan": ("com.docker.compose.service", "unreviewed"),
+                    "daemon-label-disagreement": ("com.docker.compose.project", "foreign"),
+                }[fault]
+                observed["daemonInventory"][1]["Labels"][key] = replacement
+                if fault != "daemon-label-disagreement":
+                    observed["containerInspections"][1]["Config"]["Labels"][key] = replacement
+            elif fault == "network-view":
+                observed["networkInspections"][0]["Containers"].pop("9" * 64)
+            else:
+                foreign = {
+                    "Id": "1" * 64, "Name": "/foreign", "Config": {"Labels": {}},
+                    "Mounts": [], "NetworkSettings": {"Networks": {}}, "State": {"Running": False},
+                }
+                if fault.endswith("consumer") and fault != "network-consumer":
+                    source = observed["containerInspections"][1 if fault == "upload-consumer" else 0]["Mounts"][0]
+                    foreign["Mounts"] = [dict(source)]
+                elif fault == "network-consumer":
+                    foreign["NetworkSettings"] = observed["containerInspections"][1]["NetworkSettings"]
+                elif fault == "reserved-name":
+                    foreign["Name"] = "/meet-production-foreign-1"
+                observed["containerInspections"].append(foreign)
+                observed["daemonInventory"].append({
+                    "Id": foreign["Id"], "Names": foreign["Name"][1:], "Labels": {},
+                })
+            with self.subTest(fault=fault), self.assertRaises(helper.ProviderError):
+                self.admit(value)
+
+    def test_request_baseline_and_post_create_unexplained_delta_refuse(self):
+        for fault in ("missing-request", "postgres-endpoint", "uploads-consumer", "old-running-endpoint",
+                      "created-active-endpoint", "wrong-token", "volume-metadata", "network-created",
+                      "old-id", "foreign-project-member", "old-network-id", "old-gateway",
+                      "old-unknown"):
+            _, _, post = self.sequence()
+            observed = post["observed"]
+            if fault == "missing-request":
+                post["requestBaseline"] = None
+            elif fault == "postgres-endpoint":
+                post["requestBaseline"]["endpoints"]["9" * 64]["IPAddress"] = "172.25.0.8"
+            elif fault == "uploads-consumer":
+                post["requestBaseline"]["volumeConsumers"]["uploads_data"] = ["1" * 64]
+            elif fault == "old-running-endpoint":
+                post["requestBaseline"]["endpoints"]["f" * 64]["EndpointID"] = "d" * 64
+            elif fault.startswith("old-") and fault != "old-id":
+                key, replacement = {
+                    "old-network-id": ("NetworkID", "1" * 64),
+                    "old-gateway": ("Gateway", "172.25.0.1"), "old-unknown": ("Unknown", False),
+                }[fault]
+                post["requestBaseline"]["endpoints"]["f" * 64][key] = replacement
+            elif fault == "created-active-endpoint":
+                observed["containerInspections"][1]["NetworkSettings"]["Networks"]["meet-production_default"]["EndpointID"] = "c" * 64
+            elif fault == "wrong-token":
+                for labels in (observed["daemonInventory"][1]["Labels"], observed["containerInspections"][1]["Config"]["Labels"]):
+                    labels["org.meet.timepad.operation"] = "b" * 32
+            elif fault == "volume-metadata":
+                observed["volumeInspections"][0]["CreatedAt"] = "2026-10-02T00:00:00Z"
+            elif fault == "network-created":
+                observed["networkInspections"][0]["Created"] = "2026-10-02T00:00:00Z"
+            elif fault == "old-id":
+                post["role"]["backendContainerId"] = "a" * 64
+            elif fault == "foreign-project-member":
+                observed["composeInventory"].append("1" * 64)
+            with self.subTest(fault=fault), self.assertRaises(helper.ProviderError):
+                self.admit(post)
+
+    def test_replacement_and_explicit_private_absence_deltas(self):
+        initial = self.prepared()
+        value = resource_context("pre-release", baseline=initial["baseline"])
+        observed = value["observed"]
+        old = "c" * 64
+        backend = observed["containerInspections"][1]
+        backend["Id"] = old
+        backend["Config"]["Labels"]["org.meet.timepad.operation"] = "a" * 32
+        backend["NetworkSettings"]["Networks"]["meet-production_default"]["DNSNames"][-1] = old[:12]
+        observed["daemonInventory"][1].update(Id=old, Labels=dict(backend["Config"]["Labels"]))
+        observed["projectInventory"] = [old, "9" * 64]
+        observed["composeInventory"] = ["9" * 64, old]
+        observed["backendInventory"] = [old]
+        value["role"].update(backendContainerId=old, priorBackendContainerId="f" * 64)
+        request = self.admit(value)
+        post = resource_context(
+            "post-create", baseline=initial["baseline"], request_baseline=request["membership"],
+        )
+        post["role"] = dict(value["role"])
+        self.admit(post)
+        value = resource_context("pre-release", baseline=initial["baseline"])
+        observed = value["observed"]
+        observed["containerInspections"].pop()
+        observed["daemonInventory"].pop()
+        observed["projectInventory"] = observed["composeInventory"] = ["9" * 64]
+        observed["backendInventory"] = []
+        with self.assertRaises(helper.ProviderError):
+            self.admit(value)
+        # This pure comparator parameter is set only after the protected absence
+        # proof; the CLI tests separately prove it cannot be caller-authorized.
+        value["role"]["allowEmptyBackend"] = True
+        request = self.admit(value)
+        post = resource_context(
+            "post-create", baseline=initial["baseline"], request_baseline=request["membership"],
+        )
+        post["role"]["allowEmptyBackend"] = True
+        self.admit(post)
+
+    def test_nonproject_unrelated_objects_remain_unowned_and_logs_are_not_identity(self):
+        value = resource_context()
+        foreign = {
+            "Id": "1" * 64, "Name": "/foreign", "Config": {"Labels": {}},
+            "Mounts": [], "NetworkSettings": {"Networks": {}},
+        }
+        value["observed"]["containerInspections"].append(foreign)
+        value["observed"]["daemonInventory"].append({"Id": "1" * 64, "Names": "foreign", "Labels": {}})
+        value["observed"]["networkInventory"].append({"ID": "2" * 64, "Name": "unrelated", "Labels": {}})
+        value["observed"]["volumeInventory"].append({"Name": "unrelated", "Driver": "local", "Labels": {}})
+        self.assertEqual(self.prepared(), self.admit(value))
+        foreign["Config"]["Labels"] = None
+        self.assertEqual(self.prepared(), self.admit(value))
+
+
+class ResourceAdmissionCommandTests(unittest.TestCase):
+    def command(self, value, *, fault=None):
+        current = live_context("PREPARED")[3]
+        proof = prepared_proof(current)
+        proof["resourcesDigest"] = helper._configuration_digest(value["baseline"])
+        final = dict(current, reason="changed") if fault == "state-drift" else current
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.multiple(
+                helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+            ))
+            stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
+            stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+            stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+            stack.enter_context(mock.patch.object(helper.os, "close"))
+            stack.enter_context(mock.patch.object(helper, "_validate_state_directory_fd"))
+            stack.enter_context(mock.patch.object(helper, "_timepad_current", side_effect=[
+                (None, None, current), (None, None, final),
+            ]))
+            stack.enter_context(mock.patch.object(helper, "_prepared_proof", return_value=proof))
+            stack.enter_context(mock.patch.object(
+                helper, "_read_resource_baseline", return_value=value["baseline"],
+            ))
+            write = stack.enter_context(mock.patch.object(helper.os, "write"))
+            unlink = stack.enter_context(mock.patch.object(helper.os, "unlink"))
+            fsync = stack.enter_context(mock.patch.object(helper.os, "fsync"))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            if fault in {"state-drift", "role", "absence", "baseline"}:
+                if fault == "role":
+                    value["role"]["backendContainerId"] = "e" * 64
+                elif fault == "absence":
+                    value["role"]["allowEmptyBackend"] = True
+                elif fault == "baseline":
+                    value["baseline"] = {}
+                with self.assertRaises(helper.ProviderError):
+                    helper._resource_admission_command(
+                        current["runId"], "/state", "final-deploy", json.dumps(value).encode(), 9,
+                    )
+                self.assertEqual("", output.getvalue())
+            else:
+                helper._resource_admission_command(
+                    current["runId"], "/state", "final-deploy", json.dumps(value).encode(), 9,
+                )
+            write.assert_not_called()
+            unlink.assert_not_called()
+            fsync.assert_not_called()
+            return output.getvalue()
+
+    def test_private_role_baseline_state_recheck_and_no_public_absence_authority(self):
+        baseline = helper._resource_admission(resource_context())["baseline"]
+        value = resource_context("pre-release", baseline=baseline)
+        result = json.loads(self.command(value))
+        self.assertEqual(helper._configuration_digest(baseline), result["baselineDigest"])
+        for fault in ("role", "absence", "baseline", "state-drift"):
+            self.command(resource_context("pre-release", baseline=baseline), fault=fault)
+
+    def test_prepared_requires_internal_transition_and_cli_requires_inherited_lock(self):
+        with (
+            mock.patch.object(helper, "_open_deploy_state_root") as opened,
+            self.assertRaises(helper.ProviderError),
+        ):
+            helper._resource_admission_command(
+                "31885558214-1", "/state", "final-deploy",
+                json.dumps(resource_context()).encode(), 9,
+            )
+        opened.assert_not_called()
+        with (
+            mock.patch.object(helper, "_deploy_lock") as lock,
+            contextlib.redirect_stderr(io.StringIO()) as error,
+        ):
+            self.assertEqual(1, helper.main(["resource-admission"]))
+        self.assertEqual("RECOVERY_REQUIRED\n", error.getvalue())
+        lock.assert_not_called()
+
+    def test_recovery_command_derives_bound_candidate_and_is_read_only(self):
+        initial = helper._resource_admission(resource_context())["baseline"]
+        request_baseline = helper._resource_admission(
+            resource_context("pre-release", baseline=initial),
+        )["membership"]
+        value = resource_context(
+            "recovery", baseline=initial, request_baseline=request_baseline,
+        )
+        current = live_context("RECOVERY_REQUIRED")[3]
+        current["containerId"] = "a" * 64
+        current["runtimeRequest"] = {
+            "operation": "create", "lifecycle": "bound", "role": "initial",
+            "containerId": "a" * 64, "priorContainerId": None,
+            "operationToken": "a" * 32, "preparedProofDigest": current["preparedProofDigest"],
+            "resourcesDigest": helper._configuration_digest(initial),
+            "resourceRequestDigest": helper._configuration_digest(request_baseline),
+        }
+        proof = prepared_proof(current)
+        proof.update(operationToken="a" * 32, resourcesDigest=helper._configuration_digest(initial))
+        expected_role = helper._resource_recovery_role(current, proof)
+        self.assertEqual({
+            "operationToken": "a" * 32, "backendContainerId": "a" * 64,
+            "priorBackendContainerId": "f" * 64, "allowEmptyBackend": False,
+        }, expected_role)
+        value["role"] = expected_role
+        with (
+            mock.patch.multiple(
+                helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+            ),
+            mock.patch.object(helper, "_open_deploy_state_root", return_value=11),
+            mock.patch.object(helper, "_lock_directory"),
+            mock.patch.object(helper.os, "open", return_value=12),
+            mock.patch.object(helper.os, "close"),
+            mock.patch.object(helper, "_validate_state_directory_fd"),
+            mock.patch.object(helper, "_timepad_current", side_effect=[
+                (None, None, current), (None, None, current),
+            ]),
+            mock.patch.object(helper, "_prepared_proof", return_value=proof),
+            mock.patch.object(helper, "_read_resource_baseline", return_value=initial),
+            mock.patch.object(helper, "_read_resource_request", return_value=request_baseline),
+            mock.patch.object(helper.os, "write") as write,
+            mock.patch.object(helper.os, "unlink") as unlink,
+            mock.patch.object(helper.os, "fsync") as fsync,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            helper._resource_admission_command(
+                current["runId"], "/state", "final-deploy", json.dumps(value).encode(), 9,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual("a" * 64, result["membership"]["backendContainerId"])
+        write.assert_not_called()
+        unlink.assert_not_called()
+        fsync.assert_not_called()
+
+    def test_recovery_after_suppress_authenticates_retained_create_receipt_and_resource_baseline(self):
+        initial = helper._resource_admission(resource_context())["baseline"]
+        request_baseline = helper._resource_admission(
+            resource_context("pre-release", baseline=initial),
+        )["membership"]
+        envelope = resource_context(
+            "recovery", baseline=initial, request_baseline=request_baseline,
+        )
+        current, _, _, candidate, _, lease, receipt = stopped_create_context()
+        module = helper._timepad_state_module()
+        baseline_digest = helper._configuration_digest(initial)
+        request_digest = helper._configuration_digest(request_baseline)
+        receipt.update(resourcesDigest=baseline_digest, resourceRequestDigest=request_digest)
+        receipt_data = module._canonical(receipt)
+        receipt_digest = helper._finalization_digest(receipt_data)
+        lease["operation"] = "deploy"
+        lease.update(
+            originDigest=current["originDigest"], incidentId=current["incidentId"],
+            operationEpoch=current["operationEpoch"],
+        )
+        lease["createCompletion"].update(
+            resourcesDigest=baseline_digest, resourceRequestDigest=request_digest,
+            receiptDigest=receipt_digest,
+        )
+        candidate_id = envelope["observed"]["backendInventory"][0]
+        config_hash = envelope["observed"]["containerInspections"][1]["Config"]["Labels"][
+            "com.docker.compose.config-hash"
+        ]
+        current.update(
+            phase="RECOVERY_REQUIRED", containerId=candidate_id, configHash=config_hash,
+            runtimeRequest={
+                "nonce": "d" * 32, "sequence": 2, "executionAttempt": current["executionAttempt"],
+                "operation": "suppress", "containerId": candidate_id, "imageId": current["target"]["tuple"]["platformImageId"],
+                "configHash": config_hash, "childAttemptId": None, "lifecycle": "completed",
+                "responseId": candidate_id, "completionDigest": "e" * 64,
+            },
+        )
+        proof = prepared_proof(current)
+        proof["resourcesDigest"] = baseline_digest
+        proof["operationToken"] = "a" * 32
+        envelope["role"] = {
+            "operationToken": proof["operationToken"], "backendContainerId": candidate_id,
+            "priorBackendContainerId": request_baseline["backendContainerId"],
+            "allowEmptyBackend": False,
+        }
+        with mock.patch.object(module, "_read_execution_lease_locked", return_value=lease), \
+             mock.patch.object(helper, "_read_resource_request", return_value=request_baseline), \
+             mock.patch.object(helper, "_read_child_file", return_value=(
+                 {}, receipt_data,
+             )):
+            saved = helper._retained_create_completion(
+                12, current, proof, module, "/state",
+            )
+        self.assertEqual(request_baseline, saved)
+        self.assertEqual(candidate_id, helper._resource_admission(envelope)["membership"]["backendContainerId"])
+
+        final = current
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.multiple(
+                helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+            ))
+            stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
+            stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+            stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+            stack.enter_context(mock.patch.object(helper.os, "close"))
+            stack.enter_context(mock.patch.object(helper, "_validate_state_directory_fd"))
+            stack.enter_context(mock.patch.object(helper, "_timepad_current", side_effect=[
+                (module, {}, current), (module, {}, final),
+            ]))
+            stack.enter_context(mock.patch.object(helper, "_prepared_proof", return_value=proof))
+            stack.enter_context(mock.patch.object(helper, "_read_resource_baseline", return_value=initial))
+            stack.enter_context(mock.patch.object(helper, "_read_resource_request", return_value=request_baseline))
+            stack.enter_context(mock.patch.object(module, "_read_execution_lease_locked", return_value=lease))
+            stack.enter_context(mock.patch.object(
+                helper, "_read_child_file",
+                return_value=({}, receipt_data),
+            ))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            helper._resource_admission_command(
+                current["runId"], "/state", "final-deploy", json.dumps(envelope).encode(), 9,
+            )
+        self.assertEqual(candidate_id, json.loads(output.getvalue())["membership"]["backendContainerId"])
+
+    def test_recovery_after_suppress_fails_closed_on_retained_receipt_or_baseline_drift(self):
+        initial = helper._resource_admission(resource_context())["baseline"]
+        request_baseline = helper._resource_admission(
+            resource_context("pre-release", baseline=initial),
+        )["membership"]
+        current, _, _, candidate, _, lease, receipt = stopped_create_context()
+        module = helper._timepad_state_module()
+        baseline_digest = helper._configuration_digest(initial)
+        request_digest = helper._configuration_digest(request_baseline)
+        receipt.update(resourcesDigest=baseline_digest, resourceRequestDigest=request_digest)
+        receipt_data = module._canonical(receipt)
+        lease["operation"] = "deploy"
+        lease.update(
+            originDigest=current["originDigest"], incidentId=current["incidentId"],
+            operationEpoch=current["operationEpoch"],
+        )
+        lease["createCompletion"].update(
+            resourcesDigest=baseline_digest, resourceRequestDigest=request_digest,
+            receiptDigest=helper._finalization_digest(receipt_data),
+        )
+        candidate_id = "a" * 64
+        config_hash = "0" * 64
+        current.update(
+            phase="RECOVERY_REQUIRED", containerId=candidate_id, configHash=config_hash,
+            runtimeRequest={
+                "nonce": "d" * 32, "sequence": 2, "executionAttempt": current["executionAttempt"],
+                "operation": "suppress", "containerId": candidate_id,
+                "imageId": current["target"]["tuple"]["platformImageId"],
+                "configHash": config_hash, "childAttemptId": None, "lifecycle": "completed",
+                "responseId": candidate_id, "completionDigest": "e" * 64,
+            },
+        )
+        proof = prepared_proof(current)
+        proof.update(resourcesDigest=baseline_digest, operationToken="a" * 32)
+        faults = (
+            ("missing-ack", dict(lease, createCompletion=None), receipt, request_baseline),
+            ("receipt-tamper", lease, dict(receipt, waitStatus=1), request_baseline),
+            ("request-baseline-drift", lease, receipt, dict(request_baseline, backendContainerId="1" * 64)),
+        )
+        for name, observed_lease, observed_receipt, observed_baseline in faults:
+            with self.subTest(name=name), \
+                 mock.patch.object(module, "_read_execution_lease_locked", return_value=observed_lease), \
+                 mock.patch.object(helper, "_read_child_file", return_value=(
+                     {}, module._canonical(observed_receipt),
+                 )), \
+                 mock.patch.object(helper, "_read_resource_request", return_value=observed_baseline), \
+                 self.assertRaises(helper.ProviderError):
+                helper._retained_create_completion(12, current, proof, module, "/state")
+
+    def test_replacement_recovery_after_suppress_uses_old_predecessor_as_request_baseline(self):
+        initial = helper._resource_admission(resource_context())["baseline"]
+        pre = resource_context("pre-release", baseline=initial)
+        old_id = "c" * 64
+        old_endpoint = pre["observed"]["containerInspections"][1]["NetworkSettings"][
+            "Networks"
+        ]["meet-production_default"]
+        old_container = pre["observed"]["containerInspections"][1]
+        old_container["Id"] = old_id
+        old_container["Name"] = "/meet-production-backend-1"
+        old_container["Config"]["Labels"]["org.meet.timepad.operation"] = "a" * 32
+        old_endpoint["DNSNames"][-1] = old_id[:12]
+        pre["observed"]["daemonInventory"][1].update(
+            Id=old_id, Labels=dict(old_container["Config"]["Labels"]),
+        )
+        pre["observed"]["projectInventory"] = [old_id, "9" * 64]
+        pre["observed"]["composeInventory"] = ["9" * 64, old_id]
+        pre["observed"]["backendInventory"] = [old_id]
+        pre["role"]["backendContainerId"] = old_id
+        pre_admission = helper._resource_admission(pre)
+        request_baseline = pre_admission["membership"]
+        recovery = resource_context(
+            "recovery", baseline=initial, request_baseline=request_baseline,
+        )
+        current, _, _, candidate, _, lease, receipt = stopped_create_context(replacement=True)
+        module = helper._timepad_state_module()
+        candidate_id = recovery["observed"]["backendInventory"][0]
+        config_hash = recovery["observed"]["containerInspections"][1]["Config"]["Labels"][
+            "com.docker.compose.config-hash"
+        ]
+        current.update(
+            phase="COMMITTING", predecessorContainerId=old_id,
+            containerId=candidate_id, configHash=config_hash,
+            commitSubstep="replacement-container-authorized",
+            runtimeRequest={
+                "nonce": "d" * 32, "sequence": 2, "executionAttempt": current["executionAttempt"],
+                "operation": "suppress", "containerId": candidate_id,
+                "imageId": current["target"]["tuple"]["platformImageId"],
+                "configHash": config_hash, "childAttemptId": None, "lifecycle": "completed",
+                "responseId": candidate_id, "completionDigest": "e" * 64,
+            },
+        )
+        baseline_digest = helper._configuration_digest(initial)
+        request_digest = helper._configuration_digest(request_baseline)
+        receipt.update(resourcesDigest=baseline_digest, resourceRequestDigest=request_digest)
+        receipt_data = module._canonical(receipt)
+        lease.update(
+            operation="deploy", originDigest=current["originDigest"],
+            incidentId=current["incidentId"], operationEpoch=current["operationEpoch"],
+        )
+        lease["createCompletion"].update(
+            resourcesDigest=baseline_digest, resourceRequestDigest=request_digest,
+            receiptDigest=helper._finalization_digest(receipt_data),
+        )
+        proof = prepared_proof(current)
+        proof.update(resourcesDigest=baseline_digest, operationToken="a" * 32)
+        recovery["role"] = {
+            "operationToken": "a" * 32, "backendContainerId": candidate_id,
+            "priorBackendContainerId": old_id, "allowEmptyBackend": False,
+        }
+        with mock.patch.object(module, "_read_execution_lease_locked", return_value=lease), \
+             mock.patch.object(helper, "_read_child_file", return_value=({}, receipt_data)), \
+             mock.patch.object(helper, "_read_resource_request", return_value=request_baseline):
+            self.assertEqual(
+                request_baseline,
+                helper._retained_create_completion(12, current, proof, module, "/state"),
+            )
+        self.assertEqual(
+            candidate_id,
+            helper._resource_admission(recovery)["membership"]["backendContainerId"],
+        )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.multiple(
+                helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+            ))
+            stack.enter_context(mock.patch.object(helper, "_open_deploy_state_root", return_value=11))
+            stack.enter_context(mock.patch.object(helper, "_lock_directory"))
+            stack.enter_context(mock.patch.object(helper.os, "open", return_value=12))
+            stack.enter_context(mock.patch.object(helper.os, "close"))
+            stack.enter_context(mock.patch.object(helper, "_validate_state_directory_fd"))
+            stack.enter_context(mock.patch.object(helper, "_timepad_current", side_effect=[
+                (module, {}, current), (module, {}, current),
+            ]))
+            stack.enter_context(mock.patch.object(helper, "_prepared_proof", return_value=proof))
+            stack.enter_context(mock.patch.object(helper, "_read_resource_baseline", return_value=initial))
+            stack.enter_context(mock.patch.object(helper, "_read_resource_request", return_value=request_baseline))
+            stack.enter_context(mock.patch.object(module, "_read_execution_lease_locked", return_value=lease))
+            stack.enter_context(mock.patch.object(
+                helper, "_read_child_file", return_value=({}, receipt_data),
+            ))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            helper._resource_admission_command(
+                current["runId"], "/state", "final-deploy", json.dumps(recovery).encode(), 9,
+            )
+        self.assertEqual(
+            candidate_id, json.loads(output.getvalue())["membership"]["backendContainerId"],
+        )
+    def test_prepared_recovery_command_uses_current_role_without_request_file(self):
+        baseline = helper._resource_admission(resource_context())["baseline"]
+        value = resource_context("prepared", baseline=baseline)
+        value["stage"] = "recovery"
+        current = live_context("PREPARED")[3]
+        proof = prepared_proof(current)
+        proof.update(operationToken="a" * 32, resourcesDigest=helper._configuration_digest(baseline))
+        value["role"] = helper._resource_role(current, proof)
+        with (
+            mock.patch.multiple(
+                helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+            ),
+            mock.patch.object(helper, "_open_deploy_state_root", return_value=11),
+            mock.patch.object(helper, "_lock_directory"),
+            mock.patch.object(helper.os, "open", return_value=12),
+            mock.patch.object(helper.os, "close"),
+            mock.patch.object(helper, "_validate_state_directory_fd"),
+            mock.patch.object(helper, "_timepad_current", side_effect=[
+                (None, None, current), (None, None, current),
+            ]),
+            mock.patch.object(helper, "_prepared_proof", return_value=proof),
+            mock.patch.object(helper, "_read_resource_baseline", return_value=baseline),
+            mock.patch.object(helper, "_read_resource_request") as read_request,
+            mock.patch.object(helper.os, "write") as write,
+            mock.patch.object(helper.os, "unlink") as unlink,
+            mock.patch.object(helper.os, "fsync") as fsync,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            helper._resource_admission_command(
+                current["runId"], "/state", "final-deploy", json.dumps(value).encode(), 9,
+            )
+        self.assertEqual("f" * 64, json.loads(output.getvalue())["membership"]["backendContainerId"])
+        read_request.assert_not_called()
+        write.assert_not_called()
+        unlink.assert_not_called()
+        fsync.assert_not_called()
+
+    def test_recovery_role_refuses_unbound_or_empty_authority(self):
+        current = live_context("RECOVERY_REQUIRED")[3]
+        current.update(containerId="a" * 64)
+        proof = prepared_proof(current)
+        proof.update(operationToken="a" * 32, resourcesDigest="6" * 64)
+        request = {
+            "operation": "create", "lifecycle": "intent", "role": "initial",
+            "containerId": None, "priorContainerId": None, "operationToken": "a" * 32,
+            "preparedProofDigest": current["preparedProofDigest"], "resourcesDigest": "6" * 64,
+        }
+        current["runtimeRequest"] = request
+        with self.assertRaises(helper.ProviderError):
+            helper._resource_recovery_role(current, proof)
+        request["lifecycle"] = "bound"
+        request["containerId"] = current["containerId"]
+        role = helper._resource_recovery_role(current, proof)
+        role["allowEmptyBackend"] = True
+        value = resource_context("recovery")
+        value["role"] = role
+        with self.assertRaises(helper.ProviderError):
+            helper._resource_admission(value)
+
+    def test_prepared_recovery_uses_only_the_frozen_existing_backend_role(self):
+        baseline = helper._resource_admission(resource_context())["baseline"]
+        value = resource_context("prepared", baseline=baseline)
+        value["stage"] = "recovery"
+        current = live_context("PREPARED")[3]
+        proof = prepared_proof(current)
+        proof.update(operationToken="a" * 32, resourcesDigest=helper._configuration_digest(baseline))
+        role = helper._resource_role(current, proof)
+        self.assertEqual("f" * 64, role["backendContainerId"])
+        self.assertFalse(role["allowEmptyBackend"])
+        value["role"] = role
+        result = helper._resource_admission(value)
+        self.assertEqual("f" * 64, result["membership"]["backendContainerId"])
+        with (
+            mock.patch.multiple(
+                helper.os, O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+                O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0), create=True,
+            ),
+            mock.patch.object(helper, "_open_deploy_state_root", return_value=11),
+            mock.patch.object(helper, "_lock_directory"),
+            mock.patch.object(helper.os, "open", return_value=12),
+            mock.patch.object(helper.os, "close"),
+            mock.patch.object(helper, "_validate_state_directory_fd"),
+            mock.patch.object(helper, "_timepad_current", side_effect=[
+                (None, None, current), (None, None, current),
+            ]),
+            mock.patch.object(helper, "_prepared_proof", return_value=proof),
+            mock.patch.object(helper, "_read_resource_baseline", return_value=baseline),
+            mock.patch.object(helper, "_read_resource_request") as read_request,
+            mock.patch.object(helper.os, "write") as write,
+            mock.patch.object(helper.os, "unlink") as unlink,
+            mock.patch.object(helper.os, "fsync") as fsync,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            helper._resource_admission_command(
+                current["runId"], "/state", "final-deploy", json.dumps(value).encode(), 9,
+            )
+        self.assertEqual("f" * 64, json.loads(output.getvalue())["membership"]["backendContainerId"])
+        read_request.assert_not_called()
+        write.assert_not_called()
+        unlink.assert_not_called()
+        fsync.assert_not_called()
+
+    def test_private_baseline_rejects_changed_digest_noncanonical_bytes_and_temporary_files(self):
+        baseline = helper._resource_admission(resource_context())["baseline"]
+        data = helper._resource_bytes(baseline, helper.MAX_RESOURCES_BYTES)
+        digest = helper._configuration_digest(baseline)
+        with (
+            mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError),
+            mock.patch.object(helper, "_read_child_file", return_value=({}, data)),
+        ):
+            self.assertEqual(baseline, helper._read_resource_baseline(12, digest))
+            with self.assertRaises(helper.ProviderError):
+                helper._read_resource_baseline(12, "0" * 64)
+        with (
+            mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError),
+            mock.patch.object(helper, "_read_child_file", return_value=({}, data + b"\n")),
+            self.assertRaises(helper.ProviderError),
+        ):
+            helper._read_resource_baseline(12, helper._finalization_digest(data + b"\n"))
+        with (
+            mock.patch.object(helper.os, "stat"),
+            mock.patch.object(helper, "_read_child_file") as read,
+            self.assertRaises(helper.ProviderError),
+        ):
+            helper._read_resource_baseline(12, digest)
+        read.assert_not_called()
+
+
+    def test_request_file_is_canonical_bounded_and_binds_exact_digest(self):
+        baseline = helper._resource_admission(resource_context())["baseline"]
+        request = helper._resource_admission(resource_context("pre-release", baseline=baseline))["membership"]
+        data = helper._resource_bytes(request, helper.MAX_RESOURCE_REQUEST_BYTES)
+        digest = helper._configuration_digest(request)
+        with mock.patch.object(helper, "_read_child_file", return_value=({}, data)) as read:
+            self.assertEqual(request, helper._read_resource_request(12, digest))
+            read.assert_called_once_with(12, "timepad-resource-request.json", 4096)
+            with self.assertRaises(helper.ProviderError):
+                helper._read_resource_request(12, "0" * 64)
+        for raw in (data + b"\n", b'{"x":1,"x":2}', b"[]"):
+            with (
+                mock.patch.object(helper, "_read_child_file", return_value=({}, raw)),
+                self.assertRaises(helper.ProviderError),
+            ):
+                helper._read_resource_request(12, helper._finalization_digest(raw))
+        self.assertTrue({"timepad-resources.json", "timepad-resource-request.json"} <= helper.RETENTION_CHILDREN)
+
+
+class StoppedCreateBindingTests(unittest.TestCase):
+    def bind(self, context, *, backend_inventory=None, compose_inventory=None):
+        current, image, model, observed, proof, lease, receipt = context
+        identity = observed["Id"]
+        with (
+            mock.patch.object(helper, "_prepared_proof", return_value=proof),
+            mock.patch.object(helper, "_read_resource_baseline", return_value={}),
+            mock.patch.object(helper, "_read_resource_request", return_value={"fixture": True}),
+            mock.patch.object(helper, "_resource_admission", return_value={
+                "baselineDigest": "6" * 64,
+                "membership": {"backendContainerId": identity,
+                               "projectInventory": sorted([identity, "9" * 64])},
+            }),
+            mock.patch.object(helper.os, "write") as write,
+            mock.patch.object(helper.os, "unlink") as unlink,
+            mock.patch.object(helper.os, "fsync") as fsync,
+        ):
+            result = helper._stopped_create_binding(
+                12, current, image, model, observed,
+                [identity] if backend_inventory is None else backend_inventory,
+                sorted([identity, "9" * 64]) if compose_inventory is None else compose_inventory,
+                completion_lease=lease,
+                completion_receipt=json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(),
+                resource_evidence={"targetConfiguration": model, "containerInspections": [observed]},
+                request_baseline={"fixture": True},
+            )
+        write.assert_not_called()
+        unlink.assert_not_called()
+        fsync.assert_not_called()
+        return result
+
+    def test_complete_resources_bind_to_normal_completion_and_private_request(self):
+        current, image, _, _, proof, lease, _ = stopped_create_context()
+        initial = helper._resource_admission(resource_context())
+        pre = helper._resource_admission(resource_context("pre-release", baseline=initial["baseline"]))
+        post = resource_context(
+            "post-create", baseline=initial["baseline"], request_baseline=pre["membership"],
+        )
+        evidence = post["observed"]
+        model = evidence["targetConfiguration"]
+        observed = evidence["containerInspections"][1]
+        proof.update(
+            modelDigest=helper._model_digest(model), targetConfigurationDigest=helper._model_digest(model),
+            resourcesDigest=initial["baselineDigest"],
+        )
+        request = current["runtimeRequest"]
+        request.update(
+            modelDigest=proof["modelDigest"], resourcesDigest=initial["baselineDigest"],
+            resourceRequestDigest=pre["membershipDigest"],
+        )
+        module = helper._timepad_state_module()
+        receipt = {
+            "schema": module.CREATE_COMPLETION_SCHEMA, "requestDigest": module.create_request_digest(request),
+            "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+            "resourcesDigest": request["resourcesDigest"], "resourceRequestDigest": request["resourceRequestDigest"],
+            "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+        }
+        data = helper._resource_bytes(receipt, module.MAX_CREATE_COMPLETION_BYTES)
+        request["completionDigest"] = helper._finalization_digest(data)
+        lease["createCompletion"] = {
+            **{key: value for key, value in receipt.items() if key != "schema"},
+            "receiptDigest": request["completionDigest"], "acknowledged": True,
+        }
+        with (
+            mock.patch.object(helper, "_prepared_proof", return_value=proof),
+            mock.patch.object(helper, "_read_resource_baseline", return_value=initial["baseline"]),
+            mock.patch.object(helper, "_read_resource_request", return_value=pre["membership"]),
+            mock.patch.object(helper.os, "write") as write,
+            mock.patch.object(helper.os, "unlink") as unlink,
+        ):
+            result = helper._stopped_create_binding(
+                12, current, image, model, observed, evidence["backendInventory"],
+                evidence["composeInventory"], completion_lease=lease, completion_receipt=data,
+                resource_evidence=evidence, request_baseline=pre["membership"],
+            )
+        write.assert_not_called()
+        unlink.assert_not_called()
+        self.assertEqual(initial["baselineDigest"], result["resourcesDigest"])
+        self.assertEqual(pre["membershipDigest"], result["resourceRequestDigest"])
+        self.assertNotIn("PRIVATE_DATABASE_CANARY", json.dumps(result))
+
+    def test_normal_completion_and_independent_stopped_configuration_bind_without_payload_output(self):
+        for replacement in (False, True):
+            context = stopped_create_context(replacement=replacement)
+            before = json.dumps(context, sort_keys=True)
+            result = self.bind(context)
+            self.assertEqual({
+                "requestNonce": context[0]["runtimeRequest"]["nonce"],
+                "containerId": context[3]["Id"], "configHash": "0" * 64,
+                "completionDigest": context[0]["runtimeRequest"]["completionDigest"],
+                "resourcesDigest": "6" * 64,
+                "resourceRequestDigest": helper._configuration_digest({"fixture": True}),
+            }, result)
+            self.assertNotIn("PRIVATE_CANARY", json.dumps(result))
+            self.assertNotIn("never-print-me", json.dumps(result))
+            self.assertEqual(before, json.dumps(context, sort_keys=True))
+            context[0].update(containerId=result["containerId"], configHash=result["configHash"])
+            context[0]["runtimeRequest"].update(
+                lifecycle="bound", containerId=result["containerId"],
+                configHash=result["configHash"], responseId=result["containerId"],
+            )
+            self.assertEqual(result, self.bind(context))
+
+    def test_recovery_lease_reuses_only_the_acknowledged_original_create_completion(self):
+        context = stopped_create_context()
+        current, _, _, _, _, lease, _ = context
+        original_request = current["runtimeRequest"]
+        original_attempt = original_request["executionAttempt"]
+        lease.update(operation="forward-recover", attempt="b" * 32)
+
+        result = self.bind(context)
+        self.assertEqual(original_request["completionDigest"], result["completionDigest"])
+        self.assertEqual(original_attempt, lease["createCompletion"]["executionAttempt"])
+
+        for field, value in (
+            ("acknowledged", False),
+            ("receiptDigest", "0" * 64),
+            ("resourcesDigest", "0" * 64),
+            ("resourceRequestDigest", "0" * 64),
+        ):
+            replay = stopped_create_context()
+            replay[5].update(operation="forward-recover", attempt="b" * 32)
+            replay[5]["createCompletion"][field] = value
+            with self.subTest(field=field), self.assertRaises(helper.ProviderError):
+                self.bind(replay)
+
+        replay = stopped_create_context()
+        replay[5].update(operation="forward-recover", attempt="b" * 32)
+        replay[0]["runtimeRequest"]["sequence"] += 1
+        with self.assertRaises(helper.ProviderError):
+            self.bind(replay)
+
+    def test_enabled_provider_fixed_mount_matches_private_configuration(self):
+        context = stopped_create_context()
+        _, image, model, observed, _, _, _ = context
+        image["Config"]["Env"] = inspection(True)["Config"]["Env"]
+        observed["Config"]["Env"] = image["Config"]["Env"] + ["PRIVATE_CANARY=never-print-me"]
+        model["services"]["backend"]["volumes"].append({
+            "type": "bind", "source": helper.HOST_CREDENTIAL_PATH,
+            "target": helper.CONTAINER_CREDENTIAL_PATH, "read_only": True,
+            "bind": {"create_host_path": False},
+        })
+        observed["HostConfig"]["Mounts"] = [{
+            "Type": "bind", "Source": helper.HOST_CREDENTIAL_PATH,
+            "Target": helper.CONTAINER_CREDENTIAL_PATH, "ReadOnly": True, "BindOptions": {},
+        }]
+        observed["Mounts"].append({
+            "Type": "bind", "Source": helper.HOST_CREDENTIAL_PATH,
+            "Destination": helper.CONTAINER_CREDENTIAL_PATH, "RW": False, "Propagation": "rprivate",
+        })
+        helper._create_runtime_configuration(image, model, observed, "a" * 32)
+        observed["HostConfig"]["Mounts"][0]["ReadOnly"] = False
+        with self.assertRaises(helper.ProviderError):
+            helper._create_runtime_configuration(image, model, observed, "a" * 32)
+
+    def test_model_rejects_unreviewed_resource_requests_before_create(self):
+        changes = (
+            ("volumes", [{"type": "volume", "source": "unreviewed", "target": "/data/uploads"}]),
+            ("volumes", []), ("volumes", [None]), ("volumes", "bad"),
+            ("ports", [{"host_ip": "0.0.0.0", "target": 8080, "published": "18080"}]),
+            ("ports", [{"host_ip": "127.0.0.1", "target": 8080, "published": "65536"}]),
+            ("healthcheck", {"test": [[]]}), ("healthcheck", {"retries": True}),
+            ("healthcheck", {"interval": "unbounded"}), ("healthcheck", {"disable": True}),
+            ("mem_limit", True), ("environment", {"PRIVATE_CANARY": False}),
+            ("logging", {"driver": "json-file", "options": {}}),
+        )
+        for key, value in changes:
+            model = stopped_create_context()[2]
+            model["services"]["backend"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(helper.ProviderError):
+                helper._create_backend_model(model, "a" * 32)
+
+    def test_missing_late_cancelled_or_unknown_completion_never_adopts_matching_inventory(self):
+        for lifecycle in ("intent", "acknowledged", "completed", "cancelled", "timed-out", None):
+            context = stopped_create_context()
+            context[0]["runtimeRequest"].update(lifecycle=lifecycle, completionDigest=None)
+            with self.subTest(lifecycle=lifecycle), self.assertRaises(helper.ProviderError):
+                self.bind(context)
+        context = stopped_create_context()
+        context[0]["runtimeRequest"] = None
+        with self.assertRaises(helper.ProviderError):
+            self.bind(context)
+        for field, value in (
+            ("acknowledged", False), ("waitStatus", 1), ("uncancelled", False),
+            ("descendantsDrained", False), ("requestDigest", "0" * 64),
+            ("receiptDigest", "0" * 64), ("executionAttempt", "0" * 32),
+        ):
+            context = stopped_create_context()
+            context[5]["createCompletion"][field] = value
+            with self.subTest(completion=field), self.assertRaises(helper.ProviderError):
+                self.bind(context)
+        context = list(stopped_create_context())
+        context[5] = None
+        with self.assertRaises(helper.ProviderError):
+            self.bind(context)
+
+    def test_every_frozen_binding_inventory_and_never_started_fact_is_required(self):
+        changes = (
+            (0, ("ownedChild",), {"pid": 101}),
+            (0, ("runtimeRequest", "operationToken"), "b" * 32),
+            (0, ("runtimeRequest", "modelDigest"), "0" * 64),
+            (0, ("runtimeRequest", "toolingDigest"), "0" * 64),
+            (3, ("Id",), "f" * 64),
+            (3, ("Id",), "short"),
+            (3, ("Image",), "sha256:" + "a" * 64),
+            (3, ("State", "Status"), "exited"),
+            (3, ("State", "Running"), True),
+            (3, ("State", "StartedAt"), "2026-01-01T00:00:00Z"),
+            (3, ("State", "Pid"), 1),
+            (3, ("State", "Dead"), True),
+            (3, ("RestartCount",), 1),
+        )
+        for index, path, value in changes:
+            context = stopped_create_context()
+            target = context[index]
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(helper.ProviderError):
+                self.bind(context)
+        for inventory in ([], ["unknown"], ["a" * 64, "b" * 64], ["a" * 64, "a" * 64]):
+            for key in ("backend_inventory", "compose_inventory"):
+                with self.subTest(inventory=inventory, key=key), self.assertRaises(helper.ProviderError):
+                    self.bind(stopped_create_context(), **{key: inventory})
+
+    def test_full_private_configuration_differences_and_unknown_model_fields_refuse(self):
+        changes = (
+            ("Config", "Env", ["PRIVATE_CANARY=changed"]),
+            ("Config", "Cmd", ["other"]),
+            ("Config", "Entrypoint", ["other"]),
+            ("Config", "User", "0"),
+            ("Config", "Image", "other"),
+            ("Config", "Healthcheck", {}),
+            ("Config", "ExposedPorts", {"22/tcp": {}}),
+            ("Config", "Unknown", True),
+            ("HostConfig", "ReadonlyRootfs", False),
+            ("HostConfig", "Init", False),
+            ("HostConfig", "CapDrop", []),
+            ("HostConfig", "CapAdd", ["SYS_ADMIN"]),
+            ("HostConfig", "Privileged", True),
+            ("HostConfig", "Devices", ["/dev/sda"]),
+            ("HostConfig", "Tmpfs", {"/tmp": "exec"}),
+            ("HostConfig", "Memory", 0),
+            ("HostConfig", "LogConfig", {"Type": "json-file", "Config": {}}),
+            ("HostConfig", "RestartPolicy", {"Name": "always", "MaximumRetryCount": 0}),
+            ("HostConfig", "PortBindings", {"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "18080"}]}),
+            ("HostConfig", "NetworkMode", "host"),
+            ("HostConfig", "Unknown", True),
+        )
+        for group, field, value in changes:
+            context = stopped_create_context()
+            context[3][group][field] = value
+            with self.subTest(group=group, field=field), self.assertRaises(helper.ProviderError):
+                self.bind(context)
+        context = stopped_create_context()
+        context[3]["Config"]["Env"].append(context[3]["Config"]["Env"][0])
+        with self.assertRaises(helper.ProviderError):
+            self.bind(context)
+        context = stopped_create_context()
+        context[3]["Mounts"][0]["Name"] = "other-volume"
+        with self.assertRaises(helper.ProviderError):
+            self.bind(context)
+        for field in ("entrypoint", "command", "post_start", "scale", "deploy", "extends", "unknown"):
+            context = stopped_create_context()
+            context[2]["services"]["backend"][field] = "unreviewed"
+            context[4]["targetConfigurationDigest"] = helper._model_digest(context[2])
+            with self.subTest(model=field), self.assertRaises(helper.ProviderError):
+                self.bind(context)
+
+    def test_replacement_keeps_original_hash_and_rejects_prior_id_and_receipt_drift(self):
+        for field, value in (("Id", "c" * 64),):
+            context = stopped_create_context(replacement=True)
+            context[3][field] = value
+            with self.assertRaises(helper.ProviderError):
+                self.bind(context)
+        context = stopped_create_context(replacement=True)
+        context[3]["Config"]["Labels"]["com.docker.compose.config-hash"] = "1" * 64
+        with self.assertRaises(helper.ProviderError):
+            self.bind(context)
+
+    def test_bounded_model_and_duplicate_json_fields_fail_with_fixed_errors(self):
+        context = stopped_create_context()
+        context[2]["services"]["backend"]["environment"]["PRIVATE_CANARY"] = "x" * (256 * 1024)
+        with self.assertRaises(helper.ProviderError) as error:
+            self.bind(context)
+        self.assertEqual("RECOVERY_REQUIRED", error.exception.category)
+        with self.assertRaises(helper.ProviderError):
+            helper._json(b'{"environment":{"PRIVATE_CANARY":"x","PRIVATE_CANARY":"y"}}')
 
 
 class PreparedProofTests(unittest.TestCase):
@@ -1574,6 +3544,7 @@ class PreparedProofTests(unittest.TestCase):
         current["preparedProofDigest"] = helper._finalization_digest(data)
         with (
             mock.patch.object(helper, "_read_child_file", return_value=({}, data)),
+            mock.patch.object(helper, "_read_resource_baseline", return_value={}),
             mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError),
             mock.patch.object(
                 helper, "_prepared_config_records",
@@ -1619,6 +3590,8 @@ class PreparedProofTests(unittest.TestCase):
             ("schema", "unknown"), ("extra", True),
             ("targetConfigurationDigest", "bad"),
             ("effectiveProviderDigest", True),
+            ("operationToken", "A" * 32), ("operationToken", None),
+            ("modelDigest", "3" * 64), ("toolingDigest", "0" * 64),
             ("provider", None),
             ("provider", {"providerEnabled": False, "durableDisposition": "created",
                           "transaction": None}),
@@ -1782,7 +3755,19 @@ class PreparedProofTests(unittest.TestCase):
             predecessorInspection=envelope["inspection"],
             imageInspection=envelope["imageInspection"],
             targetConfiguration=envelope["targetConfiguration"],
+            operationToken="a" * 32, toolingDigest=current["toolingDigest"],
         )
+        resource_evidence = resource_context()["observed"]
+        captured = resource_evidence["containerInspections"][1]
+        captured["Image"] = "sha256:" + current["predecessor"]["tuple"]["platformImageId"]
+        captured["Config"]["Labels"].update({
+            "org.opencontainers.image.revision": current["predecessor"]["tuple"]["revision"],
+            "org.opencontainers.image.version": current["predecessor"]["tuple"]["version"],
+        })
+        resource_evidence["daemonInventory"][1]["Labels"] = dict(captured["Config"]["Labels"])
+        payload["targetConfiguration"] = resource_evidence["targetConfiguration"]
+        payload["resourceEvidence"] = resource_evidence
+        payload["predecessorInspection"] = [captured]
         files = {}
         events = []
 
@@ -1847,8 +3832,13 @@ class PreparedProofTests(unittest.TestCase):
                 replies[0]["preparedProofDigest"],
             )
             self.assertLessEqual(len(files["timepad-prepared.json"]), 8192)
-            self.assertEqual(1, events.count("write"))
-            self.assertEqual(1, events.count("rename"))
+            self.assertEqual(2, events.count("write"))
+            self.assertEqual(2, events.count("rename"))
+            self.assertEqual(
+                helper._finalization_digest(files["timepad-resources.json"]),
+                replies[0]["resourcesDigest"],
+            )
+            self.assertLessEqual(len(files["timepad-resources.json"]), helper.MAX_RESOURCES_BYTES)
             self.assertEqual("fsync", events[events.index("rename") + 1])
             files["timepad-prepared.json"] += b" "
             with self.assertRaises(helper.ProviderError):
@@ -2309,7 +4299,7 @@ class ProviderLiveGrantTests(unittest.TestCase):
     def test_registered_recovery_only_allows_read_only_request_reconciliation(self) -> None:
         self.lease.update(operation="forward-recover", lifecycle="registered", workEndNs=None)
         self.reply["name"] = "recovery-admission"
-        for command in ("live-resume", "absence-resume", "runtime-request-proof"):
+        for command in ("live-resume", "absence-resume", "runtime-request-proof", "resource-admission"):
             self.args.command = command
             with self.subTest(command=command), self.authority():
                 helper._deadline_check()

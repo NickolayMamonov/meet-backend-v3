@@ -499,6 +499,7 @@ PY
 }
 
 provider_release_main() {
+local -a timepad_controller_arguments=("$@")
 root=
 base_compose=
 image=
@@ -711,7 +712,23 @@ fi
 supervisor_enabled=false
 recovery_admission_only=false
 supervisor_client() {
-  command timeout 10s python3 "$script_dir/test_vps_timepad_supervisor.py" \
+  local duration=10s bound=
+  case "${1:-}" in
+    create-release) bound=40 ;;
+    create-completion) bound=50 ;;
+  esac
+  if [ -n "$bound" ]; then
+    [[ "${recovery_work_end_ns:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+    duration=$(command timeout 3s python3 -B -c '
+import sys
+import time
+remaining = min(int(sys.argv[1]), (int(sys.argv[2]) - time.monotonic_ns()) / 1_000_000_000)
+if remaining <= 0:
+    raise SystemExit(1)
+print(f"{remaining:.9f}s")
+' "$bound" "$recovery_work_end_ns") || return 1
+  fi
+  command timeout "$duration" python3 "$script_dir/test_vps_timepad_supervisor.py" \
     client --root "$state_root" "$@"
 }
 supervisor_cancel_exit() {
@@ -806,7 +823,7 @@ recovery_retry_runtime_refusal() {
 }
 supervisor_register_recovery() {
   local grant grant_id deadline publication lease_revision digest
-  local current container inspection global_ids compose_ids runtime_evidence=
+  local current runtime_evidence=
   local registration_result
   local -a evidence_args=()
   grant=$(supervisor_client grant recovery-registration 30) || {
@@ -852,42 +869,10 @@ supervisor_register_recovery() {
         echo "fixture_timepad_guard=RECOVERY_SELECTOR_MISMATCH" >&2
       return 1
     }
-    container=$(jq -er '.containerId | strings | select(test("^[a-f0-9]{64}$"))' \
-      <<<"$current") || {
-        [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
-          echo "fixture_timepad_guard=RECOVERY_CONTAINER_INVALID" >&2
-        return 1
-      }
-    inspection=$(command timeout 5s docker inspect "$container") || {
-      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
-        echo "fixture_timepad_guard=RECOVERY_INSPECTION_FAILED" >&2
-      return 1
-    }
-    global_ids=$(command timeout 5s docker ps --all --quiet \
-      --filter label=com.docker.compose.project=meet-production \
-      --filter label=com.docker.compose.service=backend) || {
-        [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
-          echo "fixture_timepad_guard=RECOVERY_DOCKER_INVENTORY_FAILED" >&2
-        return 1
-      }
-    compose_ids=$(command timeout 5s bash -c '
-      set -euo pipefail
-      source "$1"
-      runtime_compose "$2" "$3" ps -aq backend
-    ' _ "$runtime_helper" "$root" "$compose_script") || {
-      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
-        echo "fixture_timepad_guard=RECOVERY_COMPOSE_INVENTORY_FAILED" >&2
-      return 1
-    }
-    runtime_evidence=$(jq -cn --argjson inspection "$inspection" \
-      --arg global "$global_ids" --arg compose "$compose_ids" '
-      {inspection:$inspection,backendInventory:($global | split("\n")),
-       composeInventory:($compose | split("\n"))}
-    ') || {
-      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
-        echo "fixture_timepad_guard=RECOVERY_EVIDENCE_ENCODE_FAILED" >&2
-      return 1
-    }
+    runtime_evidence=$(TIMEPAD_RECOVERY_EVIDENCE_GRANT="$grant" \
+      command timeout 30s python3 -B "$script_dir/test_vps_timepad_supervisor.py" \
+        client --root "$state_root" recovery-evidence --end-ns "$deadline" -- \
+        "${timepad_controller_arguments[@]}") || return 1
     evidence_args=(--runtime-evidence)
   fi
   registration_result=$(command timeout 30s python3 "$timepad_helper" register-recovery \
@@ -959,16 +944,21 @@ supervisor_timeout() {
       python3:"$timepad_helper")
         case "${3:-}" in read-state|authorize-recovery) ;; *) return 1 ;; esac ;;
       python3:"$provider_helper")
-        case "${3:-}" in check-image|live-resume|absence-resume|runtime-request-proof) ;; *) return 1 ;; esac ;;
+        case "${3:-}" in check-image|live-resume|absence-resume|runtime-request-proof|resource-admission) ;; *) return 1 ;; esac ;;
       python3:-) ;; # Fixed controller's bounded private-input stat validation.
       *) return 1 ;;
     esac
     wait_name=recovery-admission
-  elif [ "${TIMEPAD_WORKER_MODE:-controller-worker}" = rollback-worker ]; then
-    # Reconstruction and daemon proof are still required. Admission is
-    # read-only: no config/provider/state writer can enter under this grant.
-    [ "$executable:${2:-}:${3:-}" = "python3:$timepad_helper:rollback-admission" ] ||
-      return 1
+  elif [ "${TIMEPAD_WORKER_MODE:-controller-worker}" = rollback-worker ] &&
+    [ "${rollback_worker_admitted:-false}" != true ]; then
+    # Fixed read-only reconstruction precedes the remaining-work capability.
+    case "$executable:${2:-}" in
+      docker:inspect|docker:ps) ;;
+      bash:-c) ;; # Fixed recovery_backend_inventory wrapper only.
+      python3:"$timepad_helper")
+        case "${3:-}" in read-state|rollback-admission) ;; *) return 1 ;; esac ;;
+      *) return 1 ;;
+    esac
     wait_name=rollback-admission
   fi
   if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" = fail-closed-worker ]; then
@@ -1000,7 +990,7 @@ supervisor_timeout() {
     # same durable lease and absolute deadline under inherited FD9.
     case "${3:-}" in
       prepare|verify|finish|prepare-finalization|finish-committed-resume|\
-      live-resume|absence-resume|prepare-transition-proof|runtime-request-proof|state-publish|\
+      live-resume|absence-resume|prepare-transition-proof|runtime-request-proof|resource-admission|state-publish|\
       retention-list|retention-check|retention-delete)
         set -- "$@" --execution-attempt "$TIMEPAD_ATTEMPT" \
           --execution-grant "$grant_id" --deadline-ns "$end_ns"
@@ -1117,13 +1107,307 @@ fail_closed_retry_refusal() {
 }
 
 rollback_worker_admission() {
-  timeout 15s python3 "$timepad_helper" rollback-admission \
-    --root "$state_root" --deploy-lock-fd 9 >/dev/null ||
+  local current inventory
+  current=$(timeout 15s python3 "$timepad_helper" read-state \
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') ||
     fail "ROLLBACK_NOT_ADMITTED"
-  # State compatibility and kernel ECHILD do not prove an interrupted Docker
-  # request has completed. Keep mutation closed until daemon/config/provider
-  # reconstruction is implemented and independently verified.
+  previous_container=$(jq -er '.predecessorContainerId | strings |
+    select(test("^[a-f0-9]{64}$"))' <<<"$current") || fail "ROLLBACK_NOT_ADMITTED"
+  inventory=$(recovery_backend_inventory) || fail "ROLLBACK_NOT_ADMITTED"
+  [ "$inventory" = "$previous_container" ] || fail "ROLLBACK_NOT_ADMITTED"
+  previous_inspect=$(docker_container_inspect "$previous_container") ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  rollback_runtime_evidence=$(jq -cn --arg root "$root" --arg base "$base_compose" \
+    --arg id "$previous_container" --argjson inspection "$previous_inspect" \
+    '{deploymentRoot:$root,baseCompose:$base,backendInventory:[$id],inspection:$inspection}') ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  rollback_admission_proof=$(printf '%s' "$rollback_runtime_evidence" |
+    timeout 15s python3 "$timepad_helper" rollback-admission \
+      --root "$state_root" --deploy-lock-fd 9) ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  jq -e --arg attempt "$TIMEPAD_ATTEMPT" --arg predecessor "$previous_container" '
+    .executionAttempt == $attempt and .predecessorContainerId == $predecessor and
+    (.proofDigest | type == "string" and test("^[a-f0-9]{64}$"))
+  ' <<<"$rollback_admission_proof" >/dev/null || fail "ROLLBACK_NOT_ADMITTED"
+}
+
+rollback_worker_continue() {
+  [ "${TIMEPAD_WORKER_MODE:-}" = rollback-worker ] ||
+    fail "PRIVATE_WORKER_REQUIRED"
+  local grant grant_id
+  # No new operation, image override, run directory, or budget is selected.
+  # Every value below is reconstructed by the fixed helper from this attempt.
+  run_key=$(jq -er '.runId' <<<"$rollback_admission_proof") || fail "ROLLBACK_NOT_ADMITTED"
+  state=$(jq -er --arg root "$state_root/" '$root + .ownedRun' \
+    <<<"$rollback_admission_proof") || fail "ROLLBACK_NOT_ADMITTED"
+  state_suffix=${state#"$state_root/$run_key-"}
+  previous_image=$(jq -er '.previousImage' <<<"$rollback_admission_proof") ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  previous_id=$(jq -er '"sha256:" + .predecessor.tuple.platformImageId' \
+    <<<"$rollback_admission_proof") || fail "ROLLBACK_NOT_ADMITTED"
+  previous_revision=$(jq -er '.predecessor.tuple.revision' <<<"$rollback_admission_proof") ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  previous_version=$(jq -er '.predecessor.tuple.version' <<<"$rollback_admission_proof") ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  previous_runtime_hash=$(jq -er '.previousConfigHash' <<<"$rollback_admission_proof") ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  provider_enabled=$(jq -er '.providerEnabled | tostring' <<<"$rollback_admission_proof") ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  durable_disposition=$(jq -er '.durableDisposition' <<<"$rollback_admission_proof") ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  updater_completed=false
+  case "$(jq -er '.installedEnvironment' <<<"$rollback_admission_proof")" in
+    production) ;;
+    target) updater_completed=true ;;
+    *) fail "ROLLBACK_NOT_ADMITTED" ;;
+  esac
+  updater_started=false
+  rollback_complete=false
+  prepared_timepad=true
+  supervisor_client admit-rollback >/dev/null || fail "ROLLBACK_NOT_ADMITTED"
+  supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  rollback_worker_admitted=true
+  recovery_budget_arm
+  # This one grant supervises the fixed synchronous rollback, including local
+  # shell filesystem writes. Nested blocking operations keep their smaller
+  # grants and the same absolute workEnd; no grant is usable in reserve.
+  grant=$(supervisor_client grant rollback-remaining-work 540) ||
+    fail "ROLLBACK_NOT_ADMITTED"
+  grant_id=$(jq -er '.grantId' <<<"$grant") || fail "ROLLBACK_NOT_ADMITTED"
+  rollback || fail "RECOVERY_REQUIRED"
+  supervisor_client complete "$grant_id" >/dev/null || fail "RECOVERY_REQUIRED"
+  supervisor_client prepare-terminal >/dev/null || fail "RECOVERY_REQUIRED"
+  supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  supervisor_client terminal 0 >/dev/null || fail "RECOVERY_REQUIRED"
+}
+
+rollback_worker_runtime_gate() {
+  # Remove only after actual-worker filesystem/runtime acceptance of the
+  # dedicated continuation. No environment/CLI selector can bypass this gate.
   fail "ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED"
+}
+
+# These declarations precede private-worker dispatch because Bash does not
+# hoist functions. Only declarations moved; ordinary deploy statements retain
+# their original ordering.
+compose() {
+  timeout 30s bash -c '
+    set -euo pipefail
+    source "$1"
+    runtime_compose "$2" "$3" "${@:4}"
+  ' _ "$runtime_helper" "$root" "$compose_script" "$@" 2>/dev/null
+}
+
+compose_up() {
+  timeout 240s bash -c '
+    set -euo pipefail
+    source "$1"
+    runtime_compose "$2" "$3" "${@:4}"
+  ' _ "$runtime_helper" "$root" "$compose_script" "$@" 2>/dev/null
+}
+
+run_safety_hook() {
+  local phase=$1
+  local expected_image=$2
+  local expected_id=$3
+  local expected_revision=$4
+  local expected_version=$5
+  local expected_runtime_hash=$6
+  local output=$state/$phase.json
+  [ "$closed_beta_safety" = true ] || return 0
+  [ ! -e "$output" ] && [ ! -L "$output" ] ||
+    fail "closed-beta $phase evidence already exists"
+  safety_args=(
+    --phase "$phase"
+    --root "$root"
+    --compose-script "$compose_script"
+    --state-dir "$state"
+    --expected-image "$expected_image"
+    --expected-image-id "$expected_id"
+    --expected-revision "$expected_revision"
+    --expected-version "$expected_version"
+    --expected-runtime-hash "$expected_runtime_hash"
+    --state-mode "$state_mode"
+  )
+  if [ -n "$public_url" ]; then
+    safety_args+=(--public-url "$public_url")
+  fi
+  timeout 60s "$safety_hook" "${safety_args[@]}" \
+    --output "$output" >/dev/null 2>&1 ||
+    fail "RECOVERY_REQUIRED"
+  [ -f "$output" ] && [ ! -L "$output" ] && [ -s "$output" ] ||
+    fail "closed-beta $phase evidence is unavailable"
+  chmod 600 "$output"
+  if [ "$phase" = final ] && [ -n "$public_url" ]; then
+    timeout 60s "$script_dir/verify-test-vps-assets.sh" \
+      --public-url "$public_url" \
+      --output "$state/frozen-assets.json" >/dev/null 2>&1 ||
+      fail "RECOVERY_REQUIRED"
+    curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+      --proto '=https' --tlsv1.2 \
+      "$public_url/meetings" | jq -e 'type == "array"' >/dev/null
+    [ "$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
+      --proto '=https' --tlsv1.2 \
+      -o /dev/null -w '%{http_code}' "$public_url/actuator")" = 404 ] ||
+      fail "Actuator is not private"
+    headers=$(mktemp)
+    trap 'rm -f -- "$headers"' RETURN
+    curl --silent --show-error --connect-timeout 5 --max-time 15 \
+      --proto '=http' \
+      -D "$headers" -o /dev/null "${public_url/https:\/\//http://}/meetings"
+    grep -Eiq '^location: https://' "$headers" ||
+      fail "HTTP does not redirect to HTTPS"
+    rm -f -- "$headers"
+    missing_admin=$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
+      --output /dev/null \
+      --write-out '%{http_code}' -X POST \
+      "$public_url/admin/demo-catalog/bootstrap" \
+      -H 'Content-Type: application/json' --data '{}')
+    wrong_admin=$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
+      --output /dev/null \
+      --write-out '%{http_code}' -X POST \
+      "$public_url/admin/demo-catalog/bootstrap" \
+      -H 'X-Admin-Key: wrong' -H 'Content-Type: application/json' --data '{}')
+    [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ] ||
+      fail "admin guard did not reject unauthenticated requests"
+  fi
+}
+
+write_terminal_record() {
+  local outcome=$1
+  local terminal="$state/terminal.json"
+  [ "$outcome" = committed ] || [ "$outcome" = rolled-back ] ||
+    fail "RECOVERY_REQUIRED"
+  umask 077
+  timeout 30s jq -cn --arg run_key "$run_key" --arg outcome "$outcome" \
+    --argjson enabled "$provider_enabled" \
+    '{schemaVersion:1,runKey:$run_key,outcome:$outcome,providerEnabled:$enabled}' \
+    >"$terminal"
+  chmod 600 "$terminal"
+  timeout 30s python3 - "$terminal" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+provider_finish() {
+  local outcome=$1
+  local inspection=$2
+  write_provider_marker finalizing \
+    "${durable_disposition:-none}"
+  if [ "$prepared_timepad" = true ] && [ "$outcome" = committed ]; then
+    printf '%s' "$inspection" |
+      timeout 30s python3 "$provider_helper" finish-committed-resume \
+        --run-key "$run_key" --state-root "$state_root" \
+        --state-kind "$state_suffix" --deploy-lock-fd 9 >/dev/null ||
+      fail "RECOVERY_REQUIRED"
+  else
+    printf '%s' "$inspection" |
+      timeout 30s python3 "$provider_helper" finish \
+        --run-key "$run_key" --state-root "$state_root" \
+        --outcome "$outcome" --deploy-lock-fd 9 >/dev/null ||
+      fail "RECOVERY_REQUIRED"
+    write_terminal_record "$outcome"
+    timeout 30s rm -f -- "$provider_pointer" || fail "RECOVERY_REQUIRED"
+    timeout 30s python3 - "$state_root" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+  fi
+  timeout 30s jq -cn --argjson enabled "$provider_enabled" --arg outcome "$outcome" \
+    '{schemaVersion:1,providerEnabled:$enabled,credentialMountPresent:$enabled,
+      credentialMountReadOnly:$enabled,outcome:$outcome}'
+}
+
+restore_previous_active_files() {
+  restore_active_file "$active_compose" compose || fail "RECOVERY_REQUIRED"
+  restore_active_file "$active_runtime" runtime || fail "RECOVERY_REQUIRED"
+}
+
+rollback() {
+  local rollback_receipt receipt_digest
+  recovery_work_check || fail "RECOVERY_REQUIRED"
+  if [ "$prepared_timepad" = true ]; then
+    timepad_claim_rollback
+  fi
+  if [ "$updater_completed" = true ]; then
+    validate_configuration_boundary "$state/config.env.target"
+  elif [ "$updater_started" = false ]; then
+    validate_configuration_boundary "$state/config.env.production"
+  fi
+  write_provider_marker rolling-back "${durable_disposition:-none}"
+  restore_previous_active_files
+  if [ "$updater_completed" = true ]; then
+    validate_configuration_boundary "$state/config.env.target"
+  fi
+  updater_started=true
+  PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
+    timeout 60s "$update_script" "$previous_image" "$previous_revision" "$previous_version" \
+    >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
+  cmp -s "$root/.env.production" "$state/config.env.previous" ||
+    fail "RECOVERY_REQUIRED"
+  printf '%s\n' "$(configuration_file_identity "$root/.env.production")" \
+    >"$state/config.env.previous.identity"
+  chmod 600 "$state/config.env.previous.identity"
+  validate_configuration_boundary "$state/config.env.previous"
+  compose_up -d --no-deps --no-build --pull never --force-recreate \
+    --wait --wait-timeout 180 backend >/dev/null
+  recovery_deadline_check
+  restored_container=$(compose ps -q backend)
+  restored_inspect=$(docker_container_inspect "$restored_container" 2>/dev/null) ||
+    fail "RECOVERY_REQUIRED"
+  restored_hash=$(docker_container_inspect "$restored_container" \
+    --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
+  [ "$restored_hash" = "$previous_runtime_hash" ] ||
+    fail "rollback did not restore the exact predecessor Compose runtime"
+  runtime_invariants_bounded "$previous_id" "$previous_revision" \
+    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 ||
+    fail "RECOVERY_REQUIRED"
+  printf '[%s,%s]' "$previous_inspect" "$restored_inspect" |
+    timeout 30s python3 "$provider_helper" verify \
+      --run-key "$run_key" --state-root "$state_root" --phase rollback \
+      --deploy-lock-fd 9 >/dev/null ||
+    fail "RECOVERY_REQUIRED"
+  verify_public_contract "$public_url"
+  recovery_deadline_check
+  run_safety_hook rollback "$previous_image" "$previous_id" \
+    "$previous_revision" "$previous_version" "$previous_runtime_hash"
+  final_restored_container=$(compose ps -q backend)
+  [ "$final_restored_container" = "$restored_container" ] ||
+    fail "RECOVERY_REQUIRED"
+  final_restored_inspect=$(docker_container_inspect "$final_restored_container" \
+    2>/dev/null) || fail "RECOVERY_REQUIRED"
+  runtime_invariants_bounded "$previous_id" "$previous_revision" \
+    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 ||
+    fail "RECOVERY_REQUIRED"
+  runtime_environment_bounded >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
+  (verify_public_contract "$public_url") || fail "RECOVERY_REQUIRED"
+  printf '[%s,%s]' "$previous_inspect" "$final_restored_inspect" |
+    timeout 30s python3 "$provider_helper" verify \
+      --run-key "$run_key" --state-root "$state_root" --phase rollback \
+      --deploy-lock-fd 9 >/dev/null ||
+    fail "RECOVERY_REQUIRED"
+  rollback_receipt=$(provider_finish rolled-back "$final_restored_inspect")
+  if [ "$prepared_timepad" = true ]; then
+    receipt_digest=$(printf '%s' "$rollback_receipt" | sha256sum | awk '{print $1}')
+    timepad_advance ROLLED_BACK ROLLBACK_VERIFIED "" "" "$receipt_digest"
+    echo "schema_guard=rolled-back"
+  fi
+  rollback_complete=true
+  echo "rollback=completed previous_image_id=$previous_id"
+  echo "operation_outcome=rolled-back"
 }
 
 docker_image_inspect() {
@@ -1291,7 +1575,7 @@ recovery_backend_inventory() {
 }
 
 recovery_absent_candidate() {
-  local inventory image_json configuration active name expected ids created
+  local inventory active name expected ids created
   # A failed inspect is not absence evidence. Both complete inventories must
   # succeed and agree, and the immutable original receipt must admit creation.
   inventory=$(recovery_backend_inventory) ||
@@ -1310,22 +1594,7 @@ recovery_absent_candidate() {
   cmp -s "$active_compose" "$state/config.base-compose.yml" &&
     cmp -s "$active_runtime" "$state/target-runtime.override.yml" ||
     fail "RECOVERY_CONFIGURATION_MISMATCH"
-  image_json=$(timeout 30s docker image inspect "$image" 2>/dev/null) ||
-    fail "RECOVERY_TARGET_IMAGE_REQUIRED"
-  configuration=$(env -i PATH="$PATH" HOME=/root COMPOSE_PROJECT_NAME=meet-production \
-    BACKEND_IMAGE="$image" BACKEND_VERSION="$version" BACKEND_REVISION="$revision" \
-    timeout 30s docker compose --project-directory "$root" \
-      --env-file "$state/config.env.target" \
-      -f "$state/config.base-compose.yml" -f "$state/target-runtime.override.yml" \
-      config --format json 2>/dev/null) || fail "RECOVERY_CONFIGURATION_MISMATCH"
-  jq -cn --slurpfile authority "$recovery_authorization" \
-    --argjson inspection "$image_json" --argjson configuration "$configuration" '
-    {schema:"meet-backend/test-vps-provider-absence-resume/v1",
-     authorization:$authority[0],imageInspection:$inspection,
-     targetConfiguration:$configuration,backendInventory:[]}' |
-    timeout 30s python3 "$provider_helper" absence-resume \
-      --run-key "$recovery_run_key" --state-root "$state_root" \
-      --state-kind "$recovery_state_suffix" --deploy-lock-fd 9 >/dev/null ||
+  timepad_create_action verify-target replacement >/dev/null ||
     fail "RECOVERY_PROVIDER_ABSENCE_PROOF_REQUIRED"
   # Consume the one-use budget before releasing any migration-capable child.
   # An unbound create-intent is deliberately unresolved on crash re-entry.
@@ -1340,15 +1609,11 @@ recovery_absent_candidate() {
   inventory=$(recovery_backend_inventory) ||
     fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
   [ -z "$inventory" ] || fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
-  run_owned_child FORWARD_RECOVERING timeout --kill-after=5s 240s bash -c '
-    set -euo pipefail
-    source "$1"
-    runtime_compose "$2" "$3" "${@:4}"
-  ' _ "$runtime_helper" "$root" "$compose_script" \
-    up --no-start --no-deps --no-build --pull never --force-recreate backend \
+  run_owned_child FORWARD_RECOVERING create replacement \
     >/dev/null || fail "RECOVERY_REPLACEMENT_CREATE_FAILED"
   ids=$(recovery_backend_inventory) || fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
-  [[ "$ids" =~ ^[a-f0-9]{64}$ ]] && [ "$ids" != "$recovery_container" ] ||
+  [[ "$ids" =~ ^[a-f0-9]{64}$ ]] && [ "$ids" != "$recovery_container" ] &&
+    [ "$ids" = "$candidate_container" ] ||
     fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
   created=$(timeout 30s docker inspect "$ids") ||
     fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
@@ -1359,8 +1624,6 @@ recovery_absent_candidate() {
     .[0].Config.Labels["com.docker.compose.service"] == "backend" and
     .[0].Config.Labels["com.docker.compose.config-hash"] == $hash
   ' <<<"$created" >/dev/null || fail "RECOVERY_REPLACEMENT_IDENTITY_MISMATCH"
-  timeout 15s docker update --restart=no "$ids" >/dev/null ||
-    fail "RECOVERY_REPLACEMENT_POLICY_FAILED"
   [ "$(timeout 30s docker inspect "$ids" \
     --format '{{.HostConfig.RestartPolicy.Name}}')" = no ] ||
     fail "RECOVERY_REPLACEMENT_POLICY_FAILED"
@@ -1448,19 +1711,119 @@ timepad_advance() {
 }
 
 timepad_claim_rollback() {
+  if [ "${TIMEPAD_WORKER_MODE:-controller-worker}" = rollback-worker ]; then
+    local inventory inspection evidence
+    inventory=$(recovery_backend_inventory) || fail "ROLLBACK_NOT_ADMITTED"
+    [ "$inventory" = "$previous_container" ] || fail "ROLLBACK_NOT_ADMITTED"
+    inspection=$(docker_container_inspect "$previous_container") ||
+      fail "ROLLBACK_NOT_ADMITTED"
+    evidence=$(jq -cn --argjson admission "$rollback_admission_proof" \
+      --arg root "$root" --arg base "$base_compose" --arg id "$previous_container" \
+      --argjson inspection "$inspection" '
+      {admission:$admission,runtime:{deploymentRoot:$root,baseCompose:$base,
+        backendInventory:[$id],inspection:$inspection}}') || fail "ROLLBACK_NOT_ADMITTED"
+    printf '%s' "$evidence" |
+      timeout 15s python3 "$timepad_helper" claim-rollback \
+        --root "$state_root" --deploy-lock-fd 9 >/dev/null ||
+      fail "ROLLBACK_NOT_ADMITTED"
+    return
+  fi
   timeout 15s python3 "$timepad_helper" claim-rollback \
     --root "$state_root" --deploy-lock-fd 9 >/dev/null ||
     fail "ROLLBACK_NOT_ADMITTED"
 }
 
+timepad_create_action() {
+  local action=$1 role=$2 timing end duration
+  [ "$supervisor_enabled" = true ] || return 1
+  case "$action" in
+    admit-target|publish-prepared|verify-target|create|reconcile-bound) ;;
+    *) return 1 ;;
+  esac
+  case "$role" in initial|replacement) ;; *) return 1 ;; esac
+  timing=$(command timeout 3s python3 -B -c '
+import sys
+import time
+action, work_end = sys.argv[1:]
+now = time.monotonic_ns()
+if action in {"create", "reconcile-bound"}:
+    if not work_end:
+        raise SystemExit(1)
+    end = int(work_end)
+else:
+    end = min(now + 30_000_000_000, int(work_end)) if work_end else now + 30_000_000_000
+if end <= now:
+    raise SystemExit(1)
+print(str(end) + " " + format((end - now) / 1_000_000_000, ".9f") + "s")
+' "$action" "${recovery_work_end_ns:-}") || return 1
+  read -r end duration <<<"$timing"
+  # One authenticated action. The server derives its own original deadline;
+  # these client limits cannot arm, extend or renew any attempt or grant.
+  command timeout "$duration" python3 -B "$script_dir/test_vps_timepad_supervisor.py" \
+    client --root "$state_root" create-driver --action "$action" --role "$role" --end-ns "$end"
+}
+
+timepad_resource_revalidate() {
+  timepad_create_action verify-target initial >/dev/null
+}
+
+timepad_request_bind_create() {
+  local result
+  result=$(timepad_create_action reconcile-bound initial) || return 1
+  candidate_container=$(jq -er '.containerId | strings | select(test("^[a-f0-9]{64}$"))' <<<"$result") || return 1
+  target_hash=$(jq -er '.configHash | strings | select(test("^[a-f0-9]{64}$"))' <<<"$result") || return 1
+}
+
+run_owned_create() {
+  local phase=$1 role=$2 result
+  case "$phase:$role" in CUTOVER_POSSIBLE:initial|FORWARD_RECOVERING:replacement) ;;
+    *) return 1 ;;
+  esac
+  result=$(timepad_create_action create "$role") || return 1
+  candidate_container=$(jq -er '.containerId | strings | select(test("^[a-f0-9]{64}$"))' <<<"$result") || return 1
+  target_hash=$(jq -er '.configHash | strings | select(test("^[a-f0-9]{64}$"))' <<<"$result") || return 1
+}
+
+validate_timepad_input() {
+  timeout 10s python3 - "$1" "$2" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+limit = int(sys.argv[2])
+try:
+    info = os.lstat(path)
+except OSError:
+    raise SystemExit(1)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_uid != 0
+    or info.st_nlink != 1
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or info.st_size > limit
+):
+    raise SystemExit(1)
+PY
+}
+
 timepad_request_publish() {
-  local request=$1 current phase changes=$state/.timepad-request-changes.json
+  local request=$1 child=${2:-null} current phase changes=$state/.timepad-request-changes.json
   current=$(timeout 10s python3 "$timepad_helper" read-state \
     --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
   phase=$(jq -er '.phase' <<<"$current") || return 1
   [ ! -e "$changes" ] && [ ! -L "$changes" ] || return 1
   (umask 077; set -o noclobber
-    jq -cn --argjson request "$request" '{changes:{runtimeRequest:$request}}' >"$changes") ||
+    jq -cn --argjson request "$request" --argjson child "$child" '
+      {changes:({runtimeRequest:$request} +
+        (if $request.operation == "create" and $request.lifecycle == "intent" then
+           {ownedChild:$child,latestAttemptId:$request.childAttemptId}
+         elif $request.operation == "create" and $request.lifecycle == "bound" then
+           {containerId:$request.containerId,configHash:$request.configHash} +
+           (if $request.role == "replacement" then
+              {commitSubstep:"replacement-container-authorized"} else {} end)
+         else {} end))}
+    ' >"$changes") ||
     return 1
   timeout 15s python3 "$timepad_helper" advance --root "$state_root" \
     --phase "$phase" --changes "$changes" --deploy-lock-fd 9 >/dev/null || {
@@ -1471,20 +1834,38 @@ timepad_request_publish() {
 }
 
 timepad_request_begin() {
-  local operation=$1 child=${2:-} expected_container=$3 current request nonce
+  local operation=$1 child=${2:-} expected_container=$3 current request nonce predecessor_hash=
   current=$(timeout 10s python3 "$timepad_helper" read-state \
     --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
   nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$nonce" =~ ^[a-f0-9]{32}$ ]] || return 1
+  if [ "$(jq -er '.phase' <<<"$current")" = PREPARED ]; then
+    case "$operation" in suppress|stop) ;; *) return 1 ;; esac
+    [ -z "$child" ] || return 1
+    predecessor_hash=${previous_runtime_hash:-}
+    [[ "$predecessor_hash" =~ ^[a-f0-9]{64}$ ]] || return 1
+  fi
   request=$(jq -ce --arg operation "$operation" --arg nonce "$nonce" \
     --arg attempt "$TIMEPAD_ATTEMPT" --arg child "$child" \
-    --arg container "$expected_container" '
-    select(.executionAttempt == $attempt and .containerId == $container) |
+    --arg container "$expected_container" --arg predecessorHash "$predecessor_hash" '
+    select(.executionAttempt == $attempt) |
+    if .phase == "PREPARED" then
+      select(.predecessorContainerId == $container) |
+      {nonce:$nonce,sequence:((.runtimeRequest.sequence // 0) + 1),
+       executionAttempt:$attempt,operation:$operation,containerId:$container,
+       imageId:.predecessor.tuple.platformImageId,configHash:$predecessorHash,
+       childAttemptId:null,lifecycle:"intent",responseId:null,completionDigest:null,
+       role:"predecessor",originDigest:.originDigest,incidentId:.incidentId,
+       operationEpoch:.operationEpoch,preparedProofDigest:.preparedProofDigest,
+       evidenceDigest:.evidenceDigest}
+    else
+    select(.containerId == $container) |
     {nonce:$nonce,sequence:((.runtimeRequest.sequence // 0) + 1),
      executionAttempt:$attempt,operation:$operation,containerId:.containerId,
      imageId:.target.tuple.platformImageId,configHash:.configHash,
      childAttemptId:(if $child == "" then null else $child end),
      lifecycle:"intent",responseId:null,completionDigest:null}
+    end
   ' <<<"$current") || return 1
   timepad_request_publish "$request"
 }
@@ -1523,17 +1904,40 @@ timepad_request_complete() {
   timepad_request_publish "$request"
 }
 
+timepad_request_preflight() {
+  local current container nonce inspection proof
+  current=$(timeout 10s python3 "$timepad_helper" read-state \
+    --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  [ "$(jq -r '.runtimeRequest.role // ""' <<<"$current")" = predecessor ] || return 0
+  container=$(jq -er '.runtimeRequest.containerId' <<<"$current") || return 1
+  nonce=$(jq -er '.runtimeRequest.nonce' <<<"$current") || return 1
+  inspection=$(timeout 15s docker inspect "$container") || return 1
+  proof=$(jq -cn --arg nonce "$nonce" --argjson inspection "$inspection" \
+    '{requestNonce:$nonce,inspection:$inspection}' |
+    timeout 15s python3 "$provider_helper" runtime-request-proof \
+      --run-key "$run_key" --state-root "$state_root" \
+      --state-kind "$state_suffix" --deploy-lock-fd 9) || return 1
+  jq -e --arg nonce "$nonce" '
+    .requestNonce == $nonce and (.admissionDigest | strings | test("^[a-f0-9]{64}$"))
+  ' <<<"$proof" >/dev/null
+}
+
 timepad_runtime_mutate() {
+  # Validate the entire invocation before publishing intent or contacting Docker.
+  [ "$#" -eq 2 ] || return 1
   local operation=$1 container=$2 response
-  shift 2
+  case "$operation" in suppress|restore-policy|stop) ;; *) return 1 ;; esac
+  [[ "$container" =~ ^[a-f0-9]{64}$ ]] || return 1
+  [ "$container" = "${container,,}" ] || return 1
   timepad_request_begin "$operation" "" "$container" || return 1
+  timepad_request_preflight || return 1
   case "$operation" in
     suppress) response=$(timeout 15s docker update --restart=no "$container") || return 1 ;;
     restore-policy) response=$(timeout 15s docker update --restart=unless-stopped "$container") || return 1 ;;
     stop) response=$(timeout 30s docker stop --time 10 "$container") || return 1 ;;
     *) return 1 ;;
   esac
-  [ "$#" -eq 0 ] && [ "$response" = "$container" ] || return 1
+  [ "$response" = "$container" ] || return 1
   timepad_request_acknowledge "$response" && timepad_request_complete
 }
 
@@ -1633,9 +2037,12 @@ run_owned_child() {
   local released_json grant handshake_grant noclobber_was_set=false
   shift
   [ "$#" -gt 0 ] || fail "OWNED_CHILD_INVALID"
-  # This slice admits exact-container synchronous start only. Compose creation
-  # needs its own positively correlated daemon completion before this gate can
-  # be widened; an empty inventory or client exit cannot supply that proof.
+  if [ "$1" = create ]; then
+    [ "$#" -eq 2 ] || fail "RUNTIME_REQUEST_CORRELATION_REQUIRED"
+    run_owned_create "$phase" "$2"
+    return
+  fi
+  # Existing-ID requests retain their exact synchronous Docker response contract.
   [ "$#" -eq 6 ] && [ "$1" = timeout ] && [ "$2" = --kill-after=5s ] &&
     [ "$3" = 30s ] && [ "$4" = docker ] && [ "$5" = start ] &&
     [[ "$6" =~ ^[a-f0-9]{64}$ ]] || fail "RUNTIME_REQUEST_CORRELATION_REQUIRED"
@@ -1821,7 +2228,8 @@ timepad_prepare_transition() {
     --arg run_id "$run_key" --arg incident "$incident_id" \
     --arg owned_run "$(basename "$state")" \
     --arg tooling_digest "$(sha256sum "${BASH_SOURCE[0]}" "$runtime_helper" \
-      "$timepad_helper" "$timepad_contract" | sha256sum | awk '{print $1}')" \
+      "$timepad_helper" "$timepad_contract" "$script_dir/test_vps_timepad_supervisor.py" \
+      "$script_dir/test_vps_timepad_create.py" "$provider_helper" | sha256sum | awk '{print $1}')" \
     --argjson target "$(jq -c '.tuple' <<<"$target_binding")" \
     --argjson predecessor "$(jq -c '.tuple' <<<"$predecessor_binding")" '
       {rootId:$root_id,targetId:$target_id,predecessorId:$predecessor_id,
@@ -1846,66 +2254,19 @@ timepad_prepare_transition() {
     rm -f -- "$evidence_file" "$admission_file"
     return 0
   fi
+  timepad_operation_token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  [[ "$timepad_operation_token" =~ ^[a-f0-9]{32}$ ]] ||
+    fail "PROVIDER_STATE_INVALID"
   timepad_admitted=true
 }
 
 timepad_publish_prepared_transition() {
   [ "$timepad_admitted" = true ] || return 0
   recovery_budget_arm
-  local evidence_file=$state/.timepad-prepare.json
-  local admission_file=$state/.timepad-admission.json
-  local proof_input proof_output proof_digest grant grant_id deadline output
-  proof_input=$(jq -cn --slurpfile evidence "$evidence_file" \
-    --argjson predecessor_inspection "$previous_inspect" \
-    --argjson image_inspection "$target_image_inspect" \
-    --argjson target_configuration "$target_config" '
-      {schema:"meet-backend/test-vps-timepad-prepared-input/v1",
-       evidence:$evidence[0],predecessorInspection:$predecessor_inspection,
-       imageInspection:$image_inspection,targetConfiguration:$target_configuration}
-    ') || fail "PROVIDER_STATE_INVALID"
-  if [ "$supervisor_enabled" = true ]; then
-    grant=$(supervisor_client grant provider 30) ||
-      fail "PROVIDER_STATE_INVALID"
-    grant_id=$(jq -er '.grantId | strings' <<<"$grant") ||
-      fail "PROVIDER_STATE_INVALID"
-    deadline=$(jq -er '.endNs | numbers' <<<"$grant") ||
-      fail "PROVIDER_STATE_INVALID"
-    proof_output=$(printf '%s' "$proof_input" |
-      command timeout 30s python3 "$provider_helper" prepare-transition-proof \
-        --run-key "$run_key" --state-root "$state_root" \
-        --state-kind "$state_suffix" --deploy-lock-fd 9 \
-        --execution-attempt "$TIMEPAD_ATTEMPT" --execution-grant "$grant_id" \
-        --deadline-ns "$deadline") || {
-          supervisor_client complete "$grant_id" >/dev/null || :
-          fail "PROVIDER_STATE_INVALID"
-        }
-    supervisor_client complete "$grant_id" >/dev/null ||
-      fail "PROVIDER_STATE_INVALID"
-  else
-    proof_output=$(printf '%s' "$proof_input" |
-      timeout 30s python3 "$provider_helper" prepare-transition-proof \
-        --run-key "$run_key" --state-root "$state_root" \
-        --state-kind "$state_suffix" --deploy-lock-fd 9) ||
-      fail "PROVIDER_STATE_INVALID"
-  fi
-  proof_digest=$(jq -er \
-    '.preparedProofDigest | strings | select(test("^[a-f0-9]{64}$"))' \
-    <<<"$proof_output") || fail "PROVIDER_STATE_INVALID"
-  jq -e --arg digest "$proof_digest" '.preparedProofDigest=$digest' \
-    "$evidence_file" >"$state/.timepad-prepare.next" ||
-    fail "PROVIDER_STATE_INVALID"
-  chmod 600 "$state/.timepad-prepare.next"
-  mv -f -- "$state/.timepad-prepare.next" "$evidence_file"
-  output=$(timeout 15s python3 "$timepad_helper" prepare \
-    --root "$state_root" --contract "$timepad_contract" \
-    --evidence "$evidence_file" --deploy-lock-fd 9 2>/dev/null) ||
+  timepad_create_action publish-prepared initial >/dev/null ||
     fail "TIMEPAD_ADMISSION_REFUSED"
-  jq -e --arg disposition "$admission_disposition" '
-    .admission == $disposition and .result == "PREPARED" and
-    (.epoch | type == "number" and . > 0)
-  ' <<<"$output" >/dev/null || fail "GUARD_STATE_LOST"
   prepared_timepad=true
-  rm -f -- "$evidence_file" "$admission_file"
+  rm -f -- "$state/.timepad-prepare.json" "$state/.timepad-admission.json"
 }
 
 state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
@@ -1962,30 +2323,14 @@ if [ -n "${TIMEPAD_WORKER_MODE:-}" ]; then
   fi
   if [ "$TIMEPAD_WORKER_MODE" = rollback-worker ]; then
     rollback_worker_admission
+    # Keep dispatch closed until the complete dedicated continuation has
+    # actual-worker acceptance evidence, including its filesystem writers.
+    rollback_worker_runtime_gate
+    rollback_worker_continue
+    trap - EXIT
+    exit 0
   fi
 fi
-validate_timepad_input() {
-  timeout 10s python3 - "$1" "$2" <<'PY'
-import os
-import stat
-import sys
-
-path = sys.argv[1]
-limit = int(sys.argv[2])
-try:
-    info = os.lstat(path)
-except OSError:
-    raise SystemExit(1)
-if (
-    not stat.S_ISREG(info.st_mode)
-    or info.st_uid != 0
-    or info.st_nlink != 1
-    or stat.S_IMODE(info.st_mode) != 0o600
-    or info.st_size > limit
-):
-    raise SystemExit(1)
-PY
-}
 if [ "$operation" = bootstrap-guard ]; then
   bootstrap_authority=$state_root/timepad-bootstrap-authority.json
   bootstrap_observed=$state_root/timepad-bootstrap-observed.json
@@ -2049,11 +2394,12 @@ if [ "$operation" = forward-recover ]; then
   [ -d "$recovery_state_dir" ] && [ ! -L "$recovery_state_dir" ] ||
     fail "GUARD_STATE_LOST"
   state=$recovery_state_dir
+  run_key=$recovery_run_key
+  state_suffix=$recovery_state_suffix
 
   # Recovery is deliberately dispatched before retention, state publication,
-  # configuration updates, or Compose creation. The durable container binding
-  # is the only runtime identity accepted here; Compose selection is merely a
-  # consistency check after that identity has been inspected.
+  # configuration updates, or Compose creation. An acknowledged create may
+  # finish its independent binding; all other requests need a durable exact ID.
   recovery_target_id=$(docker_image_inspect "$image" --format '{{.Id}}') ||
     fail "RECOVERY_SELECTOR_MISMATCH"
   recovery_image_inspect=$(docker_image_inspect "$image") ||
@@ -2082,6 +2428,27 @@ if [ "$operation" = forward-recover ]; then
   [ ! -e "$smtp_pointer" ] && [ ! -L "$smtp_pointer" ] ||
     fail "RECOVERY_REQUIRED"
 
+  if jq -e '.runtimeRequest.operation == "create" and
+    .runtimeRequest.lifecycle == "normal-completed"' <<<"$recovery_state" >/dev/null; then
+    # Registration already proved the old drained lease, durable completion
+    # ACK and private resource/request files. Only that adopted request may
+    # bind; never replay create or manufacture a completion acknowledgment.
+    jq -e --arg attempt "$TIMEPAD_ATTEMPT" '
+      .executionAttempt == $attempt and .ownedChild == null
+    ' <<<"$recovery_state" >/dev/null ||
+      fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
+    recovery_admission_only=false
+    supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
+    supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+    timepad_request_bind_create || fail "CREATE_STOPPED_BINDING_REFUSED"
+    timepad_resource_revalidate post-create || fail "RESOURCE_ADMISSION_REFUSED"
+    recovery_state=$(timeout 15s python3 "$timepad_helper" read-state \
+      --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') ||
+      fail "GUARD_STATE_LOST"
+    recovery_phase=$(jq -er '.phase | strings' <<<"$recovery_state") ||
+      fail "GUARD_STATE_LOST"
+  fi
+
   recovery_container=$(jq -er '.containerId // empty' <<<"$recovery_state") ||
     recovery_container=
   recovery_hash=$(jq -er '.configHash // empty' <<<"$recovery_state") ||
@@ -2103,10 +2470,11 @@ if [ "$operation" = forward-recover ]; then
     *) fail "RECOVERY_PHASE_REFUSED" ;;
   esac
   # Intent without a daemon receipt remains unknown, even after client exit,
-  # ECHILD, or agreeing inventories. Read-only provider/runtime admission must
-  # precede lease arming, adoption, owned-child stop and every retry writer.
+  # ECHILD, or agreeing inventories. Read-only provider/runtime admission (the
+  # registration proof for create) precedes arming, adoption and retry writers.
   jq -e '.runtimeRequest != null and
-    (.runtimeRequest.lifecycle == "completed" or .runtimeRequest.lifecycle == "acknowledged")' \
+    (.runtimeRequest.lifecycle == "completed" or .runtimeRequest.lifecycle == "acknowledged" or
+     (.runtimeRequest.operation == "create" and .runtimeRequest.lifecycle == "bound"))' \
     <<<"$recovery_state" >/dev/null ||
     fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
   if [ "$recovery_phase" = COMMITTED ]; then
@@ -2166,8 +2534,8 @@ if [ "$operation" = forward-recover ]; then
   [ "$recovery_substep" != replacement-create-intent ] ||
     fail "RECOVERY_REPLACEMENT_CREATE_UNRESOLVED"
   if ! recovery_inspect=$(timeout 30s docker inspect "$recovery_container" 2>/dev/null); then
-    # The exact-container slice cannot correlate Compose create responses yet.
-    # Preserve the one-use replacement intent gate; absence is not completion.
+    # A failed inspect cannot replace the durable binding or authorize another
+    # create. Preserve the one-use gate; absence is not completion.
     fail "RECOVERY_OWNERSHIP_PROOF_REQUIRED"
   fi
   [ "$(timeout 30s docker inspect "$recovery_container" \
@@ -2234,9 +2602,11 @@ if [ "$operation" = forward-recover ]; then
         --state-kind "$recovery_state_suffix" --deploy-lock-fd 9) ||
       fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
   fi
-  recovery_admission_only=false
-  supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
-  supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  if [ "$recovery_admission_only" = true ]; then
+    recovery_admission_only=false
+    supervisor_client arm >/dev/null || fail "EXECUTION_SUPERVISOR_ARM_FAILED"
+    supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
+  fi
   if [ "$recovery_phase" != COMMITTED ]; then
     adoption_args=()
     if [ -n "$recovery_request_proof" ]; then
@@ -2336,6 +2706,15 @@ if [ "$operation" = forward-recover ]; then
       replacement-terminal-policy-intent:unless-stopped|\
       replacement-policy-restored:no|replacement-policy-restored:unless-stopped|\
       :no) ;;
+      :unless-stopped|replacement-container-authorized:unless-stopped)
+        jq -e '.runtimeRequest.operation == "create" and
+          .runtimeRequest.lifecycle == "bound" and .ownedChild == null and
+          .runtimeRequest.containerId == .containerId and
+          .runtimeRequest.configHash == .configHash' <<<"$recovery_state" >/dev/null &&
+          jq -e '.[0].State.Status == "created" and .[0].State.Running == false and
+            .[0].State.StartedAt == "0001-01-01T00:00:00Z" and .[0].RestartCount == 0' \
+            <<<"$recovery_inspect" >/dev/null || fail "RECOVERY_RUNTIME_MISMATCH"
+        ;;
       *) fail "RECOVERY_RUNTIME_MISMATCH" ;;
     esac
   else
@@ -2445,6 +2824,10 @@ if [ "$operation" = forward-recover ]; then
   fi
   if [ "$recovery_retry_needed" = true ]; then
     timepad_advance FORWARD_RECOVERING EXACT_IMAGE_RETRY
+    if jq -e '.runtimeRequest.operation == "create" and
+      .runtimeRequest.lifecycle == "bound"' <<<"$recovery_state" >/dev/null; then
+      timepad_resource_revalidate post-create || fail "RESOURCE_ADMISSION_REFUSED"
+    fi
     [ "$recovery_restart" = no ] ||
       timepad_runtime_mutate suppress "$candidate_container" \
         >/dev/null || fail "RECOVERY_RETRY_QUIESCE_FAILED"
@@ -2458,6 +2841,7 @@ if [ "$operation" = forward-recover ]; then
     [ "$(timeout 30s docker inspect "$candidate_container" \
       --format '{{.HostConfig.RestartPolicy.Name}}')" = no ] ||
       fail "RECOVERY_RETRY_QUIESCE_FAILED"
+    timepad_resource_revalidate recovery || fail "RESOURCE_ADMISSION_REFUSED"
     run_owned_child FORWARD_RECOVERING timeout --kill-after=5s 30s docker start \
       "$candidate_container" >/dev/null || fail "RECOVERY_RETRY_START_FAILED"
     recovery_deadline=$(recovery_health_deadline 180) ||
@@ -2666,22 +3050,6 @@ timeout 30s python3 "$provider_helper" state-publish \
   --state-kind "$state_suffix" --deploy-lock-fd 9 >/dev/null ||
   fail "RECOVERY_REQUIRED"
 
-compose() {
-  timeout 30s bash -c '
-    set -euo pipefail
-    source "$1"
-    runtime_compose "$2" "$3" "${@:4}"
-  ' _ "$runtime_helper" "$root" "$compose_script" "$@" 2>/dev/null
-}
-
-compose_up() {
-  timeout 240s bash -c '
-    set -euo pipefail
-    source "$1"
-    runtime_compose "$2" "$3" "${@:4}"
-  ' _ "$runtime_helper" "$root" "$compose_script" "$@" 2>/dev/null
-}
-
 previous_image=$(runtime_release_field_bounded BACKEND_IMAGE) ||
   fail "PROVIDER_STATE_INVALID"
 previous_version=$(runtime_release_field_bounded BACKEND_VERSION) ||
@@ -2744,131 +3112,6 @@ fi
 snapshot_active_file "$active_compose" compose
 snapshot_active_file "$active_runtime" runtime
 
-run_safety_hook() {
-  local phase=$1
-  local expected_image=$2
-  local expected_id=$3
-  local expected_revision=$4
-  local expected_version=$5
-  local expected_runtime_hash=$6
-  local output=$state/$phase.json
-  [ "$closed_beta_safety" = true ] || return 0
-  [ ! -e "$output" ] && [ ! -L "$output" ] ||
-    fail "closed-beta $phase evidence already exists"
-  safety_args=(
-    --phase "$phase"
-    --root "$root"
-    --compose-script "$compose_script"
-    --state-dir "$state"
-    --expected-image "$expected_image"
-    --expected-image-id "$expected_id"
-    --expected-revision "$expected_revision"
-    --expected-version "$expected_version"
-    --expected-runtime-hash "$expected_runtime_hash"
-    --state-mode "$state_mode"
-  )
-  if [ -n "$public_url" ]; then
-    safety_args+=(--public-url "$public_url")
-  fi
-  timeout 60s "$safety_hook" "${safety_args[@]}" \
-    --output "$output" >/dev/null 2>&1 ||
-    fail "RECOVERY_REQUIRED"
-  [ -f "$output" ] && [ ! -L "$output" ] && [ -s "$output" ] ||
-    fail "closed-beta $phase evidence is unavailable"
-  chmod 600 "$output"
-  if [ "$phase" = final ] && [ -n "$public_url" ]; then
-    timeout 60s "$script_dir/verify-test-vps-assets.sh" \
-      --public-url "$public_url" \
-      --output "$state/frozen-assets.json" >/dev/null 2>&1 ||
-      fail "RECOVERY_REQUIRED"
-    curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
-      --proto '=https' --tlsv1.2 \
-      "$public_url/meetings" | jq -e 'type == "array"' >/dev/null
-    [ "$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
-      --proto '=https' --tlsv1.2 \
-      -o /dev/null -w '%{http_code}' "$public_url/actuator")" = 404 ] ||
-      fail "Actuator is not private"
-    headers=$(mktemp)
-    trap 'rm -f -- "$headers"' RETURN
-    curl --silent --show-error --connect-timeout 5 --max-time 15 \
-      --proto '=http' \
-      -D "$headers" -o /dev/null "${public_url/https:\/\//http://}/meetings"
-    grep -Eiq '^location: https://' "$headers" ||
-      fail "HTTP does not redirect to HTTPS"
-    rm -f -- "$headers"
-    missing_admin=$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
-      --output /dev/null \
-      --write-out '%{http_code}' -X POST \
-      "$public_url/admin/demo-catalog/bootstrap" \
-      -H 'Content-Type: application/json' --data '{}')
-    wrong_admin=$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
-      --output /dev/null \
-      --write-out '%{http_code}' -X POST \
-      "$public_url/admin/demo-catalog/bootstrap" \
-      -H 'X-Admin-Key: wrong' -H 'Content-Type: application/json' --data '{}')
-    [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ] ||
-      fail "admin guard did not reject unauthenticated requests"
-  fi
-}
-
-write_terminal_record() {
-  local outcome=$1
-  local terminal="$state/terminal.json"
-  [ "$outcome" = committed ] || [ "$outcome" = rolled-back ] ||
-    fail "RECOVERY_REQUIRED"
-  umask 077
-  timeout 30s jq -cn --arg run_key "$run_key" --arg outcome "$outcome" \
-    --argjson enabled "$provider_enabled" \
-    '{schemaVersion:1,runKey:$run_key,outcome:$outcome,providerEnabled:$enabled}' \
-    >"$terminal"
-  chmod 600 "$terminal"
-  timeout 30s python3 - "$terminal" <<'PY'
-import os
-import sys
-
-fd = os.open(sys.argv[1], os.O_RDONLY)
-try:
-    os.fsync(fd)
-finally:
-    os.close(fd)
-PY
-}
-
-provider_finish() {
-  local outcome=$1
-  local inspection=$2
-  write_provider_marker finalizing \
-    "${durable_disposition:-none}"
-  if [ "$prepared_timepad" = true ] && [ "$outcome" = committed ]; then
-    printf '%s' "$inspection" |
-      timeout 30s python3 "$provider_helper" finish-committed-resume \
-        --run-key "$run_key" --state-root "$state_root" \
-        --state-kind "$state_suffix" --deploy-lock-fd 9 >/dev/null ||
-      fail "RECOVERY_REQUIRED"
-  else
-    printf '%s' "$inspection" |
-      timeout 30s python3 "$provider_helper" finish \
-        --run-key "$run_key" --state-root "$state_root" \
-        --outcome "$outcome" --deploy-lock-fd 9 >/dev/null ||
-      fail "RECOVERY_REQUIRED"
-    write_terminal_record "$outcome"
-    timeout 30s rm -f -- "$provider_pointer" || fail "RECOVERY_REQUIRED"
-    timeout 30s python3 - "$state_root" <<'PY'
-import os
-import sys
-
-fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
-try:
-    os.fsync(fd)
-finally:
-    os.close(fd)
-PY
-  fi
-  timeout 30s jq -cn --argjson enabled "$provider_enabled" --arg outcome "$outcome" \
-    '{schemaVersion:1,providerEnabled:$enabled,credentialMountPresent:$enabled,
-      credentialMountReadOnly:$enabled,outcome:$outcome}'
-}
-
 guarded_candidate_start() {
   local ids id_count candidate_json candidate_image running restart status deadline candidate_id
   recovery_work_check || fail "RECOVERY_REQUIRED"
@@ -2886,12 +3129,14 @@ guarded_candidate_start() {
     [ "$(docker_container_inspect "$previous_container" \
       --format '{{.State.Running}}')" = true ] ||
     fail "RECOVERY_REQUIRED"
-  timeout 15s docker update --restart=no "$previous_container" >/dev/null ||
+  # Predecessor writes use the captured identity and provider proof, not merely
+  # a current inventory observation. No raw-Docker fallback on refusal.
+  timepad_runtime_mutate suppress "$previous_container" ||
     fail "RECOVERY_REQUIRED"
   predecessor_restart=$(docker_container_inspect "$previous_container" \
     --format '{{.HostConfig.RestartPolicy.Name}}') || fail "RECOVERY_REQUIRED"
   [ "$predecessor_restart" = no ] || fail "RECOVERY_REQUIRED"
-  timeout 30s docker stop --time 10 "$previous_container" >/dev/null ||
+  timepad_runtime_mutate stop "$previous_container" ||
     fail "RECOVERY_REQUIRED"
   [ "$(docker_container_inspect "$previous_container" \
     --format '{{.State.Running}}')" = false ] || fail "RECOVERY_REQUIRED"
@@ -2913,13 +3158,8 @@ guarded_candidate_start() {
   [ "$(jq -er '.current.containerId // ""' <<<"$fence_state")" = "" ] ||
     fail "GUARD_STATE_LOST"
   echo "schema_guard=cutover-possible"
-  run_owned_child CUTOVER_POSSIBLE timeout --kill-after=5s 240s bash -c '
-    set -euo pipefail
-    source "$1"
-    runtime_compose "$2" "$3" "${@:4}"
-  ' _ "$runtime_helper" "$root" "$compose_script" \
-    up --no-start --no-deps --no-build --pull never \
-    --force-recreate backend >/dev/null
+  run_owned_child CUTOVER_POSSIBLE create initial >/dev/null
+  local bound_container=$candidate_container
   ids=$(compose ps -aq backend) || fail "RECOVERY_REQUIRED"
   mapfile -t candidate_ids <<<"$ids"
   id_count=0
@@ -2931,7 +3171,8 @@ guarded_candidate_start() {
     fi
   done
   [ "$id_count" -eq 1 ] &&
-    [[ "$candidate_container" =~ ^[a-f0-9]{12,64}$ ]] ||
+    [[ "$candidate_container" =~ ^[a-f0-9]{64}$ ]] &&
+    [ "$candidate_container" = "$bound_container" ] ||
     fail "RECOVERY_REQUIRED"
   candidate_json=$(docker_container_inspect "$candidate_container") ||
     fail "RECOVERY_REQUIRED"
@@ -2950,13 +3191,13 @@ guarded_candidate_start() {
     [ "$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // ""' \
       <<<"$candidate_json")" = backend ] ||
     fail "RECOVERY_REQUIRED"
-  timeout 15s docker update --restart=no "$candidate_container" >/dev/null ||
-    fail "RECOVERY_REQUIRED"
   restart=$(docker_container_inspect "$candidate_container" \
     --format '{{.HostConfig.RestartPolicy.Name}}') || fail "RECOVERY_REQUIRED"
   [ "$restart" = no ] || fail "RECOVERY_REQUIRED"
   timepad_advance VERIFYING CANDIDATE_IDENTITY_PERSISTED \
     "$candidate_container" "$target_hash"
+  timepad_create_action verify-target initial >/dev/null ||
+    fail "RESOURCE_ADMISSION_REFUSED"
   run_owned_child VERIFYING timeout --kill-after=5s 30s docker start "$candidate_container" \
     >/dev/null || fail "RECOVERY_REQUIRED"
   deadline=$(recovery_health_deadline 180) || fail "RECOVERY_REQUIRED"
@@ -3210,6 +3451,13 @@ echo "schema_guard=$admission_disposition"
 run_safety_hook predecessor "$previous_image" "$previous_id" \
   "$previous_revision" "$previous_version" "$previous_runtime_hash"
 
+make_environment_candidate "$state/config.env.production" \
+  "$state/config.env.target" "$image" "$revision" "$version" ||
+  fail "PROVIDER_STATE_INVALID"
+make_environment_candidate "$state/config.env.production" \
+  "$state/config.env.previous" "$previous_image" "$previous_revision" \
+  "$previous_version" || fail "PROVIDER_STATE_INVALID"
+
 if [ "$provider_enabled" = true ]; then
   cat >"$state/target-runtime.override.yml" <<'YAML'
 services:
@@ -3244,8 +3492,17 @@ services:
         - http://127.0.0.1:8080/meetings
 YAML
 fi
+if [ "$timepad_admitted" = true ]; then
+  [[ "$timepad_operation_token" =~ ^[a-f0-9]{32}$ ]] ||
+    fail "PROVIDER_STATE_INVALID"
+  printf '    env_file: !override\n      - "%s/config.env.target"\n    labels:\n      org.meet.timepad.operation: "%s"\n' \
+    "$state" "$timepad_operation_token" >>"$state/target-runtime.override.yml"
+fi
 chmod 600 "$state/target-runtime.override.yml"
 
+if [ "$timepad_admitted" = true ]; then
+  timepad_create_action admit-target initial >/dev/null || fail "TOOLING_OR_MODEL_UNAVAILABLE"
+else
 target_config=$(
   env -i PATH="$PATH" HOME=/root COMPOSE_PROJECT_NAME=meet-production \
     BACKEND_IMAGE="$image" BACKEND_VERSION="$version" BACKEND_REVISION="$revision" \
@@ -3302,13 +3559,7 @@ printf '%s\n%s\n%s\n' "$previous_inspect" "$target_image_inspect" "$target_confi
     (tuple($previous).APP_PUSH_MAINTENANCE_ENABLED == "true" or
       tuple($previous).APP_PUSH_MAINTENANCE_ENABLED == "false")
   ' >/dev/null 2>&1 || fail "PROVIDER_STATE_INVALID"
-
-make_environment_candidate "$state/config.env.production" \
-  "$state/config.env.target" "$image" "$revision" "$version" ||
-  fail "PROVIDER_STATE_INVALID"
-make_environment_candidate "$state/config.env.production" \
-  "$state/config.env.previous" "$previous_image" "$previous_revision" \
-  "$previous_version" || fail "PROVIDER_STATE_INVALID"
+fi
 
 printf '%s' "$previous_inspect" |
   timeout 30s python3 "$provider_helper" prepare \
@@ -3336,85 +3587,6 @@ fi
 write_provider_marker prepared "$durable_disposition"
 credential_prepared=true
 timepad_publish_prepared_transition
-
-restore_previous_active_files() {
-  restore_active_file "$active_compose" compose || fail "RECOVERY_REQUIRED"
-  restore_active_file "$active_runtime" runtime || fail "RECOVERY_REQUIRED"
-}
-
-rollback() {
-  local rollback_receipt receipt_digest
-  recovery_work_check || fail "RECOVERY_REQUIRED"
-  if [ "$prepared_timepad" = true ]; then
-    timepad_claim_rollback
-  fi
-  if [ "$updater_completed" = true ]; then
-    validate_configuration_boundary "$state/config.env.target"
-  elif [ "$updater_started" = false ]; then
-    validate_configuration_boundary "$state/config.env.production"
-  fi
-  write_provider_marker rolling-back "${durable_disposition:-none}"
-  restore_previous_active_files
-  if [ "$updater_completed" = true ]; then
-    validate_configuration_boundary "$state/config.env.target"
-  fi
-  updater_started=true
-  PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
-    timeout 60s "$update_script" "$previous_image" "$previous_revision" "$previous_version" \
-    >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
-  cmp -s "$root/.env.production" "$state/config.env.previous" ||
-    fail "RECOVERY_REQUIRED"
-  printf '%s\n' "$(configuration_file_identity "$root/.env.production")" \
-    >"$state/config.env.previous.identity"
-  chmod 600 "$state/config.env.previous.identity"
-  validate_configuration_boundary "$state/config.env.previous"
-  compose_up -d --no-deps --no-build --pull never --force-recreate \
-    --wait --wait-timeout 180 backend >/dev/null
-  recovery_deadline_check
-  restored_container=$(compose ps -q backend)
-  restored_inspect=$(docker_container_inspect "$restored_container" 2>/dev/null) ||
-    fail "RECOVERY_REQUIRED"
-  restored_hash=$(docker_container_inspect "$restored_container" \
-    --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
-  [ "$restored_hash" = "$previous_runtime_hash" ] ||
-    fail "rollback did not restore the exact predecessor Compose runtime"
-  runtime_invariants_bounded "$previous_id" "$previous_revision" \
-    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 ||
-    fail "RECOVERY_REQUIRED"
-  printf '[%s,%s]' "$previous_inspect" "$restored_inspect" |
-    timeout 30s python3 "$provider_helper" verify \
-      --run-key "$run_key" --state-root "$state_root" --phase rollback \
-      --deploy-lock-fd 9 >/dev/null ||
-    fail "RECOVERY_REQUIRED"
-  verify_public_contract "$public_url"
-  recovery_deadline_check
-  run_safety_hook rollback "$previous_image" "$previous_id" \
-    "$previous_revision" "$previous_version" "$previous_runtime_hash"
-  final_restored_container=$(compose ps -q backend)
-  [ "$final_restored_container" = "$restored_container" ] ||
-    fail "RECOVERY_REQUIRED"
-  final_restored_inspect=$(docker_container_inspect "$final_restored_container" \
-    2>/dev/null) || fail "RECOVERY_REQUIRED"
-  runtime_invariants_bounded "$previous_id" "$previous_revision" \
-    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 ||
-    fail "RECOVERY_REQUIRED"
-  runtime_environment_bounded >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
-  (verify_public_contract "$public_url") || fail "RECOVERY_REQUIRED"
-  printf '[%s,%s]' "$previous_inspect" "$final_restored_inspect" |
-    timeout 30s python3 "$provider_helper" verify \
-      --run-key "$run_key" --state-root "$state_root" --phase rollback \
-      --deploy-lock-fd 9 >/dev/null ||
-    fail "RECOVERY_REQUIRED"
-  rollback_receipt=$(provider_finish rolled-back "$final_restored_inspect")
-  if [ "$prepared_timepad" = true ]; then
-    receipt_digest=$(printf '%s' "$rollback_receipt" | sha256sum | awk '{print $1}')
-    timepad_advance ROLLED_BACK ROLLBACK_VERIFIED "" "" "$receipt_digest"
-    echo "schema_guard=rolled-back"
-  fi
-  rollback_complete=true
-  echo "rollback=completed previous_image_id=$previous_id"
-  echo "operation_outcome=rolled-back"
-}
 
 verify_predecessor_before_writers() {
   local current_container current_inspect

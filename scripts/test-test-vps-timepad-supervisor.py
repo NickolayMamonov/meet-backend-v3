@@ -11,7 +11,10 @@ from __future__ import annotations
 import argparse
 import ast
 from contextlib import nullcontext
+from copy import deepcopy
 import importlib.util
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -22,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -587,6 +591,845 @@ class AttemptTests(unittest.TestCase):
         self.assertEqual(attempt.result, (1, "QUIESCENCE_UNCONFIRMED"))
 
 
+def create_fixture(attempt="b" * 32, *, role="initial", sequence=1):
+    identity = {
+        "pid": 321, "processGroup": 321, "startTicks": 456,
+        "bootId": "01234567-89ab-cdef-0123-456789abcdef",
+        "commandDigest": "a" * 64, "attemptId": "c" * 32 + ":1",
+    }
+    grant = supervisor.Grant("d" * 32, "create-execute", 300 * NS, attempt, "controller-worker")
+    create = supervisor.CreateAttempt(role, identity["attemptId"], grant)
+    create.identity = identity
+    request = {
+        "nonce": "e" * 32, "sequence": sequence, "executionAttempt": attempt,
+        "operation": "create", "containerId": None, "imageId": "f" * 64,
+        "configHash": None, "childAttemptId": identity["attemptId"],
+        "lifecycle": "intent", "responseId": None, "completionDigest": None,
+        "originDigest": "1" * 64, "operationEpoch": 1, "incidentId": "c" * 32,
+        "operationToken": "2" * 32, "preparedProofDigest": "3" * 64,
+        "modelDigest": "4" * 64, "toolingDigest": "5" * 64,
+        "resourcesDigest": "6" * 64, "resourceRequestDigest": "7" * 64,
+        "role": role, "priorContainerId": None if role == "initial" else "8" * 64,
+        "childIdentity": identity,
+    }
+    return create, request, state.create_request_digest(request)
+
+
+def recovery_create_fixture(origin_digest, identity, *, replacement=False):
+    _, request, _ = create_fixture(role="replacement" if replacement else "initial", sequence=2 if replacement else 1)
+    if replacement:
+        child = dict(request["childIdentity"], attemptId=request["incidentId"] + ":2")
+        request = dict(request, childIdentity=child, childAttemptId=child["attemptId"])
+    request = dict(request, originDigest=origin_digest)
+    image = {
+        "id": "target", "domain": "new-schema", "tuple": {
+            "repositoryDigest": ACK, "platformImageId": request["imageId"],
+            "revision": "c" * 40, "version": "1.0.0",
+            "migrationInventoryDigest": ACK, "migrationResources": ["reviewed"],
+            "beforeSchema": ACK, "afterSchema": ACK, "guardEvidence": ACK,
+            "dependencyPolicy": "resolved", "dependencyFloor": ACK,
+            "recoveryEvidence": ACK, "retryExact": True, "unknownTransitionCovered": True,
+        },
+    }
+    predecessor = {**image, "id": "prior"}
+    approved = {
+        "schema": state.CONTRACT_SCHEMA, "formatVersion": 1, "controller": state.CONTROLLER,
+        "active": True, "rootId": "test-root", "initialDomain": [],
+        "images": [image, predecessor], "transitions": [{
+            "id": "transition", "targetId": "target", "beforeSchema": ACK, "afterSchema": ACK,
+            "compatiblePredecessors": ["prior"],
+        }],
+    }
+    prepared = state.new_prepared_state(
+        state.new_ready_state(origin_digest), operation="deploy", run_id="original",
+        incident_id=request["incidentId"],
+        admission=state.admit(
+            approved, root_id="test-root", target_id="target", predecessor_id="prior",
+            transition_id="transition", target_tuple=image["tuple"], predecessor_tuple=predecessor["tuple"],
+        ),
+        target=image, predecessor=predecessor, predecessor_container_id="0" * 64,
+        transition_id="transition", owned_run="123-5", tooling_digest=request["toolingDigest"],
+        prepared_proof_digest=request["preparedProofDigest"],
+        execution_attempt=request["executionAttempt"],
+    )
+    receipt = state._canonical({
+        "schema": state.CREATE_COMPLETION_SCHEMA, "requestDigest": state.create_request_digest(request),
+        "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+        "resourcesDigest": request["resourcesDigest"],
+        "resourceRequestDigest": request["resourceRequestDigest"],
+        "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+    })
+    request = dict(request, lifecycle="normal-completed", completionDigest=hashlib.sha256(receipt).hexdigest())
+    current = dict(
+        prepared, phase="RECOVERY_REQUIRED", latestAttemptId=request["childAttemptId"], runtimeRequest=request,
+    )
+    if replacement:
+        current.update(
+            phase="COMMITTING", containerId=request["priorContainerId"], configHash="9" * 64,
+            commitWitnessDigest="a" * 64, providerFinalizationDigest="b" * 64,
+            commitSubstep="replacement-create-intent",
+        )
+    current = state._current(current)
+    old = supervisor.Attempt("deploy", clock=Clock(), nonce=request["executionAttempt"])
+    old.arm()
+    old.cancel("EXIT")
+    previous = state._execution_lease({
+        **old.lease(), "lifecycle": "drained", "revision": 4,
+        "supervisor": {**identity, "pid": 2_000_000_001}, "worker": None,
+        "workerMode": "controller-worker",
+        "workers": [{"mode": "controller-worker", **identity, "pid": 2_000_000_002}],
+        "createCompletion": {
+            **{key: value for key, value in json.loads(receipt).items() if key != "schema"},
+            "receiptDigest": request["completionDigest"], "acknowledged": True,
+        },
+    })
+    return approved, current, previous, receipt
+
+
+class CreateProtocolTests(unittest.TestCase):
+    """Deterministic authority, replay, wait and publisher race coverage."""
+
+    def setUp(self):
+        # Symbolic constants only: portable mocks do not create Unix sockets.
+        for name, fallback in (("AF_UNIX", 1), ("SOCK_SEQPACKET", 5)):
+            self.enterContext(mock.patch.object(socket, name, getattr(socket, name, fallback), create=True))
+
+    def running(self):
+        create, request, digest = create_fixture()
+        create.phase = "checking-release"
+        create.bind_request(request, digest, create.identity)
+        create.release()
+        return create
+
+    def ready(self):
+        create = self.running()
+        create.observe_result({
+            "kind": "create-result", "attempt": create.grant.attempt,
+            "requestDigest": create.request_digest, "childIdentity": create.identity,
+            "waitStatus": 0, "descendantsDrained": True,
+        })
+        create.wait_status = 0
+        self.assertTrue(create.ready(unexpected_children=False, now=100 * NS))
+        return create
+
+    def instance(self):
+        me = supervisor.ProcessIdentity(100, 1, 42, 0)
+        with mock.patch.object(supervisor, "linux_preflight"), \
+                mock.patch.object(supervisor, "process_identity", return_value=me), \
+                mock.patch.object(supervisor, "boot_id", return_value="01234567-89ab-cdef-0123-456789abcdef"):
+            instance = supervisor.Supervisor("/fixture", "deploy", [], mock.Mock())
+        instance.attempt.clock = Clock()
+        instance.attempt.idle_end = instance.attempt.clock() + 30 * NS
+        instance.attempt.arm()
+        acknowledged(instance.attempt)
+        return instance
+
+    def test_fixed_rpc_cli_accepts_only_the_four_defined_shapes(self):
+        parser = supervisor._cli()
+        for argv in (
+            ["create-launch", "--role", "initial", "--attempt-id", "c" * 32 + ":1"],
+            ["create-release", "--request-digest", ACK, "--child-identity-json", "{}"],
+            ["create-result", "--request-digest", ACK],
+            ["create-completion", "--request-digest", ACK, "--child-identity-json", "{}"],
+        ):
+            self.assertEqual(argv[0], parser.parse_args(["client", "--root", "/fixture", *argv]).call)
+        with mock.patch("sys.stderr"):
+            for argv in (
+                ["create-launch", "--role", "rollback", "--attempt-id", "c" * 32 + ":1"],
+                ["create-launch", "--role", "initial", "--attempt-id", "c" * 32 + ":1", "--", "sh"],
+                ["create-release", "--request-digest", ACK, "--argv", "sh"],
+                ["grant", "create-completion", "10"], ["grant", "create-execute", "240"],
+            ):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    parser.parse_args(["client", "--root", "/fixture", *argv])
+
+    def test_launcher_attempt_role_and_sequence_are_strict(self):
+        grant = create_fixture()[0].grant
+        for role, attempt in (
+            ("initial", ""), ("initial", "../1"), ("initial", "c" * 32 + ":0"),
+            ("initial", "c" * 32 + ":" + str(1 << 64)), ("rollback", "c" * 32 + ":1"),
+            ([], "c" * 32 + ":1"), ("initial", None),
+        ):
+            with self.subTest(role=role, attempt=attempt), self.assertRaises(supervisor.SupervisorError):
+                supervisor.CreateAttempt(role, attempt, grant)
+
+    def test_release_binds_intent_role_nonce_sequence_resources_and_identity(self):
+        for field, wrong in (
+            ("executionAttempt", "0" * 32), ("role", "replacement"),
+            ("sequence", 0), ("nonce", "0" * 32), ("resourcesDigest", "0" * 64),
+            ("resourceRequestDigest", "0" * 64), ("lifecycle", "normal-completed"),
+            ("childAttemptId", "c" * 32 + ":2"),
+            ("childIdentity", {**create_fixture()[0].identity, "startTicks": 999}),
+        ):
+            create, request, digest = create_fixture()
+            create.phase = "checking-release"
+            with self.subTest(field=field), self.assertRaises(supervisor.SupervisorError):
+                create.bind_request({**request, field: wrong}, digest, create.identity)
+            self.assertFalse(create.released)
+        create, request, digest = create_fixture()
+        create.phase = "checking-release"
+        with self.assertRaises(supervisor.SupervisorError):
+            create.bind_request(request, digest, {**create.identity, "pid": 999})
+
+    def test_release_and_completion_are_one_shot(self):
+        create = self.running()
+        with self.assertRaises(supervisor.SupervisorError):
+            create.release()
+        create = self.ready()
+        create.begin_completion(create.request_digest, create.identity)
+        with self.assertRaises(supervisor.SupervisorError):
+            create.begin_completion(create.request_digest, create.identity)
+
+    def test_launcher_result_alone_or_wait_alone_never_readies(self):
+        create = self.running()
+        create.observe_result({
+            "kind": "create-result", "attempt": create.grant.attempt,
+            "requestDigest": create.request_digest, "childIdentity": create.identity,
+            "waitStatus": 0, "descendantsDrained": True,
+        })
+        self.assertFalse(create.ready(unexpected_children=False, now=100 * NS))
+        create = self.running()
+        create.wait_status = 0
+        self.assertFalse(create.ready(unexpected_children=False, now=100 * NS))
+        with self.assertRaises(supervisor.SupervisorError):
+            create.begin_completion(create.request_digest, create.identity)
+
+    def test_failed_wait_or_adopted_descendants_or_expiry_never_readies(self):
+        for status, unexpected, now in (
+            (1, False, 100 * NS), (0, True, 100 * NS), (0, False, 300 * NS),
+        ):
+            create = self.ready()
+            create.phase = "running"
+            create.wait_status = status
+            with self.subTest(status=status, unexpected=unexpected, now=now), \
+                    self.assertRaises(supervisor.SupervisorError):
+                create.ready(unexpected_children=unexpected, now=now)
+        create = self.ready()
+        with self.assertRaises(supervisor.SupervisorError):
+            create.ready(unexpected_children=True, now=100 * NS)
+
+    def test_result_cannot_fabricate_wait_or_local_echild_or_replay(self):
+        for changes in (
+            {"attempt": "0" * 32}, {"requestDigest": "0" * 64},
+            {"waitStatus": 1}, {"waitStatus": False},
+            {"descendantsDrained": False}, {"descendantsDrained": 1}, {"argv": ["sh"]},
+        ):
+            create = self.running()
+            result = {
+                "kind": "create-result", "attempt": create.grant.attempt,
+                "requestDigest": create.request_digest, "childIdentity": create.identity,
+                "waitStatus": 0, "descendantsDrained": True,
+            }
+            with self.subTest(changes=changes), self.assertRaises(supervisor.SupervisorError):
+                create.observe_result({**result, **changes})
+        create = self.ready()
+        with self.assertRaises(supervisor.SupervisorError):
+            create.observe_result(create.result)
+
+    def test_receipt_binds_both_resource_digests_and_exact_state_contract(self):
+        create = self.ready()
+        create.begin_completion(create.request_digest, create.identity)
+        receipt = create.receipt()
+        self.assertEqual(create.request["resourcesDigest"], receipt["resourcesDigest"])
+        self.assertEqual(create.request["resourceRequestDigest"], receipt["resourceRequestDigest"])
+        digest = hashlib.sha256(supervisor.encode(receipt)).hexdigest()
+        completed = {
+            "runtimeRequest": dict(create.request, lifecycle="normal-completed", completionDigest=digest),
+        }
+        evidence = {
+            **{key: value for key, value in receipt.items() if key != "schema"},
+            "receiptDigest": digest, "acknowledged": True,
+        }
+        state.validate_create_completion(
+            completed, {"attempt": create.grant.attempt, "createCompletion": evidence},
+            supervisor.encode(receipt), acknowledged=True,
+        )
+        for field in ("resourcesDigest", "resourceRequestDigest"):
+            with self.subTest(field=field), self.assertRaises(state.GuardError):
+                state.validate_create_completion(completed, {
+                    "attempt": create.grant.attempt, "createCompletion": {**evidence, field: "0" * 64},
+                }, supervisor.encode(receipt), acknowledged=True)
+
+    def test_cancellation_or_role_change_refuses_every_create_rpc_before_fork(self):
+        for change in ("cancel", "rollback", "expiry", "unacknowledged"):
+            instance = self.instance()
+            if change == "cancel":
+                instance.attempt.cancel("TERM", 143)
+            elif change == "rollback":
+                instance.attempt.role = "rollback-worker"
+            elif change == "expiry":
+                instance.attempt.clock.advance(540)
+            else:
+                instance.attempt.acked_revision = -1
+            with self.subTest(change=change), mock.patch.object(instance, "_launch_create") as launch, \
+                    self.assertRaises(supervisor.SupervisorError):
+                instance._create_rpc("create-launch", {
+                    "createRole": "initial", "attemptId": "c" * 32 + ":1",
+                }, mock.Mock(), supervisor.ProcessIdentity(200, 100, 2, 0))
+            launch.assert_not_called()
+
+    def test_signal_queued_at_release_or_ack_boundary_revokes_before_action(self):
+        instance = self.instance()
+        instance.pending_signals.append(signal.SIGTERM)
+        with mock.patch.object(instance, "_notify_clock"), \
+                self.assertRaises(supervisor.SupervisorError):
+            instance._create_internal_grant("create-completion", 10 * NS)
+        self.assertEqual(("TERM", 143), (instance.attempt.first_reason, instance.attempt.first_status))
+        self.assertFalse(instance.attempt.grants)
+        self.assertEqual([], instance.pending_signals)
+
+    def test_completion_revokes_competing_publisher_and_cannot_park_or_publish(self):
+        instance = self.instance()
+        instance.create = self.ready()
+        instance.create.grant = supervisor.Grant(
+            "d" * 32, "create-execute", instance.attempt.work_end, instance.attempt.nonce,
+            "controller-worker",
+        )
+        instance.attempt.grants[instance.create.grant.grant_id] = instance.create.grant
+        instance.attempt.grant("state-publish", NS)
+        with mock.patch.object(instance, "_create_peer_chain"), \
+                mock.patch.object(instance, "_park_create_controller") as park, \
+                self.assertRaisesRegex(supervisor.SupervisorError, "OWNERSHIP_UNCERTAIN"):
+            instance._create_rpc("create-completion", {
+                "requestDigest": instance.create.request_digest, "childIdentity": instance.create.identity,
+            }, mock.Mock(), supervisor.ProcessIdentity(200, 100, 2, 0))
+        park.assert_not_called()
+        self.assertFalse(instance.attempt.grants)
+        self.assertFalse(instance.create.completion_issued)
+
+    def test_result_polling_never_renews_grants_or_clock(self):
+        instance = self.instance()
+        instance.create = self.ready()
+        before = (instance.attempt.t0, instance.attempt.work_end, instance.attempt.hard_end,
+                  instance.attempt.idle_end, instance.attempt.revision)
+        with mock.patch.object(instance, "_create_peer_chain"):
+            for _ in range(20):
+                self.assertEqual({"status": "ready"}, instance._create_rpc("create-result", {
+                    "requestDigest": instance.create.request_digest,
+                }, mock.Mock(), supervisor.ProcessIdentity(200, 100, 2, 0)))
+        self.assertEqual(before, (instance.attempt.t0, instance.attempt.work_end, instance.attempt.hard_end,
+                                  instance.attempt.idle_end, instance.attempt.revision))
+
+    def test_private_controller_ancestry_rejects_foreign_peer_and_reused_start(self):
+        instance = self.instance()
+        instance.worker_pid = 200
+        instance.worker_identity = {
+            "pid": 200, "startTicks": 123, "bootId": "01234567-89ab-cdef-0123-456789abcdef",
+        }
+        for peer in (
+            supervisor.ProcessIdentity(201, 100, 4, 0),
+            supervisor.ProcessIdentity(200, 100, 124, 0),
+            supervisor.ProcessIdentity(200, 100, 123, 99),
+        ):
+            with self.subTest(peer=peer), mock.patch.object(
+                supervisor, "boot_id", return_value=instance.worker_identity["bootId"],
+            ), mock.patch.object(
+                supervisor.os, "geteuid", return_value=0, create=True,
+            ), mock.patch.object(
+                supervisor.os, "getpid", return_value=100,
+            ), self.assertRaises(supervisor.SupervisorError):
+                instance._create_peer_chain(peer)
+
+    def test_cancelled_publisher_cannot_resume_controller_or_ack_completion(self):
+        instance = self.instance()
+        instance.create = self.ready()
+        instance.create.phase = "publishing"
+        instance.create_reply = mock.Mock()
+        instance.create_parked = [(supervisor.ProcessIdentity(200, 100, 2, 0), 33)]
+        instance.attempt.cancel("TERM", 143)
+        with mock.patch.object(instance, "_resume_create_controller") as resume:
+            instance._tick_create({})
+        resume.assert_called_once_with(cancel=True)
+        self.assertIsNone(instance.create_reply)
+        self.assertEqual("publishing", instance.create.phase)
+
+    def test_completion_wait_and_ack_are_both_required_before_unparking(self):
+        instance = self.instance()
+        instance.create = self.ready()
+        instance.create.phase = "publishing"
+        instance.create_helper_pid = 345
+        instance.create_helper_stage = "publish"
+        instance.create_helper_result = {"receiptDigest": ACK, "sequence": 1}
+        with mock.patch.object(instance.children, "refresh"), \
+                mock.patch.object(instance, "_resume_create_controller") as resume:
+            instance._tick_create({})
+        resume.assert_not_called()
+        instance.create_helper_status = 0
+        instance.create_completion_evidence = {"receiptDigest": ACK, "acknowledged": False}
+        with mock.patch.object(instance.children, "refresh"), \
+                mock.patch.object(instance, "_resume_create_controller") as resume, \
+                self.assertRaises(supervisor.SupervisorError):
+            instance._tick_create({})
+        resume.assert_not_called()
+
+    def test_only_successful_publisher_wait_and_durable_ack_resume_then_reply_once(self):
+        instance = self.instance()
+        instance.create = self.ready()
+        instance.create.phase = "publishing"
+        instance.create_helper_pid = 345
+        instance.create_helper_status = 0
+        instance.create_helper_stage = "publish"
+        instance.create_helper_result = {"receiptDigest": ACK, "sequence": 1}
+        instance.create_completion_evidence = {"receiptDigest": ACK, "acknowledged": True}
+        instance.attempt.grants[instance.create.grant.grant_id] = instance.create.grant
+        events = []
+        with mock.patch.object(instance.children, "refresh"), \
+                mock.patch.object(instance, "_resume_create_controller",
+                                  side_effect=lambda **kwargs: events.append(("resume", kwargs))), \
+                mock.patch.object(instance, "_create_reply",
+                                  side_effect=lambda value: events.append(("reply", value))):
+            instance._tick_create({})
+            instance._tick_create({})
+        self.assertEqual([
+            ("resume", {"cancel": False}), ("reply", {"receiptDigest": ACK, "sequence": 1}),
+        ], events)
+        self.assertEqual("completed", instance.create.phase)
+        self.assertFalse(instance.attempt.grants)
+
+    def test_rpc_kernel_peer_and_nonce_role_schema_are_fenced(self):
+        for change in ({}, {"attempt": "0" * 32}, {"role": "rollback-worker"},
+                       {"argv": ["sh"]}, {"kind": "create-publisher-ack-intent"}):
+            instance = self.instance()
+            instance.worker = mock.Mock()
+            instance.worker_hello = True
+            peer = supervisor.ProcessIdentity(200, 100, 2, 0)
+            frame = {
+                "kind": "create-launch", "attempt": instance.attempt.nonce,
+                "role": "controller-worker", "createRole": "initial",
+                "attemptId": "c" * 32 + ":1", **change,
+            }
+            reply = mock.Mock(family=socket.AF_UNIX, type=socket.SOCK_SEQPACKET)
+
+            def receive(_channel, **kwargs):
+                kwargs["peer"].append(peer)
+                return frame, 55
+
+            with self.subTest(change=change), \
+                    mock.patch.object(supervisor, "receive_frame", side_effect=receive), \
+                    mock.patch.object(supervisor.socket, "socket", return_value=reply), \
+                    mock.patch.object(supervisor, "send_frame"), \
+                    mock.patch.object(instance, "_create_rpc", return_value={"status": "pending"}) as create_rpc:
+                instance._rpc()
+            # Bare create RPCs are no longer a shell capability. Only the
+            # supervisor-recorded driver on its dedicated channel may use them.
+            create_rpc.assert_not_called()
+            self.assertEqual("PROTOCOL_INVALID", instance.attempt.first_reason)
+
+    def test_controller_channel_cannot_use_internal_create_grant(self):
+        for kind in ("complete", "validate-grant"):
+            instance = self.instance()
+            instance.worker = mock.Mock()
+            instance.worker_hello = True
+            instance.create, _, _ = create_fixture(instance.attempt.nonce)
+            frame = {
+                "kind": kind, "attempt": instance.attempt.nonce, "role": "controller-worker",
+                "grantId": instance.create.grant.grant_id,
+            }
+            if kind == "validate-grant":
+                frame["endNs"] = instance.create.grant.end_ns
+
+            def receive(_channel, **kwargs):
+                kwargs["peer"].append(supervisor.ProcessIdentity(200, 100, 2, 0))
+                return frame, 55
+
+            reply = mock.Mock(family=socket.AF_UNIX, type=socket.SOCK_SEQPACKET)
+            with self.subTest(kind=kind), \
+                    mock.patch.object(supervisor, "receive_frame", side_effect=receive), \
+                    mock.patch.object(supervisor.socket, "socket", return_value=reply), \
+                    mock.patch.object(supervisor, "send_frame") as send:
+                instance._rpc()
+            self.assertFalse(send.call_args.args[1]["ok"])
+            self.assertEqual("PROTOCOL_INVALID", instance.attempt.first_reason)
+
+    def test_parked_controller_requires_exact_stopped_chain_and_no_other_descendants(self):
+        instance = self.instance()
+        instance.create = self.ready()
+        instance.worker_pid = 200
+        controller = supervisor.ProcessIdentity(200, 100, 2, 0)
+        caller = supervisor.ProcessIdentity(201, 200, 3, 0)
+        instance.create_parked = [(controller, 33), (caller, 34)]
+        for status, extra, expected in ((b"T", b"", True), (b"D", b"", False),
+                                         (b"T", b"202", None)):
+            def proc(path, *_args, **_kwargs):
+                if path.endswith("/stat"):
+                    return io.BytesIO(b"200 (fixture) " + status + b" 100\n")
+                return io.BytesIO((b"201 " + extra) if "/200/" in path else b"")
+
+            with self.subTest(status=status, extra=extra), \
+                    mock.patch("builtins.open", side_effect=proc), \
+                    mock.patch.object(supervisor, "process_identity", side_effect=lambda pid: {
+                        200: controller, 201: caller,
+                    }[pid]):
+                if expected is None:
+                    with self.assertRaisesRegex(supervisor.SupervisorError, "OWNERSHIP_UNCERTAIN"):
+                        instance._create_controller_parked()
+                else:
+                    self.assertIs(expected, instance._create_controller_parked())
+
+    def test_publication_order_and_each_failure_leave_no_successful_ack(self):
+        for failure in (None, "lease-unacknowledged", "current", "ack-intent", "lease-acknowledged"):
+            instance = self.instance()
+            instance.create = self.ready()
+            instance.create.phase = "publishing"
+            before = instance._lease()
+            after = {**before, "revision": before["revision"] + 1}
+            events = []
+            client = mock.Mock()
+
+            def request(kind, **_kwargs):
+                events.append(kind)
+                if failure == "ack-intent" and kind == "create-publisher-ack-intent":
+                    raise supervisor.SupervisorError("GRANT_REVOKED")
+                return after if kind == "create-publisher-ack-intent" else {}
+
+            client.request.side_effect = request
+
+            def publish_lease(_root, snapshot, **_kwargs):
+                event = "lease-unacknowledged" if snapshot is before else "lease-acknowledged"
+                events.append(event)
+                if failure == event:
+                    raise state.GuardError("STATE_READBACK_FAILED")
+                return {"attempt": instance.attempt.nonce, "revision": snapshot["revision"], "digest": ACK}
+
+            def publish_current(_root, **kwargs):
+                events.append("current")
+                self.assertEqual(instance.create.request_digest, kwargs["request_digest"])
+                self.assertEqual(
+                    instance.create.receipt(),
+                    supervisor.decode(kwargs["supervisor_wait_evidence"]),
+                )
+                if failure == "current":
+                    raise state.GuardError("STATE_READBACK_FAILED")
+                return {"receiptDigest": ACK, "sequence": 1}
+
+            with self.subTest(failure=failure), \
+                    mock.patch.object(supervisor, "WorkerClient", return_value=client), \
+                    mock.patch.object(state, "publish_execution_lease", side_effect=publish_lease), \
+                    mock.patch.object(state, "publish_create_completion", side_effect=publish_current):
+                if failure:
+                    with self.assertRaises((state.GuardError, supervisor.SupervisorError)):
+                        instance._publish_create(before, instance.create.grant)
+                else:
+                    self.assertEqual({"receiptDigest": ACK, "sequence": 1}, instance._publish_create(
+                        before, instance.create.grant,
+                    ))
+            expected = [
+                "lease-unacknowledged", "create-publisher-lease-ack", "current",
+                "create-publisher-ack-intent", "lease-acknowledged", "create-publisher-lease-ack",
+            ]
+            boundary = "create-publisher-ack-intent" if failure == "ack-intent" else failure
+            self.assertEqual(expected if boundary is None else expected[:expected.index(boundary) + 1], events)
+
+
+class RecoveryCreateRegistrationTests(unittest.TestCase):
+    """Portable async protocol tests; filesystem and fork ownership are mocked."""
+
+    def setUp(self):
+        for name, fallback in (("AF_UNIX", 1), ("SOCK_SEQPACKET", 5)):
+            self.enterContext(mock.patch.object(socket, name, getattr(socket, name, fallback), create=True))
+        me = supervisor.ProcessIdentity(100, 1, 42, 0)
+        with mock.patch.object(supervisor, "linux_preflight"), \
+                mock.patch.object(supervisor, "process_identity", return_value=me), \
+                mock.patch.object(supervisor, "boot_id",
+                                  return_value="01234567-89ab-cdef-0123-456789abcdef"):
+            self.instance = supervisor.Supervisor("/fixture", "forward-recover", [], mock.Mock())
+        instance = self.instance
+        self.clock = Clock()
+        instance.attempt = supervisor.Attempt("forward-recover", clock=self.clock, nonce="9" * 32)
+        instance.attempt.on_change = instance._record_lease
+        instance.lock_fd = 9
+        instance.worker_pid = 101
+        instance.worker_identity = {**instance.identity, "pid": 101}
+        instance.worker_identities = [{"mode": "controller-worker", **instance.worker_identity}]
+        instance._record_lease()
+        _, self.current, self.previous, self.receipt = recovery_create_fixture("1" * 64, instance.identity)
+        instance.recovery_baseline = {
+            "lease": deepcopy(self.previous),
+            "currentDigest": hashlib.sha256(state._canonical(self.current)).hexdigest(),
+        }
+        instance.children = mock.Mock(tracked={instance.worker_pid: mock.Mock()})
+        self.files = {"lease": self.previous, "current": self.current}
+        self.enterContext(mock.patch.object(state, "deploy_lock", return_value=nullcontext(9)))
+        self.enterContext(mock.patch.object(
+            state, "_read_execution_lease_locked", side_effect=lambda _root: self.files["lease"],
+        ))
+        self.enterContext(mock.patch.object(
+            state, "_read_guard_locked", side_effect=lambda _root: ({}, self.files["current"]),
+        ))
+        self.exited = self.enterContext(mock.patch.object(
+            state, "_execution_process_exited", return_value=True,
+        ))
+        self.enterContext(mock.patch.object(
+            state, "_execution_process_record", return_value=(
+                instance.identity["bootId"], instance.worker_identity["startTicks"],
+                instance.identity["pid"],
+            ),
+        ))
+        self.enterContext(mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True))
+
+        def require(_root, current, *, acknowledged):
+            state.validate_create_completion(current, self.files["lease"], self.receipt,
+                                             acknowledged=acknowledged)
+
+        self.enterContext(mock.patch.object(state, "_require_create_completion_locked", side_effect=require))
+
+    def rpc(self, kind, **fields):
+        instance = self.instance
+        instance.worker = mock.Mock()
+        instance.worker_hello = True
+        reply = mock.Mock(family=socket.AF_UNIX, type=socket.SOCK_SEQPACKET)
+
+        def receive(_channel, **kwargs):
+            kwargs["peer"].append(supervisor.ProcessIdentity(101, 100, 42, 0))
+            return {
+                "kind": kind, "attempt": instance.attempt.nonce, "role": "controller-worker", **fields,
+            }, 55
+
+        with mock.patch.object(supervisor, "receive_frame", side_effect=receive), \
+                mock.patch.object(supervisor.socket, "socket", return_value=reply), \
+                mock.patch.object(supervisor, "socket_pair", return_value=(mock.Mock(), mock.Mock())), \
+                mock.patch.object(supervisor.os, "fork", return_value=555, create=True), \
+                mock.patch.object(supervisor, "send_frame") as send, \
+                mock.patch.object(instance, "_notify_clock"):
+            instance._rpc()
+        return send.call_args.args[1] if send.called else None
+
+    def register(self):
+        reply = self.rpc("grant", name="recovery-registration", localNs=30 * NS)
+        self.assertTrue(reply["ok"])
+        grant = self.instance.registration_grant
+        self.assertIsNotNone(grant)
+        self.files["lease"] = {
+            **self.instance._lease(), "createCompletion": deepcopy(self.previous["createCompletion"]),
+        }
+        self.files["current"] = dict(self.current, executionAttempt=self.instance.attempt.nonce)
+        return grant
+
+    def acknowledge(self):
+        response = self.rpc("lease-ack", revision=0,
+                            digest=hashlib.sha256(state._canonical(self.files["lease"])).hexdigest())
+        if response is not None:
+            return response
+        registration = self.instance.registration_ack
+        registration.snapshot = state._read_recovery_registration_snapshot(
+            self.instance.root, self.instance._lease(), registration.digest,
+            self.instance.recovery_baseline, deploy_lock_fd=9,
+        )
+        with mock.patch.object(supervisor, "send_frame") as send:
+            self.instance._tick_registration({registration.pid: 0})
+        return send.call_args.args[1]
+
+    def test_exact_state_helper_successor_is_retained_through_arm_cancellation_and_drain(self):
+        grant = self.register()
+        self.assertIsNone(self.instance.create_completion_evidence)
+        self.assertTrue(self.rpc("complete", grantId=grant.grant_id)["ok"])
+        self.assertTrue(self.instance.attempt.recovery_registration_completed)
+        self.assertTrue(self.acknowledge()["ok"])
+        self.assertIsNone(self.instance.registration_ack)
+        instance = self.instance
+        registered = instance._lease()
+        self.assertEqual(self.files["lease"], registered)
+        instance.attempt.arm()
+        instance.attempt.cancel("TERM", 143)
+        instance.attempt.after_drain()
+        instance.worker_identity = None
+        instance.attempt._change("drained")
+        snapshots = [registered, *[instance.lease_snapshots[key] for key in sorted(instance.lease_snapshots)]]
+        for previous, candidate in zip(snapshots, snapshots[1:]):
+            state._validate_lease_successor(previous, candidate)
+            self.assertEqual(self.previous["createCompletion"], candidate["createCompletion"])
+        self.assertEqual(self.current["runtimeRequest"], self.files["current"]["runtimeRequest"])
+        self.assertIsNone(self.files["current"]["containerId"])
+        self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+        with self.assertRaises(state.GuardError):
+            state.require_runtime_request_completion(self.files["current"])
+
+    def test_capture_rejects_missing_receipt_acknowledgment_drained_or_process_proof(self):
+        for fault in ("missing", "receipt", "unacknowledged", "resources", "live", "undrained"):
+            lease = deepcopy(self.previous)
+            if fault == "missing":
+                lease["createCompletion"] = None
+            elif fault == "unacknowledged":
+                lease["createCompletion"]["acknowledged"] = False
+            elif fault == "resources":
+                lease["createCompletion"]["resourcesDigest"] = "0" * 64
+            elif fault == "undrained":
+                lease["lifecycle"] = "draining"
+            self.instance.recovery_baseline["lease"] = lease
+            self.files["lease"] = {
+                **self.instance._lease(), "createCompletion": lease["createCompletion"],
+            }
+            self.files["current"] = dict(self.current, executionAttempt=self.instance.attempt.nonce)
+            self.exited.return_value = fault != "live"
+            with self.subTest(fault=fault), mock.patch.object(
+                self, "receipt", b"{}" if fault == "receipt" else self.receipt,
+            ):
+                with self.assertRaises(state.GuardError):
+                    state._read_recovery_registration_snapshot(
+                        self.instance.root, self.instance._lease(),
+                        hashlib.sha256(state._canonical(self.files["lease"])).hexdigest(),
+                        self.instance.recovery_baseline, deploy_lock_fd=9,
+                    )
+                self.assertIsNone(self.instance.create_completion_evidence)
+                self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+
+    def test_registration_ack_rejects_erasure_mutation_replay_and_missing_proof(self):
+        grant = self.register()
+        self.assertTrue(self.rpc("complete", grantId=grant.grant_id)["ok"])
+        expected = deepcopy(self.files)
+        for fault in ("erased", "resource", "current", "receipt", "old-lease", "live", "digest"):
+            self.files = deepcopy(expected)
+            if fault == "erased":
+                self.files["lease"]["createCompletion"] = None
+            elif fault == "resource":
+                self.files["lease"]["createCompletion"]["resourceRequestDigest"] = "0" * 64
+            elif fault == "current":
+                self.files["current"]["runtimeRequest"]["nonce"] = "0" * 32
+            elif fault == "old-lease":
+                self.files["lease"] = self.previous
+            self.exited.return_value = fault != "live"
+            digest = hashlib.sha256(state._canonical(self.files["lease"])).hexdigest()
+            if fault == "digest":
+                digest = "0" * 64
+            with self.subTest(fault=fault), mock.patch.object(
+                self, "receipt", b"{}" if fault == "receipt" else self.receipt,
+            ), self.assertRaises(state.GuardError):
+                state._read_recovery_registration_snapshot(
+                    self.instance.root, self.instance._lease(), digest,
+                    self.instance.recovery_baseline, deploy_lock_fd=9,
+                )
+            self.assertIsNone(self.instance.create_completion_evidence)
+            self.assertEqual(-1, self.instance.attempt.acked_revision)
+            self.assertFalse(state._RECOVERY_CREATE_COMPLETION_PROOF.get())
+
+    def test_ack_before_registration_completion_or_after_cancellation_cannot_import_evidence(self):
+        self.register()
+        self.assertFalse(self.acknowledge()["ok"])
+        self.assertIsNone(self.instance.create_completion_evidence)
+        self.assertEqual("PROTOCOL_INVALID", self.instance.attempt.first_reason)
+
+    def test_readback_alone_never_imports_without_exact_zero_wait(self):
+        grant = self.register()
+        self.rpc("complete", grantId=grant.grant_id)
+        self.assertIsNone(self.rpc(
+            "lease-ack", revision=0,
+            digest=hashlib.sha256(state._canonical(self.files["lease"])).hexdigest(),
+        ))
+        registration = self.instance.registration_ack
+        registration.snapshot = deepcopy(self.files["lease"])
+        self.instance._tick_registration({})
+        self.assertIsNone(self.instance.create_completion_evidence)
+        with self.assertRaises(supervisor.SupervisorError):
+            self.instance._tick_registration({registration.pid: 1})
+        self.assertEqual(-1, self.instance.attempt.acked_revision)
+
+    def test_registration_grant_expiry_never_imports(self):
+        grant = self.register()
+        self.rpc("complete", grantId=grant.grant_id)
+        self.clock.now = grant.end_ns
+        self.assertFalse(self.acknowledge()["ok"])
+        self.assertIsNone(self.instance.registration_ack)
+        self.assertIsNone(self.instance.create_completion_evidence)
+
+    def test_cancellation_while_reader_runs_cannot_import_or_ack(self):
+        grant = self.register()
+        self.rpc("complete", grantId=grant.grant_id)
+        self.rpc("lease-ack", revision=0,
+                 digest=hashlib.sha256(state._canonical(self.files["lease"])).hexdigest())
+        registration = self.instance.registration_ack
+        registration.snapshot = deepcopy(self.files["lease"])
+        self.instance.attempt.cancel("TERM", 143)
+        with mock.patch.object(supervisor, "send_frame") as send:
+            self.instance._tick_registration({registration.pid: 0})
+        send.assert_not_called()
+        registration.reply.close.assert_called_once()
+        self.assertIsNone(self.instance.registration_ack)
+        self.assertIsNone(self.instance.create_completion_evidence)
+
+    def test_queued_signal_at_readback_boundary_revokes_before_ack(self):
+        grant = self.register()
+        self.rpc("complete", grantId=grant.grant_id)
+        self.rpc("lease-ack", revision=0,
+                 digest=hashlib.sha256(state._canonical(self.files["lease"])).hexdigest())
+        registration = self.instance.registration_ack
+        registration.snapshot = deepcopy(self.files["lease"])
+        self.instance.pending_signals.append(signal.SIGTERM)
+        with mock.patch.object(supervisor, "send_frame") as send, \
+                mock.patch.object(self.instance, "_notify_clock"):
+            self.instance._tick_registration({registration.pid: 0})
+        send.assert_not_called()
+        self.assertEqual("TERM", self.instance.attempt.first_reason)
+        self.assertEqual(-1, self.instance.attempt.acked_revision)
+        self.assertIsNone(self.instance.create_completion_evidence)
+
+    def test_initial_registration_ack_is_one_shot(self):
+        grant = self.register()
+        self.rpc("complete", grantId=grant.grant_id)
+        self.assertTrue(self.acknowledge()["ok"])
+        self.assertFalse(self.acknowledge()["ok"])
+        self.assertIsNone(self.instance.registration_ack)
+
+    def test_acknowledged_replacement_completion_handoff_preserves_original_witness(self):
+        _, self.current, self.previous, self.receipt = recovery_create_fixture(
+            "1" * 64, self.instance.identity, replacement=True,
+        )
+        self.files = {"lease": self.previous, "current": self.current}
+        self.instance.recovery_baseline = {
+            "lease": deepcopy(self.previous),
+            "currentDigest": hashlib.sha256(state._canonical(self.current)).hexdigest(),
+        }
+        grant = self.register()
+        self.rpc("complete", grantId=grant.grant_id)
+        self.assertTrue(self.acknowledge()["ok"])
+        self.assertEqual(self.previous["createCompletion"], self.instance._lease()["createCompletion"])
+        for key in ("commitWitnessDigest", "providerFinalizationDigest", "configHash", "containerId", "commitSubstep"):
+            self.assertEqual(self.current[key], self.files["current"][key])
+
+    def test_replacement_intent_or_missing_completion_cannot_be_imported(self):
+        for fault in ("intent", "missing", "unacknowledged"):
+            _, current, previous, receipt = recovery_create_fixture(
+                "1" * 64, self.instance.identity, replacement=True,
+            )
+            if fault == "intent":
+                current["runtimeRequest"] = dict(current["runtimeRequest"], lifecycle="intent", completionDigest=None)
+            elif fault == "missing":
+                previous["createCompletion"] = None
+            else:
+                previous["createCompletion"]["acknowledged"] = False
+            self.receipt = receipt
+            self.instance.recovery_baseline = {
+                "lease": previous, "currentDigest": hashlib.sha256(state._canonical(current)).hexdigest(),
+            }
+            self.files = {
+                "lease": dict(self.instance._lease(), createCompletion=previous["createCompletion"]),
+                "current": dict(current, executionAttempt=self.instance.attempt.nonce),
+            }
+            with self.subTest(fault=fault), self.assertRaises(state.GuardError):
+                state._read_recovery_registration_snapshot(
+                    self.instance.root, self.instance._lease(),
+                    hashlib.sha256(state._canonical(self.files["lease"])).hexdigest(),
+                    self.instance.recovery_baseline, deploy_lock_fd=9,
+                )
+            self.assertIsNone(self.instance.create_completion_evidence)
+
+    def test_response_rejects_unknown_schema_and_unacknowledged_old_completion(self):
+        grant = self.register()
+        self.rpc("complete", grantId=grant.grant_id)
+        self.rpc("lease-ack", revision=0,
+                 digest=hashlib.sha256(state._canonical(self.files["lease"])).hexdigest())
+        for snapshot in (
+            dict(self.files["lease"], extra=True),
+            dict(self.files["lease"], createCompletion=dict(
+                self.previous["createCompletion"], acknowledged=False,
+            )),
+        ):
+            with self.subTest(snapshot=snapshot), mock.patch.object(
+                supervisor, "receive_frame", return_value=({"lease": snapshot}, None),
+            ), self.assertRaises(supervisor.SupervisorError):
+                self.instance._registration_response()
+        self.assertIsNone(self.instance.create_completion_evidence)
+
+
 class ControllerLifecycleTests(unittest.TestCase):
     """Execute actual shell functions with private deterministic RPC boundaries."""
 
@@ -605,7 +1448,9 @@ class ControllerLifecycleTests(unittest.TestCase):
         return subprocess.run(
             [bash, "-s", "--", *arguments],
             input="set -euo pipefail\n" + script,
-            capture_output=True, text=True, timeout=60 if os.name == "nt" else 15, check=False,
+            # Git Bash process startup can dominate these mocked shell tests
+            # on Windows. This is a harness ceiling, never an attempt budget.
+            capture_output=True, text=True, timeout=120 if os.name == "nt" else 15, check=False,
         )
 
     def test_terminal_handshake_ack_order_and_each_refusal(self):
@@ -868,7 +1713,9 @@ fail() { echo "$1" >&2; exit 91; }
         self.assertIn('*) fail "PRIVATE_WORKER_MODE_UNAVAILABLE"', private_dispatch)
 
     def test_recovery_registration_checks_dispatch_before_publication_and_acks_once(self):
-        script = self.function("supervisor_register_recovery") + r"""
+        # Registration deliberately captures helper stderr for sanitized
+        # failure classification. Keep fixture tracing out of that payload.
+        script = "exec 3>&2\n" + self.function("supervisor_register_recovery") + r"""
 state_root=/fixture/root
 timepad_helper=/fixture/state.py
 timepad_contract=/fixture/contract.json
@@ -890,7 +1737,7 @@ supervisor_client() {
   esac
 }
 command() {
-  echo "$*" >&2
+  echo "$*" >&3
   if [ "${5:-}" = read-state ]; then
     echo '{"current":{"executionAttempt":null,"phase":"CUTOVER_POSSIBLE"}}'
     return 0
@@ -983,23 +1830,40 @@ supervisor_timeout 30s "$@"
                     ])
 
     def test_rollback_state_proof_never_releases_mutation_without_daemon_proof(self):
-        script = self.function("rollback_worker_admission") + r"""
+        script = self.function("rollback_worker_admission") + "\n" + self.function("rollback_worker_runtime_gate") + r"""
 timepad_helper=/fixture/state.py
 state_root=/fixture/root
+root=/fixture/deployment
+base_compose=/fixture/compose.yml
+TIMEPAD_ATTEMPT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 fault=$1
-timeout() { echo "$*" >&2; [ "$fault" != state ]; }
+timeout() {
+  echo "$*" >&2
+  [ "$fault" != state ] || return 1
+  if [ "$4" = read-state ]; then
+    echo '{"current":{"predecessorContainerId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+  elif [ "$fault" = proof ]; then
+    echo '{"executionAttempt":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","predecessorContainerId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","proofDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+  else
+    echo '{"result":"state-admitted"}'
+  fi
+}
+recovery_backend_inventory() { echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; }
+docker_container_inspect() { echo '[]'; }
 fail() { echo "$1" >&2; exit 91; }
 supervisor_client() { echo unexpected-admit-rollback; return 92; }
 rollback_worker_admission
+rollback_worker_runtime_gate
 """
-        for fault in ("none", "state"):
+        for fault in ("none", "state", "proof"):
             result = self.shell(script, fault)
             self.assertEqual(91, result.returncode, result.stderr)
             self.assertEqual("", result.stdout)
-            self.assertEqual(result.stderr.splitlines(), [
-                "15s python3 /fixture/state.py rollback-admission --root /fixture/root --deploy-lock-fd 9",
-                "ROLLBACK_NOT_ADMITTED" if fault == "state" else "ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED",
-            ])
+            expected = ["15s python3 /fixture/state.py read-state --root /fixture/root --deploy-lock-fd 9"]
+            if fault != "state":
+                expected.append("15s python3 /fixture/state.py rollback-admission --root /fixture/root --deploy-lock-fd 9")
+            expected.append("ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED" if fault == "proof" else "ROLLBACK_NOT_ADMITTED")
+            self.assertEqual(expected, result.stderr.splitlines())
 
     def test_lease_transport_newline_is_not_published_as_durable_bytes(self):
         script = self.function("supervisor_publish_lease") + r"""
@@ -1093,6 +1957,125 @@ class FixtureSupervisor(supervisor.Supervisor):
 
 
 class LinuxSupervisorTests(unittest.TestCase):
+    def test_create_registration_readback_child_preserves_proof_or_refuses_partial_handoff(self):
+        for fault, replacement in (
+            ("none", False), ("receipt", False), ("digest", False), ("erased", False), ("aborted", False),
+            ("none", True), ("receipt", True),
+        ):
+            with self.subTest(fault=fault, replacement=replacement), tempfile.TemporaryDirectory() as directory:
+                os.chmod(directory, 0o700)
+                authority = {
+                    "rootId": "test-root", "bootstrapId": "bootstrap-1", "initialRuntime": "a" * 64,
+                    "initialConfig": "b" * 64, "initialSchema": "c" * 64,
+                    "initialStartupInventory": "d" * 64, "schemaHistoryProvenance": True,
+                }
+                observed = {
+                    "rootId": "test-root", "runtime": "a" * 64, "config": "b" * 64,
+                    "schema": "c" * 64, "startupInventory": "d" * 64, "schemaHistoryProvenance": True,
+                }
+                state.bootstrap_guard(directory, authority=authority, observed=observed)
+                origin, _ = state.read_guard(directory)
+                approved, current, previous, receipt = recovery_create_fixture(
+                    origin["originDigest"], {
+                        "pid": 123, "startTicks": 42, "bootId": supervisor.boot_id(),
+                    }, replacement=replacement,
+                )
+                run = Path(directory, current["ownedRun"])
+                run.mkdir(mode=0o700)
+                receipt_path = run / (
+                    "timepad-replacement-completion.json" if replacement else "timepad-create-completion.json"
+                )
+                receipt_path.write_bytes(receipt)
+                receipt_path.chmod(0o600)
+                lease_path = Path(directory, state.EXECUTION_LEASE_NAME)
+                lease_path.write_bytes(state._canonical(previous))
+                lease_path.chmod(0o600)
+                Path(directory, state.GUARD_DIR, "current.json").write_bytes(state._canonical(current))
+                target = current["target"]
+                authorization = {
+                    "schema": state.RECOVERY_AUTH_SCHEMA, "rootId": "test-root",
+                    "originDigest": origin["originDigest"], "originalOperation": "deploy",
+                    "runId": current["runId"], "operationEpoch": current["operationEpoch"],
+                    "incidentId": current["incidentId"], "evidenceDigest": current["evidenceDigest"],
+                    "targetId": target["id"], "revision": target["tuple"]["revision"],
+                    "version": target["tuple"]["version"],
+                    "repositoryDigest": target["tuple"]["repositoryDigest"],
+                    "platformImageId": target["tuple"]["platformImageId"], "action": "retry-exact-candidate",
+                }
+                authorization_path = Path(directory, "timepad-recovery-authorization.json")
+                authorization_path.write_bytes(state._canonical(authorization))
+                authorization_path.chmod(0o600)
+                selectors = {key: authorization[key] for key in (
+                    "runId", "incidentId", "operationEpoch", "evidenceDigest",
+                    "repositoryDigest", "revision", "version",
+                )}
+
+                def behavior(client, root, mode):
+                    if mode != "controller-worker":
+                        fixture_publish(client, root)
+                        fixture_terminal(client, root, 1)
+                        return
+                    grant = client.request("grant", name="recovery-registration", localNs=30 * NS)
+                    # Only the external provider observation is synthetic. State
+                    # authority, prior process exit, receipt, FD9, publication,
+                    # readback child, wait status and subsequent revisions are real.
+                    provider = SimpleNamespace(
+                        ProviderError=RuntimeError,
+                        _recovery_lease_runtime_proof=lambda *_args: current["runtimeRequest"],
+                    )
+                    with mock.patch.object(
+                        state.importlib.util, "spec_from_file_location",
+                        return_value=SimpleNamespace(loader=mock.Mock()),
+                    ), mock.patch.object(state.importlib.util, "module_from_spec", return_value=provider):
+                        acknowledgment = state.register_recovery(
+                            root, contract=approved, selectors=selectors, deploy_lock_fd=9,
+                            execution_grant=state.ExecutionGrant(
+                                grant["attempt"], grant["grantId"], grant["endNs"],
+                            ), runtime_evidence=b"{}",
+                        )
+                    if fault == "receipt":
+                        receipt_path.write_bytes(b"{}")
+                    elif fault == "digest":
+                        acknowledgment["digest"] = "0" * 64
+                    elif fault == "erased":
+                        snapshot = state._read_execution_lease_locked(root)
+                        snapshot["createCompletion"] = None
+                        raw = state._canonical(snapshot)
+                        lease_path.write_bytes(raw)
+                        acknowledgment["digest"] = hashlib.sha256(raw).hexdigest()
+                    if fault != "aborted":
+                        client.request("complete", grantId=grant["grantId"])
+                    client.request(
+                        "lease-ack", revision=acknowledgment["revision"], digest=acknowledgment["digest"],
+                    )
+                    if client.request("lease")["createCompletion"] != previous["createCompletion"]:
+                        os._exit(6)
+                    client.request("arm")
+                    fixture_publish(client, root)
+                    Path(root, "handoff-checked").write_bytes(b"checked")
+                    client.request("cancel", reason="EXIT", status=1)
+                    signal.pause()
+
+                result, _ = self.run_fixture(
+                    behavior, directory=directory, operation="forward-recover",
+                    timing=supervisor.Timing(), timeout=25,
+                )
+                self.assertEqual(1, result["status"])
+                self.assertEqual("RECOVERY_REQUIRED" if fault == "none" else "QUIESCENCE_UNCONFIRMED", result["reason"])
+                self.assertEqual(fault == "none", Path(directory, "handoff-checked").exists())
+                durable = state._read_execution_lease_locked(directory)
+                actual = state.read_guard(directory)[1]
+                self.assertEqual(current["runtimeRequest"], actual["runtimeRequest"])
+                self.assertEqual(current["phase"], actual["phase"])
+                self.assertEqual(current["containerId"], actual["containerId"])
+                for key in ("commitWitnessDigest", "providerFinalizationDigest", "configHash", "commitSubstep"):
+                    self.assertEqual(current[key], actual[key])
+                if fault == "none":
+                    self.assertEqual(previous["createCompletion"], durable["createCompletion"])
+                    self.assertEqual("drained", durable["lifecycle"])
+                    self.assertIsNone(durable["worker"])
+                    self.assertGreaterEqual(durable["revision"], 6)
+
     def test_failed_cleanup_terminal_publishes_childless_lease_before_fixed_refusal(self):
         def behavior(client, directory, mode):
             fixture_publish(client, directory)
@@ -1671,6 +2654,65 @@ class LinuxKernelTests(unittest.TestCase):
         os.waitpid(pid, 0)
         self.fail("fixture child exceeded bounded wait")
 
+    def test_fixed_create_wait_requires_exact_wait_and_local_echild(self):
+        import test_vps_timepad_create as create_module
+
+        for behavior, expected in (("zero", True), ("nonzero", False), ("orphan", False)):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    supervisor.linux_preflight()
+                    child = os.fork()
+                    if child == 0:
+                        if behavior == "orphan":
+                            descendant = os.fork()
+                            if descendant == 0:
+                                os.setsid()
+                                signal.pause()
+                        time.sleep(0.05)
+                        os._exit(1 if behavior == "nonzero" else 0)
+                    start = create_module._process_start(child)
+                    spawned = create_module.SpawnedCreate(child, os.pidfd_open(child, 0), start)
+                    selection = create_module.Selection(
+                        "/fixture", "/fixture/base.yml", "unused", "unused", "unused", "123-1", "deploy", "deploy",
+                    )
+                    context = create_module.CreateContext(
+                        "/fixture", selection, time.monotonic_ns() + 2 * NS, create_module.Role.INITIAL,
+                    )
+
+                    accepted = False
+                    try:
+                        create_module.wait_create(spawned, context)
+                        accepted = True
+                    except create_module.CreateError:
+                        pass
+                    children = supervisor.Children()
+                    end = time.monotonic_ns() + 2 * NS
+                    while not children.reap():
+                        if time.monotonic_ns() >= end:
+                            os._exit(4)
+                        children.signal_owned(signal.SIGKILL)
+                        time.sleep(0.01)
+                    os._exit(0 if accepted == expected else 5)
+                except BaseException:
+                    os._exit(6)
+            with self.subTest(behavior=behavior):
+                self.assertEqual(0, self.wait_child(pid))
+
+    def test_rpc_credentials_are_kernel_bound_not_frame_assertions(self):
+        sender, receiver = supervisor.socket_pair()
+        reply, passed = supervisor.socket_pair()
+        try:
+            supervisor.send_frame(sender, {"pid": os.getpid() + 1}, passed.fileno())
+            peers = []
+            frame, fd = supervisor.receive_frame(receiver, accept_fd=True, peer=peers)
+            self.assertEqual(os.getpid() + 1, frame["pid"])
+            self.assertEqual([supervisor.process_identity(os.getpid())], peers)
+            os.close(fd)
+        finally:
+            for endpoint in (sender, receiver, reply, passed):
+                endpoint.close()
+
     def test_pidfd_identity_and_unknown_parent_are_not_signalled(self):
         supervisor.linux_preflight()
         identity = supervisor.process_identity(os.getpid())
@@ -1852,7 +2894,7 @@ def main():
                 print("SUPERVISOR_FIXTURES_BLOCKED: isolation launcher required", file=sys.stderr)
                 return 77
         supervisor.linux_preflight()
-    classes = [AttemptTests, ControllerLifecycleTests]
+    classes = [AttemptTests, CreateProtocolTests, RecoveryCreateRegistrationTests, ControllerLifecycleTests]
     if not options.portable:
         classes += [LinuxKernelTests, LinuxSupervisorTests]
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls) for cls in classes)

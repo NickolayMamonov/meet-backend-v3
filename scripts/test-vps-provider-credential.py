@@ -21,6 +21,7 @@ import ctypes
 import errno
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import os
 import pathlib
@@ -43,6 +44,22 @@ MAX_CREDENTIAL_BYTES = 1024 * 1024
 MAX_WITNESS_BYTES = 16 * 1024 * 1024
 MAX_FINALIZATION_BYTES = 8 * 1024
 MAX_PREPARED_BYTES = 8 * 1024
+MAX_MODEL_BYTES = 256 * 1024
+MAX_RESOURCES_BYTES = 16 * 1024
+MAX_RESOURCE_REQUEST_BYTES = 4 * 1024
+MAX_RESOURCE_ENTRIES = 256
+RESOURCE_ADMISSION_SCHEMA = "meet-backend/test-vps-timepad-resource-admission/v1"
+RESOURCE_BASELINE_SCHEMA = "meet-backend/test-vps-timepad-resources/v1"
+RESOURCE_PROJECT = "meet-production"
+RESOURCE_NETWORK = "meet-production_default"
+RESOURCE_VOLUMES = {
+    "uploads_data": "meet-production_uploads_data",
+    "postgres_data": "meet-production_postgres_data",
+}
+POSTGRES_IMAGE = (
+    "postgres:16-alpine@sha256:"
+    "4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2"
+)
 MAX_JSON_DEPTH = 32
 MAX_OWNER_BYTES = 4096
 CONTAINER_CREDENTIAL_PATH = "/run/secrets/meet-firebase-service-account.json"
@@ -264,7 +281,7 @@ def _execution_mutation(
             else "provider"
         )
         if expected_name == "recovery-admission" and args.command not in {
-            "live-resume", "absence-resume", "runtime-request-proof",
+            "live-resume", "absence-resume", "runtime-request-proof", "resource-admission",
         }:
             _fail("recovery")
 
@@ -2772,7 +2789,21 @@ def _runtime_request_proof(
         request = module.runtime_request(current["runtimeRequest"])
     except (module.GuardError, TypeError, KeyError):
         _fail("recovery")
-    if request["lifecycle"] != "acknowledged":
+    predecessor = request.get("role") == "predecessor"
+    if predecessor and (
+        current["phase"] != "PREPARED"
+        or request["containerId"] != current["predecessorContainerId"]
+        or request["imageId"] != current["predecessor"]["tuple"]["platformImageId"]
+        or any(request[key] != current[key] for key in (
+            "originDigest", "incidentId", "operationEpoch", "executionAttempt",
+            "preparedProofDigest", "evidenceDigest",
+        ))
+    ):
+        _fail("recovery")
+    admission = predecessor and request["lifecycle"] == "intent"
+    if request["operation"] == "create" or (
+        request["lifecycle"] != "acknowledged" and not admission
+    ):
         _fail("recovery")
     if request["childAttemptId"] is not None and current["ownedChild"] is not None:
         if request["childAttemptId"] != current["ownedChild"]["attemptId"]:
@@ -2781,9 +2812,9 @@ def _runtime_request_proof(
             module.require_child_group_quiescent(current["ownedChild"])
         except (module.GuardError, OSError):
             _fail("recovery")
-    exact, _ = _live_resume_runtime(inspect, current, "runtime")
+    exact, _ = _live_resume_runtime(inspect, current, "admission" if predecessor else "runtime")
     if (
-        not exact or inspect["Id"] != request["containerId"]
+        exact == predecessor or inspect["Id"] != request["containerId"]
         or inspect["Image"] != "sha256:" + request["imageId"]
         or inspect["Config"]["Labels"]["com.docker.compose.config-hash"] != request["configHash"]
     ):
@@ -2791,6 +2822,18 @@ def _runtime_request_proof(
     running = inspect["State"]["Running"]
     policy = inspect["HostConfig"]["RestartPolicy"]["Name"]
     operation = request["operation"]
+    if admission:
+        if current["phase"] != "PREPARED" or (
+            operation == "suppress" and not running
+            or operation == "stop" and policy != "no"
+        ):
+            _fail("recovery")
+        return {
+            "requestNonce": request["nonce"],
+            "admissionDigest": _configuration_digest({
+                "request": request, "running": running, "restartPolicy": policy,
+            }),
+        }
     if (
         operation == "start" and (not running or policy != "no")
         or operation == "stop" and (running or policy != "no")
@@ -2814,18 +2857,27 @@ def _runtime_request_completion(
 ) -> None:
     """Fixed read-only adapter; publication remains under the controller's state grant."""
     value = _json(input_data, "recovery")
-    if not isinstance(value, dict) or set(value) != {"requestNonce", "inspection"}:
+    if not isinstance(value, dict):
         _fail("recovery")
     root_fd = _open_deploy_state_root(state_root)
     try:
         _lock_directory(root_fd)
-        _, _, current = _timepad_current(state_root, deploy_lock_fd)
+        module, _, current = _timepad_current(state_root, deploy_lock_fd)
         if (
             state_kind not in STATE_KINDS or current["runId"] != run_key
             or current["ownedRun"] != f"{run_key}-{state_kind}"
             or current["runtimeRequest"] is None
-            or value["requestNonce"] != current["runtimeRequest"]["nonce"]
+            or value.get("requestNonce") != current["runtimeRequest"]["nonce"]
         ):
+            _fail("recovery")
+        create = current["runtimeRequest"]["operation"] == "create"
+        fields = {"requestNonce", "inspection"}
+        if create:
+            fields |= {
+                "imageInspection", "targetConfiguration", "backendInventory", "composeInventory",
+                "resourceEvidence", "requestBaseline",
+            }
+        if set(value) != fields:
             _fail("recovery")
         run_fd = os.open(
             current["ownedRun"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd,
@@ -2833,10 +2885,38 @@ def _runtime_request_completion(
         try:
             _lock_directory(run_fd)
             _validate_state_directory_fd(run_fd, current["ownedRun"])
-            _live_resume_config(run_fd, current)
-            result = _runtime_request_proof(current, _inspect(
-                json.dumps(value["inspection"], separators=(",", ":")).encode(),
-            ))
+            inspection = _inspect(json.dumps(value["inspection"], separators=(",", ":")).encode())
+            if create:
+                request = current["runtimeRequest"]
+                name = ("timepad-create-completion.json" if request["role"] == "initial"
+                        else "timepad-replacement-completion.json")
+                result = _stopped_create_binding(
+                    run_fd, current,
+                    _inspect(json.dumps(value["imageInspection"], separators=(",", ":")).encode()),
+                    value["targetConfiguration"], inspection,
+                    value["backendInventory"], value["composeInventory"],
+                    completion_lease=module._read_execution_lease_locked(state_root),
+                    completion_receipt=_read_child_file(
+                        run_fd, name, module.MAX_CREATE_COMPLETION_BYTES,
+                    )[1],
+                    resource_evidence=value["resourceEvidence"],
+                    request_baseline=value["requestBaseline"],
+                )
+            else:
+                _live_resume_config(run_fd, current)
+                if current["runtimeRequest"].get("role") == "predecessor":
+                    if current["phase"] != "PREPARED":
+                        _fail("recovery")
+                    proof = _prepared_proof(run_fd, current)
+                    _prepared_no_commit_files(run_fd)
+                    _live_resume_runtime(inspection, current, "admission")
+                    _live_resume_predecessor(run_fd, current, inspection)
+                    if (
+                        proof["provider"] != _prepared_transaction(run_key, state_root, inspection)
+                        or proof["effectiveProviderDigest"] != _configuration_digest(_effective_tuple(inspection))
+                    ):
+                        _fail("recovery")
+                result = _runtime_request_proof(current, inspection)
             _, _, final = _timepad_current(state_root, deploy_lock_fd)
             if final != current:
                 _fail("recovery")
@@ -2963,8 +3043,16 @@ def _prepared_config_records(run_fd: int) -> list[dict[str, Any]]:
 def _prepared_transaction(
     run_key: str, state_root: str, inspect: dict[str, Any],
 ) -> dict[str, Any]:
+    return _intact_provider_record(
+        run_key, state_root, inspect, allowed_phases={"prepared", "applying"},
+    )
+
+
+def _intact_provider_record(
+    run_key: str, state_root: str, inspect: dict[str, Any], *, allowed_phases: set[str],
+) -> dict[str, Any]:
     marker = _live_resume_transaction(run_key, state_root, inspect, predecessor=True)
-    if marker["phase"] not in {"prepared", "applying"}:
+    if marker["phase"] not in allowed_phases:
         _fail("recovery")
     result: dict[str, Any] = {
         "providerEnabled": marker["providerEnabled"],
@@ -3005,6 +3093,191 @@ def _prepared_transaction(
     return result
 
 
+def _rollback_source(path: str) -> tuple[bytes, bytes]:
+    """Read a protected live configuration and its existing shell identity."""
+    parent, name = _open_reference_parent(path)
+    fd = None
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+            or info.st_mode & 0o022 or info.st_nlink != 1
+            or info.st_size > MAX_CREDENTIAL_BYTES
+        ):
+            _fail("recovery")
+        _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+        data = bytearray()
+        while len(data) <= MAX_CREDENTIAL_BYTES:
+            _deadline_check()
+            chunk = os.read(fd, min(65536, MAX_CREDENTIAL_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        final_info = os.fstat(fd)
+        path_info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            len(data) != info.st_size
+            or len(data) > MAX_CREDENTIAL_BYTES
+            or _stable_entry_identity(final_info) != _stable_entry_identity(info)
+            or final_info.st_ctime_ns != info.st_ctime_ns
+            or _stable_entry_identity(path_info) != _stable_entry_identity(info)
+            or path_info.st_ctime_ns != info.st_ctime_ns
+        ):
+            _fail("recovery")
+        identity = (
+            f"{info.st_dev}:{info.st_ino}:{info.st_mode}:{info.st_uid}:"
+            f"{info.st_gid}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}:"
+            f"{hashlib.sha256(data).hexdigest()}\n"
+        ).encode("ascii")
+        return bytes(data), identity
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent)
+
+
+def _rollback_configuration(run_fd: int, deployment_root: str, base_compose: str) -> str:
+    """Admit only a completely recorded original or target configuration."""
+    _retention_reference(deployment_root)
+    _retention_reference(base_compose)
+    base, identity = _rollback_source(base_compose)
+    if (
+        base != _read_child_file(run_fd, "config.base-compose.yml", MAX_CREDENTIAL_BYTES)[1]
+        or identity != _read_child_file(run_fd, "config.base-compose.yml.identity", MAX_OWNER_BYTES)[1]
+    ):
+        _fail("recovery")
+    environment, identity = _rollback_source(deployment_root + "/.env.production")
+    selected = None
+    for view in ("production", "target"):
+        name = f"config.env.{view}"
+        expected = _read_child_file(run_fd, name, MAX_CREDENTIAL_BYTES)[1]
+        try:
+            recorded = _read_child_file(run_fd, name + ".identity", MAX_OWNER_BYTES)[1]
+        except FileNotFoundError:
+            continue
+        if environment == expected and identity == recorded:
+            selected = view
+            break
+    if selected is None:
+        _fail("recovery")
+    for kind, path in (
+        ("compose", "/var/lib/meet-production/active-compose.yml"),
+        ("runtime", "/var/lib/meet-production/active-runtime.override.yml"),
+    ):
+        try:
+            live, identity = _rollback_source(path)
+        except FileNotFoundError:
+            try:
+                os.stat(f"had-active-{kind}", dir_fd=run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            _fail("recovery")
+        admitted = False
+        for prefix in ("previous", "candidate"):
+            try:
+                recorded = _read_child_file(
+                    run_fd, f"{prefix}-active-{kind}.identity", MAX_OWNER_BYTES,
+                )[1]
+                expected = _read_child_file(
+                    run_fd, f"{prefix}-active-{kind}.yml", MAX_CREDENTIAL_BYTES,
+                )[1]
+            except FileNotFoundError:
+                continue
+            if identity == recorded and live == expected:
+                admitted = True
+                break
+        if not admitted:
+            _fail("recovery")
+    return selected
+
+
+def _rollback_runtime_proof(
+    state_root: str, current: dict[str, Any], lease: dict[str, Any],
+    input_data: bytes, check: Callable[[], None], *, claim: bool = False,
+) -> dict[str, Any]:
+    """Read-only failure rollback proof; never imports forward-recovery authority."""
+    token = _EXECUTION_CHECK.set(check)
+    try:
+        return _reconstruct_rollback_runtime(state_root, current, lease, input_data, check, claim=claim)
+    finally:
+        _EXECUTION_CHECK.reset(token)
+
+
+def _reconstruct_rollback_runtime(
+    state_root: str, current: dict[str, Any], lease: dict[str, Any],
+    input_data: bytes, check: Callable[[], None], *, claim: bool,
+) -> dict[str, Any]:
+    check()
+    module = _timepad_state_module()
+    module._rollback_state_admission(
+        current, lease, "rolling-back" if claim else "rollback-admission",
+    )
+    value = _json(input_data, "recovery")
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"deploymentRoot", "baseCompose", "backendInventory", "inspection"}
+        or value["backendInventory"] != [current["predecessorContainerId"]]
+        or current["containerId"] is not None
+    ):
+        # A replaced/absent predecessor needs independently reconstructed
+        # original runtime evidence; one candidate inventory cannot supply it.
+        _fail("recovery")
+    inspect = _inspect(json.dumps(value["inspection"], separators=(",", ":")).encode())
+    if _live_resume_runtime(inspect, current, "admission")[0]:
+        _fail("recovery")
+    if current["runtimeRequest"] is not None:
+        request = module.require_runtime_request_completion(current)
+        if request.get("role") != "predecessor":
+            _fail("recovery")
+    elif current["phase"] != "PREPARED":
+        _fail("recovery")
+    root_fd = _open_deploy_state_root(state_root)
+    try:
+        _lock_directory(root_fd)
+        run_fd = os.open(
+            current["ownedRun"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd,
+        )
+        try:
+            _lock_directory(run_fd)
+            _validate_state_directory_fd(run_fd, current["ownedRun"])
+            proof = _prepared_proof(run_fd, current)
+            _prepared_no_commit_files(run_fd)
+            _prepared_environment(run_fd, current)
+            _live_resume_predecessor(run_fd, current, inspect)
+            provider = _intact_provider_record(
+                current["runId"], state_root, inspect,
+                allowed_phases={"prepared", "applying", "verifying"},
+            )
+            if (
+                provider != proof["provider"]
+                or proof["effectiveProviderDigest"] != _configuration_digest(_effective_tuple(inspect))
+            ):
+                _fail("recovery")
+            installed = _rollback_configuration(run_fd, value["deploymentRoot"], value["baseCompose"])
+            reference = _read_child_file(run_fd, "previous-image", MAX_OWNER_BYTES)[1].decode("ascii").rstrip("\n")
+            result = {
+                **{key: current[key] for key in (
+                    "originDigest", "incidentId", "operationEpoch", "executionAttempt",
+                    "runId", "ownedRun", "preparedProofDigest", "evidenceDigest",
+                )},
+                "currentDigest": _configuration_digest(current),
+                "leaseRevision": lease["revision"],
+                "predecessor": current["predecessor"], "predecessorContainerId": inspect["Id"],
+                "previousImage": reference,
+                "previousConfigHash": inspect["Config"]["Labels"]["com.docker.compose.config-hash"],
+                "providerEnabled": provider["providerEnabled"],
+                "durableDisposition": provider["durableDisposition"],
+                "installedEnvironment": installed,
+            }
+            check()
+            return dict(result, proofDigest=_configuration_digest(result))
+        finally:
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
+
+
 def _prepared_proof(run_fd: int, current: dict[str, Any]) -> dict[str, Any]:
     try:
         os.stat(".timepad-prepared.tmp", dir_fd=run_fd, follow_symlinks=False)
@@ -3020,18 +3293,30 @@ def _prepared_proof(run_fd: int, current: dict[str, Any]) -> dict[str, Any]:
         not isinstance(proof, dict)
         or set(proof) != {
             "schema", "binding", "config", "provider", "targetConfigurationDigest",
-            "effectiveProviderDigest",
+            "effectiveProviderDigest", "operationToken", "modelDigest", "toolingDigest",
+            "resourcesDigest",
         }
         or proof["schema"] != PREPARED_SCHEMA
         or proof["binding"] != {key: current[key] for key in PREPARED_BINDING}
         or proof["config"] != _prepared_config_records(run_fd)
     ):
         _fail("recovery")
-    for field in ("targetConfigurationDigest", "effectiveProviderDigest"):
+    for field in (
+        "targetConfigurationDigest", "effectiveProviderDigest", "modelDigest", "toolingDigest",
+        "resourcesDigest",
+    ):
         if not isinstance(proof[field], str) or re.fullmatch(
             r"[0-9a-f]{64}", proof[field]
         ) is None:
             _fail("recovery")
+    if (
+        not isinstance(proof["operationToken"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", proof["operationToken"]) is None
+        or proof["toolingDigest"] != current["toolingDigest"]
+        or proof["modelDigest"] != proof["targetConfigurationDigest"]
+    ):
+        _fail("recovery")
+    _read_resource_baseline(run_fd, proof["resourcesDigest"])
     provider = proof["provider"]
     if (
         not isinstance(provider, dict)
@@ -3076,6 +3361,1413 @@ def _configuration_digest(configuration: Any) -> str:
     ).encode())
 
 
+def _model_digest(configuration: Any) -> str:
+    data = json.dumps(configuration, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    if len(data) > MAX_MODEL_BYTES:
+        _fail("recovery")
+    return _finalization_digest(data)
+
+
+def _private_equal(actual: Any, expected: Any) -> None:
+    # JSON equality also distinguishes booleans from integers, unlike Python ==.
+    if json.dumps(actual, sort_keys=True, separators=(",", ":"), allow_nan=False) != \
+            json.dumps(expected, sort_keys=True, separators=(",", ":"), allow_nan=False):
+        _fail("recovery")
+
+
+def _resource_bytes(value: Any, limit: int) -> bytes:
+    _deadline_check()
+    try:
+        _depth(value)
+        data = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+    except (ValueError, TypeError, RecursionError):
+        _fail("recovery")
+    if len(data) > limit:
+        _fail("recovery")
+    return data
+
+
+def _resource_list(value: Any) -> list[Any]:
+    if not isinstance(value, list) or len(value) > MAX_RESOURCE_ENTRIES:
+        _fail("recovery")
+    return value
+
+
+def _resource_id(value: Any) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        _fail("recovery")
+    return value
+
+
+def _resource_labels(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or len(value) > MAX_RESOURCE_ENTRIES or any(
+        not isinstance(key, str) or not key or not isinstance(item, str)
+        or len(key) > 4096 or len(item) > 4096 for key, item in value.items()
+    ):
+        _fail("recovery")
+    return value
+
+
+def _resource_ids(value: Any) -> list[str]:
+    values = [_resource_id(item) for item in _resource_list(value)]
+    if len(set(values)) != len(values):
+        _fail("recovery")
+    return sorted(values)
+
+
+def _resource_hash(kind: str, name: str) -> str:
+    # Compose v2.39.4 hashes typed compose-go v2.9.0 JSON in declaration order.
+    # Network's empty typed IPAM is retained; volume's default driver is local.
+    # CustomLabels (including the compose ownership labels) are not serialized.
+    if kind == "network" and name == RESOURCE_NETWORK:
+        data = b'{"name":"meet-production_default","ipam":{}}'
+    elif kind == "volume" and name in RESOURCE_VOLUMES.values():
+        data = ('{"name":"' + name + '","driver":"local"}').encode("utf-8")
+    else:
+        _fail("recovery")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _resource_owner(labels: Any, kind: str, logical: str, name: str) -> dict[str, str]:
+    labels = _resource_labels(labels)
+    if labels.get("com.docker.compose.project") != RESOURCE_PROJECT or \
+            labels.get("com.docker.compose." + kind) != logical:
+        _fail("recovery")
+    key = "com.docker.compose.config-hash"
+    if key in labels:
+        actual = labels[key]
+        if (kind == "volume" or actual != "") and actual != _resource_hash(kind, name):
+            _fail("recovery")
+    return labels
+
+
+def _resource_model(configuration: Any, token: str) -> dict[str, Any]:
+    backend = _create_backend_model(configuration, token)
+    if set(configuration["services"]) != {"backend", "postgres"} or \
+            configuration.get("networks") != {"default": {"name": RESOURCE_NETWORK}} or \
+            configuration.get("volumes") != {
+                logical: {"name": name} for logical, name in RESOURCE_VOLUMES.items()
+            } or backend.get("depends_on") not in (
+                {"postgres": {"condition": "service_healthy", "required": True}},
+                {"postgres": {"condition": "service_healthy"}},
+            ):
+        _fail("recovery")
+    postgres = configuration["services"]["postgres"]
+    required = {"image", "environment", "volumes", "healthcheck", "restart", "security_opt", "logging"}
+    if not isinstance(postgres, dict) or not required <= postgres.keys() or \
+            postgres.keys() - required - {"networks"}:
+        _fail("recovery")
+    if (
+        postgres["image"] != POSTGRES_IMAGE or postgres["restart"] != "unless-stopped"
+        or postgres["security_opt"] != ["no-new-privileges:true"]
+        or postgres["logging"] != backend["logging"]
+        or postgres.get("networks", {"default": None}) not in ({"default": None}, {"default": {}})
+        or postgres["volumes"] not in (
+            [{"type": "volume", "source": "postgres_data", "target": "/var/lib/postgresql/data"}],
+            [{"type": "volume", "source": "postgres_data", "target": "/var/lib/postgresql/data",
+              "volume": {}}],
+        )
+        or not isinstance(postgres["environment"], dict)
+        or set(postgres["environment"]) != {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
+    ):
+        _fail("recovery")
+    for key, source in (("POSTGRES_DB", "DB_NAME"), ("POSTGRES_USER", "DB_USERNAME"),
+                        ("POSTGRES_PASSWORD", "DB_PASSWORD")):
+        value = postgres["environment"][key]
+        if not isinstance(value, str) or not value or backend["environment"].get(source) != value:
+            _fail("recovery")
+    health = {
+        "test": ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'],
+        "interval": "10s", "timeout": "5s", "retries": 10, "start_period": "10s",
+    }
+    # Config renderers may escape literal dollars; Engine's Test is unescaped.
+    unescaped_health = dict(
+        health, test=["CMD-SHELL", 'pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}"'],
+    )
+
+    def canonical(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    accepted_healthchecks = (canonical(health), canonical(unescaped_health))
+    if canonical(postgres["healthcheck"]) not in accepted_healthchecks:
+        _fail("recovery")
+    return postgres
+
+
+def _resource_network(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(value, dict):
+        _fail("recovery")
+    required = {
+        "Name", "Id", "Created", "Scope", "Driver", "EnableIPv6", "IPAM",
+        "Internal", "Attachable", "Ingress", "ConfigFrom", "ConfigOnly", "Containers",
+        "Options", "Labels",
+    }
+    if not required <= value.keys() or value.keys() - required - {"EnableIPv4"}:
+        _fail("recovery")
+    _resource_id(value["Id"])
+    labels = _resource_owner(value["Labels"], "network", "default", RESOURCE_NETWORK)
+    for key, expected in {
+        "Name": RESOURCE_NETWORK, "Scope": "local", "Driver": "bridge", "Options": {},
+        "Internal": False, "Attachable": False, "Ingress": False, "ConfigOnly": False,
+        "EnableIPv6": False, "ConfigFrom": {"Network": ""},
+    }.items():
+        _private_equal(value[key], expected)
+    _private_equal(value.get("EnableIPv4", True), True)
+    if not isinstance(value["Created"], str) or not value["Created"]:
+        _fail("recovery")
+    ipam = value["IPAM"]
+    if not isinstance(ipam, dict) or set(ipam) != {"Driver", "Options", "Config"} or \
+            ipam["Driver"] != "default" or ipam["Options"] not in (None, {}) or \
+            not isinstance(ipam["Config"], list) or len(ipam["Config"]) != 1:
+        _fail("recovery")
+    allocation = ipam["Config"][0]
+    if not isinstance(allocation, dict) or set(allocation) != {"Subnet", "Gateway"} or \
+            any(not isinstance(item, str) for item in allocation.values()):
+        _fail("recovery")
+    try:
+        subnet = ipaddress.IPv4Network(allocation["Subnet"], strict=True)
+        gateway = ipaddress.IPv4Address(allocation["Gateway"])
+    except (ValueError, TypeError):
+        _fail("recovery")
+    if gateway not in subnet or gateway in (subnet.network_address, subnet.broadcast_address):
+        _fail("recovery")
+    endpoints = value["Containers"]
+    if not isinstance(endpoints, dict) or len(endpoints) > MAX_RESOURCE_ENTRIES:
+        _fail("recovery")
+    projection = {key: value[key] for key in required - {"Containers"}}
+    # Presence and value of resource labels are preserved, including missing hash.
+    projection["Labels"] = labels
+    projection["EnableIPv4"] = value.get("EnableIPv4", True)
+    return projection, endpoints
+
+
+def _resource_volume(value: Any, logical: str) -> dict[str, Any]:
+    required = {"Name", "CreatedAt", "Mountpoint", "Driver", "Scope", "Labels", "Options"}
+    if not isinstance(value, dict) or set(value) != required:
+        _fail("recovery")
+    name = RESOURCE_VOLUMES[logical]
+    _resource_owner(value["Labels"], "volume", logical, name)
+    if value["Name"] != name or value["Scope"] != "local" or value["Driver"] != "local" or \
+            value["Options"] not in (None, {}):
+        _fail("recovery")
+    path = value["Mountpoint"]
+    if not isinstance(path, str) or not path.startswith("/") or "\x00" in path or \
+            any(part in ("", ".", "..") for part in path.split("/")[1:]) or \
+            not isinstance(value["CreatedAt"], str) or not value["CreatedAt"]:
+        _fail("recovery")
+    return dict(value)
+
+
+def _resource_endpoint(
+    value: Any, *, identity: str, service: str, network: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.keys() - {
+        "IPAMConfig", "Links", "Aliases", "DriverOpts", "NetworkID", "EndpointID", "Gateway",
+        "IPAddress", "IPPrefixLen", "IPv6Gateway", "GlobalIPv6Address", "GlobalIPv6PrefixLen",
+        "MacAddress", "DNSNames", "GwPriority",
+    } or value.get("NetworkID") != network["Id"]:
+        _fail("recovery")
+    for key in ("IPAMConfig", "Links", "DriverOpts"):
+        if value.get(key) not in (None, {}, []):
+            _fail("recovery")
+    aliases = value.get("Aliases")
+    if not isinstance(aliases, list) or any(not isinstance(item, str) for item in aliases) or \
+            sorted(aliases) != sorted([RESOURCE_PROJECT + "-" + service + "-1", service]):
+        _fail("recovery")
+    dns_names = value.get("DNSNames")
+    if dns_names is not None and (
+        not isinstance(dns_names, list) or any(not isinstance(item, str) for item in dns_names)
+        or len(dns_names) != len(set(dns_names))
+        or not set(dns_names) <= {RESOURCE_PROJECT + "-" + service + "-1", service, identity[:12]}
+    ):
+        _fail("recovery")
+    for key in ("IPv6Gateway", "GlobalIPv6Address"):
+        if value.get(key, "") != "":
+            _fail("recovery")
+    for key in ("GlobalIPv6PrefixLen", "GwPriority"):
+        _private_equal(value.get(key, 0), 0)
+    active = value.get("EndpointID", "") != ""
+    if active:
+        _resource_id(value["EndpointID"])
+        if not isinstance(value.get("IPAddress"), str):
+            _fail("recovery")
+        allocation = network["IPAM"]["Config"][0]
+        try:
+            address = ipaddress.IPv4Address(value.get("IPAddress"))
+            subnet = ipaddress.IPv4Network(allocation["Subnet"])
+        except (ValueError, TypeError):
+            _fail("recovery")
+        if address not in subnet or address in (
+            subnet.network_address, subnet.broadcast_address,
+            ipaddress.IPv4Address(allocation["Gateway"]),
+        ) or value.get("Gateway") != allocation["Gateway"] or \
+                type(value.get("IPPrefixLen")) is not int or value["IPPrefixLen"] != subnet.prefixlen or \
+                not isinstance(value.get("MacAddress"), str) or \
+                re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", value["MacAddress"]) is None:
+            _fail("recovery")
+    else:
+        for key in ("Gateway", "IPAddress", "MacAddress"):
+            if value.get(key, "") != "":
+                _fail("recovery")
+        _private_equal(value.get("IPPrefixLen", 0), 0)
+    # Keep semantic defaults explicit so harmless Engine omission does not hide allocation drift.
+    return {
+        "NetworkID": network["Id"], "EndpointID": value.get("EndpointID", ""),
+        "Gateway": value.get("Gateway", ""), "IPAddress": value.get("IPAddress", ""),
+        "IPPrefixLen": value.get("IPPrefixLen", 0), "MacAddress": value.get("MacAddress", ""),
+        "Aliases": sorted(aliases), "DNSNames": sorted(dns_names) if dns_names is not None else None,
+    }
+
+
+def _resource_postgres(
+    observed: dict[str, Any], image: Any, model: dict[str, Any], endpoint: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(image, dict) or image.get("Id") != observed.get("Image") or \
+            not isinstance(image.get("Config"), dict):
+        _fail("recovery")
+    if not isinstance(image.get("Id"), str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image["Id"]) is None:
+        _fail("recovery")
+    digests = _resource_list(image.get("RepoDigests"))
+    digest = POSTGRES_IMAGE.split("@", 1)[1]
+    if not any(item in digests for item in (
+        "postgres@" + digest, "docker.io/library/postgres@" + digest,
+    )):
+        _fail("recovery")
+    config, host, runtime = observed.get("Config"), observed.get("HostConfig"), observed.get("State")
+    if not all(isinstance(value, dict) for value in (config, host, runtime)):
+        _fail("recovery")
+    expected_env = dict(_env_entries(image))
+    expected_env.update(model["environment"])
+    _private_equal(dict(_env_entries(observed)), expected_env)
+    image_config = image["Config"]
+    overrides = {
+        "Image": POSTGRES_IMAGE, "Env": config["Env"], "Labels": config["Labels"],
+        "Hostname": observed["Id"][:12],
+        "Healthcheck": {"Test": ["CMD-SHELL", 'pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}"'],
+                        "Interval": 10000000000,
+                        "Timeout": 5000000000, "Retries": 10, "StartPeriod": 10000000000},
+    }
+    defaults = {
+        "Domainname": "", "AttachStdin": False, "AttachStdout": True, "AttachStderr": True,
+        "Tty": False, "OpenStdin": False, "StdinOnce": False, "NetworkDisabled": False,
+        "MacAddress": "", "StopTimeout": 10,
+    }
+    for key in config:
+        if key in overrides:
+            _private_equal(config[key], overrides[key])
+        elif key in image_config:
+            _private_equal(config[key], image_config[key])
+        elif key in defaults:
+            _private_equal(config[key], defaults[key])
+        else:
+            _fail("recovery")
+    for key in image_config.keys() - {"Env", "Labels", "Healthcheck", "Hostname", "Image"}:
+        _private_equal(config.get(key), image_config[key])
+    for key, value in overrides.items():
+        _private_equal(config.get(key), value)
+    labels = config["Labels"]
+    for key, value in (image_config.get("Labels") or {}).items():
+        _private_equal(labels.get(key), value)
+    for key, value in {
+        "com.docker.compose.version": "2.39.4", "com.docker.compose.image": image["Id"],
+    }.items():
+        _private_equal(labels.get(key), value)
+    compose_metadata = {
+        "com.docker.compose.project", "com.docker.compose.service",
+        "com.docker.compose.container-number", "com.docker.compose.oneoff",
+        "com.docker.compose.version", "com.docker.compose.image", "com.docker.compose.config-hash",
+        "com.docker.compose.depends_on", "com.docker.compose.project.config_files",
+        "com.docker.compose.project.working_dir", "com.docker.compose.project.environment_file",
+    }
+    if labels.keys() - compose_metadata - (image_config.get("Labels") or {}).keys():
+        _fail("recovery")
+    if "org.meet.timepad.operation" in labels or \
+            re.fullmatch(r"[0-9a-f]{64}", labels.get("com.docker.compose.config-hash", "")) is None:
+        _fail("recovery")
+    expected_host = {
+        "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
+        "SecurityOpt": ["no-new-privileges:true"], "NetworkMode": RESOURCE_NETWORK,
+        "LogConfig": {"Type": "local", "Config": model["logging"]["options"]},
+        "Binds": ["meet-production_postgres_data:/var/lib/postgresql/data:rw"],
+    }
+    host_defaults = {
+        "ReadonlyRootfs": False, "Init": None, "Memory": 0, "Privileged": False,
+        "PublishAllPorts": False, "AutoRemove": False, "CapAdd": None, "CapDrop": None,
+        "Devices": None, "DeviceCgroupRules": None, "DeviceRequests": None, "VolumesFrom": None,
+        "Links": None, "ExtraHosts": None, "GroupAdd": None, "Sysctls": None, "Tmpfs": None,
+        "Ulimits": None, "StorageOpt": None, "CgroupParent": "", "Cgroup": "",
+        "ContainerIDFile": "", "PidMode": "", "UTSMode": "", "UsernsMode": "",
+        "IpcMode": "private", "CgroupnsMode": "private", "Isolation": "",
+        "CpuShares": 0, "NanoCpus": 0, "CpuPeriod": 0, "CpuQuota": 0,
+        "CpuRealtimePeriod": 0, "CpuRealtimeRuntime": 0, "CpusetCpus": "", "CpusetMems": "",
+        "MemoryReservation": 0, "MemorySwap": 0, "MemorySwappiness": None,
+        "OomKillDisable": None, "OomScoreAdj": 0, "PidsLimit": None,
+        "BlkioWeight": 0, "BlkioWeightDevice": None, "BlkioDeviceReadBps": None,
+        "BlkioDeviceWriteBps": None, "BlkioDeviceReadIOps": None, "BlkioDeviceWriteIOps": None,
+        "Dns": [], "DnsOptions": [], "DnsSearch": [], "ShmSize": 67108864, "Runtime": "runc",
+        "ConsoleSize": [0, 0], "VolumeDriver": "", "Mounts": [], "PortBindings": {},
+        "MaskedPaths": [
+            "/proc/asound", "/proc/acpi", "/proc/interrupts", "/proc/kcore", "/proc/keys",
+            "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug",
+            "/proc/scsi", "/sys/firmware", "/sys/devices/virtual/powercap",
+        ],
+        "ReadonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
+    }
+    if host.keys() - expected_host.keys() - host_defaults.keys():
+        _fail("recovery")
+    if not {"Privileged", "CapAdd", "Devices", "DeviceRequests", "PidMode", "UsernsMode"} <= host.keys():
+        _fail("recovery")
+    for key, value in expected_host.items():
+        _private_equal(host.get(key), value)
+    for key, value in host_defaults.items():
+        if key in host:
+            _private_equal(host[key], value)
+    for key, value in {
+        "Status": "running", "Running": True, "Paused": False, "Restarting": False,
+        "Dead": False, "OOMKilled": False, "Error": "",
+    }.items():
+        _private_equal(runtime.get(key), value)
+    if not isinstance(runtime.get("Health"), dict) or runtime["Health"].get("Status") != "healthy" or \
+            type(runtime.get("Pid")) is not int or runtime["Pid"] <= 0 or \
+            not isinstance(runtime.get("StartedAt"), str) or not runtime["StartedAt"] or \
+            runtime["StartedAt"] == "0001-01-01T00:00:00Z" or \
+            type(observed.get("RestartCount")) is not int or observed["RestartCount"] < 0 or \
+            not endpoint["EndpointID"]:
+        _fail("recovery")
+    return {
+        "containerId": observed["Id"], "imageId": image["Id"],
+        "configurationDigest": _configuration_digest({"Config": config, "HostConfig": host}),
+        "startedAt": runtime["StartedAt"], "pid": runtime["Pid"],
+        "restartCount": observed["RestartCount"], "endpoint": endpoint,
+    }
+
+
+def _resource_observation(observed: Any, role: dict[str, Any], stage: str) -> dict[str, Any]:
+    fields = {
+        "targetConfiguration", "postgresImageInspection", "projectInventory", "daemonInventory",
+        "composeInventory", "backendInventory", "containerInspections", "networkInventory",
+        "networkInspections", "volumeInventory", "volumeInspections",
+    }
+    if not isinstance(observed, dict) or set(observed) != fields:
+        _fail("recovery")
+    _resource_bytes(observed, MAX_INSPECTION_BYTES)
+    model = _resource_model(observed["targetConfiguration"], role["operationToken"])
+    containers: dict[str, Any] = {}
+    for container in _resource_list(observed["containerInspections"]):
+        _deadline_check()
+        if not isinstance(container, dict):
+            _fail("recovery")
+        identity = _resource_id(container.get("Id"))
+        if identity in containers:
+            _fail("recovery")
+        containers[identity] = container
+    daemon: dict[str, Any] = {}
+    members: dict[str, Any] = {}
+    for entry in _resource_list(observed["daemonInventory"]):
+        if not isinstance(entry, dict) or set(entry) != {"Id", "Names", "Labels"}:
+            _fail("recovery")
+        identity = _resource_id(entry["Id"])
+        labels = _resource_labels(entry["Labels"])
+        name = entry["Names"]
+        if identity in daemon or identity not in containers or not isinstance(name, str) or \
+                re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name) is None:
+            _fail("recovery")
+        container = containers[identity]
+        if container.get("Name") != "/" + name or not isinstance(container.get("Config"), dict):
+            _fail("recovery")
+        actual_labels = container["Config"].get("Labels")
+        if actual_labels is None:
+            actual_labels = {}
+        _private_equal(_resource_labels(actual_labels), labels)
+        daemon[identity] = entry
+        project = labels.get("com.docker.compose.project") == RESOURCE_PROJECT
+        reserved = name.startswith((RESOURCE_PROJECT + "-", RESOURCE_PROJECT + "_"))
+        if not project:
+            if reserved:
+                _fail("recovery")
+            continue
+        service = labels.get("com.docker.compose.service")
+        if service not in {"backend", "postgres"} or service in members or \
+                name != RESOURCE_PROJECT + "-" + service + "-1" or \
+                labels.get("com.docker.compose.container-number") != "1" or \
+                labels.get("com.docker.compose.oneoff") != "False":
+            _fail("recovery")
+        members[service] = container
+    if set(daemon) != set(containers) or len({item["Names"] for item in daemon.values()}) != len(daemon):
+        _fail("recovery")
+    project_ids = sorted(item["Id"] for item in members.values())
+    if _resource_ids(observed["projectInventory"]) != project_ids or \
+            _resource_ids(observed["composeInventory"]) != project_ids or "postgres" not in members:
+        _fail("recovery")
+    backend = members.get("backend")
+    backend_id = backend["Id"] if backend is not None else None
+    if _resource_ids(observed["backendInventory"]) != ([] if backend_id is None else [backend_id]):
+        _fail("recovery")
+    if stage in {"post-create", "completion"}:
+        if backend is None or backend_id in {
+            role["backendContainerId"], role["priorBackendContainerId"],
+        } or backend["Config"]["Labels"].get("org.meet.timepad.operation") != role["operationToken"]:
+            _fail("recovery")
+        runtime = backend.get("State")
+        if not isinstance(runtime, dict):
+            _fail("recovery")
+        for key, value in {
+            "Status": "created", "Running": False, "Paused": False, "Restarting": False,
+            "Dead": False, "OOMKilled": False, "Pid": 0, "ExitCode": 0, "Error": "",
+            "StartedAt": "0001-01-01T00:00:00Z", "FinishedAt": "0001-01-01T00:00:00Z",
+        }.items():
+            _private_equal(runtime.get(key), value)
+        _private_equal(backend.get("RestartCount"), 0)
+    elif backend_id != role["backendContainerId"] and not (
+        backend_id is None and role["allowEmptyBackend"]
+    ):
+        _fail("recovery")
+    if backend is not None and role["priorBackendContainerId"] is not None and \
+            backend["Config"]["Labels"].get("org.meet.timepad.operation") != role["operationToken"]:
+        _fail("recovery")
+    if stage == "pre-release" and backend is not None:
+        state, host = backend.get("State"), backend.get("HostConfig")
+        if not isinstance(state, dict) or not isinstance(host, dict) or \
+                state.get("Running") is not False or host.get("RestartPolicy") != {
+                    "Name": "no", "MaximumRetryCount": 0,
+                }:
+            _fail("recovery")
+        for key, value in {"Paused": False, "Restarting": False, "Dead": False, "Pid": 0}.items():
+            _private_equal(state.get(key), value)
+    network_entries = {}
+    for entry in _resource_list(observed["networkInventory"]):
+        if not isinstance(entry, dict) or set(entry) != {"ID", "Name", "Labels"}:
+            _fail("recovery")
+        identity = _resource_id(entry["ID"])
+        labels = _resource_labels(entry["Labels"])
+        name = entry["Name"]
+        if identity in network_entries or not isinstance(name, str) or not name:
+            _fail("recovery")
+        network_entries[identity] = entry
+        if labels.get("com.docker.compose.project") == RESOURCE_PROJECT and name != RESOURCE_NETWORK:
+            _fail("recovery")
+    networks = _resource_list(observed["networkInspections"])
+    matching = [item for item in network_entries.values() if item["Name"] == RESOURCE_NETWORK]
+    if len(networks) != 1 or len(matching) != 1:
+        _fail("recovery")
+    network, active_endpoints = _resource_network(networks[0])
+    if network["Id"] != matching[0]["ID"]:
+        _fail("recovery")
+    _private_equal(network["Labels"], matching[0]["Labels"])
+    volume_entries = {}
+    for entry in _resource_list(observed["volumeInventory"]):
+        if not isinstance(entry, dict) or set(entry) != {"Name", "Driver", "Labels"}:
+            _fail("recovery")
+        name, labels = entry["Name"], _resource_labels(entry["Labels"])
+        if not isinstance(name, str) or not name or name in volume_entries:
+            _fail("recovery")
+        volume_entries[name] = entry
+        if labels.get("com.docker.compose.project") == RESOURCE_PROJECT and name not in RESOURCE_VOLUMES.values():
+            _fail("recovery")
+    volumes = {}
+    for value in _resource_list(observed["volumeInspections"]):
+        if not isinstance(value, dict):
+            _fail("recovery")
+        logical = next((key for key, name in RESOURCE_VOLUMES.items() if name == value.get("Name")), None)
+        if logical is None or logical in volumes:
+            _fail("recovery")
+        volume = _resource_volume(value, logical)
+        if volume["Name"] not in volume_entries:
+            _fail("recovery")
+        _private_equal(volume_entries[volume["Name"]], {
+            "Name": volume["Name"], "Driver": volume["Driver"], "Labels": volume["Labels"],
+        })
+        volumes[logical] = volume
+    if set(volumes) != set(RESOURCE_VOLUMES) or \
+            len({value["Mountpoint"] for value in volumes.values()}) != 2:
+        _fail("recovery")
+    consumers: dict[str, list[str]] = {key: [] for key in RESOURCE_VOLUMES}
+    endpoints = {}
+    for identity, container in containers.items():
+        _deadline_check()
+        mounts = _resource_list(container.get("Mounts"))
+        service = next((key for key, member in members.items() if member["Id"] == identity), None)
+        if service == "postgres" and len(mounts) != 1:
+            _fail("recovery")
+        destinations = set()
+        for mount in mounts:
+            if not isinstance(mount, dict) or not isinstance(mount.get("Destination"), str) or \
+                    mount["Destination"] in destinations:
+                _fail("recovery")
+            destinations.add(mount["Destination"])
+            if service == "backend" and mount["Destination"] != "/data/uploads":
+                if mount["Destination"] == "/tmp" and mount.get("Type") == "tmpfs":
+                    pass
+                elif mount["Destination"] == CONTAINER_CREDENTIAL_PATH and \
+                        mount.get("Type") == "bind" and mount.get("Source") == HOST_CREDENTIAL_PATH and \
+                        mount.get("RW") is False:
+                    pass
+                else:
+                    _fail("recovery")
+            for logical, volume in volumes.items():
+                source = mount.get("Source")
+                if mount.get("Name") == volume["Name"] or (
+                    isinstance(source, str) and (
+                        source == volume["Mountpoint"] or source.startswith(volume["Mountpoint"] + "/")
+                    )
+                ):
+                    service = "backend" if logical == "uploads_data" else "postgres"
+                    if members.get(service, {}).get("Id") != identity or \
+                            mount.get("Type") != "volume" or mount.get("Name") != volume["Name"] or \
+                            mount.get("Source") != volume["Mountpoint"] or mount.get("Driver") != "local" or \
+                            mount.get("Destination") != (
+                                "/data/uploads" if logical == "uploads_data" else "/var/lib/postgresql/data"
+                            ) or mount.get("RW") is not True or mount.get("Propagation", "") != "" or \
+                            mount.get("Mode", "rw") not in ("", "rw"):
+                        _fail("recovery")
+                    consumers[logical].append(identity)
+        settings = container.get("NetworkSettings")
+        attached = settings.get("Networks") if isinstance(settings, dict) else None
+        if not isinstance(attached, dict) or len(attached) > MAX_RESOURCE_ENTRIES:
+            _fail("recovery")
+        if any(
+            not isinstance(name, str) or not name or not isinstance(value, dict)
+            for name, value in attached.items()
+        ):
+            _fail("recovery")
+        relevant = [name for name, value in attached.items() if name == RESOURCE_NETWORK or (
+            isinstance(value, dict) and value.get("NetworkID") == network["Id"]
+        )]
+        if relevant:
+            service = next((key for key, member in members.items() if member["Id"] == identity), None)
+            if service is None or set(attached) != {RESOURCE_NETWORK}:
+                _fail("recovery")
+            endpoints[identity] = _resource_endpoint(
+                attached[RESOURCE_NETWORK], identity=identity, service=service, network=network,
+            )
+        elif identity in project_ids:
+            _fail("recovery")
+    if sorted(consumers["postgres_data"]) != [members["postgres"]["Id"]] or \
+            sorted(consumers["uploads_data"]) != ([] if backend_id is None else [backend_id]):
+        _fail("recovery")
+    expected_active = {}
+    for identity, endpoint in endpoints.items():
+        if endpoint["EndpointID"]:
+            expected_active[identity] = {
+                "Name": containers[identity]["Name"][1:], "EndpointID": endpoint["EndpointID"],
+                "MacAddress": endpoint["MacAddress"],
+                "IPv4Address": endpoint["IPAddress"] + "/" + str(endpoint["IPPrefixLen"]),
+                "IPv6Address": "",
+            }
+    _private_equal(active_endpoints, expected_active)
+    if stage in {"pre-release", "post-create", "completion"} and backend_id is not None and \
+            endpoints[backend_id]["EndpointID"]:
+        _fail("recovery")
+    postgres = _resource_postgres(
+        members["postgres"], observed["postgresImageInspection"], model, endpoints[members["postgres"]["Id"]],
+    )
+    membership = {
+        "backendContainerId": backend_id, "projectInventory": project_ids,
+        "volumeConsumers": {key: sorted(value) for key, value in consumers.items()},
+        "endpoints": endpoints,
+    }
+    _resource_bytes(membership, MAX_RESOURCE_REQUEST_BYTES)
+    result = {
+        "schema": RESOURCE_BASELINE_SCHEMA,
+        "modelDigest": _model_digest(observed["targetConfiguration"]),
+        "postgres": postgres, "network": network, "volumes": volumes, "membership": membership,
+    }
+    _resource_bytes(result, MAX_RESOURCES_BYTES)
+    return result
+
+
+def _resource_admission(value: Any) -> dict[str, Any]:
+    """Pure bounded comparison; supplied role/baseline carry no independent authority."""
+    _resource_bytes(value, MAX_INSPECTION_BYTES)
+    fields = {
+        "schema", "baseline", "observed", "stage", "role", "requestBaseline", "expectedMembershipDigest",
+    }
+    if not isinstance(value, dict) or set(value) != fields or \
+            value["schema"] != RESOURCE_ADMISSION_SCHEMA or \
+            value["stage"] not in {
+                "prepared", "pre-release", "post-create", "completion", "recovery",
+            }:
+        _fail("recovery")
+    role = value["role"]
+    if not isinstance(role, dict) or set(role) != {
+        "operationToken", "backendContainerId", "priorBackendContainerId", "allowEmptyBackend",
+    } or not isinstance(role["operationToken"], str) or \
+            re.fullmatch(r"[a-f0-9]{32}", role["operationToken"]) is None or \
+            type(role["allowEmptyBackend"]) is not bool:
+        _fail("recovery")
+    for key in ("backendContainerId", "priorBackendContainerId"):
+        if role[key] is not None:
+            _resource_id(role[key])
+    if role["backendContainerId"] is None and not role["allowEmptyBackend"]:
+        _fail("recovery")
+    current = _resource_observation(value["observed"], role, value["stage"])
+    baseline = value["baseline"]
+    if value["stage"] == "prepared":
+        if baseline is not None or value["requestBaseline"] is not None or \
+                value["expectedMembershipDigest"] is not None or role["allowEmptyBackend"]:
+            _fail("recovery")
+        baseline = current
+    else:
+        if not isinstance(baseline, dict) or set(baseline) != set(current):
+            _fail("recovery")
+        _resource_bytes(baseline, MAX_RESOURCES_BYTES)
+        _private_equal(
+            {key: item for key, item in baseline.items() if key != "membership"},
+            {key: item for key, item in current.items() if key != "membership"},
+        )
+    membership = current["membership"]
+    expected = value["expectedMembershipDigest"]
+    membership_digest = _configuration_digest(membership)
+    if expected is not None and (
+        not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+        or expected != membership_digest
+    ):
+        _fail("recovery")
+    if value["stage"] in {"post-create", "completion"} or \
+            value["stage"] == "recovery" and value["requestBaseline"] is not None:
+        previous = value["requestBaseline"]
+        if not isinstance(previous, dict) or set(previous) != set(membership) or \
+                previous["backendContainerId"] not in (
+                    None, role["priorBackendContainerId"] if value["stage"] == "recovery"
+                    else role["backendContainerId"],
+                ):
+            _fail("recovery")
+        _resource_bytes(previous, MAX_RESOURCE_REQUEST_BYTES)
+        old, new = previous["backendContainerId"], membership["backendContainerId"]
+        if value["stage"] == "recovery" and (
+            role["allowEmptyBackend"] or old is None or new != role["backendContainerId"]
+        ):
+            _fail("recovery")
+        expected_previous = {
+            "backendContainerId": old,
+            "projectInventory": sorted([current["postgres"]["containerId"]] + ([] if old is None else [old])),
+            "volumeConsumers": {
+                "postgres_data": [current["postgres"]["containerId"]],
+                "uploads_data": [] if old is None else [old],
+            },
+            "endpoints": dict(membership["endpoints"]),
+        }
+        del expected_previous["endpoints"][new]
+        if old is not None:
+            old_endpoints = previous.get("endpoints")
+            if not isinstance(old_endpoints, dict) or old not in old_endpoints:
+                _fail("recovery")
+            old_endpoint = old_endpoints[old]
+            if not isinstance(old_endpoint, dict) or old_endpoint.get("EndpointID") != "" or \
+                    old_endpoint.get("IPAddress") != "":
+                _fail("recovery")
+            _private_equal(old_endpoint, _resource_endpoint(
+                old_endpoint, identity=old, service="backend", network=current["network"],
+            ))
+            expected_previous["endpoints"][old] = old_endpoint
+        elif not role["allowEmptyBackend"]:
+            _fail("recovery")
+        _private_equal(previous, expected_previous)
+    elif value["stage"] == "recovery":
+        if role["allowEmptyBackend"] or baseline["membership"]["backendContainerId"] is None or \
+                baseline["membership"]["backendContainerId"] != role["backendContainerId"]:
+            _fail("recovery")
+        _private_equal(membership, baseline["membership"])
+    elif value["requestBaseline"] is not None:
+        _fail("recovery")
+    _deadline_check()
+    return {
+        "baseline": baseline, "baselineDigest": _configuration_digest(baseline),
+        "membership": membership, "membershipDigest": membership_digest,
+    }
+
+
+def _read_resource_baseline(run_fd: int, digest: str) -> dict[str, Any]:
+    for temporary in (".timepad-resources.tmp", ".timepad-resource-request.tmp"):
+        try:
+            os.stat(temporary, dir_fd=run_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            _fail("recovery")
+    _, data = _read_child_file(run_fd, "timepad-resources.json", MAX_RESOURCES_BYTES)
+    value = _json(data, "recovery")
+    if not isinstance(value, dict) or value.get("schema") != RESOURCE_BASELINE_SCHEMA or \
+            _finalization_digest(data) != digest or data != _resource_bytes(value, MAX_RESOURCES_BYTES):
+        _fail("recovery")
+    return value
+
+
+def _read_resource_request(run_fd: int, digest: str) -> dict[str, Any]:
+    _, data = _read_child_file(run_fd, "timepad-resource-request.json", MAX_RESOURCE_REQUEST_BYTES)
+    value = _json(data, "recovery")
+    if not isinstance(value, dict) or _finalization_digest(data) != digest or \
+            data != _resource_bytes(value, MAX_RESOURCE_REQUEST_BYTES):
+        _fail("recovery")
+    return value
+
+
+def _resource_envelope(
+    *, stage: str, role: dict[str, Any], observed: Any, baseline: Any = None,
+    request_baseline: Any = None, expected_membership_digest: Any = None,
+) -> dict[str, Any]:
+    return {
+        "schema": RESOURCE_ADMISSION_SCHEMA, "stage": stage, "role": role,
+        "baseline": baseline, "observed": observed, "requestBaseline": request_baseline,
+        "expectedMembershipDigest": expected_membership_digest,
+    }
+
+
+def _resource_role(
+    current: dict[str, Any], proof: dict[str, Any], *, allow_empty: bool = False,
+) -> dict[str, Any]:
+    request = current.get("runtimeRequest")
+    replacement = current.get("commitSubstep", "").startswith("replacement-") \
+        if isinstance(current.get("commitSubstep"), str) else False
+    if isinstance(request, dict) and request.get("operation") == "create":
+        replacement = request["role"] == "replacement"
+        backend_id = request["priorContainerId"] if replacement else current["predecessorContainerId"]
+    else:
+        backend_id = current.get("containerId") if replacement else current["predecessorContainerId"]
+    return {
+        "operationToken": proof["operationToken"], "backendContainerId": backend_id,
+        "priorBackendContainerId": current["predecessorContainerId"] if replacement else None,
+        "allowEmptyBackend": allow_empty,
+    }
+
+
+def _resource_recovery_role(
+    current: dict[str, Any], proof: dict[str, Any], *,
+    request_baseline: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    request = current.get("runtimeRequest")
+    if current.get("phase") not in {
+        "CUTOVER_POSSIBLE", "VERIFYING", "RECOVERY_REQUIRED", "FORWARD_RECOVERING",
+        "COMMITTING", "COMMITTED",
+    } or current.get("containerId") is None:
+        _fail("recovery")
+    if isinstance(request, dict) and request.get("operation") == "create":
+        if (
+            request.get("lifecycle") != "bound"
+            or request.get("containerId") != current["containerId"]
+            or request.get("operationToken") != proof["operationToken"]
+            or request.get("preparedProofDigest") != current.get("preparedProofDigest")
+            or request.get("resourcesDigest") != proof["resourcesDigest"]
+            or request.get("role") not in {"initial", "replacement"}
+        ):
+            _fail("recovery")
+        request_prior_id = request.get("priorContainerId")
+        if request["role"] == "replacement" and \
+                request_prior_id != current.get("predecessorContainerId"):
+            _fail("recovery")
+        if request["role"] == "initial" and request_prior_id is not None:
+            _fail("recovery")
+        prior_id = request_prior_id or current.get("predecessorContainerId")
+    elif (
+        request_baseline is None
+        or not isinstance(request, dict)
+        or request.get("operation") not in {"suppress", "stop"}
+        or request.get("lifecycle") != "completed"
+        or request.get("containerId") != current["containerId"]
+        or request.get("configHash") != current.get("configHash")
+        or request_baseline.get("backendContainerId") != current.get("predecessorContainerId")
+    ):
+        _fail("recovery")
+    else:
+        prior_id = request_baseline["backendContainerId"]
+    return {
+        "operationToken": proof["operationToken"],
+        "backendContainerId": current["containerId"],
+        "priorBackendContainerId": prior_id,
+        "allowEmptyBackend": False,
+    }
+
+
+def _retained_create_completion(
+    run_fd: int, current: dict[str, Any], proof: dict[str, Any],
+    module: Any, state_root: str,
+) -> dict[str, Any]:
+    """Authenticate the acknowledged create after a later runtime request replaced it."""
+    request = current.get("runtimeRequest")
+    try:
+        request = module.runtime_request(request)
+        module.require_runtime_request_completion(current)
+    except (module.GuardError, TypeError, KeyError):
+        _fail("recovery")
+    if (
+        request["operation"] not in {"suppress", "stop"}
+        or request["containerId"] != current.get("containerId")
+        or request["configHash"] != current.get("configHash")
+        or request["imageId"] != current["target"]["tuple"]["platformImageId"]
+        or current.get("ownedChild") is not None
+        or current.get("phase") == "PREPARED"
+    ):
+        _fail("recovery")
+    lease = module._read_execution_lease_locked(state_root)
+    if lease is None or lease["createCompletion"] is None:
+        _fail("recovery")
+    try:
+        completion = module._create_completion_evidence(lease["createCompletion"])
+    except (module.GuardError, TypeError, KeyError):
+        _fail("recovery")
+    if (
+        completion["acknowledged"] is not True
+        or completion["resourcesDigest"] != proof["resourcesDigest"]
+        or lease["operation"] not in {"deploy", "forward-recover"}
+        or lease["originDigest"] != current["originDigest"]
+        or lease["incidentId"] != current["incidentId"]
+        or lease["operationEpoch"] != current["operationEpoch"]
+        or lease["attempt"] != current["executionAttempt"]
+        or completion["executionAttempt"] != lease["attempt"]
+        and lease["operation"] != "forward-recover"
+    ):
+        _fail("recovery")
+    receipt_name = (
+        "timepad-replacement-completion.json"
+        if isinstance(current.get("commitSubstep"), str)
+        and current["commitSubstep"].startswith("replacement-")
+        else "timepad-create-completion.json"
+    )
+    receipt = _read_child_file(
+        run_fd, receipt_name, module.MAX_CREATE_COMPLETION_BYTES,
+    )[1]
+    value = _json(receipt, "recovery")
+    expected = {
+        "schema": module.CREATE_COMPLETION_SCHEMA,
+        **{key: completion[key] for key in (
+            "requestDigest", "executionAttempt", "childIdentity", "resourcesDigest",
+            "resourceRequestDigest", "waitStatus", "uncancelled", "descendantsDrained",
+        )},
+    }
+    if (
+        value != expected
+        or receipt != module._canonical(expected)
+        or hashlib.sha256(receipt).hexdigest() != completion["receiptDigest"]
+    ):
+        _fail("recovery")
+    request_baseline = _read_resource_request(
+        run_fd, completion["resourceRequestDigest"],
+    )
+    if request_baseline["backendContainerId"] != current.get("predecessorContainerId"):
+        _fail("recovery")
+    return request_baseline
+
+
+def _recovery_candidate_runtime(
+    value: dict[str, Any], current: dict[str, Any], request: dict[str, Any],
+) -> None:
+    observed = value.get("observed")
+    containers = observed.get("containerInspections") if isinstance(observed, dict) else None
+    if not isinstance(containers, list):
+        _fail("recovery")
+    candidates = [
+        row for row in containers
+        if isinstance(row, dict) and row.get("Id") == current.get("containerId")
+    ]
+    if len(candidates) != 1:
+        _fail("recovery")
+    exact_target, _ = _live_resume_runtime(candidates[0], current, "runtime")
+    runtime = candidates[0].get("State")
+    host = candidates[0].get("HostConfig")
+    if (
+        not exact_target
+        or candidates[0].get("Id") != request.get("containerId")
+        or candidates[0].get("Config", {}).get("Labels", {}).get(
+            "com.docker.compose.config-hash"
+        ) != request.get("configHash")
+        or not isinstance(runtime, dict)
+        or not isinstance(host, dict)
+        or request["operation"] == "stop" and runtime.get("Running") is not False
+        or host.get("RestartPolicy", {}).get("Name") != "no"
+    ):
+        _fail("recovery")
+
+
+def _resource_admission_command(
+    run_key: str, state_root: str, state_kind: str, data: bytes, deploy_lock_fd: int,
+) -> None:
+    value = _json(data, "recovery")
+    if not isinstance(value, dict) or value.get("stage") == "prepared":
+        # Initial authority is established only by prepare-transition-proof.
+        _fail("recovery")
+    root_fd = _open_deploy_state_root(state_root)
+    try:
+        _lock_directory(root_fd)
+        module, _, current = _timepad_current(state_root, deploy_lock_fd)
+        if state_kind not in STATE_KINDS or current["runId"] != run_key or \
+                current["ownedRun"] != f"{run_key}-{state_kind}":
+            _fail("recovery")
+        run_fd = os.open(current["ownedRun"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            _lock_directory(run_fd)
+            _validate_state_directory_fd(run_fd, current["ownedRun"])
+            proof = _prepared_proof(run_fd, current)
+            baseline = _read_resource_baseline(run_fd, proof["resourcesDigest"])
+            # An absence-recovery authorization must be supplied by the existing
+            # private recovery path, not by this public JSON adapter.
+            if value.get("stage") == "recovery" and \
+                    current["phase"] == "PREPARED" and current.get("runtimeRequest") is None:
+                role = _resource_role(current, proof)
+                if role["backendContainerId"] is None:
+                    _fail("recovery")
+            elif value.get("stage") == "recovery":
+                request = current.get("runtimeRequest")
+                if isinstance(request, dict) and request.get("operation") in {"suppress", "stop"}:
+                    saved_request = _retained_create_completion(
+                        run_fd, current, proof, module, state_root,
+                    )
+                    _private_equal(value.get("requestBaseline"), saved_request)
+                    _recovery_candidate_runtime(value, current, request)
+                    role = _resource_recovery_role(
+                        current, proof, request_baseline=saved_request,
+                    )
+                else:
+                    role = _resource_recovery_role(current, proof)
+            else:
+                role = _resource_role(current, proof)
+            _private_equal(value.get("role"), role)
+            _private_equal(value.get("baseline"), baseline)
+            if value.get("stage") in {"post-create", "completion"}:
+                try:
+                    request = module.require_create_normal_completion(current)
+                except module.GuardError:
+                    _fail("recovery")
+                if request["resourcesDigest"] != proof["resourcesDigest"]:
+                    _fail("recovery")
+                _private_equal(value.get("requestBaseline"), _read_resource_request(
+                    run_fd, request["resourceRequestDigest"],
+                ))
+            elif value.get("stage") == "recovery":
+                request = current.get("runtimeRequest")
+                if isinstance(request, dict) and request.get("operation") in {"suppress", "stop"}:
+                    # _retained_create_completion authenticated this exact saved
+                    # request against the durable completion receipt and lease.
+                    pass
+                elif isinstance(request, dict) and request.get("operation") == "create":
+                    _private_equal(value.get("requestBaseline"), _read_resource_request(
+                        run_fd, request["resourceRequestDigest"],
+                    ))
+                elif value.get("requestBaseline") is not None:
+                    _fail("recovery")
+            elif value.get("expectedMembershipDigest") is not None:
+                _read_resource_request(run_fd, value["expectedMembershipDigest"])
+            result = _resource_admission(value)
+            _, _, final = _timepad_current(state_root, deploy_lock_fd)
+            if final != current:
+                _fail("recovery")
+            _deadline_check()
+            print(_resource_bytes(result, MAX_RESOURCES_BYTES + MAX_RESOURCE_REQUEST_BYTES + 1024).decode())
+        finally:
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _create_backend_model(configuration: Any, token: str) -> dict[str, Any]:
+    """Repository-specific effective model; this is not a general Compose translator."""
+    _model_digest(configuration)
+    if (
+        not isinstance(configuration, dict)
+        or set(configuration) - {"name", "services", "networks", "volumes", "x-bounded-logging"}
+        or configuration.get("name") != "meet-production"
+        or not isinstance(configuration.get("services"), dict)
+        or set(configuration["services"]) - {"backend", "postgres"}
+        or not isinstance(configuration["services"].get("backend"), dict)
+    ):
+        _fail("recovery")
+    backend = configuration["services"]["backend"]
+    allowed = {
+        "image", "pull_policy", "build", "environment", "depends_on", "ports", "volumes",
+        "user", "tmpfs", "read_only", "init", "cap_drop", "security_opt", "healthcheck",
+        "stop_grace_period", "mem_limit", "restart", "logging", "networks", "labels",
+    }
+    required = {
+        "image", "environment", "ports", "volumes", "user", "tmpfs", "read_only",
+        "init", "cap_drop", "security_opt", "healthcheck", "mem_limit", "restart",
+        "logging", "labels",
+    }
+    if not required <= backend.keys() or backend.keys() - allowed:
+        _fail("recovery")
+    if (
+        backend["user"] != "10001:10001" or backend["read_only"] is not True
+        or backend["init"] is not True or backend["cap_drop"] != ["ALL"]
+        or backend["security_opt"] != ["no-new-privileges:true"]
+        or backend["tmpfs"] != ["/tmp"] or backend["restart"] != "unless-stopped"
+        or backend.get("pull_policy", "never") != "never"
+        or backend.get("networks", {"default": None}) not in (
+            {"default": None}, {"default": {}},
+        )
+        or not isinstance(backend["labels"], dict)
+        or backend["labels"].get("org.meet.timepad.operation") != token
+        or any(not isinstance(k, str) or not isinstance(v, str)
+               for k, v in backend["labels"].items())
+        or any(key.startswith("com.docker.compose.") for key in backend["labels"])
+    ):
+        _fail("recovery")
+    dependency = backend.get("depends_on", {})
+    if dependency not in ({}, {"postgres": {"condition": "service_healthy", "required": True}},
+                          {"postgres": {"condition": "service_healthy"}}):
+        _fail("recovery")
+    for key, names in (
+        ("networks", {"default": "meet-production_default"}),
+        ("volumes", {"uploads_data": "meet-production_uploads_data",
+                     "postgres_data": "meet-production_postgres_data"}),
+    ):
+        resources = configuration.get(key, {})
+        if not isinstance(resources, dict) or resources.keys() - names.keys():
+            _fail("recovery")
+        for name, resource in resources.items():
+            if resource != {"name": names[name]}:
+                _fail("recovery")
+    _create_model_controls(backend)
+    return backend
+
+
+def _create_model_controls(backend: dict[str, Any]) -> None:
+    """Reject unsupported resource requests before Compose can create anything."""
+    if not isinstance(backend["environment"], dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in backend["environment"].items()
+    ):
+        _fail("recovery")
+    health = backend["healthcheck"]
+    if not isinstance(health, dict) or health.keys() - {
+        "test", "interval", "timeout", "retries", "start_period", "start_interval",
+    }:
+        _fail("recovery")
+    for key, value in health.items():
+        if key == "test":
+            if not isinstance(value, list) or not value \
+                    or any(not isinstance(item, str) for item in value) \
+                    or value[0] not in {"CMD", "CMD-SHELL"}:
+                _fail("recovery")
+        elif key == "retries":
+            if type(value) is not int or value < 1:
+                _fail("recovery")
+        else:
+            _create_duration(value)
+    if _create_duration(backend.get("stop_grace_period", "30s")) % 1000000000:
+        _fail("recovery")
+    if type(backend["mem_limit"]) is not int or backend["mem_limit"] <= 0:
+        _fail("recovery")
+    logging = backend["logging"]
+    if not isinstance(logging, dict) or set(logging) != {"driver", "options"} or \
+            logging["driver"] != "local" or not isinstance(logging["options"], dict) or \
+            set(logging["options"]) != {"max-size", "max-file"} or any(
+                not isinstance(value, str) or not value for value in logging["options"].values()
+            ):
+        _fail("recovery")
+    ports = backend["ports"]
+    if (
+        not isinstance(ports, list) or len(ports) != 1 or not isinstance(ports[0], dict)
+        or ports[0].keys() - {"mode", "host_ip", "target", "published", "protocol"}
+        or ports[0].get("host_ip") != "127.0.0.1" or type(ports[0].get("target")) is not int
+        or ports[0]["target"] != 8080 or ports[0].get("protocol", "tcp") != "tcp"
+        or ports[0].get("mode", "ingress") != "ingress"
+        or not isinstance(ports[0].get("published"), str)
+        or re.fullmatch(r"[1-9][0-9]{0,4}", ports[0]["published"]) is None
+        or int(ports[0]["published"]) > 65535
+    ):
+        _fail("recovery")
+    mounts = backend["volumes"]
+    if not isinstance(mounts, list) or len(mounts) not in {1, 2}:
+        _fail("recovery")
+    destinations = []
+    for mount in mounts:
+        if not isinstance(mount, dict) or mount not in (
+            {"type": "volume", "source": "uploads_data", "target": "/data/uploads"},
+            {"type": "volume", "source": "uploads_data", "target": "/data/uploads", "volume": {}},
+            {"type": "bind", "source": HOST_CREDENTIAL_PATH, "target": CONTAINER_CREDENTIAL_PATH,
+             "read_only": True, "bind": {"create_host_path": False}},
+        ):
+            _fail("recovery")
+        if mount["type"] == "bind" and (
+            mount["read_only"] is not True or mount["bind"]["create_host_path"] is not False
+        ):
+            _fail("recovery")
+        destinations.append(mount["target"])
+    if len(set(destinations)) != len(destinations) or "/data/uploads" not in destinations:
+        _fail("recovery")
+
+
+def _create_duration(value: Any) -> int:
+    if not isinstance(value, str):
+        _fail("recovery")
+    match = re.fullmatch(r"([0-9]{1,9})(ns|us|ms|s|m|h)", value)
+    if match is None:
+        _fail("recovery")
+    return int(match[1]) * {"ns": 1, "us": 1000, "ms": 1000000,
+                           "s": 1000000000, "m": 60000000000, "h": 3600000000000}[match[2]]
+
+
+def _create_runtime_configuration(
+    image: dict[str, Any], configuration: Any, observed: dict[str, Any], token: str,
+) -> None:
+    """Compare the private projections used by runtime invariants before any start."""
+    backend = _create_backend_model(configuration, token)
+    config, host = observed.get("Config"), observed.get("HostConfig")
+    image_config = image.get("Config")
+    if not all(isinstance(value, dict) for value in (config, host, image_config)):
+        _fail("recovery")
+    environment = dict(_env_entries(image))
+    environment.update(backend["environment"])
+    _private_equal(dict(_env_entries(observed)), environment)
+    for key in ("Entrypoint", "Cmd", "WorkingDir", "StopSignal"):
+        _private_equal(config.get(key), image_config.get(key))
+    _private_equal(config.get("Image"), backend["image"])
+    _private_equal(config.get("User"), backend["user"])
+    config_defaults = {
+        "Domainname": "", "AttachStdin": False, "AttachStdout": True, "AttachStderr": True,
+        "Tty": False, "OpenStdin": False, "StdinOnce": False, "OnBuild": None,
+        "NetworkDisabled": False, "MacAddress": "",
+    }
+    config_fields = {
+        "Image", "User", "Env", "Labels", "Entrypoint", "Cmd", "WorkingDir",
+        "StopSignal", "StopTimeout", "Healthcheck", "Volumes", "ExposedPorts", "Hostname",
+    }
+    if config.keys() - config_fields - config_defaults.keys():
+        _fail("recovery")
+    for key, value in config_defaults.items():
+        if key in config:
+            _private_equal(config[key], value)
+    if config.get("Hostname", observed["Id"][:12]) != observed["Id"][:12]:
+        _fail("recovery")
+    # Image-declared anonymous volumes would introduce unreviewed inheritance.
+    if image_config.get("Volumes") not in (None, {}) or config.get("Volumes") not in (None, {}):
+        _fail("recovery")
+    labels = config.get("Labels")
+    expected_labels = dict(image_config.get("Labels") or {})
+    expected_labels.update(backend["labels"])
+    compose_labels = {
+        "com.docker.compose.project": "meet-production",
+        "com.docker.compose.service": "backend",
+        "com.docker.compose.container-number": "1",
+        "com.docker.compose.oneoff": "False",
+        "com.docker.compose.version": "2.39.4",
+        "com.docker.compose.image": image["Id"],
+    }
+    if not isinstance(labels, dict):
+        _fail("recovery")
+    for key, value in {**expected_labels, **compose_labels}.items():
+        _private_equal(labels.get(key), value)
+    metadata = {
+        "com.docker.compose.config-hash", "com.docker.compose.depends_on",
+        "com.docker.compose.project.config_files", "com.docker.compose.project.working_dir",
+        "com.docker.compose.project.environment_file",
+    }
+    if labels.keys() - expected_labels.keys() - compose_labels.keys() - metadata:
+        _fail("recovery")
+    if any(not isinstance(value, str) or len(value) > 4096 for value in labels.values()):
+        _fail("recovery")
+    health = backend["healthcheck"]
+    expected_health = dict(image_config.get("Healthcheck") or {})
+    for key, value in health.items():
+        destination = {
+            "test": "Test", "interval": "Interval", "timeout": "Timeout",
+            "retries": "Retries", "start_period": "StartPeriod", "start_interval": "StartInterval",
+        }[key]
+        expected_health[destination] = value if key in {"test", "retries"} else _create_duration(value)
+    _private_equal(config.get("Healthcheck"), expected_health)
+    stop = _create_duration(backend.get("stop_grace_period", "30s"))
+    _private_equal(config.get("StopTimeout"), stop // 1000000000)
+    memory = backend["mem_limit"]
+    logging = backend["logging"]
+    expected_host = {
+        "ReadonlyRootfs": True, "Init": True, "CapDrop": ["ALL"],
+        "SecurityOpt": ["no-new-privileges:true"], "Tmpfs": {"/tmp": ""},
+        "Memory": memory, "LogConfig": {"Type": "local", "Config": logging["options"]},
+        "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
+        "NetworkMode": "meet-production_default",
+    }
+    # Every other supported host control must have its inert Engine default.
+    defaults = {
+        "Privileged": False, "PublishAllPorts": False, "AutoRemove": False,
+        "ReadonlyPaths": None, "MaskedPaths": None, "CapAdd": None, "Devices": None,
+        "DeviceCgroupRules": None, "DeviceRequests": None, "VolumesFrom": None,
+        "Links": None, "ExtraHosts": None, "GroupAdd": None, "Sysctls": None,
+        "Ulimits": None, "StorageOpt": None, "CgroupParent": "", "Cgroup": "",
+        "ContainerIDFile": "", "PidMode": "", "UTSMode": "", "UsernsMode": "",
+        "IpcMode": "private", "CgroupnsMode": "private", "Isolation": "",
+        "CpuShares": 0, "NanoCpus": 0, "CpuPeriod": 0, "CpuQuota": 0,
+        "CpuRealtimePeriod": 0, "CpuRealtimeRuntime": 0, "CpusetCpus": "",
+        "CpusetMems": "", "MemoryReservation": 0, "MemorySwap": memory * 2,
+        "MemorySwappiness": None, "OomKillDisable": None, "OomScoreAdj": 0,
+        "PidsLimit": None, "BlkioWeight": 0, "BlkioWeightDevice": None,
+        "BlkioDeviceReadBps": None, "BlkioDeviceWriteBps": None,
+        "BlkioDeviceReadIOps": None, "BlkioDeviceWriteIOps": None,
+        "Dns": [], "DnsOptions": [], "DnsSearch": [], "ShmSize": 67108864,
+        "Runtime": "runc", "ConsoleSize": [0, 0], "VolumeDriver": "",
+    }
+    # Engine's standard path restrictions are not arbitrary host controls.
+    defaults["MaskedPaths"] = [
+        "/proc/asound", "/proc/acpi", "/proc/interrupts", "/proc/kcore", "/proc/keys",
+        "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug",
+        "/proc/scsi", "/sys/firmware", "/sys/devices/virtual/powercap",
+    ]
+    defaults["ReadonlyPaths"] = [
+        "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
+    ]
+    for key, value in expected_host.items():
+        _private_equal(host.get(key), value)
+    for key, value in defaults.items():
+        if key in host:
+            if key in {"MaskedPaths", "ReadonlyPaths"}:
+                if not isinstance(host[key], list) or any(not isinstance(item, str) for item in host[key]):
+                    _fail("recovery")
+                _private_equal(sorted(host[key]), sorted(value))
+            else:
+                _private_equal(host[key], value)
+    if host.keys() - expected_host.keys() - defaults.keys() - {"Mounts", "Binds", "PortBindings"}:
+        _fail("recovery")
+    for key in ("Privileged", "CapAdd", "Devices", "DeviceRequests", "PidMode", "UsernsMode"):
+        if key not in host:
+            _fail("recovery")
+    ports = backend["ports"]
+    _private_equal(host.get("PortBindings"), {
+        "8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": ports[0]["published"]}],
+    })
+    _private_equal(config.get("ExposedPorts"), {"8080/tcp": {}})
+    mounts = []
+    binds = []
+    api_mounts = []
+    for mount in backend["volumes"]:
+        if not isinstance(mount, dict):
+            _fail("recovery")
+        if mount.get("type") == "volume":
+            if mount not in (
+                {"type": "volume", "source": "uploads_data", "target": "/data/uploads"},
+                {"type": "volume", "source": "uploads_data", "target": "/data/uploads", "volume": {}},
+            ):
+                _fail("recovery")
+            mounts.append(("volume", "meet-production_uploads_data", "/data/uploads", False, ""))
+            binds.append("meet-production_uploads_data:/data/uploads:rw")
+        elif mount == {
+            "type": "bind", "source": HOST_CREDENTIAL_PATH, "target": CONTAINER_CREDENTIAL_PATH,
+            "read_only": True, "bind": {"create_host_path": False},
+        }:
+            mounts.append(("bind", HOST_CREDENTIAL_PATH, CONTAINER_CREDENTIAL_PATH, True, "rprivate"))
+            api_mounts.append({
+                "Type": "bind", "Source": HOST_CREDENTIAL_PATH,
+                "Target": CONTAINER_CREDENTIAL_PATH, "ReadOnly": True, "BindOptions": {},
+            })
+        else:
+            _fail("recovery")
+    actual_mounts = []
+    for mount in _mounts(observed):
+        if type(mount.get("RW")) is not bool:
+            _fail("recovery")
+        actual_mounts.append((
+            mount.get("Type"), mount.get("Name") or mount.get("Source"),
+            mount.get("Destination"), not mount["RW"], mount.get("Propagation", ""),
+        ))
+    if len(mounts) != len(set(mounts)) or sorted(actual_mounts) != sorted(mounts):
+        _fail("recovery")
+    _private_equal(sorted(host.get("Binds") or []), sorted(binds))
+    _private_equal(host.get("Mounts") or [], api_mounts)
+    network = observed.get("NetworkSettings")
+    endpoints = network.get("Networks") if isinstance(network, dict) else None
+    if not isinstance(endpoints, dict) or set(endpoints) != {"meet-production_default"}:
+        _fail("recovery")
+    endpoint = endpoints["meet-production_default"]
+    if not isinstance(endpoint, dict) or any(endpoint.get(key) not in (None, {}, []) for key in (
+        "IPAMConfig", "Links", "DriverOpts",
+    )):
+        _fail("recovery")
+    _private_equal(sorted(endpoint.get("Aliases") or []), ["backend", "meet-production-backend-1"])
+    if endpoint.keys() - {
+        "IPAMConfig", "Links", "Aliases", "DriverOpts", "NetworkID", "EndpointID", "Gateway",
+        "IPAddress", "IPPrefixLen", "IPv6Gateway", "GlobalIPv6Address", "GlobalIPv6PrefixLen",
+        "MacAddress", "DNSNames", "GwPriority",
+    }:
+        _fail("recovery")
+    for key in ("EndpointID", "Gateway", "IPAddress", "IPv6Gateway", "GlobalIPv6Address", "MacAddress"):
+        if endpoint.get(key, "") != "":
+            _fail("recovery")
+    for key in ("IPPrefixLen", "GlobalIPv6PrefixLen", "GwPriority"):
+        _private_equal(endpoint.get(key, 0), 0)
+
+
+def _stopped_create_binding(
+    run_fd: int, current: dict[str, Any], image: dict[str, Any], configuration: Any,
+    observed: dict[str, Any], backend_inventory: Any, compose_inventory: Any,
+    *, completion_lease: dict[str, Any] | None, completion_receipt: bytes,
+    resource_evidence: Any = None, request_baseline: Any = None,
+) -> dict[str, Any]:
+    """Independent binding never supplies or repairs the supervisor completion acknowledgment."""
+    module = _timepad_state_module()
+    try:
+        request = module.require_create_normal_completion(current)
+        if completion_lease is None:
+            _fail("recovery")
+        module.validate_create_completion(
+            current, completion_lease, completion_receipt, acknowledged=True,
+        )
+    except module.GuardError:
+        _fail("recovery")
+    proof, _ = _prepared_target(run_fd, current, image, configuration)
+    _private_equal(
+        request_baseline, _read_resource_request(run_fd, request["resourceRequestDigest"]),
+    )
+    resources = _resource_admission(_resource_envelope(
+        stage="post-create", role=_resource_role(current, proof),
+        observed=resource_evidence,
+        baseline=_read_resource_baseline(run_fd, proof["resourcesDigest"]),
+        request_baseline=request_baseline,
+    ))
+    _private_equal(resource_evidence["targetConfiguration"], configuration)
+    _private_equal(
+        next(
+            item for item in resource_evidence["containerInspections"]
+            if item["Id"] == resources["membership"]["backendContainerId"]
+        ),
+        observed,
+    )
+    if request.get("resourcesDigest") != resources["baselineDigest"] or \
+            request.get("resourceRequestDigest") != _configuration_digest(request_baseline):
+        _fail("recovery")
+    if (
+        current["ownedChild"] is not None
+        or request["operationToken"] != proof["operationToken"]
+        or request["modelDigest"] != proof["modelDigest"]
+        or request["toolingDigest"] != proof["toolingDigest"]
+        or request["preparedProofDigest"] != current["preparedProofDigest"]
+    ):
+        _fail("recovery")
+    identity = observed.get("Id")
+    if (
+        not isinstance(identity, str) or re.fullmatch(r"[a-f0-9]{64}", identity) is None
+        or identity in {request["priorContainerId"], current["predecessorContainerId"]}
+        or backend_inventory != [identity]
+        or _resource_ids(compose_inventory) != resources["membership"]["projectInventory"]
+        or observed.get("Image") != "sha256:" + request["imageId"]
+        or observed.get("RestartCount") != 0
+    ):
+        _fail("recovery")
+    runtime = observed.get("State")
+    if not isinstance(runtime, dict):
+        _fail("recovery")
+    for key, value in {
+        "Status": "created", "Running": False, "Paused": False, "Restarting": False,
+        "Dead": False, "OOMKilled": False, "Pid": 0, "ExitCode": 0, "Error": "",
+        "StartedAt": "0001-01-01T00:00:00Z", "FinishedAt": "0001-01-01T00:00:00Z",
+    }.items():
+        _private_equal(runtime.get(key), value)
+    _create_runtime_configuration(image, configuration, observed, proof["operationToken"])
+    config_hash = observed["Config"]["Labels"].get("com.docker.compose.config-hash")
+    if not isinstance(config_hash, str) or re.fullmatch(r"[a-f0-9]{64}", config_hash) is None:
+        _fail("recovery")
+    if request["role"] == "replacement" and config_hash != current["configHash"]:
+        _fail("recovery")
+    if request["lifecycle"] == "bound" and (
+        request["containerId"] != identity or request["configHash"] != config_hash
+    ):
+        _fail("recovery")
+    _deadline_check()
+    return {
+        "requestNonce": request["nonce"], "containerId": identity,
+        "configHash": config_hash, "completionDigest": request["completionDigest"],
+        "resourcesDigest": resources["baselineDigest"],
+        "resourceRequestDigest": _configuration_digest(request_baseline),
+    }
+
+
 def _prepared_target(
     run_fd: int, current: dict[str, Any], image_value: Any, configuration: Any,
 ) -> tuple[dict[str, Any], dict[str, str]]:
@@ -3083,7 +4775,7 @@ def _prepared_target(
     image = _inspect(json.dumps(image_value, separators=(",", ":")).encode())
     effective = _absence_target_tuple(image, configuration, current)
     if (
-        proof["targetConfigurationDigest"] != _configuration_digest(configuration)
+        proof["targetConfigurationDigest"] != _model_digest(configuration)
         or proof["effectiveProviderDigest"] != _configuration_digest(effective)
     ):
         _fail("recovery")
@@ -3159,7 +4851,7 @@ def _prepare_transition_proof(
     value = _json(input_data, "recovery")
     if not isinstance(value, dict) or set(value) != {
         "schema", "evidence", "predecessorInspection", "imageInspection",
-        "targetConfiguration",
+        "targetConfiguration", "operationToken", "toolingDigest", "resourceEvidence",
     } or value["schema"] != PREPARED_INPUT_SCHEMA:
         _fail("recovery")
     evidence = value["evidence"]
@@ -3169,6 +4861,12 @@ def _prepare_transition_proof(
         "incidentId", "ownedRun", "toolingDigest",
     }
     if not isinstance(evidence, dict) or set(evidence) != required:
+        _fail("recovery")
+    if (
+        not isinstance(value["operationToken"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", value["operationToken"]) is None
+        or value["toolingDigest"] != evidence["toolingDigest"]
+    ):
         _fail("recovery")
     root_fd = _open_deploy_state_root(state_root)
     try:
@@ -3247,6 +4945,25 @@ def _prepare_transition_proof(
             _live_resume_predecessor(run_fd, current, inspect)
             image = _inspect(json.dumps(value["imageInspection"]).encode())
             effective = _absence_target_tuple(image, value["targetConfiguration"], current)
+            _create_backend_model(value["targetConfiguration"], value["operationToken"])
+            resources = _resource_admission(_resource_envelope(
+                stage="prepared",
+                role={
+                    "operationToken": value["operationToken"],
+                    "backendContainerId": current["predecessorContainerId"],
+                    "priorBackendContainerId": None, "allowEmptyBackend": False,
+                },
+                observed=value["resourceEvidence"],
+            ))
+            _private_equal(
+                value["resourceEvidence"]["targetConfiguration"], value["targetConfiguration"],
+            )
+            captured_predecessor = next(
+                item for item in value["resourceEvidence"]["containerInspections"]
+                if item["Id"] == current["predecessorContainerId"]
+            )
+            for key in ("Id", "Image", "Config", "HostConfig", "Mounts", "NetworkSettings"):
+                _private_equal(inspect.get(key), captured_predecessor.get(key))
             if effective != _effective_tuple(inspect):
                 _fail("recovery")
             provider = _prepared_transaction(run_key, state_root, inspect)
@@ -3259,12 +4976,27 @@ def _prepare_transition_proof(
                 "binding": {key: current[key] for key in PREPARED_BINDING},
                 "config": _prepared_config_records(run_fd),
                 "provider": provider,
-                "targetConfigurationDigest": _configuration_digest(value["targetConfiguration"]),
+                "targetConfigurationDigest": _model_digest(value["targetConfiguration"]),
                 "effectiveProviderDigest": _configuration_digest(effective),
+                "operationToken": value["operationToken"],
+                "modelDigest": _model_digest(value["targetConfiguration"]),
+                "toolingDigest": value["toolingDigest"],
+                "resourcesDigest": resources["baselineDigest"],
             }
             data = json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
             if len(data) > MAX_PREPARED_BYTES:
                 _fail("recovery")
+            resource_data = _resource_bytes(resources["baseline"], MAX_RESOURCES_BYTES)
+            try:
+                os.stat("timepad-resources.json", dir_fd=run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                _write_private_at(run_fd, ".timepad-resources.tmp", resource_data, 0o600)
+                _rename_noreplace(run_fd, ".timepad-resources.tmp", "timepad-resources.json")
+                _deadline_check()
+                os.fsync(run_fd)
+            _private_equal(
+                _read_resource_baseline(run_fd, resources["baselineDigest"]), resources["baseline"],
+            )
             for entry in proof["config"]:
                 fd = os.open(
                     entry["name"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -3288,6 +5020,7 @@ def _prepare_transition_proof(
             _deadline_check()
             sys.stdout.write(json.dumps({
                 "schemaVersion": 1, "preparedProofDigest": current["preparedProofDigest"],
+                "resourcesDigest": resources["baselineDigest"],
                 "outcome": "proof-prepared",
             }, separators=(",", ":")) + "\n")
         finally:
@@ -3847,6 +5580,7 @@ def _validate_live_resume(
 def _recovery_lease_runtime_proof(
     state_root: str, current: dict[str, Any], authorization: bytes,
     input_data: bytes, deploy_lock_fd: int, check: Callable[[], None],
+    *, create_completion_recovery: bool = False,
 ) -> dict[str, Any]:
     """Fixed registration-only proof before replacing stale execution ownership.
 
@@ -3855,6 +5589,123 @@ def _recovery_lease_runtime_proof(
     """
     module = _timepad_state_module()
     value = _json(input_data, "recovery")
+    if create_completion_recovery:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {
+                "inspection", "backendInventory", "composeInventory",
+                "imageInspection", "targetConfiguration", "resourceEvidence",
+                "requestBaseline",
+            }
+        ):
+            _fail("recovery")
+        authorization_value = _json(authorization, "recovery")
+        if not isinstance(authorization_value, dict):
+            _fail("recovery")
+        request = current.get("runtimeRequest")
+        if (
+            not isinstance(request, dict)
+            or request.get("operation") != "create"
+            or request.get("lifecycle") not in {"normal-completed", "bound"}
+            or current.get("phase") == "PREPARED"
+            or current.get("ownedChild") is not None
+            or request.get("role") not in {"initial", "replacement"}
+        ):
+            _fail("recovery")
+        if request["lifecycle"] == "normal-completed":
+            role_binding_matches = (
+                request["containerId"] is None
+                and request["configHash"] is None
+                and (
+                    request["role"] == "initial"
+                    and request["priorContainerId"] is None
+                    and current.get("containerId") is None
+                    and current.get("configHash") is None
+                    or request["role"] == "replacement"
+                    and isinstance(request["priorContainerId"], str)
+                    and current.get("containerId") == request["priorContainerId"]
+                    and isinstance(current.get("configHash"), str)
+                )
+            )
+        else:
+            role_binding_matches = (
+                request["containerId"] == current.get("containerId")
+                and request["configHash"] == current.get("configHash")
+                and isinstance(request["containerId"], str)
+                and (
+                    request["role"] == "initial"
+                    and request["priorContainerId"] is None
+                    or request["role"] == "replacement"
+                    and isinstance(request["priorContainerId"], str)
+                    and request["containerId"] != request["priorContainerId"]
+                )
+            )
+        if not role_binding_matches:
+            _fail("recovery")
+        observed = _inspect(
+            json.dumps(value["inspection"], separators=(",", ":")).encode()
+        )
+        if (
+            not isinstance(value["backendInventory"], list)
+            or len(value["backendInventory"]) != 1
+            or value["backendInventory"] != [observed.get("Id")]
+            or not isinstance(value["composeInventory"], list)
+            or len(value["composeInventory"]) > MAX_RESOURCE_ENTRIES
+        ):
+            _fail("recovery")
+        root_fd = _open_deploy_state_root(state_root)
+        try:
+            _lock_directory(root_fd)
+            module, origin, durable_current = _timepad_current(
+                state_root, deploy_lock_fd,
+            )
+            if durable_current != current:
+                _fail("recovery")
+            _resume_binding_authority(
+                authorization_value,
+                module=module,
+                origin=origin,
+                current=durable_current,
+                run_key=current["runId"],
+                state_kind=current["ownedRun"].removeprefix(current["runId"] + "-"),
+            )
+            lease = module._read_execution_lease_locked(state_root)
+            run_fd = os.open(
+                current["ownedRun"],
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+            try:
+                _lock_directory(run_fd)
+                _validate_state_directory_fd(run_fd, current["ownedRun"])
+                name = (
+                    "timepad-create-completion.json"
+                    if request["role"] == "initial"
+                    else "timepad-replacement-completion.json"
+                )
+                receipt = _read_child_file(
+                    run_fd, name, module.MAX_CREATE_COMPLETION_BYTES,
+                )[1]
+                _stopped_create_binding(
+                    run_fd, current,
+                    _inspect(json.dumps(
+                        value["imageInspection"], separators=(",", ":"),
+                    ).encode()),
+                    value["targetConfiguration"], observed,
+                    value["backendInventory"], value["composeInventory"],
+                    completion_lease=lease,
+                    completion_receipt=receipt,
+                    resource_evidence=value["resourceEvidence"],
+                    request_baseline=value["requestBaseline"],
+                )
+                if _timepad_current(state_root, deploy_lock_fd)[2] != current:
+                    _fail("recovery")
+            finally:
+                os.close(run_fd)
+        finally:
+            os.close(root_fd)
+        check()
+        return request
     if not isinstance(value, dict) or set(value) != {
         "inspection", "backendInventory", "composeInventory",
     } or value["backendInventory"] != [current["containerId"]] or \
@@ -5867,6 +7718,10 @@ RETENTION_CHILDREN = frozenset(
         OWNER_MARKER,
         "provider-finalization.json",
         "timepad-prepared.json",
+        "timepad-resources.json",
+        "timepad-resource-request.json",
+        "timepad-create-completion.json",
+        "timepad-replacement-completion.json",
         "timepad-commit-witness.json",
         "previous-active-compose.yml",
         "previous-active-compose.identity",
@@ -6166,6 +8021,7 @@ def _parser() -> argparse.ArgumentParser:
             "absence-resume",
             "prepare-transition-proof",
             "runtime-request-proof",
+            "resource-admission",
             "state-publish",
             "retention-list",
             "retention-check",
@@ -6265,6 +8121,12 @@ def _dispatch(args: argparse.Namespace) -> None:
             args.run_key, args.state_root, args.state_kind,
             _bounded_stdin(MAX_INSPECTION_BYTES), args.active_deploy_lock_fd,
         )
+    elif args.command == "resource-admission":
+        _run_key(args.run_key)
+        _resource_admission_command(
+            args.run_key, args.state_root, args.state_kind,
+            _bounded_stdin(MAX_INSPECTION_BYTES), args.active_deploy_lock_fd,
+        )
     elif args.command == "state-publish":
         _state_publish(args.state_root, args.run_key, args.state_kind)
     elif args.command == "retention-list":
@@ -6307,6 +8169,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "absence-resume",
             "prepare-transition-proof",
             "runtime-request-proof",
+            "resource-admission",
             "state-publish",
             "retention-list",
             "retention-check",
@@ -6314,9 +8177,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         }
         if args.deploy_lock_fd is not None and args.command not in lock_commands:
             _fail("recovery")
-        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof", "runtime-request-proof"} and args.deploy_lock_fd is None:
+        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof", "runtime-request-proof", "resource-admission"} and args.deploy_lock_fd is None:
             _fail("recovery")
-        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof", "runtime-request-proof"} and (
+        if args.command in {"live-resume", "absence-resume", "prepare-transition-proof", "runtime-request-proof", "resource-admission"} and (
             args.phase or args.outcome or args.protected_path
             or args.protected_state or args.retention_state
         ):

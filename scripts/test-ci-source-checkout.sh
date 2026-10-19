@@ -133,6 +133,8 @@ require 'source_sha, release_tag, release_version, and release_id must be suppli
   'release tuple validation'
 require 'python3 -B "$TOOLING_SCRIPTS/test-test-vps-timepad-supervisor.py"' \
   'isolated Linux supervisor acceptance command'
+require 'python3 -B "$TOOLING_SCRIPTS/test-test-vps-timepad-create.py"' \
+  'isolated Linux shared create-driver contract command'
 require 'timeout 900s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh"' \
   'bounded isolated supervisor fixture launcher'
 

@@ -338,6 +338,7 @@ jobs:
             scripts/test-vps-provider-credential.py
             scripts/test_vps_timepad_state.py
             scripts/test_vps_timepad_supervisor.py
+            scripts/test_vps_timepad_create.py
             scripts/test-vps-timepad-release-contracts.json
           )
           for file in "${files[@]}"; do
