@@ -4256,6 +4256,11 @@ class ProviderLiveGrantTests(unittest.TestCase):
                 deploy_lock_fd=9,
                 purpose="cleanup-stop-proof",
             )
+            self.module.check_execution_lease.side_effect = (
+                lambda root, **_kwargs: self.module.cleanup_request_admission(
+                    self.module._read_guard_locked(root)[1], self.lease,
+                )
+            )
             for command in ("prepare", "verify", "finish", "state-publish", "live-resume", "retention-delete"):
                 self.args.command = command
                 with self.subTest(command=command), self.assertRaises(helper.ProviderError):
