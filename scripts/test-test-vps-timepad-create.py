@@ -709,19 +709,28 @@ class LinuxBoundaries(unittest.TestCase):
                 os.close(write_fd)
 
     def test_real_wait_requires_zero_status(self):
-        # This tests the actual launcher wait, not a mocked wait status.
+        # Keep waitpid(-1) proof in an isolated process. Earlier Supervisor
+        # tests make this runner a subreaper, so unrelated fixture children
+        # must not be adopted by this wait test.
         for status in (0, 7):
             pid = os.fork()
             if pid == 0:
-                time.sleep(0.05)
-                os._exit(status)
-            start = create._process_start(pid)
-            child = create.SpawnedCreate(pid, os.pidfd_open(pid, 0), start)
-            if status == 0:
-                create.wait_create(child, context())
-            else:
-                with self.assertRaises(create.CreateError):
+                child_pid = os.fork()
+                if child_pid == 0:
+                    time.sleep(0.05)
+                    os._exit(status)
+                start = create._process_start(child_pid)
+                child = create.SpawnedCreate(
+                    child_pid, os.pidfd_open(child_pid, 0), start,
+                )
+                try:
                     create.wait_create(child, context())
+                except create.CreateError:
+                    os._exit(0 if status != 0 else 10)
+                os._exit(0 if status == 0 else 11)
+            waited, raw = os.waitpid(pid, 0)
+            self.assertEqual(pid, waited)
+            self.assertEqual(0, os.waitstatus_to_exitcode(raw))
 
 
 @unittest.skipUnless(sys.platform == "linux", "actual controller requires isolated Linux/root")

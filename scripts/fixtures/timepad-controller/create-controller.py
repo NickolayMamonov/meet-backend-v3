@@ -158,6 +158,9 @@ def run(case: Path, scenario: str) -> int:
 
     forward = scenario not in {"bootstrap", "bootstrap-mismatch", "deploy-blocked"}
     operation = "deploy" if forward or scenario == "deploy-blocked" else "bootstrap-guard"
+    # The release wrapper maps bootstrap-guard onto the deploy supervisor
+    # lifecycle; the guard operation remains in the controller arguments.
+    supervisor_operation = "deploy" if operation == "bootstrap-guard" else operation
     arguments = [
         "--root", str(case / "root"), "--base-compose", str(case / "compose.yml"),
         "--image", "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + "0" * 64,
@@ -194,7 +197,8 @@ def run(case: Path, scenario: str) -> int:
             supervisor._close_except({child.fileno()})
             os.environ["TIMEPAD_FIXTURE_DIAGNOSTICS"] = "1"
             instance = supervisor.Supervisor(
-                str(case / "state"), operation, arguments, child, create_transport=fake,
+                str(case / "state"), supervisor_operation, arguments, child,
+                create_transport=fake,
             )
             stage = "run"
             os._exit(instance.run())
