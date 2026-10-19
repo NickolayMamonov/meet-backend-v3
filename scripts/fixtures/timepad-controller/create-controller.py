@@ -22,6 +22,7 @@ import signal
 import re
 import sys
 import time
+import traceback
 
 
 def require(condition: bool, reason: str) -> None:
@@ -207,9 +208,20 @@ def run(case: Path, scenario: str) -> int:
                 re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", str(error)) else "OTHER"
             )
             safe_stage = stage if stage in {"construct", "run"} else "unknown"
+            safe_symbols = {
+                "Attempt", "Children", "__init__", "boot_id", "linux_preflight",
+                "process_identity", "reject",
+            }
+            symbols = [
+                frame.name if frame.name in safe_symbols else "other"
+                for frame in traceback.extract_tb(error.__traceback__)[-4:]
+            ]
             private(
                 case / "supervisor-error",
-                (safe_stage + ":" + safe_name + ":" + safe_reason + "\n").encode("ascii"),
+                (
+                    safe_stage + ":" + safe_name + ":" + safe_reason + ":" +
+                    ",".join(symbols) + "\n"
+                ).encode("ascii"),
             )
             os._exit(1)
     child.close()
