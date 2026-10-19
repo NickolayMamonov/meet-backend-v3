@@ -3855,6 +3855,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "TIMEPAD_FIXTURE_CASE": str(case),
                     "TIMEPAD_FIXTURE_ADAPTER_DIR": str(ROOT / "fixtures/timepad-controller"),
                     "TIMEPAD_FIXTURE_DOCKER_LOG": str(case / "docker.log"),
+                    "TIMEPAD_FIXTURE_EXPECTED_DOCKER": str(bin_path / "docker"),
+                    "TIMEPAD_FIXTURE_EXPECTED_DOCKER_LOG": str(case / "docker.log"),
                     "TIMEPAD_FIXTURE_DIAGNOSTICS": "1",
                     "TEST_VPS_STATE_ROOT": str(state_root),
                 })
@@ -3880,6 +3882,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         (case / "recovery-transport-events").read_text()
                         if (case / "recovery-transport-events").exists() else "<no transport calls>"
                     )
+                    self.assertIn("fixture_timepad_guard=WORKER_DOCKER_PATH_MATCH", result.stderr)
+                    self.assertIn("fixture_timepad_guard=WORKER_DOCKER_LOG_MATCH", result.stderr)
                     self.assertEqual(
                         1, result.returncode,
                         result.stdout + result.stderr + "\ntransport=" + transport_trace,
@@ -4030,6 +4034,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "TIMEPAD_FIXTURE_CASE": str(case),
                     "TIMEPAD_FIXTURE_ADAPTER_DIR": str(ROOT / "fixtures/timepad-controller"),
                     "TIMEPAD_FIXTURE_DOCKER_LOG": str(case / "docker.log"),
+                    "TIMEPAD_FIXTURE_EXPECTED_DOCKER": str(bin_path / "docker"),
+                    "TIMEPAD_FIXTURE_EXPECTED_DOCKER_LOG": str(case / "docker.log"),
                     "TIMEPAD_FIXTURE_DIAGNOSTICS": "1",
                     "TEST_VPS_STATE_ROOT": str(state_root),
                 })
@@ -4055,6 +4061,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     (case / "recovery-transport-events").read_text()
                     if (case / "recovery-transport-events").exists() else "<no transport calls>"
                 )
+                self.assertIn("fixture_timepad_guard=WORKER_DOCKER_PATH_MATCH", result.stderr)
+                self.assertIn("fixture_timepad_guard=WORKER_DOCKER_LOG_MATCH", result.stderr)
                 self.assertEqual(
                     1, result.returncode,
                     result.stdout + result.stderr + "\ntransport=" + transport_trace,

@@ -1411,7 +1411,16 @@ rollback() {
 }
 
 docker_image_inspect() {
-  timeout 30s docker image inspect "$@" 2>/dev/null
+  timeout 30s docker image inspect "$@" 2>/dev/null || {
+    if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
+      if command -v docker >/dev/null 2>&1; then
+        echo "fixture_timepad_guard=DOCKER_IMAGE_INSPECT_FAILED" >&2
+      else
+        echo "fixture_timepad_guard=DOCKER_CLI_UNAVAILABLE" >&2
+      fi
+    fi
+    return 1
+  }
 }
 
 docker_container_inspect() {
@@ -2402,6 +2411,18 @@ if [ "$operation" = forward-recover ]; then
   state=$recovery_state_dir
   run_key=$recovery_run_key
   state_suffix=$recovery_state_suffix
+  if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
+    if [ "$(command -v docker 2>/dev/null || :)" = "${TIMEPAD_FIXTURE_EXPECTED_DOCKER:-}" ]; then
+      echo "fixture_timepad_guard=WORKER_DOCKER_PATH_MATCH" >&2
+    else
+      echo "fixture_timepad_guard=WORKER_DOCKER_PATH_MISMATCH" >&2
+    fi
+    if [ "${TIMEPAD_FIXTURE_DOCKER_LOG:-}" = "${TIMEPAD_FIXTURE_EXPECTED_DOCKER_LOG:-}" ]; then
+      echo "fixture_timepad_guard=WORKER_DOCKER_LOG_MATCH" >&2
+    else
+      echo "fixture_timepad_guard=WORKER_DOCKER_LOG_MISMATCH" >&2
+    fi
+  fi
 
   # Recovery is deliberately dispatched before retention, state publication,
   # configuration updates, or Compose creation. An acknowledged create may
