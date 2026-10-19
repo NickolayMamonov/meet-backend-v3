@@ -3881,6 +3881,45 @@ class StaleRecoveryControllerTests(unittest.TestCase):
             if len(line) <= 512 and line.startswith(prefixes)
         ][-12:]
 
+    @staticmethod
+    def fixture_process_tree(root_pid):
+        pending = [root_pid]
+        seen = set()
+        facts = []
+        while pending and len(seen) < 32:
+            pid = pending.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            proc = pathlib.Path("/proc") / str(pid)
+            try:
+                stat = (proc / "stat").read_bytes()
+                fields = stat[stat.rfind(b")") + 2:].split()
+                children = (proc / "task" / str(pid) / "children").read_text().split()
+                fd_count = 0
+                pipe_count = 0
+                for descriptor in os.scandir(proc / "fd"):
+                    if fd_count == 256:
+                        break
+                    fd_count += 1
+                    try:
+                        pipe_count += os.readlink(descriptor.path).startswith("pipe:[")
+                    except OSError:
+                        pass
+                facts.append({
+                    "present": True,
+                    "state": fields[0].decode("ascii") if fields and fields[0] in {
+                        b"R", b"S", b"D", b"T", b"t", b"Z", b"X", b"I",
+                    } else "other",
+                    "childCount": min(len(children), 32),
+                    "fdCount": fd_count,
+                    "pipeCount": pipe_count,
+                })
+                pending.extend(int(child) for child in children[:32] if child.isdecimal())
+            except (OSError, ValueError, IndexError):
+                facts.append({"present": False})
+        return {"processCount": len(facts), "truncated": bool(pending), "processes": facts}
+
     def assert_unresolved_interlock(self, root, attempt, supervisor):
         try:
             with state.deploy_lock(root) as lock_fd:
@@ -4156,29 +4195,52 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "--recovery-binding-digest", current["evidenceDigest"],
                     "--recovery-action", "retry-exact-candidate",
                 ]
+                # A detached fail-closed supervisor may intentionally outlive
+                # the relay. File-backed, size-limited capture lets the wrapper
+                # exit without waiting for inherited stdout/stderr pipe EOF.
+                stdout_capture = tempfile.TemporaryFile()
+                stderr_capture = tempfile.TemporaryFile()
+                wrapper = None
                 try:
-                    result = subprocess.run(
-                        command, env=environment, capture_output=True, text=True,
-                        timeout=130, check=False,
+                    wrapper = subprocess.Popen(
+                        command, env=environment, stdout=stdout_capture, stderr=stderr_capture,
+                        preexec_fn=lambda: __import__("resource").setrlimit(
+                            __import__("resource").RLIMIT_FSIZE, (65536, 65536),
+                        ),
                     )
-                except subprocess.TimeoutExpired as error:
-                    # subprocess.run has reaped the command it owns. The
-                    # persisted lease lets this fixture report whether the
-                    # supervisor/worker remains alive, owns FD9, or has open
-                    # channels without exposing raw state or process data.
-                    diagnostic = self.timeout_evidence(state_root)
-                    diagnostic["phase"] = phase
-                    diagnostic["fault"] = fault
-                    diagnostic["timeoutSeconds"] = 130
-                    diagnostic["supervisorTrace"] = self.timeout_trace(error)
-                    diagnostic_text = json.dumps(
-                        diagnostic, sort_keys=True, separators=(",", ":"),
+                    try:
+                        returncode = wrapper.wait(timeout=130)
+                    except subprocess.TimeoutExpired:
+                        tree = self.fixture_process_tree(wrapper.pid)
+                        stderr_capture.seek(0)
+                        captured_stderr = stderr_capture.read(65536)
+                        error = subprocess.TimeoutExpired(command, 130, stderr=captured_stderr)
+                        diagnostic = self.timeout_evidence(state_root)
+                        diagnostic.update({
+                            "wrapperTree": tree,
+                            "wrapperPidPresent": os.path.exists("/proc/" + str(wrapper.pid)),
+                            "phase": phase,
+                            "fault": fault,
+                            "timeoutSeconds": 130,
+                            "supervisorTrace": self.timeout_trace(error),
+                        })
+                        diagnostic_text = json.dumps(
+                            diagnostic, sort_keys=True, separators=(",", ":"),
+                        )
+                        print("FIXTURE_RECOVERY_TIMEOUT " + diagnostic_text, file=sys.stderr, flush=True)
+                        wrapper.kill()
+                        wrapper.wait(timeout=5)
+                        self.fail("bounded recovery attempt timed out: " + diagnostic_text)
+                    stdout_capture.seek(0)
+                    stderr_capture.seek(0)
+                    result = subprocess.CompletedProcess(
+                        command, returncode,
+                        stdout_capture.read(65536).decode("utf-8", errors="replace"),
+                        stderr_capture.read(65536).decode("utf-8", errors="replace"),
                     )
-                    print(
-                        "FIXTURE_RECOVERY_TIMEOUT " + diagnostic_text,
-                        file=sys.stderr, flush=True,
-                    )
-                    self.fail("bounded recovery attempt timed out: " + diagnostic_text)
+                finally:
+                    stdout_capture.close()
+                    stderr_capture.close()
                 log_path = case / "docker.log"
                 log = log_path.read_text().splitlines() if log_path.exists() else []
                 starts = [line for line in log if line.startswith("start-id:")]
