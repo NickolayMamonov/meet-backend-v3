@@ -1197,28 +1197,37 @@ class CreateDriver:
 
     def recovery_evidence(self) -> tuple[dict[str, Any], bytes]:
         """Read-only collection; register-recovery remains the only adopter/writer."""
+        self.context.check_time()
         with guard.deploy_lock(self.context.state_root, 9), self.provider._operation_deadline(self.context.end_ns):
             origin, current = guard._read_guard_locked(self.context.state_root)
             self._recovery_authority(origin, current)
             self.context = replace(self.context, run_name=current["ownedRun"])
             before = self.context.input_identities()
-            model, _ = self._models(installed=current["phase"] != "PREPARED", stage=Stage.RENDER)
-            observed, image = self._observations(model)
-            with self._run_fd() as fd:
-                proof = self.provider._prepared_proof(fd, current)
-                self.provider._prepared_target(fd, current, image, model)
-                self.provider._prepared_environment(fd, current)
-                request = current["runtimeRequest"]
-                membership = (
-                    self.provider._read_resource_request(fd, request["resourceRequestDigest"])
-                    if request is not None and request["operation"] == "create" else None
-                )
             request = current["runtimeRequest"]
-            if request is not None and request["operation"] == "create":
+            creating = request is not None and request["operation"] == "create"
+            if creating:
+                model, tooling = self._models(installed=current["phase"] != "PREPARED", stage=Stage.RENDER)
+                observed, image = self._observations(model)
+                with self._run_fd() as fd:
+                    self.provider._prepared_proof(fd, current)
+                    self.provider._prepared_target(fd, current, image, model)
+                    self.provider._prepared_environment(fd, current)
+                    membership = self.provider._read_resource_request(fd, request["resourceRequestDigest"])
                 if request["lifecycle"] not in {"normal-completed", "bound"}:
                     refuse("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
                 identity = observed["backendInventory"][0] if len(observed["backendInventory"]) == 1 else None
             else:
+                # Historical synchronous requests have live-resume proofs, not
+                # create model/resource receipts. Registration still repeats
+                # their request-specific proof before adopting ownership.
+                if request is None or current["phase"] == "PREPARED":
+                    refuse("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+                tooling = validate_tooling(self.transport.identity(Stage.RENDER, self.context), _contract())
+                value = parse(self.transport.observe(self.context), MAX_EVIDENCE)
+                if not isinstance(value, dict) or set(value) != {"resources", "imageInspection"} or \
+                        not isinstance(value["resources"], dict):
+                    refuse()
+                observed = value["resources"]
                 identity = current["containerId"]
             inspection = [item for item in observed["containerInspections"] if item["Id"] == identity]
             if len(inspection) != 1:
@@ -1227,11 +1236,25 @@ class CreateDriver:
                 "inspection": inspection, "backendInventory": observed["backendInventory"],
                 "composeInventory": observed["composeInventory"],
             }
-            if request is not None and request["operation"] == "create":
+            if creating:
                 evidence.update(
                     imageInspection=image, targetConfiguration=model,
                     resourceEvidence=observed, requestBaseline=membership,
                 )
+            else:
+                root_fd = guard._open_root(self.context.state_root)
+                try:
+                    authorization = guard._read_at(
+                        root_fd, "timepad-recovery-authorization.json", guard.MAX_AUTHORIZATION_BYTES,
+                    )
+                finally:
+                    os.close(root_fd)
+                self.provider._recovery_lease_runtime_proof(
+                    self.context.state_root, current, authorization,
+                    canonical(evidence, guard.MAX_RECOVERY_RUNTIME_BYTES), 9, self.context.check_time,
+                )
+            if validate_tooling(self.transport.identity(Stage.RENDER, self.context), _contract()) != tooling:
+                refuse("TOOLING_OR_MODEL_UNAVAILABLE")
             if guard._read_guard_locked(self.context.state_root)[1] != current or before != self.context.input_identities():
                 refuse()
             self.context.check_time()

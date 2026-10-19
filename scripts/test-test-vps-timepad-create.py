@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from contextlib import ExitStack, nullcontext
 from dataclasses import FrozenInstanceError, replace
 import hashlib
 import os
@@ -64,6 +65,176 @@ def tooling() -> tuple[create.ToolingObservation, dict]:
 
 
 class Contracts(unittest.TestCase):
+    def recovery_case(self, stack, *, operation="stop", lifecycle="completed"):
+        """Portable branch test only; kernel/registration proof is not mocked acceptance."""
+        observed_tooling, contract = tooling()
+        current = {
+            "ownedRun": context().run_name, "phase": "VERIFYING",
+            "containerId": "e" * 64, "runtimeRequest": {
+                "operation": operation, "lifecycle": lifecycle, "resourceRequestDigest": "f" * 64,
+            },
+        }
+        inspection = {"Id": current["containerId"]}
+        resources = {
+            "containerInspections": [inspection], "backendInventory": [inspection["Id"]],
+            "composeInventory": [inspection["Id"]],
+        }
+        transport = mock.Mock(spec=create.Transport)
+        transport.identity.return_value = observed_tooling
+        transport.observe.return_value = create.canonical({
+            "resources": resources, "imageInspection": [],
+        }, create.MAX_EVIDENCE)
+        provider = mock.Mock()
+        provider._operation_deadline.side_effect = lambda _: nullcontext()
+        stack.enter_context(mock.patch.object(create, "_provider", return_value=provider))
+        stack.enter_context(mock.patch.object(create, "_contract", return_value=contract))
+        stack.enter_context(mock.patch.object(create.guard, "deploy_lock", return_value=nullcontext()))
+        state_read = stack.enter_context(mock.patch.object(
+            create.guard, "_read_guard_locked", return_value=({}, current),
+        ))
+        inputs = stack.enter_context(mock.patch.object(
+            create.CreateContext, "input_identities", return_value=("one", "two", "three"),
+        ))
+        stack.enter_context(mock.patch.object(create.guard, "_open_root", return_value=123))
+        stack.enter_context(mock.patch.object(create.guard, "_read_at", return_value=b"authorization"))
+        stack.enter_context(mock.patch.object(create.os, "close"))
+        binding = stack.enter_context(mock.patch.object(create, "recovery_binding", return_value={"bound": True}))
+        driver = create.CreateDriver(context(), transport, mock.Mock(attempt="a" * 32))
+        stack.enter_context(mock.patch.object(driver, "_recovery_authority"))
+        models = stack.enter_context(mock.patch.object(
+            driver, "_models", return_value=({}, create.validate_tooling(observed_tooling, contract)),
+        ))
+        stack.enter_context(mock.patch.object(driver, "_run_fd", return_value=nullcontext(321)))
+        return driver, provider, transport, current, resources, models, inputs, state_read, binding
+
+    def test_legacy_evidence_uses_pinned_observation_and_strict_request_proof_only(self):
+        for operation in ("suppress", "stop", "start", "restore-policy"):
+            for lifecycle in ("acknowledged", "completed"):
+                with self.subTest(operation=operation, lifecycle=lifecycle), ExitStack() as stack:
+                    driver, provider, transport, current, resources, models, *_ = self.recovery_case(
+                        stack, operation=operation, lifecycle=lifecycle,
+                    )
+                    binding, raw = driver.recovery_evidence()
+                    self.assertEqual({"bound": True}, binding)
+                    evidence = create.parse(raw, create.guard.MAX_RECOVERY_RUNTIME_BYTES)
+                    self.assertEqual({
+                        "inspection": resources["containerInspections"],
+                        "backendInventory": resources["backendInventory"],
+                        "composeInventory": resources["composeInventory"],
+                    }, evidence)
+                    provider._recovery_lease_runtime_proof.assert_called_once_with(
+                        driver.context.state_root, current, b"authorization", raw, 9, driver.context.check_time,
+                    )
+                    self.assertEqual(2, transport.identity.call_count)
+                    transport.observe.assert_called_once_with(driver.context)
+                    models.assert_not_called()
+                    transport.render.assert_not_called()
+                    transport.spawn_create.assert_not_called()
+                    provider._prepared_proof.assert_not_called()
+                    provider._prepared_target.assert_not_called()
+                    provider._prepared_environment.assert_not_called()
+                    provider._read_resource_request.assert_not_called()
+
+    def test_legacy_evidence_refuses_proof_tooling_inputs_state_and_inventory_uncertainty(self):
+        for fault in (
+            "proof", "missing-pin", "changed-pin", "inputs", "state",
+            "missing-request", "prepared", "foreign", "duplicate", "expired",
+        ):
+            with self.subTest(fault=fault), ExitStack() as stack:
+                driver, provider, transport, current, resources, _, inputs, state_read, binding = self.recovery_case(stack)
+                if fault == "proof":
+                    provider._recovery_lease_runtime_proof.side_effect = create.CreateError("proof refused")
+                elif fault == "missing-pin":
+                    stack.enter_context(mock.patch.object(create, "_contract", return_value={}))
+                elif fault == "changed-pin":
+                    first = transport.identity.return_value
+                    transport.identity.side_effect = [first, replace(first, socket_identity=(2, *first.socket_identity[1:]))]
+                elif fault == "inputs":
+                    inputs.side_effect = [("one",), ("changed",)]
+                elif fault == "state":
+                    state_read.side_effect = [({}, current), ({}, dict(current, phase="COMMITTING"))]
+                elif fault == "missing-request":
+                    current["runtimeRequest"] = None
+                elif fault == "prepared":
+                    current["phase"] = "PREPARED"
+                elif fault in {"foreign", "duplicate"}:
+                    resources["containerInspections"] = (
+                        [{"Id": "f" * 64}] if fault == "foreign"
+                        else resources["containerInspections"] * 2
+                    )
+                    transport.observe.return_value = create.canonical({
+                        "resources": resources, "imageInspection": [],
+                    }, create.MAX_EVIDENCE)
+                elif fault == "expired":
+                    driver.context = replace(driver.context, end_ns=time.monotonic_ns() - 1)
+                with self.assertRaises(create.CreateError):
+                    driver.recovery_evidence()
+                binding.assert_not_called()
+                transport.spawn_create.assert_not_called()
+                if fault in {"missing-pin", "missing-request", "prepared", "expired"}:
+                    transport.observe.assert_not_called()
+
+    def test_create_evidence_retains_frozen_model_prepared_and_resource_checks(self):
+        for lifecycle in ("normal-completed", "bound", "intent"):
+            with self.subTest(lifecycle=lifecycle), ExitStack() as stack:
+                driver, provider, transport, current, resources, models, *_ = self.recovery_case(
+                    stack, operation="create", lifecycle=lifecycle,
+                )
+                stack.enter_context(mock.patch.object(driver, "_observations", return_value=(resources, [])))
+                provider._read_resource_request.return_value = {"membership": "frozen"}
+                if lifecycle == "intent":
+                    with self.assertRaisesRegex(create.CreateError, "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"):
+                        driver.recovery_evidence()
+                else:
+                    _, raw = driver.recovery_evidence()
+                    evidence = create.parse(raw, create.guard.MAX_RECOVERY_RUNTIME_BYTES)
+                    self.assertEqual({"membership": "frozen"}, evidence["requestBaseline"])
+                    self.assertEqual(resources, evidence["resourceEvidence"])
+                    self.assertIn("targetConfiguration", evidence)
+                    self.assertIn("imageInspection", evidence)
+                models.assert_called_once_with(installed=True, stage=create.Stage.RENDER)
+                provider._prepared_proof.assert_called_once_with(321, current)
+                provider._prepared_target.assert_called_once_with(321, current, [], {})
+                provider._prepared_environment.assert_called_once_with(321, current)
+                provider._read_resource_request.assert_called_once_with(321, "f" * 64)
+                provider._recovery_lease_runtime_proof.assert_not_called()
+                transport.spawn_create.assert_not_called()
+
+    def test_recovery_binding_preserves_legacy_request_context_and_all_frozen_inputs(self):
+        value = context()
+        current = {
+            "ownedRun": value.run_name, "originDigest": "a" * 64, "incidentId": "b" * 32,
+            "operationEpoch": 1, "runtimeRequest": {"operation": "stop", "sequence": 1},
+            "preparedProofDigest": "c" * 64,
+        }
+        with mock.patch.object(create.guard, "deploy_lock", return_value=nullcontext()), \
+                mock.patch.object(create.guard, "_read_guard_locked", return_value=({}, current)) as read, \
+                mock.patch.object(create.CreateContext, "input_identities", return_value=("one", "two", "three")) as inputs:
+            original = create.recovery_binding(value, "d" * 32)
+            self.assertEqual("a" * 64, original["originDigest"])
+            self.assertEqual("b" * 32, original["incidentId"])
+            self.assertEqual(1, original["operationEpoch"])
+            self.assertEqual("d" * 32, original["attempt"])
+            self.assertEqual("c" * 64, original["preparedProofDigest"])
+            self.assertEqual(value.end_ns, original["endNs"])
+            self.assertEqual(hashlib.sha256(create.canonical(current["runtimeRequest"], 4096)).hexdigest(),
+                             original["requestDigest"])
+            for index in range(3):
+                changed = ["one", "two", "three"]
+                changed[index] = "changed"
+                inputs.return_value = tuple(changed)
+                self.assertNotEqual(original["inputDigest"], create.recovery_binding(value, "d" * 32)["inputDigest"])
+            inputs.return_value = ("one", "two", "three")
+            changed_context = replace(value, selection=replace(value.selection, recovery_run="other-run"))
+            self.assertNotEqual(original["contextDigest"], create.recovery_binding(changed_context, "d" * 32)["contextDigest"])
+            inputs.side_effect = [("one", "two", "three"), ("one", "two", "changed")]
+            with self.assertRaises(create.CreateError):
+                create.recovery_binding(value, "d" * 32)
+            inputs.side_effect = None
+            read.side_effect = [({}, current), ({}, dict(current, operationEpoch=2))]
+            with self.assertRaises(create.CreateError):
+                create.recovery_binding(value, "d" * 32)
+
     def shell_functions(self, *names: str) -> str:
         source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text()
         # Top-level controller functions end with an unindented brace.

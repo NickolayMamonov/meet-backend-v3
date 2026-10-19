@@ -3733,13 +3733,27 @@ class HistoricalRecoveryFixtureTests(unittest.TestCase):
     "actual stale-recovery controller requires the isolated Linux fixture",
 )
 class StaleRecoveryControllerTests(unittest.TestCase):
+    def setup_case(self, case, phase, *, request_proof=False):
+        # Historical supervisor ownership must belong to an exited process,
+        # not this still-live unittest runner or its unrelated descendants.
+        command = [
+            sys.executable, "-B", str(ROOT / "fixtures/timepad-controller/recovery.py"),
+            "setup", str(case), phase, "intact",
+        ]
+        if request_proof:
+            command.append("request-proof")
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+        if request_proof:
+            with state.deploy_lock(case / "state"):
+                lease = state._read_execution_lease_locked(case / "state")
+                self.assertIsNotNone(lease)
+                self.assertTrue(state._execution_process_exited(lease["supervisor"]))
+                self.assertTrue(all(
+                    state._execution_process_exited(worker) for worker in lease["workers"]
+                ))
+
     def test_retry_refusal_requires_completed_stop_and_reentry_keeps_same_incident(self):
-        spec = importlib.util.spec_from_file_location(
-            "retry_refusal_fixture", ROOT / "fixtures/timepad-controller/recovery.py",
-        )
-        assert spec is not None and spec.loader is not None
-        adapter = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(adapter)
         fixture_root = pathlib.Path("/var/lib/timepad-fixture")
         fixture_root.mkdir(mode=0o700, exist_ok=True)
         for fault in ("none", "stop-fails"):
@@ -3747,8 +3761,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 prefix="case-refusal-", dir=fixture_root,
             ) as temporary:
                 case = pathlib.Path(temporary) / "fixture"
-                with redirect_stdout(io.StringIO()):
-                    adapter.setup(case, "CUTOVER_POSSIBLE", "intact", request_proof=True)
+                self.setup_case(case, "CUTOVER_POSSIBLE", request_proof=True)
                 state_root = case / "state"
                 _, original = state.read_guard(state_root)
                 bin_path = case / "bin"
@@ -3831,12 +3844,6 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                             self.assertEqual(before_reentry, snapshots)
 
     def test_only_complete_stale_lease_and_daemon_proofs_release_exact_container_retry(self):
-        spec = importlib.util.spec_from_file_location(
-            "stale_recovery_fixture", ROOT / "fixtures/timepad-controller/recovery.py",
-        )
-        assert spec is not None and spec.loader is not None
-        adapter = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(adapter)
         fixture_root = pathlib.Path("/var/lib/timepad-fixture")
         fixture_root.mkdir(mode=0o700, exist_ok=True)
         for phase, fault in (
@@ -3857,8 +3864,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 prefix="case-stale-", dir=fixture_root,
             ) as temporary, ExitStack() as stack:
                 case = pathlib.Path(temporary) / "fixture"
-                with redirect_stdout(io.StringIO()):
-                    adapter.setup(case, phase, "intact")
+                self.setup_case(case, phase)
                 state_root = case / "state"
                 _, current = state.read_guard(state_root)
                 old = execution_lease(attempt="8" * 32, revision=4, lifecycle="drained")
