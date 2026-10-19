@@ -4133,6 +4133,54 @@ class ExecutionInterlockTests(unittest.TestCase):
             helper._timepad_publication_guard("/state")
 
 
+class ProviderCleanupLeaseAdmissionIntegrationTests(unittest.TestCase):
+    def test_provider_cleanup_routes_through_exact_central_drain_admission(self):
+        module = helper._timepad_state_module()
+        attempt = "a" * 32
+        lease = {
+            "attempt": attempt, "revision": 4, "workerMode": "fail-closed-worker",
+            "lifecycle": "draining", "operation": "forward-recover",
+            "firstFailure": "RECOVERY_RETRY_RUNTIME_FAILED", "firstStatus": 1,
+            "workEndNs": 150, "hardEndNs": 400,
+            "supervisor": {"pid": 101, "startTicks": 10, "bootId": "fixture"},
+        }
+        request = {
+            "executionAttempt": attempt, "operation": "stop",
+            "containerId": "c" * 64, "configHash": "d" * 64,
+            "imageId": "e" * 64, "lifecycle": "acknowledged",
+        }
+        current = {
+            "executionAttempt": attempt, "phase": "VERIFYING", "ownedChild": None,
+            "containerId": request["containerId"], "configHash": request["configHash"],
+            "target": {"tuple": {"platformImageId": request["imageId"]}},
+            "runtimeRequest": request,
+        }
+        args = helper._parser().parse_args(["prepare"])
+        args.command = "runtime-request-proof"
+        args.state_root = "/fixture"
+        args.deploy_lock_fd = 9
+        args.execution_attempt = attempt
+        args.execution_grant = "b" * 32
+        args.deadline_ns = 200
+
+        with (
+            mock.patch.object(helper.os, "stat"),
+            mock.patch.object(module, "_read_execution_lease_locked", return_value=lease),
+            mock.patch.object(module, "_execution_lease_supervisor_is_live", return_value=True),
+            mock.patch.object(module, "deploy_lock", return_value=contextlib.nullcontext(9)),
+            mock.patch.object(module, "_read_guard_locked", return_value=({}, current)),
+        ):
+            self.assertIs(lease, helper._execution_interlock(args, 9))
+            for phase in ("COMMITTING", "RECOVERY_REQUIRED"):
+                current["phase"] = phase
+                with self.subTest(phase=phase), self.assertRaises(helper.ProviderError):
+                    helper._execution_interlock(args, 9)
+            current["phase"] = "VERIFYING"
+            lease["workerMode"] = "controller-worker"
+            with self.assertRaises(helper.ProviderError):
+                helper._execution_interlock(args, 9)
+
+
 class ProviderLiveGrantTests(unittest.TestCase):
     def setUp(self) -> None:
         import test_vps_timepad_supervisor
