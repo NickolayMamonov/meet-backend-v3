@@ -1459,10 +1459,17 @@ class ControllerLifecycleTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "recover"
         )
         case = SCRIPTS / "fixtures/timepad-controller/relay-case"
+
+        def write_private(path, value):
+            with path.open("xb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(value)
+
         namespace = {
             "__file__": str(case / "tools/create-controller.py"), "Path": Path,
             "os": os, "sys": sys, "time": time,
             "require": lambda condition, reason: condition or self.fail(reason),
+            "private": write_private,
             "no_socket": mock.Mock(),
         }
         exec(compile(ast.Module(body=[recovery], type_ignores=[]), str(source), "exec"), namespace)
@@ -2776,13 +2783,13 @@ class LinuxSupervisorTests(unittest.TestCase):
                 behavior, directory=directory, observe=release_late_worker,
             )
             self.assertEqual(released, [True])
-            self.assertEqual((result["status"], result["reason"]), (143, "ROLLED_BACK"))
+            self.assertEqual((result["status"], result["reason"]), (143, "QUIESCENCE_UNCONFIRMED"))
             self.assertTrue(Path(directory, "late-completion-refused").is_file())
             self.assertFalse(Path(directory, "late-completion-accepted").exists())
             lease = state._read_execution_lease_locked(directory)
             self.assertEqual("TERM", lease["firstFailure"])
-            self.assertTrue(lease["rollbackIssued"])
-            self.assertIn("rollback-worker", [worker["mode"] for worker in lease["workers"]])
+            self.assertFalse(lease["rollbackIssued"])
+            self.assertNotIn("rollback-worker", [worker["mode"] for worker in lease["workers"]])
 
     def test_unresolved_publication_failure_retains_childless_fd9_keeper(self):
         def behavior(client, directory, mode):
