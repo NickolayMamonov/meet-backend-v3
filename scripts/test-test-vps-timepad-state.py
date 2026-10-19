@@ -3798,7 +3798,9 @@ class StaleRecoveryControllerTests(unittest.TestCase):
         """Return bounded ownership/channel facts without dumping state or proc data."""
         lease_path = state_root / state.EXECUTION_LEASE_NAME
         try:
-            lease = json.loads(lease_path.read_bytes())
+            with lease_path.open("rb") as source:
+                raw_lease = source.read(65_537)
+            lease = json.loads(raw_lease) if len(raw_lease) <= 65_536 else None
         except (OSError, ValueError):
             lease = None
 
@@ -3814,18 +3816,26 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 start_ticks = int(fields[19])
                 if start_ticks != identity["startTicks"]:
                     return {"present": False}
-                children = (proc / "task" / str(pid) / "children").read_bytes().split()
-                descriptors = list((proc / "fd").iterdir())
+                with (proc / "task" / str(pid) / "children").open("rb") as source:
+                    children = source.read(8192).split()
+                descriptor_count = 0
+                socket_count = 0
+                for descriptor in os.scandir(proc / "fd"):
+                    if descriptor_count == 256:
+                        break
+                    descriptor_count += 1
+                    try:
+                        if os.readlink(descriptor.path).startswith("socket:["):
+                            socket_count += 1
+                    except OSError:
+                        continue
                 return {
                     "present": True,
                     "state": fields[0].decode("ascii") if fields[0] in {b"R", b"S", b"D", b"T", b"t", b"Z", b"X", b"I"} else "other",
                     "children": min(len(children), 256),
-                    "fdCount": min(len(descriptors), 256),
-                    "fd9": any(path.name == "9" for path in descriptors),
-                    "socketCount": min(sum(
-                        path.is_symlink() and os.readlink(path).startswith("socket:[")
-                        for path in descriptors
-                    ), 256),
+                    "fdCount": descriptor_count,
+                    "fd9": os.path.lexists(proc / "fd/9"),
+                    "socketCount": socket_count,
                 }
             except (OSError, ValueError, KeyError, IndexError):
                 return {"present": False}
@@ -4161,9 +4171,14 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     diagnostic["fault"] = fault
                     diagnostic["timeoutSeconds"] = 130
                     diagnostic["supervisorTrace"] = self.timeout_trace(error)
-                    self.fail("bounded recovery attempt timed out: " + json.dumps(
+                    diagnostic_text = json.dumps(
                         diagnostic, sort_keys=True, separators=(",", ":"),
-                    ))
+                    )
+                    print(
+                        "FIXTURE_RECOVERY_TIMEOUT " + diagnostic_text,
+                        file=sys.stderr, flush=True,
+                    )
+                    self.fail("bounded recovery attempt timed out: " + diagnostic_text)
                 log_path = case / "docker.log"
                 log = log_path.read_text().splitlines() if log_path.exists() else []
                 starts = [line for line in log if line.startswith("start-id:")]
