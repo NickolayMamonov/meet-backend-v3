@@ -1008,12 +1008,19 @@ if __name__ == "__main__":
     elif sys.argv[1] == "docker":
         docker(pathlib.Path(os.environ["TIMEPAD_FIXTURE_CASE"]), sys.argv[2:])
     elif sys.argv[1] == "run-controller":
-        case = pathlib.Path(sys.argv[2])
-        require_isolated(case)
-        if pathlib.Path(__file__).resolve() != case / "tools/recovery.py":
-            raise SystemExit("recovery controller must use its staged fixture")
-        channel = load("historical_controller_channel", case / "tools/create-controller.py")
-        raise SystemExit(channel.recover(case, sys.argv[3:]))
+        try:
+            case = pathlib.Path(sys.argv[2])
+            require_isolated(case)
+            if pathlib.Path(__file__).resolve() != case / "tools/recovery.py":
+                raise SystemExit("recovery controller must use its staged fixture")
+            channel = load("historical_controller_channel", case / "tools/create-controller.py")
+            status = channel.recover(case, sys.argv[3:])
+        except (Exception, SystemExit):
+            # Fixture/protocol failures must never satisfy a controller test
+            # expecting status 1, or leak a raw exception through diagnostics.
+            print("FIXTURE_RECOVERY_CHANNEL_FAILED", file=sys.stderr, flush=True)
+            raise SystemExit(2)
+        raise SystemExit(status)
     elif sys.argv[1] == "refusal-snapshot":
         print(refusal_snapshot(pathlib.Path(sys.argv[2])))
     elif sys.argv[1] == "assert-foreign-provider":

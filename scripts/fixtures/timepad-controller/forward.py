@@ -111,14 +111,18 @@ def fixture_data(source: Path) -> dict:
 class ForwardTransport:
     """Only external facts and a real fixed no-start child, not a driver."""
 
-    def __init__(self, case: Path, facts: dict, *, recovery_runtime: Path | None = None):
+    def __init__(
+        self, case: Path, facts: dict, *, recovery_runtime: Path | None = None,
+        diagnostics: bool = False,
+    ):
         self.case, self.facts = case, facts
         self.recovery_runtime = recovery_runtime
+        self.diagnostics = diagnostics
 
     def identity(self, stage, context):
         import test_vps_timepad_create as create
 
-        if self.recovery_runtime is not None:
+        if self.diagnostics:
             transport_event(self.case, "identity")
         no_socket()
         context.check_time()
@@ -142,7 +146,7 @@ class ForwardTransport:
     def observe(self, context):
         import test_vps_timepad_create as create
 
-        if self.recovery_runtime is not None:
+        if self.diagnostics:
             transport_event(self.case, "observe")
         no_socket()
         context.check_time()
@@ -200,7 +204,7 @@ class ForwardTransport:
     def spawn_create(self, context, control_fds):
         import test_vps_timepad_create as create
 
-        if self.recovery_runtime is not None:
+        if self.diagnostics:
             transport_event(self.case, "spawn_create")
         no_socket()
         context.check_time()

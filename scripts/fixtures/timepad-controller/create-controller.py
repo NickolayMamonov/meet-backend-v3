@@ -301,7 +301,9 @@ def recover(case: Path, arguments: list[str]) -> int:
     require(os.environ.get("TEST_VPS_STATE_ROOT") == str(case / "state"),
             "historical state root is not fixed")
     no_socket()
-    fake = ForwardTransport(case, {}, recovery_runtime=case / "runtime.json")
+    fake = ForwardTransport(
+        case, {}, recovery_runtime=case / "runtime.json", diagnostics=True,
+    )
     parent, child = supervisor.socket_pair()
     pid = os.fork()
     if pid == 0:
