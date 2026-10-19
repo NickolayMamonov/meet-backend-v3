@@ -190,6 +190,7 @@ def run(case: Path, scenario: str) -> int:
         try:
             parent.close()
             supervisor._close_except({child.fileno()})
+            os.environ["TIMEPAD_FIXTURE_DIAGNOSTICS"] = "1"
             instance = supervisor.Supervisor(
                 str(case / "state"), operation, arguments, child, create_transport=fake,
             )
