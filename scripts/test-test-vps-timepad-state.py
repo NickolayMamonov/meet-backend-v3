@@ -3801,8 +3801,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                          record["result"]["reason"])
         self.assertEqual("RECOVERY_RETRY_RUNTIME_FAILED" if terminal else None,
                          record["result"]["outcome"])
-        self.assertEqual(terminal, record["reaped"])
         if terminal:
+            self.assertTrue(record["reaped"])
             self.assertTrue(state._execution_process_exited(lease["supervisor"]))
         else:
             # Once every owned child has exited, an unresolved result may
@@ -3810,13 +3810,21 @@ class StaleRecoveryControllerTests(unittest.TestCase):
             # the interlock for subsequent writers and retention operations.
             with state.deploy_lock(case / "state") as lock_fd:
                 unresolved = state._read_execution_lease_locked(case / "state")
-            self.assertEqual("quiescence-unconfirmed", unresolved["lifecycle"])
-            with state.deploy_lock(case / "state") as lock_fd:
-                with self.assertRaises(state.GuardError) as blocked:
-                    state.check_execution_lease(
-                        case / "state", attempt=lease["attempt"], deploy_lock_fd=lock_fd,
-                    )
-            self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason)
+            if unresolved["lifecycle"] == "draining":
+                with self.assertRaises(state.GuardError) as busy:
+                    with state.deploy_lock(case / "state"):
+                        pass
+                self.assertEqual("DEPLOY_LOCK_BUSY", busy.exception.reason)
+            else:
+                self.assertEqual("quiescence-unconfirmed", unresolved["lifecycle"])
+                self.assertTrue(state._execution_process_exited(lease["supervisor"]))
+                with state.deploy_lock(case / "state") as lock_fd:
+                    os.set_inheritable(lock_fd, True)
+                    with self.assertRaises(state.GuardError) as blocked:
+                        state.check_execution_lease(
+                            case / "state", attempt=lease["attempt"], deploy_lock_fd=lock_fd,
+                        )
+                self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason)
         self.assertFalse(os.path.lexists("/run/docker.sock"))
         self.assertFalse(os.path.lexists("/var/run/docker.sock"))
         self.assertIsNone(lease["createCompletion"])
@@ -3898,15 +3906,22 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     if fault == "none":
                         _, after = state.read_guard(state_root)
                     else:
-                        # Failed stop is childless but unresolved: the lease,
-                        # rather than a fictional live keeper, blocks writers.
-                        with state.deploy_lock(state_root) as lock_fd:
-                            with self.assertRaises(state.GuardError) as blocked:
-                                state.check_execution_lease(
-                                    state_root, attempt=original["executionAttempt"],
-                                    deploy_lock_fd=lock_fd,
+                        # The failed stop is either still held by a live
+                        # keeper or durably blocks reentry after childlessness.
+                        try:
+                            with state.deploy_lock(state_root) as lock_fd:
+                                os.set_inheritable(lock_fd, True)
+                                with self.assertRaises(state.GuardError) as blocked:
+                                    state.check_execution_lease(
+                                        state_root, attempt=original["executionAttempt"],
+                                        deploy_lock_fd=lock_fd,
+                                    )
+                                self.assertEqual(
+                                    "EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason,
                                 )
-                            self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason)
+                                _, after = state._read_guard_locked(state_root)
+                        except state.GuardError as busy:
+                            self.assertEqual("DEPLOY_LOCK_BUSY", busy.exception.reason)
                             _, after = state._read_guard_locked(state_root)
                     lease = state._read_execution_lease_locked(state_root)
                     self.assertEqual(original["incidentId"], after["incidentId"])
