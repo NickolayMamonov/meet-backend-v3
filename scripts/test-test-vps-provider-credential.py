@@ -4013,7 +4013,9 @@ class ExecutionInterlockTests(unittest.TestCase):
             mock.patch.object(module, "check_execution_lease") as check,
         ):
             helper._execution_interlock(args, 9)
-            check.assert_called_once_with(args.state_root, attempt="a" * 32, deploy_lock_fd=9)
+            check.assert_called_once_with(
+                args.state_root, attempt="a" * 32, deploy_lock_fd=9, purpose="writer",
+            )
             for field, replacement in (
                 ("deploy_lock_fd", None), ("execution_attempt", None),
                 ("execution_grant", None),
@@ -4200,6 +4202,12 @@ class ProviderLiveGrantTests(unittest.TestCase):
             self.args.command = "runtime-request-proof"
             with self.authority():
                 helper._deadline_check()
+            self.module.check_execution_lease.assert_called_with(
+                self.args.state_root,
+                attempt=self.args.execution_attempt,
+                deploy_lock_fd=9,
+                purpose="cleanup-stop-proof",
+            )
             for command in ("prepare", "verify", "finish", "state-publish", "live-resume", "retention-delete"):
                 self.args.command = command
                 with self.subTest(command=command), self.assertRaises(helper.ProviderError):

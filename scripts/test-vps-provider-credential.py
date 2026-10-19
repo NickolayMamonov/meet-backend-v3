@@ -206,14 +206,16 @@ def _execution_interlock(args: argparse.Namespace, lock_fd: int) -> dict[str, An
             or args.deadline_ns is None
         ):
             _fail("recovery")
-        module.check_execution_lease(
-            args.state_root, attempt=args.execution_attempt, deploy_lock_fd=lock_fd
-        )
         cleanup = lease["workerMode"] == "fail-closed-worker"
+        module.check_execution_lease(
+            args.state_root,
+            attempt=args.execution_attempt,
+            deploy_lock_fd=lock_fd,
+            purpose="cleanup-stop-proof" if cleanup else "writer",
+        )
         if cleanup:
             if args.command != "runtime-request-proof":
                 _fail("recovery")
-            module.cleanup_request_admission(module._read_guard_locked(args.state_root)[1], lease)
         # Only read-only correlated stop proof may use the cleanup reserve.
         end = lease["hardEndNs"] if cleanup else lease["workEndNs"]
         if end is None:

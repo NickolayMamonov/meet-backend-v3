@@ -2599,11 +2599,21 @@ def check_execution_lease(
     *,
     attempt: str | None = None,
     deploy_lock_fd: int | None = None,
+    purpose: str = "writer",
 ) -> dict[str, Any]:
-    """Read-only writer/retention interlock; never removes or reconciles a lease."""
+    """Authorize a named lease use; never removes or reconciles a lease.
+
+    Cleanup proof is the sole exception to draining-state rejection and remains
+    bound to the exact live fail-closed request.  A matching attempt is not
+    sufficient authority to let a stale worker through a drain.
+    """
+    if purpose not in {"writer", "cleanup-stop-proof"}:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
     with deploy_lock(root, deploy_lock_fd):
         lease = _read_execution_lease_locked(root)
         if lease is None:
+            if purpose != "writer":
+                _reject("EXECUTION_LEASE_UNRESOLVED")
             return {"outcome": "unleased"}
         if deploy_lock_fd is None:
             _reject("EXECUTION_LEASE_FD_REQUIRED")
@@ -2619,6 +2629,14 @@ def check_execution_lease(
                 current["executionAttempt"] not in {None, lease["attempt"]}:
             _reject("EXECUTION_LEASE_UNRESOLVED")
         if lease["lifecycle"] in {"quiescence-unconfirmed", "drained"}:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if lease["lifecycle"] == "draining":
+            if purpose != "cleanup-stop-proof":
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            if current is None:
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            cleanup_request_admission(current, lease)
+        elif purpose == "cleanup-stop-proof":
             _reject("EXECUTION_LEASE_UNRESOLVED")
         return {"attempt": lease["attempt"], "revision": lease["revision"], "outcome": "matched"}
 

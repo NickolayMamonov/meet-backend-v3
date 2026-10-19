@@ -489,6 +489,70 @@ class LeasePublicationAuthorityTests(unittest.TestCase):
         self.client.close.assert_called_once()
         self.assertIsNone(state._EXECUTION_CHECK.get())
 
+    def test_draining_lease_admission_is_central_and_cleanup_is_narrowly_correlated(self):
+        lease = execution_lease(
+            attempt="a" * 32, revision=3, lifecycle="draining",
+            operation="forward-recover",
+        )
+        lease.update(
+            workerMode="fail-closed-worker",
+            firstFailure="RECOVERY_RETRY_RUNTIME_FAILED",
+            firstStatus=1,
+        )
+        request = {
+            "executionAttempt": lease["attempt"], "operation": "stop",
+            "containerId": digest("c"), "configHash": digest("d"),
+            "imageId": digest("e"), "lifecycle": "acknowledged",
+        }
+        current = {
+            "phase": "VERIFYING", "executionAttempt": lease["attempt"],
+            "ownedChild": None, "containerId": request["containerId"],
+            "configHash": request["configHash"],
+            "target": {"tuple": {"platformImageId": request["imageId"]}},
+            "runtimeRequest": request,
+        }
+        patches = (
+            mock.patch.object(state, "deploy_lock", return_value=nullcontext(9)),
+            mock.patch.object(state, "_read_execution_lease_locked", return_value=lease),
+            mock.patch.object(state, "_execution_lease_supervisor_is_live", return_value=True),
+            mock.patch.object(state, "_read_guard_locked", return_value=({}, current)),
+        )
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            self.assertEqual(
+                "matched",
+                state.check_execution_lease(
+                    "/fixture", attempt=lease["attempt"], deploy_lock_fd=9,
+                    purpose="cleanup-stop-proof",
+                )["outcome"],
+            )
+            with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                state.check_execution_lease(
+                    "/fixture", attempt=lease["attempt"], deploy_lock_fd=9,
+                )
+            for phase in ("COMMITTING", "RECOVERY_REQUIRED"):
+                current["phase"] = phase
+                with self.subTest(phase=phase), self.assertRaisesRegex(
+                    state.GuardError, "EXECUTION_LEASE_UNRESOLVED",
+                ):
+                    state.check_execution_lease(
+                        "/fixture", attempt=lease["attempt"], deploy_lock_fd=9,
+                        purpose="cleanup-stop-proof",
+                    )
+            current["phase"] = "VERIFYING"
+            lease["workerMode"] = "controller-worker"
+            with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                state.check_execution_lease(
+                    "/fixture", attempt=lease["attempt"], deploy_lock_fd=9,
+                    purpose="cleanup-stop-proof",
+                )
+            with self.assertRaisesRegex(state.GuardError, "EXECUTION_LEASE_UNRESOLVED"):
+                state.check_execution_lease(
+                    "/fixture", attempt=lease["attempt"], deploy_lock_fd=9,
+                    purpose="unknown",
+                )
+
     def test_fabricated_snapshot_role_identity_and_worker_null_are_not_publication_authority(self):
         for field, value in (
             ("attempt", "f" * 32), ("supervisor", {**self.lease["supervisor"], "startTicks": 999}),
