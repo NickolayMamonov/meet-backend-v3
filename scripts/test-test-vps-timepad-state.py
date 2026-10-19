@@ -3805,10 +3805,14 @@ class StaleRecoveryControllerTests(unittest.TestCase):
         if terminal:
             self.assertTrue(state._execution_process_exited(lease["supervisor"]))
         else:
-            with self.assertRaises(state.GuardError) as busy:
-                with state.deploy_lock(case / "state"):
-                    pass
-            self.assertEqual("DEPLOY_LOCK_BUSY", busy.exception.reason)
+            # Once every owned child has exited, an unresolved result may
+            # release FD9. The durable quiescence-unconfirmed lease remains
+            # the interlock for subsequent writers and retention operations.
+            with state.deploy_lock(case / "state") as lock_fd:
+                unresolved = state._read_execution_lease_locked(
+                    case / "state", deploy_lock_fd=lock_fd,
+                )
+            self.assertEqual("quiescence-unconfirmed", unresolved["lifecycle"])
         self.assertFalse(os.path.lexists("/run/docker.sock"))
         self.assertFalse(os.path.lexists("/var/run/docker.sock"))
         self.assertIsNone(lease["createCompletion"])
