@@ -312,9 +312,10 @@ def recover(case: Path, arguments: list[str]) -> int:
             os.setsid()
             supervisor._close_except({child.fileno()})
             # Refused attempts can retain FD9 after the relay has returned.
-            # Their passive keeper must not retain the caller's output pipes.
+            # The passive keeper must not retain caller output, but the
+            # controller's fixed sanitized fixture diagnostics are preserved.
             null = os.open("/dev/null", os.O_RDWR)
-            for fd in (0, 1, 2):
+            for fd in (0, 1):
                 os.dup2(null, fd)
             if null > 2:
                 os.close(null)
@@ -383,6 +384,11 @@ def recover(case: Path, arguments: list[str]) -> int:
             no_socket()
             return frame["status"]
         raise AssertionError("historical relay inventory exceeded bound")
+    except (OSError, supervisor.SupervisorError):
+        # Match the public relay when lock/lease admission closes the channel
+        # before a result. No terminal receipt or drained lease is fabricated.
+        print("schema_guard=QUIESCENCE_UNCONFIRMED", flush=True)
+        return 1
     finally:
         parent.close()
         if not reaped:

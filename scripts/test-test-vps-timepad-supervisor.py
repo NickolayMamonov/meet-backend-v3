@@ -1433,6 +1433,86 @@ class RecoveryCreateRegistrationTests(unittest.TestCase):
 class ControllerLifecycleTests(unittest.TestCase):
     """Execute actual shell functions with private deterministic RPC boundaries."""
 
+    def test_historical_relay_transport_loss_is_a_fixed_fail_closed_result(self):
+        source = SCRIPTS / "fixtures/timepad-controller/create-controller.py"
+        recovery = next(
+            node for node in ast.parse(source.read_text(encoding="utf-8")).body
+            if isinstance(node, ast.FunctionDef) and node.name == "recover"
+        )
+        case = SCRIPTS / "fixtures/timepad-controller/relay-case"
+        namespace = {
+            "__file__": str(case / "tools/create-controller.py"), "Path": Path,
+            "os": os, "sys": sys, "time": time,
+            "require": lambda condition, reason: condition or self.fail(reason),
+            "no_socket": mock.Mock(),
+        }
+        exec(compile(ast.Module(body=[recovery], type_ignores=[]), str(source), "exec"), namespace)
+        hello = {
+            "kind": "hello", "attempt": "a" * 32, "supervisor": {"pid": 123},
+            "hardEndNs": time.monotonic_ns() + 600 * NS, "watchEndNs": 1,
+        }
+        arguments = ["--operation", "forward-recover", "--root", str(case / "root")]
+        for received in (
+            [supervisor.SupervisorError("PROTOCOL_INVALID")],
+            [(hello, None), OSError("private transport detail")],
+        ):
+            with self.subTest(after_hello=len(received) > 1), \
+                    mock.patch.dict(os.environ, {"TEST_VPS_STATE_ROOT": str(case / "state")}), \
+                    mock.patch.dict(sys.modules, {"forward": SimpleNamespace(ForwardTransport=mock.Mock())}), \
+                    mock.patch.object(supervisor, "socket_pair", return_value=(mock.Mock(), mock.Mock())), \
+                    mock.patch.object(os, "fork", return_value=123, create=True), \
+                    mock.patch.object(os, "WNOHANG", 1, create=True), \
+                    mock.patch.object(os, "waitpid", return_value=(0, 0), create=True) as wait, \
+                    mock.patch.object(supervisor, "_wait_readable"), \
+                    mock.patch.object(supervisor, "receive_frame", side_effect=received), \
+                    mock.patch.object(supervisor, "send_frame"), \
+                    mock.patch.object(supervisor, "process_identity"), \
+                    mock.patch.object(supervisor, "lease_identity", return_value=hello["supervisor"]), \
+                    mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(1, namespace["recover"](case, arguments))
+                self.assertEqual("schema_guard=QUIESCENCE_UNCONFIRMED\n", output.getvalue())
+                wait.assert_called_once_with(123, os.WNOHANG)
+
+    def test_registered_recovery_read_only_handoff_reaches_runtime_admission(self):
+        source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
+        start = source.index('if [ "$operation" = forward-recover ]; then\n  recovery_budget_arm')
+        end = source.index("  recovery_target_id=", start)
+        script = self.function("recovery_budget_arm") + r"""
+state_root=$1
+recovery_t0_ns=
+supervisor_enabled=true
+recovery_admission_only=true
+TIMEPAD_ATTEMPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+TIMEPAD_WORKER_MODE=controller-worker
+timepad_helper=/fixture/state.py
+operation=forward-recover
+recovery_run_key=original-run
+recovery_incident=dddddddddddddddddddddddddddddddd
+recovery_epoch=7
+recovery_binding_digest=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+supervisor_client() {
+  [ "$1" = lease ] || return 90
+  echo '{"attempt":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","lifecycle":"registered","t0Ns":100,"workEndNs":540000000100,"hardEndNs":600000000100}'
+}
+validate_timepad_input() { return 0; }
+timeout() {
+  case "$4" in
+    authorize-recovery) echo '{"outcome":"authorized"}' ;;
+    read-state) echo '{"current":{"operation":"deploy","phase":"CUTOVER_POSSIBLE","runId":"original-run","incidentId":"dddddddddddddddddddddddddddddddd","operationEpoch":7,"evidenceDigest":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","ownedRun":"original-run-final-deploy"}}' ;;
+    *) return 90 ;;
+  esac
+}
+fail() { echo "$1" >&2; exit 91; }
+""" + source[start:end] + """
+  echo runtime-admission
+fi
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "original-run-final-deploy").mkdir()
+            result = self.shell(script, Path(directory).as_posix())
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("runtime-admission\n", result.stdout)
+
     def function(self, name):
         import re
         source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
