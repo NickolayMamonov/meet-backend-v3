@@ -4,7 +4,9 @@
 Only the explicit Supervisor constructor receives the fixture transport. The
 production worker, state/provider helpers, locks, grants and terminal publisher
 are unchanged. Bootstrap is executable here; guarded deploy still refuses at
-its existing lifecycle gate before any create or start.
+its existing lifecycle gate before any create or start. The forward scenarios
+are integration scaffolding until that production lifecycle is completed and
+its gate is lifted; their presence is not evidence of successful guarded create.
 """
 
 from __future__ import annotations
@@ -66,6 +68,7 @@ def prepare(case: Path, scenario: str) -> None:
     for name in (
         "deploy-test-vps-provider-release.sh", "production-compose.sh",
         "update-production-release.sh", "test-vps-runtime-invariants.sh",
+        "production-config-digest.sh",
         "test-vps-provider-credential.py", "test_vps_timepad_state.py",
         "test_vps_timepad_supervisor.py", "test_vps_timepad_create.py",
         "test-vps-timepad-release-contracts.json",
@@ -73,12 +76,31 @@ def prepare(case: Path, scenario: str) -> None:
         shutil.copyfile(source / name, case / "tools" / name)
         (case / "tools" / name).chmod(0o700 if name.endswith(".sh") else 0o600)
     shutil.copyfile(Path(__file__), case / "tools/create-controller.py")
+    forward = scenario not in {"bootstrap", "bootstrap-mismatch", "deploy-blocked"}
+    if forward:
+        import forward as external
+
+        facts = external.fixture_data(source)
+        shutil.copyfile(Path(__file__).with_name("forward.py"), case / "tools/forward.py")
+        (case / "bin").mkdir(mode=0o700)
+        for kind in ("docker", "curl"):
+            shutil.copyfile(Path(__file__).with_name("forward-" + kind), case / "bin" / kind)
+            (case / "bin" / kind).chmod(0o700)
+        private(case / "forward-facts.json", json.dumps(facts).encode())
+        backend = next(item for item in facts["resources"]["containerInspections"]
+                       if item["Config"]["Labels"]["com.docker.compose.service"] == "backend")
+        private(case / "forward-runtime.json", json.dumps({"backend": backend, "created": False}).encode())
+        private(case / "forward-scenario", scenario.encode())
+        contract_path = case / "tools/test-vps-timepad-release-contracts.json"
+        contract_path.write_bytes(json.dumps(facts["contract"]).encode())
     for name, fixture in (
         ("root/.env.production", "root-env"),
         ("root/docker-compose.production.yml", "compose.yml"),
         ("compose.yml", "compose.yml"),
     ):
         private(case / name, (source / "fixtures/timepad-controller" / fixture).read_bytes())
+    if forward:
+        (case / "root/.env.production").write_text("\n".join(backend["Config"]["Env"]) + "\n")
     authority = {
         "rootId": "test-root", "bootstrapId": "fixture-bootstrap",
         "initialRuntime": "a" * 64, "initialConfig": "b" * 64,
@@ -132,7 +154,8 @@ def run(case: Path, scenario: str) -> int:
     # transport selector or worker replacement is forwarded to production.
     import test_vps_timepad_supervisor as supervisor
 
-    operation = "deploy" if scenario == "deploy-blocked" else "bootstrap-guard"
+    forward = scenario not in {"bootstrap", "bootstrap-mismatch", "deploy-blocked"}
+    operation = "deploy" if forward or scenario == "deploy-blocked" else "bootstrap-guard"
     arguments = [
         "--root", str(case / "root"), "--base-compose", str(case / "compose.yml"),
         "--image", "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + "0" * 64,
@@ -142,10 +165,24 @@ def run(case: Path, scenario: str) -> int:
     if operation == "bootstrap-guard":
         arguments += ["--initial-proof-id", "fixture-initial", "--bootstrap-id", "fixture-bootstrap"]
     else:
-        arguments += ["--rollout-domain", "initial-domain"]
+        arguments += (["--rollout-domain", "timepad-first-transition", "--initial-proof-id", "first-timepad"]
+                      if forward else ["--rollout-domain", "initial-domain"])
+    if forward:
+        arguments[arguments.index("--image") + 1] = (
+            "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + "1" * 64
+        )
+        arguments[arguments.index("--revision") + 1] = "3" * 40
+        arguments[arguments.index("--version") + 1] = "1.2.3"
     os.environ["TEST_VPS_STATE_ROOT"] = str(case / "state")
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-    fake = RefusingTransport(case)
+    if forward:
+        from forward import ForwardTransport
+
+        fake = ForwardTransport(case, json.loads((case / "forward-facts.json").read_bytes()))
+        os.environ["PATH"] = str(case / "bin") + ":" + os.environ["PATH"]
+        os.environ["TIMEPAD_FIXTURE_CASE"] = str(case)
+    else:
+        fake = RefusingTransport(case)
     parent, child = supervisor.socket_pair()
     pid = os.fork()
     if pid == 0:
@@ -159,7 +196,7 @@ def run(case: Path, scenario: str) -> int:
         except BaseException:
             os._exit(1)
     child.close()
-    end = time.monotonic_ns() + 90 * supervisor.NS
+    end = time.monotonic_ns() + (600 if forward else 90) * supervisor.NS
     frames = []
     status = None
     try:
@@ -193,6 +230,28 @@ def run(case: Path, scenario: str) -> int:
                 break
         require(status is not None, "actual controller worker exceeded fixture deadline")
         no_socket()
+        if forward:
+            import test_vps_timepad_state as guard
+
+            _, current = guard.read_guard(str(case / "state"))
+            effects = (case / "forward-effects").read_text().splitlines() if (
+                case / "forward-effects"
+            ).exists() else []
+            starts = [effect for effect in effects if effect.startswith("start:")]
+            run_path = case / "state/fixture-channel-1-final-deploy"
+            if scenario == "forward":
+                require(status == 0 and current["phase"] == "COMMITTED",
+                        "actual normal forward did not commit")
+                require(starts == ["start:" + "a" * 64], "candidate start inventory is not exact")
+                require((run_path / "timepad-create-completion.json").is_file(),
+                        "actual completion publisher receipt missing")
+                require(current["ownedChild"] is None and current["containerId"] == "a" * 64,
+                        "actual candidate binding or child drain missing")
+            else:
+                require(status != 0 and not starts, "refused forward started a candidate")
+            private(case / "forward-relay-result.json", json.dumps(frames[-1], sort_keys=True).encode())
+            print("ACTUAL_FORWARD_CONTROLLER_PASS: scenario=" + scenario + " no_socket=true", flush=True)
+            return 0
         require(not (case / "transport-calls").exists(), "read-only worker attempted guarded create")
         require(all((case / "root" / name).read_bytes() == value
                     for name, value in installed_inputs.items()),
@@ -224,7 +283,10 @@ def run(case: Path, scenario: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", type=Path, required=True)
-    parser.add_argument("--scenario", choices=("bootstrap", "bootstrap-mismatch", "deploy-blocked"), required=True)
+    parser.add_argument("--scenario", choices=(
+        "bootstrap", "bootstrap-mismatch", "deploy-blocked", "forward",
+        "suppress-refused", "stop-refused",
+    ), required=True)
     parser.add_argument("--staged", action="store_true")
     options = parser.parse_args()
     isolated(options.case)
@@ -236,6 +298,8 @@ def main() -> int:
         ])
     require(Path(__file__).resolve() == options.case / "tools/create-controller.py",
             "fixture stage identity is not fixed")
+    if options.scenario not in {"bootstrap", "bootstrap-mismatch", "deploy-blocked"}:
+        require(run(options.case, "bootstrap") == 0, "actual bootstrap did not complete")
     return run(options.case, options.scenario)
 
 

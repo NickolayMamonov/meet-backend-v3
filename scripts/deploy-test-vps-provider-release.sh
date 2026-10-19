@@ -3193,7 +3193,19 @@ guarded_candidate_start() {
     fail "RECOVERY_REQUIRED"
   restart=$(docker_container_inspect "$candidate_container" \
     --format '{{.HostConfig.RestartPolicy.Name}}') || fail "RECOVERY_REQUIRED"
-  [ "$restart" = no ] || fail "RECOVERY_REQUIRED"
+  [ "$restart" = unless-stopped ] || fail "RECOVERY_REQUIRED"
+  local observed_candidate_hash=$target_hash
+  timepad_request_bind_create || fail "RECOVERY_REQUIRED"
+  [ "$candidate_container" = "$bound_container" ] &&
+    [ "$target_hash" = "$observed_candidate_hash" ] ||
+    fail "RECOVERY_REQUIRED"
+  timepad_runtime_mutate suppress "$candidate_container" ||
+    fail "RECOVERY_REQUIRED"
+  [ "$(docker_container_inspect "$candidate_container" \
+    --format '{{.State.Running}}')" = false ] &&
+    [ "$(docker_container_inspect "$candidate_container" \
+      --format '{{.HostConfig.RestartPolicy.Name}}')" = no ] ||
+    fail "RECOVERY_REQUIRED"
   timepad_advance VERIFYING CANDIDATE_IDENTITY_PERSISTED \
     "$candidate_container" "$target_hash"
   timepad_create_action verify-target initial >/dev/null ||
@@ -3738,8 +3750,8 @@ fi
 commit_receipt=$(provider_finish committed "$candidate_inspect")
 if [ "$prepared_timepad" = true ]; then
   timepad_advance COMMITTING "" "" "" "" "" terminal-policy-intent
-  timeout 15s docker update --restart=unless-stopped "$candidate_container" \
-    >/dev/null || fail "RECOVERY_REQUIRED"
+  timepad_runtime_mutate restore-policy "$candidate_container" ||
+    fail "RECOVERY_REQUIRED"
   [ "$(docker_container_inspect "$candidate_container" \
     --format '{{.HostConfig.RestartPolicy.Name}}')" = unless-stopped ] ||
     fail "RECOVERY_REQUIRED"

@@ -12,6 +12,7 @@ import ast
 from contextlib import ExitStack, nullcontext
 from dataclasses import FrozenInstanceError, replace
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import signal
@@ -65,6 +66,72 @@ def tooling() -> tuple[create.ToolingObservation, dict]:
 
 
 class Contracts(unittest.TestCase):
+    def forward_fixture(self):
+        path = SCRIPTS / "fixtures/timepad-controller/forward.py"
+        spec = importlib.util.spec_from_file_location("_forward_fixture_contract", path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_forward_external_facts_use_real_pinned_tooling_and_resource_comparators(self):
+        fixture = self.forward_fixture()
+        facts = fixture.fixture_data(SCRIPTS)
+        self.assertEqual({
+            "contract", "model", "image", "predecessorImage", "resources",
+        }, set(facts))
+        self.assertEqual(64, len(create.validate_tooling(fixture.tooling(), facts["contract"])))
+        provider = create._provider()
+        provider._create_backend_model(facts["model"], "a" * 32)
+        envelope = provider._resource_envelope(
+            stage="prepared", role={
+                "operationToken": "a" * 32, "backendContainerId": "f" * 64,
+                "priorBackendContainerId": None, "allowEmptyBackend": False,
+            }, observed=dict(facts["resources"], targetConfiguration=facts["model"]),
+        )
+        result = provider._resource_admission(envelope)
+        self.assertEqual(64, len(result["baselineDigest"]))
+        self.assertEqual("f" * 64, result["membership"]["backendContainerId"])
+        self.assertNotEqual(facts["image"]["Id"], facts["predecessorImage"]["Id"])
+        self.assertNotEqual(facts["model"]["services"]["backend"]["image"],
+                            facts["predecessorImage"]["RepoDigests"][0])
+        backend = next(item for item in facts["resources"]["containerInspections"]
+                       if item["Id"] == "f" * 64)
+        self.assertTrue(backend["State"]["Running"])
+        self.assertEqual("unless-stopped", backend["HostConfig"]["RestartPolicy"]["Name"])
+
+    def test_forward_fixture_keeps_four_method_transport_and_refuses_unknown_external_actions(self):
+        fixture = self.forward_fixture()
+        facts = fixture.fixture_data(SCRIPTS)
+        source = (SCRIPTS / "fixtures/timepad-controller/forward.py").read_text()
+        tree = ast.parse(source)
+        transport = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                         and node.name == "ForwardTransport")
+        self.assertEqual({"__init__", "identity", "render", "observe", "spawn_create"}, {
+            node.name for node in transport.body if isinstance(node, ast.FunctionDef)
+        })
+        for forbidden in ("waitpid", "publish_current", "_atomic_write", "prepare_terminal", "lease-ack"):
+            self.assertNotIn(forbidden, source)
+        backend = next(item for item in facts["resources"]["containerInspections"]
+                       if item["Id"] == "f" * 64)
+        with tempfile.TemporaryDirectory() as directory:
+            case = Path(directory)
+            path = case / "forward-runtime.json"
+            path.write_bytes(create.canonical({"backend": backend, "created": False}, create.MAX_EVIDENCE))
+            before = path.read_bytes()
+            # Pure negative adapter contracts do not need a Linux socket probe.
+            with mock.patch.object(fixture, "no_socket"):
+                for arguments in (
+                    ["compose", "up"], ["start", "foreign"], ["exec", backend["Id"], "sh"],
+                    ["inspect", backend["Id"], "--format", "{{unknown}}"],
+                    ["volume", "inspect", "foreign"],
+                ):
+                    with self.subTest(arguments=arguments), self.assertRaises(AssertionError):
+                        fixture.docker(case, arguments, facts)
+            self.assertEqual(before, path.read_bytes())
+            self.assertFalse((case / "forward-effects").exists())
+
     def recovery_case(self, stack, *, operation="stop", lifecycle="completed"):
         """Portable branch test only; kernel/registration proof is not mocked acceptance."""
         observed_tooling, contract = tooling()

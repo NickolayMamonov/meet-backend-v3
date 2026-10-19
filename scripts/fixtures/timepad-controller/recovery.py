@@ -41,7 +41,14 @@ def load(name: str, path: pathlib.Path):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    # These fixture modules import their reviewed sibling modules by their
+    # production module names. Loading through an arbitrary file path does not
+    # otherwise make that sibling directory importable.
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(path.parent))
     return module
 
 
