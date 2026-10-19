@@ -19,6 +19,7 @@ from pathlib import Path
 import selectors
 import shutil
 import signal
+import re
 import sys
 import time
 
@@ -198,7 +199,14 @@ def run(case: Path, scenario: str) -> int:
             safe_name = error_name if (
                 error_name.isascii() and error_name.isidentifier() and len(error_name) <= 64
             ) else "Exception"
-            private(case / "supervisor-error", (safe_name + "\n").encode("ascii"))
+            safe_reason = (
+                str(error) if isinstance(error, supervisor.SupervisorError) and
+                re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", str(error)) else "OTHER"
+            )
+            private(
+                case / "supervisor-error",
+                (safe_name + ":" + safe_reason + "\n").encode("ascii"),
+            )
             os._exit(1)
     child.close()
     end = time.monotonic_ns() + (600 if forward else 90) * supervisor.NS
