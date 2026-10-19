@@ -187,6 +187,7 @@ def run(case: Path, scenario: str) -> int:
     parent, child = supervisor.socket_pair()
     pid = os.fork()
     if pid == 0:
+        stage = "construct"
         try:
             parent.close()
             supervisor._close_except({child.fileno()})
@@ -194,6 +195,7 @@ def run(case: Path, scenario: str) -> int:
             instance = supervisor.Supervisor(
                 str(case / "state"), operation, arguments, child, create_transport=fake,
             )
+            stage = "run"
             os._exit(instance.run())
         except BaseException as error:
             error_name = type(error).__name__
@@ -204,9 +206,10 @@ def run(case: Path, scenario: str) -> int:
                 str(error) if isinstance(error, supervisor.SupervisorError) and
                 re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", str(error)) else "OTHER"
             )
+            safe_stage = stage if stage in {"construct", "run"} else "unknown"
             private(
                 case / "supervisor-error",
-                (safe_name + ":" + safe_reason + "\n").encode("ascii"),
+                (safe_stage + ":" + safe_name + ":" + safe_reason + "\n").encode("ascii"),
             )
             os._exit(1)
     child.close()
