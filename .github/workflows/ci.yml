@@ -470,10 +470,10 @@ jobs:
           timeout 300s python3 -B "$TOOLING_SCRIPTS/test-test-vps-provider-credential.py"
           timeout 600s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
             python3 -B "$TOOLING_SCRIPTS/test-test-vps-timepad-state.py"
-          timeout 900s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
-            python3 -B "$TOOLING_SCRIPTS/test-test-vps-timepad-supervisor.py"
           timeout 120s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
             python3 -B "$TOOLING_SCRIPTS/test-test-vps-timepad-create.py"
+          timeout 900s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
+            python3 -B "$TOOLING_SCRIPTS/test-test-vps-timepad-supervisor.py"
           timeout 1800s sudo -n bash "$TOOLING_SCRIPTS/fixtures/timepad-controller/run-isolated.sh" \
             bash "$TOOLING_SCRIPTS/test-test-vps-timepad-controller.sh"
           timeout 600s bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
