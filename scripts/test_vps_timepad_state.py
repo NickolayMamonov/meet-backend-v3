@@ -2618,7 +2618,7 @@ def check_execution_lease(
         if current is not None and current["phase"] not in TERMINAL | {"READY"} and \
                 current["executionAttempt"] not in {None, lease["attempt"]}:
             _reject("EXECUTION_LEASE_UNRESOLVED")
-        if lease["lifecycle"] in {"quiescence-unconfirmed", "drained"}:
+        if lease["lifecycle"] in {"draining", "quiescence-unconfirmed", "drained"}:
             _reject("EXECUTION_LEASE_UNRESOLVED")
         return {"attempt": lease["attempt"], "revision": lease["revision"], "outcome": "matched"}
 
