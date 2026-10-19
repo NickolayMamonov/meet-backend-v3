@@ -2397,8 +2397,15 @@ class Supervisor:
                     self._begin_publication(terminal=True)
                     childless = False
                 if self.attempt.lifecycle == "quiescence-unconfirmed":
+                    if childless and self.completion_pid is None and self.completion_ack is None:
+                        if self.lease_snapshots:
+                            self._begin_publication(terminal=False)
+                            childless = False
+                        else:
+                            self._report()
+                            return 1
                     self._report()
-                    if childless:
+                    if childless and self.completion_pid is None:
                         return 1
                     # Passive keeper: no more signals, commands, state writers,
                     # fsync or Docker calls, and no postdeadline finalization.

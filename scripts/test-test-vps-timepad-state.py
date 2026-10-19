@@ -3797,11 +3797,14 @@ class StaleRecoveryControllerTests(unittest.TestCase):
         try:
             with state.deploy_lock(root) as lock_fd:
                 os.set_inheritable(lock_fd, True)
+                lease = state._read_execution_lease_locked(root)
+                self.assertIn(lease["lifecycle"], {"draining", "quiescence-unconfirmed"})
                 with self.assertRaises(state.GuardError) as blocked:
                     state.check_execution_lease(
                         root, attempt=attempt, deploy_lock_fd=lock_fd,
                     )
                 self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason)
+                self.assertTrue(state._execution_process_exited(supervisor))
         except state.GuardError as busy:
             self.assertEqual("DEPLOY_LOCK_BUSY", busy.exception.reason)
             self.assertFalse(state._execution_process_exited(supervisor))
@@ -3820,12 +3823,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
             self.assertTrue(record["reaped"])
             self.assertTrue(state._execution_process_exited(lease["supervisor"]))
         else:
-            # Once every owned child has exited, an unresolved result may
-            # release FD9. The durable quiescence-unconfirmed lease remains
-            # the interlock for subsequent writers and retention operations.
-            with state.deploy_lock(case / "state") as lock_fd:
-                unresolved = state._read_execution_lease_locked(case / "state")
-            self.assertIn(unresolved["lifecycle"], {"draining", "quiescence-unconfirmed"})
+            # Either a live keeper retains FD9, or the exited supervisor leaves
+            # a durable unresolved lease to interlock later writers.
             self.assert_unresolved_interlock(case / "state", lease["attempt"], lease["supervisor"])
         self.assertFalse(os.path.lexists("/run/docker.sock"))
         self.assertFalse(os.path.lexists("/var/run/docker.sock"))
@@ -3905,16 +3904,16 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         1, result.returncode,
                         result.stdout + result.stderr + "\ntransport=" + transport_trace,
                     )
+                    lease = state._read_execution_lease_locked(state_root)
                     if fault == "none":
                         _, after = state.read_guard(state_root)
                     else:
                         # The failed stop is either still held by a live
                         # keeper or durably blocks reentry after childlessness.
                         self.assert_unresolved_interlock(
-                            state_root, original["executionAttempt"], original["supervisor"],
+                            state_root, lease["attempt"], lease["supervisor"],
                         )
                         _, after = state._read_guard_locked(state_root)
-                    lease = state._read_execution_lease_locked(state_root)
                     self.assertEqual(original["incidentId"], after["incidentId"])
                     self.assertEqual(1, after["operationEpoch"])
                     self.assertIsNone(after["ownedChild"])

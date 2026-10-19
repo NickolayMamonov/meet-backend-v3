@@ -498,7 +498,7 @@ class AttemptTests(unittest.TestCase):
                     yield from publication_calls(child, guards)
 
         calls = list(publication_calls(run))
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         self.assertTrue(all(any("childless" in guard for guard in guards) for guards in calls))
 
     def test_drill_86_only_after_successful_admitted_rollback(self):
