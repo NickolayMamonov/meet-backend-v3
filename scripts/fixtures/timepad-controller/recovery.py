@@ -230,6 +230,7 @@ def setup(
     )
     private(state_root / "timepad-recovery-authorization.json", json.dumps(auth).encode())
     image = current["target"]["tuple"]
+    private(case / "selected-image.json", json.dumps(image).encode())
     env = (
         f'BACKEND_IMAGE=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:{image["repositoryDigest"]}\n'
         f'BACKEND_REVISION={image["revision"]}\nBACKEND_VERSION={image["version"]}\n'
@@ -892,10 +893,7 @@ def docker(case: pathlib.Path, arguments: list[str]) -> None:
     replacement = fault in {"replace", "create-fails", "create-intent"}
     exists = not replacement or (case / "created").exists()
     if op == "image" and arguments[1] == "inspect":
-        _, current = load(
-            "historical_image_state", SOURCE / "test_vps_timepad_state.py",
-        ).read_guard(case / "state")
-        target = current["target"]["tuple"]
+        target = json.loads((case / "selected-image.json").read_bytes())
         if arguments[2] != (
             "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + target["repositoryDigest"]
         ):

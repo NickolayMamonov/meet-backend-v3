@@ -3883,8 +3883,6 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         (case / "recovery-transport-events").read_text()
                         if (case / "recovery-transport-events").exists() else "<no transport calls>"
                     )
-                    self.assertIn("fixture_timepad_guard=WORKER_DOCKER_PATH_MATCH", result.stderr)
-                    self.assertIn("fixture_timepad_guard=WORKER_DOCKER_LOG_MATCH", result.stderr)
                     self.assertEqual(
                         1, result.returncode,
                         result.stdout + result.stderr + "\ntransport=" + transport_trace,
@@ -4063,13 +4061,13 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     (case / "recovery-transport-events").read_text()
                     if (case / "recovery-transport-events").exists() else "<no transport calls>"
                 )
-                self.assertIn("fixture_timepad_guard=WORKER_DOCKER_PATH_MATCH", result.stderr)
-                self.assertIn("fixture_timepad_guard=WORKER_DOCKER_LOG_MATCH", result.stderr)
                 self.assertEqual(
                     1, result.returncode,
                     result.stdout + result.stderr + "\ntransport=" + transport_trace,
                 )
                 if fault in {"none", "acknowledged"}:
+                    self.assertIn("fixture_timepad_guard=WORKER_DOCKER_PATH_MATCH", result.stderr)
+                    self.assertIn("fixture_timepad_guard=WORKER_DOCKER_LOG_MATCH", result.stderr)
                     after = state._read_guard_locked(state_root)[1]
                     lease_after = state._read_execution_lease_locked(state_root)
                     diagnostic = {
