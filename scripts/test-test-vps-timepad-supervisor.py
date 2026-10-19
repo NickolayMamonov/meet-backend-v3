@@ -509,8 +509,16 @@ class AttemptTests(unittest.TestCase):
                     yield from publication_calls(child, guards)
 
         calls = list(publication_calls(run))
-        self.assertEqual(len(calls), 3)
+        self.assertTrue(calls)
         self.assertTrue(all(any("childless" in guard for guard in guards) for guards in calls))
+        self.assertTrue(any(
+            any("pending_terminal is not None" in guard for guard in guards)
+            for guards in calls
+        ))
+        self.assertTrue(any(
+            any("self.attempt.draining" in guard for guard in guards)
+            for guards in calls
+        ))
 
     def test_drill_86_only_after_successful_admitted_rollback(self):
         attempt = self.armed()
@@ -1486,8 +1494,8 @@ class ControllerLifecycleTests(unittest.TestCase):
 
     def test_registered_recovery_read_only_handoff_reaches_runtime_admission(self):
         source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
-        start = source.index('if [ "$operation" = forward-recover ]; then\n  recovery_budget_arm')
-        end = source.index("  recovery_target_id=", start)
+        branch = source.index('if [ "$operation" = forward-recover ]; then')
+        end = source.index("  recovery_target_id=", branch)
         script = self.function("recovery_budget_arm") + r"""
 state_root=$1
 recovery_t0_ns=
@@ -1514,7 +1522,7 @@ timeout() {
   esac
 }
 fail() { echo "$1" >&2; exit 91; }
-""" + source[start:end] + """
+""" + source[branch:end] + """
   echo runtime-admission
 fi
 """
@@ -2110,9 +2118,14 @@ class LinuxSupervisorTests(unittest.TestCase):
                     # Only the external provider observation is synthetic. State
                     # authority, prior process exit, receipt, FD9, publication,
                     # readback child, wait status and subsequent revisions are real.
+                    def recovery_runtime_proof(*_args, create_completion_recovery=False):
+                        if create_completion_recovery is not True:
+                            raise AssertionError("registration omitted create-completion proof mode")
+                        return current["runtimeRequest"]
+
                     provider = SimpleNamespace(
                         ProviderError=RuntimeError,
-                        _recovery_lease_runtime_proof=lambda *_args: current["runtimeRequest"],
+                        _recovery_lease_runtime_proof=recovery_runtime_proof,
                     )
                     with mock.patch.object(
                         state.importlib.util, "spec_from_file_location",

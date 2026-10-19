@@ -2056,6 +2056,22 @@ class Supervisor:
         peers: list[ProcessIdentity] = []
         frame, passed = receive_frame(channel, accept_fd=True, peer=peers)
         assert passed is not None
+        kind = frame.get("kind")
+        schemas = {
+            "hello": set(), "arm": set(), "lease": set(),
+            "lease-ack": {"revision", "digest"}, "grant": {"name", "localNs"},
+            "complete": {"grantId"}, "cancel": {"reason", "status"},
+            "validate-grant": {"grantId", "endNs"},
+            "admit-rollback": set(), "prepare-terminal": set(), "terminal": {"status"},
+            "create-launch": {"createRole", "attemptId"},
+            "create-release": {"requestDigest", "childIdentity"},
+            "create-result": {"requestDigest"},
+            "create-completion": {"requestDigest", "childIdentity"},
+            "create-driver": {"action", "createRole"},
+            "recovery-evidence": set(),
+        }
+        if kind == "terminal":
+            schemas["terminal"] = {"status", "outcome"} if "outcome" in frame else {"status"}
         try:
             reply = socket.socket(fileno=passed)
         except OSError:
@@ -2068,22 +2084,6 @@ class Supervisor:
             if frame.get("attempt") != self.attempt.nonce or \
                     frame.get("role") != self.attempt.role:
                 reject()
-            kind = frame.get("kind")
-            schemas = {
-                "hello": set(), "arm": set(), "lease": set(),
-                "lease-ack": {"revision", "digest"}, "grant": {"name", "localNs"},
-                "complete": {"grantId"}, "cancel": {"reason", "status"},
-                "validate-grant": {"grantId", "endNs"},
-                "admit-rollback": set(), "prepare-terminal": set(), "terminal": {"status"},
-                "create-launch": {"createRole", "attemptId"},
-                "create-release": {"requestDigest", "childIdentity"},
-                "create-result": {"requestDigest"},
-                "create-completion": {"requestDigest", "childIdentity"},
-                "create-driver": {"action", "createRole"},
-                "recovery-evidence": set(),
-            }
-            if kind == "terminal" and "outcome" in frame:
-                schemas["terminal"] = {"status", "outcome"}
             if not isinstance(kind, str) or kind not in schemas or \
                     set(frame) != {"kind", "attempt", "role"} | schemas[kind]:
                 reject()
