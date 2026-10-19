@@ -4110,6 +4110,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "TIMEPAD_FIXTURE_EXPECTED_DOCKER": str(bin_path / "docker"),
                     "TIMEPAD_FIXTURE_EXPECTED_DOCKER_LOG": str(case / "docker.log"),
                     "TIMEPAD_FIXTURE_DIAGNOSTICS": "1",
+                    "TIMEPAD_FIXTURE_DIAGNOSTIC_FILE": str(case / "recovery-diagnostics"),
                     "TEST_VPS_STATE_ROOT": str(state_root),
                 })
                 if fault == "stop-fails":
@@ -4292,6 +4293,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "TIMEPAD_FIXTURE_EXPECTED_DOCKER": str(bin_path / "docker"),
                     "TIMEPAD_FIXTURE_EXPECTED_DOCKER_LOG": str(case / "docker.log"),
                     "TIMEPAD_FIXTURE_DIAGNOSTICS": "1",
+                    "TIMEPAD_FIXTURE_DIAGNOSTIC_FILE": str(case / "recovery-diagnostics"),
                     "TEST_VPS_STATE_ROOT": str(state_root),
                 })
                 before = (current_path.read_bytes(), lease_path.read_bytes())
@@ -4356,6 +4358,10 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     stderr_capture.close()
                 log_path = case / "docker.log"
                 log = log_path.read_text().splitlines() if log_path.exists() else []
+                diagnostic_path = case / "recovery-diagnostics"
+                recovery_diagnostics = (
+                    diagnostic_path.read_text() if diagnostic_path.exists() else ""
+                )
                 starts = [line for line in log if line.startswith("start-id:")]
                 self.assertTrue(all(line == "start-id:" + current["containerId"] for line in starts))
                 transport_trace = (
@@ -4367,8 +4373,14 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     result.stdout + result.stderr + "\ntransport=" + transport_trace,
                 )
                 if fault in {"none", "acknowledged"}:
-                    self.assertIn("fixture_timepad_guard=WORKER_DOCKER_PATH_MATCH", result.stderr)
-                    self.assertIn("fixture_timepad_guard=WORKER_DOCKER_LOG_MATCH", result.stderr)
+                    self.assertIn(
+                        "fixture_timepad_guard=WORKER_DOCKER_PATH_MATCH",
+                        recovery_diagnostics,
+                    )
+                    self.assertIn(
+                        "fixture_timepad_guard=WORKER_DOCKER_LOG_MATCH",
+                        recovery_diagnostics,
+                    )
                     after = state._read_guard_locked(state_root)[1]
                     lease_after = state._read_execution_lease_locked(state_root)
                     diagnostic = {

@@ -315,8 +315,20 @@ def recover(case: Path, arguments: list[str]) -> int:
             # Match the production relay: a passive keeper must not retain
             # any caller output pipe.
             null = os.open("/dev/null", os.O_RDWR)
-            for fd in (0, 1, 2):
+            for fd in (0, 1):
                 os.dup2(null, fd)
+            diagnostic_path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE")
+            if diagnostic_path is not None:
+                require(Path(diagnostic_path) == case / "recovery-diagnostics",
+                        "fixture diagnostic destination is not fixed")
+                diagnostic_fd = os.open(
+                    diagnostic_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600,
+                )
+                os.dup2(diagnostic_fd, 2)
+                if diagnostic_fd > 2:
+                    os.close(diagnostic_fd)
+            else:
+                os.dup2(null, 2)
             if null > 2:
                 os.close(null)
             instance = supervisor.Supervisor(
