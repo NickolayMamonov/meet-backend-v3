@@ -3809,10 +3809,14 @@ class StaleRecoveryControllerTests(unittest.TestCase):
             # release FD9. The durable quiescence-unconfirmed lease remains
             # the interlock for subsequent writers and retention operations.
             with state.deploy_lock(case / "state") as lock_fd:
-                unresolved = state._read_execution_lease_locked(
-                    case / "state", deploy_lock_fd=lock_fd,
-                )
+                unresolved = state._read_execution_lease_locked(case / "state")
             self.assertEqual("quiescence-unconfirmed", unresolved["lifecycle"])
+            with state.deploy_lock(case / "state") as lock_fd:
+                with self.assertRaises(state.GuardError) as blocked:
+                    state.check_execution_lease(
+                        case / "state", attempt=lease["attempt"], deploy_lock_fd=lock_fd,
+                    )
+            self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason)
         self.assertFalse(os.path.lexists("/run/docker.sock"))
         self.assertFalse(os.path.lexists("/var/run/docker.sock"))
         self.assertIsNone(lease["createCompletion"])
@@ -3894,14 +3898,16 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     if fault == "none":
                         _, after = state.read_guard(state_root)
                     else:
-                        # An unacknowledged stop retains the real passive
-                        # keeper's FD9. Inspect schema-validated evidence
-                        # read-only; do not claim lock acquisition/quiescence.
-                        with self.assertRaises(state.GuardError) as busy:
-                            with state.deploy_lock(state_root):
-                                pass
-                        self.assertEqual("DEPLOY_LOCK_BUSY", busy.exception.reason)
-                        _, after = state._read_guard_locked(state_root)
+                        # Failed stop is childless but unresolved: the lease,
+                        # rather than a fictional live keeper, blocks writers.
+                        with state.deploy_lock(state_root) as lock_fd:
+                            with self.assertRaises(state.GuardError) as blocked:
+                                state.check_execution_lease(
+                                    state_root, attempt=original["executionAttempt"],
+                                    deploy_lock_fd=lock_fd,
+                                )
+                            self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason)
+                            _, after = state._read_guard_locked(state_root)
                     lease = state._read_execution_lease_locked(state_root)
                     self.assertEqual(original["incidentId"], after["incidentId"])
                     self.assertEqual(1, after["operationEpoch"])
