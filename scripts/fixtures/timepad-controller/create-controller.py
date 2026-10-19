@@ -193,7 +193,12 @@ def run(case: Path, scenario: str) -> int:
                 str(case / "state"), operation, arguments, child, create_transport=fake,
             )
             os._exit(instance.run())
-        except BaseException:
+        except BaseException as error:
+            error_name = type(error).__name__
+            safe_name = error_name if (
+                error_name.isascii() and error_name.isidentifier() and len(error_name) <= 64
+            ) else "Exception"
+            private(case / "supervisor-error", (safe_name + "\n").encode("ascii"))
             os._exit(1)
     child.close()
     end = time.monotonic_ns() + (600 if forward else 90) * supervisor.NS
@@ -206,7 +211,17 @@ def run(case: Path, scenario: str) -> int:
                 selector.register(parent, selectors.EVENT_READ)
                 if not selector.select(0.05):
                     continue
-            frame, _ = supervisor.receive_frame(parent)
+            try:
+                frame, _ = supervisor.receive_frame(parent)
+            except supervisor.SupervisorError as error:
+                detail = (
+                    (case / "supervisor-error").read_text().strip()
+                    if (case / "supervisor-error").exists() else "NO_CHILD_EXCEPTION"
+                )
+                raise AssertionError(
+                    "fixture supervisor channel closed: protocol=" + str(error) +
+                    " child=" + detail,
+                ) from None
             require(len(frames) < 256, "fixture relay inventory exceeded bound")
             frames.append(frame)
             if len(frames) == 1:
