@@ -383,6 +383,7 @@ def recover(case: Path, arguments: list[str]) -> int:
             os._exit(1)
     child.close()
     reaped = False
+    hello = None
     try:
         supervisor._wait_readable(parent, time.monotonic_ns() + 5 * supervisor.NS)
         hello, _ = supervisor.receive_frame(parent)
@@ -390,6 +391,13 @@ def recover(case: Path, arguments: list[str]) -> int:
                 and hello["kind"] == "hello" and
                 hello["supervisor"] == supervisor.lease_identity(supervisor.process_identity(pid)),
                 "historical supervisor identity is not kernel-bound")
+        private(
+            case / ("recovery-supervisor-" + hello["attempt"] + ".json"),
+            json.dumps({
+                "attempt": hello["attempt"], "supervisor": hello["supervisor"],
+                "hardEndNs": hello["hardEndNs"], "watchEndNs": hello["watchEndNs"],
+            }, sort_keys=True).encode(),
+        )
         supervisor.send_frame(parent, {"kind": "ready", "attempt": hello["attempt"]})
         hard_end, watch_end = hello["hardEndNs"], hello["watchEndNs"]
         for _ in range(256):
@@ -407,6 +415,11 @@ def recover(case: Path, arguments: list[str]) -> int:
                     frame["kind"] == "result" and frame["status"] == 1 and
                     frame["reason"] in {"RECOVERY_REQUIRED", "QUIESCENCE_UNCONFIRMED"},
                     "historical refusal result is not fixed")
+            if frame["reason"] == "QUIESCENCE_UNCONFIRMED":
+                private(case / ("recovery-channel-" + hello["attempt"] + ".json"), json.dumps({
+                    "attempt": hello["attempt"], "failure": "RESULT_QUIESCENCE_UNCONFIRMED",
+                    "state": "result",
+                }, sort_keys=True).encode())
             if frame["reason"] == "RECOVERY_REQUIRED":
                 end = time.monotonic_ns() + 5 * supervisor.NS
                 if hard_end is not None:
@@ -439,9 +452,17 @@ def recover(case: Path, arguments: list[str]) -> int:
             no_socket()
             return frame["status"]
         raise AssertionError("historical relay inventory exceeded bound")
-    except (OSError, supervisor.SupervisorError):
+    except (OSError, supervisor.SupervisorError) as error:
         # Match the public relay when lock/lease admission closes the channel
         # before a result. No terminal receipt or drained lease is fabricated.
+        if hello is not None:
+            failure = (
+                str(error) if isinstance(error, supervisor.SupervisorError) and
+                re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", str(error)) else "OS_ERROR"
+            )
+            private(case / ("recovery-channel-" + hello["attempt"] + ".json"), json.dumps({
+                "attempt": hello["attempt"], "failure": failure, "state": "closed-or-error",
+            }, sort_keys=True).encode())
         print("schema_guard=QUIESCENCE_UNCONFIRMED", flush=True)
         return 1
     finally:

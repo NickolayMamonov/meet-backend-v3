@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib.util
 import json
 import os
 import pathlib
+import select
+import signal
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -603,6 +607,12 @@ def assert_unknown_inventory_refusal(case: pathlib.Path) -> None:
 
 def refusal_snapshot(case: pathlib.Path) -> str:
     require_isolated(case)
+    _, module = case_helpers(case)
+    with module.deploy_lock(case / "state"):
+        return _refusal_snapshot_locked(case, module)
+
+
+def _refusal_snapshot_locked(case: pathlib.Path, module) -> str:
     paths = [case / "runtime.json"]
     for root in (case / "state", case / "root", pathlib.Path("/var/lib/meet-production")):
         if root.exists():
@@ -814,12 +824,209 @@ def unresolved_registration_snapshot(case: pathlib.Path) -> str:
                 or list((process / "fd").iterdir())
             ):
                 raise SystemExit("unresolved registration still has an unproved live owner/writer")
-        # A zombie retains its /proc identity, but no file descriptors or
-        # children. The unresolved lease, not a claimed live lock-keeper,
-        # excludes replay after this attempt's writers have exited.
-        snapshot = json.loads(refusal_snapshot(case))
+        snapshot = json.loads(_refusal_snapshot_locked(case, module))
         del snapshot[str(state_root / module.EXECUTION_LEASE_NAME)]
         return json.dumps(snapshot, sort_keys=True)
+
+
+class LeaseWriteObserver:
+    """Observe bounded writes in the fixture state directory without reading state."""
+
+    def __init__(self, state_root: pathlib.Path):
+        libc = ctypes.CDLL(None, use_errno=True)
+        self._libc = libc
+        libc.inotify_init1.argtypes = [ctypes.c_int]
+        libc.inotify_init1.restype = ctypes.c_int
+        libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        libc.inotify_add_watch.restype = ctypes.c_int
+        self.fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+        mask = 0x00000002 | 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
+        if libc.inotify_add_watch(self.fd, os.fsencode(state_root), mask) < 0:
+            error = ctypes.get_errno()
+            os.close(self.fd)
+            raise OSError(error, "inotify_add_watch failed")
+
+    def changed(self) -> bool:
+        modified = False
+        header_size = struct.calcsize("iIII")
+        while select.select([self.fd], [], [], 0)[0]:
+            try:
+                data = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            offset = 0
+            while offset < len(data):
+                _watch, mask, _cookie, name_size = struct.unpack_from("iIII", data, offset)
+                offset += header_size
+                name = data[offset:offset + name_size].split(b"\0", 1)[0]
+                offset += name_size
+                if mask & 0x00004000:
+                    raise RuntimeError("lease observer event queue overflowed")
+                if name == b".timepad-execution.json" or name.startswith(b".tmp-"):
+                    modified = True
+        return modified
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+
+def _enable_fixture_subreaper() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "fixture subreaper setup failed")
+
+
+def _supervisor_record(case: pathlib.Path) -> dict:
+    records = sorted(case.glob("recovery-supervisor-*.json"))
+    if not records:
+        raise SystemExit("fixture did not record an authenticated supervisor identity")
+    value = json.loads(records[0].read_bytes())
+    if (
+        set(value) != {"attempt", "supervisor", "hardEndNs", "watchEndNs"}
+        or not isinstance(value["attempt"], str)
+        or set(value["supervisor"]) != {"pid", "startTicks", "bootId"}
+        or type(value["hardEndNs"]) is not int or type(value["watchEndNs"]) is not int
+    ):
+        raise SystemExit("fixture supervisor identity record is malformed")
+    return value
+
+
+def _require_live_keeper(case: pathlib.Path, owner: dict, module, supervisor) -> None:
+    if supervisor.lease_identity(supervisor.process_identity(owner["pid"])) != owner:
+        raise SystemExit("fixture keeper process identity changed")
+    process = pathlib.Path(f"/proc/{owner['pid']}")
+    stat_fields = (process / "stat").read_bytes().rsplit(b")", 1)[1].split()
+    if stat_fields[0] not in {b"S", b"D"} or \
+            (process / f"task/{owner['pid']}/children").read_bytes().split():
+        raise SystemExit("fixture keeper is not a childless live process")
+    lock = case / "state/.deploy.lock"
+    lock_info = lock.stat()
+    fd_info = (process / "fd/9").stat()
+    if (fd_info.st_dev, fd_info.st_ino) != (lock_info.st_dev, lock_info.st_ino):
+        raise SystemExit("fixture keeper does not retain the exact FD9 deploy lock")
+    try:
+        with module.deploy_lock(case / "state"):
+            pass
+    except module.GuardError as error:
+        if error.reason != "DEPLOY_LOCK_BUSY":
+            raise
+    else:
+        raise SystemExit("fixture keeper did not exclude a competing deploy lock")
+
+
+def _terminate_owned_keeper(owner: dict) -> None:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise SystemExit("fixture-owned pidfd teardown is unavailable")
+    pidfd = os.pidfd_open(owner["pid"])
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                waited, status = os.waitpid(owner["pid"], os.WNOHANG)
+            except ChildProcessError:
+                raise SystemExit("fixture keeper was not adopted for exact reaping")
+            if waited == owner["pid"]:
+                if os.waitstatus_to_exitcode(status) != -signal.SIGKILL:
+                    raise SystemExit("fixture keeper teardown status is unexpected")
+                return
+            time.sleep(0.01)
+        raise SystemExit("fixture keeper did not reap within its bound")
+    finally:
+        os.close(pidfd)
+
+
+def run_unresolved_replay(case: pathlib.Path, command: list[str]) -> int:
+    """Replay while the original FD9 keeper is live, observe writes, then reap only it."""
+    require_isolated(case)
+    if not command or not (case / "refusal-baseline").is_file():
+        raise SystemExit("unresolved replay requires the fixed command and baseline")
+    _enable_fixture_subreaper()
+    first = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        timeout=130, check=False,
+    )
+    if first.returncode != 1 or first.stdout.strip() != "schema_guard=QUIESCENCE_UNCONFIRMED":
+        raise SystemExit("initial unresolved registration did not return the fixed refusal")
+    relay = _supervisor_record(case)
+    owner = relay["supervisor"]
+    channel_path = case / ("recovery-channel-" + relay["attempt"] + ".json")
+    channel = json.loads(channel_path.read_bytes())
+    if (
+        set(channel) != {"attempt", "failure", "state"}
+        or channel["attempt"] != relay["attempt"]
+        or not isinstance(channel["failure"], str)
+        or channel["state"] != "closed-or-error"
+    ):
+        raise SystemExit("fixture refusal channel diagnostic is malformed")
+    supervisor = load("unresolved_replay_supervisor", case / "tools/test_vps_timepad_supervisor.py")
+    _, module = case_helpers(case)
+    _require_live_keeper(case, owner, module, supervisor)
+    observer = LeaseWriteObserver(case / "state")
+    try:
+        replay = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            timeout=130, check=False,
+        )
+        if replay.returncode != 1 or replay.stdout.strip() != "schema_guard=QUIESCENCE_UNCONFIRMED":
+            raise SystemExit("unresolved replay did not return the fixed refusal")
+        _require_live_keeper(case, owner, module, supervisor)
+        if observer.changed():
+            raise SystemExit("unresolved replay wrote the protected lease")
+        _terminate_owned_keeper(owner)
+        if observer.changed():
+            raise SystemExit("fixture keeper teardown wrote the protected lease")
+    finally:
+        observer.close()
+
+    with module.deploy_lock(case / "state"):
+        _, current = module._read_guard_locked(case / "state")
+        lease = module._read_execution_lease_locked(case / "state")
+        if (
+            current["phase"] not in {"CUTOVER_POSSIBLE", "ROLLING_BACK"}
+            or current["runtimeRequest"] is not None or current["executionAttempt"] is not None
+            or lease is None or lease["operation"] != "forward-recover"
+            or lease["lifecycle"] != "draining" or lease["firstFailure"] != "EXIT"
+            or lease["firstStatus"] != 1 or lease["rollbackIssued"]
+            or lease["workerMode"] != "fail-closed-worker"
+            or lease["attempt"] != relay["attempt"] or lease["supervisor"] != owner
+            or lease["hardEndNs"] != relay["hardEndNs"]
+            or [worker["mode"] for worker in lease["workers"]] != [
+                "controller-worker", "fail-closed-worker",
+            ]
+            or lease["worker"] != {
+                key: lease["workers"][-1][key] for key in ("pid", "bootId", "startTicks")
+            }
+            or lease["workEndNs"] - lease["t0Ns"] != 540_000_000_000
+            or lease["hardEndNs"] - lease["workEndNs"] != 60_000_000_000
+            or not all(module._execution_process_exited(worker) for worker in lease["workers"])
+            or not module._execution_process_exited(owner)
+        ):
+            raise SystemExit("unresolved replay lost its exact immutable lease evidence")
+    before = json.loads((case / "refusal-baseline").read_bytes())
+    after = json.loads(refusal_snapshot(case))
+    after.pop(str(case / "state/.timepad-execution.json"), None)
+    if before != after:
+        raise SystemExit("unresolved replay changed incident/provider/configuration/runtime evidence")
+    private(case / "recovery-observation.json", json.dumps({
+        "attempt": relay["attempt"], "channelFailure": channel["failure"],
+        "keeperFd9": True, "keeperChildless": True, "replayLockBusy": True,
+        "replayLeaseWriteEvents": False, "ownedKeeperPidfdReaped": True,
+        "lockedPostSnapshotMatchesBaseline": True,
+    }, sort_keys=True).encode())
+    print("schema_guard=QUIESCENCE_UNCONFIRMED", flush=True)
+    return 1
+
+
+def record_refusal_baseline(case: pathlib.Path) -> None:
+    require_isolated(case)
+    data = sys.stdin.buffer.read(1_048_577)
+    value = json.loads(data)
+    if len(data) > 1_048_576 or not isinstance(value, dict) or len(value) > 4096:
+        raise SystemExit("fixture refusal baseline is malformed")
+    private(case / "refusal-baseline", json.dumps(value, sort_keys=True).encode())
 
 
 def run_active(case: pathlib.Path, command: list[str]) -> int:
@@ -1040,6 +1247,15 @@ if __name__ == "__main__":
         raise SystemExit(status)
     elif sys.argv[1] == "refusal-snapshot":
         print(refusal_snapshot(pathlib.Path(sys.argv[2])))
+    elif sys.argv[1] == "record-refusal-baseline":
+        record_refusal_baseline(pathlib.Path(sys.argv[2]))
+    elif sys.argv[1] == "run-unresolved-replay":
+        try:
+            status = run_unresolved_replay(pathlib.Path(sys.argv[2]), sys.argv[3:])
+        except Exception:
+            print("FIXTURE_UNRESOLVED_REPLAY_FAILED", file=sys.stderr, flush=True)
+            raise SystemExit(2)
+        raise SystemExit(status)
     elif sys.argv[1] == "assert-foreign-provider":
         assert_foreign_provider_refusal(pathlib.Path(sys.argv[2]))
     elif sys.argv[1] == "assert-missing":

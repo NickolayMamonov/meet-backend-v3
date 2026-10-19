@@ -274,6 +274,10 @@ assert_bound_recovery() {
     { [ "$phase" = COMMITTING ] &&
       { [ "$fault" = unknown-inventory ] || [ "$fault" = create-intent ]; }; }; then
     refusal_before=$(timeout 10s python3 -B "$fixture_bin/recovery.py" refusal-snapshot "$case_dir")
+    if [ "$fault" = missing ]; then
+      timeout 10s python3 -B "$fixture_bin/recovery.py" \
+        record-refusal-baseline "$case_dir" <<<"$refusal_before"
+    fi
   fi
   if [ "$fault" = foreign-provider ]; then
     # The helper owns the specific private diagnostic. The public relay keeps
@@ -314,7 +318,15 @@ assert_bound_recovery() {
     --recovery-incident "$(printf 'd%.0s' {1..32})" --recovery-epoch 1 \
     --recovery-binding-digest "$(<"$case_dir/binding")" \
     --recovery-action retry-exact-candidate)
-  if output=$(timeout --kill-after=5s 130s "${recovery_command[@]}" 2>&1)
+  if [ "$phase" = CUTOVER_POSSIBLE ] && [ "$fault" = missing ]; then
+    if output=$(timeout --kill-after=5s 300s python3 -B "$fixture_bin/recovery.py" \
+      run-unresolved-replay "$case_dir" "${recovery_command[@]}" 2>&1)
+    then
+      status=0
+    else
+      status=$?
+    fi
+  elif output=$(timeout --kill-after=5s 130s "${recovery_command[@]}" 2>&1)
   then
     status=0
   else
@@ -336,15 +348,11 @@ assert_bound_recovery() {
       [ ! -s "$case_dir/docker.log" ] ||
         fail "transport refusal reached the shell Docker boundary"
     fi
-    if [ "$fault" = missing ]; then
-      # Registration is control-plane evidence. Validate its unresolved,
-      # exited-owner shape before excluding only that newly created lease.
-      after=$(timeout 10s python3 -B "$fixture_bin/recovery.py" unresolved-registration-snapshot "$case_dir")
-    else
+    if [ "$fault" != missing ]; then
       after=$(timeout 10s python3 -B "$fixture_bin/recovery.py" refusal-snapshot "$case_dir")
+      [ "$refusal_before" = "$after" ] ||
+        fail "recovery phase=$phase fault=$fault changed incident/provider/lease/configuration/runtime"
     fi
-    [ "$refusal_before" = "$after" ] ||
-      fail "recovery phase=$phase fault=$fault changed incident/provider/lease/configuration/runtime"
   fi
   [ "$status" -eq 1 ] && {
     if [ "$expected" = QUIESCENCE_UNCONFIRMED ]; then
@@ -384,20 +392,8 @@ assert_bound_recovery() {
     ! grep -Eq '^((update|stop|start):|compose:(up|create)$)' "$case_dir/docker.log" ||
       fail "refusal mutated runtime"
     if [ "$phase" = CUTOVER_POSSIBLE ] && [ "$fault" = missing ]; then
-      local replay_before replay_log
-      replay_before=$(timeout 10s python3 -B "$fixture_bin/recovery.py" refusal-snapshot "$case_dir")
-      replay_log=$(sha256sum "$case_dir/docker.log" | awk '{print $1}')
-      if output=$(timeout --kill-after=5s 130s "${recovery_command[@]}" 2>&1); then
-        status=0
-      else
-        status=$?
-      fi
-      [ "$status" -eq 1 ] && [ "$output" = "schema_guard=QUIESCENCE_UNCONFIRMED" ] ||
-        fail "unresolved registration replay did not refuse with the sanitized contract"
-      [ "$replay_before" = "$(timeout 10s python3 -B "$fixture_bin/recovery.py" refusal-snapshot "$case_dir")" ] &&
-        [ "$replay_log" = "$(sha256sum "$case_dir/docker.log" | awk '{print $1}')" ] &&
-        [ "$refusal_before" = "$(timeout 10s python3 -B "$fixture_bin/recovery.py" unresolved-registration-snapshot "$case_dir")" ] ||
-        fail "unresolved registration replay changed lease/incident/provider/configuration/runtime"
+      # run-unresolved-replay has already retried under the live FD9 keeper,
+      # observed kernel write events, and reaped only that fixture-owned PID.
       echo "CONTROLLER_RECOVERY_UNRESOLVED_PASS: missing-legacy replay_refused=1 lease_unchanged=1 live_writers=0 target_starts=0"
     fi
   else
