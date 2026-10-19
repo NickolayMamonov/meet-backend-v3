@@ -2868,7 +2868,10 @@ if [ "$operation" = forward-recover ]; then
     [ "$(timeout 30s docker inspect "$candidate_container" \
       --format '{{.HostConfig.RestartPolicy.Name}}')" = no ] ||
       fail "RECOVERY_RETRY_QUIESCE_FAILED"
-    timepad_resource_revalidate recovery || fail "RESOURCE_ADMISSION_REFUSED"
+    if jq -e '.runtimeRequest.operation == "create" and
+      .runtimeRequest.lifecycle == "bound"' <<<"$recovery_state" >/dev/null; then
+      timepad_resource_revalidate recovery || fail "RESOURCE_ADMISSION_REFUSED"
+    fi
     run_owned_child FORWARD_RECOVERING timeout --kill-after=5s 30s docker start \
       "$candidate_container" >/dev/null || fail "RECOVERY_RETRY_START_FAILED"
     recovery_deadline=$(recovery_health_deadline 180) ||
