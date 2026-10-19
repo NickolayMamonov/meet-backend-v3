@@ -2157,7 +2157,7 @@ class Supervisor:
             self._fixture_diagnostic(
                 "rpc_reject",
                 kind=kind if isinstance(kind, str) and kind in schemas else "unknown",
-                reason=str(error) if str(error) in FAILURES else "OTHER",
+                reason=str(error) if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", str(error)) else "OTHER",
                 cancel_reason=(
                     frame["reason"] if kind == "cancel" and frame.get("reason") in FAILURES else "OTHER"
                 ),
