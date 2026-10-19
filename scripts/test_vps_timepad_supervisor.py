@@ -1192,7 +1192,16 @@ class Supervisor:
                 with socket.socket(fileno=response) as channel:
                     send_frame(channel, {"lease": snapshot})
                 os._exit(0)
-            except BaseException:
+            except BaseException as error:
+                if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+                    reason = (
+                        str(error) if isinstance(error, (CreateError, SupervisorError))
+                        else "OS_ERROR" if isinstance(error, OSError) else "OTHER"
+                    )
+                    print(
+                        f"fixture_timepad_supervisor=driver_child_refusal reason={reason}",
+                        file=sys.stderr, flush=True,
+                    )
                 os._exit(1)
         child.close()
         self.registration_ack = RecoveryRegistrationAck(pid, reply, parent, digest, end)
