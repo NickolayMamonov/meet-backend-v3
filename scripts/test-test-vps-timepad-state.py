@@ -4176,7 +4176,13 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         self.assertEqual("no", runtime["HostConfig"]["RestartPolicy"]["Name"])
                     else:
                         self.assertEqual("schema_guard=QUIESCENCE_UNCONFIRMED\n", result.stdout)
-                        self.assertNotIn("RECOVERY_RETRY_RUNTIME_FAILED", result.stderr)
+                        # Fixture diagnostics report the sticky sanitized
+                        # firstFailure; only a completed refusal may emit the
+                        # public deployment-failed result.
+                        self.assertNotIn(
+                            "test VPS deployment failed: RECOVERY_RETRY_RUNTIME_FAILED",
+                            result.stderr,
+                        )
                         self.assertEqual("intent", request["lifecycle"])
                         self.assertIsNone(request["responseId"])
                         self.assertIsNone(request["completionDigest"])
