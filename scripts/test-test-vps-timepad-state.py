@@ -3793,6 +3793,84 @@ class HistoricalRecoveryFixtureTests(unittest.TestCase):
     "actual stale-recovery controller requires the isolated Linux fixture",
 )
 class StaleRecoveryControllerTests(unittest.TestCase):
+    @staticmethod
+    def timeout_evidence(state_root):
+        """Return bounded ownership/channel facts without dumping state or proc data."""
+        lease_path = state_root / state.EXECUTION_LEASE_NAME
+        try:
+            lease = json.loads(lease_path.read_bytes())
+        except (OSError, ValueError):
+            lease = None
+
+        def process_facts(identity):
+            if not isinstance(identity, dict):
+                return {"present": False}
+            pid = identity.get("pid")
+            if type(pid) is not int or pid < 1:
+                return {"present": False}
+            proc = pathlib.Path("/proc") / str(pid)
+            try:
+                fields = (proc / "stat").read_bytes().rsplit(b")", 1)[1].split()
+                start_ticks = int(fields[19])
+                if start_ticks != identity["startTicks"]:
+                    return {"present": False}
+                children = (proc / "task" / str(pid) / "children").read_bytes().split()
+                descriptors = list((proc / "fd").iterdir())
+                return {
+                    "present": True,
+                    "state": fields[0].decode("ascii") if fields[0] in {b"R", b"S", b"D", b"T", b"t", b"Z", b"X", b"I"} else "other",
+                    "children": min(len(children), 256),
+                    "fdCount": min(len(descriptors), 256),
+                    "fd9": any(path.name == "9" for path in descriptors),
+                    "socketCount": min(sum(
+                        path.is_symlink() and os.readlink(path).startswith("socket:[")
+                        for path in descriptors
+                    ), 256),
+                }
+            except (OSError, ValueError, KeyError, IndexError):
+                return {"present": False}
+
+        if isinstance(lease, dict):
+            workers = lease.get("workers")
+            workers = workers if isinstance(workers, list) else []
+            ownership = {
+                "supervisor": process_facts(lease.get("supervisor")),
+                "worker": process_facts(lease.get("worker")),
+                "workers": [process_facts(worker) for worker in workers[:3]],
+            }
+            lease_facts = {
+                key: lease.get(key) for key in (
+                    "lifecycle", "workerMode", "firstFailure", "revision", "operation",
+                )
+            }
+        else:
+            ownership = {}
+            lease_facts = {"available": False}
+        return {
+            "phase": "timeout",
+            "outcome": "subprocess-timeout",
+            "lease": lease_facts,
+            "ownership": ownership,
+        }
+
+    @staticmethod
+    def timeout_trace(error):
+        raw = error.stderr or b""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        prefixes = (
+            "fixture_timepad_supervisor=attempt_transition ",
+            "fixture_timepad_supervisor=attempt_cancel ",
+            "fixture_timepad_supervisor=rpc_reject ",
+            "fixture_timepad_supervisor=event_refusal ",
+            "fixture_timepad_supervisor=event_loop_refusal ",
+            "fixture_timepad_supervisor=driver_child_refusal ",
+        )
+        return [
+            line[:512] for line in raw.splitlines()
+            if len(line) <= 512 and line.startswith(prefixes)
+        ][-12:]
+
     def assert_unresolved_interlock(self, root, attempt, supervisor):
         try:
             with state.deploy_lock(root) as lock_fd:
@@ -4055,7 +4133,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "TEST_VPS_STATE_ROOT": str(state_root),
                 })
                 before = (current_path.read_bytes(), lease_path.read_bytes())
-                result = subprocess.run([
+                command = [
                     sys.executable, "-B", str(case / "tools/recovery.py"),
                     "run-controller", str(case),
                     "--root", str(case / "root"), "--base-compose", str(case / "compose.yml"),
@@ -4067,7 +4145,25 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "--recovery-epoch", "2" if fault == "stale-epoch" else "1",
                     "--recovery-binding-digest", current["evidenceDigest"],
                     "--recovery-action", "retry-exact-candidate",
-                ], env=environment, capture_output=True, text=True, timeout=130, check=False)
+                ]
+                try:
+                    result = subprocess.run(
+                        command, env=environment, capture_output=True, text=True,
+                        timeout=130, check=False,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    # subprocess.run has reaped the command it owns. The
+                    # persisted lease lets this fixture report whether the
+                    # supervisor/worker remains alive, owns FD9, or has open
+                    # channels without exposing raw state or process data.
+                    diagnostic = self.timeout_evidence(state_root)
+                    diagnostic["phase"] = phase
+                    diagnostic["fault"] = fault
+                    diagnostic["timeoutSeconds"] = 130
+                    diagnostic["supervisorTrace"] = self.timeout_trace(error)
+                    self.fail("bounded recovery attempt timed out: " + json.dumps(
+                        diagnostic, sort_keys=True, separators=(",", ":"),
+                    ))
                 log_path = case / "docker.log"
                 log = log_path.read_text().splitlines() if log_path.exists() else []
                 starts = [line for line in log if line.startswith("start-id:")]
