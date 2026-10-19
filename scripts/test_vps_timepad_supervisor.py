@@ -2314,6 +2314,14 @@ class Supervisor:
         self.completion_channel, self.completion_pid = parent, pid
         self._notify_clock()
 
+    def _publish_unconfirmed(self) -> bool:
+        """Publish unresolved ownership only inside the original hard budget."""
+        if not self.lease_snapshots or self.attempt.hard_end is None or \
+                self.attempt.clock() >= self.attempt.hard_end:
+            return False
+        self._begin_publication(terminal=False)
+        return True
+
     def _completion_response(self) -> None:
         assert self.completion_channel is not None
         acknowledgment, _ = receive_frame(self.completion_channel)
@@ -2398,8 +2406,11 @@ class Supervisor:
                     childless = False
                 if self.attempt.lifecycle == "quiescence-unconfirmed":
                     if childless and self.completion_pid is None and self.completion_ack is None:
-                        if self.lease_snapshots:
-                            self._begin_publication(terminal=False)
+                        if self._publish_unconfirmed():
+                            childless = False
+                        elif self.lease_snapshots:
+                            # HardEnd is absolute. Keep FD9; a stale durable
+                            # lease still blocks writers if this process dies.
                             childless = False
                         else:
                             self._report()

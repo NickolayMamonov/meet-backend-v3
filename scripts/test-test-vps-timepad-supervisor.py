@@ -444,6 +444,17 @@ class AttemptTests(unittest.TestCase):
         self.attempt.unconfirmed()
         self.assertFalse(eval(condition, {}, {"self": instance, "now": 10}))
 
+    def test_unconfirmed_publication_cannot_start_at_or_after_hard_end(self):
+        instance = supervisor.Supervisor.__new__(supervisor.Supervisor)
+        instance.attempt = SimpleNamespace(hard_end=100, clock=mock.Mock(return_value=100))
+        instance.lease_snapshots = {3: {"lifecycle": "quiescence-unconfirmed"}}
+        instance._begin_publication = mock.Mock()
+        self.assertFalse(instance._publish_unconfirmed())
+        instance._begin_publication.assert_not_called()
+        instance.attempt.clock.return_value = 99
+        self.assertTrue(instance._publish_unconfirmed())
+        instance._begin_publication.assert_called_once_with(terminal=False)
+
     def test_cancellation_snapshots_are_ordered_bounded_and_do_not_share_worker_lists(self):
         instance = supervisor.Supervisor.__new__(supervisor.Supervisor)
         instance.attempt = self.attempt
