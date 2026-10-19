@@ -1128,6 +1128,8 @@ class Supervisor:
             "registration_ack_children",
             "registration_ack_reject",
             "rpc_reject",
+            "event_refusal",
+            "event_loop_refusal",
         }
         if label not in allowed:
             reject("PROTOCOL_INVALID")
@@ -2446,6 +2448,16 @@ class Supervisor:
                             else:
                                 self._rpc()
                         except (OSError, SupervisorError):
+                            self._fixture_diagnostic(
+                                "event_refusal",
+                                event=event.data if event.data in {
+                                    "relay", "worker", "completion", "registration", "create",
+                                    "create-helper", "create-driver-result", "create-driver-rpc",
+                                    "create-launcher-rpc", "create-helper-rpc",
+                                } else "unknown",
+                                lifecycle=self.attempt.lifecycle,
+                                failure=self.attempt.first_reason or "NONE",
+                            )
                             if event.data == "relay":
                                 self.relay_alive = False
                                 self.attempt.cancel("TRANSPORT_LOST")
@@ -2462,6 +2474,11 @@ class Supervisor:
                                     self.worker = None
                                 self.attempt.cancel("PROTOCOL_INVALID")
             except (OSError, SupervisorError):
+                self._fixture_diagnostic(
+                    "event_loop_refusal",
+                    lifecycle=self.attempt.lifecycle,
+                    failure=self.attempt.first_reason or "NONE",
+                )
                 self.attempt.cancel("OWNERSHIP_UNCERTAIN")
                 if self.create_parked:
                     self._resume_create_controller(cancel=True)
