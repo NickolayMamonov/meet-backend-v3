@@ -2356,6 +2356,12 @@ if [ "$operation" = bootstrap-guard ]; then
   exit 0
 fi
 if [ "$operation" = forward-recover ]; then
+  recovery_selector_refused() {
+    local predicate=$1
+    [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" != 1 ] ||
+      echo "fixture_timepad_guard=RECOVERY_SELECTOR_${predicate}" >&2
+    fail "RECOVERY_SELECTOR_MISMATCH"
+  }
   recovery_budget_arm
   recovery_authorization=$state_root/timepad-recovery-authorization.json
   validate_timepad_input "$recovery_authorization" 32768 ||
@@ -2371,7 +2377,7 @@ if [ "$operation" = forward-recover ]; then
       $s.runId == $run and $s.incidentId == ($incident | ascii_downcase) and
       ($s.operationEpoch | tostring) == $epoch and
       $s.evidenceDigest == $binding
-    ' <<<"$state_result" >/dev/null || fail "RECOVERY_SELECTOR_MISMATCH"
+    ' <<<"$state_result" >/dev/null || recovery_selector_refused STATE
   jq -e '.outcome == "authorized" or .outcome == "already-completed"' \
     <<<"$recovery_result" >/dev/null || fail "RECOVERY_AUTHORIZATION_INVALID"
   recovery_state=$(jq -ce '.current' <<<"$state_result") ||
@@ -2388,7 +2394,7 @@ if [ "$operation" = forward-recover ]; then
   case "$recovery_owned_run" in
     "$recovery_run_key-final-deploy") recovery_state_suffix=final-deploy ;;
     "$recovery_run_key-rollback-drill") recovery_state_suffix=rollback-drill ;;
-    *) fail "RECOVERY_SELECTOR_MISMATCH" ;;
+    *) recovery_selector_refused OWNED_RUN ;;
   esac
   recovery_state_dir=$state_root/$recovery_owned_run
   [ -d "$recovery_state_dir" ] && [ ! -L "$recovery_state_dir" ] ||
@@ -2401,9 +2407,9 @@ if [ "$operation" = forward-recover ]; then
   # configuration updates, or Compose creation. An acknowledged create may
   # finish its independent binding; all other requests need a durable exact ID.
   recovery_target_id=$(docker_image_inspect "$image" --format '{{.Id}}') ||
-    fail "RECOVERY_SELECTOR_MISMATCH"
+    recovery_selector_refused IMAGE_INSPECT
   recovery_image_inspect=$(docker_image_inspect "$image") ||
-    fail "RECOVERY_SELECTOR_MISMATCH"
+    recovery_selector_refused IMAGE_INSPECT
   [ "$(docker_image_inspect "$image" \
     --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision" ] &&
     [ "$(docker_image_inspect "$image" \
@@ -2412,10 +2418,10 @@ if [ "$operation" = forward-recover ]; then
       --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
       "https://github.com/NickolayMamonov/meet-backend-v3" ] &&
     [ "$(docker_image_inspect "$image" --format '{{.Config.User}}')" = 10001:10001 ] ||
-    fail "RECOVERY_SELECTOR_MISMATCH"
+    recovery_selector_refused IMAGE_LABELS
   printf '%s' "$recovery_image_inspect" |
     timeout 30s python3 "$provider_helper" check-image >/dev/null ||
-    fail "RECOVERY_SELECTOR_MISMATCH"
+    recovery_selector_refused IMAGE_POLICY
   jq -e --arg image "${recovery_target_id#sha256:}" \
     --arg repository "${image##*@sha256:}" --arg revision "$revision" \
     --arg version "$version" '
@@ -2424,7 +2430,7 @@ if [ "$operation" = forward-recover ]; then
       .target.tuple.repositoryDigest == $repository and
       .target.tuple.revision == $revision and
       .target.tuple.version == $version
-    ' <<<"$recovery_state" >/dev/null || fail "RECOVERY_SELECTOR_MISMATCH"
+    ' <<<"$recovery_state" >/dev/null || recovery_selector_refused TARGET_TUPLE
   [ ! -e "$smtp_pointer" ] && [ ! -L "$smtp_pointer" ] ||
     fail "RECOVERY_REQUIRED"
 
