@@ -2157,7 +2157,10 @@ class Supervisor:
             self._fixture_diagnostic(
                 "rpc_reject",
                 kind=kind if isinstance(kind, str) and kind in schemas else "unknown",
-                reason="OWNERSHIP_UNCERTAIN" if str(error) == "OWNERSHIP_UNCERTAIN" else "OTHER",
+                reason=str(error) if str(error) in FAILURES else "OTHER",
+                cancel_reason=(
+                    frame["reason"] if kind == "cancel" and frame.get("reason") in FAILURES else "OTHER"
+                ),
                 registration_pending=self.registration_ack is not None,
             )
             try:
