@@ -3884,13 +3884,17 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     children = source.read(8192).split()
                 descriptor_count = 0
                 socket_count = 0
+                pipe_count = 0
                 for descriptor in os.scandir(proc / "fd"):
                     if descriptor_count == 256:
                         break
                     descriptor_count += 1
                     try:
-                        if os.readlink(descriptor.path).startswith("socket:["):
+                        target = os.readlink(descriptor.path)
+                        if target.startswith("socket:["):
                             socket_count += 1
+                        elif target.startswith("pipe:["):
+                            pipe_count += 1
                     except OSError:
                         continue
                 return {
@@ -3900,6 +3904,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "fdCount": descriptor_count,
                     "fd9": os.path.lexists(proc / "fd/9"),
                     "socketCount": socket_count,
+                    "pipeCount": pipe_count,
                 }
             except (OSError, ValueError, KeyError, IndexError):
                 return {"present": False}
@@ -4006,7 +4011,10 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         "attemptMatches": current["executionAttempt"] == lease["attempt"],
                         "supervisorLive": not state._execution_process_exited(supervisor),
                     }, sort_keys=True, separators=(",", ":")))
-                self.assertTrue(state._execution_process_exited(supervisor))
+                self.assertTrue(
+                    state._execution_process_exited(supervisor),
+                    json.dumps(self.timeout_evidence(root), sort_keys=True, separators=(",", ":")),
+                )
         except state.GuardError as busy:
             self.assertEqual("DEPLOY_LOCK_BUSY", busy.reason)
             self.assertFalse(state._execution_process_exited(supervisor))
