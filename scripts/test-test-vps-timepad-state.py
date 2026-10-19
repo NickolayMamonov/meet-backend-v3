@@ -3926,11 +3926,22 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 os.set_inheritable(lock_fd, True)
                 lease = state._read_execution_lease_locked(root)
                 self.assertIn(lease["lifecycle"], {"draining", "quiescence-unconfirmed"})
-                with self.assertRaises(state.GuardError) as blocked:
+                try:
                     state.check_execution_lease(
                         root, attempt=attempt, deploy_lock_fd=lock_fd,
                     )
-                self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason)
+                except state.GuardError as blocked:
+                    self.assertEqual("EXECUTION_LEASE_UNRESOLVED", blocked.exception.reason)
+                else:
+                    _, current = state._read_guard_locked(root)
+                    self.fail(json.dumps({
+                        "interlock": "admitted-unresolved-lease",
+                        "leaseLifecycle": lease["lifecycle"],
+                        "leaseFailure": lease["firstFailure"],
+                        "currentPhase": current["phase"],
+                        "attemptMatches": current["executionAttempt"] == lease["attempt"],
+                        "supervisorLive": not state._execution_process_exited(supervisor),
+                    }, sort_keys=True, separators=(",", ":")))
                 self.assertTrue(state._execution_process_exited(supervisor))
         except state.GuardError as busy:
             self.assertEqual("DEPLOY_LOCK_BUSY", busy.exception.reason)
