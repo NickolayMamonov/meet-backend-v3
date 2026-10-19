@@ -2447,7 +2447,7 @@ class Supervisor:
                                 )
                             else:
                                 self._rpc()
-                        except (OSError, SupervisorError):
+                        except (OSError, SupervisorError) as error:
                             self._fixture_diagnostic(
                                 "event_refusal",
                                 event=event.data if event.data in {
@@ -2455,6 +2455,10 @@ class Supervisor:
                                     "create-helper", "create-driver-result", "create-driver-rpc",
                                     "create-launcher-rpc", "create-helper-rpc",
                                 } else "unknown",
+                                error=(
+                                    str(error) if isinstance(error, SupervisorError)
+                                    else "OS_ERROR"
+                                ),
                                 lifecycle=self.attempt.lifecycle,
                                 failure=self.attempt.first_reason or "NONE",
                             )
