@@ -111,8 +111,9 @@ def fixture_data(source: Path) -> dict:
 class ForwardTransport:
     """Only external facts and a real fixed no-start child, not a driver."""
 
-    def __init__(self, case: Path, facts: dict):
+    def __init__(self, case: Path, facts: dict, *, recovery_runtime: Path | None = None):
         self.case, self.facts = case, facts
+        self.recovery_runtime = recovery_runtime
 
     def identity(self, stage, context):
         import test_vps_timepad_create as create
@@ -127,6 +128,7 @@ class ForwardTransport:
 
         no_socket()
         context.check_time()
+        require(self.recovery_runtime is None, "historical recovery requested a create model")
         require(isinstance(view, create.View), "unexpected model view")
         model = copy.deepcopy(self.facts["model"])
         override = Path(context.run, "target-runtime.override.yml").read_text()
@@ -140,6 +142,25 @@ class ForwardTransport:
 
         no_socket()
         context.check_time()
+        if self.recovery_runtime is not None:
+            require(self.recovery_runtime == self.case / "runtime.json",
+                    "historical runtime input is not fixed")
+            backend = json.loads(self.recovery_runtime.read_bytes())
+            fault = (self.case / "fault").read_text()
+            missing = fault in {"missing", "missing-request-proof"} or (
+                fault in {"replace", "create-fails", "create-intent"}
+                and not (self.case / "created").exists()
+            )
+            inventory = [] if missing else [backend["Id"]]
+            if fault == "unknown-inventory":
+                inventory = ["a" * 64]
+            return create.canonical({
+                "resources": {
+                    "containerInspections": [] if missing else [backend],
+                    "backendInventory": inventory, "composeInventory": inventory,
+                },
+                "imageInspection": [],
+            }, create.MAX_EVIDENCE)
         value = json.loads((self.case / "forward-runtime.json").read_bytes())
         resources = copy.deepcopy(self.facts["resources"])
         backend = value["backend"]
@@ -177,6 +198,7 @@ class ForwardTransport:
 
         no_socket()
         context.check_time()
+        require(self.recovery_runtime is None, "historical recovery attempted create")
         require(control_fds == (9,), "fixture create inherited unexpected authority")
         model = create.parse(self.render(create.View.FROZEN_TARGET, context), create.MAX_MODEL)
         path = self.case / "forward-runtime.json"

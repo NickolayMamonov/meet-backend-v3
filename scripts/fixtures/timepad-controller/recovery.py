@@ -22,10 +22,13 @@ def stage_tooling(tools: pathlib.Path) -> None:
     for name in (
         "deploy-test-vps-provider-release.sh", "production-compose.sh",
         "update-production-release.sh", "test-vps-runtime-invariants.sh",
+        "production-config-digest.sh",
         "test-vps-provider-credential.py", "test_vps_timepad_state.py",
         "test_vps_timepad_supervisor.py", "test_vps_timepad_create.py",
     ):
         shutil.copy2(SOURCE / name, tools / name)
+    for name in ("create-controller.py", "forward.py", "recovery.py"):
+        shutil.copy2(pathlib.Path(__file__).with_name(name), tools / name)
 
 
 def historical_lease(module, attempt, *, owner: dict, workers: list, worker=None) -> dict:
@@ -117,9 +120,10 @@ def setup(
     proof_faults = {"intact", "foreign", "foreign-provider", "missing-request-proof", "reaped-child"}
     if request_proof and not (
         phase == "CUTOVER_POSSIBLE" and fault in proof_faults
+        or phase in {"VERIFYING", "RECOVERY_REQUIRED", "FORWARD_RECOVERING"} and fault == "intact"
         or phase == "ROLLING_BACK" and fault in {"intact", "foreign", "missing-input"}
         or phase == "COMMITTING" and fault in {
-            "unknown-inventory", "create-intent", "create-fails", "replace",
+            "intact", "unknown-inventory", "create-intent", "create-fails", "replace",
         }
     ):
         raise SystemExit("request proof requires an admitted exact-retry fixture")
@@ -128,12 +132,17 @@ def setup(
     )
     fixtures = load("provider_recovery_fixtures", SOURCE / "test-test-vps-provider-credential.py")
     module, contract, _, template, envelope = fixtures.live_context(phase)
+    external = load("historical_external_facts", pathlib.Path(__file__).with_name("forward.py"))
+    # The legacy request branch admits only pinned external tooling. It does
+    # not acquire a create model/resource proof or a fabricated PREPARED receipt.
+    contract["tooling"] = external.fixture_data(SOURCE)["contract"]["tooling"]
     if not compatible:
         contract["transitions"][0]["compatiblePredecessors"] = []
     root, state_root, tools = (case / name for name in ("root", "state", "tools"))
     for directory in (case, root, state_root, tools):
         directory.mkdir(mode=0o700)
     stage_tooling(tools)
+    private(case / "docker.log", b"")
     private(tools / "test-vps-timepad-release-contracts.json", json.dumps(contract).encode())
     provider = fixtures.helper
     with module.deploy_lock(state_root):
@@ -236,6 +245,7 @@ def setup(
     ):
         private(run / name, source.read_bytes())
         private(run / (name + ".identity"), identity(source))
+    private(run / "target-runtime.override.yml", b"services:\n  backend: {}\n")
     private(state_root / ".provider-transaction.current", json.dumps(dict(
         schemaVersion=1, runKey=current["runId"], phase=(
             "rolling-back" if phase == "ROLLING_BACK" else "verifying"
@@ -278,7 +288,6 @@ def setup(
             private(path, content)
             private(run / f"candidate-active-{name}.yml", content)
             private(run / f"candidate-active-{name}.identity", identity(path))
-        private(run / "target-runtime.override.yml", b"services:\n  backend: {}\n")
         if fault == "create-intent":
             current = module.advance_state(current, "FORWARD_RECOVERING")
             current = module.advance_state(
@@ -998,6 +1007,13 @@ if __name__ == "__main__":
         )
     elif sys.argv[1] == "docker":
         docker(pathlib.Path(os.environ["TIMEPAD_FIXTURE_CASE"]), sys.argv[2:])
+    elif sys.argv[1] == "run-controller":
+        case = pathlib.Path(sys.argv[2])
+        require_isolated(case)
+        if pathlib.Path(__file__).resolve() != case / "tools/recovery.py":
+            raise SystemExit("recovery controller must use its staged fixture")
+        channel = load("historical_controller_channel", case / "tools/create-controller.py")
+        raise SystemExit(channel.recover(case, sys.argv[3:]))
     elif sys.argv[1] == "refusal-snapshot":
         print(refusal_snapshot(pathlib.Path(sys.argv[2])))
     elif sys.argv[1] == "assert-foreign-provider":

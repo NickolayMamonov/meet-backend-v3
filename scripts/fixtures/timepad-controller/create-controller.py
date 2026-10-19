@@ -280,6 +280,109 @@ def run(case: Path, scenario: str) -> int:
             os.waitpid(pid, 0)
 
 
+def recover(case: Path, arguments: list[str]) -> int:
+    """Relay a historical case to the actual worker, not production RealTransport.
+
+    A quiescence refusal deliberately leaves the real passive keeper in the
+    fixture PID namespace, just as the public relay does. Only a positive
+    terminal result is accompanied by an actual wait/exit assertion.
+    """
+    import test_vps_timepad_supervisor as supervisor
+    from forward import ForwardTransport
+
+    require(Path(__file__).resolve() == case / "tools/create-controller.py",
+            "historical controller is not staged")
+    require(arguments.count("--operation") == 1 and
+            arguments[arguments.index("--operation") + 1] == "forward-recover",
+            "historical controller operation is not fixed")
+    require(arguments.count("--root") == 1 and
+            arguments[arguments.index("--root") + 1] == str(case / "root"),
+            "historical controller root is not fixed")
+    require(os.environ.get("TEST_VPS_STATE_ROOT") == str(case / "state"),
+            "historical state root is not fixed")
+    no_socket()
+    fake = ForwardTransport(case, {}, recovery_runtime=case / "runtime.json")
+    parent, child = supervisor.socket_pair()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            parent.close()
+            os.setsid()
+            supervisor._close_except({child.fileno()})
+            # Refused attempts can retain FD9 after the relay has returned.
+            # Their passive keeper must not retain the caller's output pipes.
+            null = os.open("/dev/null", os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            if null > 2:
+                os.close(null)
+            instance = supervisor.Supervisor(
+                str(case / "state"), "forward-recover", arguments, child,
+                create_transport=fake,
+            )
+            os._exit(instance.run())
+        except BaseException:
+            os._exit(1)
+    child.close()
+    reaped = False
+    try:
+        supervisor._wait_readable(parent, time.monotonic_ns() + 5 * supervisor.NS)
+        hello, _ = supervisor.receive_frame(parent)
+        require(set(hello) == {"kind", "attempt", "supervisor", "hardEndNs", "watchEndNs"}
+                and hello["kind"] == "hello" and
+                hello["supervisor"] == supervisor.lease_identity(supervisor.process_identity(pid)),
+                "historical supervisor identity is not kernel-bound")
+        supervisor.send_frame(parent, {"kind": "ready", "attempt": hello["attempt"]})
+        hard_end, watch_end = hello["hardEndNs"], hello["watchEndNs"]
+        for _ in range(256):
+            no_socket()
+            supervisor._wait_readable(parent, hard_end if hard_end is not None else watch_end)
+            frame, _ = supervisor.receive_frame(parent)
+            require(frame.get("attempt") == hello["attempt"], "historical relay attempt changed")
+            if frame.get("kind") == "clock":
+                require(set(frame) == {"kind", "attempt", "hardEndNs", "watchEndNs"} and
+                        (hard_end is None or frame["hardEndNs"] == hard_end),
+                        "historical relay clock changed")
+                hard_end, watch_end = frame["hardEndNs"], frame["watchEndNs"]
+                continue
+            require(set(frame) == {"kind", "attempt", "status", "reason", "outcome"} and
+                    frame["kind"] == "result" and frame["status"] == 1 and
+                    frame["reason"] in {"RECOVERY_REQUIRED", "QUIESCENCE_UNCONFIRMED"},
+                    "historical refusal result is not fixed")
+            if frame["reason"] == "RECOVERY_REQUIRED":
+                end = time.monotonic_ns() + 5 * supervisor.NS
+                if hard_end is not None:
+                    end = min(end, hard_end)
+                while time.monotonic_ns() < end:
+                    no_socket()
+                    waited, status = os.waitpid(pid, os.WNOHANG)
+                    if waited:
+                        reaped = True
+                        require(os.waitstatus_to_exitcode(status) == frame["status"],
+                                "historical result did not match actual supervisor exit")
+                        break
+                    time.sleep(0.01)
+                require(reaped, "historical terminal supervisor did not exit")
+            private(case / ("recovery-relay-" + hello["attempt"] + ".json"), json.dumps({
+                "hello": hello, "result": frame, "reaped": reaped,
+            }, sort_keys=True).encode())
+            outcome = frame["outcome"]
+            require(outcome is None or (
+                frame["reason"] == "RECOVERY_REQUIRED" and
+                supervisor.REFUSAL_OUTCOMES.get(outcome) == "forward-recover"
+            ), "historical refusal outcome is not fixed")
+            if outcome is not None:
+                print("test VPS deployment failed: " + outcome, file=sys.stderr, flush=True)
+            print("schema_guard=" + frame["reason"], flush=True)
+            no_socket()
+            return frame["status"]
+        raise AssertionError("historical relay inventory exceeded bound")
+    finally:
+        parent.close()
+        if not reaped:
+            os.waitpid(pid, os.WNOHANG)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", type=Path, required=True)

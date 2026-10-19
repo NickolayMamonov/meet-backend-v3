@@ -3667,11 +3667,61 @@ class HistoricalRecoveryFixtureTests(unittest.TestCase):
             result = subprocess.run([
                 sys.executable, "-I", "-B", "-c",
                 "import pathlib, sys; sys.path.insert(0, sys.argv[1]); "
-                "import test_vps_timepad_supervisor, test_vps_timepad_create; "
-                "assert pathlib.Path(test_vps_timepad_create.__file__).parent == pathlib.Path(sys.argv[1])",
+                "import test_vps_timepad_supervisor, test_vps_timepad_create, forward, recovery; "
+                "assert all(pathlib.Path(module.__file__).parent == pathlib.Path(sys.argv[1]) "
+                "for module in (test_vps_timepad_create, forward, recovery))",
                 temporary,
             ], capture_output=True, text=True, timeout=20, check=False)
             self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_historical_transport_observes_runtime_faults_without_durable_writes(self):
+        external = self.adapter.load(
+            "historical_transport_contract", ROOT / "fixtures/timepad-controller/forward.py",
+        )
+        import test_vps_timepad_create as create
+
+        observed = {"Id": digest("f"), "State": {"Running": False}}
+        with tempfile.TemporaryDirectory() as temporary:
+            case = pathlib.Path(temporary)
+            runtime = case / "runtime.json"
+            runtime.write_bytes(state._canonical(observed))
+            fault_path = case / "fault"
+            transport = external.ForwardTransport(case, {}, recovery_runtime=runtime)
+            context = SimpleNamespace(check_time=lambda: None)
+            for fault, inspections, inventory in (
+                ("intact", [observed], [observed["Id"]]),
+                ("unknown-inventory", [observed], [digest("a")]),
+                ("missing", [], []), ("missing-request-proof", [], []),
+                ("replace", [], []), ("create-fails", [], []), ("create-intent", [], []),
+            ):
+                with self.subTest(fault=fault), mock.patch.object(external, "no_socket"):
+                    fault_path.write_text(fault)
+                    before = {path.name: path.read_bytes() for path in case.iterdir()}
+                    result = create.parse(transport.observe(context), create.MAX_EVIDENCE)
+                    self.assertEqual({
+                        "containerInspections": inspections,
+                        "backendInventory": inventory, "composeInventory": inventory,
+                    }, result["resources"])
+                    self.assertEqual([], result["imageInspection"])
+                    self.assertEqual(before, {path.name: path.read_bytes() for path in case.iterdir()})
+                    with self.assertRaises(AssertionError):
+                        transport.render(create.View.FROZEN_TARGET, context)
+                    with self.assertRaises(AssertionError):
+                        transport.spawn_create(context, (9,))
+
+    def test_historical_relay_uses_actual_supervisor_and_only_constructor_transport(self):
+        path = ROOT / "fixtures/timepad-controller/create-controller.py"
+        tree = ast.parse(path.read_text())
+        relay = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "recover")
+        source = ast.unparse(relay)
+        self.assertIn("supervisor.Supervisor(", source)
+        self.assertIn("create_transport=fake", source)
+        self.assertIn("instance.run()", source)
+        self.assertIn("os.waitstatus_to_exitcode(status)", source)
+        for forbidden in ("mock", "production_supervisor(", "RealTransport(", "clock=",
+                          ".spawn =", ".waitpid =", ".publish_current", "_atomic_write"):
+            self.assertNotIn(forbidden, source)
 
     def test_historical_non_create_lease_has_exact_persisted_schema(self):
         attempt = supervisor.Attempt("deploy", nonce="8" * 32)
@@ -3733,6 +3783,27 @@ class HistoricalRecoveryFixtureTests(unittest.TestCase):
     "actual stale-recovery controller requires the isolated Linux fixture",
 )
 class StaleRecoveryControllerTests(unittest.TestCase):
+    def assert_refusal_relay(self, case, lease, *, terminal):
+        record = json.loads((case / ("recovery-relay-" + lease["attempt"] + ".json")).read_bytes())
+        self.assertEqual(lease["supervisor"], record["hello"]["supervisor"])
+        self.assertEqual(lease["attempt"], record["result"]["attempt"])
+        self.assertEqual("RECOVERY_REQUIRED" if terminal else "QUIESCENCE_UNCONFIRMED",
+                         record["result"]["reason"])
+        self.assertEqual("RECOVERY_RETRY_RUNTIME_FAILED" if terminal else None,
+                         record["result"]["outcome"])
+        self.assertEqual(terminal, record["reaped"])
+        if terminal:
+            self.assertTrue(state._execution_process_exited(lease["supervisor"]))
+        else:
+            with self.assertRaises(state.GuardError) as busy:
+                with state.deploy_lock(case / "state"):
+                    pass
+            self.assertEqual("DEPLOY_LOCK_BUSY", busy.exception.reason)
+        self.assertFalse(os.path.lexists("/run/docker.sock"))
+        self.assertFalse(os.path.lexists("/var/run/docker.sock"))
+        self.assertIsNone(lease["createCompletion"])
+        self.assertFalse(list((case / "state").glob("*/timepad-create-completion*.json")))
+
     def setup_case(self, case, phase, *, request_proof=False):
         # Historical supervisor ownership must belong to an exited process,
         # not this still-live unittest runner or its unrelated descendants.
@@ -3780,7 +3851,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 if fault == "stop-fails":
                     environment["TIMEPAD_FIXTURE_FAIL_AT"] = "stop:--time"
                 command = [
-                    "bash", str(case / "tools/deploy-test-vps-provider-release.sh"),
+                    sys.executable, "-B", str(case / "tools/recovery.py"),
+                    "run-controller", str(case),
                     "--root", str(case / "root"), "--base-compose", str(case / "compose.yml"),
                     "--image", "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + "1" * 64,
                     "--revision", "3" * 40, "--version", "1.2.3",
@@ -3795,7 +3867,17 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         command, env=environment, capture_output=True, text=True, timeout=130, check=False,
                     )
                     self.assertEqual(1, result.returncode, result.stdout + result.stderr)
-                    _, after = state.read_guard(state_root)
+                    if fault == "none":
+                        _, after = state.read_guard(state_root)
+                    else:
+                        # An unacknowledged stop retains the real passive
+                        # keeper's FD9. Inspect schema-validated evidence
+                        # read-only; do not claim lock acquisition/quiescence.
+                        with self.assertRaises(state.GuardError) as busy:
+                            with state.deploy_lock(state_root):
+                                pass
+                        self.assertEqual("DEPLOY_LOCK_BUSY", busy.exception.reason)
+                        _, after = state._read_guard_locked(state_root)
                     lease = state._read_execution_lease_locked(state_root)
                     self.assertEqual(original["incidentId"], after["incidentId"])
                     self.assertEqual(1, after["operationEpoch"])
@@ -3823,6 +3905,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         self.assertEqual(after["incidentId"] + f":{dispatch}", after["latestAttemptId"])
                         self.assertEqual("drained", lease["lifecycle"])
                         self.assertIsNone(lease["worker"])
+                        self.assert_refusal_relay(case, lease, terminal=True)
                         self.assertNotIn(lease["attempt"], attempts)
                         attempts.append(lease["attempt"])
                         runtime = json.loads((case / "runtime.json").read_bytes())
@@ -3839,6 +3922,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                             (state_root / state.EXECUTION_LEASE_NAME).read_bytes(),
                         )
                         if dispatch == 1:
+                            self.assert_refusal_relay(case, lease, terminal=False)
                             before_reentry = snapshots
                         else:
                             self.assertEqual(before_reentry, snapshots)
@@ -3864,13 +3948,14 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 prefix="case-stale-", dir=fixture_root,
             ) as temporary, ExitStack() as stack:
                 case = pathlib.Path(temporary) / "fixture"
-                self.setup_case(case, phase)
+                self.setup_case(case, phase, request_proof=True)
                 state_root = case / "state"
                 _, current = state.read_guard(state_root)
-                old = execution_lease(attempt="8" * 32, revision=4, lifecycle="drained")
-                old.update(firstFailure="EXIT", firstStatus=1)
+                old = state._read_execution_lease_locked(state_root)
+                self.assertEqual("drained", old["lifecycle"])
+                self.assertEqual("completed", current["runtimeRequest"]["lifecycle"])
                 identities = []
-                for _ in range(2):
+                for _ in range(2 if fault in {"live-worker", "live-supervisor"} else 0):
                     process = subprocess.Popen(
                         [sys.executable, "-B", "-c", "import sys; sys.stdin.buffer.read()"],
                         stdin=subprocess.PIPE, start_new_session=True,
@@ -3884,17 +3969,10 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         process.communicate(timeout=5)
                     else:
                         stack.callback(process.communicate, timeout=5)
-                old["supervisor"] = identities[0]
-                old["workers"] = [{"mode": "controller-worker", **identities[1]}]
-                request = {
-                    "nonce": "9" * 32, "sequence": 1, "executionAttempt": old["attempt"],
-                    "operation": "stop", "containerId": current["containerId"],
-                    "imageId": current["target"]["tuple"]["platformImageId"],
-                    "configHash": current["configHash"], "childAttemptId": None,
-                    "lifecycle": "completed", "responseId": current["containerId"],
-                    "completionDigest": "a" * 64,
-                }
-                current.update(executionAttempt=old["attempt"], runtimeRequest=request)
+                if identities:
+                    old["supervisor"] = identities[0]
+                    old["workers"] = [{"mode": "controller-worker", **identities[1]}]
+                request = current["runtimeRequest"]
                 if fault == "acknowledged":
                     request.update(lifecycle="acknowledged", completionDigest=None)
                 elif fault == "intent":
@@ -3902,7 +3980,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 elif fault == "missing-request":
                     current["runtimeRequest"] = None
                 elif fault == "unbound":
-                    old.update(lifecycle="armed", worker=identities[1])
+                    worker = {key: old["workers"][0][key] for key in ("pid", "bootId", "startTicks")}
+                    old.update(lifecycle="armed", worker=worker)
                 elif fault == "overflow":
                     old["firstFailure"] = "DESCENDANT_OVERFLOW"
                 elif fault == "partial-pair":
@@ -3939,7 +4018,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 })
                 before = (current_path.read_bytes(), lease_path.read_bytes())
                 result = subprocess.run([
-                    "bash", str(case / "tools/deploy-test-vps-provider-release.sh"),
+                    sys.executable, "-B", str(case / "tools/recovery.py"),
+                    "run-controller", str(case),
                     "--root", str(case / "root"), "--base-compose", str(case / "compose.yml"),
                     "--image", "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + "1" * 64,
                     "--revision", "3" * 40, "--version", "1.2.3",
@@ -3988,6 +4068,9 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     self.assertEqual(1, after["operationEpoch"])
                     self.assertNotEqual(old["attempt"], after["executionAttempt"])
                     self.assertEqual(after["executionAttempt"], state._read_execution_lease_locked(state_root)["attempt"])
+                    # The existing retry-failure terminal worker admits only
+                    # VERIFYING. COMMITTING retains its unconfirmed keeper.
+                    self.assert_refusal_relay(case, lease_after, terminal=phase != "COMMITTING")
                 else:
                     self.assertEqual([], starts)
                     self.assertEqual(before, (current_path.read_bytes(), lease_path.read_bytes()))

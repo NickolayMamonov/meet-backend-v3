@@ -296,14 +296,16 @@ assert_bound_recovery() {
   export TIMEPAD_FIXTURE_CASE=$case_dir
   export TIMEPAD_FIXTURE_DOCKER_LOG=$case_dir/docker.log
   export TEST_VPS_STATE_ROOT=$case_dir/state
-  local -a launch=("$bash_path")
+  # Public production refusal/preflight rows above retain fixed RealTransport.
+  # Runtime recovery rows use only the explicit fixture constructor seam.
+  local -a launch=(python3 -B "$case_dir/tools/recovery.py" run-controller "$case_dir")
   case "$fault" in
     active-child*)
-      launch=(python3 -B "$fixture_bin/recovery.py" run-active "$case_dir" "$bash_path")
+      launch=(python3 -B "$fixture_bin/recovery.py" run-active "$case_dir"
+        "${launch[@]}")
       ;;
   esac
   local -a recovery_command=("${launch[@]}" \
-    "$case_dir/tools/deploy-test-vps-provider-release.sh" \
     --root "$case_dir/root" --base-compose "$case_dir/compose.yml" \
     --image "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:$(printf '1%.0s' {1..64})" \
     --revision "$(printf '3%.0s' {1..40})" --version 1.2.3 \
@@ -331,8 +333,8 @@ assert_bound_recovery() {
     ! grep -Eq '^((update|stop|start|rm|volume):|compose:(up|create|start|stop|update|rm)$)' \
       "$case_dir/docker.log" || fail "ownership refusal attempted runtime mutation"
     if [ "$fault" = foreign ] || [ "$fault" = missing-request-proof ]; then
-      [ "$(<"$case_dir/docker.log")" = "inspect:$allowed_start" ] ||
-        fail "runtime refusal passed exact ownership admission"
+      [ ! -s "$case_dir/docker.log" ] ||
+        fail "transport refusal reached the shell Docker boundary"
     fi
     if [ "$fault" = missing ]; then
       # Registration is control-plane evidence. Validate its unresolved,
