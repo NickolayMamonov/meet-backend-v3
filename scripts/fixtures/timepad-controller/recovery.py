@@ -896,7 +896,7 @@ def docker(case: pathlib.Path, arguments: list[str]) -> None:
             "historical_image_state", SOURCE / "test_vps_timepad_state.py",
         ).read_guard(case / "state")
         target = current["target"]["tuple"]
-        if arguments[-1] != (
+        if arguments[2] != (
             "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + target["repositoryDigest"]
         ):
             raise SystemExit(90)
