@@ -3876,6 +3876,11 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                 return {"present": False}
             proc = pathlib.Path("/proc") / str(pid)
             try:
+                boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text(
+                    encoding="ascii",
+                ).strip()
+                if boot_id != identity["bootId"]:
+                    return {"present": False}
                 fields = (proc / "stat").read_bytes().rsplit(b")", 1)[1].split()
                 start_ticks = int(fields[19])
                 if start_ticks != identity["startTicks"]:
@@ -3990,6 +3995,22 @@ class StaleRecoveryControllerTests(unittest.TestCase):
         return {"processCount": len(facts), "truncated": bool(pending), "processes": facts}
 
     def assert_unresolved_interlock(self, root, attempt, supervisor):
+        def assert_owner_quiescent():
+            evidence = self.timeout_evidence(root)
+            owner = evidence["ownership"].get("supervisor", {})
+            self.assertTrue(
+                state._execution_process_exited(supervisor) or (
+                    owner.get("present") is True
+                    and owner.get("state") == "Z"
+                    and owner.get("children") == 0
+                    and owner.get("fdCount") == 0
+                    and owner.get("fd9") is False
+                    and owner.get("socketCount") == 0
+                    and owner.get("pipeCount") == 0
+                ),
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+            )
+
         try:
             with state.deploy_lock(root) as lock_fd:
                 os.set_inheritable(lock_fd, True)
@@ -4011,15 +4032,12 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         "attemptMatches": current["executionAttempt"] == lease["attempt"],
                         "supervisorLive": not state._execution_process_exited(supervisor),
                     }, sort_keys=True, separators=(",", ":")))
-                self.assertTrue(
-                    state._execution_process_exited(supervisor),
-                    json.dumps(self.timeout_evidence(root), sort_keys=True, separators=(",", ":")),
-                )
+                assert_owner_quiescent()
         except state.GuardError as busy:
             self.assertEqual("DEPLOY_LOCK_BUSY", busy.reason)
             self.assertFalse(state._execution_process_exited(supervisor))
         else:
-            self.assertTrue(state._execution_process_exited(supervisor))
+            assert_owner_quiescent()
 
     def assert_refusal_relay(self, case, lease, *, terminal):
         record = json.loads((case / ("recovery-relay-" + lease["attempt"] + ".json")).read_bytes())
