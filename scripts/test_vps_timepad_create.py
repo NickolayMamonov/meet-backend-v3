@@ -831,20 +831,23 @@ class CreateDriver:
                 "grant", name=name, localNs=seconds * NS,
                 parentEndNs=self.context.end_ns,
             )
-            stage = "validate"
+            stage = "schema"
             if set(frame) != {"attempt", "grantId", "endNs", "role", "name"}:
                 if diagnostic:
                     print("fixture_timepad_create=grant_refusal stage=schema", file=sys.stderr, flush=True)
                 refuse()
+            stage = "correlation"
             if frame["attempt"] != self.client.attempt or frame["name"] != name or \
                     frame["role"] != self.client.role:
                 if diagnostic:
                     print("fixture_timepad_create=grant_refusal stage=correlation", file=sys.stderr, flush=True)
                 refuse()
+            stage = "deadline"
             if frame["endNs"] > self.context.end_ns:
                 if diagnostic:
                     print("fixture_timepad_create=grant_refusal stage=deadline", file=sys.stderr, flush=True)
                 refuse()
+            stage = "grant-record"
             grant = guard.ExecutionGrant(frame["attempt"], frame["grantId"], frame["endNs"])
             stage = "body"
             yield grant
