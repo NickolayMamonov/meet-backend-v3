@@ -24,6 +24,8 @@ import sys
 import time
 import traceback
 
+MAX_RELAY_FRAMES = 4096
+
 
 def require(condition: bool, reason: str) -> None:
     if not condition:
@@ -347,7 +349,9 @@ def run(case: Path, scenario: str) -> int:
             os._exit(1)
     child.close()
     end = time.monotonic_ns() + (600 if forward else 90) * supervisor.NS
-    frames = []
+    relay_frame_count = 0
+    relay_attempt = None
+    result_frame = None
     status = None
     passive_keeper = False
     try:
@@ -368,17 +372,19 @@ def run(case: Path, scenario: str) -> int:
                     "fixture supervisor channel closed: protocol=" + str(error) +
                     " child=" + detail,
                 ) from None
-            require(len(frames) < 256, "fixture relay inventory exceeded bound")
-            frames.append(frame)
-            if len(frames) == 1:
+            require(relay_frame_count < MAX_RELAY_FRAMES, "fixture relay inventory exceeded bound")
+            relay_frame_count += 1
+            if relay_frame_count == 1:
                 require(frame.get("kind") == "hello" and
                         frame.get("supervisor") == supervisor.lease_identity(supervisor.process_identity(pid)),
                         "fixture supervisor identity was not kernel-bound")
+                relay_attempt = frame["attempt"]
                 supervisor.send_frame(parent, {"kind": "ready", "attempt": frame["attempt"]})
             else:
-                require(frame.get("attempt") == frames[0]["attempt"], "fixture relay attempt changed")
+                require(frame.get("attempt") == relay_attempt, "fixture relay attempt changed")
                 require(frame.get("kind") in {"clock", "result"}, "fixture relay message is not fixed")
             if frame["kind"] == "result":
+                result_frame = frame
                 if forward and scenario != "forward" and frame["reason"] == "QUIESCENCE_UNCONFIRMED":
                     # The refusal is not a normal exit. Observe the retained
                     # lock before fixture-only teardown, never fake a drain.
@@ -510,7 +516,7 @@ def run(case: Path, scenario: str) -> int:
                         "actual candidate binding or child drain missing")
             else:
                 require(status != 0 and not starts, "refused forward started a candidate")
-            private(case / "forward-relay-result.json", json.dumps(frames[-1], sort_keys=True).encode())
+            private(case / "forward-relay-result.json", json.dumps(result_frame, sort_keys=True).encode())
             print("ACTUAL_FORWARD_CONTROLLER_PASS: scenario=" + scenario + " no_socket=true", flush=True)
             return 0
         require(not (case / "transport-calls").exists(), "read-only worker attempted guarded create")
@@ -523,7 +529,7 @@ def run(case: Path, scenario: str) -> int:
                 "gated worker published an owned deploy run")
         # The subprocess exit and terminal lease are real observations, not
         # caller-supplied state or a manufactured publication acknowledgment.
-        private(case / "relay-result.json", json.dumps(frames[-1], sort_keys=True).encode())
+        private(case / "relay-result.json", json.dumps(result_frame, sort_keys=True).encode())
         print("ACTUAL_CONTROLLER_CHANNEL_PASS: scenario=" + scenario +
               " no_socket=true create_pipeline=NOT_PROVEN", flush=True)
         return 0
