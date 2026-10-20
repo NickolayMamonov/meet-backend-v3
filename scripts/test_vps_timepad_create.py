@@ -314,11 +314,21 @@ class ToolingObservation:
     socket_identity: tuple[int, ...]
 
     def environment(self, context: CreateContext) -> dict[str, str]:
-        return {
+        environment = {
             "PATH": self.trusted_path, "HOME": "/root",
             "DOCKER_CONFIG": context.run + "/docker-client",
             "DOCKER_HOST": "unix:///run/docker.sock",
         }
+        if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+            diagnostic_path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE", "")
+            if re.fullmatch(
+                r"/var/lib/timepad-fixture/case-create-worker-[A-Za-z0-9_-]+/driver-diagnostics",
+                diagnostic_path,
+            ) is None:
+                refuse()
+            environment["TIMEPAD_FIXTURE_DIAGNOSTICS"] = "1"
+            environment["TIMEPAD_FIXTURE_DIAGNOSTIC_FILE"] = diagnostic_path
+        return environment
 
 
 @dataclass(frozen=True)
@@ -932,6 +942,29 @@ class CreateDriver:
                         " symbols=" + ",".join(symbols),
                         file=sys.stderr, flush=True,
                     )
+                    diagnostic_path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE", "")
+                    record = (
+                        "provider_failure exception=" + safe_name +
+                        " reason=" + safe_reason + " symbols=" + ",".join(symbols) + "\n"
+                    ).encode("ascii")
+                    if len(record) <= 512 and re.fullmatch(
+                        r"/var/lib/timepad-fixture/case-create-worker-[A-Za-z0-9_-]+/driver-diagnostics",
+                        diagnostic_path,
+                    ):
+                        try:
+                            fd = os.open(
+                                diagnostic_path,
+                                os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            )
+                            try:
+                                metadata = os.fstat(fd)
+                                if stat.S_ISREG(metadata.st_mode) and \
+                                        metadata.st_size <= 4096 - len(record):
+                                    os.write(fd, record)
+                            finally:
+                                os.close(fd)
+                        except OSError:
+                            pass
                 raise
             return parse(stream.getvalue().encode(), 32768)
 

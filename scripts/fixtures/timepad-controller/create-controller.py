@@ -466,6 +466,13 @@ def run(case: Path, scenario: str) -> int:
                                     record,
                                 ):
                                     driver_failure = record.decode("ascii")
+                                elif re.fullmatch(
+                                    rb"provider_failure exception=[A-Za-z][A-Za-z0-9_]{0,63} "
+                                    rb"reason=[A-Z][A-Z0-9_]{0,63} "
+                                    rb"symbols=[A-Za-z0-9_,:]{1,256}",
+                                    record,
+                                ):
+                                    driver_failure = record.decode("ascii")
                     supervisor_path = case / "supervisor-error"
                     if driver_failure == "none" and supervisor_path.is_file() and \
                             not supervisor_path.is_symlink():
