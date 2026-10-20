@@ -4557,7 +4557,13 @@ def _create_runtime_configuration(
                 "org.opencontainers.image.revision", "org.opencontainers.image.version",
                 "org.opencontainers.image.source",
             }
-            record = ("label_mismatch key=" + key + "\n").encode("ascii") if key in safe_labels else b""
+            label_class = (
+                "known" if key in safe_labels
+                else "oci" if key.startswith("org.opencontainers.image.")
+                else "compose" if key.startswith("com.docker.compose.")
+                else "other"
+            )
+            record = ("label_mismatch class=" + label_class + "\n").encode("ascii")
             if record and re.fullmatch(
                 r"/var/lib/timepad-fixture/case-create-worker-[A-Za-z0-9_-]+/driver-diagnostics",
                 diagnostic_path,
