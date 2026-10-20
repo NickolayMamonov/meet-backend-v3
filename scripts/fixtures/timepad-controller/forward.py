@@ -465,9 +465,19 @@ def docker(case: Path, arguments: list[str], facts: dict) -> None:
     if scenario == "suppress-refused" and operation == "suppress":
         raise SystemExit(90)
     if operation == "suppress":
-        require(backend["State"]["Running"]
+        if value["created"]:
+            require(
+                backend["State"]["Status"] == "created"
+                and not backend["State"]["Running"]
                 and backend["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped",
-                "fixture suppression did not target the running predecessor")
+                "candidate suppression did not target the stopped no-start candidate",
+            )
+        else:
+            require(
+                backend["State"]["Running"]
+                and backend["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped",
+                "fixture suppression did not target the running predecessor",
+            )
         backend["HostConfig"]["RestartPolicy"]["Name"] = "no"
     elif operation == "stop":
         require(backend["State"]["Running"]
