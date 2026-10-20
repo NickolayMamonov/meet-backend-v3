@@ -1550,6 +1550,8 @@ class Supervisor:
                         "_resource_role", "_resource_recovery_role", "_resource_postgres",
                         "_resource_backend", "_resource_network", "_resource_volume",
                         "_resource_containers", "_resource_restart", "_resource_observation",
+                        "_retained_create_completion", "_create_completion_evidence",
+                        "_read_execution_lease_locked", "require_runtime_request_completion",
                     }
                     symbols = ",".join(
                         frame.name + ":" + str(frame.lineno)
