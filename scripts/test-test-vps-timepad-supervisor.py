@@ -1123,6 +1123,100 @@ class CreateProtocolTests(unittest.TestCase):
             self.assertIs(helper_rpc, instance.create_helper_rpc)
             self.assertFalse(helper_rpc.close.called)
 
+    def launcher_rpc_eof_instance(self):
+        instance = self.instance()
+        instance.create = self.ready()
+        instance.create.phase = "running"
+        instance.create.result = None
+        instance.create.wait_status = None
+        instance.create_pid = 345
+        instance.create_launcher_rpc = mock.Mock()
+        instance.create_channel = mock.Mock()
+        instance.create_handshake_end = None
+        return instance
+
+    def deliver_launcher_rpc_eof(self, instance, channel):
+        with mock.patch.object(supervisor, "receive_frame",
+                               side_effect=supervisor.ChannelClosed("PROTOCOL_INVALID")):
+            instance._create_private_rpc(channel, publisher=False)
+
+    def deliver_launcher_result(self, instance):
+        create = instance.create
+        result = {
+            "kind": "create-result", "attempt": create.grant.attempt,
+            "requestDigest": create.request_digest, "childIdentity": create.identity,
+            "waitStatus": 0, "descendantsDrained": True,
+        }
+        with mock.patch.object(supervisor, "receive_frame", return_value=(result, None)):
+            instance._create_message()
+
+    def test_launcher_result_rpc_eof_and_exact_wait_orders(self):
+        for order in (("eof", "result", "wait"), ("result", "eof", "wait"), ("wait", "result")):
+            with self.subTest(order=order):
+                instance = self.launcher_rpc_eof_instance()
+                rpc = instance.create_launcher_rpc
+                with mock.patch.object(instance.children, "refresh"):
+                    for event in order:
+                        if event == "eof":
+                            self.deliver_launcher_rpc_eof(instance, rpc)
+                        elif event == "result":
+                            self.deliver_launcher_result(instance)
+                        else:
+                            instance._tick_create({345: 0})
+                    if instance.create.wait_status is None:
+                        instance._tick_create({345: 0})
+                    if instance.create.result is None:
+                        self.assertEqual("running", instance.create.phase)
+                        self.deliver_launcher_result(instance)
+                        instance._tick_create({})
+                    self.assertEqual("ready", instance.create.phase)
+                    self.assertEqual(0, instance.create.wait_status)
+                    self.assertIsNotNone(instance.create.result)
+                    self.assertIsNone(instance.create_launcher_rpc)
+                    rpc.close.assert_called_once()
+
+    def test_launcher_rpc_eof_does_not_authorize_missing_or_bad_result(self):
+        instance = self.launcher_rpc_eof_instance()
+        self.deliver_launcher_rpc_eof(instance, instance.create_launcher_rpc)
+        with mock.patch.object(instance.children, "refresh"):
+            instance._tick_create({345: 0})
+        self.assertEqual(0, instance.create.wait_status)
+        self.assertIsNone(instance.create.result)
+        self.assertEqual("running", instance.create.phase)
+        with mock.patch.object(supervisor, "receive_frame",
+                               side_effect=supervisor.ChannelClosed("PROTOCOL_INVALID")), \
+                self.assertRaises(supervisor.ChannelClosed):
+            instance._create_message()
+        self.assertEqual("running", instance.create.phase)
+
+        instance = self.launcher_rpc_eof_instance()
+        self.deliver_launcher_rpc_eof(instance, instance.create_launcher_rpc)
+        with mock.patch.object(supervisor, "receive_frame",
+                               side_effect=supervisor.SupervisorError("PROTOCOL_INVALID")), \
+                self.assertRaisesRegex(supervisor.SupervisorError, "PROTOCOL_INVALID"):
+            instance._create_message()
+        self.assertIsNone(instance.create.result)
+        self.assertEqual("running", instance.create.phase)
+
+        instance = self.launcher_rpc_eof_instance()
+        self.deliver_launcher_rpc_eof(instance, instance.create_launcher_rpc)
+        with mock.patch.object(instance.children, "refresh"), \
+                self.assertRaisesRegex(supervisor.SupervisorError, "OWNERSHIP_UNCERTAIN"):
+            instance._tick_create({345: 7})
+        self.assertIsNone(instance.create.result)
+
+    def test_eof_on_unrelated_launcher_rpc_is_not_unregistered(self):
+        instance = self.launcher_rpc_eof_instance()
+        launcher_rpc = instance.create_launcher_rpc
+        for channel, publisher in ((mock.Mock(), False), (launcher_rpc, True)):
+            with self.subTest(publisher=publisher), \
+                    mock.patch.object(supervisor, "receive_frame",
+                                      side_effect=supervisor.ChannelClosed("PROTOCOL_INVALID")), \
+                    self.assertRaises(supervisor.ChannelClosed):
+                instance._create_private_rpc(channel, publisher=publisher)
+            self.assertIs(launcher_rpc, instance.create_launcher_rpc)
+            self.assertFalse(launcher_rpc.close.called)
+
     def test_rpc_kernel_peer_and_nonce_role_schema_are_fenced(self):
         for change in ({}, {"attempt": "0" * 32}, {"role": "rollback-worker"},
                        {"argv": ["sh"]}, {"kind": "create-publisher-ack-intent"}):

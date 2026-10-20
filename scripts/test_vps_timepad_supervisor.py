@@ -1898,11 +1898,16 @@ class Supervisor:
                 fixture_frame_diagnostics=os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1",
             )
         except ChannelClosed:
-            if not publisher or channel is not self.create_helper_rpc or \
-                    self.create_helper_pid is None:
-                raise
-            channel.close()
-            self.create_helper_rpc = None
+            if publisher:
+                if channel is not self.create_helper_rpc or self.create_helper_pid is None:
+                    raise
+                channel.close()
+                self.create_helper_rpc = None
+            else:
+                if channel is not self.create_launcher_rpc or self.create_pid is None:
+                    raise
+                channel.close()
+                self.create_launcher_rpc = None
             return
         assert fd is not None and self.create is not None
         with socket.socket(fileno=fd) as reply:
