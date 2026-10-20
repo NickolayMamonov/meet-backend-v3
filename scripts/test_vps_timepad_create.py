@@ -906,6 +906,8 @@ class CreateDriver:
                         "_read_resource_baseline", "_resource_role",
                         "_resource_recovery_role", "_resource_envelope",
                         "_private_equal", "_resource_admission", "_read_resource_request",
+                        "_resource_bytes", "_resource_observation", "_resource_id",
+                        "_configuration_digest", "_resource_endpoint",
                     }
                     symbols = [
                         frame.name + ":" + str(frame.lineno)
