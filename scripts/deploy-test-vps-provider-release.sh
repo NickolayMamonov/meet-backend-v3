@@ -2129,9 +2129,22 @@ run_owned_child() {
   setsid bash -c '
     set -euo pipefail
     exec {gate_fd}<>"$1"
-    IFS= read -r -t 5 gate <&"$gate_fd" || exit 125
+    if ! IFS= read -r -t 5 gate <&"$gate_fd"; then
+      if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
+        printf "fixture_timepad_create_handshake=read-timeout\n" >&2 || :
+      fi
+      exit 125
+    fi
     exec {gate_fd}>&-
-    [ "$gate" = "$2" ] || exit 125
+    if [ "$gate" != "$2" ]; then
+      if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
+        printf "fixture_timepad_create_handshake=token-mismatch\n" >&2 || :
+      fi
+      exit 125
+    fi
+    if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
+      printf "fixture_timepad_create_handshake=accepted\n" >&2 || :
+    fi
     shift 2
     set +e
     "$@" | python3 -c '"'"'
@@ -2178,6 +2191,9 @@ sys.stdout.buffer.write(data)
   exec {handshake_fd}<>"$fifo"
   printf '%s\n' "$token" >&"$handshake_fd"
   exec {handshake_fd}>&-
+  if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
+    printf 'fixture_timepad_create_handshake=released\n' >&2 || :
+  fi
   complete_owned_child || fail "OWNED_CHILD_QUIESCENCE_UNCONFIRMED"
   return "$owned_child_wait_status"
 }
