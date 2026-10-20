@@ -1546,6 +1546,10 @@ class Supervisor:
                         "run", "_pending", "_state", "_models", "_observations",
                         "_provider_call", "_grant", "request", "_rpc",
                         "_create_peer_chain", "identity", "render", "observe",
+                        "_resource", "_resource_admission", "_resource_envelope",
+                        "_resource_role", "_resource_recovery_role", "_resource_postgres",
+                        "_resource_backend", "_resource_network", "_resource_volume",
+                        "_resource_containers", "_resource_restart", "_resource_observation",
                     }
                     symbols = ",".join(
                         frame.name + ":" + str(frame.lineno)
