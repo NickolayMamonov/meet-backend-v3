@@ -2652,6 +2652,16 @@ class LinuxSupervisorTests(unittest.TestCase):
                         fixture_publish(client, root)
                         fixture_terminal(client, root, 1)
                         return
+                    def stage(name):
+                        if name not in {
+                            "grant", "register", "fault-injection", "complete",
+                            "lease-ack", "lease-readback", "arm", "publish",
+                            "cancel", "pause",
+                        }:
+                            os._exit(7)
+                        os.write(2, f"registration-readback-stage={name}\n".encode("ascii"))
+
+                    stage("grant")
                     grant = client.request("grant", name="recovery-registration", localNs=30 * NS)
                     # Only the external provider observation is synthetic. State
                     # authority, prior process exit, receipt, FD9, publication,
@@ -2669,12 +2679,14 @@ class LinuxSupervisorTests(unittest.TestCase):
                         state.importlib.util, "spec_from_file_location",
                         return_value=SimpleNamespace(loader=mock.Mock()),
                     ), mock.patch.object(state.importlib.util, "module_from_spec", return_value=provider):
+                        stage("register")
                         acknowledgment = state.register_recovery(
                             root, contract=approved, selectors=selectors, deploy_lock_fd=9,
                             execution_grant=state.ExecutionGrant(
                                 grant["attempt"], grant["grantId"], grant["endNs"],
                             ), runtime_evidence=b"{}",
                         )
+                    stage("fault-injection")
                     if fault == "receipt":
                         receipt_path.write_bytes(b"{}")
                     elif fault == "digest":
@@ -2686,16 +2698,23 @@ class LinuxSupervisorTests(unittest.TestCase):
                         lease_path.write_bytes(raw)
                         acknowledgment["digest"] = hashlib.sha256(raw).hexdigest()
                     if fault != "aborted":
+                        stage("complete")
                         client.request("complete", grantId=grant["grantId"])
+                    stage("lease-ack")
                     client.request(
                         "lease-ack", revision=acknowledgment["revision"], digest=acknowledgment["digest"],
                     )
+                    stage("lease-readback")
                     if client.request("lease")["createCompletion"] != previous["createCompletion"]:
                         os._exit(6)
+                    stage("arm")
                     client.request("arm")
+                    stage("publish")
                     fixture_publish(client, root)
                     Path(root, "handoff-checked").write_bytes(b"checked")
+                    stage("cancel")
                     client.request("cancel", reason="EXIT", status=1)
+                    stage("pause")
                     signal.pause()
 
                 result, _ = self.run_fixture(
