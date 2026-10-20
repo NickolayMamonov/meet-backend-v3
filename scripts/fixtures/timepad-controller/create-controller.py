@@ -446,6 +446,7 @@ def run(case: Path, scenario: str) -> int:
                     ):
                         failure = "none"
                     driver_failure = "none"
+                    label_failure = None
                     diagnostic_path = case / "driver-diagnostics"
                     if diagnostic_path.is_file() and not diagnostic_path.is_symlink():
                         diagnostic = diagnostic_path.read_bytes()
@@ -478,7 +479,9 @@ def run(case: Path, scenario: str) -> int:
                                     rb"(?:project|service|container-number|oneoff|version|image)",
                                     record,
                                 ):
-                                    driver_failure = record.decode("ascii")
+                                    label_failure = record.decode("ascii")
+                    if label_failure is not None:
+                        driver_failure = label_failure
                     supervisor_path = case / "supervisor-error"
                     if driver_failure == "none" and supervisor_path.is_file() and \
                             not supervisor_path.is_symlink():
