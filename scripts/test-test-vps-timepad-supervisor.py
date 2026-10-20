@@ -131,12 +131,12 @@ class AttemptTests(unittest.TestCase):
     def test_production_drain_reserves_one_second_for_pidfd_kill_before_hard_end(self):
         attempt = supervisor.Attempt("forward-recover", clock=self.clock)
         attempt.arm()
-        self.clock.advance(595)
+        self.clock.now = attempt.hard_end - 5 * NS
         attempt.role = "fail-closed-worker"
         attempt.begin_drain()
         self.assertEqual(attempt.hard_end, attempt.drain_end)
         self.assertEqual(self.clock.now + 4 * NS, attempt.term_end)
-        self.clock.advance(4_500_000_000)
+        self.clock.advance(4.5)
         self.assertLess(self.clock.now, attempt.drain_end)
         self.assertLessEqual(attempt.term_end, self.clock.now)
 
@@ -2820,7 +2820,23 @@ class LinuxSupervisorTests(unittest.TestCase):
                                         children = Path(
                                             f"/proc/{pid}/task/{pid}/children",
                                         ).read_text().split()
-                                        self.assertEqual([], children)
+                                        identities = []
+                                        for child in children[:16]:
+                                            try:
+                                                stat = Path(f"/proc/{child}/stat").read_bytes()
+                                                fields = stat.rsplit(b")", 1)[1].split()
+                                                state_name = fields[0].decode("ascii")
+                                                comm = stat.split(b"(", 1)[1].split(b")", 1)[0]
+                                                safe_comm = re.sub(
+                                                    rb"[^A-Za-z0-9_.-]", b"_", comm[:32],
+                                                ).decode("ascii")
+                                                identities.append(
+                                                    f"pid={child},comm={safe_comm},state={state_name}",
+                                                )
+                                            except (OSError, IndexError, UnicodeError):
+                                                identities.append(f"pid={child},identity=vanished")
+                                        self.assertEqual([], children, "owned direct children=" +
+                                                         ";".join(identities))
                                     return result, frames
                         except (BlockingIOError, supervisor.SupervisorError):
                             pass
