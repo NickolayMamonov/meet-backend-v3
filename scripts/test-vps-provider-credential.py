@@ -4556,6 +4556,10 @@ def _create_runtime_configuration(
                 "com.docker.compose.version", "com.docker.compose.image",
                 "org.opencontainers.image.revision", "org.opencontainers.image.version",
                 "org.opencontainers.image.source",
+                "com.docker.compose.config-hash", "com.docker.compose.depends_on",
+                "com.docker.compose.project.config_files",
+                "com.docker.compose.project.working_dir",
+                "com.docker.compose.project.environment_file",
             }
             label_class = (
                 "known" if key in safe_labels
