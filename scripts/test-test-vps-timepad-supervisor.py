@@ -128,6 +128,16 @@ class AttemptTests(unittest.TestCase):
         attempt.grant("rollback-remaining-work", 600 * NS)
         self.assertEqual(original, (attempt.nonce, attempt.t0, attempt.work_end, attempt.hard_end))
 
+    def test_production_drain_reserves_a_bounded_pidfd_kill_window(self):
+        attempt = supervisor.Attempt("forward-recover", clock=self.clock)
+        attempt.arm()
+        self.clock.advance(590)
+        attempt.role = "fail-closed-worker"
+        attempt.begin_drain()
+        self.assertEqual(attempt.hard_end, attempt.drain_end)
+        self.assertLessEqual(attempt.term_end - self.clock.now, 5 * NS)
+        self.assertGreaterEqual(attempt.drain_end - attempt.term_end, NS)
+
     def test_driver_grant_is_clamped_to_absolute_parent_deadline(self):
         attempt = self.armed()
         parent_end = self.clock.now + 10 * NS

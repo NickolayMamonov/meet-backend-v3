@@ -420,8 +420,10 @@ class Attempt:
             (self.work_end is not None and now >= self.work_end) else self.work_end
         assert end is not None
         self.drain_end = min(now + self.timing.drain_ns, end)
-        # Leave one event-loop tick for pidfd KILL before the absolute end.
-        margin = min(100_000_000, self.timing.term_ns // 10)
+        # Keep a bounded KILL window before the absolute end. A single
+        # scheduler-delayed event-loop wake must not consume the entire
+        # escalation interval and leave a responsive child alive at hardEnd.
+        margin = min(NS, max(100_000_000, self.timing.term_ns // 5))
         self.term_end = max(now, min(now + self.timing.term_ns, self.drain_end - margin))
 
     def lease(self) -> dict[str, Any]:
