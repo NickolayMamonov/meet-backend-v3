@@ -4180,6 +4180,14 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     child_diagnostic = json.dumps(
                         child_evidence, sort_keys=True, separators=(",", ":"),
                     )
+                    handshake_events = []
+                    for line in result.stderr.splitlines():
+                        if not line.startswith("fixture_timepad_create_handshake="):
+                            continue
+                        event = line.partition("=")[2]
+                        if event not in {"read-timeout", "token-mismatch", "accepted", "released"}:
+                            self.fail("unexpected fixed handshake diagnostic")
+                        handshake_events.append(event)
                     supervisor_trace = (
                         (case / "recovery-diagnostics").read_text().splitlines()
                         if (case / "recovery-diagnostics").exists() else []
@@ -4203,12 +4211,17 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                             "firstStatus": lease["firstStatus"],
                             "workerPresent": lease["worker"] is not None,
                         },
+                        "ownedChildHandshake": handshake_events,
                         "supervisorTrace": supervisor_trace,
                         "relay": relay_trace,
                     }, sort_keys=True, separators=(",", ":"))
                     self.assertEqual(original["incidentId"], after["incidentId"])
                     self.assertEqual(1, after["operationEpoch"])
-                    self.assertIsNone(after["ownedChild"], child_diagnostic)
+                    self.assertIn(
+                        ["accepted", "released"], handshake_events,
+                        lifecycle_diagnostic,
+                    )
+                    self.assertIsNone(after["ownedChild"], lifecycle_diagnostic)
                     self.assertEqual(after["executionAttempt"], lease["attempt"])
                     self.assertEqual(
                         "RECOVERY_RETRY_RUNTIME_FAILED", lease["firstFailure"],
