@@ -469,7 +469,10 @@ def run(case: Path, scenario: str) -> int:
                                 elif re.fullmatch(
                                     rb"type=[A-Za-z][A-Za-z0-9_]{0,63} "
                                     rb"reason=[A-Z][A-Z0-9_]{0,63} "
-                                    rb"action=[a-z-]{1,32} symbols=[A-Za-z0-9_,:]{1,256}",
+                                    rb"action=[a-z-]{1,32} field=(?:unknown|backendInventory|"
+                                    rb"composeInventory|containerInspections|imageInspection|"
+                                    rb"membership|operation|resources|resourcesDigest|runtimeRequest|"
+                                    rb"targetConfiguration) symbols=[A-Za-z0-9_,:]{1,256}",
                                     record,
                                 ):
                                     driver_failure = record.decode("ascii")

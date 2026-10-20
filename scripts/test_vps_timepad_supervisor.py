@@ -1555,6 +1555,14 @@ class Supervisor:
                     error_type = type(error).__name__
                     if not error_type.isascii() or not error_type.isidentifier() or len(error_type) > 64:
                         error_type = "Exception"
+                    key_field = (
+                        error.args[0] if isinstance(error, KeyError) and len(error.args) == 1
+                        and error.args[0] in {
+                            "backendInventory", "composeInventory", "containerInspections",
+                            "imageInspection", "membership", "operation", "resources",
+                            "resourcesDigest", "runtimeRequest", "targetConfiguration",
+                        } else "unknown"
+                    )
                     diagnostic_path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE")
                     if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1" and \
                             isinstance(diagnostic_path, str) and re.fullmatch(
@@ -1564,7 +1572,8 @@ class Supervisor:
                         line = (
                             "type=" + error_type + " reason=" +
                             (reason if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", reason) else "OTHER") +
-                            " action=" + selected.value + " symbols=" + symbols + "\n"
+                            " action=" + selected.value + " field=" + key_field +
+                            " symbols=" + symbols + "\n"
                         ).encode("ascii")
                         try:
                             fd = os.open(
