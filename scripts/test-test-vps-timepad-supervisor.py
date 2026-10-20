@@ -2701,9 +2701,20 @@ class LinuxSupervisorTests(unittest.TestCase):
                         stage("complete")
                         client.request("complete", grantId=grant["grantId"])
                     stage("lease-ack")
-                    client.request(
-                        "lease-ack", revision=acknowledgment["revision"], digest=acknowledgment["digest"],
-                    )
+                    try:
+                        client.request(
+                            "lease-ack", revision=acknowledgment["revision"], digest=acknowledgment["digest"],
+                        )
+                    except supervisor.SupervisorError as error:
+                        if fault not in {"receipt", "digest", "erased"}:
+                            raise
+                        if str(error) != "PRIVATE_REQUEST_REFUSED":
+                            raise
+                        stage("expected-lease-ack-refusal")
+                        client.request("cancel", reason="EXIT", status=1)
+                        stage("pause")
+                        signal.pause()
+                        raise AssertionError("cancelled worker unexpectedly resumed")
                     stage("lease-readback")
                     if client.request("lease")["createCompletion"] != previous["createCompletion"]:
                         os._exit(6)
