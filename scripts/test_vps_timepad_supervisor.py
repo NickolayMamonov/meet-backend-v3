@@ -85,6 +85,7 @@ import stat
 import struct
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -1527,8 +1528,18 @@ class Supervisor:
                         str(error) if isinstance(error, (CreateError, SupervisorError))
                         else "OS_ERROR" if isinstance(error, OSError) else "OTHER"
                     )
+                    allowed_symbols = {
+                        "run", "_pending", "_state", "_models", "_observations",
+                        "_provider_call", "_grant", "request", "_rpc",
+                        "_create_peer_chain", "identity", "render", "observe",
+                    }
+                    symbols = ",".join(
+                        frame.name for frame in traceback.extract_tb(error.__traceback__)
+                        if frame.name in allowed_symbols
+                    )[-256:] or "NONE"
                     print(
-                        f"fixture_timepad_supervisor=driver_child_refusal reason={reason}",
+                        f"fixture_timepad_supervisor=driver_child_refusal "
+                        f"reason={reason} symbols={symbols}",
                         file=sys.stderr, flush=True,
                     )
                 os._exit(1)
