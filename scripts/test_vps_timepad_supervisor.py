@@ -1892,7 +1892,10 @@ class Supervisor:
     def _create_private_rpc(self, channel: socket.socket, *, publisher: bool) -> None:
         self.create_rpc_gate = "frame"
         peers: list[ProcessIdentity] = []
-        frame, fd = receive_frame(channel, accept_fd=True, peer=peers)
+        frame, fd = receive_frame(
+            channel, accept_fd=True, peer=peers,
+            fixture_frame_diagnostics=os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1",
+        )
         assert fd is not None and self.create is not None
         with socket.socket(fileno=fd) as reply:
             reply.setblocking(False)
