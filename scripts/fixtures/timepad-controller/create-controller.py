@@ -449,13 +449,23 @@ def run(case: Path, scenario: str) -> int:
                     diagnostic_path = case / "driver-diagnostics"
                     if diagnostic_path.is_file() and not diagnostic_path.is_symlink():
                         diagnostic = diagnostic_path.read_bytes()
-                        if len(diagnostic) <= 4096 and re.fullmatch(
-                            rb"type=[A-Za-z][A-Za-z0-9_]{0,63} "
-                            rb"reason=[A-Z][A-Z0-9_]{0,63} "
-                            rb"action=[a-z-]{1,32} symbols=[A-Za-z0-9_,:]{1,256}\n?",
-                            diagnostic,
-                        ):
-                            driver_failure = diagnostic.decode("ascii").strip()
+                        if len(diagnostic) <= 4096:
+                            for record in diagnostic.splitlines()[-8:]:
+                                if re.fullmatch(
+                                    rb"helper=(release-admission|completion-admission|publish) "
+                                    rb"type=[A-Za-z][A-Za-z0-9_]{0,63} "
+                                    rb"reason=[A-Z][A-Z0-9_]{0,63} "
+                                    rb"symbols=(?:NONE|[A-Za-z0-9_,:]{1,256})",
+                                    record,
+                                ):
+                                    driver_failure = record.decode("ascii")
+                                elif re.fullmatch(
+                                    rb"type=[A-Za-z][A-Za-z0-9_]{0,63} "
+                                    rb"reason=[A-Z][A-Z0-9_]{0,63} "
+                                    rb"action=[a-z-]{1,32} symbols=[A-Za-z0-9_,:]{1,256}",
+                                    record,
+                                ):
+                                    driver_failure = record.decode("ascii")
                     supervisor_path = case / "supervisor-error"
                     if driver_failure == "none" and supervisor_path.is_file() and \
                             not supervisor_path.is_symlink():

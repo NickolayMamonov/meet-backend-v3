@@ -1799,7 +1799,51 @@ class Supervisor:
                 with socket.socket(fileno=result_fd) as channel:
                     send_frame(channel, result)
                 os._exit(0)
-            except BaseException:
+            except BaseException as error:
+                diagnostic_path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE")
+                if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1" and \
+                        stage in {"release-admission", "completion-admission", "publish"} and \
+                        isinstance(diagnostic_path, str) and re.fullmatch(
+                            r"/var/lib/timepad-fixture/case-create-worker-[A-Za-z0-9_-]{1,64}/driver-diagnostics",
+                            diagnostic_path,
+                        ):
+                    error_type = type(error).__name__
+                    if not error_type.isascii() or not error_type.isidentifier() or len(error_type) > 64:
+                        error_type = "Exception"
+                    reason = (
+                        str(error) if isinstance(error, SupervisorError)
+                        else "OS_ERROR" if isinstance(error, OSError) else "OTHER"
+                    )
+                    if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", reason) is None:
+                        reason = "OTHER"
+                    allowed_symbols = {
+                        "_publish_create", "_fixed_create_stage", "_create_environment",
+                        "WorkerClient", "request", "send_frame", "publish_execution_lease",
+                        "publish_create_completion", "_create_private_rpc",
+                    }
+                    symbols = [
+                        frame.name + ":" + str(frame.lineno)
+                        for frame in traceback.extract_tb(error.__traceback__)[-6:]
+                        if frame.name in allowed_symbols
+                    ]
+                    line = (
+                        "helper=" + stage + " type=" + error_type + " reason=" + reason +
+                        " symbols=" + (",".join(symbols) or "NONE") + "\n"
+                    ).encode("ascii")
+                    try:
+                        fd = os.open(
+                            diagnostic_path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW,
+                        )
+                        try:
+                            details = os.fstat(fd)
+                            if stat.S_ISREG(details.st_mode) and details.st_uid == os.geteuid() and \
+                                    stat.S_IMODE(details.st_mode) == 0o600 and \
+                                    details.st_size + len(line) <= 4096:
+                                os.write(fd, line)
+                        finally:
+                            os.close(fd)
+                    except OSError:
+                        pass
                 os._exit(1)
         child.close()
         control.close()
@@ -2587,6 +2631,12 @@ class Supervisor:
                                     "create-helper", "create-driver-result", "create-driver-rpc",
                                     "create-launcher-rpc", "create-helper-rpc",
                                 } else "unknown",
+                                helper_stage=(
+                                    self.create_helper_stage
+                                    if self.create_helper_stage in {
+                                        "release-admission", "completion-admission", "publish",
+                                    } else "none"
+                                ) if event.data == "create-helper-rpc" else "none",
                                 error=(
                                     str(error) if isinstance(error, SupervisorError)
                                     else "OS_ERROR"
