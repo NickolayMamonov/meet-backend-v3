@@ -1141,6 +1141,7 @@ class Supervisor:
         self.create_helper_status: int | None = None
         self.create_helper_result: dict[str, Any] | None = None
         self.create_helper_stage: str | None = None
+        self.create_rpc_gate = "none"
         self.create_completion_evidence: dict[str, Any] | None = None
         self.recovery_baseline: dict[str, Any] | None = None
         self.registration_grant: Grant | None = None
@@ -1889,24 +1890,30 @@ class Supervisor:
         self.create_helper_channel = None
 
     def _create_private_rpc(self, channel: socket.socket, *, publisher: bool) -> None:
+        self.create_rpc_gate = "frame"
         peers: list[ProcessIdentity] = []
         frame, fd = receive_frame(channel, accept_fd=True, peer=peers)
         assert fd is not None and self.create is not None
         with socket.socket(fileno=fd) as reply:
             reply.setblocking(False)
+            self.create_rpc_gate = "reply-socket"
             if reply.family != socket.AF_UNIX or reply.type != socket.SOCK_SEQPACKET or \
                     frame.get("attempt") != self.attempt.nonce or \
                     frame.get("role") != "controller-worker":
                 reject()
+            self.create_rpc_gate = "authority"
             self._create_authority(pending_lease=publisher and self.create_helper_stage == "publish")
+            self.create_rpc_gate = "grant"
             if self.attempt.clock() >= self.create.grant.end_ns or \
                     self.attempt.grants.get(self.create.grant.grant_id) != self.create.grant:
                 reject("GRANT_REVOKED")
             peer = peers[0]
+            self.create_rpc_gate = "helper-peer"
             if publisher and self.create_helper_stage == "publish" and \
                     peer != self.create_helper_identity:
                 reject("PRIVATE_WORKER_REQUIRED")
             root_pid = self.create_helper_pid if publisher else self.create_pid
+            self.create_rpc_gate = "peer-chain"
             for _ in range(MAX_CHILDREN):
                 if peer.pid == root_pid:
                     break
@@ -1915,11 +1922,13 @@ class Supervisor:
                 peer = process_identity(peer.parent)
             else:
                 reject("PRIVATE_WORKER_REQUIRED")
+            self.create_rpc_gate = "peer-identity"
             if publisher and self.create_helper_identity != peer or not publisher and (
                 self.create.identity is None or peer.start != self.create.identity["startTicks"]
             ):
                 reject("PRIVATE_WORKER_REQUIRED")
             kind = frame.get("kind")
+            self.create_rpc_gate = "rpc-kind"
             base = {"kind", "attempt", "role"}
             value: dict[str, Any] = {}
             if kind == "hello" and set(frame) == base:
@@ -2636,6 +2645,13 @@ class Supervisor:
                                     if self.create_helper_stage in {
                                         "release-admission", "completion-admission", "publish",
                                     } else "none"
+                                ) if event.data == "create-helper-rpc" else "none",
+                                helper_gate=(
+                                    self.create_rpc_gate
+                                    if self.create_rpc_gate in {
+                                        "frame", "reply-socket", "authority", "grant",
+                                        "helper-peer", "peer-chain", "peer-identity", "rpc-kind",
+                                    } else "unknown"
                                 ) if event.data == "create-helper-rpc" else "none",
                                 error=(
                                     str(error) if isinstance(error, SupervisorError)
