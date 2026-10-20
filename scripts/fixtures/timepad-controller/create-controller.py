@@ -424,6 +424,26 @@ def run(case: Path, scenario: str) -> int:
             starts = [effect for effect in effects if effect.startswith("start:")]
             run_path = case / "state/31885558214-1-final-deploy"
             if scenario == "forward":
+                if status != 0 or current["phase"] != "COMMITTED":
+                    effect_kinds = ",".join(
+                        effect.split(":", 1)[0] for effect in effects
+                    ) or "none"
+                    phase = current.get("phase")
+                    if phase not in {
+                        "READY", "PREPARED", "CUTOVER_POSSIBLE", "VERIFYING",
+                        "COMMITTING", "COMMITTED", "RECOVERY_REQUIRED",
+                        "FORWARD_RECOVERING", "ROLLING_BACK", "ROLLED_BACK",
+                    }:
+                        phase = "unknown"
+                    failure = current.get("firstFailure")
+                    if not isinstance(failure, str) or not re.fullmatch(
+                        r"[A-Z][A-Z0-9_]{0,63}", failure,
+                    ):
+                        failure = "none"
+                    raise AssertionError(
+                        "actual normal forward did not commit: phase=" + phase +
+                        " failure=" + failure + " effects=" + effect_kinds,
+                    )
                 require(status == 0 and current["phase"] == "COMMITTED",
                         "actual normal forward did not commit")
                 require(starts == ["start:" + "a" * 64], "candidate start inventory is not exact")
