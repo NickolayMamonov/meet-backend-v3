@@ -4149,9 +4149,40 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                             state_root, lease["attempt"], lease["supervisor"],
                         )
                         _, after = state._read_guard_locked(state_root)
+                    child = after["ownedChild"]
+                    child_evidence = {"present": child is not None}
+                    if child is not None:
+                        try:
+                            identity_matches = state.owned_child_is_same_process(child)
+                        except state.GuardError:
+                            identity_matches = False
+                        try:
+                            os.killpg(child["processGroup"], 0)
+                            group_exists = True
+                        except ProcessLookupError:
+                            group_exists = False
+                        except PermissionError:
+                            group_exists = True
+                        child_evidence.update({
+                            "identityMatches": identity_matches,
+                            "groupExists": group_exists,
+                            "lifecycle": child["lifecycle"],
+                        })
+                    child_evidence.update({
+                        "leaseLifecycle": lease["lifecycle"],
+                        "firstFailure": lease["firstFailure"],
+                        "workerPresent": lease["worker"] is not None,
+                        "runtimeOperation": after["runtimeRequest"]["operation"],
+                        "runtimeLifecycle": after["runtimeRequest"]["lifecycle"],
+                        "runtimeResponsePresent": after["runtimeRequest"]["responseId"] is not None,
+                        "runtimeCompletionPresent": after["runtimeRequest"]["completionDigest"] is not None,
+                    })
+                    child_diagnostic = json.dumps(
+                        child_evidence, sort_keys=True, separators=(",", ":"),
+                    )
                     self.assertEqual(original["incidentId"], after["incidentId"])
                     self.assertEqual(1, after["operationEpoch"])
-                    self.assertIsNone(after["ownedChild"])
+                    self.assertIsNone(after["ownedChild"], child_diagnostic)
                     self.assertEqual(after["executionAttempt"], lease["attempt"])
                     self.assertEqual("RECOVERY_RETRY_RUNTIME_FAILED", lease["firstFailure"])
                     self.assertEqual(1, lease["firstStatus"])
