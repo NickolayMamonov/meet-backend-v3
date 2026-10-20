@@ -2128,23 +2128,57 @@ run_owned_child() {
   set -o noclobber
   setsid bash -c '
     set -euo pipefail
+    fixture_timepad_create_diagnostic() {
+      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
+      case "${1:-}" in
+        read-timeout|token-mismatch|accepted|released) ;;
+        *) return 0 ;;
+      esac
+      timeout 2s python3 - "$1" <<PY >/dev/null 2>&1 || :
+import fcntl
+import os
+import re
+import stat
+import sys
+
+path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE", "")
+if re.fullmatch(
+    r"/var/lib/timepad-fixture/case-[A-Za-z0-9_-]{1,64}/fixture/recovery-diagnostics",
+    path,
+) is None:
+    raise SystemExit(1)
+record = ("fixture_timepad_create_handshake=" + sys.argv[1] + "\n").encode("ascii")
+path_info = os.lstat(path)
+if not stat.S_ISREG(path_info.st_mode) or stat.S_IMODE(path_info.st_mode) != 0o600:
+    raise SystemExit(1)
+fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_uid != os.geteuid()
+        or (path_info.st_dev, path_info.st_ino) != (info.st_dev, info.st_ino)
+        or info.st_size > 4096 - len(record)
+    ):
+        raise SystemExit(1)
+    if os.write(fd, record) != len(record):
+        raise SystemExit(1)
+finally:
+    os.close(fd)
+PY
+    }
     exec {gate_fd}<>"$1"
     if ! IFS= read -r -t 5 gate <&"$gate_fd"; then
-      if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
-        printf "fixture_timepad_create_handshake=read-timeout\n" >&2 || :
-      fi
+      fixture_timepad_create_diagnostic read-timeout
       exit 125
     fi
     exec {gate_fd}>&-
     if [ "$gate" != "$2" ]; then
-      if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
-        printf "fixture_timepad_create_handshake=token-mismatch\n" >&2 || :
-      fi
+      fixture_timepad_create_diagnostic token-mismatch
       exit 125
     fi
-    if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
-      printf "fixture_timepad_create_handshake=accepted\n" >&2 || :
-    fi
+    fixture_timepad_create_diagnostic accepted
     shift 2
     set +e
     "$@" | python3 -c '"'"'
@@ -2191,9 +2225,9 @@ sys.stdout.buffer.write(data)
   exec {handshake_fd}<>"$fifo"
   printf '%s\n' "$token" >&"$handshake_fd"
   exec {handshake_fd}>&-
-  if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
-    printf 'fixture_timepad_create_handshake=released\n' >&2 || :
-  fi
+  # The shell child has its own bounded wait; persist only this fixed enum so
+  # the supervisor need not inherit or expose runtime-command stderr.
+  fixture_timepad_create_diagnostic released
   complete_owned_child || fail "OWNED_CHILD_QUIESCENCE_UNCONFIRMED"
   return "$owned_child_wait_status"
 }

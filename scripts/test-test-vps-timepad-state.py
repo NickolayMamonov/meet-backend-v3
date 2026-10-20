@@ -4180,18 +4180,23 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     child_diagnostic = json.dumps(
                         child_evidence, sort_keys=True, separators=(",", ":"),
                     )
+                    supervisor_trace = (
+                        (case / "recovery-diagnostics").read_text().splitlines()
+                        if (case / "recovery-diagnostics").exists() else []
+                    )
+                    self.assertLessEqual(
+                        (case / "recovery-diagnostics").stat().st_size
+                        if (case / "recovery-diagnostics").exists() else 0,
+                        4096,
+                    )
                     handshake_events = []
-                    for line in result.stderr.splitlines():
+                    for line in supervisor_trace:
                         if not line.startswith("fixture_timepad_create_handshake="):
                             continue
                         event = line.partition("=")[2]
                         if event not in {"read-timeout", "token-mismatch", "accepted", "released"}:
                             self.fail("unexpected fixed handshake diagnostic")
                         handshake_events.append(event)
-                    supervisor_trace = (
-                        (case / "recovery-diagnostics").read_text().splitlines()
-                        if (case / "recovery-diagnostics").exists() else []
-                    )
                     relay_path = case / ("recovery-relay-" + lease["attempt"] + ".json")
                     relay_trace = {}
                     if relay_path.exists():
