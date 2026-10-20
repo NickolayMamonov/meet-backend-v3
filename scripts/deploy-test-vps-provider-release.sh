@@ -40,7 +40,9 @@ fixture_create_stage() {
     CANDIDATE_BOUND_ID|CANDIDATE_INSPECT|CANDIDATE_IMAGE|CANDIDATE_RUNNING|\
     CANDIDATE_HASH|CANDIDATE_IDENTITY|CANDIDATE_LABELS|CANDIDATE_POLICY|\
     CANDIDATE_BINDING|CANDIDATE_CORRELATION|CANDIDATE_SUPPRESS|CANDIDATE_SUPPRESSED|\
-    VERIFYING_PUBLICATION|RESOURCE_REVALIDATION|CANDIDATE_START|CANDIDATE_HEALTH)
+    VERIFYING_PUBLICATION|RESOURCE_REVALIDATION|CANDIDATE_START|CANDIDATE_HEALTH|\
+    OWNED_CHILD_READBACK|OWNED_CHILD_STOP_STARTED|OWNED_CHILD_WAITED|\
+    OWNED_CHILD_STOPPED|OWNED_CHILD_GRANT_COMPLETED|OWNED_CHILD_CLEAR_PUBLISHED)
       printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
       ;;
   esac
@@ -2015,6 +2017,7 @@ complete_owned_child() {
   state_json=$(timeout 10s python3 "$timepad_helper" read-state \
     --root "$state_root" --deploy-lock-fd 9) || return 1
   child_json=$(jq -c '.current.ownedChild' <<<"$state_json") || return 1
+  fixture_create_stage OWNED_CHILD_READBACK
   if [ "$child_json" != null ]; then
     [ "$(jq -er '.pid' <<<"$child_json")" = "$owned_child_pid" ] &&
       [ "$(jq -er '.attemptId' <<<"$child_json")" = "$owned_child_attempt" ] ||
@@ -2027,10 +2030,13 @@ complete_owned_child() {
       --root "$state_root" --deploy-lock-fd 9 --term-grace-seconds 5 \
       >/dev/null &
     stop_pid=$!
+    fixture_create_stage OWNED_CHILD_STOP_STARTED
   fi
   wait "$owned_child_pid" || status=$?
+  fixture_create_stage OWNED_CHILD_WAITED
   if [ -n "${stop_pid:-}" ]; then
     wait "$stop_pid" || stop_status=$?
+    fixture_create_stage OWNED_CHILD_STOPPED
     [ "$stop_status" -eq 0 ] || return 1
   fi
   if [ "$child_json" = null ]; then
@@ -2054,11 +2060,13 @@ complete_owned_child() {
       "$reaped_json" "$owned_child_attempt" || return 1
     timepad_advance "$owned_child_phase" "" "" "" "" "" "" "" \
       null "$owned_child_attempt" || return 1
+    fixture_create_stage OWNED_CHILD_CLEAR_PUBLISHED
   fi
   [ -z "$owned_child_fifo" ] || rm -f -- "$owned_child_fifo"
   [ -z "${owned_child_response:-}" ] || rm -f -- "$owned_child_response"
   if [ -n "${owned_child_grant:-}" ]; then
     supervisor_client complete "$owned_child_grant" >/dev/null || return 1
+    fixture_create_stage OWNED_CHILD_GRANT_COMPLETED
   fi
   owned_child_pid=
   owned_child_fifo=
