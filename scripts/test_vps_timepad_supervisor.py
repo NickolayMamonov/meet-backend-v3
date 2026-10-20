@@ -445,9 +445,13 @@ class Attempt:
             reject("LEASE_ACK_INVALID")
         self.acked_revision, self.lease_digest = revision, digest
 
-    def grant(self, name: str, local_ns: int) -> Grant:
+    def grant(self, name: str, local_ns: int, *, parent_end_ns: int | None = None) -> Grant:
         now = self.clock()
         _integer(local_ns, 1, 600 * NS)
+        if parent_end_ns is not None and (
+            type(parent_end_ns) is not int or parent_end_ns <= now
+        ):
+            reject("WAIT_REFUSED")
         if not isinstance(name, str) or name not in WAIT_NAMES or len(self.grants) >= MAX_GRANTS:
             reject("WAIT_REFUSED")
         if self.hard_end is not None and now >= self.hard_end:
@@ -496,6 +500,8 @@ class Attempt:
         if name == "child-handshake":
             local_ns = min(local_ns, self.timing.handshake_ns)
         end = min(end, now + local_ns)
+        if parent_end_ns is not None:
+            end = min(end, parent_end_ns)
         if end <= now:
             reject("WAIT_REFUSED")
         grant = Grant(secrets.token_hex(16), name, end, self.nonce, self.role)
@@ -2223,7 +2229,10 @@ class Supervisor:
                     parent_end = _integer(frame["parentEndNs"], 1)
                     now = self.attempt.clock()
                     local = min(local, self.driver_end - now, parent_end - now)
-                grant = self.attempt.grant(frame["name"], local)
+                grant = self.attempt.grant(
+                    frame["name"], local,
+                    parent_end_ns=parent_end if driver else None,
+                )
                 if grant.name == "recovery-registration":
                     self.registration_grant = grant
                 value = grant.frame()

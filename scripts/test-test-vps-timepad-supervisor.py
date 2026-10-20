@@ -128,6 +128,15 @@ class AttemptTests(unittest.TestCase):
         attempt.grant("rollback-remaining-work", 600 * NS)
         self.assertEqual(original, (attempt.nonce, attempt.t0, attempt.work_end, attempt.hard_end))
 
+    def test_driver_grant_is_clamped_to_absolute_parent_deadline(self):
+        attempt = self.armed()
+        parent_end = self.clock.now + 10 * NS
+        grant = attempt.grant("provider", 30 * NS, parent_end_ns=parent_end)
+        self.assertEqual(grant.end_ns, parent_end)
+        self.clock.now = parent_end
+        with self.assertRaises(supervisor.SupervisorError):
+            attempt.grant("provider", 30 * NS, parent_end_ns=parent_end)
+
     def test_forward_recovery_charges_authorization_before_any_grant(self):
         attempt = supervisor.Attempt("forward-recover", clock=self.clock)
         original = attempt.t0
