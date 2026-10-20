@@ -4548,6 +4548,31 @@ def _create_runtime_configuration(
     if not isinstance(labels, dict):
         _fail("recovery")
     for key, value in {**expected_labels, **compose_labels}.items():
+        if labels.get(key) != value and os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+            diagnostic_path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE", "")
+            safe_labels = {
+                "com.docker.compose.project", "com.docker.compose.service",
+                "com.docker.compose.container-number", "com.docker.compose.oneoff",
+                "com.docker.compose.version", "com.docker.compose.image",
+            }
+            record = ("label_mismatch key=" + key + "\n").encode("ascii") if key in safe_labels else b""
+            if record and re.fullmatch(
+                r"/var/lib/timepad-fixture/case-create-worker-[A-Za-z0-9_-]+/driver-diagnostics",
+                diagnostic_path,
+            ):
+                try:
+                    fd = os.open(
+                        diagnostic_path,
+                        os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    )
+                    try:
+                        metadata = os.fstat(fd)
+                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 4096 - len(record):
+                            os.write(fd, record)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    pass
         _private_equal(labels.get(key), value)
     metadata = {
         "com.docker.compose.config-hash", "com.docker.compose.depends_on",

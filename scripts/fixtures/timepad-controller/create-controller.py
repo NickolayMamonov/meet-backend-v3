@@ -473,6 +473,12 @@ def run(case: Path, scenario: str) -> int:
                                     record,
                                 ):
                                     driver_failure = record.decode("ascii")
+                                elif re.fullmatch(
+                                    rb"label_mismatch key=com[.]docker[.]compose[.]"
+                                    rb"(?:project|service|container-number|oneoff|version|image)",
+                                    record,
+                                ):
+                                    driver_failure = record.decode("ascii")
                     supervisor_path = case / "supervisor-error"
                     if driver_failure == "none" and supervisor_path.is_file() and \
                             not supervisor_path.is_symlink():
