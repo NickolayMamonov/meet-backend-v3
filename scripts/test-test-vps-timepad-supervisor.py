@@ -2656,7 +2656,7 @@ class LinuxSupervisorTests(unittest.TestCase):
                         if name not in {
                             "grant", "register", "fault-injection", "complete",
                             "lease-ack", "lease-readback", "arm", "publish",
-                            "cancel", "pause",
+                            "expected-lease-ack-refusal", "cancel", "pause",
                         }:
                             os._exit(7)
                         os.write(2, f"registration-readback-stage={name}\n".encode("ascii"))
