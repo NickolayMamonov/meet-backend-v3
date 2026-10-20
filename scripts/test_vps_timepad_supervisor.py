@@ -1171,6 +1171,7 @@ class Supervisor:
             "driver_exit",
             "event_refusal",
             "event_loop_refusal",
+            "relay_refusal",
         }
         if label not in allowed:
             reject("PROTOCOL_INVALID")
@@ -2415,10 +2416,26 @@ class Supervisor:
                 self.attempt.cancel("TRANSPORT_LOST")
 
     def _relay_message(self) -> None:
-        frame, _ = receive_frame(self.relay)
-        if set(frame) != {"kind", "attempt", "signal"} or frame["kind"] != "cancel" or \
-                frame["attempt"] != self.attempt.nonce or not isinstance(frame["signal"], str) or \
-                frame["signal"] not in {"TERM", "INT", "HUP"}:
+        try:
+            frame, _ = receive_frame(self.relay)
+        except ChannelClosed:
+            self._fixture_diagnostic("relay_refusal", reason="peer-eof")
+            raise
+        except SupervisorError:
+            self._fixture_diagnostic("relay_refusal", reason="frame-invalid")
+            raise
+        if set(frame) != {"kind", "attempt", "signal"}:
+            reason = "frame-shape"
+        elif frame["kind"] != "cancel":
+            reason = "frame-kind"
+        elif frame["attempt"] != self.attempt.nonce:
+            reason = "attempt"
+        elif not isinstance(frame["signal"], str) or frame["signal"] not in {"TERM", "INT", "HUP"}:
+            reason = "signal"
+        else:
+            reason = None
+        if reason is not None:
+            self._fixture_diagnostic("relay_refusal", reason=reason)
             reject()
         number = {"TERM": signal.SIGTERM, "INT": signal.SIGINT, "HUP": signal.SIGHUP}[frame["signal"]]
         self.attempt.cancel(frame["signal"], 128 + number)

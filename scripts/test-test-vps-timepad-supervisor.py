@@ -752,6 +752,56 @@ class CreateProtocolTests(unittest.TestCase):
         acknowledged(instance.attempt)
         return instance
 
+    def test_relay_refusal_diagnostics_are_fixed_and_cancel_frames_stay_authenticated(self):
+        cases = (
+            (lambda attempt: {"kind": "clock", "attempt": attempt, "signal": "TERM"}, "frame-kind"),
+            (lambda _attempt: {"kind": "cancel", "attempt": "0" * 32, "signal": "TERM"}, "attempt"),
+            (lambda attempt: {"kind": "cancel", "attempt": attempt, "signal": "KILL"}, "signal"),
+            (lambda attempt: {
+                "kind": "cancel", "attempt": attempt, "signal": "TERM", "extra": "private",
+            }, "frame-shape"),
+        )
+        for build_frame, reason in cases:
+            instance = self.instance()
+            frame = build_frame(instance.attempt.nonce)
+            instance.relay = mock.Mock()
+            with self.subTest(reason=reason), \
+                    mock.patch.object(supervisor, "receive_frame", return_value=(frame, None)), \
+                    mock.patch.object(instance, "_fixture_diagnostic") as diagnostic, \
+                    self.assertRaisesRegex(supervisor.SupervisorError, "PROTOCOL_INVALID"):
+                instance._relay_message()
+            diagnostic.assert_called_once_with("relay_refusal", reason=reason)
+            self.assertIsNone(instance.attempt.first_reason)
+
+        instance = self.instance()
+        instance.relay = mock.Mock()
+        with mock.patch.object(supervisor, "receive_frame", side_effect=supervisor.ChannelClosed(
+            "PROTOCOL_INVALID",
+        )), mock.patch.object(instance, "_fixture_diagnostic") as diagnostic, \
+                self.assertRaises(supervisor.ChannelClosed):
+            instance._relay_message()
+        diagnostic.assert_called_once_with("relay_refusal", reason="peer-eof")
+
+        instance = self.instance()
+        instance.relay = mock.Mock()
+        with mock.patch.object(supervisor, "receive_frame", side_effect=supervisor.SupervisorError(
+            "PROTOCOL_INVALID",
+        )), mock.patch.object(instance, "_fixture_diagnostic") as diagnostic, \
+                self.assertRaisesRegex(supervisor.SupervisorError, "PROTOCOL_INVALID"):
+            instance._relay_message()
+        diagnostic.assert_called_once_with("relay_refusal", reason="frame-invalid")
+
+        instance = self.instance()
+        instance.relay = mock.Mock()
+        with mock.patch.object(supervisor.signal, "SIGHUP", signal.SIGTERM, create=True), \
+                mock.patch.object(instance, "_notify_clock"), \
+                mock.patch.object(supervisor, "receive_frame", return_value=({
+            "kind": "cancel", "attempt": instance.attempt.nonce, "signal": "TERM",
+        }, None)), mock.patch.object(instance, "_fixture_diagnostic") as diagnostic:
+            instance._relay_message()
+        diagnostic.assert_not_called()
+        self.assertEqual("TERM", instance.attempt.first_reason)
+
     def test_fixed_rpc_cli_accepts_only_the_four_defined_shapes(self):
         parser = supervisor._cli()
         for argv in (
