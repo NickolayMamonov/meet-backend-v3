@@ -821,28 +821,44 @@ class CreateDriver:
 
     @contextmanager
     def _grant(self, name: str, seconds: int = 30) -> Iterator[guard.ExecutionGrant]:
-        self.context.check_time()
-        frame = self.client.request(
-            "grant", name=name, localNs=min(seconds * NS, self.context.end_ns - time.monotonic_ns()),
-        )
-        if set(frame) != {"attempt", "grantId", "endNs", "role", "name"}:
-            if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
-                print("fixture_timepad_create=grant_refusal stage=schema", file=sys.stderr, flush=True)
-            refuse()
-        if frame["attempt"] != self.client.attempt or frame["name"] != name or \
-                frame["role"] != self.client.role:
-            if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
-                print("fixture_timepad_create=grant_refusal stage=correlation", file=sys.stderr, flush=True)
-            refuse()
-        if frame["endNs"] > self.context.end_ns:
-            if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
-                print("fixture_timepad_create=grant_refusal stage=deadline", file=sys.stderr, flush=True)
-            refuse()
-        grant = guard.ExecutionGrant(frame["attempt"], frame["grantId"], frame["endNs"])
+        diagnostic = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1"
+        stage = "deadline"
         try:
+            self.context.check_time()
+            stage = "request"
+            frame = self.client.request(
+                "grant", name=name, localNs=min(seconds * NS, self.context.end_ns - time.monotonic_ns()),
+            )
+            stage = "validate"
+            if set(frame) != {"attempt", "grantId", "endNs", "role", "name"}:
+                if diagnostic:
+                    print("fixture_timepad_create=grant_refusal stage=schema", file=sys.stderr, flush=True)
+                refuse()
+            if frame["attempt"] != self.client.attempt or frame["name"] != name or \
+                    frame["role"] != self.client.role:
+                if diagnostic:
+                    print("fixture_timepad_create=grant_refusal stage=correlation", file=sys.stderr, flush=True)
+                refuse()
+            if frame["endNs"] > self.context.end_ns:
+                if diagnostic:
+                    print("fixture_timepad_create=grant_refusal stage=deadline", file=sys.stderr, flush=True)
+                refuse()
+            grant = guard.ExecutionGrant(frame["attempt"], frame["grantId"], frame["endNs"])
+            stage = "body"
             yield grant
-        finally:
+            stage = "complete"
             self.client.request("complete", grantId=grant.grant_id)
+        except BaseException as error:
+            if diagnostic:
+                error_name = type(error).__name__
+                if not error_name.isascii() or not error_name.isidentifier() or len(error_name) > 64:
+                    error_name = "Exception"
+                print(
+                    "fixture_timepad_create=grant_failure stage=" + stage +
+                    " exception=" + error_name,
+                    file=sys.stderr, flush=True,
+                )
+            raise
 
     def _provider_call(self, command: str, value: dict[str, Any]) -> dict[str, Any]:
         if command not in {"prepare-transition-proof", "resource-admission", "runtime-request-proof", "absence-resume"}:
