@@ -900,10 +900,16 @@ class CreateDriver:
                         "_execution_interlock", "_execution_mutation",
                         "_prepare_transition_proof", "_resource_admission_command",
                         "_absence_resume", "_runtime_request_completion",
-                        "state_run_identity", "_operation_deadline",
+                        "state_run_identity", "_operation_deadline", "_timepad_current",
+                        "_open_deploy_state_root", "_lock_directory",
+                        "_validate_state_directory_fd", "_prepared_proof",
+                        "_read_resource_baseline", "_resource_role",
+                        "_resource_recovery_role", "_resource_envelope",
+                        "_private_equal", "_resource_admission", "_read_resource_request",
                     }
                     symbols = [
-                        frame.name if frame.name in safe_symbols else "other"
+                        frame.name + ":" + str(frame.lineno)
+                        if frame.name in safe_symbols else "other"
                         for frame in traceback.extract_tb(error.__traceback__)[-6:]
                     ]
                     safe_name = type(error).__name__
