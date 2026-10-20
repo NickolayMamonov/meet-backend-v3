@@ -90,17 +90,9 @@ def fixture_data(source: Path) -> dict:
     backend["Config"]["Labels"].update(predecessor_image["Config"]["Labels"])
     backend["Config"]["Labels"]["com.docker.compose.image"] = predecessor_image["Id"]
     backend["State"]["Health"] = {"Status": "healthy"}
-    # The real deploy shell has already crossed the suppress/stop fence before
-    # the guarded controller's pre-release resource observation. Model that
-    # external precondition explicitly; the controller still verifies the
-    # stopped, restart-disabled, disconnected predecessor itself.
-    backend["State"].update({
-        "Status": "exited", "Running": False, "Paused": False, "Restarting": False,
-        "Dead": False, "Pid": 0, "ExitCode": 0,
-    })
-    backend["HostConfig"]["RestartPolicy"] = {"Name": "no", "MaximumRetryCount": 0}
-    endpoint = backend["NetworkSettings"]["Networks"]["meet-production_default"]
-    endpoint.update(EndpointID="", IPAddress="", Gateway="", IPPrefixLen=0, MacAddress="")
+    # These are the actual pre-deploy observations. The fake Docker boundary
+    # changes restart policy and connectivity only after the controller has
+    # published the corresponding exact runtime intent.
     backend["NetworkSettings"]["Ports"] = {
         "8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18080"}],
     }
@@ -229,6 +221,8 @@ class ForwardTransport:
         require(not backend["State"]["Running"], "create raced running predecessor")
         require(backend["HostConfig"]["RestartPolicy"]["Name"] == "no",
                 "create raced unsuppressed predecessor")
+        endpoint = backend["NetworkSettings"]["Networks"]["meet-production_default"]
+        require(not endpoint["EndpointID"], "create raced a connected predecessor")
         backend.update(Id="a" * 64, Image=self.facts["image"]["Id"], RestartCount=0)
         backend["Config"].update(copy.deepcopy(self.facts["image"]["Config"]))
         backend["Config"].update(
@@ -461,9 +455,17 @@ def docker(case: Path, arguments: list[str], facts: dict) -> None:
     if scenario == "suppress-refused" and operation == "suppress":
         raise SystemExit(90)
     if operation == "suppress":
+        require(backend["State"]["Running"]
+                and backend["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped",
+                "fixture suppression did not target the running predecessor")
         backend["HostConfig"]["RestartPolicy"]["Name"] = "no"
     elif operation == "stop":
+        require(backend["State"]["Running"]
+                and backend["HostConfig"]["RestartPolicy"]["Name"] == "no",
+                "fixture stop preceded suppression")
         backend["State"].update(Status="exited", Running=False, Pid=0)
+        endpoint = backend["NetworkSettings"]["Networks"]["meet-production_default"]
+        endpoint.update(EndpointID="", IPAddress="", Gateway="", IPPrefixLen=0, MacAddress="")
     elif operation == "start":
         backend["State"].update(Status="running", Running=True, Pid=456,
                                 Health={"Status": "healthy"}, StartedAt="2026-10-01T02:00:00Z")

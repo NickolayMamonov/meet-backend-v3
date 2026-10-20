@@ -116,6 +116,55 @@ class Contracts(unittest.TestCase):
                        if item["Id"] == "f" * 64)
         self.assertTrue(backend["State"]["Running"])
         self.assertEqual("unless-stopped", backend["HostConfig"]["RestartPolicy"]["Name"])
+        endpoint = backend["NetworkSettings"]["Networks"]["meet-production_default"]
+        member = facts["resources"]["networkInspections"][0]["Containers"][backend["Id"]]
+        self.assertTrue(endpoint["EndpointID"])
+        self.assertEqual(endpoint["EndpointID"], member["EndpointID"])
+        self.assertEqual(endpoint["MacAddress"], member["MacAddress"])
+
+    def test_forward_fixture_disconnects_predecessor_only_after_exact_stop_intent(self):
+        fixture = self.forward_fixture()
+        facts = fixture.fixture_data(SCRIPTS)
+        backend = next(item for item in facts["resources"]["containerInspections"]
+                       if item["Id"] == "f" * 64)
+        with tempfile.TemporaryDirectory() as directory:
+            case = Path(directory)
+            runtime_path = case / "forward-runtime.json"
+            runtime_path.write_bytes(create.canonical(
+                {"backend": backend, "created": False}, create.MAX_EVIDENCE,
+            ))
+            (case / "forward-scenario").write_text("forward")
+            current = {"runtimeRequest": {
+                "lifecycle": "intent", "operation": "suppress", "containerId": backend["Id"],
+            }}
+            import test_vps_timepad_state as guard
+
+            with mock.patch.object(fixture, "no_socket"), \
+                    mock.patch.object(guard, "deploy_lock", side_effect=lambda *args: nullcontext()), \
+                    mock.patch.object(guard, "_read_guard_locked",
+                                      side_effect=lambda *args: (None, current)):
+                fixture.docker(case, ["update", "--restart=no", backend["Id"]], facts)
+                suppressed = fixture.ForwardTransport(case, facts).observe(context())
+                suppressed = create.parse(suppressed, create.MAX_EVIDENCE)["resources"]
+                stopped_backend = suppressed["containerInspections"][1]
+                endpoint = stopped_backend["NetworkSettings"]["Networks"]["meet-production_default"]
+                self.assertTrue(stopped_backend["State"]["Running"])
+                self.assertEqual("no", stopped_backend["HostConfig"]["RestartPolicy"]["Name"])
+                self.assertTrue(endpoint["EndpointID"])
+                self.assertIn(backend["Id"], suppressed["networkInspections"][0]["Containers"])
+
+                current["runtimeRequest"] = {
+                    "lifecycle": "intent", "operation": "stop", "containerId": backend["Id"],
+                }
+                fixture.docker(case, ["stop", "--time", "10", backend["Id"]], facts)
+                stopped = fixture.ForwardTransport(case, facts).observe(context())
+                stopped = create.parse(stopped, create.MAX_EVIDENCE)["resources"]
+                stopped_backend = stopped["containerInspections"][1]
+                endpoint = stopped_backend["NetworkSettings"]["Networks"]["meet-production_default"]
+                self.assertFalse(stopped_backend["State"]["Running"])
+                self.assertEqual("no", stopped_backend["HostConfig"]["RestartPolicy"]["Name"])
+                self.assertFalse(endpoint["EndpointID"])
+                self.assertNotIn(backend["Id"], stopped["networkInspections"][0]["Containers"])
 
     def test_forward_fixture_keeps_four_method_transport_and_refuses_unknown_external_actions(self):
         fixture = self.forward_fixture()
@@ -992,6 +1041,18 @@ class LinuxActualController(unittest.TestCase):
             "suppress:" + predecessor, "stop:" + predecessor,
             "suppress:" + candidate, "start:" + candidate, "restore-policy:" + candidate,
         ], effects)
+        suppressed = observations["predecessor-suppress"]["backend"]
+        self.assertTrue(suppressed["State"]["Running"])
+        self.assertEqual("unless-stopped", suppressed["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertTrue(suppressed["NetworkSettings"]["Networks"]["meet-production_default"]["EndpointID"])
+        stop_intent = observations["predecessor-stop"]["backend"]
+        self.assertTrue(stop_intent["State"]["Running"])
+        self.assertEqual("no", stop_intent["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertTrue(stop_intent["NetworkSettings"]["Networks"]["meet-production_default"]["EndpointID"])
+        quiesced = observations["create-spawn"]["backend"]
+        self.assertFalse(quiesced["State"]["Running"])
+        self.assertEqual("no", quiesced["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertFalse(quiesced["NetworkSettings"]["Networks"]["meet-production_default"]["EndpointID"])
         prepared = observations["predecessor-suppress"]["current"]
         self.assertEqual("PREPARED", prepared["phase"])
         self.assertEqual("pre-barrier-only", prepared["predecessorDisposition"])
