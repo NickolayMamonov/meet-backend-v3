@@ -751,13 +751,15 @@ def receive_frame(
     channel: socket.socket, *, accept_fd: bool = False,
     peer: list[ProcessIdentity] | None = None,
     fixture_frame_diagnostics: bool = False,
+    fixture_channel: str | None = None,
 ) -> tuple[dict[str, Any], int | None]:
     def refuse_frame(stage: str) -> None:
         if fixture_frame_diagnostics and os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
-            print(
-                f"fixture_timepad_supervisor=rpc_frame_refusal stage={stage}",
-                file=sys.stderr, flush=True,
-            )
+            channel = fixture_channel if fixture_channel in {
+                "create-launcher-rpc", "create-helper-rpc", "driver-rpc",
+            } else "unknown"
+            print(f"fixture_timepad_supervisor=rpc_frame_refusal stage={stage} channel={channel}",
+                  file=sys.stderr, flush=True)
         reject()
 
     data, ancillary, flags, _ = channel.recvmsg(
@@ -765,8 +767,12 @@ def receive_frame(
     )
     if not data and not ancillary and not flags:
         if fixture_frame_diagnostics and os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+            diagnostic_channel = fixture_channel if fixture_channel in {
+                "create-launcher-rpc", "create-helper-rpc", "driver-rpc",
+            } else "unknown"
             print(
-                "fixture_timepad_supervisor=rpc_frame_refusal stage=peer-eof",
+                f"fixture_timepad_supervisor=rpc_frame_refusal stage=peer-eof "
+                f"channel={diagnostic_channel}",
                 file=sys.stderr, flush=True,
             )
         raise ChannelClosed("PROTOCOL_INVALID")
@@ -1896,6 +1902,9 @@ class Supervisor:
             frame, fd = receive_frame(
                 channel, accept_fd=True, peer=peers,
                 fixture_frame_diagnostics=os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1",
+                fixture_channel=(
+                    "create-helper-rpc" if publisher else "create-launcher-rpc"
+                ),
             )
         except ChannelClosed:
             if publisher:
@@ -2196,6 +2205,7 @@ class Supervisor:
         try:
             frame, passed = receive_frame(
                 channel, accept_fd=True, peer=peers, fixture_frame_diagnostics=driver,
+                fixture_channel="driver-rpc" if driver else None,
             )
         except ChannelClosed:
             if driver and channel is self.driver_rpc:
