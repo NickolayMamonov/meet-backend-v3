@@ -2461,7 +2461,7 @@ class Supervisor:
             return
         status, reason = self.attempt.result
         if reason == "QUIESCENCE_UNCONFIRMED" and self.completion_pid is not None and \
-                self.completion_channel is not None:
+                self.completion_channel is not None and self.completion_status in {None, 0}:
             # A successful unresolved-lease publication must be acknowledged
             # before the relay can observe the refusal and inspect durable state.
             return
@@ -2595,6 +2595,9 @@ class Supervisor:
                         now >= self.completion_grant.end_ns and \
                         self.attempt.lifecycle != "quiescence-unconfirmed":
                     self.children.signal_owned(signal.SIGKILL)
+                    if self.completion_channel is not None:
+                        self.completion_channel.close()
+                        self.completion_channel = None
                     self.attempt.unconfirmed()
                 if childless and self.completion_pid is not None:
                     if self.completion_status != 0 or (
@@ -2737,6 +2740,9 @@ class Supervisor:
                                 self.attempt.cancel("TRANSPORT_LOST")
                                 self._notify_clock()
                             elif event.data in {"completion", "registration"}:
+                                if event.data == "completion" and self.completion_channel is not None:
+                                    self.completion_channel.close()
+                                    self.completion_channel = None
                                 self.attempt.unconfirmed()
                             elif event.data.startswith("create"):
                                 self.attempt.cancel("OWNERSHIP_UNCERTAIN")
