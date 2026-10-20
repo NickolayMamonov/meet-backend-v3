@@ -908,6 +908,10 @@ class CreateDriver:
                         "_private_equal", "_resource_admission", "_read_resource_request",
                         "_resource_bytes", "_resource_observation", "_resource_id",
                         "_configuration_digest", "_resource_endpoint",
+                        "_stopped_create_binding", "_resource_admission",
+                        "_resource_postgres", "_resource_backend",
+                        "_resource_network", "_resource_volume",
+                        "_resource_containers", "_resource_restart",
                     }
                     symbols = [
                         frame.name + ":" + str(frame.lineno)
