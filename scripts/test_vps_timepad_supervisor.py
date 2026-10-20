@@ -757,6 +757,11 @@ def receive_frame(
         MAX_FRAME + 1, socket.CMSG_SPACE(4 * 4) + socket.CMSG_SPACE(12),
     )
     if not data and not ancillary and not flags:
+        if fixture_frame_diagnostics and os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+            print(
+                "fixture_timepad_supervisor=rpc_frame_refusal stage=peer-eof",
+                file=sys.stderr, flush=True,
+            )
         raise ChannelClosed("PROTOCOL_INVALID")
     descriptors: list[int] = []
     credentials = None
