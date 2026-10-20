@@ -2721,7 +2721,6 @@ class LinuxSupervisorTests(unittest.TestCase):
                         if fault not in {"receipt", "digest", "erased"} or not expected_refusal:
                             raise
                         stage("expected-lease-ack-refusal")
-                        client.request("cancel", reason="EXIT", status=1)
                         stage("pause")
                         signal.pause()
                         raise AssertionError("cancelled worker unexpectedly resumed")
