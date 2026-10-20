@@ -2459,10 +2459,15 @@ class Supervisor:
     def _report(self) -> None:
         if self.reported or self.attempt.result is None:
             return
+        status, reason = self.attempt.result
+        if reason == "QUIESCENCE_UNCONFIRMED" and self.completion_pid is not None and \
+                self.completion_status in {None, 0}:
+            # A successful unresolved-lease publication must be acknowledged
+            # before the relay can observe the refusal and inspect durable state.
+            return
         self.reported = True
         if self.relay_alive:
             try:
-                status, reason = self.attempt.result
                 send_frame(self.relay, {
                     "kind": "result", "attempt": self.attempt.nonce,
                     "status": status, "reason": reason,
