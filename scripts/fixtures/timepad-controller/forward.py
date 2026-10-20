@@ -57,6 +57,16 @@ def fixture_data(source: Path) -> dict:
     # synthetic current/prepared/lease/receipt values never enter this harness.
     resources = module.resource_context("prepared")["observed"]
     _, image, _, _, _, _, _ = module.stopped_create_context(resource_only=True)
+    image = copy.deepcopy(image)
+    image_labels = image["Config"].get("Labels") or {}
+    image["Config"]["Labels"] = {
+        key: value for key, value in image_labels.items()
+        if not key.startswith("com.docker.compose.")
+    }
+    require(
+        not any(key.startswith("com.docker.compose.") for key in image["Config"]["Labels"]),
+        "target image fixture retained runtime-generated Compose labels",
+    )
     contract = copy.deepcopy(module.live_context("PREPARED")[1])
     contract["images"][1]["tuple"]["repositoryDigest"] = "0" * 64
     contract["tooling"] = {
