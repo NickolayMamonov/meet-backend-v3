@@ -2613,6 +2613,8 @@ class Supervisor:
                             return self.attempt.result[0]  # type: ignore[index]
                         self.completion_pid = None
                         self.completion_grant = None
+                        self.completion_ack = None
+                        self.completion_status = None
                 elif childless and self.attempt.pending_terminal is not None:
                     self._begin_publication(terminal=True)
                     childless = False
