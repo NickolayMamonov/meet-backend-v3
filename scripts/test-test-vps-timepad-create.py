@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -313,10 +314,15 @@ class Contracts(unittest.TestCase):
 
     def run_shell(self, source: str) -> subprocess.CompletedProcess:
         bash = r"C:\Program Files\Git\bin\bash.exe" if sys.platform == "win32" else "bash"
-        result = subprocess.run(
-            [bash, "-c", "set -euo pipefail\n" + source],
-            stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
-        )
+        # Git Bash truncates long -c arguments on Windows. Keep the script
+        # complete while preserving closed stdin for the functions under test.
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "contract.sh"
+            script.write_text("set -euo pipefail\n" + source, encoding="utf-8", newline="\n")
+            result = subprocess.run(
+                [bash, script.as_posix()],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
+            )
         self.assertEqual(0, result.returncode, result.stderr.decode(errors="replace"))
         return result
 
@@ -407,10 +413,11 @@ fi
                     self.assertEqual(expected, trace)
 
     def test_predecessor_refusal_never_reaches_barrier_create_or_start(self):
-        functions = self.shell_functions("guarded_candidate_start")
+        functions = self.shell_functions("fixture_create_stage", "guarded_candidate_start")
         for failure in ("suppress", "stop", "none"):
             with self.subTest(failure=failure):
                 result = self.run_shell(functions + """
+TIMEPAD_FIXTURE_DIAGNOSTICS=
 previous_container=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 previous_id=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 recovery_work_check() { :; }
@@ -443,6 +450,179 @@ if [ "$failure" = none ]; then [ "$status" -eq 97 ]; else [ "$status" -eq 95 ]; 
                 expected = ["suppress"] + (["stop"] if failure != "suppress" else [])
                 self.assertEqual(expected + (["barrier"] if failure == "none" else ["RECOVERY_REQUIRED"]),
                                  result.stderr.decode().splitlines())
+
+    def test_create_stage_diagnostics_are_opt_in_fixed_bounded_and_non_failing(self):
+        function = self.shell_functions("fixture_create_stage")
+        source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text()
+        stages = sorted(set(re.findall(r"^\s*fixture_create_stage ([A-Z_]+)$", source, re.MULTILINE)))
+        self.assertGreater(len(stages), 0)
+        self.assertLessEqual(len(stages), 64)
+        result = self.run_shell(function + """
+unset TIMEPAD_FIXTURE_DIAGNOSTICS
+fixture_create_stage PREDECESSOR_SUPPRESS
+for enabled in '' 0 true 01; do
+  TIMEPAD_FIXTURE_DIAGNOSTICS=$enabled fixture_create_stage PREDECESSOR_SUPPRESS
+done
+TIMEPAD_FIXTURE_DIAGNOSTICS=1
+fixture_create_stage
+fixture_create_stage PRIVATE_CANARY
+fixture_create_stage 'PRIVATE_CANARY=never-print-me
+PREDECESSOR_SUPPRESS'
+fixture_create_stage '$(echo never-print-me)'
+""" + "\n".join("fixture_create_stage " + stage for stage in stages) + """
+# A missing diagnostic sink must not become a controller failure.
+fixture_create_stage PREDECESSOR_SUPPRESS 2>/dev/null >&- 2>&-
+echo diagnostic-status-preserved
+""")
+        self.assertEqual(b"diagnostic-status-preserved\n", result.stdout)
+        self.assertEqual(
+            ["fixture_timepad_create_stage=" + stage for stage in stages],
+            result.stderr.decode().splitlines(),
+        )
+        self.assertLessEqual(len(result.stderr), 8192)
+        self.assertNotIn(b"PRIVATE_CANARY", result.stdout + result.stderr)
+        self.assertNotIn(b"never-print-me", result.stdout + result.stderr)
+
+    def test_create_stage_diagnostics_identify_refused_gate_without_changing_result(self):
+        stages = [
+            "WORK_BUDGET", "PREDECESSOR_INVENTORY", "PREDECESSOR_INSPECT",
+            "PREDECESSOR_IDENTITY", "PREDECESSOR_SUPPRESS", "PREDECESSOR_SUPPRESSED",
+            "PREDECESSOR_STOP", "PREDECESSOR_STOPPED", "BARRIER_PUBLICATION",
+            "FENCE_READ", "FENCE_PHASE", "FENCE_EPOCH", "FENCE_BINDING", "FENCE_UNBOUND",
+            "CREATE_INITIAL", "CANDIDATE_INVENTORY",
+        ]
+        functions = self.shell_functions("fixture_create_stage", "guarded_candidate_start")
+        # This observer only records the next fixed gate for fault injection;
+        # the actual helper still controls and sanitizes diagnostic output.
+        functions = functions.replace("fixture_create_stage() {", "emit_create_stage() {", 1)
+        harness = functions + """
+fixture_create_stage() { current_stage=$1; emit_create_stage "$@"; }
+previous_container=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+previous_id=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+admission_disposition=pre-barrier-only
+timepad_helper=fixed-helper
+state_root=fixed-root
+unsafe_cutover_latch=false
+current_stage=
+gate() { [ "$current_stage" != "$fault" ]; }
+recovery_work_check() { gate; }
+compose() { gate || return 1; echo "$previous_container"; }
+docker_container_inspect() {
+  gate || return 1
+  case "$current_stage:$*" in
+    PREDECESSOR_IDENTITY:*Image*) echo "$previous_id";;
+    PREDECESSOR_IDENTITY:*Running*) echo true;;
+    PREDECESSOR_SUPPRESSED:*) echo no;;
+    PREDECESSOR_STOPPED:*) echo false;;
+    *) echo matching;;
+  esac
+}
+jq() {
+  if [ "$current_stage" = FENCE_UNBOUND ] && [ "$fault" = FENCE_UNBOUND ]; then
+    echo unexpected-container
+    return 0
+  fi
+  gate || return 1
+  case "$*" in
+    *project*) echo meet-production;;
+    *service*) echo backend;;
+    *current.phase*) echo CUTOVER_POSSIBLE;;
+    *current.operationEpoch*) echo 1;;
+    *current.predecessorDisposition*) echo "$admission_disposition";;
+    *current.containerId*) echo '';;
+    *) exit 96;;
+  esac
+}
+timepad_runtime_mutate() {
+  echo "mutation:$1" >&2
+  gate
+}
+timepad_advance() {
+  echo barrier >&2
+  gate || fail GUARD_STATE_LOST
+}
+timeout() { gate || return 1; echo matching; }
+run_owned_child() {
+  echo create >&2
+  gate || return 23
+  candidate_container=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+}
+fail() { echo "$1" >&2; exit 95; }
+"""
+        for index, fault in enumerate(stages):
+            traces = []
+            for enabled in ("", "1"):
+                with self.subTest(fault=fault, diagnostics=enabled):
+                    result = self.run_shell(harness + f"""
+fault={fault}
+TIMEPAD_FIXTURE_DIAGNOSTICS='{enabled}'
+set +e
+( set -e; guarded_candidate_start )
+status=$?
+set -e
+echo "status=$status"
+""")
+                    lines = result.stderr.decode().splitlines()
+                    diagnostic = [line for line in lines if line.startswith("fixture_timepad_create_stage=")]
+                    self.assertEqual(
+                        ["fixture_timepad_create_stage=" + stage for stage in stages[:index + 1]]
+                        if enabled else [], diagnostic,
+                    )
+                    effects = [line for line in lines if not line.startswith("fixture_timepad_create_stage=")]
+                    self.assertEqual(b"status=23\n" if fault == "CREATE_INITIAL" else b"status=95\n",
+                                     result.stdout.splitlines(keepends=True)[-1])
+                    if fault != "CREATE_INITIAL":
+                        self.assertEqual(
+                            "GUARD_STATE_LOST" if fault.startswith("FENCE_") or fault == "BARRIER_PUBLICATION"
+                            else "RECOVERY_REQUIRED", effects[-1],
+                        )
+                    self.assertNotIn("start", effects)
+                    if index < stages.index("BARRIER_PUBLICATION"):
+                        self.assertNotIn("barrier", effects)
+                        self.assertNotIn("create", effects)
+                    if index < stages.index("CREATE_INITIAL"):
+                        self.assertNotIn("create", effects)
+                    traces.append((result.stdout, effects))
+            if len(traces) == 2:
+                self.assertEqual(traces[0], traces[1], fault)
+
+    def test_predecessor_verification_diagnostics_preserve_failure_contract(self):
+        stages = [
+            "PREDECESSOR_VERIFY_INVENTORY", "PREDECESSOR_VERIFY_INSPECT",
+            "PREDECESSOR_VERIFY_PROVIDER",
+        ]
+        functions = self.shell_functions("fixture_create_stage", "verify_predecessor_before_writers")
+        functions = functions.replace("fixture_create_stage() {", "emit_create_stage() {", 1)
+        harness = functions + """
+fixture_create_stage() { current_stage=$1; emit_create_stage "$@"; }
+previous_inspect=PRIVATE_CANARY
+provider_helper=fixed-helper
+state_root=fixed-root
+run_key=fixed-run
+gate() { [ "$current_stage" != "$fault" ]; }
+compose() { gate || return 1; echo exact-container; }
+docker_container_inspect() { gate || return 1; echo PRIVATE_CANARY; }
+timeout() { gate; }
+fail() { echo "$1" >&2; exit 95; }
+"""
+        for index, fault in enumerate(stages):
+            for enabled in ("", "1"):
+                with self.subTest(fault=fault, diagnostics=enabled):
+                    result = self.run_shell(harness + f"""
+fault={fault}
+TIMEPAD_FIXTURE_DIAGNOSTICS='{enabled}'
+set +e
+( set -e; verify_predecessor_before_writers )
+status=$?
+[ "$status" -eq 95 ]
+""")
+                    self.assertEqual(b"", result.stdout)
+                    self.assertEqual(
+                        (["fixture_timepad_create_stage=" + stage for stage in stages[:index + 1]]
+                         if enabled else []) + ["PROVIDER_STATE_INVALID"],
+                        result.stderr.decode().splitlines(),
+                    )
+                    self.assertNotIn(b"PRIVATE_CANARY", result.stdout + result.stderr)
 
     def test_state_admission_alone_never_releases_rollback_mutation(self):
         functions = self.shell_functions("rollback_worker_admission")

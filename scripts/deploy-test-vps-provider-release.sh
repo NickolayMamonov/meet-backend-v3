@@ -23,6 +23,29 @@ fail() {
   exit 1
 }
 
+fixture_create_stage() {
+  # Trace the next gate, including helpers that exit directly. Diagnostics
+  # cannot supply authority, expose private values, or change a gate's status.
+  [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
+  case "${1:-}" in
+    PREPARED_BUDGET|PREPARED_PUBLICATION|ACTIVE_FILES_VALIDATION|\
+    PREDECESSOR_VERIFY_INVENTORY|PREDECESSOR_VERIFY_INSPECT|PREDECESSOR_VERIFY_PROVIDER|\
+    CONFIGURATION_VALIDATION|APPLYING_MARKER|ACTIVE_COMPOSE_INSTALL|ACTIVE_COMPOSE_RECORD|\
+    ACTIVE_RUNTIME_INSTALL|ACTIVE_RUNTIME_RECORD|TARGET_UPDATE|TARGET_BYTES|\
+    TARGET_IDENTITY|TARGET_CONFIGURATION|WORK_BUDGET|PREDECESSOR_INVENTORY|\
+    PREDECESSOR_INSPECT|PREDECESSOR_IDENTITY|PREDECESSOR_SUPPRESS|PREDECESSOR_SUPPRESSED|\
+    PREDECESSOR_STOP|PREDECESSOR_STOPPED|BARRIER_PUBLICATION|FENCE_READ|FENCE_PHASE|\
+    FENCE_EPOCH|FENCE_BINDING|FENCE_UNBOUND|CREATE_INITIAL|CANDIDATE_INVENTORY|\
+    CANDIDATE_BOUND_ID|CANDIDATE_INSPECT|CANDIDATE_IMAGE|CANDIDATE_RUNNING|\
+    CANDIDATE_HASH|CANDIDATE_IDENTITY|CANDIDATE_LABELS|CANDIDATE_POLICY|\
+    CANDIDATE_BINDING|CANDIDATE_CORRELATION|CANDIDATE_SUPPRESS|CANDIDATE_SUPPRESSED|\
+    VERIFYING_PUBLICATION|RESOURCE_REVALIDATION|CANDIDATE_START|CANDIDATE_HEALTH)
+      printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
+      ;;
+  esac
+  return 0
+}
+
 verify_production_env_settings() {
   timeout 30s python3 - "$1" <<'PY'
 import os
@@ -2274,7 +2297,9 @@ timepad_prepare_transition() {
 
 timepad_publish_prepared_transition() {
   [ "$timepad_admitted" = true ] || return 0
+  fixture_create_stage PREPARED_BUDGET
   recovery_budget_arm
+  fixture_create_stage PREPARED_PUBLICATION
   timepad_create_action publish-prepared initial >/dev/null ||
     fail "TIMEPAD_ADMISSION_REFUSED"
   prepared_timepad=true
@@ -3149,12 +3174,16 @@ snapshot_active_file "$active_runtime" runtime
 
 guarded_candidate_start() {
   local ids id_count candidate_json candidate_image running restart status deadline candidate_id
+  fixture_create_stage WORK_BUDGET
   recovery_work_check || fail "RECOVERY_REQUIRED"
   local predecessor_current predecessor_state predecessor_restart
+  fixture_create_stage PREDECESSOR_INVENTORY
   predecessor_current=$(compose ps -q backend) || fail "RECOVERY_REQUIRED"
   [ "$predecessor_current" = "$previous_container" ] || fail "RECOVERY_REQUIRED"
+  fixture_create_stage PREDECESSOR_INSPECT
   predecessor_state=$(docker_container_inspect "$previous_container") ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage PREDECESSOR_IDENTITY
   [ "$(docker_container_inspect "$previous_container" \
     --format '{{.Image}}')" = "$previous_id" ] &&
     [ "$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // ""' \
@@ -3166,35 +3195,47 @@ guarded_candidate_start() {
     fail "RECOVERY_REQUIRED"
   # Predecessor writes use the captured identity and provider proof, not merely
   # a current inventory observation. No raw-Docker fallback on refusal.
+  fixture_create_stage PREDECESSOR_SUPPRESS
   timepad_runtime_mutate suppress "$previous_container" ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage PREDECESSOR_SUPPRESSED
   predecessor_restart=$(docker_container_inspect "$previous_container" \
     --format '{{.HostConfig.RestartPolicy.Name}}') || fail "RECOVERY_REQUIRED"
   [ "$predecessor_restart" = no ] || fail "RECOVERY_REQUIRED"
+  fixture_create_stage PREDECESSOR_STOP
   timepad_runtime_mutate stop "$previous_container" ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage PREDECESSOR_STOPPED
   [ "$(docker_container_inspect "$previous_container" \
     --format '{{.State.Running}}')" = false ] || fail "RECOVERY_REQUIRED"
 
   unsafe_cutover_latch=true
+  fixture_create_stage BARRIER_PUBLICATION
   timepad_advance CUTOVER_POSSIBLE CUTOVER_ACKNOWLEDGED
   local fence_state fence_phase fence_epoch
+  fixture_create_stage FENCE_READ
   fence_state=$(timeout 15s python3 "$timepad_helper" read-state \
     --root "$state_root" --deploy-lock-fd 9) || fail "GUARD_STATE_LOST"
+  fixture_create_stage FENCE_PHASE
   fence_phase=$(jq -er '.current.phase | strings' <<<"$fence_state") ||
     fail "GUARD_STATE_LOST"
+  fixture_create_stage FENCE_EPOCH
   fence_epoch=$(jq -er '.current.operationEpoch | numbers' <<<"$fence_state") ||
     fail "GUARD_STATE_LOST"
+  fixture_create_stage FENCE_BINDING
   [ "$fence_phase" = CUTOVER_POSSIBLE ] &&
     [ "$fence_epoch" -gt 0 ] &&
     [ "$(jq -er '.current.predecessorDisposition | strings' \
       <<<"$fence_state")" = "$admission_disposition" ] ||
     fail "GUARD_STATE_LOST"
+  fixture_create_stage FENCE_UNBOUND
   [ "$(jq -er '.current.containerId // ""' <<<"$fence_state")" = "" ] ||
     fail "GUARD_STATE_LOST"
   echo "schema_guard=cutover-possible"
+  fixture_create_stage CREATE_INITIAL
   run_owned_child CUTOVER_POSSIBLE create initial >/dev/null
   local bound_container=$candidate_container
+  fixture_create_stage CANDIDATE_INVENTORY
   ids=$(compose ps -aq backend) || fail "RECOVERY_REQUIRED"
   mapfile -t candidate_ids <<<"$ids"
   id_count=0
@@ -3205,48 +3246,64 @@ guarded_candidate_start() {
       id_count=$((id_count + 1))
     fi
   done
+  fixture_create_stage CANDIDATE_BOUND_ID
   [ "$id_count" -eq 1 ] &&
     [[ "$candidate_container" =~ ^[a-f0-9]{64}$ ]] &&
     [ "$candidate_container" = "$bound_container" ] ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_INSPECT
   candidate_json=$(docker_container_inspect "$candidate_container") ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_IMAGE
   candidate_image=$(docker_container_inspect "$candidate_container" \
     --format '{{.Image}}') || fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_RUNNING
   running=$(docker_container_inspect "$candidate_container" \
     --format '{{.State.Running}}') || fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_HASH
   target_hash=$(docker_container_inspect "$candidate_container" \
     --format '{{index .Config.Labels "com.docker.compose.config-hash"}}') ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_IDENTITY
   [ "$candidate_image" = "$target_id" ] && [ "$running" = false ] &&
     [[ "$target_hash" =~ ^[0-9a-f]{64}$ ]] ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_LABELS
   [ "$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // ""' \
     <<<"$candidate_json")" = meet-production ] &&
     [ "$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // ""' \
       <<<"$candidate_json")" = backend ] ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_POLICY
   restart=$(docker_container_inspect "$candidate_container" \
     --format '{{.HostConfig.RestartPolicy.Name}}') || fail "RECOVERY_REQUIRED"
   [ "$restart" = unless-stopped ] || fail "RECOVERY_REQUIRED"
   local observed_candidate_hash=$target_hash
+  fixture_create_stage CANDIDATE_BINDING
   timepad_request_bind_create || fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_CORRELATION
   [ "$candidate_container" = "$bound_container" ] &&
     [ "$target_hash" = "$observed_candidate_hash" ] ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_SUPPRESS
   timepad_runtime_mutate suppress "$candidate_container" ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_SUPPRESSED
   [ "$(docker_container_inspect "$candidate_container" \
     --format '{{.State.Running}}')" = false ] &&
     [ "$(docker_container_inspect "$candidate_container" \
       --format '{{.HostConfig.RestartPolicy.Name}}')" = no ] ||
     fail "RECOVERY_REQUIRED"
+  fixture_create_stage VERIFYING_PUBLICATION
   timepad_advance VERIFYING CANDIDATE_IDENTITY_PERSISTED \
     "$candidate_container" "$target_hash"
+  fixture_create_stage RESOURCE_REVALIDATION
   timepad_create_action verify-target initial >/dev/null ||
     fail "RESOURCE_ADMISSION_REFUSED"
+  fixture_create_stage CANDIDATE_START
   run_owned_child VERIFYING timeout --kill-after=5s 30s docker start "$candidate_container" \
     >/dev/null || fail "RECOVERY_REQUIRED"
+  fixture_create_stage CANDIDATE_HEALTH
   deadline=$(recovery_health_deadline 180) || fail "RECOVERY_REQUIRED"
   while recovery_health_window_open "$deadline"; do
     recovery_deadline_check
@@ -3637,11 +3694,14 @@ timepad_publish_prepared_transition
 
 verify_predecessor_before_writers() {
   local current_container current_inspect
+  fixture_create_stage PREDECESSOR_VERIFY_INVENTORY
   current_container=$(compose ps -q backend) ||
     fail "PROVIDER_STATE_INVALID"
   [ -n "$current_container" ] || fail "PROVIDER_STATE_INVALID"
+  fixture_create_stage PREDECESSOR_VERIFY_INSPECT
   current_inspect=$(docker_container_inspect "$current_container" 2>/dev/null) ||
     fail "PROVIDER_STATE_INVALID"
+  fixture_create_stage PREDECESSOR_VERIFY_PROVIDER
   printf '[%s,%s]' "$previous_inspect" "$current_inspect" |
     timeout 30s python3 "$provider_helper" verify \
       --run-key "$run_key" --state-root "$state_root" --phase predecessor \
@@ -3701,29 +3761,42 @@ verify_predecessor_for_cleanup() {
       }
 }
 
+fixture_create_stage ACTIVE_FILES_VALIDATION
 validate_active_files_before_writers
 verify_predecessor_before_writers
+fixture_create_stage CONFIGURATION_VALIDATION
 validate_configuration_boundary "$state/config.env.production"
+fixture_create_stage APPLYING_MARKER
 write_provider_marker applying "$durable_disposition"
 mutation_started=true
 validate_configuration_boundary "$state/config.env.production"
+fixture_create_stage ACTIVE_COMPOSE_INSTALL
 timeout 30s install -m 600 "$state/config.base-compose.yml" "$active_compose" ||
   fail "PROVIDER_STATE_INVALID"
+fixture_create_stage ACTIVE_COMPOSE_RECORD
 record_candidate_active_file "$active_compose" compose
+fixture_create_stage CONFIGURATION_VALIDATION
 validate_configuration_boundary "$state/config.env.production"
+fixture_create_stage ACTIVE_RUNTIME_INSTALL
 timeout 30s install -m 600 "$state/target-runtime.override.yml" "$active_runtime" ||
   fail "PROVIDER_STATE_INVALID"
+fixture_create_stage ACTIVE_RUNTIME_RECORD
 record_candidate_active_file "$active_runtime" runtime
+fixture_create_stage CONFIGURATION_VALIDATION
 validate_configuration_boundary "$state/config.env.production"
 updater_started=true
+fixture_create_stage TARGET_UPDATE
 PRODUCTION_ROOT=$root PRODUCTION_SCRIPTS_DIR=$script_dir \
   timeout 60s "$update_script" "$image" "$revision" "$version" >/dev/null 2>&1 ||
   fail "PROVIDER_STATE_INVALID"
+fixture_create_stage TARGET_BYTES
 cmp -s "$root/.env.production" "$state/config.env.target" ||
   fail "PROVIDER_STATE_INVALID"
+fixture_create_stage TARGET_IDENTITY
 printf '%s\n' "$(configuration_file_identity "$root/.env.production")" \
   >"$state/config.env.target.identity"
 chmod 600 "$state/config.env.target.identity"
+fixture_create_stage TARGET_CONFIGURATION
 validate_configuration_boundary "$state/config.env.target"
 updater_completed=true
 if [ "$prepared_timepad" = true ]; then
