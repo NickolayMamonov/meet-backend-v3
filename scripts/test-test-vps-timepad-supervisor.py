@@ -1014,6 +1014,115 @@ class CreateProtocolTests(unittest.TestCase):
         self.assertEqual("completed", instance.create.phase)
         self.assertFalse(instance.attempt.grants)
 
+    def helper_rpc_eof_instance(self):
+        instance = self.instance()
+        instance.create = self.ready()
+        instance.create.phase = "ready"
+        instance.create_helper_pid = 345
+        instance.create_helper_identity = supervisor.ProcessIdentity(345, 100, 43, 0)
+        instance.create_helper_stage = "publish"
+        instance.create_helper_status = None
+        instance.create_helper_result = None
+        instance.create_helper_channel = mock.Mock()
+        instance.create_helper_rpc = mock.Mock()
+        instance.create_completion_evidence = {"receiptDigest": ACK, "acknowledged": True}
+        instance.create_reply = mock.Mock()
+        instance.attempt.grants[instance.create.grant.grant_id] = instance.create.grant
+        return instance
+
+    def deliver_helper_rpc_eof(self, instance, channel):
+        with mock.patch.object(supervisor, "receive_frame",
+                               side_effect=supervisor.ChannelClosed("PROTOCOL_INVALID")):
+            instance._create_private_rpc(channel, publisher=True)
+
+    def deliver_helper_result(self, instance, result):
+        with mock.patch.object(supervisor, "receive_frame", return_value=(result, None)):
+            instance._create_helper_response()
+
+    def test_helper_result_and_clean_rpc_eof_order_do_not_replace_exact_wait(self):
+        result = {"receiptDigest": ACK, "sequence": 1}
+        for order in (("eof", "result", "wait"), ("result", "eof", "wait"), ("wait", "result")):
+            with self.subTest(order=order):
+                instance = self.helper_rpc_eof_instance()
+                rpc = instance.create_helper_rpc
+                with mock.patch.object(instance.children, "refresh"), \
+                        mock.patch.object(instance, "_resume_create_controller") as resume, \
+                        mock.patch.object(instance, "_create_reply") as reply:
+                    for event in order:
+                        if event == "eof":
+                            self.deliver_helper_rpc_eof(instance, rpc)
+                        elif event == "result":
+                            self.deliver_helper_result(instance, result)
+                        else:
+                            instance._tick_create({345: 0})
+                    if instance.create_helper_status is None:
+                        instance._tick_create({345: 0})
+                    if instance.create_helper_result is None:
+                        self.assertEqual("ready", instance.create.phase)
+                        resume.assert_not_called()
+                        reply.assert_not_called()
+                        self.deliver_helper_result(instance, result)
+                        instance._tick_create({})
+                    self.assertEqual("completed", instance.create.phase)
+                    resume.assert_called_once_with(cancel=False)
+                    reply.assert_called_once_with(result)
+                    self.assertIsNone(instance.create_helper_rpc)
+                    rpc.close.assert_called_once()
+
+    def test_clean_helper_rpc_eof_alone_never_accepts_missing_result(self):
+        instance = self.helper_rpc_eof_instance()
+        self.deliver_helper_rpc_eof(instance, instance.create_helper_rpc)
+        with mock.patch.object(instance.children, "refresh"), \
+                mock.patch.object(instance, "_resume_create_controller") as resume, \
+                mock.patch.object(instance, "_create_reply") as reply:
+            instance._tick_create({345: 0})
+        self.assertEqual(0, instance.create_helper_status)
+        self.assertIsNone(instance.create_helper_result)
+        self.assertEqual("ready", instance.create.phase)
+        resume.assert_not_called()
+        reply.assert_not_called()
+        with mock.patch.object(supervisor, "receive_frame",
+                               side_effect=supervisor.ChannelClosed("PROTOCOL_INVALID")), \
+                self.assertRaises(supervisor.ChannelClosed):
+            instance._create_helper_response()
+        self.assertEqual("ready", instance.create.phase)
+        self.assertIsNone(instance.attempt.result)
+
+    def test_helper_result_requires_zero_wait_and_well_formed_frame(self):
+        result = {"receiptDigest": ACK, "sequence": 1}
+        instance = self.helper_rpc_eof_instance()
+        self.deliver_helper_rpc_eof(instance, instance.create_helper_rpc)
+        self.deliver_helper_result(instance, result)
+        with mock.patch.object(instance.children, "refresh"), \
+                mock.patch.object(instance, "_resume_create_controller") as resume, \
+                mock.patch.object(instance, "_create_reply") as reply, \
+                self.assertRaisesRegex(supervisor.SupervisorError, "OWNERSHIP_UNCERTAIN"):
+            instance._tick_create({345: 7})
+        self.assertNotEqual("completed", instance.create.phase)
+        resume.assert_not_called()
+        reply.assert_not_called()
+
+        instance = self.helper_rpc_eof_instance()
+        self.deliver_helper_rpc_eof(instance, instance.create_helper_rpc)
+        with mock.patch.object(supervisor, "receive_frame",
+                               side_effect=supervisor.SupervisorError("PROTOCOL_INVALID")), \
+                self.assertRaisesRegex(supervisor.SupervisorError, "PROTOCOL_INVALID"):
+            instance._create_helper_response()
+        self.assertIsNone(instance.create_helper_result)
+        self.assertEqual("ready", instance.create.phase)
+
+    def test_clean_eof_on_other_rpc_channel_remains_protocol_failure(self):
+        instance = self.helper_rpc_eof_instance()
+        helper_rpc = instance.create_helper_rpc
+        for channel, publisher in ((helper_rpc, False), (mock.Mock(), True)):
+            with self.subTest(publisher=publisher), \
+                    mock.patch.object(supervisor, "receive_frame",
+                                      side_effect=supervisor.ChannelClosed("PROTOCOL_INVALID")), \
+                    self.assertRaises(supervisor.ChannelClosed):
+                instance._create_private_rpc(channel, publisher=publisher)
+            self.assertIs(helper_rpc, instance.create_helper_rpc)
+            self.assertFalse(helper_rpc.close.called)
+
     def test_rpc_kernel_peer_and_nonce_role_schema_are_fenced(self):
         for change in ({}, {"attempt": "0" * 32}, {"role": "rollback-worker"},
                        {"argv": ["sh"]}, {"kind": "create-publisher-ack-intent"}):
