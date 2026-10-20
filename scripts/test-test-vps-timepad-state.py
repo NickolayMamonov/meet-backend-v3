@@ -4180,11 +4180,40 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     child_diagnostic = json.dumps(
                         child_evidence, sort_keys=True, separators=(",", ":"),
                     )
+                    supervisor_trace = (
+                        (case / "recovery-diagnostics").read_text().splitlines()
+                        if (case / "recovery-diagnostics").exists() else []
+                    )
+                    relay_path = case / ("recovery-relay-" + lease["attempt"] + ".json")
+                    relay_trace = {}
+                    if relay_path.exists():
+                        relay_record = json.loads(relay_path.read_bytes())
+                        relay_trace = {
+                            "status": relay_record["result"]["status"],
+                            "reason": relay_record["result"]["reason"],
+                            "outcome": relay_record["result"]["outcome"],
+                            "reaped": relay_record["reaped"],
+                            "transportEvents": relay_record["transportEvents"],
+                        }
+                    lifecycle_diagnostic = json.dumps({
+                        "child": child_evidence,
+                        "lease": {
+                            "lifecycle": lease["lifecycle"],
+                            "firstFailure": lease["firstFailure"],
+                            "firstStatus": lease["firstStatus"],
+                            "workerPresent": lease["worker"] is not None,
+                        },
+                        "supervisorTrace": supervisor_trace,
+                        "relay": relay_trace,
+                    }, sort_keys=True, separators=(",", ":"))
                     self.assertEqual(original["incidentId"], after["incidentId"])
                     self.assertEqual(1, after["operationEpoch"])
                     self.assertIsNone(after["ownedChild"], child_diagnostic)
                     self.assertEqual(after["executionAttempt"], lease["attempt"])
-                    self.assertEqual("RECOVERY_RETRY_RUNTIME_FAILED", lease["firstFailure"])
+                    self.assertEqual(
+                        "RECOVERY_RETRY_RUNTIME_FAILED", lease["firstFailure"],
+                        lifecycle_diagnostic,
+                    )
                     self.assertEqual(1, lease["firstStatus"])
                     request = after["runtimeRequest"]
                     self.assertEqual("stop", request["operation"])
