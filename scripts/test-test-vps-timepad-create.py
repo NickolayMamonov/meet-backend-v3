@@ -1055,7 +1055,7 @@ class LinuxActualController(unittest.TestCase):
         self.assertFalse(quiesced["NetworkSettings"]["Networks"]["meet-production_default"]["EndpointID"])
         prepared = observations["predecessor-suppress"]["current"]
         self.assertEqual("PREPARED", prepared["phase"])
-        self.assertEqual("pre-barrier-only", prepared["predecessorDisposition"])
+        self.assertEqual("post-barrier-compatible", prepared["predecessorDisposition"])
         self.assertEqual(1, prepared["operationEpoch"])
         self.assertIsNone(prepared["containerId"])
         self.assertEqual("predecessor", prepared["runtimeRequest"]["role"])
