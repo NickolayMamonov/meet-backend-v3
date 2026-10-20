@@ -513,10 +513,16 @@ def run(case: Path, scenario: str) -> int:
             # Only this forked fixture process is killed, after childlessness,
             # lock retention and a non-success result were observed. Durable
             # unresolved state remains unchanged; this is not protocol success.
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             waited, actual = os.waitpid(pid, 0)
-            require(waited == pid and os.waitstatus_to_exitcode(actual) == -signal.SIGKILL,
-                    "fixture passive-keeper teardown failed")
+            exit_status = os.waitstatus_to_exitcode(actual)
+            require(
+                waited == pid and status != 0 and exit_status in {-signal.SIGKILL, status},
+                "fixture passive-keeper teardown failed",
+            )
         elif status is None:
             # Closing the real relay revokes authority. Never manufacture an
             # ACK, unlock FD9 or kill only the supervisor and orphan its workers.

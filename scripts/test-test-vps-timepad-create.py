@@ -1243,8 +1243,8 @@ class LinuxActualController(unittest.TestCase):
                 sys.executable, "-B", str(SCRIPTS / "fixtures/timepad-controller/create-controller.py"),
                 "--case", str(case), "--scenario", scenario,
             ], stdin=subprocess.DEVNULL, capture_output=True, timeout=730)
-            self.assertEqual(0, result.returncode, result.stderr.decode(errors="replace"))
             try:
+                self.assertEqual(0, result.returncode, result.stderr.decode(errors="replace"))
                 self.assertLessEqual(len(result.stdout) + len(result.stderr), 65536)
                 self.assertFalse(os.path.lexists("/run/docker.sock"))
                 self.assertFalse(os.path.lexists("/var/run/docker.sock"))
