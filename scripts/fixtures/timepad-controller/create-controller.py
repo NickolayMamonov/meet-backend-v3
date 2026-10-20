@@ -456,6 +456,16 @@ def run(case: Path, scenario: str) -> int:
                             diagnostic,
                         ):
                             driver_failure = diagnostic.decode("ascii").strip()
+                    supervisor_path = case / "supervisor-error"
+                    if driver_failure == "none" and supervisor_path.is_file() and \
+                            not supervisor_path.is_symlink():
+                        diagnostic = supervisor_path.read_bytes()
+                        if len(diagnostic) <= 512 and re.fullmatch(
+                            rb"(construct|run):[A-Za-z][A-Za-z0-9_]{0,63}:"
+                            rb"[A-Z][A-Z0-9_]{0,63}:[A-Za-z0-9_,]{1,128}\n?",
+                            diagnostic,
+                        ):
+                            driver_failure = "supervisor=" + diagnostic.decode("ascii").strip()
                     raise AssertionError(
                         "actual normal forward did not commit: phase=" + phase +
                         " failure=" + failure + " effects=" + effect_kinds +
