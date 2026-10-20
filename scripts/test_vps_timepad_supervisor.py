@@ -130,6 +130,10 @@ class SupervisorError(Exception):
     """Fixed sanitized error: no OS exception or private input is printed."""
 
 
+class ChannelClosed(SupervisorError):
+    """Clean socket EOF, distinct from a malformed or truncated protocol frame."""
+
+
 def reject(reason: str = "PROTOCOL_INVALID") -> None:
     raise SupervisorError(reason)
 
@@ -743,6 +747,8 @@ def receive_frame(
     data, ancillary, flags, _ = channel.recvmsg(
         MAX_FRAME + 1, socket.CMSG_SPACE(4 * 4) + socket.CMSG_SPACE(12),
     )
+    if not data and not ancillary and not flags:
+        raise ChannelClosed("PROTOCOL_INVALID")
     descriptors: list[int] = []
     credentials = None
     try:
@@ -2054,7 +2060,18 @@ class Supervisor:
         channel = self.worker if channel is None else channel
         assert channel is not None
         peers: list[ProcessIdentity] = []
-        frame, passed = receive_frame(channel, accept_fd=True, peer=peers)
+        try:
+            frame, passed = receive_frame(channel, accept_fd=True, peer=peers)
+        except ChannelClosed:
+            if driver or channel is not self.worker:
+                raise
+            channel.close()
+            self.worker = None
+            # EOF can precede SIGCHLD/wait visibility. Retain worker_pid until
+            # the sole Children.reap owner supplies its exact exit status.
+            if self.attempt.pending_terminal is None:
+                raise
+            return
         assert passed is not None
         kind = frame.get("kind")
         schemas = {
@@ -2187,6 +2204,8 @@ class Supervisor:
             })
             self._notify_clock()
         except SupervisorError as error:
+            self.attempt.pending_terminal = None
+            self.attempt.pending_outcome = None
             self._fixture_diagnostic(
                 "rpc_reject",
                 kind=kind if isinstance(kind, str) and kind in schemas else "unknown",
@@ -2497,6 +2516,7 @@ class Supervisor:
                                 ),
                                 lifecycle=self.attempt.lifecycle,
                                 failure=self.attempt.first_reason or "NONE",
+                                terminal_pending=self.attempt.pending_terminal is not None,
                             )
                             if event.data == "relay":
                                 self.relay_alive = False
@@ -2508,10 +2528,12 @@ class Supervisor:
                                 self.attempt.cancel("OWNERSHIP_UNCERTAIN")
                                 if self.create_parked:
                                     self._resume_create_controller(cancel=True)
-                            elif self.attempt.pending_terminal is None:
+                            else:
                                 if self.worker is not None:
                                     self.worker.close()
                                     self.worker = None
+                                self.attempt.pending_terminal = None
+                                self.attempt.pending_outcome = None
                                 self.attempt.cancel("PROTOCOL_INVALID")
             except (OSError, SupervisorError):
                 self._fixture_diagnostic(

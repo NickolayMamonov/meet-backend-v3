@@ -1140,6 +1140,251 @@ class CreateProtocolTests(unittest.TestCase):
             self.assertEqual(expected if boundary is None else expected[:expected.index(boundary) + 1], events)
 
 
+class WorkerCompletionTests(unittest.TestCase):
+    """Drive the real event loop with deterministic selector/wait ordering."""
+
+    class LoopStopped(Exception):
+        pass
+
+    def setUp(self):
+        for name, fallback in (
+            ("AF_UNIX", 1), ("SOCK_SEQPACKET", 5), ("MSG_TRUNC", 32),
+            ("MSG_CTRUNC", 8), ("SCM_RIGHTS", 1),
+        ):
+            self.enterContext(mock.patch.object(socket, name, getattr(socket, name, fallback), create=True))
+        self.enterContext(mock.patch.object(socket, "CMSG_SPACE", lambda size: size + 16, create=True))
+        self.reset_instance()
+
+    def reset_instance(self):
+        self.clock = Clock()
+        me = supervisor.ProcessIdentity(100, 1, 42, 0)
+        with mock.patch.object(supervisor, "linux_preflight"), \
+                mock.patch.object(supervisor, "process_identity", return_value=me), \
+                mock.patch.object(supervisor, "boot_id", return_value="01234567-89ab-cdef-0123-456789abcdef"):
+            self.instance = supervisor.Supervisor("/fixture", "deploy", [], mock.Mock())
+        instance = self.instance
+        instance.attempt.clock = self.clock
+        instance.attempt.idle_end = self.clock() + 30 * NS
+        instance.attempt.arm()
+        acknowledged(instance.attempt)
+        instance.attempt.prepare_terminal()
+        acknowledged(instance.attempt)
+        instance._published(instance.attempt.revision)
+        instance.lock_fd = 9
+        instance.worker = self.worker = mock.Mock()
+        instance.worker_pid = 101
+        instance.worker_hello = True
+        self.publications = []
+        self.received_worker = 0
+        self.observations = []
+
+    def drive(self, ticks, packets, *, ack_error=None, before_terminal=None):
+        instance = self.instance
+        waits = []
+        selections = []
+        for childless, statuses, events in ticks:
+            waits.extend((pid, status << 8 if status >= 0 else -status) for pid, status in statuses.items())
+            waits.append(ChildProcessError() if childless else (0, 0))
+            selections.append([(SimpleNamespace(data=event, fileobj=self.worker), 1) for event in events])
+        waits.append(self.LoopStopped())
+        packets = iter(packets)
+        reply = mock.Mock(family=socket.AF_UNIX, type=socket.SOCK_SEQPACKET)
+        completion = mock.Mock()
+        begin = instance._begin_publication
+
+        def publication(*, terminal):
+            self.publications.append((terminal, instance.worker_pid, dict(instance.children.statuses)))
+            if not terminal:
+                raise self.LoopStopped()
+            begin(terminal=True)
+
+        def receive(channel, **kwargs):
+            if channel is instance.relay:
+                return {"kind": "ready", "attempt": instance.attempt.nonce}, None
+            if channel is completion:
+                return {
+                    "attempt": instance.attempt.nonce,
+                    "revision": instance.completion_snapshot["revision"], "digest": ACK,
+                }, None
+            self.assertIs(self.worker, channel)
+            self.received_worker += 1
+            packet = next(packets)
+            if isinstance(packet, Exception):
+                raise packet
+            if before_terminal is not None:
+                before_terminal()
+            kwargs["peer"].append(supervisor.ProcessIdentity(101, 100, 42, 0))
+            return {
+                "kind": "terminal", "attempt": instance.attempt.nonce,
+                "role": instance.attempt.role, "status": 0, **packet,
+            }, 55
+
+        def send(channel, _frame, *_args):
+            if channel is reply and ack_error is not None:
+                raise ack_error
+
+        selector = mock.MagicMock()
+        selector.__enter__.return_value = selector
+
+        def select(_timeout):
+            self.observations.append((
+                instance.worker, instance.worker_pid, instance.attempt.pending_terminal,
+            ))
+            return selections[len(self.observations) - 1]
+
+        selector.select.side_effect = select
+        with mock.patch.object(supervisor.signal, "SIGHUP", 1, create=True), \
+                mock.patch.object(supervisor.signal, "signal"), \
+                mock.patch.object(supervisor.time, "monotonic_ns", side_effect=self.clock), \
+                mock.patch.object(supervisor.os, "WNOHANG", 1, create=True), \
+                mock.patch.object(supervisor.os, "waitpid", side_effect=waits, create=True) as wait, \
+                mock.patch.object(supervisor.os, "waitstatus_to_exitcode",
+                                  side_effect=lambda status: status >> 8 if status >= 256 or status == 0 else -status,
+                                  create=True), \
+                mock.patch.object(supervisor.os, "fork", return_value=201, create=True), \
+                mock.patch.object(supervisor, "socket_pair", return_value=(completion, mock.Mock())), \
+                mock.patch.object(supervisor.socket, "socket", return_value=reply), \
+                mock.patch.object(supervisor, "_wait_readable"), \
+                mock.patch.object(supervisor, "receive_frame", side_effect=receive), \
+                mock.patch.object(supervisor, "send_frame", side_effect=send), \
+                mock.patch.object(supervisor.selectors, "DefaultSelector", return_value=selector), \
+                mock.patch.object(instance, "acquire_lock"), \
+                mock.patch.object(instance, "spawn"), \
+                mock.patch.object(instance, "_begin_publication", side_effect=publication):
+            try:
+                result = instance.run()
+            except self.LoopStopped:
+                result = None
+        self.assertTrue(all(call.args == (-1, 1) for call in wait.call_args_list))
+        return result
+
+    def test_terminal_eof_before_reap_waits_for_exact_worker_and_final_publisher(self):
+        self.assertEqual(0, self.drive([
+            (False, {}, ["worker"]), (False, {}, ["worker"]), (False, {}, []),
+            (True, {101: 0}, ["completion"]), (True, {201: 0}, []),
+        ], [{}, supervisor.ChannelClosed("PROTOCOL_INVALID")]))
+        self.assertEqual([(True, None, {101: 0})], self.publications)
+        self.assertEqual({201: 0}, self.instance.children.statuses)
+        self.assertEqual(2, self.received_worker)
+        self.assertEqual((None, 101, 0), self.observations[2])
+        self.assertIsNone(self.instance.worker)
+        self.worker.close.assert_called_once()
+        self.assertEqual((0, "COMPLETED"), self.instance.attempt.result)
+
+    def test_terminal_reap_before_eof_preserves_exact_status_map(self):
+        self.assertEqual(0, self.drive([
+            (False, {}, ["worker"]), (True, {101: 0}, ["completion"]), (True, {201: 0}, []),
+        ], [{}]))
+        self.assertEqual([(True, None, {101: 0})], self.publications)
+        self.assertEqual(1, self.received_worker)
+        self.worker.close.assert_called_once()
+
+    def test_eof_and_another_child_zero_exit_never_complete_unreaped_worker(self):
+        self.assertIsNone(self.drive([
+            (False, {}, ["worker"]), (False, {}, ["worker"]), (False, {102: 0}, []),
+        ], [{}, supervisor.ChannelClosed("PROTOCOL_INVALID")]))
+        self.assertEqual([], self.publications)
+        self.assertEqual(101, self.instance.worker_pid)
+        self.assertIsNone(self.instance.attempt.result)
+        self.assertEqual(0, self.instance.attempt.pending_terminal)
+        self.assertIsNone(self.instance.attempt.first_reason)
+
+    def test_premature_eof_is_not_a_terminal_ack_even_with_zero_wait(self):
+        self.assertIsNone(self.drive([
+            (False, {}, ["worker"]), (True, {101: 0}, []),
+        ], [supervisor.ChannelClosed("PROTOCOL_INVALID")]))
+        self.assertEqual([(False, None, {101: 0})], self.publications)
+        self.assertEqual("PROTOCOL_INVALID", self.instance.attempt.first_reason)
+        self.assertIsNone(self.instance.attempt.result)
+
+    def test_terminal_ack_does_not_hide_nonzero_or_signalled_worker_exit(self):
+        for status in (7, -15):
+            with self.subTest(status=status):
+                self.reset_instance()
+                self.assertIsNone(self.drive([
+                    (False, {}, ["worker"]), (False, {}, ["worker"]), (True, {101: status}, []),
+                ], [{}, supervisor.ChannelClosed("PROTOCOL_INVALID")]))
+                self.assertEqual([(False, None, {101: status})], self.publications)
+                self.assertEqual("EXIT", self.instance.attempt.first_reason)
+                self.assertIsNone(self.instance.attempt.pending_terminal)
+                self.assertIsNone(self.instance.attempt.result)
+
+    def test_malformed_frame_after_terminal_cannot_be_treated_as_eof(self):
+        self.assertIsNone(self.drive([
+            (False, {}, ["worker"]), (False, {}, ["worker"]), (True, {101: 0}, []),
+        ], [{}, supervisor.SupervisorError("PROTOCOL_INVALID")]))
+        self.assertEqual([(False, None, {101: 0})], self.publications)
+        self.assertEqual("PROTOCOL_INVALID", self.instance.attempt.first_reason)
+        self.assertIsNone(self.instance.attempt.pending_terminal)
+
+    def test_duplicate_terminal_cannot_replace_or_retain_an_earlier_ack(self):
+        self.assertIsNone(self.drive([
+            (False, {}, ["worker"]), (False, {}, ["worker"]), (True, {101: 0}, []),
+        ], [{}, {}]))
+        self.assertEqual([(False, None, {101: 0})], self.publications)
+        self.assertEqual("PROTOCOL_INVALID", self.instance.attempt.first_reason)
+        self.assertIsNone(self.instance.attempt.pending_terminal)
+
+    def test_cleanup_terminal_cannot_hide_bad_frames_when_first_failure_is_latched(self):
+        for packet in (supervisor.SupervisorError("PROTOCOL_INVALID"), {"status": 1}):
+            with self.subTest(packet=packet):
+                self.reset_instance()
+                attempt = self.instance.attempt
+                attempt.role = "fail-closed-worker"
+                attempt.first_reason, attempt.first_status = "TERM", 143
+                self.assertIsNone(self.drive([
+                    (False, {}, ["worker"]), (False, {}, ["worker"]), (True, {101: 0}, []),
+                ], [{"status": 1}, packet]))
+                self.assertEqual([(False, None, {101: 0})], self.publications)
+                self.assertEqual(("TERM", 143), (attempt.first_reason, attempt.first_status))
+                self.assertIsNone(attempt.pending_terminal)
+                self.assertIsNone(attempt.result)
+
+    def test_terminal_reply_transport_failure_cannot_complete_even_with_zero_wait(self):
+        self.assertIsNone(self.drive([
+            (False, {}, ["worker"]), (True, {101: 0}, []),
+        ], [{}], ack_error=BrokenPipeError()))
+        self.assertEqual([(False, None, {101: 0})], self.publications)
+        self.assertIsNone(self.instance.attempt.pending_terminal)
+        self.assertIsNone(self.instance.attempt.result)
+
+    def test_unacknowledged_drained_lease_refuses_terminal(self):
+        self.instance.attempt.acked_revision = -1
+        self.assertIsNone(self.drive([
+            (False, {}, ["worker"]), (True, {101: 0}, []),
+        ], [{}]))
+        self.assertEqual([(False, None, {101: 0})], self.publications)
+        self.assertIsNone(self.instance.attempt.pending_terminal)
+
+    def test_terminal_crossing_work_end_cannot_extend_deadlines(self):
+        before = (self.instance.attempt.t0, self.instance.attempt.work_end, self.instance.attempt.hard_end)
+        self.assertIsNone(self.drive([
+            (False, {}, ["worker"]), (True, {101: 0}, []),
+        ], [{}], before_terminal=lambda: self.clock.advance(540)))
+        self.assertEqual([(False, None, {101: 0})], self.publications)
+        self.assertEqual(before, (
+            self.instance.attempt.t0, self.instance.attempt.work_end, self.instance.attempt.hard_end,
+        ))
+        self.assertIsNone(self.instance.attempt.pending_terminal)
+
+    def test_only_empty_unadorned_receive_is_clean_eof(self):
+        for data, ancillary, flags in (
+            (b"", [], 0), (b'{"kind":', [], 0), (b"", [], socket.MSG_TRUNC),
+            (b"", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, b"")], 0),
+            (b"x" * (supervisor.MAX_FRAME + 1), [], 0),
+        ):
+            channel = mock.Mock()
+            channel.recvmsg.return_value = data, ancillary, flags, None
+            with self.subTest(data=data[:20], ancillary=ancillary, flags=flags):
+                try:
+                    supervisor.receive_frame(channel, accept_fd=True, peer=[])
+                except supervisor.SupervisorError as error:
+                    self.assertEqual(not data and not ancillary and not flags,
+                                     isinstance(error, supervisor.ChannelClosed))
+                else:
+                    self.fail("invalid receive accepted")
+
+
 class RecoveryCreateRegistrationTests(unittest.TestCase):
     """Portable async protocol tests; filesystem and fork ownership are mocked."""
 
@@ -2965,6 +3210,25 @@ class LinuxKernelTests(unittest.TestCase):
             for endpoint in (sender, receiver, reply, passed):
                 endpoint.close()
 
+    def test_control_eof_is_distinct_from_empty_partial_and_truncated_packets(self):
+        for payload in (b"", b'{"kind":', b"x" * (supervisor.MAX_FRAME + 1)):
+            sender, receiver = supervisor.socket_pair()
+            try:
+                sender.send(payload)
+                with self.subTest(payload=payload[:20]):
+                    try:
+                        supervisor.receive_frame(receiver, accept_fd=True, peer=[])
+                    except supervisor.SupervisorError as error:
+                        self.assertNotIsInstance(error, supervisor.ChannelClosed)
+                    else:
+                        self.fail("invalid packet accepted as a frame")
+                sender.close()
+                with self.assertRaises(supervisor.ChannelClosed):
+                    supervisor.receive_frame(receiver, accept_fd=True, peer=[])
+            finally:
+                sender.close()
+                receiver.close()
+
     def test_pidfd_identity_and_unknown_parent_are_not_signalled(self):
         supervisor.linux_preflight()
         identity = supervisor.process_identity(os.getpid())
@@ -3146,7 +3410,10 @@ def main():
                 print("SUPERVISOR_FIXTURES_BLOCKED: isolation launcher required", file=sys.stderr)
                 return 77
         supervisor.linux_preflight()
-    classes = [AttemptTests, CreateProtocolTests, RecoveryCreateRegistrationTests, ControllerLifecycleTests]
+    classes = [
+        AttemptTests, CreateProtocolTests, WorkerCompletionTests,
+        RecoveryCreateRegistrationTests, ControllerLifecycleTests,
+    ]
     if not options.portable:
         classes += [LinuxKernelTests, LinuxSupervisorTests]
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls) for cls in classes)
