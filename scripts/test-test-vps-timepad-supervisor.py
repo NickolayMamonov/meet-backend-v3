@@ -2705,10 +2705,17 @@ class LinuxSupervisorTests(unittest.TestCase):
                         client.request(
                             "lease-ack", revision=acknowledgment["revision"], digest=acknowledgment["digest"],
                         )
-                    except supervisor.SupervisorError as error:
-                        if fault not in {"receipt", "digest", "erased"}:
-                            raise
-                        if str(error) != "PRIVATE_REQUEST_REFUSED":
+                    except BaseException as error:
+                        error_class = type(error).__name__
+                        if error_class not in {
+                            "SupervisorError", "ChannelClosed", "OSError", "TimeoutError",
+                            "AssertionError", "GuardError",
+                        }:
+                            error_class = "OTHER"
+                        os.write(2, f"registration-readback-ack-exception={error_class}\n".encode("ascii"))
+                        if fault not in {"receipt", "digest", "erased"} or not isinstance(
+                            error, supervisor.SupervisorError,
+                        ) or str(error) != "PRIVATE_REQUEST_REFUSED":
                             raise
                         stage("expected-lease-ack-refusal")
                         client.request("cancel", reason="EXIT", status=1)
