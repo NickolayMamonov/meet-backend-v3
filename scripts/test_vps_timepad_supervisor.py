@@ -2461,7 +2461,7 @@ class Supervisor:
             return
         status, reason = self.attempt.result
         if reason == "QUIESCENCE_UNCONFIRMED" and self.completion_pid is not None and \
-                self.completion_status in {None, 0}:
+                self.completion_channel is not None:
             # A successful unresolved-lease publication must be acknowledged
             # before the relay can observe the refusal and inspect durable state.
             return
@@ -2632,9 +2632,15 @@ class Supervisor:
                     self._report()
                     if childless and self.completion_pid is None:
                         return 1
-                    # Passive keeper: no more signals, commands, state writers,
-                    # fsync or Docker calls, and no postdeadline finalization.
-                    time.sleep(1)
+                    # The keeper has no workers or runtime commands; it still
+                    # consumes the bounded lease-publication acknowledgment.
+                    if self.completion_channel is not None:
+                        with selectors.DefaultSelector() as selector:
+                            selector.register(self.completion_channel, selectors.EVENT_READ)
+                            if selector.select(0.1):
+                                self._completion_response()
+                    else:
+                        time.sleep(0.1)
                     continue
                 if self.attempt.draining:
                     if childless:
