@@ -743,7 +743,16 @@ def send_frame(channel: socket.socket, frame: dict[str, Any], fd: int | None = N
 def receive_frame(
     channel: socket.socket, *, accept_fd: bool = False,
     peer: list[ProcessIdentity] | None = None,
+    fixture_frame_diagnostics: bool = False,
 ) -> tuple[dict[str, Any], int | None]:
+    def refuse_frame(stage: str) -> None:
+        if fixture_frame_diagnostics and os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+            print(
+                f"fixture_timepad_supervisor=rpc_frame_refusal stage={stage}",
+                file=sys.stderr, flush=True,
+            )
+        reject()
+
     data, ancillary, flags, _ = channel.recvmsg(
         MAX_FRAME + 1, socket.CMSG_SPACE(4 * 4) + socket.CMSG_SPACE(12),
     )
@@ -755,22 +764,28 @@ def receive_frame(
         for level, kind, raw in ancillary:
             if level == socket.SOL_SOCKET and kind == getattr(socket, "SCM_CREDENTIALS", -1):
                 if credentials is not None or len(raw) != 12:
-                    reject()
+                    refuse_frame("credentials-shape")
                 credentials = struct.unpack("3i", raw)
                 continue
             if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
-                reject()
+                refuse_frame("ancillary-kind")
             values = array.array("i")
             values.frombytes(raw[:len(raw) - len(raw) % values.itemsize])
             descriptors.extend(values)
         if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(data) > MAX_FRAME or \
                 len(descriptors) != (1 if accept_fd else 0):
-            reject()
-        frame = decode(data)
+            refuse_frame("truncation-or-fd-count")
+        try:
+            frame = decode(data)
+        except SupervisorError:
+            refuse_frame("frame-schema")
         if peer is not None:
             if credentials is None or credentials[2] != os.geteuid():
                 reject("PRIVATE_WORKER_REQUIRED")
-            actual = process_identity(_integer(credentials[0], 1))
+            try:
+                actual = process_identity(_integer(credentials[0], 1))
+            except SupervisorError:
+                refuse_frame("peer-pid")
             if actual.uid != credentials[2]:
                 reject("PRIVATE_WORKER_REQUIRED")
             peer.append(actual)
@@ -2061,7 +2076,9 @@ class Supervisor:
         assert channel is not None
         peers: list[ProcessIdentity] = []
         try:
-            frame, passed = receive_frame(channel, accept_fd=True, peer=peers)
+            frame, passed = receive_frame(
+                channel, accept_fd=True, peer=peers, fixture_frame_diagnostics=driver,
+            )
         except ChannelClosed:
             if driver or channel is not self.worker:
                 raise
