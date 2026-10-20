@@ -23,6 +23,22 @@ def require(condition: bool, reason: str) -> None:
         raise AssertionError(reason)
 
 
+def action_class(arguments: list[str]) -> str:
+    """Describe an unexpected Docker argv without exposing IDs or values."""
+    if not arguments:
+        return "empty"
+    verb = arguments[0] if arguments[0] in {
+        "compose", "exec", "image", "inspect", "port", "stop", "start",
+        "update", "volume",
+    } else "other"
+    subcommand = (
+        arguments[1] if len(arguments) > 1 and arguments[1] in {
+            "inspect", "ps", "port", "start", "stop", "update",
+        } else "other"
+    )
+    return f"verb={verb},subcommand={subcommand},argc={len(arguments)}"
+
+
 def no_socket() -> None:
     require(not os.environ.get("DOCKER_HOST"), "fixture Docker host is not empty")
     require(not any(os.path.lexists(path) for path in (
@@ -444,7 +460,10 @@ def docker(case: Path, arguments: list[str], facts: dict) -> None:
         ("update", "--restart=unless-stopped", backend["Id"]): "restore-policy",
     }
     operation = operations.get(tuple(arguments))
-    require(operation is not None, "fixture rejected unknown Docker action")
+    require(
+        operation is not None,
+        "fixture rejected unknown Docker action (" + action_class(arguments) + ")",
+    )
     import test_vps_timepad_state as guard
 
     with guard.deploy_lock(str(case / "state"), 9):
