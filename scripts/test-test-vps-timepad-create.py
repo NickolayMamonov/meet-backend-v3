@@ -1238,11 +1238,20 @@ class LinuxActualController(unittest.TestCase):
         parent.mkdir(mode=0o700, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="case-create-worker-", dir=parent) as temporary:
             case = Path(temporary)
-            result = subprocess.run([
-                "timeout", "--signal=TERM", "--kill-after=5s", "720s",
-                sys.executable, "-B", str(SCRIPTS / "fixtures/timepad-controller/create-controller.py"),
-                "--case", str(case), "--scenario", scenario,
-            ], stdin=subprocess.DEVNULL, capture_output=True, timeout=730)
+            try:
+                result = subprocess.run([
+                    "timeout", "--signal=TERM", "--kill-after=5s", "720s",
+                    sys.executable, "-B", str(SCRIPTS / "fixtures/timepad-controller/create-controller.py"),
+                    "--case", str(case), "--scenario", scenario,
+                ], stdin=subprocess.DEVNULL, capture_output=True, timeout=730)
+            except subprocess.TimeoutExpired as error:
+                trace_path = case / "relay-trace"
+                trace = trace_path.read_bytes() if trace_path.is_file() and \
+                    not trace_path.is_symlink() else b"unavailable\n"
+                self.fail(
+                    "actual controller subprocess timed out; bounded relay trace=" +
+                    trace[:4096].decode("ascii", errors="replace"),
+                )
             try:
                 self.assertEqual(0, result.returncode, result.stderr.decode(errors="replace"))
                 self.assertLessEqual(len(result.stdout) + len(result.stderr), 65536)

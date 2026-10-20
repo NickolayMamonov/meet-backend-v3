@@ -25,6 +25,7 @@ import time
 import traceback
 
 MAX_RELAY_FRAMES = 4096
+MAX_RELAY_TRACE = 4096
 
 
 def require(condition: bool, reason: str) -> None:
@@ -60,6 +61,25 @@ def private(path: Path, value: bytes) -> None:
     with path.open("xb") as stream:
         os.fchmod(stream.fileno(), 0o600)
         stream.write(value)
+
+
+def relay_trace(case: Path, records: list[str], event: str) -> None:
+    if event not in {"wait", "hello", "ready-sent", "clock", "result",
+                     "childless", "keeper-killed", "supervisor-exited", "deadline"}:
+        event = "other"
+    if records and records[-1] == event:
+        return
+    if len(records) < MAX_RELAY_TRACE:
+        records.append(event)
+    encoded = ("\n".join(records[-128:]) + "\n").encode("ascii")
+    path = case / "relay-trace"
+    temporary = case / ".relay-trace"
+    with temporary.open("wb") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
 
 
 def prepare(case: Path, scenario: str) -> None:
@@ -354,8 +374,10 @@ def run(case: Path, scenario: str) -> int:
     result_frame = None
     status = None
     passive_keeper = False
+    trace: list[str] = []
     try:
         while time.monotonic_ns() < end:
+            relay_trace(case, trace, "wait")
             no_socket()
             with selectors.DefaultSelector() as selector:
                 selector.register(parent, selectors.EVENT_READ)
@@ -375,15 +397,19 @@ def run(case: Path, scenario: str) -> int:
             require(relay_frame_count < MAX_RELAY_FRAMES, "fixture relay inventory exceeded bound")
             relay_frame_count += 1
             if relay_frame_count == 1:
+                relay_trace(case, trace, "hello")
                 require(frame.get("kind") == "hello" and
                         frame.get("supervisor") == supervisor.lease_identity(supervisor.process_identity(pid)),
                         "fixture supervisor identity was not kernel-bound")
                 relay_attempt = frame["attempt"]
                 supervisor.send_frame(parent, {"kind": "ready", "attempt": frame["attempt"]})
+                relay_trace(case, trace, "ready-sent")
             else:
+                relay_trace(case, trace, frame["kind"])
                 require(frame.get("attempt") == relay_attempt, "fixture relay attempt changed")
                 require(frame.get("kind") in {"clock", "result"}, "fixture relay message is not fixed")
             if frame["kind"] == "result":
+                relay_trace(case, trace, "result")
                 result_frame = frame
                 if forward and scenario != "forward" and frame["reason"] == "QUIESCENCE_UNCONFIRMED":
                     # The refusal is not a normal exit. Observe the retained
@@ -399,6 +425,7 @@ def run(case: Path, scenario: str) -> int:
                         time.sleep(0.05)
                     require(not children_path.read_text().strip(),
                             "uncertain keeper still has writers")
+                    relay_trace(case, trace, "childless")
                     with (case / "state/.deploy.lock").open("rb") as lock:
                         try:
                             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -421,6 +448,7 @@ def run(case: Path, scenario: str) -> int:
                         "fixture result did not match actual supervisor exit")
                 break
         require(status is not None, "actual controller worker exceeded fixture deadline")
+        relay_trace(case, trace, "supervisor-exited")
         no_socket()
         if forward:
             import test_vps_timepad_state as guard
@@ -547,6 +575,7 @@ def run(case: Path, scenario: str) -> int:
             except ProcessLookupError:
                 pass
             waited, actual = os.waitpid(pid, 0)
+            relay_trace(case, trace, "keeper-killed")
             exit_status = os.waitstatus_to_exitcode(actual)
             require(
                 waited == pid and status != 0 and exit_status in {-signal.SIGKILL, status},
