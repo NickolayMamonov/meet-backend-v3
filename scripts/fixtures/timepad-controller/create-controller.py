@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Actual-worker channel fixture, not successful guarded-create acceptance.
+"""Actual-worker channel and initial guarded-create fixtures.
 
 Only the explicit Supervisor constructor receives the fixture transport. The
 production worker, state/provider helpers, locks, grants and terminal publisher
-are unchanged. Bootstrap is executable here; guarded deploy still refuses at
-its existing lifecycle gate before any create or start. The forward scenarios
-are integration scaffolding until that production lifecycle is completed and
-its gate is lifted; their presence is not evidence of successful guarded create.
+are unchanged. Observations below are fixture-only snapshots of actual writes,
+never replacement state, wait evidence or publication acknowledgments. Passing
+the initial-create row does not prove the complete controller acceptance matrix.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -82,12 +82,21 @@ def prepare(case: Path, scenario: str) -> None:
     if forward:
         import forward as external
 
+        active_root = Path("/var/lib/meet-production")
+        active_root.mkdir(mode=0o700, exist_ok=True)
+        require(not any(active_root.iterdir()), "forward fixture active root is not fresh")
         facts = external.fixture_data(source)
         shutil.copyfile(Path(__file__).with_name("forward.py"), case / "tools/forward.py")
         (case / "bin").mkdir(mode=0o700)
         for kind in ("docker", "curl"):
             shutil.copyfile(Path(__file__).with_name("forward-" + kind), case / "bin" / kind)
             (case / "bin" / kind).chmod(0o700)
+        (case / "bin/docker").write_bytes(
+            b'#!/usr/bin/env bash\nset -euo pipefail\n'
+            b': "${TIMEPAD_FIXTURE_CASE:?forward fixture case is required}"\n'
+            b'exec python3 -B "$TIMEPAD_FIXTURE_CASE/tools/create-controller.py" '
+            b'--external-docker "$@"\n'
+        )
         private(case / "forward-facts.json", json.dumps(facts).encode())
         backend = next(item for item in facts["resources"]["containerInspections"]
                        if item["Config"]["Labels"]["com.docker.compose.service"] == "backend")
@@ -147,6 +156,111 @@ class RefusingTransport:
         return self._unexpected("spawn_create")
 
 
+def snapshot(case: Path, event: str) -> None:
+    """Record bounded private fixture observations, outside production state."""
+    import test_vps_timepad_state as guard
+
+    require(event in {
+        "predecessor-suppress", "predecessor-stop", "create-spawn",
+        "normal-completed", "bound", "candidate-suppress", "candidate-start",
+        "candidate-health", "candidate-restore",
+    }, "unknown fixture observation")
+    path = case / ("observed-" + event + ".json")
+    if path.exists():
+        require(event not in {"create-spawn", "candidate-start"},
+                "fixture observed a repeated create/start")
+        return
+    no_socket()
+    with guard.deploy_lock(str(case / "state"), 9):
+        _, current = guard._read_guard_locked(str(case / "state"))
+        lease = guard._read_execution_lease_locked(str(case / "state"))
+        receipt_path = case / "state" / current["ownedRun"] / "timepad-create-completion.json"
+        receipt = receipt_path.read_bytes() if receipt_path.exists() else None
+        require(receipt is None or len(receipt) <= guard.MAX_CREATE_COMPLETION_BYTES,
+                "fixture receipt observation exceeded bound")
+        backend = json.loads((case / "forward-runtime.json").read_bytes())["backend"]
+        environment = backend["Config"].pop("Env")
+        environment_digest = hashlib.sha256(json.dumps(
+            sorted(environment), separators=(",", ":"),
+        ).encode()).hexdigest()
+        value = {
+            "current": current, "lease": lease,
+            "receipt": receipt.decode("ascii") if receipt is not None else None,
+            "backend": backend, "environmentDigest": environment_digest,
+        }
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        require(len(raw) <= 65536, "fixture observation exceeded bound")
+        private(path, raw)
+        with (case / "observed-order").open("ab") as stream:
+            require(stream.tell() < 4096, "fixture observation order exceeded bound")
+            stream.write(event.encode("ascii") + b"\n")
+
+
+class ObservedForwardTransport:
+    """Delegate external facts unchanged; record actual lifecycle readbacks."""
+
+    def __init__(self, case: Path, facts: dict):
+        from forward import ForwardTransport
+
+        self.case = case
+        self.external = ForwardTransport(case, facts)
+
+    def identity(self, stage, context):
+        return self.external.identity(stage, context)
+
+    def render(self, view, context):
+        return self.external.render(view, context)
+
+    def observe(self, context):
+        import test_vps_timepad_state as guard
+
+        result = self.external.observe(context)
+        with guard.deploy_lock(context.state_root, 9):
+            _, current = guard._read_guard_locked(context.state_root)
+            request = current["runtimeRequest"]
+            if request is not None and request["operation"] == "create" and \
+                    request["lifecycle"] in {"normal-completed", "bound"}:
+                snapshot(self.case, request["lifecycle"])
+                if (self.case / "forward-scenario").read_text() == "binding-environment-drift":
+                    observed = json.loads(result)
+                    backend = next(item for item in observed["resources"]["containerInspections"]
+                                   if item["Id"] == "a" * 64)
+                    backend["Config"]["Env"].append("UNAPPROVED_FIXTURE_ENV=changed")
+                    return json.dumps(observed, separators=(",", ":")).encode()
+        return result
+
+    def spawn_create(self, context, control_fds):
+        snapshot(self.case, "create-spawn")
+        return self.external.spawn_create(context, control_fds)
+
+
+def external_docker(case: Path, arguments: list[str]) -> int:
+    """Observe only the existing fixture's exact external Docker boundaries."""
+    import forward
+
+    isolated(case)
+    require(Path(__file__).resolve() == case / "tools/create-controller.py",
+            "fixture Docker adapter is not staged")
+    predecessor, candidate = "f" * 64, "a" * 64
+    events = {
+        ("update", "--restart=no", predecessor): "predecessor-suppress",
+        ("stop", "--time", "10", predecessor): "predecessor-stop",
+        ("update", "--restart=no", candidate): "candidate-suppress",
+        ("start", candidate): "candidate-start",
+        ("update", "--restart=unless-stopped", candidate): "candidate-restore",
+    }
+    event = events.get(tuple(arguments))
+    if event is not None:
+        snapshot(case, event)
+    elif arguments == [
+        "inspect", candidate, "--format",
+        "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+    ]:
+        snapshot(case, "candidate-health")
+    forward.docker(case, arguments, json.loads((case / "forward-facts.json").read_bytes()))
+    return 0
+
+
 def run(case: Path, scenario: str) -> int:
     installed_inputs = {
         name: (case / "root" / name).read_bytes()
@@ -181,9 +295,7 @@ def run(case: Path, scenario: str) -> int:
     os.environ["TEST_VPS_STATE_ROOT"] = str(case / "state")
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     if forward:
-        from forward import ForwardTransport
-
-        fake = ForwardTransport(case, json.loads((case / "forward-facts.json").read_bytes()))
+        fake = ObservedForwardTransport(case, json.loads((case / "forward-facts.json").read_bytes()))
         os.environ["PATH"] = str(case / "bin") + ":" + os.environ["PATH"]
         os.environ["TIMEPAD_FIXTURE_CASE"] = str(case)
     else:
@@ -232,6 +344,7 @@ def run(case: Path, scenario: str) -> int:
     end = time.monotonic_ns() + (600 if forward else 90) * supervisor.NS
     frames = []
     status = None
+    passive_keeper = False
     try:
         while time.monotonic_ns() < end:
             no_socket()
@@ -261,6 +374,31 @@ def run(case: Path, scenario: str) -> int:
                 require(frame.get("attempt") == frames[0]["attempt"], "fixture relay attempt changed")
                 require(frame.get("kind") in {"clock", "result"}, "fixture relay message is not fixed")
             if frame["kind"] == "result":
+                if forward and scenario != "forward" and frame["reason"] == "QUIESCENCE_UNCONFIRMED":
+                    # The refusal is not a normal exit. Observe the retained
+                    # lock before fixture-only teardown, never fake a drain.
+                    import fcntl
+
+                    require(frame["status"] != 0, "uncertain attempt reported success")
+                    require(os.waitpid(pid, os.WNOHANG) == (0, 0), "passive keeper already exited")
+                    children_path = Path(f"/proc/{pid}/task/{pid}/children")
+                    drain_end = min(end, time.monotonic_ns() + 10 * supervisor.NS)
+                    while children_path.read_text().strip() and time.monotonic_ns() < drain_end:
+                        no_socket()
+                        time.sleep(0.05)
+                    require(not children_path.read_text().strip(),
+                            "uncertain keeper still has writers")
+                    with (case / "state/.deploy.lock").open("rb") as lock:
+                        try:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            pass
+                        else:
+                            raise AssertionError("uncertain keeper released FD9")
+                    private(case / "passive-keeper-observed", b"childless;lock-held;not-normal-exit\n")
+                    passive_keeper = True
+                    status = frame["status"]
+                    break
                 while time.monotonic_ns() < end:
                     no_socket()
                     reaped, actual = os.waitpid(pid, os.WNOHANG)
@@ -276,7 +414,10 @@ def run(case: Path, scenario: str) -> int:
         if forward:
             import test_vps_timepad_state as guard
 
-            _, current = guard.read_guard(str(case / "state"))
+            current = (
+                json.loads((case / "observed-normal-completed.json").read_bytes())["current"]
+                if passive_keeper else guard.read_guard(str(case / "state"))[1]
+            )
             effects = (case / "forward-effects").read_text().splitlines() if (
                 case / "forward-effects"
             ).exists() else []
@@ -311,7 +452,15 @@ def run(case: Path, scenario: str) -> int:
         return 0
     finally:
         parent.close()
-        if status is None:
+        if passive_keeper:
+            # Only this forked fixture process is killed, after childlessness,
+            # lock retention and a non-success result were observed. Durable
+            # unresolved state remains unchanged; this is not protocol success.
+            os.kill(pid, signal.SIGKILL)
+            waited, actual = os.waitpid(pid, 0)
+            require(waited == pid and os.waitstatus_to_exitcode(actual) == -signal.SIGKILL,
+                    "fixture passive-keeper teardown failed")
+        elif status is None:
             # Closing the real relay revokes authority. Never manufacture an
             # ACK, unlock FD9 or kill only the supervisor and orphan its workers.
             try:
@@ -472,11 +621,13 @@ def recover(case: Path, arguments: list[str]) -> int:
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["--external-docker"]:
+        return external_docker(Path(os.environ["TIMEPAD_FIXTURE_CASE"]), sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", type=Path, required=True)
     parser.add_argument("--scenario", choices=(
         "bootstrap", "bootstrap-mismatch", "deploy-blocked", "forward",
-        "suppress-refused", "stop-refused",
+        "suppress-refused", "stop-refused", "binding-environment-drift",
     ), required=True)
     parser.add_argument("--staged", action="store_true")
     options = parser.parse_args()

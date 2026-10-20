@@ -13,6 +13,7 @@ from contextlib import ExitStack, nullcontext
 from dataclasses import FrozenInstanceError, replace
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import signal
@@ -336,6 +337,35 @@ if timepad_runtime_mutate """ + invocation + """; then exit 90; fi
 """)
                 self.assertEqual(b"", result.stdout)
 
+    def test_terminal_success_requires_preparation_and_lease_ack_before_result(self):
+        function = self.shell_functions("supervisor_complete")
+        for outcome in ("", "bootstrapped", "already-completed"):
+            for failure in ("none", "prepare-terminal", "publish", "terminal"):
+                with self.subTest(outcome=outcome, failure=failure):
+                    result = self.run_shell(function + """
+supervisor_enabled=true
+supervisor_client() { echo "$*" >&2; [ "$1" != "$failure" ]; }
+supervisor_publish_lease() { echo publish >&2; [ "$failure" != publish ]; }
+fail() { echo "$1" >&2; exit 91; }
+""" + f"failure={failure}\n" + """
+set +e
+( supervisor_complete """ + outcome + """ )
+status=$?
+if [ "$failure" = none ]; then [ "$status" -eq 0 ]; else [ "$status" -eq 91 ]; fi
+""")
+                    expected = ["prepare-terminal"]
+                    if failure != "prepare-terminal":
+                        expected.append("publish")
+                    if failure in {"none", "terminal"}:
+                        expected.append("terminal 0" + (" --outcome " + outcome if outcome else ""))
+                    if failure != "none":
+                        expected.append({
+                            "prepare-terminal": "EXECUTION_TERMINAL_PREPARE_FAILED",
+                            "publish": "EXECUTION_LEASE_PUBLICATION_FAILED",
+                            "terminal": "EXECUTION_TERMINAL_ACK_FAILED",
+                        }[failure])
+                    self.assertEqual(expected, result.stderr.decode().splitlines())
+
     def test_runtime_mutation_requires_ordered_exact_synchronous_response(self):
         functions = self.shell_functions("timepad_runtime_mutate")
         container = "a" * 64
@@ -612,6 +642,17 @@ status=$?
         self.assertEqual({"_unexpected", "identity", "render", "observe", "spawn_create"}, {
             node.name for node in fake.body if isinstance(node, ast.FunctionDef)
         })
+        observed = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                        and node.name == "ObservedForwardTransport")
+        self.assertEqual({"__init__", "identity", "render", "observe", "spawn_create"}, {
+            node.name for node in observed.body if isinstance(node, ast.FunctionDef)
+        })
+        for method in ("identity", "render", "observe", "spawn_create"):
+            self.assertIn("self.external." + method + "(", ast.unparse(observed))
+        snapshot = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "snapshot")
+        self.assertNotIn("publish", ast.unparse(snapshot))
+        self.assertIn("environmentDigest", ast.unparse(snapshot))
 
     def test_production_main_rejects_crafted_transport_flags_in_subprocess(self):
         for flags in (
@@ -735,9 +776,153 @@ class LinuxBoundaries(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "linux", "actual controller requires isolated Linux/root")
 class LinuxActualController(unittest.TestCase):
-    """Real worker bootstrap/refusals, explicitly not successful create coverage."""
+    """Real bootstrap/refusal and first-create rows, not the complete matrix."""
+
+    def assert_initial_create(self, case: Path, result: subprocess.CompletedProcess) -> None:
+        self.assertIn(b"ACTUAL_FORWARD_CONTROLLER_PASS: scenario=forward", result.stdout)
+        self.assertNotIn(b"PRIVATE_CANARY", result.stdout + result.stderr)
+        self.assertNotIn(b"never-print-me", result.stdout + result.stderr)
+        order = (case / "observed-order").read_text().splitlines()
+        self.assertEqual([
+            "predecessor-suppress", "predecessor-stop", "create-spawn",
+            "normal-completed", "bound", "candidate-suppress", "candidate-start",
+            "candidate-health", "candidate-restore",
+        ], order)
+        observations = {
+            event: create.parse((case / ("observed-" + event + ".json")).read_bytes(), 65536)
+            for event in order
+        }
+        predecessor, candidate = "f" * 64, "a" * 64
+        effects = (case / "forward-effects").read_text().splitlines()
+        self.assertEqual([
+            "suppress:" + predecessor, "stop:" + predecessor,
+            "suppress:" + candidate, "start:" + candidate, "restore-policy:" + candidate,
+        ], effects)
+        prepared = observations["predecessor-suppress"]["current"]
+        self.assertEqual("PREPARED", prepared["phase"])
+        self.assertEqual("pre-barrier-only", prepared["predecessorDisposition"])
+        self.assertEqual(1, prepared["operationEpoch"])
+        self.assertIsNone(prepared["containerId"])
+        self.assertEqual("predecessor", prepared["runtimeRequest"]["role"])
+        self.assertEqual(predecessor, prepared["predecessorContainerId"])
+        run_path = case / "state" / prepared["ownedRun"]
+        prepared_raw = (run_path / "timepad-prepared.json").read_bytes()
+        proof = create.parse(prepared_raw, 8192)
+        self.assertEqual(prepared["preparedProofDigest"], hashlib.sha256(prepared_raw).hexdigest())
+        self.assertEqual(proof["resourcesDigest"], hashlib.sha256(
+            (run_path / "timepad-resources.json").read_bytes(),
+        ).hexdigest())
+        self.assertEqual((run_path / "config.env.target").read_bytes(),
+                         (case / "root/.env.production").read_bytes())
+        self.assertEqual((run_path / "config.base-compose.yml").read_bytes(),
+                         Path("/var/lib/meet-production/active-compose.yml").read_bytes())
+        self.assertEqual((run_path / "target-runtime.override.yml").read_bytes(),
+                         Path("/var/lib/meet-production/active-runtime.override.yml").read_bytes())
+
+        launch = observations["create-spawn"]
+        intent = launch["current"]["runtimeRequest"]
+        self.assertEqual("CUTOVER_POSSIBLE", launch["current"]["phase"])
+        self.assertEqual("intent", intent["lifecycle"])
+        self.assertEqual("initial", intent["role"])
+        self.assertIsNone(intent["priorContainerId"])
+        self.assertIsNone(intent["containerId"])
+        self.assertIsNone(intent["responseId"])
+        self.assertIsNone(intent["configHash"])
+        self.assertIsNone(intent["completionDigest"])
+        self.assertIsNone(launch["receipt"])
+        self.assertFalse(launch["backend"]["State"]["Running"])
+        self.assertEqual("no", launch["backend"]["HostConfig"]["RestartPolicy"]["Name"])
+        for field in ("operationToken", "modelDigest", "toolingDigest", "resourcesDigest"):
+            self.assertEqual(proof[field], intent[field], field)
+        self.assertEqual(prepared["preparedProofDigest"], intent["preparedProofDigest"])
+        for field in ("originDigest", "incidentId", "operationEpoch", "executionAttempt"):
+            self.assertEqual(prepared[field], intent[field], field)
+        self.assertEqual(hashlib.sha256((run_path / "timepad-resource-request.json").read_bytes()).hexdigest(),
+                         intent["resourceRequestDigest"])
+        self.assertEqual(intent["childIdentity"], {
+            key: launch["current"]["ownedChild"][key] for key in create.guard.CHILD_IDENTITY_FIELDS
+        })
+
+        facts = create.parse((case / "forward-facts.json").read_bytes(), create.MAX_EVIDENCE)
+        model = facts["model"]
+        model["services"]["backend"]["labels"]["org.meet.timepad.operation"] = proof["operationToken"]
+        self.assertEqual(proof["modelDigest"], create._provider()._model_digest(model))
+        expected_environment = sorted(facts["image"]["Config"]["Env"] + [
+            key + "=" + value for key, value in model["services"]["backend"]["environment"].items()
+        ])
+        environment_digest = hashlib.sha256(json.dumps(
+            expected_environment, separators=(",", ":"),
+        ).encode()).hexdigest()
+        for event, lifecycle in (("normal-completed", "normal-completed"), ("bound", "bound")):
+            observation = observations[event]
+            current = observation["current"]
+            self.assertEqual(lifecycle, current["runtimeRequest"]["lifecycle"])
+            self.assertIsNone(current["ownedChild"])
+            create.guard.validate_create_completion(
+                current, observation["lease"], observation["receipt"].encode(), acknowledged=True,
+            )
+            self.assertEqual(create.guard.create_request_digest(intent),
+                             observation["lease"]["createCompletion"]["requestDigest"])
+            backend = observation["backend"]
+            self.assertEqual(candidate, backend["Id"])
+            self.assertEqual(facts["image"]["Id"], backend["Image"])
+            self.assertEqual("created", backend["State"]["Status"])
+            self.assertFalse(backend["State"]["Running"])
+            self.assertEqual("0001-01-01T00:00:00Z", backend["State"]["StartedAt"])
+            self.assertEqual(0, backend["RestartCount"])
+            self.assertEqual(proof["operationToken"], backend["Config"]["Labels"]["org.meet.timepad.operation"])
+            self.assertEqual(environment_digest, observation["environmentDigest"])
+        bound = observations["bound"]["current"]
+        self.assertEqual(candidate, bound["containerId"])
+        self.assertEqual("1" * 64, bound["configHash"])
+        self.assertIsNone(observations["normal-completed"]["current"]["containerId"])
+
+        start = observations["candidate-start"]
+        self.assertEqual("VERIFYING", start["current"]["phase"])
+        self.assertEqual(candidate, start["current"]["containerId"])
+        self.assertEqual("intent", start["current"]["runtimeRequest"]["lifecycle"])
+        self.assertEqual("start", start["current"]["runtimeRequest"]["operation"])
+        self.assertEqual("released", start["current"]["ownedChild"]["lifecycle"])
+        self.assertEqual(observations["bound"]["receipt"], start["receipt"])
+        self.assertEqual(observations["bound"]["lease"]["createCompletion"], start["lease"]["createCompletion"])
+        self.assertFalse(start["backend"]["State"]["Running"])
+        self.assertEqual("no", start["backend"]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertEqual(environment_digest, start["environmentDigest"])
+        health = observations["candidate-health"]
+        self.assertTrue(health["backend"]["State"]["Running"])
+        self.assertEqual("healthy", health["backend"]["State"]["Health"]["Status"])
+        restore = observations["candidate-restore"]["current"]
+        self.assertEqual("COMMITTING", restore["phase"])
+        self.assertEqual("terminal-policy-intent", restore["commitSubstep"])
+        self.assertRegex(restore["commitWitnessDigest"], r"^[a-f0-9]{64}$")
+        self.assertRegex(restore["providerFinalizationDigest"], r"^[a-f0-9]{64}$")
+        self.assertEqual("committed", create.parse((run_path / "terminal.json").read_bytes(), 8192)["outcome"])
+        self.assertFalse((case / "state/.provider-transaction.current").exists())
+        _, final = create.guard.read_guard(case / "state")
+        self.assertEqual("COMMITTED", final["phase"])
+        self.assertEqual("policy-restored", final["commitSubstep"])
+        self.assertEqual(candidate, final["containerId"])
+        self.assertIsNone(final["ownedChild"])
+        self.assertEqual("completed", final["runtimeRequest"]["lifecycle"])
+        self.assertEqual("restore-policy", final["runtimeRequest"]["operation"])
+        with create.guard.deploy_lock(case / "state"):
+            lease = create.guard._read_execution_lease_locked(case / "state")
+        self.assertEqual("drained", lease["lifecycle"])
+        self.assertIsNone(lease["worker"])
+        self.assertIsNone(lease["firstFailure"])
+        reply = create.parse((case / "forward-relay-result.json").read_bytes(), supervisor.MAX_FRAME)
+        self.assertEqual((0, "COMPLETED"), (reply["status"], reply["reason"]))
+        self.assertEqual(reply["attempt"], lease["attempt"])
+        self.assertEqual(observations["bound"]["lease"]["createCompletion"], lease["createCompletion"])
+        for event in order:
+            self.assertEqual(lease["t0Ns"], observations[event]["lease"]["t0Ns"])
+            self.assertEqual(lease["workEndNs"], observations[event]["lease"]["workEndNs"])
+            self.assertEqual(lease["hardEndNs"], observations[event]["lease"]["hardEndNs"])
 
     def run_case(self, scenario: str):
+        if scenario in {"forward", "binding-environment-drift"}:
+            self.run_forward_case(scenario)
+            return
         parent = Path("/var/lib/timepad-fixture")
         parent.mkdir(mode=0o700, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="case-create-worker-", dir=parent) as temporary:
@@ -750,9 +935,9 @@ class LinuxActualController(unittest.TestCase):
             result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=110)
             self.assertEqual(0, result.returncode, result.stderr.decode(errors="replace"))
             self.assertLessEqual(len(result.stdout) + len(result.stderr), 65536)
-            self.assertIn(b"create_pipeline=NOT_PROVEN", result.stdout)
             self.assertFalse(os.path.lexists("/run/docker.sock"))
             self.assertFalse(os.path.lexists("/var/run/docker.sock"))
+            self.assertIn(b"create_pipeline=NOT_PROVEN", result.stdout)
             self.assertFalse((case / "transport-calls").exists(), "refused worker released create")
             fixtures = SCRIPTS / "fixtures/timepad-controller"
             for installed, fixture in (
@@ -793,6 +978,70 @@ class LinuxActualController(unittest.TestCase):
                 )
                 self.assertIn(expected, result.stderr)
 
+    def run_forward_case(self, scenario: str):
+        parent = Path("/var/lib/timepad-fixture")
+        parent.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="case-create-worker-", dir=parent) as temporary:
+            case = Path(temporary)
+            result = subprocess.run([
+                "timeout", "--signal=TERM", "--kill-after=5s", "720s",
+                sys.executable, "-B", str(SCRIPTS / "fixtures/timepad-controller/create-controller.py"),
+                "--case", str(case), "--scenario", scenario,
+            ], stdin=subprocess.DEVNULL, capture_output=True, timeout=730)
+            self.assertEqual(0, result.returncode, result.stderr.decode(errors="replace"))
+            try:
+                self.assertLessEqual(len(result.stdout) + len(result.stderr), 65536)
+                self.assertFalse(os.path.lexists("/run/docker.sock"))
+                self.assertFalse(os.path.lexists("/var/run/docker.sock"))
+                if scenario == "forward":
+                    self.assert_initial_create(case, result)
+                else:
+                    order = (case / "observed-order").read_text().splitlines()
+                    self.assertEqual([
+                        "predecessor-suppress", "predecessor-stop", "create-spawn", "normal-completed",
+                    ], order)
+                    self.assertEqual(["suppress:" + "f" * 64, "stop:" + "f" * 64],
+                                     (case / "forward-effects").read_text().splitlines())
+                    self.assertEqual(b"childless;lock-held;not-normal-exit\n",
+                                     (case / "passive-keeper-observed").read_bytes())
+                    completed = create.parse(
+                        (case / "observed-normal-completed.json").read_bytes(), 65536,
+                    )
+                    create.guard.validate_create_completion(
+                        completed["current"], completed["lease"],
+                        completed["receipt"].encode(), acknowledged=True,
+                    )
+                    _, current = create.guard.read_guard(case / "state")
+                    self.assertIsNone(current["containerId"])
+                    self.assertIsNone(current["configHash"])
+                    self.assertIsNone(current["ownedChild"])
+                    self.assertEqual("normal-completed", current["runtimeRequest"]["lifecycle"])
+                    self.assertEqual(completed["current"]["runtimeRequest"], current["runtimeRequest"])
+                    self.assertIn(current["phase"], {"CUTOVER_POSSIBLE", "RECOVERY_REQUIRED"})
+                    with create.guard.deploy_lock(case / "state"):
+                        lease = create.guard._read_execution_lease_locked(case / "state")
+                    self.assertEqual("quiescence-unconfirmed", lease["lifecycle"])
+                    self.assertIsNotNone(lease["firstFailure"])
+                    self.assertEqual(completed["lease"]["createCompletion"], lease["createCompletion"])
+                    reply = create.parse(
+                        (case / "forward-relay-result.json").read_bytes(), supervisor.MAX_FRAME,
+                    )
+                    self.assertNotEqual(0, reply["status"])
+                    self.assertEqual("QUIESCENCE_UNCONFIRMED", reply["reason"])
+            finally:
+                # The fixture has exited and its passive keeper, if any, was
+                # explicitly torn down. Only this case's exact active copies
+                # may be removed from the already-private namespace.
+                run_path = case / "state/fixture-channel-1-final-deploy"
+                for active, source in (
+                    ("active-compose.yml", "config.base-compose.yml"),
+                    ("active-runtime.override.yml", "target-runtime.override.yml"),
+                ):
+                    path = Path("/var/lib/meet-production") / active
+                    self.assertFalse(path.is_symlink())
+                    self.assertEqual((run_path / source).read_bytes(), path.read_bytes())
+                    path.unlink()
+
     def test_actual_bootstrap_worker_grant_publication_and_childless_terminal(self):
         self.run_case("bootstrap")
 
@@ -801,6 +1050,12 @@ class LinuxActualController(unittest.TestCase):
 
     def test_actual_deploy_worker_keeps_unintegrated_lifecycle_closed_before_create(self):
         self.run_case("deploy-blocked")
+
+    def test_actual_initial_create_receipt_binding_start_health_and_finalization(self):
+        self.run_case("forward")
+
+    def test_actual_completed_create_environment_drift_never_binds_starts_or_retries(self):
+        self.run_case("binding-environment-drift")
 
 
 def main() -> int:

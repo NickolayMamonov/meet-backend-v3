@@ -1459,6 +1459,7 @@ class ControllerLifecycleTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "recover"
         )
         case = SCRIPTS / "fixtures/timepad-controller/relay-case"
+        case.mkdir(mode=0o700, parents=True, exist_ok=True)
 
         def write_private(path, value):
             with path.open("xb") as stream:
@@ -2217,6 +2218,7 @@ class LinuxSupervisorTests(unittest.TestCase):
     def run_fixture(
         self, behavior, *, operation="deploy", timing=None, timeout=15, disconnect=False,
         directory=None, observe=None, expect_keeper=False, expect_childless_keeper=False,
+        supervisor_type=FixtureSupervisor,
     ):
         with tempfile.TemporaryDirectory() if directory is None else nullcontext(directory) as directory:
             os.chmod(directory, 0o700)
@@ -2227,7 +2229,7 @@ class LinuxSupervisorTests(unittest.TestCase):
                     relay.close()
                     os.setsid()
                     supervisor._close_except({child.fileno()})
-                    instance = FixtureSupervisor(
+                    instance = supervisor_type(
                         directory, operation, [], child, behavior=behavior,
                         timing=timing or supervisor.Timing(
                             work_ns=4 * NS, hard_ns=8 * NS, handshake_ns=NS,
@@ -2265,6 +2267,7 @@ class LinuxSupervisorTests(unittest.TestCase):
                                 except (BlockingIOError, supervisor.SupervisorError):
                                     break
                         self.assertNotEqual(os.waitstatus_to_exitcode(status), 3)
+                        self.assertFalse(expect_keeper, "unconfirmed supervisor exited instead of retaining FD9")
                         return result, frames
                     if not disconnect:
                         try:
@@ -2733,120 +2736,124 @@ class LinuxSupervisorTests(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_event_loop_rejects_worker_completion_after_acknowledged_cancellation(self):
-        def behavior(client, directory, mode):
-            if mode == "controller-worker":
+        for reason, status in (("TERM", 143), ("EXIT", 1)):
+            def behavior(client, directory, mode):
                 fixture_publish(client, directory)
-                client.request("arm")
-                fixture_publish(client, directory)
-                grant = client.request("grant", name="preflight", localNs=10 * NS)
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                client.request("cancel", reason="TERM", status=143)
-                Path(directory, "late-completion-ready").write_bytes(b"")
-                gate = os.open(Path(directory, "late-completion-gate"), os.O_RDONLY)
-                try:
-                    os.read(gate, 1)
-                finally:
-                    os.close(gate)
-                try:
-                    client.request("complete", grantId=grant["grantId"])
-                except supervisor.SupervisorError:
-                    Path(directory, "late-completion-refused").write_bytes(b"")
-                else:
-                    Path(directory, "late-completion-accepted").write_bytes(b"")
-                return
-            if mode != "rollback-worker":
-                os._exit(5)
-            admission = client.request("grant", name="rollback-admission", localNs=NS)
-            client.request("complete", grantId=admission["grantId"])
-            client.request("admit-rollback")
-            fixture_publish(client, directory)
-            rollback = client.request("grant", name="rollback-remaining-work", localNs=NS)
-            client.request("complete", grantId=rollback["grantId"])
-            fixture_terminal(client, directory, 0)
-
-        with tempfile.TemporaryDirectory() as directory:
-            os.chmod(directory, 0o700)
-            os.mkfifo(Path(directory, "late-completion-gate"), 0o600)
-            released = []
-
-            def release_late_worker(root, _frames):
-                if released or not Path(root, "late-completion-ready").exists():
+                if mode == "controller-worker":
+                    client.request("arm")
+                    fixture_publish(client, directory)
+                    Path(directory, "original-lease").write_bytes(supervisor.encode(client.request("lease")))
+                    grant = client.request("grant", name="preflight", localNs=10 * NS)
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    client.request("cancel", reason=reason, status=status)
+                    # The cancel reply is the checkpoint: completion must be
+                    # refused even before the revoked worker has exited.
+                    try:
+                        client.request("complete", grantId=grant["grantId"])
+                    except supervisor.SupervisorError as error:
+                        self.assertEqual("PRIVATE_REQUEST_REFUSED", str(error))
+                        Path(directory, "late-completion-refused").write_bytes(b"")
+                    else:
+                        Path(directory, "late-completion-accepted").write_bytes(b"")
                     return
-                gate = os.open(Path(root, "late-completion-gate"), os.O_WRONLY)
-                try:
-                    os.write(gate, b"x")
-                finally:
-                    os.close(gate)
-                released.append(True)
+                if mode != "rollback-worker":
+                    os._exit(5)
+                # Each replacement role must publish/ACK its own lease before
+                # admission; inherited FD9 alone does not authorize a grant.
+                admission = client.request("grant", name="rollback-admission", localNs=NS)
+                client.request("complete", grantId=admission["grantId"])
+                client.request("admit-rollback")
+                fixture_publish(client, directory)
+                rollback = client.request("grant", name="rollback-remaining-work", localNs=NS)
+                Path(directory, "rollback-grant").write_bytes(supervisor.encode(rollback))
+                client.request("complete", grantId=rollback["grantId"])
+                fixture_terminal(client, directory, 0)
 
-            result, _ = self.run_fixture(
-                behavior, directory=directory, observe=release_late_worker,
-            )
-            self.assertEqual(released, [True])
-            self.assertEqual((result["status"], result["reason"]), (143, "ROLLED_BACK"))
-            self.assertTrue(Path(directory, "late-completion-refused").is_file())
-            self.assertFalse(Path(directory, "late-completion-accepted").exists())
-            lease = state._read_execution_lease_locked(directory)
-            self.assertEqual("TERM", lease["firstFailure"])
-            self.assertTrue(lease["rollbackIssued"])
-            self.assertIn("rollback-worker", [worker["mode"] for worker in lease["workers"]])
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                result, frames = self.run_fixture(behavior, directory=directory)
+                self.assertEqual((result["status"], result["reason"]), (status, "ROLLED_BACK"))
+                self.assertTrue(Path(directory, "late-completion-refused").is_file())
+                self.assertFalse(Path(directory, "late-completion-accepted").exists())
+                original = json.loads(Path(directory, "original-lease").read_bytes())
+                rollback = json.loads(Path(directory, "rollback-grant").read_bytes())
+                lease = state._read_execution_lease_locked(directory)
+                for field in ("attempt", "t0Ns", "workEndNs", "hardEndNs"):
+                    self.assertEqual(original[field], lease[field], field)
+                self.assertEqual(reason, lease["firstFailure"])
+                self.assertEqual(status, lease["firstStatus"])
+                self.assertTrue(lease["rollbackIssued"])
+                self.assertEqual(["controller-worker", "rollback-worker"], [
+                    worker["mode"] for worker in lease["workers"]
+                ])
+                self.assertEqual("drained", lease["lifecycle"])
+                self.assertIsNone(lease["worker"])
+                self.assertEqual(original["attempt"], rollback["attempt"])
+                self.assertEqual("rollback-worker", rollback["role"])
+                self.assertEqual("rollback-remaining-work", rollback["name"])
+                self.assertLessEqual(rollback["endNs"], original["workEndNs"])
+                self.assertEqual({original["hardEndNs"]}, {
+                    frame["hardEndNs"] for frame in frames
+                    if frame.get("kind") == "clock" and frame["hardEndNs"] is not None
+                })
+                with state.deploy_lock(directory):
+                    pass  # The final childless publication may release FD9.
 
     def test_unresolved_publication_failure_retains_childless_fd9_keeper(self):
+        class PublicationFailureSupervisor(FixtureSupervisor):
+            def _begin_publication(self, *, terminal):
+                snapshot = self.lease_snapshots[min(self.lease_snapshots)]
+                if not terminal:
+                    with Path(self.root, "publication-attempts").open("ab") as events:
+                        events.write(supervisor.encode(snapshot) + b"\n")
+                    if snapshot["lifecycle"] == "drain-forward":
+                        # The preceding cancel-forward writer has already
+                        # exited and ACKed. Fail the next actual writer before
+                        # its fork, not in a racy parent filesystem poll.
+                        Path(self.root, ".tmp-fixture-publication-conflict").write_bytes(b"")
+                super()._begin_publication(terminal=terminal)
+
         def behavior(client, directory, mode):
-            if mode == "controller-worker":
-                fixture_publish(client, directory)
-                client.request("arm")
-                fixture_publish(client, directory)
-                Path(directory, "publication-ready").write_bytes(b"")
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                client.request("cancel", reason="EXIT", status=1)
-                signal.pause()
-                return
-            if mode != "fail-closed-worker":
+            if mode != "controller-worker":
                 os._exit(5)
-            client.request("grant", name="cleanup-stop", localNs=10 * NS)
+            fixture_publish(client, directory)
+            client.request("arm")
+            fixture_publish(client, directory)
+            Path(directory, "original-lease").write_bytes(supervisor.encode(client.request("lease")))
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            client.request("cancel", reason="EXIT", status=1)
             signal.pause()
 
         with tempfile.TemporaryDirectory() as directory:
-            os.chmod(directory, 0o700)
-            original_stat = []
-            publications = []
-            injected = []
-
-            def fail_unresolved_publication(root, _frames):
-                if not Path(root, "publication-ready").exists():
-                    return
-                lease = Path(root, state.EXECUTION_LEASE_NAME)
-                current = lease.stat()
-                if not original_stat:
-                    original_stat.append((current.st_dev, current.st_ino, current.st_mtime_ns))
-                    return
-                identity = (current.st_dev, current.st_ino, current.st_mtime_ns)
-                if identity != original_stat[0]:
-                    if not publications or publications[-1] != identity:
-                        publications.append(identity)
-                    if not injected:
-                        Path(root, ".tmp-fixture-publication-conflict").write_bytes(b"")
-                        injected.append(True)
-
             result, _ = self.run_fixture(
-                behavior, operation="forward-recover",
+                behavior, directory=directory, operation="forward-recover",
                 timing=supervisor.Timing(
                     work_ns=2 * NS, hard_ns=8 * NS, handshake_ns=NS,
                     idle_ns=2 * NS, drain_ns=NS, term_ns=NS // 4,
                     stop_ns=NS, publish_ns=NS,
                 ),
-                timeout=12, observe=fail_unresolved_publication,
+                timeout=12, supervisor_type=PublicationFailureSupervisor,
                 expect_keeper=True, expect_childless_keeper=True,
             )
             self.assertEqual((result["status"], result["reason"]), (1, "QUIESCENCE_UNCONFIRMED"))
-            self.assertEqual(injected, [True])
-            self.assertEqual(len(publications), 1)
             self.assertTrue(Path(directory, ".tmp-fixture-publication-conflict").is_file())
+            publications = [
+                json.loads(raw) for raw in Path(directory, "publication-attempts").read_bytes().splitlines()
+            ]
+            self.assertEqual(["cancel-forward", "drain-forward"], [
+                snapshot["lifecycle"] for snapshot in publications
+            ])
+            original = json.loads(Path(directory, "original-lease").read_bytes())
             lease = state._read_execution_lease_locked(directory)
+            self.assertEqual(publications[0], lease)
             self.assertEqual("cancel-forward", lease["lifecycle"])
             self.assertIsNotNone(lease["worker"])
+            self.assertEqual("EXIT", lease["firstFailure"])
+            self.assertEqual(1, lease["firstStatus"])
+            self.assertFalse(lease["rollbackIssued"])
+            self.assertEqual(["controller-worker"], [worker["mode"] for worker in lease["workers"]])
+            for field in ("attempt", "t0Ns", "workEndNs", "hardEndNs"):
+                self.assertEqual(original[field], lease[field], field)
+            self.assertEqual(lease["revision"] + 1, publications[1]["revision"])
 
     def test_full_real_clock_540_600_stalled_worker_deadlines(self):
         # Intentionally uses the immutable production Timing, not a shortened

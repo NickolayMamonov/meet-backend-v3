@@ -807,12 +807,15 @@ supervisor_publish_lease() {
   rm -f -- "$lease"
 }
 supervisor_complete() {
+  local -a outcome_args=()
+  [ "$#" -le 1 ] || fail "EXECUTION_TERMINAL_ACK_FAILED"
+  [ "$#" -eq 0 ] || outcome_args=(--outcome "$1")
   [ "$supervisor_enabled" = true ] ||
     fail "EXECUTION_SUPERVISOR_REQUIRED"
   supervisor_client prepare-terminal >/dev/null ||
     fail "EXECUTION_TERMINAL_PREPARE_FAILED"
   supervisor_publish_lease || fail "EXECUTION_LEASE_PUBLICATION_FAILED"
-  supervisor_client terminal 0 --outcome "$1" >/dev/null ||
+  supervisor_client terminal 0 "${outcome_args[@]}" >/dev/null ||
     fail "EXECUTION_TERMINAL_ACK_FAILED"
 }
 recovery_retry_runtime_refusal() {
@@ -3054,9 +3057,11 @@ PY
   echo "operation_outcome=deployment-completed"
   exit 0
 fi
-# Rollback reconstruction and daemon quiescence are not yet integrated.
-# Do not allow an ordinary deploy to reach its first writer.
-fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"
+# The first transition uses the shared guarded-create lifecycle below. Legacy
+# deployment and rollback still require their separate runtime acceptance gate.
+[ "$operation" = deploy ] && [ "$mode" = deploy ] &&
+  [ "$rollout_domain" = timepad-first-transition ] ||
+  fail "EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"
 if [ "$closed_beta_safety" = true ]; then
   [ -f "$safety_hook" ] && [ ! -L "$safety_hook" ] && [ -x "$safety_hook" ] ||
     fail "closed-beta safety hook is unavailable"
@@ -3797,6 +3802,7 @@ if [ "$prepared_timepad" = true ]; then
 fi
 mutation_started=false
 rollback_complete=true
+supervisor_complete
 echo "deployment=completed image_id=$target_id version=$version revision=$revision"
 echo "operation_outcome=deployment-completed"
 
