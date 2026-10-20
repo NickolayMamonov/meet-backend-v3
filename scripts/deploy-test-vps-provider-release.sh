@@ -32,7 +32,8 @@ fixture_create_stage() {
     PREDECESSOR_VERIFY_INVENTORY|PREDECESSOR_VERIFY_INSPECT|PREDECESSOR_VERIFY_PROVIDER|\
     CONFIGURATION_VALIDATION|APPLYING_MARKER|ACTIVE_COMPOSE_INSTALL|ACTIVE_COMPOSE_RECORD|\
     ACTIVE_RUNTIME_INSTALL|ACTIVE_RUNTIME_RECORD|TARGET_UPDATE|TARGET_BYTES|\
-    TARGET_IDENTITY|TARGET_CONFIGURATION|WORK_BUDGET|PREDECESSOR_INVENTORY|\
+    TARGET_IDENTITY|TARGET_CONFIGURATION|PROVIDER_POINTER_CHECK|RETENTION_CHECK|\
+    STATE_PUBLISH|WORK_BUDGET|PREDECESSOR_INVENTORY|\
     PREDECESSOR_INSPECT|PREDECESSOR_IDENTITY|PREDECESSOR_SUPPRESS|PREDECESSOR_SUPPRESSED|\
     PREDECESSOR_STOP|PREDECESSOR_STOPPED|BARRIER_PUBLICATION|FENCE_READ|FENCE_PHASE|\
     FENCE_EPOCH|FENCE_BINDING|FENCE_UNBOUND|CREATE_INITIAL|CANDIDATE_INVENTORY|\
@@ -3097,13 +3098,16 @@ fi
 if [ -e "$smtp_pointer" ] || [ -L "$smtp_pointer" ]; then
   fail "SMTP transaction is active; reconcile it with the SMTP tooling first"
 fi
+fixture_create_stage PROVIDER_POINTER_CHECK
 if [ -e "$provider_pointer" ] || [ -L "$provider_pointer" ]; then
   fail "RECOVERY_REQUIRED"
 fi
+fixture_create_stage RETENTION_CHECK
 timeout 30s python3 "$provider_helper" retention-check \
   --state-root "$state_root" --deploy-lock-fd 9 >/dev/null ||
   fail "RECOVERY_REQUIRED"
 
+fixture_create_stage STATE_PUBLISH
 timeout 30s python3 "$provider_helper" state-publish \
   --state-root "$state_root" \
   --run-key "$run_key" \
