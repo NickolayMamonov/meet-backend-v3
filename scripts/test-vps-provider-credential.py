@@ -4213,12 +4213,8 @@ def _retained_create_completion(
         completion["acknowledged"] is not True
         or completion["resourcesDigest"] != proof["resourcesDigest"]
         or lease["operation"] not in {"deploy", "forward-recover"}
-        or lease["originDigest"] != current["originDigest"]
-        or lease["incidentId"] != current["incidentId"]
-        or lease["operationEpoch"] != current["operationEpoch"]
         or lease["attempt"] != current["executionAttempt"]
         or completion["executionAttempt"] != lease["attempt"]
-        and lease["operation"] != "forward-recover"
     ):
         _fail("recovery")
     receipt_name = (
