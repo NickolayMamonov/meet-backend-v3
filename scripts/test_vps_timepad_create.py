@@ -912,6 +912,7 @@ class CreateDriver:
                         "_resource_postgres", "_resource_backend",
                         "_resource_network", "_resource_volume",
                         "_resource_containers", "_resource_restart",
+                        "_create_runtime_configuration",
                     }
                     symbols = [
                         frame.name + ":" + str(frame.lineno)
