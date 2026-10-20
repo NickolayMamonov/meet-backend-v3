@@ -1539,7 +1539,7 @@ class Supervisor:
                     )[-256:] or "NONE"
                     print(
                         f"fixture_timepad_supervisor=driver_child_refusal "
-                        f"reason={reason} symbols={symbols}",
+                        f"reason={reason} action={selected.value} symbols={symbols}",
                         file=sys.stderr, flush=True,
                     )
                 os._exit(1)

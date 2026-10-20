@@ -811,9 +811,18 @@ class CreateDriver:
         frame = self.client.request(
             "grant", name=name, localNs=min(seconds * NS, self.context.end_ns - time.monotonic_ns()),
         )
-        if set(frame) != {"attempt", "grantId", "endNs", "role", "name"} or \
-                frame["attempt"] != self.client.attempt or frame["name"] != name or \
-                frame["role"] != self.client.role or frame["endNs"] > self.context.end_ns:
+        if set(frame) != {"attempt", "grantId", "endNs", "role", "name"}:
+            if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+                print("fixture_timepad_create=grant_refusal stage=schema", file=sys.stderr, flush=True)
+            refuse()
+        if frame["attempt"] != self.client.attempt or frame["name"] != name or \
+                frame["role"] != self.client.role:
+            if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+                print("fixture_timepad_create=grant_refusal stage=correlation", file=sys.stderr, flush=True)
+            refuse()
+        if frame["endNs"] > self.context.end_ns:
+            if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+                print("fixture_timepad_create=grant_refusal stage=deadline", file=sys.stderr, flush=True)
             refuse()
         grant = guard.ExecutionGrant(frame["attempt"], frame["grantId"], frame["endNs"])
         try:
