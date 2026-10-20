@@ -28,8 +28,8 @@ def action_class(arguments: list[str]) -> str:
     if not arguments:
         return "empty"
     verb = arguments[0] if arguments[0] in {
-        "compose", "exec", "image", "inspect", "port", "stop", "start",
-        "update", "volume",
+        "compose", "exec", "image", "inspect", "kill", "network", "port",
+        "ps", "rm", "start", "stop", "update", "volume",
     } else "other"
     subcommand = (
         arguments[1] if len(arguments) > 1 and arguments[1] in {
