@@ -475,8 +475,10 @@ def run(case: Path, scenario: str) -> int:
                                 ):
                                     driver_failure = record.decode("ascii")
                                 elif re.fullmatch(
-                                    rb"label_mismatch key=com[.]docker[.]compose[.]"
-                                    rb"(?:project|service|container-number|oneoff|version|image)",
+                                    rb"label_mismatch key=(?:com[.]docker[.]compose[.]"
+                                    rb"(?:project|service|container-number|oneoff|version|image)|"
+                                    rb"org[.]opencontainers[.]image[.]"
+                                    rb"(?:revision|version|source))",
                                     record,
                                 ):
                                     label_failure = record.decode("ascii")

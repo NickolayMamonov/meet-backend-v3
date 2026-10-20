@@ -4554,6 +4554,8 @@ def _create_runtime_configuration(
                 "com.docker.compose.project", "com.docker.compose.service",
                 "com.docker.compose.container-number", "com.docker.compose.oneoff",
                 "com.docker.compose.version", "com.docker.compose.image",
+                "org.opencontainers.image.revision", "org.opencontainers.image.version",
+                "org.opencontainers.image.source",
             }
             record = ("label_mismatch key=" + key + "\n").encode("ascii") if key in safe_labels else b""
             if record and re.fullmatch(
