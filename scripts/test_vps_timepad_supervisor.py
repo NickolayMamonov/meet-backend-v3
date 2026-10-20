@@ -1550,7 +1550,7 @@ class Supervisor:
                     diagnostic_path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE")
                     if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1" and \
                             isinstance(diagnostic_path, str) and re.fullmatch(
-                                r"/var/lib/timepad-fixture/case-create-worker-[0-9]+/driver-diagnostics",
+                                r"/var/lib/timepad-fixture/case-create-worker-[A-Za-z0-9_-]{1,64}/driver-diagnostics",
                                 diagnostic_path,
                             ):
                         line = (
