@@ -7424,13 +7424,17 @@ def _timepad_retention_guard(
             _, current = module.read_guard(state_root, deploy_lock_fd=deploy_lock_fd)
     except (module.GuardError, OSError, ValueError, TypeError, AttributeError):
         _fail("recovery")
-    if current["phase"] not in {"COMMITTED", "ROLLED_BACK"}:
-        _fail("recovery")
     try:
         final_root_path_info = os.stat(state_root, follow_symlinks=False)
     except OSError:
         _fail("recovery")
     if not _same_inode(final_root_path_info, os.fstat(state_root_fd)):
+        _fail("recovery")
+    if current["phase"] == "READY":
+        if current.get("operationEpoch") != 0 or current.get("ownedRun") is not None:
+            _fail("recovery")
+        return None
+    if current["phase"] not in {"COMMITTED", "ROLLED_BACK"}:
         _fail("recovery")
     owned_run = current["ownedRun"]
     if not isinstance(owned_run, str):

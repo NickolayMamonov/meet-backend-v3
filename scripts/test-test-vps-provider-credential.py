@@ -5045,6 +5045,28 @@ class ProviderCredentialTests(unittest.TestCase):
         os.name == "posix" and hasattr(os, "O_DIRECTORY"),
         "Linux filesystem test",
     )
+    def test_retention_allows_unowned_epoch_zero_ready_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            (root / "timepad-guard").mkdir()
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            module = helper._timepad_state_module()
+            ready = module.new_ready_state("a" * 64)
+            try:
+                with mock.patch.object(
+                    module, "read_guard", return_value=({}, ready),
+                ) as read_guard:
+                    self.assertIsNone(
+                        helper._timepad_retention_guard(str(root), root_fd, 9),
+                    )
+                read_guard.assert_called_once_with(str(root), deploy_lock_fd=9)
+            finally:
+                os.close(root_fd)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_DIRECTORY"),
+        "Linux filesystem test",
+    )
     def test_retention_protects_the_latest_terminal_run_and_rechecks_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
