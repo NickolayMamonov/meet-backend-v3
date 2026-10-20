@@ -1275,7 +1275,21 @@ class LinuxActualController(unittest.TestCase):
                     self.assertIn(current["phase"], {"CUTOVER_POSSIBLE", "RECOVERY_REQUIRED"})
                     with create.guard.deploy_lock(case / "state"):
                         lease = create.guard._read_execution_lease_locked(case / "state")
-                    self.assertEqual("quiescence-unconfirmed", lease["lifecycle"])
+                    transitions = [
+                        line for line in result.stderr.decode(errors="replace").splitlines()
+                        if re.fullmatch(
+                            r"fixture_timepad_supervisor=attempt_transition "
+                            r"lifecycle=(?:registered|armed|cancel-forward|drain-forward|"
+                            r"draining|quiescence-unconfirmed|drained) "
+                            r"failure=(?:none|[A-Z][A-Z0-9_]{0,63})",
+                            line,
+                        )
+                    ][-12:]
+                    self.assertEqual(
+                        "quiescence-unconfirmed", lease["lifecycle"],
+                        "fixed lifecycle trace=" + "|".join(transitions) +
+                        " firstFailure=" + str(lease["firstFailure"]),
+                    )
                     self.assertIsNotNone(lease["firstFailure"])
                     self.assertEqual(completed["lease"]["createCompletion"], lease["createCompletion"])
                     reply = create.parse(
