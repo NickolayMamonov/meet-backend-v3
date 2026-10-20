@@ -4560,6 +4560,7 @@ def _create_runtime_configuration(
                 r"/var/lib/timepad-fixture/case-create-worker-[A-Za-z0-9_-]+/driver-diagnostics",
                 diagnostic_path,
             ):
+                print(record.decode("ascii").strip(), file=sys.stderr, flush=True)
                 try:
                     fd = os.open(
                         diagnostic_path,
