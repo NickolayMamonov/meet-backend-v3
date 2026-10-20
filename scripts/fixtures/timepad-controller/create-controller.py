@@ -98,6 +98,7 @@ def prepare(case: Path, scenario: str) -> None:
             b'--external-docker "$@"\n'
         )
         private(case / "forward-facts.json", json.dumps(facts).encode())
+        private(case / "driver-diagnostics", b"")
         backend = next(item for item in facts["resources"]["containerInspections"]
                        if item["Config"]["Labels"]["com.docker.compose.service"] == "backend")
         private(case / "forward-runtime.json", json.dumps({"backend": backend, "created": False}).encode())
@@ -308,6 +309,10 @@ def run(case: Path, scenario: str) -> int:
             parent.close()
             supervisor._close_except({child.fileno()})
             os.environ["TIMEPAD_FIXTURE_DIAGNOSTICS"] = "1"
+            if forward:
+                os.environ["TIMEPAD_FIXTURE_DIAGNOSTIC_FILE"] = str(
+                    case / "driver-diagnostics",
+                )
             instance = supervisor.Supervisor(
                 str(case / "state"), supervisor_operation, arguments, child,
                 create_transport=fake,
@@ -440,9 +445,21 @@ def run(case: Path, scenario: str) -> int:
                         r"[A-Z][A-Z0-9_]{0,63}", failure,
                     ):
                         failure = "none"
+                    driver_failure = "none"
+                    diagnostic_path = case / "driver-diagnostics"
+                    if diagnostic_path.is_file() and not diagnostic_path.is_symlink():
+                        diagnostic = diagnostic_path.read_bytes()
+                        if len(diagnostic) <= 4096 and re.fullmatch(
+                            rb"type=[A-Za-z][A-Za-z0-9_]{0,63} "
+                            rb"reason=[A-Z][A-Z0-9_]{0,63} "
+                            rb"action=[a-z-]{1,32} symbols=[A-Za-z0-9_,:]{1,256}\n?",
+                            diagnostic,
+                        ):
+                            driver_failure = diagnostic.decode("ascii").strip()
                     raise AssertionError(
                         "actual normal forward did not commit: phase=" + phase +
-                        " failure=" + failure + " effects=" + effect_kinds,
+                        " failure=" + failure + " effects=" + effect_kinds +
+                        " driver=" + driver_failure,
                     )
                 require(status == 0 and current["phase"] == "COMMITTED",
                         "actual normal forward did not commit")
