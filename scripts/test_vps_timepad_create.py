@@ -828,7 +828,8 @@ class CreateDriver:
             self.context.check_time()
             stage = "request"
             frame = self.client.request(
-                "grant", name=name, localNs=min(seconds * NS, self.context.end_ns - time.monotonic_ns()),
+                "grant", name=name, localNs=seconds * NS,
+                parentEndNs=self.context.end_ns,
             )
             stage = "validate"
             if set(frame) != {"attempt", "grantId", "endNs", "role", "name"}:

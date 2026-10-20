@@ -2133,6 +2133,8 @@ class Supervisor:
         }
         if kind == "terminal":
             schemas["terminal"] = {"status", "outcome"} if "outcome" in frame else {"status"}
+        if driver and kind == "grant":
+            schemas["grant"] = {"name", "localNs", "parentEndNs"}
         try:
             reply = socket.socket(fileno=passed)
         except OSError:
@@ -2218,7 +2220,9 @@ class Supervisor:
                 if driver:
                     if self.driver_end is None:
                         reject()
-                    local = min(local, self.driver_end - self.attempt.clock())
+                    parent_end = _integer(frame["parentEndNs"], 1)
+                    now = self.attempt.clock()
+                    local = min(local, self.driver_end - now, parent_end - now)
                 grant = self.attempt.grant(frame["name"], local)
                 if grant.name == "recovery-registration":
                     self.registration_grant = grant
