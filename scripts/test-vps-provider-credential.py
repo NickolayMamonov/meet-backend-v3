@@ -4567,13 +4567,14 @@ def _create_runtime_configuration(
                 else "compose" if key.startswith("com.docker.compose.")
                 else "other"
             )
-            record = ("label_mismatch class=" + label_class + "\n").encode("ascii")
+            record = (
+                "label_mismatch key=" + key + "\n" if key in safe_labels
+                else "label_mismatch class=" + label_class + "\n"
+            ).encode("ascii")
             if record and re.fullmatch(
                 r"/var/lib/timepad-fixture/case-create-worker-[A-Za-z0-9_-]+/driver-diagnostics",
                 diagnostic_path,
             ):
-                if key in safe_labels:
-                    print("label_mismatch key=" + key, file=sys.stderr, flush=True)
                 try:
                     fd = os.open(
                         diagnostic_path,
