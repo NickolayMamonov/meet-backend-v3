@@ -1154,6 +1154,7 @@ class Supervisor:
             "registration_ack_children",
             "registration_ack_reject",
             "rpc_reject",
+            "driver_exit",
             "event_refusal",
             "event_loop_refusal",
         }
@@ -1563,6 +1564,8 @@ class Supervisor:
             return
         if self.driver_pid in statuses:
             self.driver_status = statuses[self.driver_pid]
+            if self.driver_status != 0:
+                self._fixture_diagnostic("driver_exit", status=self.driver_status)
         if self.attempt.first_reason is not None:
             if self.driver_reply is not None:
                 self.driver_reply.close()
