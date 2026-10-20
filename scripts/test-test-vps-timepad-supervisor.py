@@ -1099,12 +1099,17 @@ class CreateProtocolTests(unittest.TestCase):
                         mock.patch.object(instance, "_resume_create_controller") as resume, \
                         mock.patch.object(instance, "_create_reply") as reply:
                     for event in order:
+                        statuses = {}
                         if event == "eof":
                             self.deliver_helper_rpc_eof(instance, rpc)
                         elif event == "result":
                             self.deliver_helper_result(instance, result)
                         else:
-                            instance._tick_create({345: 0})
+                            statuses = {345: 0}
+                        # The production loop ticks completion state after each
+                        # readable event and waitpid observation. Preserve that
+                        # ordering when the exact wait precedes the result frame.
+                        instance._tick_create(statuses)
                     if instance.create_helper_status is None:
                         instance._tick_create({345: 0})
                     if instance.create_helper_result is None:
@@ -1207,12 +1212,17 @@ class CreateProtocolTests(unittest.TestCase):
                 rpc = instance.create_launcher_rpc
                 with mock.patch.object(instance.children, "refresh"):
                     for event in order:
+                        statuses = {}
                         if event == "eof":
                             self.deliver_launcher_rpc_eof(instance, rpc)
                         elif event == "result":
                             self.deliver_launcher_result(instance)
                         else:
-                            instance._tick_create({345: 0})
+                            statuses = {345: 0}
+                        # The production loop observes the result and exact
+                        # child wait independently, then reconciles them on
+                        # every event-loop pass.
+                        instance._tick_create(statuses)
                     if instance.create.wait_status is None:
                         instance._tick_create({345: 0})
                     if instance.create.result is None:
@@ -3387,6 +3397,7 @@ class LinuxSupervisorTests(unittest.TestCase):
 
         result, frames = self.run_fixture(
             behavior, operation="forward-recover", timing=supervisor.Timing(), timeout=610,
+            expect_keeper=True, expect_childless_keeper=True,
         )
         elapsed = time.monotonic() - started
         self.assertEqual(result["reason"], "QUIESCENCE_UNCONFIRMED")
