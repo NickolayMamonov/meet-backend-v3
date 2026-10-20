@@ -2088,6 +2088,10 @@ class Supervisor:
                 channel, accept_fd=True, peer=peers, fixture_frame_diagnostics=driver,
             )
         except ChannelClosed:
+            if driver and channel is self.driver_rpc:
+                channel.close()
+                self.driver_rpc = None
+                return
             if driver or channel is not self.worker:
                 raise
             channel.close()
