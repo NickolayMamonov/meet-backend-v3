@@ -49,6 +49,14 @@ fixture_create_stage() {
   return 0
 }
 
+fixture_create_wait_status() {
+  [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
+  local status=${1:-}
+  [[ "$status" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$status" -le 255 ] || return 0
+  printf 'fixture_timepad_create_wait_status=%s\n' "$status" >&2 || :
+  return 0
+}
+
 verify_production_env_settings() {
   timeout 30s python3 - "$1" <<'PY'
 import os
@@ -2037,6 +2045,8 @@ complete_owned_child() {
   wait "$owned_child_pid" || status=$?
   declare -F fixture_create_stage >/dev/null &&
     fixture_create_stage OWNED_CHILD_WAITED
+  declare -F fixture_create_wait_status >/dev/null &&
+    fixture_create_wait_status "$status"
   if [ -n "${stop_pid:-}" ]; then
     wait "$stop_pid" || stop_status=$?
     declare -F fixture_create_stage >/dev/null &&

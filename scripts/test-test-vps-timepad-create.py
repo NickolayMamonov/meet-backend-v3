@@ -546,6 +546,26 @@ echo diagnostic-status-preserved
         self.assertNotIn(b"PRIVATE_CANARY", result.stdout + result.stderr)
         self.assertNotIn(b"never-print-me", result.stdout + result.stderr)
 
+    def test_owned_child_wait_status_diagnostic_is_opt_in_bounded_and_exact(self):
+        function = self.shell_functions("fixture_create_wait_status")
+        result = self.run_shell(function + r"""
+TIMEPAD_FIXTURE_DIAGNOSTICS=1
+fixture_create_wait_status 0
+fixture_create_wait_status 23
+fixture_create_wait_status 255
+fixture_create_wait_status 256
+fixture_create_wait_status 01
+fixture_create_wait_status PRIVATE_CANARY
+TIMEPAD_FIXTURE_DIAGNOSTICS=0
+fixture_create_wait_status 7
+""")
+        self.assertEqual(
+            ["fixture_timepad_create_wait_status=0",
+             "fixture_timepad_create_wait_status=23",
+             "fixture_timepad_create_wait_status=255"],
+            result.stderr.decode().splitlines(),
+        )
+
     def test_create_stage_diagnostics_identify_refused_gate_without_changing_result(self):
         stages = [
             "WORK_BUDGET", "PREDECESSOR_INVENTORY", "PREDECESSOR_INSPECT",
