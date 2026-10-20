@@ -4693,6 +4693,22 @@ def _stopped_create_binding(
     resource_evidence: Any = None, request_baseline: Any = None,
 ) -> dict[str, Any]:
     """Independent binding never supplies or repairs the supervisor completion acknowledgment."""
+    def require_equal(stage: str, actual: Any, expected: Any) -> None:
+        try:
+            _private_equal(actual, expected)
+        except ProviderError:
+            if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+                if stage not in {
+                    "request-baseline", "resource-target", "container-inspection",
+                    "resources-digest", "resource-request-digest", "container-runtime",
+                }:
+                    _fail("recovery")
+                print(
+                    "fixture_timepad_create=binding_refusal stage=" + stage,
+                    file=sys.stderr, flush=True,
+                )
+            raise
+
     module = _timepad_state_module()
     try:
         request = module.require_create_normal_completion(current)
@@ -4704,7 +4720,8 @@ def _stopped_create_binding(
     except module.GuardError:
         _fail("recovery")
     proof, _ = _prepared_target(run_fd, current, image, configuration)
-    _private_equal(
+    require_equal(
+        "request-baseline",
         request_baseline, _read_resource_request(run_fd, request["resourceRequestDigest"]),
     )
     resources = _resource_admission(_resource_envelope(
@@ -4713,17 +4730,20 @@ def _stopped_create_binding(
         baseline=_read_resource_baseline(run_fd, proof["resourcesDigest"]),
         request_baseline=request_baseline,
     ))
-    _private_equal(resource_evidence["targetConfiguration"], configuration)
-    _private_equal(
+    require_equal("resource-target", resource_evidence["targetConfiguration"], configuration)
+    require_equal(
+        "container-inspection",
         next(
             item for item in resource_evidence["containerInspections"]
             if item["Id"] == resources["membership"]["backendContainerId"]
         ),
         observed,
     )
-    if request.get("resourcesDigest") != resources["baselineDigest"] or \
-            request.get("resourceRequestDigest") != _configuration_digest(request_baseline):
-        _fail("recovery")
+    require_equal("resources-digest", request.get("resourcesDigest"), resources["baselineDigest"])
+    require_equal(
+        "resource-request-digest", request.get("resourceRequestDigest"),
+        _configuration_digest(request_baseline),
+    )
     if (
         current["ownedChild"] is not None
         or request["operationToken"] != proof["operationToken"]
@@ -4750,7 +4770,7 @@ def _stopped_create_binding(
         "Dead": False, "OOMKilled": False, "Pid": 0, "ExitCode": 0, "Error": "",
         "StartedAt": "0001-01-01T00:00:00Z", "FinishedAt": "0001-01-01T00:00:00Z",
     }.items():
-        _private_equal(runtime.get(key), value)
+        require_equal("container-runtime", runtime.get(key), value)
     _create_runtime_configuration(image, configuration, observed, proof["operationToken"])
     config_hash = observed["Config"]["Labels"].get("com.docker.compose.config-hash")
     if not isinstance(config_hash, str) or re.fullmatch(r"[a-f0-9]{64}", config_hash) is None:
