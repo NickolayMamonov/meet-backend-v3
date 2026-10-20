@@ -68,6 +68,20 @@ def tooling() -> tuple[create.ToolingObservation, dict]:
 
 
 class Contracts(unittest.TestCase):
+    def test_owned_run_identity_preserves_the_complete_provider_run_key(self):
+        self.assertEqual(
+            ("31885558214-1", "final-deploy"),
+            create.state_run_identity("31885558214-1-final-deploy"),
+        )
+        self.assertEqual(
+            ("31885558214-1", "rollback-drill"),
+            create.state_run_identity("31885558214-1-rollback-drill"),
+        )
+        with self.assertRaises(create.CreateError):
+            create.state_run_identity("31885558214-final-deploy")
+        with self.assertRaises(create.CreateError):
+            create.state_run_identity("31885558214-1-unrecognized")
+
     def forward_fixture(self):
         path = SCRIPTS / "fixtures/timepad-controller/forward.py"
         spec = importlib.util.spec_from_file_location("_forward_fixture_contract", path)

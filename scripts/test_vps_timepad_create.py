@@ -77,6 +77,19 @@ class Stage(str, Enum):
     COMPLETE = "complete"
 
 
+def state_run_identity(owned_run: str) -> tuple[str, str]:
+    for suffix, state_kind in (
+        ("-rollback-drill", "rollback-drill"),
+        ("-final-deploy", "final-deploy"),
+    ):
+        if owned_run.endswith(suffix):
+            run_key = owned_run[:-len(suffix)]
+            if re.fullmatch(r"[0-9]+-[0-9]+", run_key) is None:
+                refuse()
+            return run_key, state_kind
+    refuse()
+
+
 def canonical(value: Any, limit: int) -> bytes:
     try:
         data = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -845,8 +858,7 @@ class CreateDriver:
             with self.provider._operation_deadline(grant.end_ns):
                 lease = self.provider._execution_interlock(args, 9)
                 with self.provider._execution_mutation(args, lease), redirect_stdout(stream):
-                    run_key = self.context.run_name.rsplit("-", 2)[0]
-                    state_kind = "rollback-drill" if self.context.run_name.endswith("-rollback-drill") else "final-deploy"
+                    run_key, state_kind = state_run_identity(self.context.run_name)
                     if command == "prepare-transition-proof":
                         self.provider._prepare_transition_proof(run_key, self.context.state_root, state_kind, data, 9)
                     elif command == "resource-admission":
