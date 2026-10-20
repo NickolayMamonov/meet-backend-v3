@@ -2634,9 +2634,10 @@ class Supervisor:
                         else:
                             self._report()
                             return 1
-                    if childless and self.completion_pid is None:
+                    if childless:
                         self._report()
-                        return 1
+                        if self.completion_pid is None:
+                            return 1
                     # The keeper has no workers or runtime commands; it still
                     # consumes the bounded lease-publication acknowledgment.
                     if self.completion_channel is not None:
