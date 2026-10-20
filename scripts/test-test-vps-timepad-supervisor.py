@@ -2595,6 +2595,11 @@ class FixtureSupervisor(supervisor.Supervisor):
 
 class LinuxSupervisorTests(unittest.TestCase):
     def test_create_registration_readback_child_preserves_proof_or_refuses_partial_handoff(self):
+        class DiagnosticSupervisor(FixtureSupervisor):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                os.environ["TIMEPAD_FIXTURE_DIAGNOSTICS"] = "1"
+
         for fault, replacement in (
             ("none", False), ("receipt", False), ("digest", False), ("erased", False), ("aborted", False),
             ("none", True), ("receipt", True),
@@ -2740,6 +2745,7 @@ class LinuxSupervisorTests(unittest.TestCase):
                 result, _ = self.run_fixture(
                     behavior, directory=directory, operation="forward-recover",
                     timing=supervisor.Timing(), timeout=25, expect_keeper=fault != "none",
+                    supervisor_type=DiagnosticSupervisor,
                 )
                 self.assertEqual(1, result["status"])
                 self.assertEqual("RECOVERY_REQUIRED" if fault == "none" else "QUIESCENCE_UNCONFIRMED", result["reason"])

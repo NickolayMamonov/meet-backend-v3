@@ -1154,6 +1154,7 @@ class Supervisor:
         self.recovery_baseline: dict[str, Any] | None = None
         self.registration_grant: Grant | None = None
         self.registration_ack: RecoveryRegistrationAck | None = None
+        self.fixture_diagnostic_count = 0
         self.create_parked: list[tuple[ProcessIdentity, int]] = []
         self.create_park_end: int | None = None
         self.last_create_sequence = 0
@@ -1166,6 +1167,8 @@ class Supervisor:
     def _fixture_diagnostic(self, label: str, **fields: int | bool | str) -> None:
         if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") != "1":
             return
+        if self.fixture_diagnostic_count >= 16:
+            return
         allowed = {
             "registration_ack_children",
             "registration_ack_reject",
@@ -1177,6 +1180,7 @@ class Supervisor:
         }
         if label not in allowed:
             reject("PROTOCOL_INVALID")
+        self.fixture_diagnostic_count += 1
         values = " ".join(f"{key}={value}" for key, value in sorted(fields.items()))
         print(f"fixture_timepad_supervisor={label} {values}".rstrip(), file=sys.stderr, flush=True)
 
@@ -1255,12 +1259,36 @@ class Supervisor:
 
         registration = self.registration_ack
         assert registration is not None and registration.channel is not None
-        response, _ = receive_frame(registration.channel)
+        try:
+            response, _ = receive_frame(registration.channel)
+        except (OSError, SupervisorError) as error:
+            error_class = type(error).__name__
+            if error_class not in {"ChannelClosed", "SupervisorError", "OSError"}:
+                error_class = "Other"
+            self._fixture_diagnostic(
+                "registration_ack_reject", stage="response-channel",
+                error_class=error_class,
+                child_status=registration.status if registration.status is not None else -1,
+                lifecycle=self.attempt.lifecycle,
+            )
+            raise
         if set(response) != {"lease"} or not isinstance(response["lease"], dict):
+            self._fixture_diagnostic(
+                "registration_ack_reject", stage="response-shape",
+                error_class="InvalidFrame",
+                child_status=registration.status if registration.status is not None else -1,
+                lifecycle=self.attempt.lifecycle,
+            )
             reject("LEASE_ACK_INVALID")
         try:
             registration.snapshot = _execution_lease(response["lease"])
         except GuardError:
+            self._fixture_diagnostic(
+                "registration_ack_reject", stage="lease-shape",
+                error_class="GuardError",
+                child_status=registration.status if registration.status is not None else -1,
+                lifecycle=self.attempt.lifecycle,
+            )
             reject("LEASE_ACK_INVALID")
         registration.channel.close()
         registration.channel = None
@@ -1282,6 +1310,13 @@ class Supervisor:
             self.registration_ack = None
             return  # Cancellation drains the read-only child with the worker.
         if registration.status not in (None, 0) or self.attempt.clock() >= registration.end_ns:
+            self._fixture_diagnostic(
+                "registration_ack_reject",
+                stage="readback-child-exit" if registration.status not in (None, 0) else "readback-timeout",
+                error_class="ChildExit" if registration.status not in (None, 0) else "Timeout",
+                child_status=registration.status if registration.status is not None else -1,
+                lifecycle=self.attempt.lifecycle,
+            )
             reject("LEASE_ACK_INVALID")
         if registration.status is None or registration.snapshot is None:
             return
@@ -1293,6 +1328,12 @@ class Supervisor:
             or any(snapshot[key] != expected[key] for key in expected if key != "createCompletion")
             or hashlib.sha256(encode(snapshot)).hexdigest() != registration.digest
         ):
+            self._fixture_diagnostic(
+                "registration_ack_reject", stage="lease-mismatch",
+                error_class="LeaseMismatch",
+                child_status=registration.status if registration.status is not None else -1,
+                lifecycle=self.attempt.lifecycle,
+            )
             reject("LEASE_ACK_INVALID")
         self.children.refresh()
         if any(pid != self.worker_pid for pid in self.children.tracked):
@@ -2731,8 +2772,9 @@ class Supervisor:
                                     } else "unknown"
                                 ) if event.data == "create-helper-rpc" else "none",
                                 error=(
-                                    str(error) if isinstance(error, SupervisorError)
-                                    else "OS_ERROR"
+                                    type(error).__name__ if type(error).__name__ in {
+                                        "ChannelClosed", "SupervisorError",
+                                    } else "OS_ERROR"
                                 ),
                                 lifecycle=self.attempt.lifecycle,
                                 failure=self.attempt.first_reason or "NONE",
