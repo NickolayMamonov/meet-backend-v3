@@ -23,6 +23,7 @@ import re
 import selectors
 import stat
 import subprocess
+import sys
 import time
 import traceback
 from typing import Any, Iterator, Protocol

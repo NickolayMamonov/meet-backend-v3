@@ -1534,12 +1534,16 @@ class Supervisor:
                         "_create_peer_chain", "identity", "render", "observe",
                     }
                     symbols = ",".join(
-                        frame.name for frame in traceback.extract_tb(error.__traceback__)
+                        frame.name + ":" + str(frame.lineno)
+                        for frame in traceback.extract_tb(error.__traceback__)
                         if frame.name in allowed_symbols
                     )[-256:] or "NONE"
+                    error_type = type(error).__name__
+                    if not error_type.isascii() or not error_type.isidentifier() or len(error_type) > 64:
+                        error_type = "Exception"
                     print(
                         f"fixture_timepad_supervisor=driver_child_refusal "
-                        f"reason={reason} action={selected.value} symbols={symbols}",
+                        f"reason={reason} type={error_type} action={selected.value} symbols={symbols}",
                         file=sys.stderr, flush=True,
                     )
                 os._exit(1)
