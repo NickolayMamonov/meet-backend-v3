@@ -858,9 +858,13 @@ class CreateDriver:
                 error_name = type(error).__name__
                 if not error_name.isascii() or not error_name.isidentifier() or len(error_name) > 64:
                     error_name = "Exception"
+                safe_reason = (
+                    str(error) if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", str(error))
+                    else "OTHER"
+                )
                 print(
                     "fixture_timepad_create=grant_failure stage=" + stage +
-                    " exception=" + error_name,
+                    " exception=" + error_name + " reason=" + safe_reason,
                     file=sys.stderr, flush=True,
                 )
             raise
@@ -905,9 +909,14 @@ class CreateDriver:
                     safe_name = type(error).__name__
                     if not safe_name.isascii() or not safe_name.isidentifier() or len(safe_name) > 64:
                         safe_name = "Exception"
+                    safe_reason = (
+                        str(error) if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", str(error))
+                        else "OTHER"
+                    )
                     print(
                         "fixture_timepad_create=provider_failure exception=" +
-                        safe_name + " symbols=" + ",".join(symbols),
+                        safe_name + " reason=" + safe_reason +
+                        " symbols=" + ",".join(symbols),
                         file=sys.stderr, flush=True,
                     )
                 raise
