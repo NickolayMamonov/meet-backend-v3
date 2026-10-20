@@ -1151,7 +1151,7 @@ class LinuxActualController(unittest.TestCase):
                 self.assertIsNotNone(lease["firstFailure"])
                 self.assertFalse((case / "state/timepad-guard").exists())
                 self.assertFalse((case / "state/.provider-transaction.current").exists())
-                self.assertFalse((case / "state/fixture-channel-1-final-deploy").exists())
+                self.assertFalse((case / "state/31885558214-1-final-deploy").exists())
                 expected = (
                     b"BOOTSTRAP_EVIDENCE_INVALID" if scenario == "bootstrap-mismatch"
                     else b"EXECUTION_CONTROLLER_LIFECYCLE_UNAVAILABLE"
@@ -1212,7 +1212,7 @@ class LinuxActualController(unittest.TestCase):
                 # The fixture has exited and its passive keeper, if any, was
                 # explicitly torn down. Only this case's exact active copies
                 # may be removed from the already-private namespace.
-                run_path = case / "state/fixture-channel-1-final-deploy"
+                run_path = case / "state/31885558214-1-final-deploy"
                 for active, source in (
                     ("active-compose.yml", "config.base-compose.yml"),
                     ("active-runtime.override.yml", "target-runtime.override.yml"),

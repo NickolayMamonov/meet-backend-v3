@@ -278,7 +278,7 @@ def run(case: Path, scenario: str) -> int:
     arguments = [
         "--root", str(case / "root"), "--base-compose", str(case / "compose.yml"),
         "--image", "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + "0" * 64,
-        "--revision", "0" * 40, "--version", "1.4.0", "--run-key", "fixture-channel-1",
+        "--revision", "0" * 40, "--version", "1.4.0", "--run-key", "31885558214-1",
         "--mode", "deploy", "--operation", operation,
     ]
     if operation == "bootstrap-guard":
@@ -422,7 +422,7 @@ def run(case: Path, scenario: str) -> int:
                 case / "forward-effects"
             ).exists() else []
             starts = [effect for effect in effects if effect.startswith("start:")]
-            run_path = case / "state/fixture-channel-1-final-deploy"
+            run_path = case / "state/31885558214-1-final-deploy"
             if scenario == "forward":
                 require(status == 0 and current["phase"] == "COMMITTED",
                         "actual normal forward did not commit")
@@ -442,7 +442,7 @@ def run(case: Path, scenario: str) -> int:
                 "gated worker changed installed configuration")
         require(not (case / "state/.provider-transaction.current").exists(),
                 "gated worker published provider transaction")
-        require(not (case / "state/fixture-channel-1-final-deploy").exists(),
+        require(not (case / "state/31885558214-1-final-deploy").exists(),
                 "gated worker published an owned deploy run")
         # The subprocess exit and terminal lease are real observations, not
         # caller-supplied state or a manufactured publication acknowledgment.
