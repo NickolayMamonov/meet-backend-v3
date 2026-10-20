@@ -24,6 +24,7 @@ import selectors
 import stat
 import subprocess
 import time
+import traceback
 from typing import Any, Iterator, Protocol
 
 import test_vps_timepad_state as guard
@@ -855,18 +856,40 @@ class CreateDriver:
                 execution_attempt=grant.attempt, execution_grant=grant.grant_id, deadline_ns=grant.end_ns,
             )
             stream = io.StringIO()
-            with self.provider._operation_deadline(grant.end_ns):
-                lease = self.provider._execution_interlock(args, 9)
-                with self.provider._execution_mutation(args, lease), redirect_stdout(stream):
-                    run_key, state_kind = state_run_identity(self.context.run_name)
-                    if command == "prepare-transition-proof":
-                        self.provider._prepare_transition_proof(run_key, self.context.state_root, state_kind, data, 9)
-                    elif command == "resource-admission":
-                        self.provider._resource_admission_command(run_key, self.context.state_root, state_kind, data, 9)
-                    elif command == "absence-resume":
-                        self.provider._absence_resume(run_key, self.context.state_root, state_kind, data, 9)
-                    else:
-                        self.provider._runtime_request_completion(run_key, self.context.state_root, state_kind, data, 9)
+            try:
+                with self.provider._operation_deadline(grant.end_ns):
+                    lease = self.provider._execution_interlock(args, 9)
+                    with self.provider._execution_mutation(args, lease), redirect_stdout(stream):
+                        run_key, state_kind = state_run_identity(self.context.run_name)
+                        if command == "prepare-transition-proof":
+                            self.provider._prepare_transition_proof(run_key, self.context.state_root, state_kind, data, 9)
+                        elif command == "resource-admission":
+                            self.provider._resource_admission_command(run_key, self.context.state_root, state_kind, data, 9)
+                        elif command == "absence-resume":
+                            self.provider._absence_resume(run_key, self.context.state_root, state_kind, data, 9)
+                        else:
+                            self.provider._runtime_request_completion(run_key, self.context.state_root, state_kind, data, 9)
+            except BaseException as error:
+                if os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTICS") == "1":
+                    safe_symbols = {
+                        "_execution_interlock", "_execution_mutation",
+                        "_prepare_transition_proof", "_resource_admission_command",
+                        "_absence_resume", "_runtime_request_completion",
+                        "state_run_identity", "_operation_deadline",
+                    }
+                    symbols = [
+                        frame.name if frame.name in safe_symbols else "other"
+                        for frame in traceback.extract_tb(error.__traceback__)[-6:]
+                    ]
+                    safe_name = type(error).__name__
+                    if not safe_name.isascii() or not safe_name.isidentifier() or len(safe_name) > 64:
+                        safe_name = "Exception"
+                    print(
+                        "fixture_timepad_create=provider_failure exception=" +
+                        safe_name + " symbols=" + ",".join(symbols),
+                        file=sys.stderr, flush=True,
+                    )
+                raise
             return parse(stream.getvalue().encode(), 32768)
 
     def _models(self, *, installed: bool, stage: Stage) -> tuple[dict[str, Any], str]:
