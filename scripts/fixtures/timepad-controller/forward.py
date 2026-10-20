@@ -90,6 +90,17 @@ def fixture_data(source: Path) -> dict:
     backend["Config"]["Labels"].update(predecessor_image["Config"]["Labels"])
     backend["Config"]["Labels"]["com.docker.compose.image"] = predecessor_image["Id"]
     backend["State"]["Health"] = {"Status": "healthy"}
+    # The real deploy shell has already crossed the suppress/stop fence before
+    # the guarded controller's pre-release resource observation. Model that
+    # external precondition explicitly; the controller still verifies the
+    # stopped, restart-disabled, disconnected predecessor itself.
+    backend["State"].update({
+        "Status": "exited", "Running": False, "Paused": False, "Restarting": False,
+        "Dead": False, "Pid": 0, "ExitCode": 0,
+    })
+    backend["HostConfig"]["RestartPolicy"] = {"Name": "no", "MaximumRetryCount": 0}
+    endpoint = backend["NetworkSettings"]["Networks"]["meet-production_default"]
+    endpoint.update(EndpointID="", IPAddress="", Gateway="", IPPrefixLen=0, MacAddress="")
     backend["NetworkSettings"]["Ports"] = {
         "8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18080"}],
     }
