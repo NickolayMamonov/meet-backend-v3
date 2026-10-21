@@ -53,7 +53,9 @@ fixture_create_start_trace() {
   [ "${TIMEPAD_FIXTURE_START_TRACE:-}" = 1 ] &&
     [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
   case "${1:-}" in
-    request-state-read|request-built|request-published|handshake-grant-completed|\
+    request-state-read|request-built|request-published|publish-state-read|\
+    publish-changes-written|publish-advance-attempted|publish-advance-failed|\
+    publish-advance-completed|handshake-grant-completed|\
     docker-grant-received|release-published|token-written) ;;
     *) return 0 ;;
   esac
@@ -1900,6 +1902,8 @@ timepad_request_publish() {
   local request=$1 child=${2:-null} current phase changes=$state/.timepad-request-changes.json
   current=$(timeout 10s python3 "$timepad_helper" read-state \
     --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  [ "$(jq -r '.operation' <<<"$request")" != start ] ||
+    fixture_create_start_trace publish-state-read
   phase=$(jq -er '.phase' <<<"$current") || return 1
   [ ! -e "$changes" ] && [ ! -L "$changes" ] || return 1
   (umask 077; set -o noclobber
@@ -1914,12 +1918,20 @@ timepad_request_publish() {
          else {} end))}
     ' >"$changes") ||
     return 1
+  [ "$(jq -r '.operation' <<<"$request")" != start ] ||
+    fixture_create_start_trace publish-changes-written
+  [ "$(jq -r '.operation' <<<"$request")" != start ] ||
+    fixture_create_start_trace publish-advance-attempted
   timeout 15s python3 "$timepad_helper" advance --root "$state_root" \
     --phase "$phase" --changes "$changes" --deploy-lock-fd 9 >/dev/null || {
+      [ "$(jq -r '.operation' <<<"$request")" != start ] ||
+        fixture_create_start_trace publish-advance-failed
       rm -f -- "$changes"
       return 1
     }
   rm -f -- "$changes"
+  [ "$(jq -r '.operation' <<<"$request")" != start ] ||
+    fixture_create_start_trace publish-advance-completed
 }
 
 timepad_request_begin() {

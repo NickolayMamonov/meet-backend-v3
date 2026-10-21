@@ -4197,6 +4197,9 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                             event = line.partition("=")[2]
                             if event not in {
                                 "request-state-read", "request-built", "request-published",
+                                "publish-state-read", "publish-changes-written",
+                                "publish-advance-attempted", "publish-advance-failed",
+                                "publish-advance-completed",
                                 "handshake-grant-completed", "docker-grant-received",
                                 "release-published", "token-written",
                             }:
