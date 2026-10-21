@@ -46,6 +46,8 @@ fixture_create_stage() {
     OWNED_START_CHILD_CAPTURED|OWNED_START_REQUEST_PUBLISHED|\
     OWNED_START_HANDSHAKE_GRANT_COMPLETED|OWNED_START_DOCKER_GRANT_RECEIVED|\
     OWNED_START_RELEASE_PUBLISHED|OWNED_START_TOKEN_WRITTEN)
+      case "$1" in
+      OWNED_START_*)
       if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
         command timeout 2s python3 - "$1" <<'PY' >/dev/null 2>&1 || :
 import fcntl
@@ -81,6 +83,11 @@ finally:
     os.close(fd)
 PY
       fi
+      ;;
+      *)
+        printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
+        ;;
+      esac
       ;;
   esac
   return 0
