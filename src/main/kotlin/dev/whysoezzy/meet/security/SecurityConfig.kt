@@ -43,6 +43,7 @@ class SecurityConfig(
 
                     // Статика — GET /media/** отдаётся без токена
                     .requestMatchers(HttpMethod.GET, "/media/**").permitAll()
+                    .requestMatchers(HttpMethod.GET, "/timepad-assets/v1/**").permitAll()
 
                     // Загрузка файлов — требует авторизации (POST /media/**)
                     .requestMatchers(HttpMethod.POST, "/media/**").authenticated()

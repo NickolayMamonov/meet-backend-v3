@@ -126,12 +126,26 @@ class PushDiagnosticService(
                 issuedAt = clock.instant(),
             )
 
-            val first = call(selected, message)
+            val firstTarget = try {
+                transaction.execute {
+                    store.recheckEligible(selected, clock.instant())
+                }
+            } catch (_: RuntimeException) {
+                throw unavailable()
+            } ?: throw NotFoundException("Push diagnostic target not found")
+            if (
+                firstTarget.fid.value != selected.fid.value ||
+                firstTarget.registrationVersion != selected.registrationVersion
+            ) {
+                throw NotFoundException("Push diagnostic target not found")
+            }
+
+            val first = call(firstTarget, message)
             if (first.localFailure && command.mode == PushDiagnosticMode.SINGLE) {
                 throw unavailable()
             }
             val firstInvalidation = if (first.result == DiagnosticCallResult.InvalidTarget) {
-                invalidate(selected, first.sentFid)
+                invalidate(firstTarget, first.sentFid)
             } else {
                 InvalidationOutcome.CONTINUE
             }
@@ -339,7 +353,7 @@ class JdbcPushDiagnosticStore(
         userId: Long,
         installationId: UUID,
         meetingId: Long,
-        now: Instant,
+        @Suppress("UNUSED_PARAMETER") now: Instant,
     ): DiagnosticSelection? =
         jdbc.query(
             """
@@ -350,9 +364,13 @@ class JdbcPushDiagnosticStore(
             JOIN push_installations i ON i.id = ?
             WHERE u.id = ? AND u.deleted_at IS NULL AND u.notifications_enabled
               AND m.id = ? AND m.status = 'ACTIVE'
-              AND m.time > EXTRACT(EPOCH FROM ?::timestamptz) * 1000
+              AND m.time > EXTRACT(EPOCH FROM clock_timestamp()) * 1000
+              AND public.timepad_policy_visible(
+                    m.id,
+                    (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
+                  )
               AND i.user_id = u.id AND i.status = 'ACTIVE' AND i.fid IS NOT NULL
-              AND i.last_seen_at > ?::timestamptz - INTERVAL '35 days'
+              AND i.last_seen_at > clock_timestamp() - INTERVAL '35 days'
             """.trimIndent(),
             { rs, _ ->
                 DiagnosticSelection(
@@ -367,7 +385,5 @@ class JdbcPushDiagnosticStore(
             installationId,
             userId,
             meetingId,
-            Timestamp.from(now),
-            Timestamp.from(now),
         ).firstOrNull()
 }

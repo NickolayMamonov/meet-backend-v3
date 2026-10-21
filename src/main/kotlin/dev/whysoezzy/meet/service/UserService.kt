@@ -9,6 +9,7 @@ import dev.whysoezzy.meet.domain.repository.CommunityRepository
 import dev.whysoezzy.meet.domain.repository.TagRepository
 import dev.whysoezzy.meet.domain.repository.RefreshTokenRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
+import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import dev.whysoezzy.meet.service.push.PushInstallationStore
 import mu.KotlinLogging
 import org.springframework.stereotype.Service
@@ -24,6 +25,8 @@ class UserService(
     private val refreshTokenRepository: RefreshTokenRepository,
     private val profileMapper: UserProfileMapper,
     private val pushInstallationStore: PushInstallationStore,
+    private val meetingRepository: MeetingRepository,
+    private val clock: java.time.Clock,
 ) {
 
     @Transactional(readOnly = true)
@@ -123,7 +126,7 @@ class UserService(
         val user = userRepository.findById(userId)
             .orElseThrow { NotFoundException("User not found") }
 
-        return user.participatingMeetings.map { meeting ->
+        return meetingRepository.findByParticipantId(userId, clock.millis()).map { meeting ->
             MeetingInfoDto(
                 id = meeting.id!!,
                 title = meeting.title,

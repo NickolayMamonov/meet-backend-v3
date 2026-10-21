@@ -103,7 +103,7 @@ class PushDiagnosticServiceTest {
             val response = service(store, provider).send(command()) as PushDiagnosticResponse.Single
 
             assertEquals(expected, response.result)
-            assertEquals(listOf("select"), store.calls)
+            assertEquals(listOf("select", "recheck"), store.calls)
             assertEquals(listOf(selected.fid), provider.fids)
         }
     }
@@ -121,7 +121,7 @@ class PushDiagnosticServiceTest {
             val response = service(store, provider).send(command()) as PushDiagnosticResponse.Single
 
             assertEquals(DiagnosticCallResult.InvalidTarget, response.result)
-            assertEquals(listOf("select", "lockOwner", "invalidate"), store.calls)
+            assertEquals(listOf("select", "recheck", "lockOwner", "invalidate"), store.calls)
             assertEquals(selected, store.invalidatedSelection)
             assertEquals(selected.fid, store.expectedFid)
             assertEquals(17, store.expectedVersion)
@@ -196,9 +196,9 @@ class PushDiagnosticServiceTest {
                 assertEquals(2, provider.messages.size)
                 assertEquals(
                     if (secondProvider == PushDeliveryResult.InvalidRegistration) {
-                        listOf("select", "recheck", "lockOwner", "invalidate")
+                        listOf("select", "recheck", "recheck", "lockOwner", "invalidate")
                     } else {
-                        listOf("select", "recheck")
+                        listOf("select", "recheck", "recheck")
                     },
                     store.calls,
                 )
@@ -227,9 +227,9 @@ class PushDiagnosticServiceTest {
             assertEquals(DiagnosticCallResult.NotAttempted, response.second)
             assertEquals(1, provider.messages.size)
             if (invalidation == DiagnosticInvalidation.APPLIED) {
-                assertEquals(listOf("select", "lockOwner", "invalidate", "recheck"), store.calls)
+                assertEquals(listOf("select", "recheck", "lockOwner", "invalidate", "recheck"), store.calls)
             } else {
-                assertFalse(store.calls.contains("recheck"))
+                assertEquals(listOf("select", "recheck", "lockOwner", "invalidate"), store.calls)
             }
         }
     }
@@ -251,7 +251,7 @@ class PushDiagnosticServiceTest {
             assertEquals(DiagnosticCallResult.Accepted, response.first)
             assertEquals(DiagnosticCallResult.InvalidTarget, response.second)
             assertEquals(2, provider.messages.size)
-            assertEquals(listOf("select", "recheck", "lockOwner", "invalidate"), store.calls)
+            assertEquals(listOf("select", "recheck", "recheck", "lockOwner", "invalidate"), store.calls)
         }
     }
 
@@ -277,7 +277,7 @@ class PushDiagnosticServiceTest {
             assertEquals(DiagnosticCallResult.NotAttempted, response.second)
             assertEquals(DiagnosticAggregateResult.INCONCLUSIVE, response.result)
             assertEquals(1, provider.messages.size)
-            assertEquals(listOf("select", "recheck"), store.calls)
+            assertEquals(listOf("select", "recheck", "recheck"), store.calls)
         }
     }
 
@@ -311,7 +311,7 @@ class PushDiagnosticServiceTest {
         assertEquals(DiagnosticCallResult.NotAttempted, first.second)
         assertEquals(DiagnosticAggregateResult.INCONCLUSIVE, first.result)
         assertEquals(1, firstProvider.messages.size)
-        assertEquals(listOf("select"), firstStore.calls)
+        assertEquals(listOf("select", "recheck"), firstStore.calls)
 
         val secondProvider = QueueProvider(
             PushDeliveryResult.Accepted,
@@ -325,7 +325,7 @@ class PushDiagnosticServiceTest {
         assertEquals(DiagnosticCallResult.ProviderUnavailable, second.second)
         assertEquals(DiagnosticAggregateResult.INCONCLUSIVE, second.result)
         assertEquals(2, secondProvider.messages.size)
-        assertEquals(listOf("select", "recheck"), secondStore.calls)
+        assertEquals(listOf("select", "recheck", "recheck"), secondStore.calls)
     }
 
     @Test
@@ -412,9 +412,9 @@ class PushDiagnosticServiceTest {
             command(mode = PushDiagnosticMode.DEDUP_PAIR),
         )
 
-        assertEquals(listOf("select", "recheck"), store.calls)
-        assertEquals(2, transactions.begins)
-        assertEquals(2, transactions.commits)
+        assertEquals(listOf("select", "recheck", "recheck"), store.calls)
+        assertEquals(3, transactions.begins)
+        assertEquals(3, transactions.commits)
         assertEquals(0, transactions.rollbacks)
         assertTrue(transactions.timeouts.all { it == 5 })
         assertEquals(2, provider.messages.size)
@@ -443,6 +443,7 @@ class PushDiagnosticServiceTest {
     ) : PushDiagnosticStore {
         val calls = mutableListOf<String>()
         var rechecked: DiagnosticSelection? = selected
+        private var recheckCount = 0
         var selectFailure: RuntimeException? = null
         var recheckFailure: RuntimeException? = null
         val invalidations = ArrayDeque<DiagnosticInvalidation>()
@@ -462,8 +463,9 @@ class PushDiagnosticServiceTest {
 
         override fun recheckEligible(selection: DiagnosticSelection, now: Instant): DiagnosticSelection? {
             calls += "recheck"
-            recheckFailure?.let { throw it }
-            return rechecked
+            recheckCount++
+            if (recheckCount > 1) recheckFailure?.let { throw it }
+            return if (recheckCount == 1) selected else rechecked
         }
 
         override fun lockOwner(userId: Long) {

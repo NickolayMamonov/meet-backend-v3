@@ -99,8 +99,8 @@ class MeetingService(
     @Transactional(readOnly = true)
     fun getMeetingById(id: Long, currentUserId: Long?): MeetingDto {
         logger.info { "Fetching meeting: $id" }
-        val meeting = meetingRepository.findById(id)
-            .orElseThrow { NotFoundException("Meeting not found") }
+        val meeting = meetingRepository.findVisibleById(id, clock.millis())
+            ?: throw NotFoundException("Meeting not found")
         return meeting.toDto(currentUserId)
     }
 
@@ -110,8 +110,8 @@ class MeetingService(
 
         val user = userRepository.findWithLockById(userId)
             ?: throw NotFoundException("User not found")
-        val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { NotFoundException("Meeting not found") }
+        val meeting = meetingRepository.findVisibleById(meetingId, clock.millis())
+            ?: throw NotFoundException("Meeting not found")
 
         if (!meeting.isActive()) throw ConflictException("Meeting is not active")
         if (meetingRepository.isUserParticipant(meetingId, userId))
@@ -131,8 +131,8 @@ class MeetingService(
 
         val user = userRepository.findWithLockById(userId)
             ?: throw NotFoundException("User not found")
-        val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { NotFoundException("Meeting not found") }
+        val meeting = meetingRepository.findById(meetingId).orElse(null)
+            ?: throw NotFoundException("Meeting not found")
 
         if (!meetingRepository.isUserParticipant(meetingId, userId))
             throw ConflictException("User is not a participant")
@@ -144,15 +144,15 @@ class MeetingService(
     @Transactional(readOnly = true)
     fun getUserMeetings(userId: Long): List<MeetingDto> {
         logger.info { "Fetching meetings for user: $userId" }
-        return meetingRepository.findByParticipantId(userId)
+        return meetingRepository.findByParticipantId(userId, clock.millis())
             .map { it.toDto(userId) }
     }
 
     @Transactional(readOnly = true)
     fun getMeetingParticipants(meetingId: Long): List<UserInfoDto> {
         logger.info { "Fetching participants for meeting: $meetingId" }
-        val meeting = meetingRepository.findById(meetingId)
-            .orElseThrow { NotFoundException("Meeting not found") }
+        val meeting = meetingRepository.findVisibleById(meetingId, clock.millis())
+            ?: throw NotFoundException("Meeting not found")
 
         return meeting.participants.map { user ->
             UserInfoDto(
@@ -195,7 +195,11 @@ class MeetingService(
                     title = community.name,
                     description = community.description,
                     imageUrl = community.imageUrl,
-                    meetingsInfo = community.getActiveMeetings().take(5).map { m ->
+                    meetingsInfo = meetingRepository.findVisibleByCommunity(
+                        community.id!!,
+                        MeetingStatus.ACTIVE,
+                        clock.millis(),
+                    ).take(5).map { m ->
                         MeetingInfoDto(m.id!!, m.title, m.imageUrl, m.date)
                     }
                 )

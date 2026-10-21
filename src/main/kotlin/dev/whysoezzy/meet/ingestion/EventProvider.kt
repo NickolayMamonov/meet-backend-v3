@@ -1,7 +1,7 @@
 package dev.whysoezzy.meet.ingestion
 
 import dev.whysoezzy.meet.domain.entity.EventSource
-import java.time.LocalDateTime
+import java.time.Instant
 
 /**
  * Адаптер источника событий. Один реализующий бин = один источник.
@@ -12,9 +12,20 @@ interface EventProvider {
     /** Какой источник обслуживает провайдер. */
     fun source(): EventSource
 
-    /**
-     * Достать события из источника.
-     * @param since подтягивать созданные/обновлённые после этого момента (инкрементально); null — полная выборка.
-     */
-    fun fetch(since: LocalDateTime?): List<RawEvent>
+    fun fetch(context: FetchContext): ProviderFetchResult
+}
+
+data class FetchContext(
+    val observedAt: Instant,
+    val savedExternalIds: List<String>,
+)
+
+sealed interface ProviderFetchResult {
+    data class Complete(
+        val accepted: List<RawEvent>,
+        val rejectedSavedExternalIds: Set<String>,
+        val observedCount: Int,
+    ) : ProviderFetchResult
+
+    data class Incomplete(val reason: String) : ProviderFetchResult
 }

@@ -68,15 +68,12 @@ app:
     refresh-token-expiration-days: 30
 
   timepad:
-    enabled: ${TIMEPAD_ENABLED:true}
+    enabled: ${TIMEPAD_ENABLED:false}
     base-url: https://api.timepad.ru/v1
     token: ${TIMEPAD_TOKEN:}
-    category-ids: [452]
-    keywords:
-    cities:
+    asset-base-url: ${TIMEPAD_ASSET_BASE_URL:}
     page-size: 100
     max-pages: 5
-    days-ahead: 180
     zone: Europe/Moscow
 
   otp:

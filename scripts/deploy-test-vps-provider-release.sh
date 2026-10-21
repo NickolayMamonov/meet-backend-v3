@@ -14,8 +14,39 @@ is_supported_test_vps_version() {
 }
 
 usage() {
-  echo "usage: $0 --root PATH --base-compose PATH --image IMAGE@sha256:DIGEST --revision SHA --version VERSION --run-key KEY --mode deploy|rollback-drill [--closed-beta-safety --state-mode empty-closed|closed-beta-demo] [--public-url https://HOST]" >&2
+  echo "usage: $0 --root PATH --base-compose PATH --image IMAGE@sha256:DIGEST --revision SHA --version VERSION --run-key KEY --mode deploy|rollback-drill [--failure-policy automatic-rollback|manual-stop] [--closed-beta-safety --state-mode empty-closed|closed-beta-demo] [--public-url https://HOST]" >&2
   exit 2
+}
+
+provider_release_on_exit() {
+  local status=$?
+  trap - EXIT
+  if [ "$status" -ne 0 ] && [ "$rollback_complete" = false ]; then
+    if [ "$mutation_started" = true ]; then
+      if [ "$failure_policy" = manual-stop ]; then
+        provider_release_stop_backend || status=1
+      else
+        rollback || status=1
+      fi
+    elif [ "$credential_prepared" = true ]; then
+      if verify_predecessor_for_cleanup; then
+        provider_finish rolled-back "$cleanup_inspect" || status=1
+      else
+        status=1
+      fi
+    fi
+  fi
+  exit "$status"
+}
+
+provider_release_stop_backend() {
+  echo "manual_intervention_required=true backend_stop=attempted" >&2
+  if compose stop backend; then
+    echo "manual_intervention_required=true backend_stop=completed" >&2
+  else
+    echo "manual_intervention_required=true backend_stop=failed" >&2
+    return 1
+  fi
 }
 
 fail() {
@@ -506,6 +537,8 @@ revision=
 version=
 run_key=
 mode=
+failure_policy=automatic-rollback
+failure_policy_set=false
 closed_beta_safety=false
 public_url=
 state_mode=
@@ -518,6 +551,12 @@ while [ "$#" -gt 0 ]; do
     --version) [ "$#" -ge 2 ] && [ -z "$version" ] || usage; version=$2; shift 2 ;;
     --run-key) [ "$#" -ge 2 ] && [ -z "$run_key" ] || usage; run_key=$2; shift 2 ;;
     --mode) [ "$#" -ge 2 ] && [ -z "$mode" ] || usage; mode=$2; shift 2 ;;
+    --failure-policy)
+      [ "$#" -ge 2 ] && [ "$failure_policy_set" = false ] || usage
+      failure_policy=$2
+      failure_policy_set=true
+      shift 2
+      ;;
     --closed-beta-safety)
       [ "$closed_beta_safety" = false ] || usage
       closed_beta_safety=true
@@ -549,6 +588,10 @@ is_supported_test_vps_version "$version" ||
   fail "target version must be at least v1.2.0"
 [[ "$run_key" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || usage
 case "$mode" in deploy|rollback-drill) ;; *) usage ;; esac
+case "$failure_policy" in automatic-rollback|manual-stop) ;; *) usage ;; esac
+if [ "$failure_policy" = manual-stop ] && [ "$mode" = rollback-drill ]; then
+  fail "manual-stop failure policy does not permit rollback-drill"
+fi
 if [ -n "$public_url" ]; then
   [[ "$public_url" =~ ^https://[^/]+$ ]] || usage
 fi
@@ -910,23 +953,7 @@ recovery_deadline_check() {
   [ "$((SECONDS - recovery_started_at))" -lt 600 ] ||
     fail "RECOVERY_REQUIRED"
 }
-on_exit() {
-  local status=$?
-  trap - EXIT
-  if [ "$status" -ne 0 ] && [ "$rollback_complete" = false ]; then
-    if [ "$mutation_started" = true ]; then
-      rollback || status=1
-    elif [ "$credential_prepared" = true ]; then
-      if verify_predecessor_for_cleanup; then
-        provider_finish rolled-back "$cleanup_inspect" || status=1
-      else
-        status=1
-      fi
-    fi
-  fi
-  exit "$status"
-}
-trap on_exit EXIT
+trap provider_release_on_exit EXIT
 trap 'exit 143' TERM INT HUP
 
 target_id=$(docker_image_inspect "$image" --format '{{.Id}}') ||

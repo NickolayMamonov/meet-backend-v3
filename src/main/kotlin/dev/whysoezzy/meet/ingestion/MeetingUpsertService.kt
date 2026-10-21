@@ -27,8 +27,21 @@ class MeetingUpsertService(
     private val dateFormatter = DateTimeFormatter.ofPattern("dd.MM.yyyy")
 
     @Transactional
-    fun upsert(source: EventSource, raw: RawEvent): UpsertResult {
-        val topics = topicClassifier.classify(raw)
+    fun upsert(source: EventSource, raw: RawEvent): UpsertResult =
+        upsertInternal(source, raw, topicClassifier.classify(raw), null)
+
+    @Transactional
+    fun upsertTimepad(raw: RawEvent, eligibleUntilMs: Long): UpsertResult {
+        require(raw.timepadGroups.isNotEmpty())
+        return upsertInternal(EventSource.TIMEPAD, raw, raw.timepadGroups.toSet(), eligibleUntilMs)
+    }
+
+    private fun upsertInternal(
+        source: EventSource,
+        raw: RawEvent,
+        topics: Set<String>,
+        eligibleUntilMs: Long?,
+    ): UpsertResult {
         if (topics.isEmpty() && onlyMatchingTopics) return UpsertResult.SKIPPED
 
         val dateLabel = Instant.ofEpochMilli(raw.startsAtEpochMs)
@@ -36,13 +49,21 @@ class MeetingUpsertService(
         val dedup = dedupHash(raw, dateLabel)
         val tags = resolveTags(topics)
 
-        val existing = meetingRepository.findBySourceAndSourceExternalId(source, raw.sourceExternalId)
+        val existing = if (source == EventSource.TIMEPAD) {
+            meetingRepository.findForUpdateBySourceAndSourceExternalId(source, raw.sourceExternalId)
+        } else {
+            meetingRepository.findBySourceAndSourceExternalId(source, raw.sourceExternalId)
+        }
 
-        val (lat, lng) = resolveCoordinates(
-            raw = raw,
-            existingLat = existing?.latitude ?: 0.0,
-            existingLng = existing?.longitude ?: 0.0,
-        )
+        val (lat, lng) = if (source == EventSource.TIMEPAD) {
+            raw.latitude to raw.longitude
+        } else {
+            resolveCoordinates(
+                raw = raw,
+                existingLat = existing?.latitude ?: 0.0,
+                existingLng = existing?.longitude ?: 0.0,
+            )
+        }
 
         return if (existing != null) {
             existing.title = raw.title
@@ -57,6 +78,7 @@ class MeetingUpsertService(
             existing.externalUrl = raw.externalUrl
             existing.isOnline = raw.isOnline
             existing.ingestedAt = LocalDateTime.now()
+            existing.timepadEligibleUntilMs = eligibleUntilMs
             existing.dedupHash = dedup
             existing.tags.clear()
             existing.tags.addAll(tags)
@@ -80,6 +102,7 @@ class MeetingUpsertService(
                 isOnline = raw.isOnline,
                 ingestedAt = LocalDateTime.now(),
                 dedupHash = dedup,
+                timepadEligibleUntilMs = eligibleUntilMs,
             )
             meetingRepository.save(meeting)
             UpsertResult.CREATED

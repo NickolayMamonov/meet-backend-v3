@@ -56,6 +56,10 @@ class MeetingReminderStore(
                   AND u.notifications_enabled
                   AND m.status = 'ACTIVE'
                   AND m.time > EXTRACT(EPOCH FROM ?::timestamptz) * 1000
+                  AND public.timepad_policy_visible(
+                      m.id,
+                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
+                  )
                   AND to_timestamp((m.time - o.minutes * 60000)::double precision / 1000)
                       BETWEEN ?::timestamptz - INTERVAL '15 minutes' AND ?::timestamptz
                   AND NOT EXISTS (
@@ -111,20 +115,30 @@ class MeetingReminderStore(
 
         val meeting = jdbc.query(
             """
-            SELECT time, push_start_version, status
+            SELECT time, push_start_version, status,
+                   public.timepad_policy_visible(
+                       id,
+                       (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
+                   ) AS policy_visible
             FROM meetings WHERE id = ? FOR SHARE
             """.trimIndent(),
-            { rs, _ -> Triple(rs.getLong("time"), rs.getLong("push_start_version"), rs.getString("status")) },
+            { rs, _ ->
+                Pair(
+                    Triple(rs.getLong("time"), rs.getLong("push_start_version"), rs.getString("status")),
+                    rs.getBoolean("policy_visible"),
+                )
+            },
             candidate.meetingId,
         ).firstOrNull() ?: return null
         val due = candidate.dueAt
         val deadline = candidate.deadlineAt
-        val currentDue = Instant.ofEpochMilli(meeting.first - candidate.offset.minutes * 60_000L)
+        val currentDue = Instant.ofEpochMilli(meeting.first.first - candidate.offset.minutes * 60_000L)
         if (
-            meeting.third != "ACTIVE" ||
-            meeting.first <= now.toEpochMilli() ||
-            meeting.first != candidate.meetingStartMs ||
-            meeting.second != candidate.startVersion ||
+            meeting.first.third != "ACTIVE" ||
+            !meeting.second ||
+            meeting.first.first <= now.toEpochMilli() ||
+            meeting.first.first != candidate.meetingStartMs ||
+            meeting.first.second != candidate.startVersion ||
             currentDue != due ||
             now.isBefore(due) ||
             now.isAfter(deadline)

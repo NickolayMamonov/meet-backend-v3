@@ -5,6 +5,8 @@ import dev.whysoezzy.meet.api.error.NotFoundException
 import dev.whysoezzy.meet.api.dto.*
 import dev.whysoezzy.meet.domain.entity.Community
 import dev.whysoezzy.meet.domain.repository.CommunityRepository
+import dev.whysoezzy.meet.domain.entity.MeetingStatus
+import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
 import mu.KotlinLogging
 import org.springframework.stereotype.Service
@@ -15,7 +17,9 @@ private val logger = KotlinLogging.logger {}
 @Service
 class CommunityService(
     private val communityRepository: CommunityRepository,
-    private val userRepository: UserRepository
+    private val userRepository: UserRepository,
+    private val meetingRepository: MeetingRepository,
+    private val clock: java.time.Clock,
 ) {
 
     @Transactional(readOnly = true)
@@ -80,7 +84,11 @@ class CommunityService(
         val community = communityRepository.findById(communityId)
             .orElseThrow { NotFoundException("Community not found") }
 
-        return community.getActiveMeetings().map { meeting ->
+        return meetingRepository.findVisibleByCommunity(
+            communityId,
+            MeetingStatus.ACTIVE,
+            clock.millis(),
+        ).map { meeting ->
             MeetingDto(
                 id = meeting.id!!,
                 imageUrl = meeting.imageUrl,
@@ -113,7 +121,10 @@ class CommunityService(
                 meetingStatus = meeting.status.name,
                 isUserInParticipants = currentUserId?.let { uid ->
                     meeting.participants.any { it.id == uid }
-                } ?: false
+                } ?: false,
+                source = meeting.source.name,
+                externalUrl = meeting.externalUrl,
+                isOnline = meeting.isOnline,
             )
         }
     }

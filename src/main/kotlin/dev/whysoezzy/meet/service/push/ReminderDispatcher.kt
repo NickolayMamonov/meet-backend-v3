@@ -520,6 +520,10 @@ class JdbcReminderDispatchStore(
                        SELECT 1 FROM meeting_participants mp
                        WHERE mp.user_id = t.user_id AND mp.meeting_id = c.meeting_id
                    ) AS joined,
+                   public.timepad_policy_visible(
+                       m.id,
+                       (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
+                   ) AS policy_visible,
                    i.fid, i.status AS installation_status,
                    i.registration_version, i.last_seen_at
             FROM meeting_reminder_targets t
@@ -541,7 +545,7 @@ class JdbcReminderDispatchStore(
                 userAvailable = row.deletedAt == null,
                 optedIn = row.notificationsEnabled,
                 joinedMeeting = row.joined,
-                meetingAvailable = row.meetingStatus == "ACTIVE",
+                meetingAvailable = row.meetingStatus == "ACTIVE" && row.policyVisible,
                 expectedStart = Instant.ofEpochMilli(row.meetingStartMs),
                 actualStart = Instant.ofEpochMilli(row.actualStartMs),
                 expectedStartVersion = row.startVersion,
@@ -655,6 +659,7 @@ class JdbcReminderDispatchStore(
             actualStartMs = rs.getLong("actual_start_ms"),
             actualStartVersion = rs.getLong("actual_start_version"),
             joined = rs.getBoolean("joined"),
+            policyVisible = rs.getBoolean("policy_visible"),
             fid = rs.getString("fid"),
             installationStatus = rs.getString("installation_status"),
             registrationVersion = rs.getLong("registration_version"),
@@ -675,6 +680,7 @@ class JdbcReminderDispatchStore(
         val actualStartMs: Long,
         val actualStartVersion: Long,
         val joined: Boolean,
+        val policyVisible: Boolean,
         val fid: String?,
         val installationStatus: String,
         val registrationVersion: Long,
@@ -747,6 +753,10 @@ class JdbcReminderDispatchStore(
                     WHERE mp.user_id = t.user_id AND mp.meeting_id = c.meeting_id
                 ) THEN 'LEFT_MEETING'
                 WHEN m.status <> 'ACTIVE' THEN 'MEETING_UNAVAILABLE'
+                WHEN NOT public.timepad_policy_visible(
+                    m.id,
+                    (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
+                ) THEN 'MEETING_UNAVAILABLE'
                 WHEN m.time <> c.meeting_start_ms
                      OR m.push_start_version <> c.start_version THEN 'START_CHANGED'
                 WHEN m.time <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint THEN 'STARTED'
