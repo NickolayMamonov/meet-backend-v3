@@ -4194,7 +4194,10 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         if not line.startswith("fixture_timepad_create_handshake="):
                             continue
                         event = line.partition("=")[2]
-                        if event not in {"read-timeout", "token-mismatch", "accepted", "released"}:
+                        if event not in {
+                            "read-start", "read-timeout", "token-received", "token-mismatch",
+                            "accepted", "write-start", "write-complete", "released",
+                        }:
                             self.fail("unexpected fixed handshake diagnostic")
                         handshake_events.append(event)
                     relay_path = case / ("recovery-relay-" + lease["attempt"] + ".json")
