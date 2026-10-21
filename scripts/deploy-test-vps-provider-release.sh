@@ -2335,11 +2335,14 @@ sys.stdout.buffer.write(data)
   owned_child_attempt=$attempt_id
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$child_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
-  timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
-  fixture_create_start_trace request-published
+  # The handshake grant covers establishing and durably recording ownership.
+  # Complete it before request publication obtains its independent state-write
+  # grant; both operations must not compete for the same short deadline.
   supervisor_client complete "$handshake_grant" >/dev/null ||
     fail "OWNED_CHILD_GRANT_REQUIRED"
   fixture_create_start_trace handshake-grant-completed
+  timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
+  fixture_create_start_trace request-published
   grant=$(supervisor_client grant docker 30) || fail "OWNED_CHILD_GRANT_REQUIRED"
   owned_child_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
   fixture_create_start_trace docker-grant-received
