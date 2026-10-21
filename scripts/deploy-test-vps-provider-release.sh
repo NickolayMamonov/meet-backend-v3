@@ -2131,7 +2131,7 @@ run_owned_child() {
     fixture_timepad_create_diagnostic() {
       [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
       case "${1:-}" in
-        read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released) ;;
+        child-started|child-captured|child-published|request-begun|read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released|intent-published|handshake-grant-completed|docker-grant-issued|release-published) ;;
         *) return 0 ;;
       esac
       timeout 2s python3 - "$1" <<PY >/dev/null 2>&1 || :
@@ -2196,6 +2196,7 @@ sys.stdout.buffer.write(data)
     exit "${statuses[1]}"
   ' _ "$fifo" "$token" "$@" >"$owned_child_response" &
   owned_child_pid=$!
+  fixture_timepad_create_diagnostic child-started
   [ "$noclobber_was_set" = true ] || set +o noclobber
   child_json=
   for ((attempt = 0; attempt < 10; attempt++)); do
@@ -2206,6 +2207,7 @@ sys.stdout.buffer.write(data)
   done
   [ -n "$child_json" ] ||
     fail "OWNED_CHILD_CAPTURE_FAILED"
+  fixture_timepad_create_diagnostic child-captured
   jq -e --argjson pid "$owned_child_pid" --arg digest "$command_digest" \
     --arg attempt "$attempt_id" '
       .pid == $pid and .processGroup == $pid and
@@ -2214,15 +2216,21 @@ sys.stdout.buffer.write(data)
   owned_child_attempt=$attempt_id
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$child_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
+  fixture_timepad_create_diagnostic child-published
   timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
+  fixture_timepad_create_diagnostic request-begun
+  fixture_timepad_create_diagnostic intent-published
   supervisor_client complete "$handshake_grant" >/dev/null ||
     fail "OWNED_CHILD_GRANT_REQUIRED"
+  fixture_timepad_create_diagnostic handshake-grant-completed
   grant=$(supervisor_client grant docker 30) || fail "OWNED_CHILD_GRANT_REQUIRED"
+  fixture_timepad_create_diagnostic docker-grant-issued
   owned_child_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
   released_json=$(jq -ce '.lifecycle="released"' <<<"$child_json") ||
     fail "OWNED_CHILD_CAPTURE_FAILED"
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$released_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
+  fixture_timepad_create_diagnostic release-published
   local handshake_fd
   exec {handshake_fd}<>"$fifo"
   fixture_timepad_create_diagnostic write-start
