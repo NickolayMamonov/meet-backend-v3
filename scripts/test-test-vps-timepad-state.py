@@ -2266,7 +2266,8 @@ class OwnedChildStateTests(unittest.TestCase):
             state.publish_current(root, prepared)
             state.publish_current(root, state.advance_state(prepared, "CUTOVER_POSSIBLE"))
             functions = "\n".join(controller_function(name) for name in (
-                "timepad_advance", "next_owned_child_attempt", "complete_owned_child", "run_owned_child",
+                "timepad_advance", "next_owned_child_attempt", "complete_owned_child",
+                "fixture_timepad_create_diagnostic", "run_owned_child",
             ))
             script = r"""
 set -euo pipefail

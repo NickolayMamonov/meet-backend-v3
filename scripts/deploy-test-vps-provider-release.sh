@@ -2161,7 +2161,8 @@ run_owned_child() {
   owned_child_response=$state/.runtime-response-$attempt_id
   [ ! -e "$owned_child_response" ] && [ ! -L "$owned_child_response" ] ||
     fail "OWNED_CHILD_INVALID"
-  export -f fixture_timepad_create_diagnostic
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    export -f fixture_timepad_create_diagnostic || :
   grant=$(supervisor_client grant child-handshake 5) || fail "OWNED_CHILD_GRANT_REQUIRED"
   handshake_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
   umask 077
@@ -2169,6 +2170,46 @@ run_owned_child() {
   set -o noclobber
   setsid bash -c '
     set -euo pipefail
+    fixture_timepad_create_diagnostic() {
+      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
+      case "${1:-}" in
+        child-captured|child-published|request-begun|handshake-grant-completed|docker-grant-issued|release-published|read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released) ;;
+        *) return 0 ;;
+      esac
+      timeout 2s python3 - "$1" <<PY >/dev/null 2>&1 || :
+import fcntl
+import os
+import re
+import stat
+import sys
+
+path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE", "")
+if re.fullmatch(
+    r"/var/lib/timepad-fixture/case-[A-Za-z0-9_-]{1,64}/fixture/recovery-diagnostics",
+    path,
+) is None:
+    raise SystemExit(1)
+record = ("fixture_timepad_create_handshake=" + sys.argv[1] + "\n").encode("ascii")
+path_info = os.lstat(path)
+if not stat.S_ISREG(path_info.st_mode) or stat.S_IMODE(path_info.st_mode) != 0o600:
+    raise SystemExit(1)
+fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_uid != os.geteuid()
+        or (path_info.st_dev, path_info.st_ino) != (info.st_dev, info.st_ino)
+        or info.st_size > 4096 - len(record)
+    ):
+        raise SystemExit(1)
+    if os.write(fd, record) != len(record):
+        raise SystemExit(1)
+finally:
+    os.close(fd)
+PY
+    }
     exec {gate_fd}<>"$1"
     fixture_timepad_create_diagnostic read-start
     if ! IFS= read -r -t 5 gate <&"$gate_fd"; then
@@ -2207,7 +2248,8 @@ sys.stdout.buffer.write(data)
   done
   [ -n "$child_json" ] ||
     fail "OWNED_CHILD_CAPTURE_FAILED"
-  fixture_timepad_create_diagnostic child-captured
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    fixture_timepad_create_diagnostic child-captured || :
   jq -e --argjson pid "$owned_child_pid" --arg digest "$command_digest" \
     --arg attempt "$attempt_id" '
       .pid == $pid and .processGroup == $pid and
@@ -2216,29 +2258,37 @@ sys.stdout.buffer.write(data)
   owned_child_attempt=$attempt_id
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$child_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
-  fixture_timepad_create_diagnostic child-published
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    fixture_timepad_create_diagnostic child-published || :
   timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
-  fixture_timepad_create_diagnostic request-begun
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    fixture_timepad_create_diagnostic request-begun || :
   supervisor_client complete "$handshake_grant" >/dev/null ||
     fail "OWNED_CHILD_GRANT_REQUIRED"
-  fixture_timepad_create_diagnostic handshake-grant-completed
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    fixture_timepad_create_diagnostic handshake-grant-completed || :
   grant=$(supervisor_client grant docker 30) || fail "OWNED_CHILD_GRANT_REQUIRED"
-  fixture_timepad_create_diagnostic docker-grant-issued
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    fixture_timepad_create_diagnostic docker-grant-issued || :
   owned_child_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
   released_json=$(jq -ce '.lifecycle="released"' <<<"$child_json") ||
     fail "OWNED_CHILD_CAPTURE_FAILED"
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$released_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
-  fixture_timepad_create_diagnostic release-published
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    fixture_timepad_create_diagnostic release-published || :
   local handshake_fd
   exec {handshake_fd}<>"$fifo"
-  fixture_timepad_create_diagnostic write-start
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    fixture_timepad_create_diagnostic write-start || :
   printf '%s\n' "$token" >&"$handshake_fd"
-  fixture_timepad_create_diagnostic write-complete
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    fixture_timepad_create_diagnostic write-complete || :
   exec {handshake_fd}>&-
   # The shell child has its own bounded wait; persist only this fixed enum so
   # the supervisor need not inherit or expose runtime-command stderr.
-  fixture_timepad_create_diagnostic released
+  declare -F fixture_timepad_create_diagnostic >/dev/null &&
+    fixture_timepad_create_diagnostic released || :
   complete_owned_child || fail "OWNED_CHILD_QUIESCENCE_UNCONFIRMED"
   return "$owned_child_wait_status"
 }
