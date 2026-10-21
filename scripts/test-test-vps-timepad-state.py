@@ -4200,7 +4200,10 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                                 "publish-read-attempted", "publish-read-failed",
                                 "publish-state-read", "publish-changes-written",
                                 "publish-advance-attempted", "publish-advance-failed",
-                                "publish-advance-completed",
+                                "publish-advance-completed", "publish-grant-requested",
+                                "publish-grant-refused", "publish-grant-received",
+                                "publish-helper-returned", "publish-grant-complete-refused",
+                                "publish-grant-completed",
                                 "handshake-grant-completed", "docker-grant-received",
                                 "release-published", "token-written",
                             }:

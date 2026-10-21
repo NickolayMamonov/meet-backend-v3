@@ -56,7 +56,9 @@ fixture_create_start_trace() {
     request-state-read|request-built|request-published|publish-state-read|\
     publish-read-attempted|publish-read-failed|publish-changes-written|\
     publish-advance-attempted|publish-advance-failed|\
-    publish-advance-completed|handshake-grant-completed|\
+    publish-advance-completed|publish-grant-requested|publish-grant-refused|\
+    publish-grant-received|publish-helper-returned|publish-grant-complete-refused|\
+    publish-grant-completed|handshake-grant-completed|\
     docker-grant-received|release-published|token-written) ;;
     *) return 0 ;;
   esac
@@ -1065,7 +1067,21 @@ supervisor_timeout() {
       *) return 1 ;;
     esac
   fi
-  grant=$(supervisor_client grant "$wait_name" "${local_bound%s}") || return 124
+  if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+    [ "${3:-}" = advance ]; then
+    fixture_create_start_trace publish-grant-requested
+  fi
+  grant=$(supervisor_client grant "$wait_name" "${local_bound%s}") || {
+    if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+      [ "${3:-}" = advance ]; then
+      fixture_create_start_trace publish-grant-refused
+    fi
+    return 124
+  }
+  if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+    [ "${3:-}" = advance ]; then
+    fixture_create_start_trace publish-grant-received
+  fi
   grant_id=$(jq -er '.grantId | strings' <<<"$grant") || return 1
   end_ns=$(jq -er '.endNs | numbers' <<<"$grant") || return 1
   if [ "$executable" = python3 ] && [ "${2:-}" = "$provider_helper" ]; then
@@ -1105,7 +1121,21 @@ PY
   else
     status=$?
   fi
-  supervisor_client complete "$grant_id" >/dev/null || return 1
+  if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+    [ "${3:-}" = advance ]; then
+    fixture_create_start_trace publish-helper-returned
+  fi
+  supervisor_client complete "$grant_id" >/dev/null || {
+    if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+      [ "${3:-}" = advance ]; then
+      fixture_create_start_trace publish-grant-complete-refused
+    fi
+    return 1
+  }
+  if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+    [ "${3:-}" = advance ]; then
+    fixture_create_start_trace publish-grant-completed
+  fi
   return "$status"
 }
 
