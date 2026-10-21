@@ -4110,6 +4110,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     "TIMEPAD_FIXTURE_EXPECTED_DOCKER": str(bin_path / "docker"),
                     "TIMEPAD_FIXTURE_EXPECTED_DOCKER_LOG": str(case / "docker.log"),
                     "TIMEPAD_FIXTURE_DIAGNOSTICS": "1",
+                    "TIMEPAD_FIXTURE_START_TRACE": "1",
                     "TIMEPAD_FIXTURE_DIAGNOSTIC_FILE": str(case / "recovery-diagnostics"),
                     "TEST_VPS_STATE_ROOT": str(state_root),
                 })

@@ -49,8 +49,11 @@ fixture_create_stage() {
     OWNED_START_RELEASE_PUBLISHED|OWNED_START_TOKEN_WRITTEN)
       case "$1" in
       OWNED_START_*)
-      printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
-      if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
+      if [ "${TIMEPAD_FIXTURE_START_TRACE:-}" = 1 ]; then
+        printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
+      fi
+      if [ "${TIMEPAD_FIXTURE_START_TRACE:-}" = 1 ] &&
+        [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
         command timeout 2s python3 - "$1" <<'PY' >/dev/null 2>&1 || :
 import fcntl
 import os
