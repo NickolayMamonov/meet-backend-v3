@@ -1624,12 +1624,12 @@ fail() { echo "$1" >&2; exit 99; }
         self.assertIn('read -r -t 5 gate', source)
         self.assertLess(source.index('timepad_advance "$phase"'),
                         source.index('printf \'%s\\n\' "$token"'))
-        self.assertLess(
-            source.index('timepad_request_begin start'),
-            source.index("setsid bash -c"),
-        )
         self.assertLess(source.index('timepad_advance "$phase"'),
                         source.index('supervisor_client complete "$handshake_grant"'))
+        self.assertLess(
+            source.index('supervisor_client complete "$handshake_grant"'),
+            source.index('timepad_request_begin start'),
+        )
         # The phase is metadata; the command executable remains in argv.
         self.assertIn("\n  shift\n", source)
         self.assertNotIn("\n  shift 2\n", source)
