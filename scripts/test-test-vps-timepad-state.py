@@ -4195,11 +4195,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                             continue
                         event = line.partition("=")[2]
                         if event not in {
-                            "child-started", "child-captured", "child-published", "request-begun",
                             "read-start", "read-timeout", "token-received", "token-mismatch",
                             "accepted", "write-start", "write-complete", "released",
-                            "intent-published", "handshake-grant-completed",
-                            "docker-grant-issued", "release-published",
                         }:
                             self.fail("unexpected fixed handshake diagnostic")
                         handshake_events.append(event)
