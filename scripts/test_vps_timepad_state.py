@@ -1,0 +1,3544 @@
+#!/usr/bin/env python3
+"""Fail-closed admission, durable guard state, and shared deploy-lock helpers.
+
+This module has no runtime, network, shell, or credential side effects. Its
+filesystem operations are deliberately Linux-only; parsing and admission are
+portable and independently testable.
+
+CLI mutation schemas:
+* When an execution lease exists, schema/bootstrap/owned-child mutations
+  require ``--execution-attempt``, ``--execution-grant`` and ``--deadline-ns``.
+  The helper validates the live private RPC grant and rechecks revocation and
+  the same absolute deadline at durable-write boundaries. FD9/nonce alone is
+  not write authority.
+* ``retain-unresolved`` is exclusive to the fixed fail-closed worker's
+  ``cleanup-publish`` grant. It changes only the fixed unresolved reason/phase,
+  preserving COMMITTING, all proof and child ownership; it never reports stop
+  confirmation or success.
+  The same worker may publish only a correlated stop request after the fixed
+  exact-retry verifier refusal, with no owned child and every other incident
+  field unchanged. Its read-only provider proof must precede stop completion;
+  neither this exception nor process reap authorizes a start or successful
+  schema outcome.
+* ``publish-lease --lease`` accepts the fixed supervisor lease snapshot only,
+  publishes it atomically under inherited FD9, and returns its exact revision
+  and SHA-256 only after fsync and readback. Each worker publication revalidates
+  the exact live private snapshot at durable-write boundaries; a live PID and
+  FD9 alone cannot fabricate a drained lease or authorize lease succession.
+  A lease is never auto-cleared.
+  A drained snapshot with ``worker=null`` is published only by the supervisor's
+  sole direct filesystem child after all original workers have exited. A new
+  authenticated attempt can replace that completed lease with intact terminal
+  guard state, or through the explicit proof-first stale recovery path below.
+* ``check-lease --attempt`` is the read-only interlock for provider and
+  retention callers; callers must pass their already-held FD9.
+* ``register-recovery`` consumes a private ``recovery-registration`` grant
+  before its initial lease exists. It checks the fixed protected authorization
+  file, exact dispatch selectors and frozen contract under FD9 before lease
+  publication. An unleased incident gets read-only registration only. A stale
+  nonterminal lease additionally requires ``--runtime-evidence`` on stdin,
+  definitive exit of all recorded identities, supervisor-owned prior ECHILD,
+  exact daemon acknowledgment/completion, inventory and provider/config proof.
+  Only then may it adopt current followed by the new registered lease under
+  uninterrupted FD9. A partial publication fails closed and needs separate
+  reconciliation; it is not a crash-atomic two-file transaction.
+* ``rollback-admission`` checks the private fixed worker/grant, frozen state
+  and owned snapshot/runtime/provider reconstruction without writes. Its
+  bounded proof is not a mutation capability. The dedicated rollback worker
+  must transition its lease and independently reconstruct again under the
+  current state-publish grant before ``claim-rollback`` can publish.
+* ``prepare --evidence`` accepts exactly ``rootId``, ``targetId``,
+  ``predecessorId``, ``predecessorContainerId``, ``transitionId``, ``target``, ``predecessor``,
+  ``operation``, ``runId``, ``incidentId``, ``ownedRun`` and ``toolingDigest``.
+  The two image values are the complete reviewed tuples; this command derives
+  their domains from the active contract and emits only admission, epoch,
+  incident ID and resulting phase.
+* ``advance --changes`` accepts exactly ``{"changes": {...}}``. The inner
+  object may contain only ``reason``, ``containerId``, ``configHash``,
+  ``ownedChild``, ``commitWitnessDigest``, ``providerFinalizationDigest``,
+  ``commitSubstep``, ``terminalReceipt``, ``latestAttemptId`` or ``runtimeRequest``. Values remain subject to the
+  strict current-state schema and transition invariants; phase is a required
+  fixed CLI choice, never a changes-file field.
+
+``ownedChild`` records one immutable process-group identity and the lifecycle
+``waiting`` → ``released`` → ``reaped`` (a cancelled waiter may go directly to
+``reaped``). Publish the waiting identity and ``latestAttemptId`` together, then
+publish released intent before releasing the handshake. Attempt IDs are
+``<incidentId>:<uint64 sequence>`` beginning at 1; clearing a reaped child retains
+the counter. Durable reap/clear publication verifies group disappearance; the
+controller remains responsible for waiting on its own child.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import errno
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import secrets
+import stat
+import sys
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping
+
+try:
+    import fcntl
+except ImportError:  # Parsing/admission remain portable; filesystem operations require Linux.
+    fcntl = None
+
+CONTRACT_SCHEMA = "meet-backend/test-vps-timepad-release-contracts/v1"
+STATE_SCHEMA = "meet-backend/test-vps-timepad-state/v4"
+ORIGIN_SCHEMA = "meet-backend/test-vps-timepad-origin/v1"
+CONTROLLER = "timepad-cutover-v1"
+MAX_CONTRACT_BYTES = 64 * 1024
+MAX_AUTHORIZATION_BYTES = 32 * 1024
+MAX_ORIGIN_BYTES = 4 * 1024
+MAX_CURRENT_BYTES = 16 * 1024
+MAX_CHANGES_BYTES = 4 * 1024
+MAX_EXECUTION_LEASE_BYTES = 4 * 1024
+MAX_CREATE_COMPLETION_BYTES = 4 * 1024
+CREATE_COMPLETION_SCHEMA = "meet-backend/test-vps-timepad-create-completion/v1"
+MAX_RECOVERY_RUNTIME_BYTES = 8 * 1024 * 1024 + 32768
+MAX_JSON_DEPTH = 8
+MAX_IMAGES = 8
+MAX_STR = 128
+MAX_LIST_ITEMS = 64
+MAX_KEY = 64
+MAX_U64 = (1 << 64) - 1
+GUARD_DIR = "timepad-guard"
+LOCK_NAME = ".deploy.lock"
+EXECUTION_LEASE_NAME = ".timepad-execution.json"
+RENAME_NOREPLACE = 1
+HEX_256 = re.compile(r"^[a-f0-9]{64}$")
+REVISION = re.compile(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
+VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$")
+IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+ROOT_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+BOOT_ID = re.compile(r"^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$")
+LEASE_NONCE = re.compile(r"^[a-f0-9]{32}$")
+CHILD_ATTEMPT_ID = re.compile(r"^([a-f0-9]{32}):([1-9][0-9]{0,19})$")
+CHILD_LIFECYCLES = frozenset({"waiting", "released", "reaped"})
+CHILD_ACTIVE_PHASES = frozenset({
+    "CUTOVER_POSSIBLE", "VERIFYING", "FORWARD_RECOVERING", "ROLLING_BACK",
+    "RECOVERY_REQUIRED",
+})
+CHILD_IDENTITY_FIELDS = frozenset({
+    "pid", "processGroup", "bootId", "startTicks", "commandDigest", "attemptId",
+})
+
+
+class GuardError(Exception):
+    """A fixed, sanitized failure safe to return through the CLI."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _reject(reason: str = "INVALID_INPUT") -> None:
+    raise GuardError(reason)
+
+
+def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            _reject()
+        value[key] = item
+    return value
+
+
+def _check_depth(value: Any, depth: int = 0) -> None:
+    if depth > MAX_JSON_DEPTH:
+        _reject("INPUT_TOO_DEEP")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or len(key) > MAX_KEY:
+                _reject()
+            _check_depth(item, depth + 1)
+    elif isinstance(value, list):
+        if len(value) > MAX_LIST_ITEMS:
+            _reject()
+        for item in value:
+            _check_depth(item, depth + 1)
+    elif isinstance(value, str):
+        if len(value) > MAX_STR or "\x00" in value:
+            _reject("INPUT_TOO_LARGE")
+    elif value is None or type(value) in (bool, int, float):
+        if isinstance(value, float):
+            _reject()
+        if type(value) is int and not -(1 << 63) <= value <= MAX_U64:
+            _reject()
+    else:
+        _reject()
+
+
+def parse_json(data: bytes, limit: int) -> Any:
+    if not isinstance(data, bytes) or len(data) > limit:
+        _reject("INPUT_TOO_LARGE")
+    try:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        _reject()
+    _check_depth(value)
+    return value
+
+
+def _object(value: Any, keys: set[str], *, exact: bool = True) -> dict[str, Any]:
+    if not isinstance(value, dict) or (exact and value.keys() != keys) or not keys <= value.keys():
+        _reject()
+    return value
+
+
+def _text(value: Any, *, pattern: re.Pattern[str] | None = None, maximum: int = MAX_STR) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value:
+        _reject()
+    if pattern is not None and pattern.fullmatch(value) is None:
+        _reject()
+    return value
+
+
+def _digest(value: Any) -> str:
+    return _text(value, pattern=HEX_256, maximum=64)
+
+
+@dataclass(frozen=True)
+class ExecutionGrant:
+    attempt: str
+    grant_id: str
+    end_ns: int
+
+    def __post_init__(self) -> None:
+        _text(self.attempt, pattern=LEASE_NONCE, maximum=32)
+        _text(self.grant_id, pattern=LEASE_NONCE, maximum=32)
+        if type(self.end_ns) is not int or not 0 < self.end_ns < 1 << 63:
+            _reject("EXECUTION_GRANT_INVALID")
+
+
+_EXECUTION_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
+    "timepad_execution_check", default=None,
+)
+_CREATE_COMPLETION_PUBLICATION: ContextVar[bool] = ContextVar(
+    "timepad_create_completion_publication", default=False,
+)
+_RECOVERY_CREATE_COMPLETION_PROOF: ContextVar[bool] = ContextVar(
+    "timepad_recovery_create_completion_proof", default=False,
+)
+
+
+def _execution_check() -> None:
+    check = _EXECUTION_CHECK.get()
+    if check is not None:
+        check()
+
+
+@contextmanager
+def _execution_mutation(
+    root: str | os.PathLike[str], deploy_lock_fd: int | None,
+    grant: ExecutionGrant | None,
+    *, cleanup_only: bool = False, create_completion_only: bool = False,
+) -> Iterator[None]:
+    """Validate the live capability, not only the last durable lease snapshot."""
+    lease = _read_execution_lease_locked(root)
+    if lease is None:
+        if grant is not None or create_completion_only:
+            _reject("EXECUTION_GRANT_INVALID")
+        yield
+        return
+    if deploy_lock_fd is None:
+        _reject("EXECUTION_LEASE_FD_REQUIRED")
+    if grant is None or grant.attempt != lease["attempt"] or \
+            not _execution_lease_supervisor_is_live(lease):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    role = lease["workerMode"]
+    cleanup = role == "fail-closed-worker"
+    if cleanup != cleanup_only:
+        _reject("EXECUTION_LEASE_STOP_ONLY")
+    end = lease["hardEndNs"] if cleanup else lease["workEndNs"]
+    if end is None or grant.end_ns > end:
+        _reject("EXECUTION_GRANT_INVALID")
+    expected_name = ("create-completion" if create_completion_only
+                     else "cleanup-publish" if cleanup else "state-publish")
+    if create_completion_only and (
+        role != "controller-worker" or os.getppid() != lease["supervisor"]["pid"]
+    ):
+        _reject("EXECUTION_GRANT_INVALID")
+    if (
+        cleanup and lease["lifecycle"] != "draining"
+        or role == "controller-worker" and (
+            lease["lifecycle"] != "armed" or lease["firstFailure"] is not None
+        )
+        or role == "rollback-worker" and (
+            lease["operation"] != "deploy" or lease["lifecycle"] != "rolling-back"
+            or not lease["rollbackIssued"]
+        )
+        or role not in {"controller-worker", "rollback-worker", "fail-closed-worker"}
+    ):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    from test_vps_timepad_supervisor import SupervisorError, WorkerClient
+
+    client = None
+    token = None
+    try:
+        client = WorkerClient(str(root))
+        if client.attempt != grant.attempt or client.role != role or \
+                client.supervisor != lease["supervisor"]:
+            _reject("EXECUTION_GRANT_INVALID")
+
+        def check() -> None:
+            if time.monotonic_ns() >= grant.end_ns:
+                _reject("EXECUTION_GRANT_EXPIRED")
+            response = client.request(
+                "validate-grant", grantId=grant.grant_id, endNs=grant.end_ns,
+            )
+            if response != {
+                "attempt": grant.attempt, "grantId": grant.grant_id,
+                "endNs": grant.end_ns, "role": role, "name": expected_name,
+            }:
+                _reject("EXECUTION_GRANT_INVALID")
+            if time.monotonic_ns() >= grant.end_ns:
+                _reject("EXECUTION_GRANT_EXPIRED")
+
+        token = _EXECUTION_CHECK.set(check)
+        check()
+        yield
+        check()
+    except SupervisorError:
+        _reject("EXECUTION_GRANT_REVOKED")
+    finally:
+        if token is not None:
+            _EXECUTION_CHECK.reset(token)
+        if client is not None:
+            client.close()
+
+
+def _execution_lease(value: Any) -> dict[str, Any]:
+    """Validate one bounded snapshot emitted by the fixed execution supervisor."""
+    fields = {
+        "format", "attempt", "operation", "t0Ns", "workEndNs", "hardEndNs",
+        "firstFailure", "firstStatus", "rollbackIssued", "lifecycle", "revision",
+        "supervisor", "worker", "workerMode", "workers", "createCompletion",
+    }
+    lease = _object(value, fields)
+    if type(lease["format"]) is not int or lease["format"] != 1:
+        _reject("EXECUTION_LEASE_INVALID")
+    _text(lease["attempt"], pattern=LEASE_NONCE, maximum=32)
+    _text(lease["operation"], pattern=re.compile(r"^(?:deploy|forward-recover|retention)$"), maximum=32)
+    _text(lease["lifecycle"], pattern=re.compile(
+        r"^(?:registered|armed|cancel-forward|drain-forward|rollback-admission|rolling-back|"
+        r"draining|quiescence-unconfirmed|drained)$"
+    ), maximum=32)
+    _uint(lease["revision"])
+    _bool(lease["rollbackIssued"])
+    deadlines = tuple(lease[key] for key in ("t0Ns", "workEndNs", "hardEndNs"))
+    if any(item is None for item in deadlines):
+        if not all(item is None for item in deadlines):
+            _reject("EXECUTION_LEASE_INVALID")
+    else:
+        start, work_end, hard_end = (_uint(item) for item in deadlines)
+        if not start <= work_end <= hard_end:
+            _reject("EXECUTION_LEASE_INVALID")
+    if lease["firstFailure"] is not None:
+        _text(lease["firstFailure"], pattern=re.compile(r"^[A-Z][A-Z0-9_]{0,63}$"))
+    if lease["firstStatus"] is not None and (
+        type(lease["firstStatus"]) is not int or not 1 <= lease["firstStatus"] <= 255
+    ):
+        _reject("EXECUTION_LEASE_INVALID")
+    if (lease["firstFailure"] is None) != (lease["firstStatus"] is None):
+        _reject("EXECUTION_LEASE_INVALID")
+    _text(lease["workerMode"], pattern=re.compile(
+        r"^(?:controller-worker|rollback-worker|fail-closed-worker|retention-worker)$"
+    ), maximum=32)
+
+    def identity(raw: Any, *, nullable: bool = False) -> dict[str, Any] | None:
+        if nullable and raw is None:
+            return None
+        row = _object(raw, {"pid", "startTicks", "bootId"})
+        if type(row["pid"]) is not int or not 1 < row["pid"] <= (1 << 31) - 1:
+            _reject("EXECUTION_LEASE_INVALID")
+        if type(row["startTicks"]) is not int or not 0 < row["startTicks"] <= MAX_U64:
+            _reject("EXECUTION_LEASE_INVALID")
+        _text(row["bootId"], pattern=BOOT_ID, maximum=36)
+        return row
+
+    identity(lease["supervisor"])
+    identity(lease["worker"], nullable=True)
+    if not isinstance(lease["workers"], list) or len(lease["workers"]) > 3:
+        _reject("EXECUTION_LEASE_INVALID")
+    for worker in lease["workers"]:
+        worker = _object(worker, {"mode", "pid", "startTicks", "bootId"})
+        _text(worker["mode"], pattern=re.compile(
+            r"^(?:controller-worker|rollback-worker|fail-closed-worker|retention-worker)$"
+        ), maximum=32)
+        identity({key: worker[key] for key in ("pid", "startTicks", "bootId")})
+    if lease["rollbackIssued"] and lease["operation"] == "retention":
+        _reject("EXECUTION_LEASE_INVALID")
+    if lease["createCompletion"] is not None:
+        completion = _create_completion_evidence(lease["createCompletion"])
+        if lease["operation"] == "retention" or (
+            completion["executionAttempt"] != lease["attempt"]
+            and not (lease["operation"] == "forward-recover" and completion["acknowledged"])
+        ):
+            _reject("EXECUTION_LEASE_INVALID")
+    return lease
+
+
+def _bool(value: Any) -> bool:
+    if type(value) is not bool:
+        _reject()
+    return value
+
+
+def _uint(value: Any) -> int:
+    if type(value) is not int or not 0 <= value <= MAX_U64:
+        _reject()
+    return value
+
+
+def _tuple(value: Any) -> dict[str, Any]:
+    obj = _object(
+        value,
+        {
+            "repositoryDigest",
+            "platformImageId",
+            "revision",
+            "version",
+            "migrationInventoryDigest",
+            "migrationResources",
+            "beforeSchema",
+            "afterSchema",
+            "guardEvidence",
+            "dependencyPolicy",
+            "dependencyFloor",
+            "recoveryEvidence",
+            "retryExact",
+            "unknownTransitionCovered",
+        },
+    )
+    for key in ("repositoryDigest", "platformImageId", "migrationInventoryDigest",
+                "beforeSchema", "afterSchema", "guardEvidence", "dependencyFloor",
+                "recoveryEvidence"):
+        _digest(obj[key])
+    _text(obj["revision"], pattern=REVISION, maximum=64)
+    _text(obj["version"], pattern=VERSION, maximum=64)
+    _text(obj["dependencyPolicy"], pattern=re.compile(r"^(?:resolved|not-applicable)$"), maximum=32)
+    if not isinstance(obj["migrationResources"], list) or len(obj["migrationResources"]) > 64:
+        _reject()
+    resources = [_text(item, pattern=IDENTIFIER) for item in obj["migrationResources"]]
+    if len(resources) != len(set(resources)):
+        _reject()
+    _bool(obj["retryExact"])
+    _bool(obj["unknownTransitionCovered"])
+    return obj
+
+
+def _binding(value: Any) -> dict[str, Any]:
+    obj = _object(value, {"id", "tuple", "domain"})
+    _text(obj["id"], pattern=IDENTIFIER)
+    _tuple(obj["tuple"])
+    _text(obj["domain"], pattern=IDENTIFIER)
+    return obj
+
+
+def _tooling(value: Any) -> dict[str, Any]:
+    obj = _object(value, {
+        "dockerCliVersion", "composeVersion", "composeCommit", "dockerCliPath",
+        "composePluginPath", "dockerCliSha256", "composePluginSha256", "platform", "provenanceRef",
+    })
+    for item in obj.values():
+        _text(item, maximum=512)
+    if (obj["dockerCliVersion"], obj["composeVersion"], obj["composeCommit"]) != (
+        "28.3.3", "2.39.4", "a32dc3da722e6b2e4fbfc72e40b1a697c4686460",
+    ) or obj["platform"] not in {"linux/amd64", "linux/arm64"}:
+        _reject("CONTRACT_UNSUPPORTED")
+    for key, basename in (("dockerCliPath", "docker"), ("composePluginPath", "docker-compose")):
+        path = obj[key]
+        if re.fullmatch(r"/[A-Za-z0-9._/-]+", path) is None or \
+                any(part in {"", ".", ".."} for part in path.split("/")[1:]) or \
+                path.rsplit("/", 1)[-1] != basename:
+            _reject()
+    for key in ("dockerCliSha256", "composePluginSha256"):
+        _digest(obj[key])
+    return obj
+
+
+def parse_contract(data: bytes | Mapping[str, Any]) -> dict[str, Any]:
+    value = parse_json(data, MAX_CONTRACT_BYTES) if isinstance(data, bytes) else data
+    obj = _object(
+        value,
+        {"schema", "formatVersion", "controller", "active", "rootId",
+         "initialDomain", "transitions", "images"},
+        exact=False,
+    )
+    if obj.keys() - {"schema", "formatVersion", "controller", "active", "rootId",
+                     "initialDomain", "transitions", "images", "tooling"}:
+        _reject()
+    if "tooling" in obj:
+        _tooling(obj["tooling"])
+    if obj["schema"] != CONTRACT_SCHEMA or type(obj["formatVersion"]) is not int or obj["formatVersion"] != 1:
+        _reject("CONTRACT_UNSUPPORTED")
+    if obj["controller"] != CONTROLLER:
+        _reject("CONTRACT_UNSUPPORTED")
+    _bool(obj["active"])
+    if obj["rootId"] is not None:
+        _text(obj["rootId"], pattern=ROOT_KEY)
+    if not all(isinstance(obj[name], list) for name in ("initialDomain", "transitions", "images")):
+        _reject()
+    if len(obj["images"]) > MAX_IMAGES or len(obj["initialDomain"]) > MAX_IMAGES or len(obj["transitions"]) > MAX_IMAGES:
+        _reject("INPUT_TOO_LARGE")
+    ids: set[str] = set()
+    for item in obj["images"]:
+        parsed = _binding(item)
+        if parsed["id"] in ids:
+            _reject()
+        ids.add(parsed["id"])
+    for item in obj["initialDomain"]:
+        row = _object(item, {"id", "tuple"})
+        _text(row["id"], pattern=IDENTIFIER)
+        if row["id"] in ids:
+            _reject()
+        ids.add(row["id"])
+        _tuple(row["tuple"])
+    transition_ids: set[str] = set()
+    for item in obj["transitions"]:
+        row = _object(item, {"id", "targetId", "beforeSchema", "afterSchema", "compatiblePredecessors"})
+        transition_id = _text(row["id"], pattern=IDENTIFIER)
+        if transition_id in transition_ids:
+            _reject("CONTRACT_DUPLICATE_TRANSITION")
+        transition_ids.add(transition_id)
+        _text(row["targetId"], pattern=IDENTIFIER)
+        _digest(row["beforeSchema"])
+        _digest(row["afterSchema"])
+        if not isinstance(row["compatiblePredecessors"], list) or len(row["compatiblePredecessors"]) > MAX_IMAGES:
+            _reject()
+        refs = [_text(ref, pattern=IDENTIFIER) for ref in row["compatiblePredecessors"]]
+        if len(refs) != len(set(refs)):
+            _reject()
+        if any(ref not in ids for ref in refs):
+            _reject("CONTRACT_REFERENCE_UNKNOWN")
+        target = next((item for item in obj["images"] if item["id"] == row["targetId"]), None)
+        if target is None:
+            _reject()
+        target_tuple = target["tuple"]
+        if (target_tuple["beforeSchema"], target_tuple["afterSchema"]) != (
+            row["beforeSchema"], row["afterSchema"],
+        ):
+            _reject("CONTRACT_TRANSITION_MISMATCH")
+        if target_tuple["dependencyPolicy"] != "resolved" or \
+                not target_tuple["retryExact"] or not target_tuple["unknownTransitionCovered"]:
+            _reject("CONTRACT_TARGET_RECOVERY_UNPROVEN")
+        for ref in refs:
+            predecessor = next((item for item in obj["images"] if item["id"] == ref), None)
+            if predecessor is None:
+                _reject("CONTRACT_REFERENCE_UNKNOWN")
+            tuple_value = predecessor["tuple"]
+            if tuple_value["afterSchema"] != row["afterSchema"] or \
+                    tuple_value["dependencyPolicy"] != "resolved" or \
+                    not tuple_value["retryExact"] or not tuple_value["unknownTransitionCovered"]:
+                _reject("CONTRACT_COMPATIBILITY_UNPROVEN")
+    if obj["active"] and (obj["rootId"] is None or not obj["images"]):
+        _reject("CONTRACT_INCOMPLETE")
+    if not obj["active"] and (obj["rootId"] is not None or obj["initialDomain"] or obj["transitions"] or obj["images"]):
+        _reject("INACTIVE_CONTRACT_HAS_AUTHORITY")
+    return obj
+
+
+@dataclass(frozen=True)
+class Admission:
+    disposition: str
+    reason: str
+    contract_digest: str
+    target_id: str | None
+    predecessor_id: str | None
+    transition_id: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "disposition": self.disposition,
+            "reason": self.reason,
+            "contractDigest": self.contract_digest,
+            "targetId": self.target_id,
+            "predecessorId": self.predecessor_id,
+            "transitionId": self.transition_id,
+        }
+
+
+def admit(
+    contract: Mapping[str, Any] | bytes,
+    *,
+    root_id: str,
+    target_id: str,
+    predecessor_id: str,
+    transition_id: str | None,
+    target_tuple: Mapping[str, Any] | None,
+    predecessor_tuple: Mapping[str, Any] | None,
+) -> Admission:
+    try:
+        parsed = parse_contract(contract)
+        _text(root_id, pattern=ROOT_KEY)
+        target = _text(target_id, pattern=IDENTIFIER)
+        predecessor = _text(predecessor_id, pattern=IDENTIFIER)
+        if not parsed["active"] or parsed["rootId"] != root_id:
+            _reject("CONTRACT_INACTIVE_OR_WRONG_ROOT")
+        target_binding = next((x for x in parsed["images"] if x["id"] == target), None)
+        pred_binding = next((x for x in parsed["images"] if x["id"] == predecessor), None)
+        initial = {x["id"]: x["tuple"] for x in parsed["initialDomain"]}
+        target_evidence = target_binding["tuple"] if target_binding else initial.get(target)
+        predecessor_evidence = pred_binding["tuple"] if pred_binding else initial.get(predecessor)
+        if target_evidence is None or predecessor_evidence is None or \
+                target_tuple is None or predecessor_tuple is None:
+            _reject("IMAGE_NOT_REVIEWED")
+        if _tuple(target_tuple) != target_evidence or _tuple(predecessor_tuple) != predecessor_evidence:
+            _reject("OBSERVED_IMAGE_MISMATCH")
+        if transition_id is None:
+            if target not in initial or predecessor not in initial:
+                _reject("IMAGE_NOT_REVIEWED")
+            target_schema = target_evidence["afterSchema"]
+            predecessor_schema = predecessor_evidence["afterSchema"]
+            if target_evidence["beforeSchema"] != target_schema or \
+                    predecessor_evidence["beforeSchema"] != predecessor_schema or \
+                    target_schema != predecessor_schema:
+                _reject("INITIAL_DOMAIN_PROOF_MISMATCH")
+            disposition, reason = "legacy-no-transition", "UNCHANGED_DOMAIN_REVIEWED"
+        else:
+            if target_binding is None:
+                _reject("TRANSITION_TARGET_UNBOUND")
+            transition = next((x for x in parsed["transitions"] if x["id"] == transition_id), None)
+            if transition is None or transition["targetId"] != target:
+                _reject("TRANSITION_NOT_REVIEWED")
+            if target_binding["tuple"]["beforeSchema"] != transition["beforeSchema"] or \
+                    target_binding["tuple"]["afterSchema"] != transition["afterSchema"]:
+                _reject("TRANSITION_EVIDENCE_MISMATCH")
+            if predecessor in transition["compatiblePredecessors"]:
+                pred = predecessor_evidence
+                if not pred["retryExact"] or not pred["unknownTransitionCovered"] or \
+                        pred["dependencyPolicy"] != "resolved" or \
+                        pred["afterSchema"] != transition["afterSchema"]:
+                    _reject("PREDECESSOR_RECOVERY_UNPROVEN")
+                disposition, reason = "post-barrier-compatible", "PREDECESSOR_FULLY_COMPATIBLE"
+            else:
+                disposition, reason = "pre-barrier-only", "PREDECESSOR_NOT_POST_BARRIER_COMPATIBLE"
+        canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+        return Admission(
+            disposition, reason, hashlib.sha256(canonical).hexdigest(),
+            target, predecessor, transition_id,
+        )
+    except GuardError as exc:
+        return Admission("refuse", exc.reason, "", None, None)
+
+
+def _canonical(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def _origin(value: Any) -> dict[str, Any]:
+    obj = _object(value, {
+        "schema", "controller", "rootId", "bootstrapId", "initialRuntime",
+        "initialConfig", "initialSchema", "initialStartupInventory",
+        "schemaHistoryProvenance", "originDigest",
+    })
+    if obj["schema"] != ORIGIN_SCHEMA or obj["controller"] != CONTROLLER:
+        _reject("ORIGIN_INVALID")
+    _text(obj["rootId"], pattern=ROOT_KEY)
+    _text(obj["bootstrapId"], pattern=IDENTIFIER)
+    for key in ("initialRuntime", "initialConfig", "initialSchema", "initialStartupInventory"):
+        _digest(obj[key])
+    _bool(obj["schemaHistoryProvenance"])
+    _digest(obj["originDigest"])
+    unsigned = dict(obj)
+    digest = unsigned.pop("originDigest")
+    if hashlib.sha256(_canonical(unsigned)).hexdigest() != digest:
+        _reject("ORIGIN_INVALID")
+    return obj
+
+
+PHASES = frozenset({
+    "READY", "PREPARED", "CUTOVER_POSSIBLE", "VERIFYING", "COMMITTING",
+    "COMMITTED", "ROLLING_BACK", "ROLLED_BACK", "RECOVERY_REQUIRED",
+    "FORWARD_RECOVERING",
+})
+TERMINAL = frozenset({"COMMITTED", "ROLLED_BACK"})
+
+
+def _child_attempt_sequence(value: Any, incident_id: str | None = None) -> int:
+    attempt = _text(value, pattern=CHILD_ATTEMPT_ID, maximum=53)
+    incident, sequence = attempt.split(":")
+    if incident_id is not None and incident != incident_id:
+        _reject("STATE_CHILD_ATTEMPT_CONFLICT")
+    return _uint(int(sequence))
+
+
+def _owned_child(value: Any) -> dict[str, Any]:
+    child = _object(value, CHILD_IDENTITY_FIELDS | {"lifecycle"})
+    for name in ("pid", "processGroup"):
+        if type(child[name]) is not int or not 1 < child[name] <= (1 << 31) - 1:
+            _reject("STATE_CHILD_INVALID")
+    if child["processGroup"] != child["pid"] or _uint(child["startTicks"]) == 0:
+        _reject("STATE_CHILD_INVALID")
+    _text(child["bootId"], pattern=BOOT_ID, maximum=36)
+    _digest(child["commandDigest"])
+    _child_attempt_sequence(child["attemptId"])
+    if not isinstance(child["lifecycle"], str) or child["lifecycle"] not in CHILD_LIFECYCLES:
+        _reject("STATE_CHILD_INVALID")
+    return child
+
+
+CREATE_REQUEST_FIELDS = frozenset({
+    "originDigest", "operationEpoch", "incidentId", "operationToken",
+    "preparedProofDigest", "modelDigest", "toolingDigest", "role",
+    "priorContainerId", "childIdentity", "resourcesDigest", "resourceRequestDigest",
+})
+
+
+def runtime_request(value: Any) -> dict[str, Any]:
+    """One bounded correlated daemon request, not a process-liveness assertion."""
+    create = isinstance(value, dict) and value.get("operation") == "create"
+    predecessor = isinstance(value, dict) and value.get("role") == "predecessor"
+    fields = {
+        "nonce", "sequence", "executionAttempt", "operation", "containerId",
+        "imageId", "configHash", "childAttemptId", "lifecycle", "responseId",
+        "completionDigest",
+    }
+    predecessor_fields = {
+        "role", "originDigest", "incidentId", "operationEpoch",
+        "preparedProofDigest", "evidenceDigest",
+    }
+    row = _object(value, fields | CREATE_REQUEST_FIELDS if create else
+                  fields | predecessor_fields if predecessor else fields)
+    _text(row["nonce"], pattern=LEASE_NONCE, maximum=32)
+    if _uint(row["sequence"]) == 0:
+        _reject("RUNTIME_REQUEST_INVALID")
+    _text(row["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
+    _digest(row["imageId"])
+    if predecessor:
+        if row["operation"] not in {"suppress", "stop"} or row["childAttemptId"] is not None:
+            _reject("RUNTIME_REQUEST_INVALID")
+        for key in ("originDigest", "preparedProofDigest", "evidenceDigest"):
+            _digest(row[key])
+        _text(row["incidentId"], pattern=LEASE_NONCE, maximum=32)
+        if _uint(row["operationEpoch"]) == 0:
+            _reject("RUNTIME_REQUEST_INVALID")
+    if create:
+        for key in ("originDigest", "preparedProofDigest", "modelDigest", "toolingDigest",
+                    "resourcesDigest", "resourceRequestDigest"):
+            _digest(row[key])
+        if _uint(row["operationEpoch"]) == 0:
+            _reject("RUNTIME_REQUEST_INVALID")
+        for key in ("incidentId", "operationToken"):
+            _text(row[key], pattern=LEASE_NONCE, maximum=32)
+        _child_attempt_sequence(row["childAttemptId"], row["incidentId"])
+        child = _object(row["childIdentity"], CHILD_IDENTITY_FIELDS)
+        _owned_child(dict(child, lifecycle="waiting"))
+        if child["attemptId"] != row["childAttemptId"]:
+            _reject("RUNTIME_REQUEST_CHILD_CONFLICT")
+        if row["role"] not in ("initial", "replacement"):
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["priorContainerId"] is not None:
+            _digest(row["priorContainerId"])
+        if (row["role"] == "initial") != (row["priorContainerId"] is None):
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["lifecycle"] not in ("intent", "normal-completed", "bound"):
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["lifecycle"] == "bound":
+            _digest(row["containerId"])
+            _digest(row["configHash"])
+            if row["responseId"] != row["containerId"] or \
+                    row["containerId"] == row["priorContainerId"]:
+                _reject("RUNTIME_REQUEST_INVALID")
+        elif any(row[key] is not None for key in ("containerId", "configHash", "responseId")):
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["lifecycle"] == "intent":
+            if row["completionDigest"] is not None:
+                _reject("RUNTIME_REQUEST_INVALID")
+        else:
+            _digest(row["completionDigest"])
+        return row
+    if not isinstance(row["operation"], str) or \
+            row["operation"] not in {"start", "stop", "suppress", "restore-policy"}:
+        _reject("RUNTIME_REQUEST_INVALID")
+    _digest(row["containerId"])
+    _digest(row["configHash"])
+    if row["childAttemptId"] is not None:
+        _child_attempt_sequence(row["childAttemptId"])
+    if not isinstance(row["lifecycle"], str) or \
+            row["lifecycle"] not in {"intent", "acknowledged", "completed"}:
+        _reject("RUNTIME_REQUEST_INVALID")
+    if row["lifecycle"] == "intent":
+        if row["responseId"] is not None or row["completionDigest"] is not None:
+            _reject("RUNTIME_REQUEST_INVALID")
+    else:
+        # Single-container Docker commands acknowledge the exact submitted ID.
+        # Neither an empty stdout nor a successful client exit is that receipt.
+        if row["responseId"] != row["containerId"]:
+            _reject("RUNTIME_REQUEST_INVALID")
+        if row["lifecycle"] == "completed":
+            _digest(row["completionDigest"])
+        elif row["completionDigest"] is not None:
+            _reject("RUNTIME_REQUEST_INVALID")
+    return row
+
+
+def require_runtime_request_completion(current: Mapping[str, Any]) -> dict[str, Any]:
+    request = current.get("runtimeRequest")
+    if request is None:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    request = runtime_request(request)
+    if request["operation"] == "create":
+        if request["lifecycle"] == "bound" or (
+            request["lifecycle"] == "normal-completed"
+            and _RECOVERY_CREATE_COMPLETION_PROOF.get()
+        ):
+            return request
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    if request["lifecycle"] != "completed":
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    return request
+
+
+def require_create_normal_completion(current: Mapping[str, Any]) -> dict[str, Any]:
+    """Read-only binding is allowed only after durable normal completion, never intent."""
+    request = current.get("runtimeRequest")
+    if request is None:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    request = runtime_request(request)
+    if request["operation"] != "create" or request["lifecycle"] not in {"normal-completed", "bound"}:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    return request
+
+
+def _require_matching_create_child(current: Mapping[str, Any]) -> dict[str, Any]:
+    request = current.get("runtimeRequest")
+    child = current.get("ownedChild")
+    if request is None or child is None:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    request = runtime_request(request)
+    child = _owned_child(child)
+    if (
+        request["operation"] != "create"
+        or request["childAttemptId"] != child["attemptId"]
+        or child["lifecycle"] not in {"waiting", "released", "reaped"}
+        or any(child[key] != request["childIdentity"][key] for key in CHILD_IDENTITY_FIELDS)
+    ):
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    return child
+
+
+def create_request_digest(value: Mapping[str, Any]) -> str:
+    request = runtime_request(dict(value))
+    if request["operation"] != "create":
+        _reject("RUNTIME_REQUEST_INVALID")
+    intent = dict(request, lifecycle="intent", containerId=None, configHash=None,
+                  responseId=None, completionDigest=None)
+    return hashlib.sha256(_canonical(intent)).hexdigest()
+
+
+def _create_completion_evidence(value: Any) -> dict[str, Any]:
+    evidence = _object(value, {
+        "requestDigest", "receiptDigest", "executionAttempt", "childIdentity",
+        "waitStatus", "uncancelled", "descendantsDrained", "acknowledged",
+        "resourcesDigest", "resourceRequestDigest",
+    })
+    for key in ("requestDigest", "receiptDigest", "resourcesDigest", "resourceRequestDigest"):
+        _digest(evidence[key])
+    _text(evidence["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
+    _object(evidence["childIdentity"], CHILD_IDENTITY_FIELDS)
+    _owned_child(dict(evidence["childIdentity"], lifecycle="waiting"))
+    if type(evidence["waitStatus"]) is not int or evidence["waitStatus"] != 0 or \
+            evidence["uncancelled"] is not True or evidence["descendantsDrained"] is not True:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    _bool(evidence["acknowledged"])
+    return evidence
+
+
+def validate_create_completion(
+    current: Mapping[str, Any], lease: Mapping[str, Any], receipt: bytes,
+    *, acknowledged: bool,
+) -> None:
+    """Receipt fragments and inspection never repair a missing durable lease acknowledgment."""
+    request = require_create_normal_completion(current)
+    evidence = _create_completion_evidence(lease.get("createCompletion"))
+    expected = {
+        "schema": CREATE_COMPLETION_SCHEMA, "requestDigest": create_request_digest(request),
+        "executionAttempt": request["executionAttempt"], "childIdentity": request["childIdentity"],
+        "resourcesDigest": request["resourcesDigest"],
+        "resourceRequestDigest": request["resourceRequestDigest"],
+        "waitStatus": 0, "uncancelled": True, "descendantsDrained": True,
+    }
+    if (
+        parse_json(receipt, MAX_CREATE_COMPLETION_BYTES) != expected
+        or receipt != _canonical(expected)
+        or hashlib.sha256(receipt).hexdigest() != request["completionDigest"]
+        or evidence != {
+            **{key: value for key, value in expected.items() if key != "schema"},
+            "receiptDigest": request["completionDigest"], "acknowledged": acknowledged,
+        }
+        or lease["attempt"] != request["executionAttempt"] and not (
+            lease["operation"] == "forward-recover" and acknowledged
+            and evidence["executionAttempt"] == request["executionAttempt"]
+        )
+        or any(
+            evidence["childIdentity"][key] != request["childIdentity"][key]
+            for key in CHILD_IDENTITY_FIELDS
+        )
+    ):
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+
+
+def _require_create_completion_locked(
+    root: str | os.PathLike[str], current: Mapping[str, Any], *, acknowledged: bool,
+) -> None:
+    request = require_create_normal_completion(current)
+    lease = _read_execution_lease_locked(root)
+    if lease is None:
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    root_fd = _open_root(root)
+    try:
+        run_fd = os.open(
+            _text(current["ownedRun"], pattern=ROOT_KEY),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd,
+        )
+        try:
+            info = os.fstat(run_fd)
+            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                _reject("STATE_PATH_UNSAFE")
+            _require_no_acl(run_fd, directory=True)
+            name = ("timepad-create-completion.json" if request["role"] == "initial"
+                    else "timepad-replacement-completion.json")
+            receipt = _read_at(run_fd, name, MAX_CREATE_COMPLETION_BYTES)
+            validate_create_completion(current, lease, receipt, acknowledged=acknowledged)
+        finally:
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
+
+
+def publish_create_completion(
+    root: str | os.PathLike[str], *, request_digest: str, supervisor_wait_evidence: bytes,
+    deploy_lock_fd: int, execution_grant: ExecutionGrant,
+) -> dict[str, Any]:
+    """Supervisor-only publication; every crash gap stays unacknowledged, never repaired."""
+    _digest(request_digest)
+    with deploy_lock(root, deploy_lock_fd), _execution_mutation(
+        root, deploy_lock_fd, execution_grant, create_completion_only=True,
+    ):
+        _, current = _read_guard_locked(root)
+        request = current["runtimeRequest"]
+        if (
+            request is None or request["operation"] != "create" or request["lifecycle"] != "intent"
+            or current["executionAttempt"] != execution_grant.attempt
+            or create_request_digest(request) != request_digest
+        ):
+            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+        _require_matching_create_child(current)
+        receipt = supervisor_wait_evidence
+        digest = hashlib.sha256(receipt).hexdigest()
+        lease = _read_execution_lease_locked(root)
+        if lease is None:
+            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+        token = _CREATE_COMPLETION_PUBLICATION.set(True)
+        try:
+            candidate = advance_state(
+                current, current["phase"], ownedChild=None, runtimeRequest=dict(
+                    request, lifecycle="normal-completed", completionDigest=digest,
+                ),
+            )
+            validate_create_completion(candidate, lease, receipt, acknowledged=False)
+            root_fd = _open_root(root)
+            try:
+                run_fd = os.open(
+                    current["ownedRun"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+                try:
+                    info = os.fstat(run_fd)
+                    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                        _reject("STATE_PATH_UNSAFE")
+                    _require_no_acl(run_fd, directory=True)
+                    name = ("timepad-create-completion.json" if request["role"] == "initial"
+                            else "timepad-replacement-completion.json")
+                    # Existing fragments, even identical bytes, are not permission
+                    # to repeat a completion that never received its acknowledgment.
+                    try:
+                        os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+                    _atomic_write(run_fd, name, receipt, MAX_CREATE_COMPLETION_BYTES, replace=False)
+                    if _read_at(run_fd, name, MAX_CREATE_COMPLETION_BYTES) != receipt:
+                        _reject("STATE_READBACK_FAILED")
+                finally:
+                    os.close(run_fd)
+            finally:
+                os.close(root_fd)
+            _publish_current_locked(root, candidate)
+            if _read_guard_locked(root)[1] != candidate:
+                _reject("STATE_READBACK_FAILED")
+            _require_create_completion_locked(root, candidate, acknowledged=False)
+            _execution_check()
+            return {"receiptDigest": digest, "sequence": request["sequence"]}
+        finally:
+            _CREATE_COMPLETION_PUBLICATION.reset(token)
+
+
+def cleanup_request_admission(current: Mapping[str, Any], lease: Mapping[str, Any]) -> None:
+    """Permit only the exact stopped-candidate proof after a verifier refusal."""
+    request = current["runtimeRequest"]
+    if (
+        lease["workerMode"] != "fail-closed-worker" or lease["lifecycle"] != "draining"
+        or lease["operation"] != "forward-recover"
+        or lease["firstFailure"] != "RECOVERY_RETRY_RUNTIME_FAILED" or lease["firstStatus"] != 1
+        or current["executionAttempt"] != lease["attempt"] or current["phase"] != "VERIFYING"
+        or current["ownedChild"] is not None or request is None
+        or request["executionAttempt"] != lease["attempt"]
+        or request["containerId"] != current["containerId"]
+        or request["configHash"] != current["configHash"]
+        or request["imageId"] != current["target"]["tuple"]["platformImageId"]
+        or request["operation"] not in {"start", "stop"}
+        or request["operation"] == "start" and request["lifecycle"] != "completed"
+    ):
+        _reject("EXECUTION_LEASE_STOP_ONLY")
+
+
+def _validate_runtime_request_transition(previous: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
+    old, new = previous["runtimeRequest"], candidate["runtimeRequest"]
+    if old == new:
+        return
+    if new is None or previous["phase"] != candidate["phase"] or \
+            candidate["phase"] in TERMINAL | {"READY"}:
+        _reject("RUNTIME_REQUEST_CONFLICT")
+    if old is None or new["nonce"] != old["nonce"]:
+        if old is not None:
+            require_runtime_request_completion(previous)
+        if old is not None and old["lifecycle"] not in {"completed", "bound"}:
+            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+        if new["sequence"] != (old["sequence"] + 1 if old else 1) or \
+                new["lifecycle"] != "intent" or \
+                new["executionAttempt"] != candidate["executionAttempt"]:
+            _reject("RUNTIME_REQUEST_CONFLICT")
+        child = candidate["ownedChild"]
+        if new.get("role") == "predecessor":
+            if candidate["phase"] != "PREPARED" or child is not None or (
+                new["operation"] == "suppress" and old is not None
+                or new["operation"] == "stop" and (
+                    old is None or old.get("role") != "predecessor"
+                    or old["operation"] != "suppress" or old["lifecycle"] != "completed"
+                    or old["configHash"] != new["configHash"]
+                )
+            ):
+                _reject("RUNTIME_REQUEST_CONFLICT")
+            return
+        if candidate["phase"] == "PREPARED":
+            _reject("RUNTIME_REQUEST_CONFLICT")
+        if new["operation"] == "create":
+            if (
+                child is None or child["lifecycle"] != "waiting"
+                or new["childIdentity"] != {key: child[key] for key in CHILD_IDENTITY_FIELDS}
+                or new["role"] == "initial" and (
+                    candidate["phase"] != "CUTOVER_POSSIBLE"
+                    or candidate["containerId"] is not None or candidate["configHash"] is not None
+                )
+                or new["role"] == "replacement" and (
+                    candidate["phase"] not in {"COMMITTING", "FORWARD_RECOVERING"}
+                    or candidate["commitSubstep"] != "replacement-create-intent"
+                    or new["priorContainerId"] != candidate["containerId"]
+                )
+                or old is not None and old["operation"] == "create" and (
+                    old["role"] != "initial" or new["role"] != "replacement"
+                    or any(old[key] != new[key] for key in (
+                        "operationToken", "modelDigest", "toolingDigest", "preparedProofDigest",
+                    ))
+                )
+            ):
+                _reject("RUNTIME_REQUEST_CHILD_CONFLICT")
+            return
+        if new["childAttemptId"] is not None and (
+            child is None or child["attemptId"] != new["childAttemptId"]
+            or child["lifecycle"] != "waiting" or new["operation"] != "start"
+        ) or new["childAttemptId"] is None and child is not None:
+            _reject("RUNTIME_REQUEST_CHILD_CONFLICT")
+        if new["containerId"] != candidate["containerId"] or \
+                new["configHash"] != candidate["configHash"] or \
+                new["imageId"] != candidate["target"]["tuple"]["platformImageId"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        return
+    if old.keys() != new.keys() or old["operation"] != new["operation"]:
+        _reject("RUNTIME_REQUEST_CONFLICT")
+    if old["operation"] == "create":
+        mutable = {"lifecycle", "containerId", "configHash", "responseId", "completionDigest"}
+        if any(old[key] != new[key] for key in old if key not in mutable):
+            _reject("RUNTIME_REQUEST_CONFLICT")
+        if (old["lifecycle"], new["lifecycle"]) not in {
+            ("intent", "normal-completed"), ("normal-completed", "bound"),
+        }:
+            _reject("RUNTIME_REQUEST_REPLAY")
+        if candidate["ownedChild"] is not None:
+            _reject("RUNTIME_REQUEST_CHILD_CONFLICT")
+        if old["lifecycle"] == "intent":
+            if not _CREATE_COMPLETION_PUBLICATION.get():
+                _reject("CREATE_COMPLETION_SUPERVISOR_REQUIRED")
+            _require_matching_create_child(previous)
+        if old["lifecycle"] == "normal-completed":
+            if old["completionDigest"] != new["completionDigest"]:
+                _reject("RUNTIME_REQUEST_CONFLICT")
+        return
+    mutable = {"lifecycle", "responseId", "completionDigest"}
+    if any(old[key] != new[key] for key in old if key not in mutable):
+        _reject("RUNTIME_REQUEST_CONFLICT")
+    if (old["lifecycle"], new["lifecycle"]) not in {
+        ("intent", "acknowledged"), ("acknowledged", "completed"),
+    }:
+        _reject("RUNTIME_REQUEST_REPLAY")
+
+
+def _current(value: Any) -> dict[str, Any]:
+    keys = {
+        "schema", "controller", "originDigest", "operationEpoch", "operation",
+        "runId", "incidentId", "phase", "reason", "target", "predecessor",
+        "predecessorContainerId",
+        "transitionId", "evidenceDigest", "predecessorDisposition", "ownedRun",
+        "toolingDigest", "containerId", "configHash", "ownedChild", "commitWitnessDigest",
+        "providerFinalizationDigest",
+        "commitSubstep", "terminalReceipt", "latestAttemptId", "rollbackIssued",
+        "executionAttempt", "preparedProofDigest", "runtimeRequest",
+    }
+    if not isinstance(value, dict) or value.keys() != keys:
+        _reject()
+    obj = dict(value)
+    if obj["schema"] != STATE_SCHEMA or obj["controller"] != CONTROLLER:
+        _reject("STATE_INVALID")
+    _bool(obj["rollbackIssued"])
+    _digest(obj["originDigest"])
+    epoch = _uint(obj["operationEpoch"])
+    if epoch == 0 and obj["phase"] != "READY":
+        _reject("STATE_INVALID")
+    if not isinstance(obj["phase"], str) or obj["phase"] not in PHASES:
+        _reject("STATE_INVALID")
+    if epoch > 0 and obj["phase"] == "READY":
+        _reject("STATE_INVALID")
+    if obj["predecessorDisposition"] is not None:
+        disposition = _text(obj["predecessorDisposition"], maximum=32)
+        if disposition not in {"pre-barrier-only", "post-barrier-compatible"}:
+            _reject("STATE_INVALID")
+    for key in ("operation", "runId", "incidentId", "reason", "commitSubstep"):
+        if obj[key] is not None:
+            if key == "operation":
+                pattern = re.compile(r"^(?:deploy|rollback-drill)$")
+            elif key == "reason":
+                pattern = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+            elif key == "commitSubstep":
+                pattern = re.compile(
+                    r"^(?:provider-cleanup|terminal-policy-intent|policy-restored|replacement-(?:create-intent|container-authorized|provider-cleanup|terminal-policy-intent|policy-restored))$"
+                )
+            elif key == "incidentId":
+                pattern = re.compile(r"^[a-f0-9]{32}$")
+            else:
+                pattern = IDENTIFIER
+            _text(obj[key], pattern=pattern, maximum=64 if key == "reason" else MAX_STR)
+    if obj["latestAttemptId"] is not None:
+        _child_attempt_sequence(obj["latestAttemptId"], obj["incidentId"])
+        if obj["phase"] == "PREPARED":
+            _reject("STATE_CHILD_PHASE")
+    if obj["phase"] == "PREPARED" and any(
+        obj[key] is not None for key in ("containerId", "configHash", "commitSubstep", "terminalReceipt")
+    ):
+        _reject("STATE_PREPARED_RUNTIME_CONFLICT")
+    if obj["executionAttempt"] is not None:
+        _text(obj["executionAttempt"], pattern=LEASE_NONCE, maximum=32)
+    if obj["target"] is not None:
+        _binding(obj["target"])
+    if obj["predecessor"] is not None:
+        _binding(obj["predecessor"])
+    if obj["runtimeRequest"] is not None:
+        request = runtime_request(obj["runtimeRequest"])
+        create = request["operation"] == "create"
+        predecessor = request.get("role") == "predecessor"
+        binding = obj["predecessor"] if predecessor else obj["target"]
+        if obj["phase"] == "READY" or obj["phase"] == "PREPARED" and not predecessor or \
+                binding is None or request["imageId"] != binding["tuple"]["platformImageId"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if predecessor and (
+            obj["phase"] not in {
+                "PREPARED", "CUTOVER_POSSIBLE", "RECOVERY_REQUIRED", "ROLLING_BACK", "ROLLED_BACK",
+            }
+            or request["containerId"] != obj["predecessorContainerId"]
+            or request["executionAttempt"] != obj["executionAttempt"]
+            or any(request[key] != obj[key] for key in (
+                "originDigest", "incidentId", "operationEpoch", "preparedProofDigest", "evidenceDigest",
+            ))
+            or obj["phase"] == "CUTOVER_POSSIBLE" and (
+                request["operation"] != "stop" or request["lifecycle"] != "completed"
+            )
+            or obj["phase"] == "ROLLED_BACK" and request["lifecycle"] != "completed"
+        ):
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if create and any(request[key] != obj[key] for key in (
+            "originDigest", "operationEpoch", "incidentId", "preparedProofDigest", "toolingDigest",
+        )):
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if create and request["lifecycle"] == "bound" and \
+                request["containerId"] == obj["predecessorContainerId"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if predecessor:
+            pass  # The independent provider proof binds the captured predecessor config hash.
+        elif not create or request["lifecycle"] == "bound":
+            if request["configHash"] != obj["configHash"] or request["containerId"] != obj["containerId"]:
+                _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        elif request["role"] == "initial":
+            if obj["containerId"] is not None or obj["configHash"] is not None:
+                _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        elif request["priorContainerId"] != obj["containerId"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        if request["childAttemptId"] is not None:
+            _child_attempt_sequence(request["childAttemptId"], obj["incidentId"])
+        if obj["phase"] in TERMINAL:
+            require_runtime_request_completion(obj)
+    for key in (
+        "evidenceDigest", "toolingDigest", "configHash", "commitWitnessDigest",
+        "providerFinalizationDigest", "terminalReceipt", "preparedProofDigest",
+    ):
+        if obj[key] is not None:
+            _digest(obj[key])
+    for key in ("target", "predecessor"):
+        if obj[key] is not None:
+            _binding(obj[key])
+    if obj["transitionId"] is not None:
+        _text(obj["transitionId"], pattern=IDENTIFIER)
+    if obj["ownedRun"] is not None:
+        _text(obj["ownedRun"], pattern=ROOT_KEY)
+    if obj["containerId"] is not None:
+        _text(obj["containerId"], pattern=re.compile(r"^[a-f0-9]{12,64}$"), maximum=64)
+    if obj["predecessorContainerId"] is not None:
+        _text(
+            obj["predecessorContainerId"],
+            pattern=re.compile(r"^[a-f0-9]{12,64}$"),
+            maximum=64,
+        )
+    if obj["ownedChild"] is not None:
+        child = _owned_child(obj["ownedChild"])
+        if child["attemptId"] != obj["latestAttemptId"]:
+            _reject("STATE_CHILD_ATTEMPT_CONFLICT")
+        replacement_child = (
+            obj["phase"] == "COMMITTING" and obj["commitSubstep"] == "replacement-create-intent"
+            and obj["runtimeRequest"] is not None and obj["runtimeRequest"]["operation"] == "create"
+            and obj["runtimeRequest"]["childAttemptId"] == child["attemptId"]
+        )
+        if obj["phase"] in TERMINAL | {"READY", "PREPARED"} or (
+            child["lifecycle"] != "reaped" and obj["phase"] not in CHILD_ACTIVE_PHASES
+            and not replacement_child
+        ):
+            _reject("STATE_CHILD_PHASE")
+    if epoch == 0:
+        if any(obj[name] is not None for name in (
+            "operation", "runId", "incidentId", "target", "predecessor", "transitionId",
+            "predecessorContainerId",
+            "reason", "evidenceDigest", "predecessorDisposition", "ownedRun", "toolingDigest",
+            "containerId", "configHash",
+            "ownedChild", "commitWitnessDigest", "providerFinalizationDigest",
+            "commitSubstep", "terminalReceipt",
+            "latestAttemptId",
+            "executionAttempt",
+            "preparedProofDigest", "runtimeRequest",
+        )):
+            _reject("STATE_INVALID")
+        if obj["rollbackIssued"]:
+            _reject("STATE_INVALID")
+    elif any(obj[name] is None for name in (
+        "operation", "runId", "incidentId", "target", "predecessor", "transitionId",
+        "predecessorContainerId",
+        "evidenceDigest", "predecessorDisposition", "ownedRun", "toolingDigest",
+        "preparedProofDigest",
+    )):
+        _reject("STATE_INVALID")
+    if obj["phase"] in {"COMMITTING", "COMMITTED"} and any(
+        obj[name] is None for name in (
+            "containerId", "configHash", "commitWitnessDigest",
+            "providerFinalizationDigest",
+        )
+    ):
+        _reject("STATE_INVALID")
+    if obj["providerFinalizationDigest"] is not None and obj["phase"] not in {
+        "COMMITTING", "RECOVERY_REQUIRED", "FORWARD_RECOVERING", "COMMITTED",
+    }:
+        _reject("STATE_INVALID")
+    if obj["commitWitnessDigest"] is not None and obj["phase"] not in {
+        "COMMITTING", "RECOVERY_REQUIRED", "FORWARD_RECOVERING", "COMMITTED",
+    }:
+        _reject("STATE_INVALID")
+    if obj["phase"] in TERMINAL and obj["terminalReceipt"] is None:
+        _reject("STATE_INVALID")
+    if obj["phase"] == "COMMITTED" and obj["commitSubstep"] not in {
+        "policy-restored", "replacement-policy-restored",
+    }:
+        _reject("STATE_INVALID")
+    return obj
+
+
+def new_ready_state(origin_digest: str) -> dict[str, Any]:
+    return {
+        "schema": STATE_SCHEMA, "controller": CONTROLLER, "originDigest": _digest(origin_digest),
+        "operationEpoch": 0, "operation": None, "runId": None, "incidentId": None,
+        "phase": "READY", "reason": None, "target": None, "predecessor": None,
+        "predecessorContainerId": None,
+        "transitionId": None, "evidenceDigest": None, "predecessorDisposition": None,
+        "ownedRun": None, "toolingDigest": None, "containerId": None, "configHash": None,
+        "ownedChild": None, "commitWitnessDigest": None,
+        "providerFinalizationDigest": None, "commitSubstep": None,
+        "terminalReceipt": None, "latestAttemptId": None, "rollbackIssued": False,
+        "executionAttempt": None, "preparedProofDigest": None, "runtimeRequest": None,
+    }
+
+
+def new_prepared_state(
+    ready: Mapping[str, Any],
+    *,
+    operation: str,
+    run_id: str,
+    incident_id: str,
+    admission: Admission,
+    target: Mapping[str, Any],
+    predecessor: Mapping[str, Any],
+    predecessor_container_id: str,
+    transition_id: str | None,
+    owned_run: str,
+    tooling_digest: str,
+    prepared_proof_digest: str,
+    execution_attempt: str | None = None,
+) -> dict[str, Any]:
+    prior = _current(dict(ready))
+    if prior["phase"] not in TERMINAL | {"READY"} or prior["operationEpoch"] == MAX_U64:
+        _reject("STATE_NOT_READY")
+    if admission.disposition not in {"pre-barrier-only", "post-barrier-compatible"}:
+        _reject("ADMISSION_REFUSED")
+    if operation == "rollback-drill" and transition_id is not None and \
+            admission.disposition != "post-barrier-compatible":
+        _reject("ROLLBACK_DRILL_UNSAFE")
+    target_binding = _binding(target)
+    predecessor_binding = _binding(predecessor)
+    if target_binding["id"] != admission.target_id or \
+            predecessor_binding["id"] != admission.predecessor_id or \
+            transition_id != admission.transition_id:
+        _reject("ADMISSION_BINDING_MISMATCH")
+    result = dict(prior)
+    result.update({
+        "operationEpoch": prior["operationEpoch"] + 1,
+        "operation": _text(operation, pattern=re.compile(r"^(?:deploy|rollback-drill)$")),
+        "runId": _text(run_id, pattern=IDENTIFIER),
+        "incidentId": _text(incident_id, pattern=re.compile(r"^[a-f0-9]{32}$")),
+        "phase": "PREPARED", "reason": None, "target": target_binding,
+        "predecessor": predecessor_binding, "transitionId": transition_id,
+        "predecessorContainerId": _text(
+            predecessor_container_id,
+            pattern=re.compile(r"^[a-f0-9]{12,64}$"),
+            maximum=64,
+        ),
+        "evidenceDigest": _digest(admission.contract_digest),
+        "preparedProofDigest": _digest(prepared_proof_digest),
+        "predecessorDisposition": admission.disposition,
+        "ownedRun": _text(owned_run, pattern=ROOT_KEY), "toolingDigest": _digest(tooling_digest),
+        "containerId": None, "configHash": None, "ownedChild": None,
+        "commitWitnessDigest": None, "providerFinalizationDigest": None,
+        "commitSubstep": None, "terminalReceipt": None,
+        "latestAttemptId": None, "rollbackIssued": False,
+        "runtimeRequest": None,
+        "executionAttempt": (
+            _text(execution_attempt, pattern=LEASE_NONCE, maximum=32)
+            if execution_attempt is not None else prior["executionAttempt"]
+        ),
+    })
+    return _current(result)
+
+
+PHASE_EDGES = {
+    "READY": frozenset({"PREPARED"}),
+    "PREPARED": frozenset({
+        "CUTOVER_POSSIBLE", "ROLLING_BACK", "RECOVERY_REQUIRED",
+    }),
+    "CUTOVER_POSSIBLE": frozenset({"VERIFYING", "ROLLING_BACK", "RECOVERY_REQUIRED", "FORWARD_RECOVERING"}),
+    "VERIFYING": frozenset({"COMMITTING", "ROLLING_BACK", "RECOVERY_REQUIRED", "FORWARD_RECOVERING"}),
+    "COMMITTING": frozenset({"COMMITTED", "RECOVERY_REQUIRED", "FORWARD_RECOVERING"}),
+    "ROLLING_BACK": frozenset({"ROLLED_BACK", "RECOVERY_REQUIRED", "FORWARD_RECOVERING"}),
+    "RECOVERY_REQUIRED": frozenset({"RECOVERY_REQUIRED", "FORWARD_RECOVERING"}),
+    "FORWARD_RECOVERING": frozenset({
+        "CUTOVER_POSSIBLE", "VERIFYING", "COMMITTING", "ROLLING_BACK",
+        "RECOVERY_REQUIRED", "FORWARD_RECOVERING",
+    }),
+    "COMMITTED": frozenset({"PREPARED"}),
+    "ROLLED_BACK": frozenset({"PREPARED"}),
+}
+INCIDENT_BINDING_FIELDS = (
+    "originDigest", "operation", "runId", "incidentId", "target", "predecessor",
+    "predecessorContainerId", "transitionId", "evidenceDigest",
+    "predecessorDisposition", "ownedRun", "toolingDigest", "preparedProofDigest",
+)
+
+
+def validate_state_transition(old: Mapping[str, Any], new: Mapping[str, Any]) -> None:
+    previous, candidate = _current(dict(old)), _current(dict(new))
+    if previous["originDigest"] != candidate["originDigest"]:
+        _reject("STATE_ORIGIN_CONFLICT")
+    old_epoch, new_epoch = previous["operationEpoch"], candidate["operationEpoch"]
+    if new_epoch == old_epoch + 1:
+        if old_epoch == MAX_U64 or candidate["phase"] != "PREPARED" or \
+                previous["phase"] not in TERMINAL | {"READY"}:
+            _reject("STATE_EPOCH_CONFLICT")
+        if candidate["runId"] == previous["runId"] or candidate["incidentId"] == previous["incidentId"]:
+            _reject("STATE_INCIDENT_REUSE")
+        return
+    if new_epoch != old_epoch:
+        _reject("STATE_EPOCH_CONFLICT")
+    if previous["executionAttempt"] is not None and \
+            candidate["executionAttempt"] != previous["executionAttempt"]:
+        _reject("STATE_EXECUTION_ATTEMPT_CONFLICT")
+    if candidate["phase"] == previous["phase"]:
+        if previous["phase"] == "PREPARED" and any(
+            candidate[key] != previous[key] for key in previous if key != "runtimeRequest"
+        ):
+            _reject("STATE_PREPARED_RUNTIME_CONFLICT")
+        if previous["phase"] in {"READY", *TERMINAL}:
+            if candidate != previous:
+                _reject("STATE_TERMINAL_CONFLICT")
+    if previous["phase"] == "PREPARED" and candidate["phase"] in {
+        "VERIFYING", "FORWARD_RECOVERING",
+    }:
+        _reject("CUTOVER_BARRIER_REQUIRED")
+    if candidate["phase"] != previous["phase"] and \
+            candidate["phase"] not in PHASE_EDGES[previous["phase"]]:
+        _reject("STATE_PHASE_CONFLICT")
+    if candidate["phase"] == "ROLLING_BACK" and previous["phase"] in {
+        "CUTOVER_POSSIBLE", "VERIFYING", "FORWARD_RECOVERING",
+    } and previous["predecessorDisposition"] != "post-barrier-compatible":
+        _reject("ROLLBACK_UNSAFE")
+    if candidate["phase"] == "ROLLING_BACK" and (
+        previous["commitWitnessDigest"] is not None
+        or previous["providerFinalizationDigest"] is not None
+    ):
+        _reject("COMMIT_ALREADY_BEGUN")
+    if any(previous[field] != candidate[field] for field in INCIDENT_BINDING_FIELDS):
+        _reject("STATE_INCIDENT_CONFLICT")
+    request = previous["runtimeRequest"]
+    if request is not None and request["operation"] == "create" and request["lifecycle"] != "bound":
+        if candidate["phase"] not in {previous["phase"], "RECOVERY_REQUIRED"}:
+            _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    binding_changed = any(previous[key] != candidate[key] for key in ("containerId", "configHash"))
+    if binding_changed:
+        bound = candidate["runtimeRequest"]
+        if (
+            request is None or request["operation"] != "create"
+            or request["lifecycle"] != "normal-completed"
+            or bound is None or bound["operation"] != "create" or bound["lifecycle"] != "bound"
+        ):
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+    if previous["rollbackIssued"] and not candidate["rollbackIssued"]:
+        _reject("STATE_ROLLBACK_LATCH_CONFLICT")
+    if not previous["rollbackIssued"] and candidate["rollbackIssued"] and (
+        candidate["phase"] != "ROLLING_BACK"
+        or candidate["commitWitnessDigest"] is not None
+        or candidate["providerFinalizationDigest"] is not None
+        or candidate["predecessorDisposition"] not in {
+            "pre-barrier-only", "post-barrier-compatible",
+        }
+    ):
+        _reject("STATE_ROLLBACK_LATCH_PHASE")
+    if previous["containerId"] is not None and candidate["containerId"] != previous["containerId"]:
+        if (
+            previous["phase"] not in {"COMMITTING", "FORWARD_RECOVERING"}
+            or candidate["phase"] != previous["phase"]
+            or previous["commitSubstep"] != "replacement-create-intent"
+            or candidate["commitSubstep"] != "replacement-container-authorized"
+            or previous["latestAttemptId"] is None
+            or candidate["latestAttemptId"] != previous["latestAttemptId"]
+            or previous["ownedChild"] is not None
+            or candidate["ownedChild"] is not None
+        ):
+            _reject("STATE_CONTAINER_CONFLICT")
+    if previous["configHash"] is not None and candidate["configHash"] != previous["configHash"]:
+        _reject("STATE_CONFIG_CONFLICT")
+    if previous["commitWitnessDigest"] is not None and \
+            candidate["commitWitnessDigest"] != previous["commitWitnessDigest"]:
+        _reject("STATE_WITNESS_CONFLICT")
+    if previous["commitWitnessDigest"] is None and \
+            candidate["commitWitnessDigest"] is not None and \
+            (
+                previous["phase"] != "VERIFYING"
+                or candidate["phase"] != "COMMITTING"
+            ):
+        _reject("STATE_WITNESS_PHASE")
+    replacement_steps = (
+        "replacement-create-intent",
+        "replacement-container-authorized",
+        "replacement-provider-cleanup",
+        "replacement-terminal-policy-intent",
+        "replacement-policy-restored",
+    )
+    old_substep = previous["commitSubstep"]
+    new_substep = candidate["commitSubstep"]
+    if old_substep in replacement_steps:
+        old_index = replacement_steps.index(old_substep)
+        if new_substep not in replacement_steps[old_index:old_index + 2]:
+            _reject("STATE_COMMIT_SUBSTEP_CONFLICT")
+    elif new_substep in replacement_steps and new_substep != replacement_steps[0]:
+        _reject("STATE_COMMIT_SUBSTEP_CONFLICT")
+    if new_substep == "replacement-create-intent" and old_substep != new_substep and (
+        previous["ownedChild"] is not None
+        or candidate["ownedChild"] is not None
+        or previous["containerId"] is None
+        or previous["commitWitnessDigest"] is None
+        or previous["providerFinalizationDigest"] is None
+    ):
+        _reject("STATE_REPLACEMENT_INTENT_CONFLICT")
+    if old_substep == "replacement-create-intent" and \
+            new_substep == "replacement-container-authorized" and \
+            (
+                candidate["containerId"] == previous["containerId"]
+                or request is None or request["operation"] != "create"
+                or request["role"] != "replacement" or request["lifecycle"] != "normal-completed"
+                or candidate["runtimeRequest"]["lifecycle"] != "bound"
+            ):
+        _reject("STATE_CONTAINER_CONFLICT")
+    if new_substep in replacement_steps and candidate["phase"] not in {
+        "COMMITTING", "FORWARD_RECOVERING", "RECOVERY_REQUIRED", "COMMITTED",
+    }:
+        _reject("STATE_COMMIT_SUBSTEP_PHASE")
+    if previous["providerFinalizationDigest"] is not None and \
+            candidate["providerFinalizationDigest"] != previous["providerFinalizationDigest"]:
+        _reject("STATE_FINALIZATION_WITNESS_CONFLICT")
+    if previous["providerFinalizationDigest"] is None and \
+            candidate["providerFinalizationDigest"] is not None and \
+            (
+                previous["phase"] != "VERIFYING"
+                or candidate["phase"] != "COMMITTING"
+                or candidate["commitWitnessDigest"] is None
+            ):
+        _reject("STATE_FINALIZATION_WITNESS_PHASE")
+    if previous["terminalReceipt"] is not None and candidate["terminalReceipt"] != previous["terminalReceipt"]:
+        _reject("STATE_RECEIPT_CONFLICT")
+    _validate_runtime_request_transition(previous, candidate)
+    _validate_child_transition(previous, candidate)
+
+
+def _validate_child_transition(previous: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
+    old_child, new_child = previous["ownedChild"], candidate["ownedChild"]
+    if old_child is None and new_child is not None:
+        replacement_create = (
+            candidate["phase"] == "COMMITTING"
+            and candidate["commitSubstep"] == "replacement-create-intent"
+            and candidate["runtimeRequest"] is not None
+            and candidate["runtimeRequest"]["operation"] == "create"
+        )
+        if candidate["phase"] not in CHILD_ACTIVE_PHASES and not replacement_create or \
+                candidate["phase"] != previous["phase"]:
+            _reject("STATE_CHILD_PHASE")
+        if new_child["lifecycle"] != "waiting":
+            _reject("STATE_CHILD_LIFECYCLE")
+        # A bounded incident-local counter rejects even historical A -> B -> A
+        # replay without retaining a journal of prior process identities.
+        old_sequence = (
+            _child_attempt_sequence(previous["latestAttemptId"], previous["incidentId"])
+            if previous["latestAttemptId"] is not None else 0
+        )
+        if old_sequence == MAX_U64 or _child_attempt_sequence(
+            candidate["latestAttemptId"], candidate["incidentId"],
+        ) != old_sequence + 1:
+            _reject("STATE_CHILD_ATTEMPT_CONFLICT")
+        return
+    if previous["latestAttemptId"] != candidate["latestAttemptId"]:
+        _reject("STATE_CHILD_ATTEMPT_CONFLICT")
+    if old_child is None:
+        return
+    if new_child is None:
+        request = previous["runtimeRequest"]
+        create_completion = (
+            request is not None and request["operation"] == "create"
+            and request["lifecycle"] == "intent"
+        )
+        if create_completion:
+            if not _CREATE_COMPLETION_PUBLICATION.get():
+                _reject("CREATE_COMPLETION_SUPERVISOR_REQUIRED")
+            _require_matching_create_child(previous)
+        elif old_child["lifecycle"] != "reaped":
+            _reject("STATE_CHILD_NOT_REAPED")
+        return
+    if any(old_child[field] != new_child[field] for field in CHILD_IDENTITY_FIELDS):
+        _reject("STATE_CHILD_CONFLICT")
+    edges = {
+        "waiting": {"waiting", "released", "reaped"},
+        "released": {"released", "reaped"},
+        "reaped": {"reaped"},
+    }
+    if new_child["lifecycle"] not in edges[old_child["lifecycle"]]:
+        _reject("STATE_CHILD_LIFECYCLE")
+    if old_child["lifecycle"] == "waiting" and new_child["lifecycle"] == "released":
+        replacement_create = (
+            candidate["phase"] == "COMMITTING"
+            and candidate["commitSubstep"] == "replacement-create-intent"
+            and candidate["runtimeRequest"] is not None
+            and candidate["runtimeRequest"]["operation"] == "create"
+        )
+        if previous["phase"] != candidate["phase"] or \
+                candidate["phase"] not in CHILD_ACTIVE_PHASES and not replacement_create:
+            _reject("STATE_CHILD_PHASE")
+
+
+def advance_state(current: Mapping[str, Any], phase: str, **changes: Any) -> dict[str, Any]:
+    previous = _current(dict(current))
+    if phase not in PHASES:
+        _reject("STATE_PHASE_CONFLICT")
+    candidate_value = dict(previous)
+    candidate_value.update(changes)
+    candidate_value["phase"] = phase
+    candidate = _current(candidate_value)
+    validate_state_transition(previous, candidate)
+    return candidate
+
+
+def _proc_start_ticks(pid: int) -> tuple[int, int]:
+    """Return the process group and kernel start tick from one bounded proc read."""
+    if os.name != "posix" or type(pid) is not int or not 1 < pid <= (1 << 31) - 1:
+        _reject("OWNED_CHILD_UNVERIFIABLE")
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096 or not raw.endswith(b"\n"):
+            _reject("OWNED_CHILD_UNVERIFIABLE")
+        # comm is parenthesized and may itself contain spaces or parentheses.
+        end = raw.rfind(b")")
+        if end < 0:
+            _reject("OWNED_CHILD_UNVERIFIABLE")
+        fields = raw[end + 2 : -1].split()
+        if len(fields) < 20:
+            _reject("OWNED_CHILD_UNVERIFIABLE")
+        process_group = int(fields[2])
+        start_ticks = int(fields[19])
+        if process_group != pid or start_ticks <= 0:
+            _reject("OWNED_CHILD_UNVERIFIABLE")
+        return process_group, start_ticks
+    except (OSError, ValueError, IndexError):
+        _reject("OWNED_CHILD_UNVERIFIABLE")
+
+
+def capture_owned_child(pid: int, *, command_digest: str, attempt_id: str) -> dict[str, Any]:
+    """Capture a process-group leader before its controller releases the start handshake."""
+    process_group, start_ticks = _proc_start_ticks(pid)
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii") as stream:
+            boot_id = stream.read(129).strip()
+    except OSError:
+        _reject("OWNED_CHILD_UNVERIFIABLE")
+    child = {
+        "pid": pid,
+        "processGroup": process_group,
+        "bootId": boot_id,
+        "startTicks": start_ticks,
+        "commandDigest": _digest(command_digest),
+        "attemptId": _text(attempt_id, pattern=IDENTIFIER),
+        "lifecycle": "waiting",
+    }
+    return _owned_child(child)
+
+
+def owned_child_is_same_process(child: Mapping[str, Any]) -> bool:
+    """Check boot, group-leader and start-time identity without signaling by PID alone."""
+    record = _owned_child(dict(child))
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii") as stream:
+            boot_id = stream.read(129).strip()
+    except OSError:
+        _reject("OWNED_CHILD_UNVERIFIABLE")
+    if boot_id != record["bootId"]:
+        return False
+    try:
+        process_group, start_ticks = _proc_start_ticks(record["pid"])
+    except GuardError as exc:
+        if exc.reason == "OWNED_CHILD_UNVERIFIABLE":
+            return False
+        raise
+    return process_group == record["processGroup"] and start_ticks == record["startTicks"]
+
+
+def stop_owned_child(
+    root: str | os.PathLike[str],
+    *,
+    deploy_lock_fd: int | None,
+    term_grace_seconds: float = 5.0,
+    execution_grant: ExecutionGrant | None = None,
+) -> dict[str, str]:
+    """Stop only the persisted group leader's owned process group, then prove quiescence."""
+    if not 0 <= term_grace_seconds <= 10:
+        _reject("OWNED_CHILD_UNVERIFIABLE")
+    with deploy_lock(root, deploy_lock_fd), _execution_mutation(root, deploy_lock_fd, execution_grant):
+        _, current = _read_guard_locked(root)
+        child = current["ownedChild"]
+        if child is None:
+            return {"outcome": "already-quiescent"}
+        if _read_execution_lease_locked(root) is not None and \
+                (execution_grant is None or current["executionAttempt"] != execution_grant.attempt):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if not owned_child_is_same_process(child):
+            # A dead or reused leader is never authority to signal a numeric PID.
+            try:
+                os.killpg(child["processGroup"], 0)
+            except ProcessLookupError:
+                return {"outcome": "already-quiescent"}
+            except PermissionError:
+                _reject("OWNED_CHILD_UNVERIFIABLE")
+            _reject("OWNED_CHILD_UNVERIFIABLE")
+        try:
+            _execution_check()
+            os.killpg(child["processGroup"], 15)
+        except ProcessLookupError:
+            return {"outcome": "already-quiescent"}
+        deadline = time.monotonic() + term_grace_seconds
+        while time.monotonic() < deadline:
+            _execution_check()
+            try:
+                os.killpg(child["processGroup"], 0)
+            except ProcessLookupError:
+                return {"outcome": "terminated"}
+            time.sleep(0.05)
+        # Before escalation, re-check the original process identity and group id.
+        if not owned_child_is_same_process(child):
+            try:
+                os.killpg(child["processGroup"], 0)
+            except ProcessLookupError:
+                return {"outcome": "terminated"}
+            _reject("OWNED_CHILD_UNVERIFIABLE")
+        try:
+            _execution_check()
+            os.killpg(child["processGroup"], 9)
+        except ProcessLookupError:
+            return {"outcome": "terminated"}
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            _execution_check()
+            try:
+                os.killpg(child["processGroup"], 0)
+            except ProcessLookupError:
+                return {"outcome": "killed"}
+            time.sleep(0.05)
+        _reject("OWNED_CHILD_QUIESCENCE_UNCONFIRMED")
+
+
+def clear_owned_child_after_quiescence(child: Mapping[str, Any] | None) -> None:
+    if child is not None:
+        require_child_group_quiescent(child)
+
+
+def require_child_group_quiescent(child: Mapping[str, Any]) -> None:
+    record = _owned_child(dict(child))
+    if os.name != "posix" or not hasattr(os, "killpg"):
+        _reject("LINUX_REQUIRED")
+    try:
+        os.killpg(record["processGroup"], 0)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        _reject("OWNED_CHILD_UNVERIFIABLE")
+    _reject("OWNED_CHILD_STILL_RUNNING")
+
+
+RECOVERY_AUTH_SCHEMA = "meet-backend/test-vps-timepad-recovery-authorization/v1"
+RECOVERABLE_PHASES = frozenset({
+    "PREPARED", "CUTOVER_POSSIBLE", "VERIFYING", "COMMITTING",
+    "ROLLING_BACK", "RECOVERY_REQUIRED", "FORWARD_RECOVERING",
+})
+
+
+def authorize_recovery(
+    data: bytes | Mapping[str, Any],
+    *,
+    root_id: str,
+    current: Mapping[str, Any],
+) -> dict[str, str | int]:
+    authority = parse_json(data, MAX_AUTHORIZATION_BYTES) if isinstance(data, bytes) else dict(data)
+    fields = {
+        "schema", "rootId", "originDigest", "originalOperation", "runId", "operationEpoch",
+        "incidentId", "evidenceDigest", "targetId", "revision", "version",
+        "repositoryDigest", "platformImageId", "action",
+    }
+    auth = _object(authority, fields)
+    state = _current(dict(current))
+    if auth["schema"] != RECOVERY_AUTH_SCHEMA:
+        _reject("RECOVERY_AUTH_INVALID")
+    _text(root_id, pattern=ROOT_KEY)
+    _text(auth["rootId"], pattern=ROOT_KEY)
+    _digest(auth["originDigest"])
+    _text(auth["originalOperation"], pattern=re.compile(r"^(?:deploy|rollback-drill|forward-recover)$"))
+    _text(auth["runId"], pattern=IDENTIFIER)
+    epoch = _uint(auth["operationEpoch"])
+    _text(auth["incidentId"], pattern=re.compile(r"^[a-f0-9]{32}$"))
+    binding = _digest(auth["evidenceDigest"])
+    target_id = _text(auth["targetId"], pattern=IDENTIFIER)
+    _text(auth["revision"], pattern=REVISION, maximum=64)
+    _text(auth["version"], pattern=VERSION, maximum=64)
+    repository = _digest(auth["repositoryDigest"])
+    image_id = _digest(auth["platformImageId"])
+    if auth["action"] != "retry-exact-candidate":
+        _reject("RECOVERY_ACTION_UNSUPPORTED")
+    if state["phase"] not in RECOVERABLE_PHASES | {"COMMITTED"}:
+        _reject("RECOVERY_PHASE_REFUSED")
+    target = state["target"]
+    if (
+        auth["rootId"] != root_id
+        or auth["originDigest"] != state["originDigest"]
+        or auth["originalOperation"] != state["operation"]
+        or auth["runId"] != state["runId"]
+        or epoch != state["operationEpoch"]
+        or auth["incidentId"] != state["incidentId"]
+        or binding != state["evidenceDigest"]
+        or target is None
+        or target["id"] != target_id
+        or target["tuple"]["revision"] != auth["revision"]
+        or target["tuple"]["version"] != auth["version"]
+        or target["tuple"]["repositoryDigest"] != repository
+        or target["tuple"]["platformImageId"] != image_id
+    ):
+        _reject("RECOVERY_SELECTOR_MISMATCH")
+    return {
+        "outcome": "already-completed" if state["phase"] == "COMMITTED" else "authorized",
+        "action": "retry-exact-candidate",
+        "incidentId": state["incidentId"], "operationEpoch": state["operationEpoch"],
+    }
+
+
+def _safe_stat(fd: int, name: str, expected_mode: int, max_bytes: int | None = None) -> os.stat_result:
+    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1:
+        _reject("STATE_PATH_UNSAFE")
+    if stat.S_IMODE(info.st_mode) != expected_mode or (max_bytes is not None and info.st_size > max_bytes):
+        _reject("STATE_PATH_UNSAFE")
+    return info
+
+
+def _require_no_acl(fd: int, *, directory: bool = False) -> None:
+    target = f"/proc/self/fd/{fd}"
+    attributes = ("system.posix_acl_access", "system.posix_acl_default") if directory else (
+        "system.posix_acl_access",
+    )
+    for attribute in attributes:
+        try:
+            os.getxattr(target, attribute, follow_symlinks=True)
+        except OSError as exc:
+            if exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)):
+                continue
+            _reject("ACL_CHECK_UNAVAILABLE" if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP)
+                    else "STATE_PATH_UNSAFE")
+        else:
+            _reject("STATE_PATH_UNSAFE")
+
+
+def _open_root(path: str | os.PathLike[str]) -> int:
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        _reject("LINUX_REQUIRED")
+    root = Path(path)
+    if not root.is_absolute() or ".." in root.parts:
+        _reject("ROOT_INVALID")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in root.parts[1:]:
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                _reject("STATE_MISSING")
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            mode = stat.S_IMODE(info.st_mode)
+            sticky_shared_tmp = info.st_uid == 0 and bool(mode & stat.S_ISVTX) and \
+                (mode & (stat.S_IWGRP | stat.S_IWOTH)) == (stat.S_IWGRP | stat.S_IWOTH)
+            if info.st_uid != 0 or (mode & 0o022 and not sticky_shared_tmp):
+                _reject("ROOT_UNSAFE")
+            _require_no_acl(fd, directory=True)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _read_at(dir_fd: int, name: str, limit: int, mode: int = 0o600) -> bytes:
+    info = _safe_stat(dir_fd, name, mode, limit)
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    try:
+        if os.fstat(fd) != info:
+            # stat_result equality is exact and catches replacement between checks.
+            _reject("STATE_RACE")
+        _require_no_acl(fd)
+        data = bytearray()
+        while len(data) <= limit:
+            chunk = os.read(fd, min(8192, limit + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > limit:
+            _reject("STATE_TOO_LARGE")
+        return bytes(data)
+    finally:
+        os.close(fd)
+
+
+def _read_execution_lease_locked(root: str | os.PathLike[str]) -> dict[str, Any] | None:
+    root_fd = _open_root(root)
+    try:
+        try:
+            raw = _read_at(root_fd, EXECUTION_LEASE_NAME, MAX_EXECUTION_LEASE_BYTES)
+        except FileNotFoundError:
+            return None
+        lease = _execution_lease(parse_json(raw, MAX_EXECUTION_LEASE_BYTES))
+        if _canonical(lease) != raw:
+            _reject("EXECUTION_LEASE_INVALID")
+        return lease
+    finally:
+        os.close(root_fd)
+
+
+def _execution_lease_supervisor_is_live(lease: Mapping[str, Any]) -> bool:
+    """A matching nonce alone never revives a lease after its supervisor exits."""
+    supervisor = lease["supervisor"]
+    if not isinstance(supervisor, Mapping):
+        return False
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii") as stream:
+            boot_id = stream.read(129).strip()
+        with open(f"/proc/{supervisor['pid']}/stat", "rb") as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096 or not raw.endswith(b"\n"):
+            return False
+        end = raw.rfind(b")")
+        if end < 0:
+            return False
+        fields = raw[end + 2:-1].split()
+        if len(fields) < 20:
+            return False
+        start_ticks = int(fields[19])
+    except (OSError, ValueError):
+        return False
+    return (
+        type(supervisor.get("pid")) is int
+        and type(supervisor.get("startTicks")) is int
+        and start_ticks == supervisor["startTicks"]
+        and boot_id == supervisor.get("bootId")
+    )
+
+
+def _execution_process_record(identity: Mapping[str, Any]) -> tuple[str, int, int] | None:
+    """Read one kernel identity; absence is distinct from an unreadable /proc."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii") as stream:
+            boot = stream.read(65).strip()
+        if BOOT_ID.fullmatch(boot) is None:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        try:
+            with open(f"/proc/{identity['pid']}/stat", "rb") as stream:
+                raw = stream.read(4097)
+        except FileNotFoundError:
+            return None
+        if len(raw) > 4096 or not raw.endswith(b"\n") or b")" not in raw:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        fields = raw.rsplit(b")", 1)[1].split()
+        if len(fields) < 20:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        return boot, int(fields[19]), int(fields[1])
+    except (OSError, ValueError, IndexError):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+
+
+def _execution_process_exited(identity: Mapping[str, Any]) -> bool:
+    record = _execution_process_record(identity)
+    return record is None or record[:2] != (identity["bootId"], identity["startTicks"])
+
+
+def _validate_supervisor_lease_publisher(candidate: Mapping[str, Any]) -> None:
+    """Authenticate the sole post-ECHILD filesystem child, not a worker assertion."""
+    if not candidate["workers"] or os.getppid() != candidate["supervisor"]["pid"]:
+        _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
+    if any(not _execution_process_exited(worker) for worker in candidate["workers"]):
+        _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
+    parent = candidate["supervisor"]["pid"]
+    try:
+        with open(f"/proc/{parent}/task/{parent}/children", "rb") as stream:
+            children = stream.read(8193)
+        if len(children) > 8192 or children.split() != [str(os.getpid()).encode("ascii")]:
+            _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
+    except OSError:
+        _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
+
+
+def _validate_childless_lease_publication(candidate: Mapping[str, Any]) -> None:
+    """Only the sole new direct helper can attest the post-worker ECHILD step."""
+    if candidate["worker"] is not None or candidate["lifecycle"] != "drained":
+        _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+    try:
+        _validate_supervisor_lease_publisher(candidate)
+    except GuardError:
+        _reject("EXECUTION_LEASE_CHILDLESS_REQUIRED")
+
+
+@contextmanager
+def _execution_lease_publication(
+    root: str | os.PathLike[str], candidate: Mapping[str, Any],
+) -> Iterator[None]:
+    """Bind publication to the live private snapshot or the sole drained helper.
+
+    The supervisor's filesystem child publishes queued cancellation revisions
+    after ECHILD. Ordinary workers must instead fetch the identical current
+    snapshot over their private channel; cancellation revokes that channel.
+    Neither path interprets process exit as daemon-request quiescence.
+    """
+    from test_vps_timepad_supervisor import SupervisorError, WorkerClient
+
+    client = None
+    token = None
+    try:
+        if os.getppid() == candidate["supervisor"]["pid"] and candidate["workers"] and all(
+            _execution_process_exited(worker) for worker in candidate["workers"]
+        ):
+            def publisher_check() -> None:
+                _validate_supervisor_lease_publisher(candidate)
+        else:
+            client = WorkerClient(str(root))
+            if client.attempt != candidate["attempt"] or \
+                    client.supervisor != candidate["supervisor"] or \
+                    client.role != candidate["workerMode"] or candidate["worker"] is None:
+                _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
+
+            def publisher_check() -> None:
+                if client.request("lease") != candidate:
+                    _reject("EXECUTION_LEASE_SNAPSHOT_CONFLICT")
+
+        def check() -> None:
+            if not _execution_lease_supervisor_is_live(candidate):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            publisher_check()
+
+        token = _EXECUTION_CHECK.set(check)
+        check()
+        yield
+        check()
+    except SupervisorError:
+        _reject("EXECUTION_LEASE_PUBLISHER_REQUIRED")
+    finally:
+        if token is not None:
+            _EXECUTION_CHECK.reset(token)
+        if client is not None:
+            client.close()
+
+
+def _validate_terminal_lease_successor(
+    root: str | os.PathLike[str], previous: Mapping[str, Any], candidate: Mapping[str, Any],
+) -> None:
+    # "drained" from a still-live controller is only terminal intent. The
+    # worker-null revision is the separate supervisor-owned ECHILD completion.
+    if previous["lifecycle"] != "drained" or previous["worker"] is not None or \
+            not previous["workers"] or previous["firstFailure"] is not None:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if any(not _execution_process_exited(identity) for identity in (
+        previous["supervisor"], *previous["workers"],
+    )):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if candidate["revision"] != 0 or candidate["lifecycle"] != "registered" or \
+            candidate["firstFailure"] is not None or candidate["rollbackIssued"] or \
+            candidate["worker"] is None or len(candidate["workers"]) != 1:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    worker = candidate["worker"]
+    if candidate["workers"] != [{"mode": candidate["workerMode"], **worker}] or \
+            candidate["workerMode"] != "controller-worker":
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    record = _execution_process_record(worker)
+    if record != (worker["bootId"], worker["startTicks"], candidate["supervisor"]["pid"]):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    # Current-state validation checks origin, epoch, exact image/config and
+    # terminal receipt bindings. Runtime/authorization revalidation remains a
+    # mandatory read-only controller step before terminal replay is reported.
+    _, current = _read_guard_locked(root)
+    if current["phase"] not in TERMINAL | {"READY"} or current["ownedChild"] is not None:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    root_fd = _open_root(root)
+    try:
+        names = set(os.listdir(root_fd))
+        if names & {".provider-transaction.current", ".smtp-transaction.current"} or \
+                any(name.startswith(".timepad-bootstrap-") for name in names):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+    finally:
+        os.close(root_fd)
+
+
+def _validate_recovery_lease_successor(
+    previous: Mapping[str, Any], candidate: Mapping[str, Any], current: Mapping[str, Any],
+) -> None:
+    """ECHILD and daemon completion are independent prerequisites, never substitutes.
+
+    The bounded lease has no crash-time descendant inventory. Only its
+    supervisor-owned worker-null drained revision proves that no unrecorded
+    descendant survived. All other old lifecycle shapes need operator repair.
+    """
+    old = _execution_lease(dict(previous))
+    new = _execution_lease(dict(candidate))
+    state = _current(dict(current))
+    if (
+        old["lifecycle"] != "drained" or old["worker"] is not None or not old["workers"]
+        or old["firstFailure"] in {"DESCENDANT_OVERFLOW", "OWNERSHIP_UNCERTAIN"}
+        or old["operation"] not in {"deploy", "forward-recover"}
+        or new["attempt"] == old["attempt"] or new["revision"] != 0
+        or new["operation"] != "forward-recover" or new["lifecycle"] != "registered"
+        or new["workerMode"] != "controller-worker" or new["worker"] is None
+        or new["firstFailure"] is not None or new["rollbackIssued"]
+        or new["workers"] != [{"mode": "controller-worker", **new["worker"]}]
+        or state["phase"] not in RECOVERABLE_PHASES - {"PREPARED"}
+        or state["executionAttempt"] != old["attempt"]
+    ):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    for identity in (old["supervisor"], *old["workers"]):
+        if not _execution_process_exited(identity):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+    worker = new["worker"]
+    if _execution_process_record(worker) != (
+        worker["bootId"], worker["startTicks"], new["supervisor"]["pid"],
+    ) or not _execution_lease_supervisor_is_live(new):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    request = require_runtime_request_completion(state)
+    if request["executionAttempt"] != old["attempt"]:
+        _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+    if state["commitSubstep"] == "replacement-create-intent" and not (
+        request["operation"] == "create" and request["role"] == "replacement"
+        and request["lifecycle"] == "normal-completed"
+    ):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if request["operation"] == "create" and request["lifecycle"] in {
+        "normal-completed", "bound",
+    }:
+        completion = _create_completion_evidence(old["createCompletion"])
+        if (
+            not completion["acknowledged"]
+            or completion != new["createCompletion"]
+            or completion["requestDigest"] != create_request_digest(request)
+            or completion["receiptDigest"] != request["completionDigest"]
+            or completion["executionAttempt"] != request["executionAttempt"]
+            or completion["childIdentity"] != request["childIdentity"]
+            or completion["resourcesDigest"] != request["resourcesDigest"]
+            or completion["resourceRequestDigest"] != request["resourceRequestDigest"]
+        ):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+    if state["ownedChild"] is not None:
+        child = state["ownedChild"]
+        if child["lifecycle"] not in {"released", "reaped"} or \
+                request["childAttemptId"] != child["attemptId"] or request["operation"] != "start" or \
+                not _execution_process_exited(child):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        require_child_group_quiescent(child)
+
+
+def _validate_lease_successor(previous: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
+    immutable = ("attempt", "operation", "supervisor")
+    if any(previous[key] != candidate[key] for key in immutable):
+        _reject("EXECUTION_LEASE_CONFLICT")
+    if candidate["revision"] != previous["revision"] + 1:
+        _reject("EXECUTION_LEASE_REVISION_CONFLICT")
+    if previous["rollbackIssued"] and not candidate["rollbackIssued"]:
+        _reject("EXECUTION_LEASE_ROLLBACK_CONFLICT")
+    if previous["firstFailure"] is not None and any(
+        previous[key] != candidate[key] for key in ("firstFailure", "firstStatus")
+    ):
+        _reject("EXECUTION_LEASE_FAILURE_CONFLICT")
+    if previous["t0Ns"] is not None and any(
+        previous[key] != candidate[key] for key in ("t0Ns", "workEndNs", "hardEndNs")
+    ):
+        _reject("EXECUTION_LEASE_DEADLINE_CONFLICT")
+    lifecycle_edges = {
+        "registered": {"registered", "armed", "draining"},
+        "armed": {"armed", "cancel-forward", "drain-forward", "rollback-admission",
+                  "draining", "quiescence-unconfirmed", "drained"},
+        "cancel-forward": {"cancel-forward", "drain-forward", "draining",
+                           "rollback-admission", "quiescence-unconfirmed", "drained"},
+        "drain-forward": {"drain-forward", "rollback-admission", "draining",
+                          "quiescence-unconfirmed", "drained"},
+        "rollback-admission": {"rollback-admission", "rolling-back", "draining",
+                               "quiescence-unconfirmed", "drained"},
+        "rolling-back": {"rolling-back", "draining", "quiescence-unconfirmed", "drained"},
+        "draining": {"draining", "quiescence-unconfirmed", "drained"},
+        "quiescence-unconfirmed": {"quiescence-unconfirmed", "drained"},
+        "drained": {"drained"},
+    }
+    if candidate["lifecycle"] not in lifecycle_edges[previous["lifecycle"]]:
+        _reject("EXECUTION_LEASE_LIFECYCLE_CONFLICT")
+    old_workers, new_workers = previous["workers"], candidate["workers"]
+    if new_workers[:len(old_workers)] != old_workers:
+        _reject("EXECUTION_LEASE_WORKER_CONFLICT")
+    old_completion, new_completion = previous["createCompletion"], candidate["createCompletion"]
+    if old_completion is not None and old_completion != new_completion:
+        if new_completion is None or (
+            old_completion["requestDigest"] == new_completion["requestDigest"]
+            and (old_completion["acknowledged"] or not new_completion["acknowledged"]
+                 or any(old_completion[key] != new_completion[key] for key in old_completion
+                        if key != "acknowledged"))
+        ) or old_completion["requestDigest"] != new_completion["requestDigest"] and \
+                not old_completion["acknowledged"]:
+            _reject("EXECUTION_LEASE_COMPLETION_CONFLICT")
+
+
+def _publish_execution_lease_locked(
+    root: str | os.PathLike[str],
+    candidate: Mapping[str, Any],
+    raw: bytes,
+    *,
+    recovery_registration: bool = False,
+) -> dict[str, Any]:
+    previous = _read_execution_lease_locked(root)
+    if previous is None:
+        if candidate["revision"] != 0 or candidate["lifecycle"] != "registered":
+            _reject("EXECUTION_LEASE_REVISION_CONFLICT")
+        try:
+            _, current = _read_guard_locked(root)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (
+            current["executionAttempt"] is not None
+            or not recovery_registration and current["phase"] not in TERMINAL | {"READY"}
+        ):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+    else:
+        if candidate["attempt"] != previous["attempt"] and candidate["revision"] == 0:
+            # Admission-only registration is not stale-lease reconciliation.
+            # Even valid selectors cannot replace an unresolved old attempt.
+            _validate_terminal_lease_successor(root, previous, candidate)
+        else:
+            if not _execution_lease_supervisor_is_live(previous):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            # Lost acknowledgments can repeat only the identical snapshot.
+            if previous != candidate:
+                _validate_lease_successor(previous, candidate)
+    if not _execution_lease_supervisor_is_live(candidate):
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if candidate["lifecycle"] == "drained" and candidate["worker"] is None:
+        _validate_childless_lease_publication(candidate)
+    root_fd = _open_root(root)
+    try:
+        _atomic_write(root_fd, EXECUTION_LEASE_NAME, raw,
+                      MAX_EXECUTION_LEASE_BYTES, replace=previous is not None)
+        if _read_at(root_fd, EXECUTION_LEASE_NAME, MAX_EXECUTION_LEASE_BYTES) != raw:
+            _reject("EXECUTION_LEASE_READBACK_FAILED")
+    finally:
+        os.close(root_fd)
+    return {
+        "attempt": candidate["attempt"],
+        "revision": candidate["revision"],
+        "digest": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def publish_execution_lease(
+    root: str | os.PathLike[str],
+    lease: Mapping[str, Any] | bytes,
+    *,
+    deploy_lock_fd: int,
+) -> dict[str, Any]:
+    """Atomically publish one supervisor lease revision while holding inherited FD9."""
+    if isinstance(lease, bytes):
+        candidate = _execution_lease(parse_json(lease, MAX_EXECUTION_LEASE_BYTES))
+        raw = lease
+        if _canonical(candidate) != raw:
+            _reject("EXECUTION_LEASE_INVALID")
+    else:
+        candidate = _execution_lease(dict(lease))
+        raw = _canonical(candidate)
+    if len(raw) > MAX_EXECUTION_LEASE_BYTES:
+        _reject("INPUT_TOO_LARGE")
+    with deploy_lock(root, deploy_lock_fd), _execution_lease_publication(root, candidate):
+        return _publish_execution_lease_locked(root, candidate, raw)
+
+
+def _recovery_registration_authority(
+    origin: Mapping[str, Any], current: Mapping[str, Any],
+    contract: Mapping[str, Any], authorization: bytes,
+    selectors: Mapping[str, Any],
+) -> None:
+    """Read-only admission: exact protected authority, dispatch and reviewed evidence."""
+    auth = parse_json(authorization, MAX_AUTHORIZATION_BYTES)
+    authorize_recovery(auth, root_id=origin["rootId"], current=current)
+    selected = _object(dict(selectors), {
+        "runId", "incidentId", "operationEpoch", "evidenceDigest",
+        "repositoryDigest", "revision", "version",
+    })
+    if any(type(value) is not type(auth[key]) or value != auth[key]
+           for key, value in selected.items()):
+        _reject("RECOVERY_SELECTOR_MISMATCH")
+    parsed = parse_contract(contract)
+    admission = admit(
+        parsed, root_id=origin["rootId"], target_id=current["target"]["id"],
+        predecessor_id=current["predecessor"]["id"], transition_id=current["transitionId"],
+        target_tuple=current["target"]["tuple"], predecessor_tuple=current["predecessor"]["tuple"],
+    )
+    if admission.disposition != current["predecessorDisposition"] or \
+            admission.contract_digest != current["evidenceDigest"]:
+        _reject("RECOVERY_EVIDENCE_CHANGED")
+
+
+def register_recovery(
+    root: str | os.PathLike[str], *, contract: Mapping[str, Any],
+    selectors: Mapping[str, Any], deploy_lock_fd: int,
+    execution_grant: ExecutionGrant,
+    runtime_evidence: bytes | None = None,
+) -> dict[str, Any]:
+    """Register recovery; stale ownership additionally needs complete runtime proof.
+
+    Only the private registered controller may publish this initial execution
+    ownership. Unleased registration cannot adopt current. Stale adoption is a
+    separate proof-first branch, never permission for runtime/config/provider
+    mutation under this registration grant.
+    """
+    from test_vps_timepad_supervisor import SupervisorError, WorkerClient
+
+    client = None
+    token = None
+    with deploy_lock(root, deploy_lock_fd):
+        try:
+            client = WorkerClient(str(root))
+            candidate = _execution_lease(client.request("lease"))
+            if (
+                client.attempt != execution_grant.attempt
+                or client.role != "controller-worker"
+                or candidate["attempt"] != execution_grant.attempt
+                or candidate["supervisor"] != client.supervisor
+                or candidate["operation"] != "forward-recover"
+                or candidate["workerMode"] != client.role
+                or candidate["lifecycle"] != "registered" or candidate["revision"] != 0
+                or candidate["firstFailure"] is not None or candidate["rollbackIssued"]
+                or candidate["worker"] is None
+                or candidate["workers"] != [{"mode": client.role, **candidate["worker"]}]
+                or candidate["workEndNs"] is None
+                or candidate["workEndNs"] - candidate["t0Ns"] != 540_000_000_000
+                or candidate["hardEndNs"] - candidate["workEndNs"] != 60_000_000_000
+                or execution_grant.end_ns > candidate["workEndNs"]
+            ):
+                _reject("RECOVERY_REGISTRATION_REFUSED")
+
+            def check() -> None:
+                if time.monotonic_ns() >= execution_grant.end_ns:
+                    _reject("EXECUTION_GRANT_EXPIRED")
+                if client.request(
+                    "validate-grant", grantId=execution_grant.grant_id, endNs=execution_grant.end_ns,
+                ) != {
+                    "attempt": execution_grant.attempt, "grantId": execution_grant.grant_id,
+                    "endNs": execution_grant.end_ns, "role": client.role,
+                    "name": "recovery-registration",
+                }:
+                    _reject("EXECUTION_GRANT_INVALID")
+                if time.monotonic_ns() >= execution_grant.end_ns:
+                    _reject("EXECUTION_GRANT_EXPIRED")
+
+            token = _EXECUTION_CHECK.set(check)
+            check()
+            origin, current = _read_guard_locked(root)
+            root_fd = _open_root(root)
+            try:
+                authorization = _read_at(
+                    root_fd, "timepad-recovery-authorization.json", MAX_AUTHORIZATION_BYTES,
+                )
+            finally:
+                os.close(root_fd)
+            _recovery_registration_authority(origin, current, contract, authorization, selectors)
+            check()
+            previous = _read_execution_lease_locked(root)
+            if previous is not None and current["phase"] not in TERMINAL | {"READY"}:
+                return _reconcile_recovery_lease_locked(
+                    root, previous, candidate, current, authorization,
+                    runtime_evidence, deploy_lock_fd, check,
+                )
+            result = _publish_execution_lease_locked(
+                root, candidate, _canonical(candidate), recovery_registration=True,
+            )
+            check()
+            return result
+        except SupervisorError:
+            _reject("EXECUTION_GRANT_REVOKED")
+        finally:
+            if token is not None:
+                _EXECUTION_CHECK.reset(token)
+            if client is not None:
+                client.close()
+
+
+def _reconcile_recovery_lease_locked(
+    root: str | os.PathLike[str], previous: Mapping[str, Any], candidate: Mapping[str, Any],
+    current: Mapping[str, Any], authorization: bytes, runtime_evidence: bytes | None,
+    deploy_lock_fd: int, check: Callable[[], None],
+) -> dict[str, Any]:
+    """Proof-first adoption in one FD9 critical section, with fail-closed crash gaps.
+
+    Current and lease are separate durable files, not a disk transaction. A
+    failure after the current write leaves mismatched attempts; all subsequent
+    writers refuse that pair. No automatic repair, rollback or start is issued.
+    """
+    if runtime_evidence is None or len(runtime_evidence) > MAX_RECOVERY_RUNTIME_BYTES:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    request = current["runtimeRequest"]
+    create_completion_recovery = (
+        request is not None and request["operation"] == "create"
+        and request["lifecycle"] in {"normal-completed", "bound"}
+    )
+    if request is None or (
+        request["lifecycle"] not in {"completed", "acknowledged"}
+        and not create_completion_recovery
+    ):
+        _reject("RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED")
+    if create_completion_recovery:
+        if candidate["createCompletion"] is not None:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if _read_execution_lease_locked(root) != previous:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        _require_create_completion_locked(root, current, acknowledged=True)
+    path = Path(__file__).with_name("test-vps-provider-credential.py")
+    spec = importlib.util.spec_from_file_location("_timepad_recovery_provider", path)
+    if spec is None or spec.loader is None:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    provider = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(provider)
+    recovery_token = _RECOVERY_CREATE_COMPLETION_PROOF.set(create_completion_recovery)
+    try:
+        request = provider._recovery_lease_runtime_proof(
+            str(root), dict(current), authorization, runtime_evidence, deploy_lock_fd, check,
+            create_completion_recovery=create_completion_recovery,
+        )
+        if create_completion_recovery and request != current["runtimeRequest"]:
+            _reject("RUNTIME_REQUEST_BINDING_CONFLICT")
+        proven = dict(current, runtimeRequest=request)
+        adopted_candidate = dict(
+            candidate,
+            createCompletion=previous["createCompletion"] if create_completion_recovery else None,
+        )
+        _validate_recovery_lease_successor(previous, adopted_candidate, proven)
+        adopted = _current(dict(proven, executionAttempt=adopted_candidate["attempt"]))
+        # Only this proof-first path may replace execution ownership. Hold that
+        # field constant while checking every other transition invariant.
+        validate_state_transition(
+            dict(current, executionAttempt=adopted_candidate["attempt"]), adopted,
+        )
+    except provider.ProviderError:
+        _reject("RECOVERY_PROVIDER_LIVE_PROOF_REQUIRED")
+    finally:
+        _RECOVERY_CREATE_COMPLETION_PROOF.reset(recovery_token)
+    check()
+    if _read_execution_lease_locked(root) != previous or _read_guard_locked(root)[1] != current:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    root_fd = _open_root(root)
+    try:
+        guard_fd = os.open(GUARD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            raw = _canonical(adopted)
+            _atomic_write(guard_fd, "current.json", raw, MAX_CURRENT_BYTES, replace=True)
+            if _read_at(guard_fd, "current.json", MAX_CURRENT_BYTES) != raw:
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+        finally:
+            os.close(guard_fd)
+        check()
+        raw = _canonical(adopted_candidate)
+        _atomic_write(root_fd, EXECUTION_LEASE_NAME, raw, MAX_EXECUTION_LEASE_BYTES, replace=True)
+        if _read_at(root_fd, EXECUTION_LEASE_NAME, MAX_EXECUTION_LEASE_BYTES) != raw:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        check()
+        return {
+            "attempt": adopted_candidate["attempt"], "revision": adopted_candidate["revision"],
+            "digest": hashlib.sha256(raw).hexdigest(),
+        }
+    except OSError:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    finally:
+        os.close(root_fd)
+
+
+def _read_recovery_registration_snapshot(
+    root: str | os.PathLike[str], expected: Mapping[str, Any], digest: str,
+    baseline: Mapping[str, Any], *, deploy_lock_fd: int,
+) -> dict[str, Any]:
+    """Read-only handoff from durable registration, never caller proof fragments."""
+    _digest(digest)
+    expected = _execution_lease(dict(expected))
+    baseline = _object(dict(baseline), {"lease", "currentDigest"})
+    if (
+        expected["operation"] != "forward-recover" or expected["revision"] != 0
+        or expected["lifecycle"] != "registered" or expected["createCompletion"] is not None
+    ):
+        _reject("RECOVERY_REGISTRATION_REFUSED")
+    with deploy_lock(root, deploy_lock_fd):
+        snapshot = _read_execution_lease_locked(root)
+        if snapshot is None or hashlib.sha256(_canonical(snapshot)).hexdigest() != digest or any(
+            snapshot[key] != expected[key] for key in expected if key != "createCompletion"
+        ):
+            _reject("EXECUTION_LEASE_SNAPSHOT_CONFLICT")
+        _, current = _read_guard_locked(root)
+        request = current["runtimeRequest"]
+        create_recovery = (
+            current["phase"] not in TERMINAL | {"READY"}
+            and request is not None and request["operation"] == "create"
+            and request["lifecycle"] in {"normal-completed", "bound"}
+        )
+        if create_recovery:
+            previous = _execution_lease(baseline["lease"])
+            prior_current = dict(current, executionAttempt=previous["attempt"])
+            if (
+                current["executionAttempt"] != snapshot["attempt"]
+                or baseline["currentDigest"] != hashlib.sha256(_canonical(prior_current)).hexdigest()
+            ):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            _require_create_completion_locked(root, current, acknowledged=True)
+            token = _RECOVERY_CREATE_COMPLETION_PROOF.set(True)
+            try:
+                _validate_recovery_lease_successor(previous, snapshot, prior_current)
+            finally:
+                _RECOVERY_CREATE_COMPLETION_PROOF.reset(token)
+        elif snapshot["createCompletion"] is not None:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if _read_execution_lease_locked(root) != snapshot or _read_guard_locked(root)[1] != current:
+            _reject("EXECUTION_LEASE_SNAPSHOT_CONFLICT")
+        return snapshot
+
+
+def rollback_state_admission(current: Mapping[str, Any], lease: Mapping[str, Any]) -> None:
+    """Pure state half of admission; never attests daemon/config/provider quiescence."""
+    _rollback_state_admission(current, lease, "rollback-admission")
+
+
+def _rollback_state_admission(
+    current: Mapping[str, Any], lease: Mapping[str, Any], lifecycle: str,
+) -> None:
+    state = _current(dict(current))
+    if (
+        lease["operation"] != "deploy" or lease["workerMode"] != "rollback-worker"
+        or lease["lifecycle"] != lifecycle or not lease["rollbackIssued"]
+        or state["executionAttempt"] != lease["attempt"] or state["rollbackIssued"]
+        or state["phase"] not in {"PREPARED", "CUTOVER_POSSIBLE", "VERIFYING"}
+        or state["ownedChild"] is not None or state["commitWitnessDigest"] is not None
+        or state["providerFinalizationDigest"] is not None
+        or state["phase"] != "PREPARED" and state["predecessorDisposition"] != "post-barrier-compatible"
+    ):
+        _reject("ROLLBACK_NOT_ADMITTED")
+    if state["runtimeRequest"] is not None:
+        require_runtime_request_completion(state)
+
+
+def rollback_runtime_admission(
+    root: str | os.PathLike[str], current: Mapping[str, Any], lease: Mapping[str, Any],
+    grant: ExecutionGrant, check: Callable[[], None], *, claim: bool = False,
+) -> dict[str, Any]:
+    """Bind fixed provider reconstruction to the original private worker capability."""
+    _rollback_state_admission(current, lease, "rolling-back" if claim else "rollback-admission")
+    check()
+    path = Path(__file__).with_name("test-vps-provider-credential.py")
+    spec = importlib.util.spec_from_file_location("_timepad_rollback_provider", path)
+    if spec is None or spec.loader is None:
+        _reject("ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED")
+    provider = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(provider)
+    try:
+        with provider._operation_deadline(grant.end_ns):
+            evidence = provider._bounded_stdin(MAX_RECOVERY_RUNTIME_BYTES)
+            admitted = None
+            if claim:
+                envelope = parse_json(evidence, MAX_RECOVERY_RUNTIME_BYTES)
+                envelope = _object(envelope, {"admission", "runtime"})
+                admitted = envelope["admission"]
+                if not isinstance(admitted, dict):
+                    _reject("ROLLBACK_NOT_ADMITTED")
+                evidence = _canonical(envelope["runtime"])
+            proof = provider._rollback_runtime_proof(
+                str(root), dict(current), dict(lease), evidence, check, claim=claim,
+            )
+            if claim:
+                # Admission is not a bearer token: independently reconstruct
+                # under the current authenticated state-publish capability.
+                previous = dict(proof, leaseRevision=lease["revision"] - 1)
+                previous.pop("proofDigest")
+                previous["proofDigest"] = hashlib.sha256(_canonical(previous)).hexdigest()
+                if admitted != previous:
+                    _reject("ROLLBACK_NOT_ADMITTED")
+    except provider.ProviderError:
+        _reject("ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED")
+    check()
+    if _read_execution_lease_locked(root) != lease or _read_guard_locked(root)[1] != current:
+        _reject("ROLLBACK_RUNTIME_QUIESCENCE_REQUIRED")
+    check()
+    return proof
+
+
+def adopt_recovery_state(
+    current: Mapping[str, Any], lease: Mapping[str, Any],
+    *, request_proof: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bind an admitted unleased incident; never replace unresolved execution ownership."""
+    state = _current(dict(current))
+    if (
+        lease["operation"] != "forward-recover" or lease["workerMode"] != "controller-worker"
+        or lease["lifecycle"] != "armed" or lease["firstFailure"] is not None
+        or state["phase"] not in RECOVERABLE_PHASES - {"PREPARED"}
+        or state["executionAttempt"] not in {None, lease["attempt"]}
+    ):
+        _reject("RECOVERY_ADOPTION_REFUSED")
+    request = state["runtimeRequest"]
+    if request_proof is not None:
+        proof = _object(dict(request_proof), {"requestNonce", "completionDigest"})
+        _digest(proof["completionDigest"])
+        if request is None or request["lifecycle"] != "acknowledged" or \
+                proof["requestNonce"] != request["nonce"]:
+            _reject("RUNTIME_REQUEST_CONFLICT")
+        request = dict(request, lifecycle="completed", completionDigest=proof["completionDigest"])
+    require_runtime_request_completion(dict(state, runtimeRequest=request))
+    return advance_state(
+        state, state["phase"], executionAttempt=lease["attempt"], runtimeRequest=request,
+    )
+
+
+def check_execution_lease(
+    root: str | os.PathLike[str],
+    *,
+    attempt: str | None = None,
+    deploy_lock_fd: int | None = None,
+    purpose: str = "writer",
+) -> dict[str, Any]:
+    """Authorize a named lease use; never removes or reconciles a lease.
+
+    Cleanup proof is the sole exception to draining-state rejection and remains
+    bound to the exact live fail-closed request.  A matching attempt is not
+    sufficient authority to let a stale worker through a drain.
+    """
+    if purpose not in {"writer", "cleanup-stop-proof"}:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    with deploy_lock(root, deploy_lock_fd):
+        lease = _read_execution_lease_locked(root)
+        if lease is None:
+            if purpose != "writer":
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            return {"outcome": "unleased"}
+        if deploy_lock_fd is None:
+            _reject("EXECUTION_LEASE_FD_REQUIRED")
+        if not _execution_lease_supervisor_is_live(lease):
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if attempt is None or attempt != lease["attempt"]:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        try:
+            _, current = _read_guard_locked(root)
+        except FileNotFoundError:
+            current = None  # A registered bootstrap can precede the guard.
+        if current is not None and current["phase"] not in TERMINAL | {"READY"} and \
+                current["executionAttempt"] not in {None, lease["attempt"]}:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if lease["lifecycle"] in {"quiescence-unconfirmed", "drained"}:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if lease["lifecycle"] == "draining":
+            if purpose != "cleanup-stop-proof":
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            if current is None:
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            cleanup_request_admission(current, lease)
+        elif purpose == "cleanup-stop-proof":
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        return {"attempt": lease["attempt"], "revision": lease["revision"], "outcome": "matched"}
+
+
+def _require_execution_lease_descriptor(
+    root: str | os.PathLike[str],
+    deploy_lock_fd: int | None,
+) -> None:
+    if _read_execution_lease_locked(root) is not None and deploy_lock_fd is None:
+        _reject("EXECUTION_LEASE_FD_REQUIRED")
+
+
+def _atomic_write(dir_fd: int, name: str, data: bytes, limit: int, *, replace: bool) -> None:
+    _execution_check()
+    if len(data) > limit:
+        _reject("STATE_TOO_LARGE")
+    if any(entry.startswith(".tmp-") for entry in os.listdir(dir_fd)):
+        _reject("STATE_TEMP_CONFLICT")
+    temp = ".tmp-" + secrets.token_hex(12)
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        os.fchmod(fd, 0o600)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or \
+                stat.S_IMODE(info.st_mode) != 0o600:
+            _reject("STATE_PATH_UNSAFE")
+        _require_no_acl(fd)
+        view = memoryview(data)
+        while view:
+            _execution_check()
+            written = os.write(fd, view)
+            if written <= 0:
+                _reject("STATE_WRITE_FAILED")
+            view = view[written:]
+        _execution_check()
+        os.fsync(fd)
+        _execution_check()
+    except Exception:
+        os.close(fd)
+        os.unlink(temp, dir_fd=dir_fd)
+        raise
+    os.close(fd)
+    try:
+        _execution_check()
+        if replace:
+            existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if not stat.S_ISREG(existing.st_mode) or existing.st_uid != 0 or existing.st_nlink != 1 or \
+                    stat.S_IMODE(existing.st_mode) != 0o600:
+                _reject("STATE_PATH_UNSAFE")
+            os.replace(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        else:
+            os.link(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+            os.unlink(temp, dir_fd=dir_fd)
+        _execution_check()
+        os.fsync(dir_fd)
+        _execution_check()
+    except Exception:
+        try:
+            os.unlink(temp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _rename_noreplace(dir_fd: int, source: str, destination: str) -> None:
+    _execution_check()
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError:
+        _reject("ATOMIC_RENAME_UNAVAILABLE")
+    renameat2.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        dir_fd, os.fsencode(source), dir_fd, os.fsencode(destination), RENAME_NOREPLACE,
+    ) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            _reject("BOOTSTRAP_CONFLICT")
+        _reject("ATOMIC_RENAME_FAILED")
+
+
+def _read_guard_locked(root: str | os.PathLike[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+    root_fd = _open_root(root)
+    try:
+        guard_fd = os.open(GUARD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            info = os.fstat(guard_fd)
+            if info.st_uid != 0 or info.st_nlink != 2 or stat.S_IMODE(info.st_mode) != 0o700:
+                _reject("STATE_PATH_UNSAFE")
+            _require_no_acl(guard_fd, directory=True)
+            names = set(os.listdir(guard_fd))
+            if names - {"origin.json", "current.json"}:
+                _reject("STATE_TEMP_CONFLICT")
+            if names != {"origin.json", "current.json"}:
+                _reject("GUARD_STATE_LOST")
+            try:
+                origin_raw = _read_at(guard_fd, "origin.json", MAX_ORIGIN_BYTES)
+            except FileNotFoundError:
+                _reject("GUARD_STATE_LOST")
+            origin = _origin(parse_json(origin_raw, MAX_ORIGIN_BYTES))
+            try:
+                current_raw = _read_at(guard_fd, "current.json", MAX_CURRENT_BYTES)
+            except FileNotFoundError:
+                _reject("GUARD_STATE_LOST")
+            current = _current(parse_json(current_raw, MAX_CURRENT_BYTES))
+            if current["originDigest"] != origin["originDigest"]:
+                _reject("GUARD_STATE_LOST")
+            return origin, current
+        finally:
+            os.close(guard_fd)
+    finally:
+        os.close(root_fd)
+
+
+def read_guard(
+    root: str | os.PathLike[str],
+    *,
+    deploy_lock_fd: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    with deploy_lock(root, deploy_lock_fd):
+        return _read_guard_locked(root)
+
+
+def _publish_current_locked(root: str | os.PathLike[str], state: Mapping[str, Any]) -> dict[str, Any]:
+    _execution_check()
+    validated = _current(dict(state))
+    root_fd = _open_root(root)
+    try:
+        guard_fd = os.open(GUARD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            guard_info = os.fstat(guard_fd)
+            if guard_info.st_uid != 0 or guard_info.st_nlink != 2 or stat.S_IMODE(guard_info.st_mode) != 0o700:
+                _reject("STATE_PATH_UNSAFE")
+            _require_no_acl(guard_fd, directory=True)
+            if set(os.listdir(guard_fd)) != {"origin.json", "current.json"}:
+                _reject("GUARD_STATE_LOST")
+            try:
+                origin_raw = _read_at(guard_fd, "origin.json", MAX_ORIGIN_BYTES)
+            except FileNotFoundError:
+                _reject("GUARD_STATE_LOST")
+            origin = _origin(parse_json(origin_raw, MAX_ORIGIN_BYTES))
+            current_raw = _read_at(guard_fd, "current.json", MAX_CURRENT_BYTES)
+            if set(os.listdir(guard_fd)) != {"origin.json", "current.json"}:
+                _reject("STATE_TEMP_CONFLICT")
+            old = _current(parse_json(current_raw, MAX_CURRENT_BYTES))
+            if origin["originDigest"] != old["originDigest"]:
+                _reject("GUARD_STATE_LOST")
+            lease = _read_execution_lease_locked(root)
+            if lease is None and (
+                old["executionAttempt"] is not None or validated["executionAttempt"] is not None
+            ):
+                _reject("EXECUTION_LEASE_UNRESOLVED")
+            if lease is not None:
+                if _EXECUTION_CHECK.get() is None:
+                    _reject("EXECUTION_GRANT_REQUIRED")
+                if validated["executionAttempt"] != lease["attempt"]:
+                    _reject("EXECUTION_LEASE_UNRESOLVED")
+                if not _execution_lease_supervisor_is_live(lease):
+                    _reject("EXECUTION_LEASE_UNRESOLVED")
+                _validate_execution_state_write(lease, old, validated, time.monotonic_ns())
+            validate_state_transition(old, validated)
+            request = validated["runtimeRequest"]
+            if request is not None and request["operation"] == "create":
+                previous_request = old["runtimeRequest"]
+                if request["lifecycle"] == "normal-completed" and \
+                        previous_request["lifecycle"] == "intent":
+                    if not _CREATE_COMPLETION_PUBLICATION.get():
+                        _reject("CREATE_COMPLETION_SUPERVISOR_REQUIRED")
+                    _require_create_completion_locked(root, validated, acknowledged=False)
+                elif request["lifecycle"] == "bound":
+                    _require_create_completion_locked(root, validated, acknowledged=True)
+            old_child, new_child = old["ownedChild"], validated["ownedChild"]
+            if old_child is not None and (
+                new_child is None
+                or (new_child["lifecycle"] == "reaped" and old_child["lifecycle"] != "reaped")
+            ):
+                # Both CLI paths publish here: neither may attest reap or discard
+                # ownership while any member of the recorded group remains.
+                require_child_group_quiescent(old_child)
+            raw = _canonical(validated)
+            _atomic_write(guard_fd, "current.json", raw, MAX_CURRENT_BYTES, replace=True)
+            if _read_at(guard_fd, "current.json", MAX_CURRENT_BYTES) != raw:
+                _reject("STATE_READBACK_FAILED")
+            if request is not None and request["operation"] == "create" and \
+                    request["lifecycle"] == "normal-completed" and \
+                    old["runtimeRequest"]["lifecycle"] == "intent":
+                _require_create_completion_locked(root, validated, acknowledged=False)
+            return validated
+        finally:
+            os.close(guard_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _validate_execution_state_write(
+    lease: Mapping[str, Any], previous: Mapping[str, Any], candidate: Mapping[str, Any], now_ns: int,
+) -> None:
+    """A live inherited FD/nonce does not revive revoked forward authority."""
+    if candidate["executionAttempt"] != lease["attempt"]:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    role, lifecycle = lease["workerMode"], lease["lifecycle"]
+    if role == "fail-closed-worker":
+        if lifecycle != "draining" or lease["hardEndNs"] is None or now_ns >= lease["hardEndNs"]:
+            _reject("EXECUTION_LEASE_UNRESOLVED")
+        if candidate["phase"] == previous["phase"] and \
+                candidate["runtimeRequest"] is not None and \
+                candidate["runtimeRequest"]["operation"] == "stop" and all(
+                    candidate[key] == previous[key] for key in previous if key != "runtimeRequest"
+                ):
+            cleanup_request_admission(previous, lease)
+            cleanup_request_admission(candidate, lease)
+            return
+        # Otherwise reserve permits only retaining the unresolved incident. It cannot
+        # clear child ownership, restore config, finalize provider cleanup or
+        # publish a successful schema outcome.
+        unresolved_phase = "COMMITTING" if previous["phase"] == "COMMITTING" else "RECOVERY_REQUIRED"
+        if candidate["phase"] != unresolved_phase or any(
+            candidate[key] != previous[key] for key in previous if key not in {"phase", "reason"}
+        ):
+            _reject("EXECUTION_LEASE_STOP_ONLY")
+        return
+    if lease["workEndNs"] is None or now_ns >= lease["workEndNs"]:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if role == "rollback-worker":
+        if lease["operation"] != "deploy" or lifecycle != "rolling-back" or \
+                not lease["rollbackIssued"] or candidate["phase"] not in {
+                    "ROLLING_BACK", "ROLLED_BACK", "RECOVERY_REQUIRED",
+                }:
+            _reject("EXECUTION_LEASE_ROLLBACK_REQUIRED")
+    elif role != "controller-worker" or lifecycle != "armed" or \
+            lease["firstFailure"] is not None:
+        _reject("EXECUTION_LEASE_UNRESOLVED")
+    if candidate["phase"] in {"ROLLING_BACK", "ROLLED_BACK"} and role != "rollback-worker":
+        _reject("EXECUTION_LEASE_ROLLBACK_REQUIRED")
+
+
+def publish_current(
+    root: str | os.PathLike[str],
+    state: Mapping[str, Any],
+    *,
+    deploy_lock_fd: int | None = None,
+    execution_grant: ExecutionGrant | None = None,
+) -> dict[str, Any]:
+    with deploy_lock(root, deploy_lock_fd), _execution_mutation(root, deploy_lock_fd, execution_grant):
+        _require_execution_lease_descriptor(root, deploy_lock_fd)
+        return _publish_current_locked(root, state)
+
+
+def _bootstrap_guard_locked(
+    root: str | os.PathLike[str],
+    *,
+    authority: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Publish explicit initial authority; never infer from an existing runtime."""
+    auth = _object(dict(authority), {
+        "rootId", "bootstrapId", "initialRuntime", "initialConfig",
+        "initialSchema", "initialStartupInventory", "schemaHistoryProvenance",
+    })
+    obs = _object(dict(observed), {
+        "rootId", "runtime", "config", "schema", "startupInventory",
+        "schemaHistoryProvenance",
+    })
+    _text(auth["rootId"], pattern=ROOT_KEY)
+    _text(auth["bootstrapId"], pattern=IDENTIFIER)
+    for key in ("initialRuntime", "initialConfig", "initialSchema", "initialStartupInventory"):
+        _digest(auth[key])
+    _bool(auth["schemaHistoryProvenance"])
+    if not auth["schemaHistoryProvenance"] or any(
+        obs[key] != auth[source] for key, source in (
+            ("rootId", "rootId"), ("runtime", "initialRuntime"), ("config", "initialConfig"),
+            ("schema", "initialSchema"), ("startupInventory", "initialStartupInventory"),
+            ("schemaHistoryProvenance", "schemaHistoryProvenance"),
+        )
+    ):
+        _reject("BOOTSTRAP_EVIDENCE_MISMATCH")
+    origin_unsigned = {
+        "schema": ORIGIN_SCHEMA, "controller": CONTROLLER, "rootId": auth["rootId"],
+        "bootstrapId": auth["bootstrapId"], "initialRuntime": auth["initialRuntime"],
+        "initialConfig": auth["initialConfig"], "initialSchema": auth["initialSchema"],
+        "initialStartupInventory": auth["initialStartupInventory"],
+        "schemaHistoryProvenance": True,
+    }
+    origin = dict(origin_unsigned, originDigest=hashlib.sha256(_canonical(origin_unsigned)).hexdigest())
+    current = new_ready_state(origin["originDigest"])
+    origin_raw, current_raw = _canonical(origin), _canonical(current)
+    if len(origin_raw) > MAX_ORIGIN_BYTES or len(current_raw) > MAX_CURRENT_BYTES:
+        _reject("STATE_TOO_LARGE")
+    root_fd = _open_root(root)
+    try:
+        staging = ".timepad-bootstrap-" + auth["bootstrapId"]
+        staged_siblings = {
+            entry for entry in os.listdir(root_fd)
+            if entry.startswith(".timepad-bootstrap-")
+        }
+        if staged_siblings - {staging}:
+            _reject("BOOTSTRAP_STAGING_CONFLICT")
+        try:
+            guard_fd = os.open(GUARD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        except FileNotFoundError:
+            created = False
+            try:
+                stage_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+            except FileNotFoundError:
+                os.mkdir(staging, 0o700, dir_fd=root_fd)
+                os.fsync(root_fd)
+                stage_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+                created = True
+            try:
+                stage_info = os.fstat(stage_fd)
+                if stage_info.st_uid != 0 or stage_info.st_nlink != 2 or \
+                        stat.S_IMODE(stage_info.st_mode) != 0o700:
+                    _reject("BOOTSTRAP_STAGING_UNSAFE")
+                _require_no_acl(stage_fd, directory=True)
+                entries = set(os.listdir(stage_fd))
+                if entries - {"origin.json", "current.json"}:
+                    _reject("BOOTSTRAP_STAGING_UNAUTHENTICATED")
+                if created:
+                    _atomic_write(stage_fd, "origin.json", origin_raw, MAX_ORIGIN_BYTES, replace=False)
+                    _atomic_write(stage_fd, "current.json", current_raw, MAX_CURRENT_BYTES, replace=False)
+                else:
+                    if "origin.json" not in entries:
+                        _reject("BOOTSTRAP_STAGING_UNAUTHENTICATED")
+                    staged_origin = _origin(parse_json(
+                        _read_at(stage_fd, "origin.json", MAX_ORIGIN_BYTES), MAX_ORIGIN_BYTES
+                    ))
+                    if staged_origin != origin:
+                        _reject("BOOTSTRAP_CONFLICT")
+                    if "current.json" not in entries:
+                        _atomic_write(stage_fd, "current.json", current_raw, MAX_CURRENT_BYTES, replace=False)
+                    else:
+                        staged_current = _current(parse_json(
+                            _read_at(stage_fd, "current.json", MAX_CURRENT_BYTES), MAX_CURRENT_BYTES
+                        ))
+                        if staged_current != current:
+                            _reject("BOOTSTRAP_CONFLICT")
+                _execution_check()
+                os.fsync(stage_fd)
+                _execution_check()
+            finally:
+                os.close(stage_fd)
+            _rename_noreplace(root_fd, staging, GUARD_DIR)
+            _execution_check()
+            os.fsync(root_fd)
+            _execution_check()
+            published_fd = os.open(GUARD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+            try:
+                if _read_at(published_fd, "origin.json", MAX_ORIGIN_BYTES) != origin_raw or \
+                        _read_at(published_fd, "current.json", MAX_CURRENT_BYTES) != current_raw:
+                    _reject("BOOTSTRAP_READBACK_FAILED")
+            finally:
+                os.close(published_fd)
+            return {"outcome": "bootstrapped", "originDigest": origin["originDigest"], "epoch": 0}
+        try:
+            guard_info = os.fstat(guard_fd)
+            if guard_info.st_uid != 0 or stat.S_IMODE(guard_info.st_mode) != 0o700:
+                _reject("STATE_PATH_UNSAFE")
+            _require_no_acl(guard_fd, directory=True)
+            if set(os.listdir(guard_fd)) - {"origin.json", "current.json"}:
+                _reject("STATE_TEMP_CONFLICT")
+            try:
+                old_origin = _origin(parse_json(
+                    _read_at(guard_fd, "origin.json", MAX_ORIGIN_BYTES), MAX_ORIGIN_BYTES
+                ))
+                old_current = _current(parse_json(
+                    _read_at(guard_fd, "current.json", MAX_CURRENT_BYTES), MAX_CURRENT_BYTES
+                ))
+            except FileNotFoundError:
+                _reject("GUARD_STATE_LOST")
+            if old_origin != origin or old_current["originDigest"] != origin["originDigest"]:
+                _reject("BOOTSTRAP_CONFLICT")
+            if old_current["operationEpoch"] == 0 and old_current["phase"] == "READY":
+                return {"outcome": "already-initialized", "originDigest": origin["originDigest"], "epoch": 0}
+            _reject("BOOTSTRAP_NOT_INITIAL")
+        finally:
+            os.close(guard_fd)
+    finally:
+        os.close(root_fd)
+
+
+def bootstrap_guard(
+    root: str | os.PathLike[str],
+    *,
+    authority: Mapping[str, Any],
+    observed: Mapping[str, Any],
+    deploy_lock_fd: int | None = None,
+    execution_grant: ExecutionGrant | None = None,
+) -> dict[str, Any]:
+    with deploy_lock(root, deploy_lock_fd), _execution_mutation(root, deploy_lock_fd, execution_grant):
+        return _bootstrap_guard_locked(root, authority=authority, observed=observed)
+
+
+def _validate_lock_fd(fd: int, root_fd: int) -> None:
+    if type(fd) is not int or fd < 0:
+        _reject("DEPLOY_LOCK_INVALID")
+    try:
+        info = os.fstat(fd)
+        path_info = os.stat(LOCK_NAME, dir_fd=root_fd, follow_symlinks=False)
+    except OSError:
+        _reject("DEPLOY_LOCK_INVALID")
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0 or \
+            stat.S_IMODE(info.st_mode) not in {0o600, 0o640, 0o644} or \
+            (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino):
+        _reject("DEPLOY_LOCK_INVALID")
+    _require_no_acl(fd)
+
+
+def _read_input(path: str | os.PathLike[str], limit: int) -> bytes:
+    try:
+        with open(path, "rb") as source:
+            data = source.read(limit + 1)
+    except OSError:
+        _reject("INPUT_UNAVAILABLE")
+    if len(data) > limit:
+        _reject("INPUT_TOO_LARGE")
+    return data
+
+
+@contextmanager
+def deploy_lock(root: str | os.PathLike[str], inherited_fd: int | None = None) -> Iterator[int]:
+    """Acquire .deploy.lock nonblocking; inherited descriptors are never unlocked."""
+    if fcntl is None:
+        _reject("LINUX_REQUIRED")
+    owned = inherited_fd is None
+    root_fd = _open_root(root)
+    fd = inherited_fd
+    locked = False
+    try:
+        if owned:
+            try:
+                fd = os.open(LOCK_NAME, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd)
+            except FileNotFoundError:
+                try:
+                    created = os.open(
+                        LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600, dir_fd=root_fd,
+                    )
+                except FileExistsError:
+                    pass
+                else:
+                    try:
+                        os.fsync(created)
+                        os.fsync(root_fd)
+                    finally:
+                        os.close(created)
+                fd = os.open(LOCK_NAME, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd)
+        _validate_lock_fd(fd, root_fd)
+        if not owned:
+            try:
+                if not os.get_inheritable(fd):
+                    _reject("DEPLOY_LOCK_INVALID")
+            except OSError:
+                _reject("DEPLOY_LOCK_INVALID")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _reject("DEPLOY_LOCK_BUSY")
+        locked = True
+        _validate_lock_fd(fd, root_fd)
+        yield fd
+    finally:
+        if owned:
+            try:
+                if locked:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        os.close(root_fd)
+
+
+def _cli() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    check = sub.add_parser("check-contract")
+    check.add_argument("--contract", required=True)
+    admission = sub.add_parser("admit")
+    admission.add_argument("--root", required=True)
+    admission.add_argument("--contract", required=True)
+    admission.add_argument("--evidence", required=True)
+    admission.add_argument("--deploy-lock-fd", type=int)
+    read = sub.add_parser("read-state")
+    read.add_argument("--root", required=True)
+    read.add_argument("--deploy-lock-fd", type=int)
+    recovery = sub.add_parser("authorize-recovery")
+    recovery.add_argument("--root", required=True)
+    recovery.add_argument("--authorization", required=True)
+    recovery.add_argument("--deploy-lock-fd", type=int)
+    registration = sub.add_parser("register-recovery")
+    registration.add_argument("--root", required=True)
+    registration.add_argument("--contract", required=True)
+    registration.add_argument("--deploy-lock-fd", type=int, required=True)
+    registration.add_argument("--run-id", required=True)
+    registration.add_argument("--incident-id", required=True)
+    registration.add_argument("--epoch", type=int, required=True)
+    registration.add_argument("--binding-digest", required=True)
+    registration.add_argument("--repository-digest", required=True)
+    registration.add_argument("--revision", required=True)
+    registration.add_argument("--version", required=True)
+    registration.add_argument("--runtime-evidence", action="store_true")
+    bootstrap = sub.add_parser("bootstrap")
+    bootstrap.add_argument("--root", required=True)
+    bootstrap.add_argument("--authority", required=True)
+    bootstrap.add_argument("--observed", required=True)
+    bootstrap.add_argument("--deploy-lock-fd", type=int)
+    publish = sub.add_parser("publish-state")
+    publish.add_argument("--root", required=True)
+    publish.add_argument("--state", required=True)
+    publish.add_argument("--deploy-lock-fd", type=int)
+    lease = sub.add_parser("publish-lease")
+    lease.add_argument("--root", required=True)
+    lease.add_argument("--lease", required=True)
+    lease.add_argument("--deploy-lock-fd", type=int, required=True)
+    lease_check = sub.add_parser("check-lease")
+    lease_check.add_argument("--root", required=True)
+    lease_check.add_argument("--attempt")
+    lease_check.add_argument("--deploy-lock-fd", type=int, required=True)
+    complete_create = sub.add_parser("publish-create-completion")
+    complete_create.add_argument("--root", required=True)
+    complete_create.add_argument("--request-digest", required=True)
+    complete_create.add_argument("--deploy-lock-fd", type=int, required=True)
+    prepare = sub.add_parser("prepare")
+    prepare.add_argument("--root", required=True)
+    prepare.add_argument("--contract", required=True)
+    prepare.add_argument("--evidence", required=True)
+    prepare.add_argument("--deploy-lock-fd", type=int)
+    advance = sub.add_parser("advance")
+    advance.add_argument("--root", required=True)
+    advance.add_argument("--phase", required=True, choices=sorted(PHASES - {"READY"}))
+    advance.add_argument("--changes", required=True)
+    advance.add_argument("--deploy-lock-fd", type=int)
+    claim_rollback = sub.add_parser("claim-rollback")
+    claim_rollback.add_argument("--root", required=True)
+    claim_rollback.add_argument("--deploy-lock-fd", type=int, required=True)
+    rollback_admission = sub.add_parser("rollback-admission")
+    rollback_admission.add_argument("--root", required=True)
+    rollback_admission.add_argument("--deploy-lock-fd", type=int, required=True)
+    adoption = sub.add_parser("adopt-recovery")
+    adoption.add_argument("--root", required=True)
+    adoption.add_argument("--contract", required=True)
+    adoption.add_argument("--deploy-lock-fd", type=int, required=True)
+    adoption.add_argument("--request-nonce")
+    adoption.add_argument("--completion-digest")
+    unresolved = sub.add_parser("retain-unresolved")
+    unresolved.add_argument("--root", required=True)
+    unresolved.add_argument("--deploy-lock-fd", type=int, required=True)
+    lock = sub.add_parser("lock-check")
+    lock.add_argument("--root", required=True)
+    lock.add_argument("--deploy-lock-fd", type=int)
+    capture_child = sub.add_parser("capture-child")
+    capture_child.add_argument("--pid", required=True, type=int)
+    capture_child.add_argument("--command-digest", required=True)
+    capture_child.add_argument("--attempt-id", required=True)
+    stop_child = sub.add_parser("stop-owned-child")
+    stop_child.add_argument("--root", required=True)
+    stop_child.add_argument("--deploy-lock-fd", type=int, required=True)
+    stop_child.add_argument("--term-grace-seconds", type=float, default=5.0)
+    for mutation in (bootstrap, publish, prepare, advance, claim_rollback, unresolved, stop_child,
+                     registration, rollback_admission, adoption, complete_create):
+        mutation.add_argument("--execution-attempt")
+        mutation.add_argument("--execution-grant")
+        mutation.add_argument("--deadline-ns", type=int)
+    return parser
+
+
+def _cli_execution_grant(args: argparse.Namespace) -> ExecutionGrant | None:
+    values = tuple(getattr(args, key, None) for key in (
+        "execution_attempt", "execution_grant", "deadline_ns",
+    ))
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        _reject("EXECUTION_GRANT_INVALID")
+    return ExecutionGrant(*values)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _cli().parse_args(argv)
+    try:
+        execution_grant = _cli_execution_grant(args)
+        if args.command == "check-contract":
+            contract = parse_contract(_read_input(args.contract, MAX_CONTRACT_BYTES))
+            result: Any = {"outcome": "valid", "active": contract["active"]}
+        elif args.command == "admit":
+            contract = parse_contract(_read_input(args.contract, MAX_CONTRACT_BYTES))
+            evidence = parse_json(_read_input(args.evidence, MAX_AUTHORIZATION_BYTES), MAX_AUTHORIZATION_BYTES)
+            with deploy_lock(args.root, args.deploy_lock_fd):
+                parsed_evidence = _object(
+                    evidence,
+                    {"rootId", "targetId", "predecessorId", "transitionId", "target", "predecessor"},
+                )
+                result = admit(
+                    contract,
+                    root_id=parsed_evidence["rootId"],
+                    target_id=parsed_evidence["targetId"],
+                    predecessor_id=parsed_evidence["predecessorId"],
+                    transition_id=parsed_evidence["transitionId"],
+                    target_tuple=parsed_evidence["target"],
+                    predecessor_tuple=parsed_evidence["predecessor"],
+                ).as_dict()
+                if result["disposition"] == "refuse":
+                    _reject(result["reason"])
+        elif args.command == "read-state":
+            origin, current = read_guard(args.root, deploy_lock_fd=args.deploy_lock_fd)
+            result = {"outcome": "read", "originDigest": origin["originDigest"], "current": current}
+        elif args.command == "authorize-recovery":
+            authorization = _read_input(args.authorization, MAX_AUTHORIZATION_BYTES)
+            with deploy_lock(args.root, args.deploy_lock_fd):
+                origin, current = _read_guard_locked(args.root)
+                result = authorize_recovery(
+                    authorization, root_id=origin["rootId"], current=current
+                )
+        elif args.command == "register-recovery":
+            if execution_grant is None:
+                _reject("EXECUTION_GRANT_REQUIRED")
+            result = register_recovery(
+                args.root, contract=parse_contract(_read_input(args.contract, MAX_CONTRACT_BYTES)),
+                selectors={
+                    "runId": args.run_id, "incidentId": args.incident_id,
+                    "operationEpoch": args.epoch, "evidenceDigest": args.binding_digest,
+                    "repositoryDigest": args.repository_digest,
+                    "revision": args.revision, "version": args.version,
+                },
+                deploy_lock_fd=args.deploy_lock_fd, execution_grant=execution_grant,
+                runtime_evidence=(
+                    sys.stdin.buffer.read(MAX_RECOVERY_RUNTIME_BYTES + 1)
+                    if args.runtime_evidence else None
+                ),
+            )
+        elif args.command == "adopt-recovery":
+            with deploy_lock(args.root, args.deploy_lock_fd), \
+                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):
+                lease = _read_execution_lease_locked(args.root)
+                if lease is None:
+                    _reject("RECOVERY_ADOPTION_REFUSED")
+                origin, current = _read_guard_locked(args.root)
+                root_fd = _open_root(args.root)
+                try:
+                    authorization = _read_at(
+                        root_fd, "timepad-recovery-authorization.json", MAX_AUTHORIZATION_BYTES,
+                    )
+                finally:
+                    os.close(root_fd)
+                auth = parse_json(authorization, MAX_AUTHORIZATION_BYTES)
+                _recovery_registration_authority(
+                    origin, current, parse_contract(_read_input(args.contract, MAX_CONTRACT_BYTES)),
+                    authorization, {key: auth[key] for key in (
+                        "runId", "incidentId", "operationEpoch", "evidenceDigest",
+                        "repositoryDigest", "revision", "version",
+                    )},
+                )
+                if (args.request_nonce is None) != (args.completion_digest is None):
+                    _reject("RUNTIME_REQUEST_CONFLICT")
+                adopted = adopt_recovery_state(
+                    current, lease, request_proof=(
+                        {"requestNonce": args.request_nonce, "completionDigest": args.completion_digest}
+                        if args.request_nonce is not None else None
+                    ),
+                )
+                if adopted != current:
+                    _publish_current_locked(args.root, adopted)
+                result = {"result": "recovery-adopted", "epoch": adopted["operationEpoch"]}
+        elif args.command == "rollback-admission":
+            from test_vps_timepad_supervisor import SupervisorError, WorkerClient
+
+            with deploy_lock(args.root, args.deploy_lock_fd):
+                lease = _read_execution_lease_locked(args.root)
+                if execution_grant is None or lease is None or \
+                        lease["attempt"] != execution_grant.attempt or \
+                        lease["workEndNs"] is None or execution_grant.end_ns > lease["workEndNs"] or \
+                        time.monotonic_ns() >= execution_grant.end_ns:
+                    _reject("ROLLBACK_NOT_ADMITTED")
+                client = None
+                try:
+                    client = WorkerClient(str(args.root))
+                    if client.attempt != execution_grant.attempt or \
+                            client.role != "rollback-worker" or client.supervisor != lease["supervisor"]:
+                        _reject("ROLLBACK_NOT_ADMITTED")
+                    expected = {
+                        "attempt": execution_grant.attempt, "grantId": execution_grant.grant_id,
+                        "endNs": execution_grant.end_ns, "role": client.role, "name": "rollback-admission",
+                    }
+                    if client.request("validate-grant", grantId=execution_grant.grant_id,
+                                      endNs=execution_grant.end_ns) != expected:
+                        _reject("ROLLBACK_NOT_ADMITTED")
+                    _, current = _read_guard_locked(args.root)
+                    rollback_state_admission(current, lease)
+                    def check_rollback() -> None:
+                        if client.request("validate-grant", grantId=execution_grant.grant_id,
+                                          endNs=execution_grant.end_ns) != expected or \
+                                time.monotonic_ns() >= execution_grant.end_ns:
+                            _reject("ROLLBACK_NOT_ADMITTED")
+
+                    proof = rollback_runtime_admission(
+                        args.root, current, lease, execution_grant, check_rollback,
+                    )
+                    if client.request("validate-grant", grantId=execution_grant.grant_id,
+                                      endNs=execution_grant.end_ns) != expected or \
+                            time.monotonic_ns() >= execution_grant.end_ns:
+                        _reject("ROLLBACK_NOT_ADMITTED")
+                    result = proof
+                except SupervisorError:
+                    _reject("EXECUTION_GRANT_REVOKED")
+                finally:
+                    if client is not None:
+                        client.close()
+        elif args.command == "bootstrap":
+            authority = parse_json(_read_input(args.authority, MAX_AUTHORIZATION_BYTES), MAX_AUTHORIZATION_BYTES)
+            observed = parse_json(_read_input(args.observed, MAX_AUTHORIZATION_BYTES), MAX_AUTHORIZATION_BYTES)
+            result = bootstrap_guard(
+                args.root, authority=authority, observed=observed,
+                deploy_lock_fd=args.deploy_lock_fd,
+                execution_grant=execution_grant,
+            )
+        elif args.command == "publish-state":
+            state = parse_json(_read_input(args.state, MAX_CURRENT_BYTES), MAX_CURRENT_BYTES)
+            result = publish_current(
+                args.root, state, deploy_lock_fd=args.deploy_lock_fd,
+                execution_grant=execution_grant,
+            )
+        elif args.command == "publish-lease":
+            lease = _read_input(args.lease, MAX_EXECUTION_LEASE_BYTES)
+            result = publish_execution_lease(
+                args.root, lease, deploy_lock_fd=args.deploy_lock_fd,
+            )
+        elif args.command == "publish-create-completion":
+            if execution_grant is None:
+                _reject("EXECUTION_GRANT_REQUIRED")
+            result = publish_create_completion(
+                args.root, request_digest=args.request_digest,
+                supervisor_wait_evidence=sys.stdin.buffer.read(MAX_CREATE_COMPLETION_BYTES + 1),
+                deploy_lock_fd=args.deploy_lock_fd, execution_grant=execution_grant,
+            )
+        elif args.command == "check-lease":
+            result = check_execution_lease(
+                args.root, attempt=args.attempt, deploy_lock_fd=args.deploy_lock_fd,
+            )
+        elif args.command == "prepare":
+            contract = parse_contract(_read_input(args.contract, MAX_CONTRACT_BYTES))
+            evidence = _object(
+                parse_json(_read_input(args.evidence, MAX_AUTHORIZATION_BYTES), MAX_AUTHORIZATION_BYTES),
+                {"rootId", "targetId", "predecessorId", "predecessorContainerId",
+                 "transitionId", "target", "predecessor",
+                 "operation", "runId", "incidentId", "ownedRun", "toolingDigest",
+                 "preparedProofDigest"},
+            )
+            with deploy_lock(args.root, args.deploy_lock_fd), \
+                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):
+                origin, current = _read_guard_locked(args.root)
+                admission = admit(
+                    contract, root_id=evidence["rootId"], target_id=evidence["targetId"],
+                    predecessor_id=evidence["predecessorId"], transition_id=evidence["transitionId"],
+                    target_tuple=evidence["target"], predecessor_tuple=evidence["predecessor"],
+                )
+                if admission.disposition == "refuse":
+                    _reject(admission.reason)
+                if evidence["rootId"] != origin["rootId"]:
+                    _reject("CONTRACT_INACTIVE_OR_WRONG_ROOT")
+                parsed_contract = parse_contract(contract)
+                target = next((item for item in parsed_contract["images"]
+                               if item["id"] == evidence["targetId"]), None)
+                if target is None:
+                    target = next((item for item in parsed_contract["initialDomain"]
+                                   if item["id"] == evidence["targetId"]), None)
+                predecessor = next((item for item in parsed_contract["images"]
+                                    if item["id"] == evidence["predecessorId"]), None)
+                if predecessor is None:
+                    predecessor = next((item for item in parsed_contract["initialDomain"]
+                                        if item["id"] == evidence["predecessorId"]), None)
+                if target is None or predecessor is None:
+                    _reject("IMAGE_NOT_REVIEWED")
+                prepared = new_prepared_state(
+                    current, operation=evidence["operation"], run_id=evidence["runId"],
+                    incident_id=evidence["incidentId"], admission=admission,
+                    target={"id": target["id"], "tuple": evidence["target"],
+                            "domain": target.get("domain", "initial")},
+                    predecessor={"id": predecessor["id"], "tuple": evidence["predecessor"],
+                                 "domain": predecessor.get("domain", "initial")},
+                    predecessor_container_id=evidence["predecessorContainerId"],
+                    transition_id=evidence["transitionId"], owned_run=evidence["ownedRun"],
+                    tooling_digest=evidence["toolingDigest"],
+                    prepared_proof_digest=evidence["preparedProofDigest"],
+                    execution_attempt=(
+                        (lease["attempt"] if lease is not None else None)
+                    ) if (lease := _read_execution_lease_locked(args.root)) is not None else None,
+                )
+                published = _publish_current_locked(args.root, prepared)
+                if _read_guard_locked(args.root)[1] != published:
+                    _reject("STATE_READBACK_FAILED")
+                result = {
+                    "admission": admission.disposition, "epoch": published["operationEpoch"],
+                    "incidentId": published["incidentId"], "result": published["phase"],
+                }
+        elif args.command == "advance":
+            changes = _object(
+                parse_json(_read_input(args.changes, MAX_CHANGES_BYTES), MAX_CHANGES_BYTES),
+                {"changes"},
+            )["changes"]
+            allowed_changes = {
+                "reason", "containerId", "configHash", "ownedChild", "commitWitnessDigest",
+                "providerFinalizationDigest",
+                "commitSubstep", "terminalReceipt", "latestAttemptId",
+                "runtimeRequest",
+            }
+            if not isinstance(changes, dict) or not changes.keys() <= allowed_changes:
+                _reject("STATE_CHANGE_UNSUPPORTED")
+            if args.phase == "PREPARED" and set(changes) != {"runtimeRequest"}:
+                _reject("STATE_CHANGE_UNSUPPORTED")
+            with deploy_lock(args.root, args.deploy_lock_fd):
+                lease = _read_execution_lease_locked(args.root)
+                cleanup = lease is not None and lease["workerMode"] == "fail-closed-worker" and \
+                    set(changes) == {"runtimeRequest"}
+                with _execution_mutation(
+                    args.root, args.deploy_lock_fd, execution_grant, cleanup_only=cleanup,
+                ):
+                    _require_execution_lease_descriptor(args.root, args.deploy_lock_fd)
+                    _, current = _read_guard_locked(args.root)
+                    advanced = advance_state(current, args.phase, **changes)
+                    published = _publish_current_locked(args.root, advanced)
+                    if _read_guard_locked(args.root)[1] != published:
+                        _reject("STATE_READBACK_FAILED")
+                    result = {
+                        "epoch": published["operationEpoch"], "incidentId": published["incidentId"],
+                        "result": published["phase"],
+                    }
+        elif args.command == "claim-rollback":
+            with deploy_lock(args.root, args.deploy_lock_fd), \
+                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant):
+                _require_execution_lease_descriptor(args.root, args.deploy_lock_fd)
+                _, current = _read_guard_locked(args.root)
+                lease = _read_execution_lease_locked(args.root)
+                if lease is not None and lease["workerMode"] == "rollback-worker":
+                    rollback_runtime_admission(
+                        args.root, current, lease, execution_grant, _execution_check, claim=True,
+                    )
+                disposition = current["predecessorDisposition"]
+                if (
+                    current["rollbackIssued"]
+                    or current["phase"] not in {"PREPARED", "CUTOVER_POSSIBLE", "VERIFYING"}
+                    or current["ownedChild"] is not None
+                    or current["commitWitnessDigest"] is not None
+                    or current["providerFinalizationDigest"] is not None
+                    or disposition not in {"pre-barrier-only", "post-barrier-compatible"}
+                    or current["phase"] in {"CUTOVER_POSSIBLE", "VERIFYING"}
+                    and disposition != "post-barrier-compatible"
+                ):
+                    _reject("ROLLBACK_NOT_ADMITTED")
+                claimed = advance_state(
+                    current,
+                    "ROLLING_BACK",
+                    reason="ROLLBACK_ADMITTED",
+                    rollbackIssued=True,
+                )
+                published = _publish_current_locked(args.root, claimed)
+                if _read_guard_locked(args.root)[1] != published:
+                    _reject("STATE_READBACK_FAILED")
+                result = {
+                    "result": "rollback-admitted",
+                    "epoch": published["operationEpoch"],
+                    "incidentId": published["incidentId"],
+                }
+        elif args.command == "retain-unresolved":
+            with deploy_lock(args.root, args.deploy_lock_fd), \
+                    _execution_mutation(args.root, args.deploy_lock_fd, execution_grant, cleanup_only=True):
+                lease = _read_execution_lease_locked(args.root)
+                if lease is None or lease["workerMode"] != "fail-closed-worker":
+                    _reject("EXECUTION_LEASE_STOP_ONLY")
+                _, current = _read_guard_locked(args.root)
+                phase = "COMMITTING" if current["phase"] == "COMMITTING" else "RECOVERY_REQUIRED"
+                unresolved = advance_state(current, phase, reason="QUIESCENCE_UNCONFIRMED")
+                published = _publish_current_locked(args.root, unresolved)
+                result = {
+                    "result": "QUIESCENCE_UNCONFIRMED", "epoch": published["operationEpoch"],
+                    "incidentId": published["incidentId"],
+                }
+        elif args.command == "capture-child":
+            result = capture_owned_child(
+                args.pid,
+                command_digest=args.command_digest,
+                attempt_id=args.attempt_id,
+            )
+        elif args.command == "stop-owned-child":
+            result = stop_owned_child(
+                args.root,
+                deploy_lock_fd=args.deploy_lock_fd,
+                term_grace_seconds=args.term_grace_seconds,
+                execution_grant=execution_grant,
+            )
+        else:
+            with deploy_lock(args.root, args.deploy_lock_fd):
+                result = {"outcome": "locked"}
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return 0
+    except GuardError as exc:
+        print(exc.reason, file=sys.stderr)
+        return 2
+    except OSError:
+        print("FILESYSTEM_OPERATION_FAILED", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

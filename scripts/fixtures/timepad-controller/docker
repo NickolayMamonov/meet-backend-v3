@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${TIMEPAD_FIXTURE_DOCKER_LOG:?fixture Docker log is required}"
+: "${TIMEPAD_FIXTURE_ADAPTER_DIR:?fixture adapter source directory is required}"
+if [ -f "$TIMEPAD_FIXTURE_DOCKER_LOG" ] &&
+  [ "$(timeout 5s stat -c %s "$TIMEPAD_FIXTURE_DOCKER_LOG")" -gt 65536 ]; then
+  echo "fixture Docker trace exceeded its bound" >&2
+  exit 90
+fi
+
+operation=${1:-}
+case "$operation" in
+  compose|image|inspect|update|stop|start|rm|ps|logs|volume) ;;
+  *) echo "fixture rejected an unknown Docker operation" >&2; exit 90 ;;
+esac
+if [ "$operation" = compose ]; then
+  suboperation=other
+  for argument in "$@"; do
+    case "$argument" in
+      up|create|start|stop|update|inspect|ps|config|port|logs|rm)
+        suboperation=$argument
+        break
+        ;;
+    esac
+  done
+else
+  suboperation=${2:-none}
+fi
+checkpoint=$operation:$suboperation
+printf '%s\n' "$checkpoint" >>"$TIMEPAD_FIXTURE_DOCKER_LOG"
+if [ "$operation" = start ]; then
+  printf 'start-id:%s\n' "${2:-missing}" >>"$TIMEPAD_FIXTURE_DOCKER_LOG"
+fi
+
+if [ "${TIMEPAD_FIXTURE_CANCEL_AT:-}" = "$checkpoint" ]; then
+  : "${TIMEPAD_FIXTURE_CASE:?fixture cancellation case is required}"
+  python3 -B "$TIMEPAD_FIXTURE_ADAPTER_DIR/admission-cancellation.py" checkpoint "$TIMEPAD_FIXTURE_CASE"
+fi
+
+if [ "${TIMEPAD_FIXTURE_PAUSE_AT:-}" = "$checkpoint" ]; then
+  : "${TIMEPAD_FIXTURE_GATE_DIR:?fixture gate directory is required}"
+  install -d -m 700 "$TIMEPAD_FIXTURE_GATE_DIR"
+  : >"$TIMEPAD_FIXTURE_GATE_DIR/$checkpoint.ready"
+  timeout 30s bash -c '
+    while [ ! -e "$1/$2.release" ]; do sleep 0.02; done
+  ' _ "$TIMEPAD_FIXTURE_GATE_DIR" "$checkpoint" || exit 91
+fi
+
+if [ "${TIMEPAD_FIXTURE_FAIL_AT:-}" = "$checkpoint" ]; then
+  exit "${TIMEPAD_FIXTURE_FAIL_STATUS:-90}"
+fi
+
+if [ -n "${TIMEPAD_FIXTURE_CASE:-}" ]; then
+  exec python3 -B "$TIMEPAD_FIXTURE_ADAPTER_DIR/recovery.py" docker "$@"
+fi
+
+echo "fixture Docker boundary has no configured response" >&2
+exit 90

@@ -324,13 +324,15 @@ runtime_safe_fingerprint() {
   } | sha256sum | awk '{print $1}'
 }
 
-verify_runtime_invariants() {
+_verify_runtime_invariants_with_restart_policy() {
   local root=$1
   local compose_script=$2
   local expected_id=$3
   local expected_revision=$4
   local expected_version=$5
   local expected_hash=$6
+  local expected_restart_policy=$7
+  local expected_container=${8:-}
   local backend postgres binding address memory
   local -a mounts postgres_mounts
   if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
@@ -338,6 +340,9 @@ verify_runtime_invariants() {
   fi
 
   backend=$(runtime_compose "$root" "$compose_script" ps -q backend)
+  if [ -n "$expected_container" ]; then
+    [ "$backend" = "$expected_container" ]
+  fi
   postgres=$(runtime_compose "$root" "$compose_script" ps -q postgres)
   [ -n "$backend" ] && [ -n "$postgres" ]
   [ "$(docker inspect "$backend" --format '{{.State.Running}}')" = true ]
@@ -352,7 +357,7 @@ verify_runtime_invariants() {
   echo "runtime_check=identity image_id=$expected_id config_hash=$expected_hash"
   [ "$(docker inspect "$backend" --format '{{.HostConfig.ReadonlyRootfs}}')" = true ]
   [ "$(docker inspect "$backend" \
-    --format '{{.HostConfig.RestartPolicy.Name}}')" = unless-stopped ]
+    --format '{{.HostConfig.RestartPolicy.Name}}')" = "$expected_restart_policy" ]
   [ "$(docker inspect "$backend" --format '{{.HostConfig.LogConfig.Type}}')" = local ]
   docker inspect "$backend" --format '{{json .HostConfig.CapDrop}}' |
     jq -e 'index("ALL") != null' >/dev/null
@@ -409,6 +414,45 @@ verify_runtime_invariants() {
   curl --fail --silent --show-error "http://$address/meetings" |
     jq -e 'type == "array"' >/dev/null
   echo "runtime_check=network image_id=$expected_id binding=$binding"
+}
+
+verify_runtime_invariants() {
+  [ "$#" -eq 6 ] || {
+    echo "verify_runtime_invariants requires exactly six arguments" >&2
+    return 2
+  }
+  _verify_runtime_invariants_with_restart_policy "$@" unless-stopped
+}
+
+# Guarded candidates are checked through a separate, deliberately non-public
+# policy path.  The durable incident must name the exact container and Compose
+# hash before a caller can accept the temporary restart suppression.
+verify_guarded_runtime_invariants() {
+  [ "$#" -eq 8 ] || {
+    echo "verify_guarded_runtime_invariants requires exactly eight arguments" >&2
+    return 2
+  }
+  local root=$1 compose_script=$2 expected_id=$3 expected_revision=$4
+  local expected_version=$5 expected_hash=$6 expected_container=$7 expected_epoch=$8
+  local helper=${TIMEPAD_STATE_HELPER:-}
+  local guard_root=${TIMEPAD_STATE_ROOT:-$root}
+  local state
+  [ -n "$helper" ] && [ -r "$helper" ] && [ "${DEPLOY_LOCK_FD:-}" = 9 ] ||
+    return 1
+  timeout 15s python3 "$helper" lock-check --root "$guard_root" --deploy-lock-fd 9 \
+    >/dev/null || return 1
+  state=$(timeout 15s python3 "$helper" read-state \
+    --root "$guard_root" --deploy-lock-fd 9) || return 1
+  jq -e --arg container "$expected_container" --arg hash "$expected_hash" \
+    --argjson epoch "$expected_epoch" '
+      .current as $s |
+      ($s.phase == "VERIFYING" or $s.phase == "COMMITTING") and
+      $s.operationEpoch == $epoch and
+      $s.containerId == $container and $s.configHash == $hash
+    ' <<<"$state" >/dev/null || return 1
+  _verify_runtime_invariants_with_restart_policy \
+    "$root" "$compose_script" "$expected_id" "$expected_revision" \
+    "$expected_version" "$expected_hash" no "$expected_container"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

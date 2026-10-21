@@ -1,0 +1,10 @@
+{
+  "schema": "meet-backend/test-vps-timepad-release-contracts/v1",
+  "formatVersion": 1,
+  "controller": "timepad-cutover-v1",
+  "active": false,
+  "rootId": null,
+  "initialDomain": [],
+  "transitions": [],
+  "images": []
+}

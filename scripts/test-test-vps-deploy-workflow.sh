@@ -8,6 +8,8 @@ deploy=scripts/deploy-test-vps-release.sh
 runtime=scripts/test-vps-runtime-invariants.sh
 provider_deploy=scripts/deploy-test-vps-provider-release.sh
 provider_helper=scripts/test-vps-provider-credential.py
+timepad_state=scripts/test_vps_timepad_state.py
+timepad_contract=scripts/test-vps-timepad-release-contracts.json
 provider_tests=scripts/test-test-vps-provider-credential.py
 provider_runtime=scripts/test-test-vps-provider-runtime.sh
 retention_fixture=scripts/test-test-vps-retention.sh
@@ -18,6 +20,7 @@ baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
 
 [ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ] &&
   [ -f "$provider_deploy" ] && [ -f "$provider_helper" ] &&
+  [ -f "$timepad_state" ] && [ -f "$timepad_contract" ] &&
   [ -f "$provider_tests" ] && [ -f "$provider_runtime" ] &&
   [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
   [ -f "$public_probe" ] && [ -f "$closed_beta_fixture" ]
@@ -26,6 +29,12 @@ deploy_text=$(<"$deploy")
 runtime_text=$(<"$runtime")
 provider_deploy_text=$(<"$provider_deploy")
 provider_helper_text=$(<"$provider_helper")
+jq -e '
+  .schema == "meet-backend/test-vps-timepad-release-contracts/v1" and
+  .formatVersion == 1 and .controller == "timepad-cutover-v1" and
+  .active == false and .rootId == null and
+  .initialDomain == [] and .transitions == [] and .images == []
+' "$timepad_contract" >/dev/null
 # shellcheck source=scripts/deploy-test-vps-release.sh
 source "$deploy"
 
@@ -44,6 +53,20 @@ require() {
 
 for text in \
   'workflow_dispatch:' \
+  'operation:' \
+  'bootstrap-guard' \
+  'forward-recover' \
+  'timepad-first-transition' \
+  'bootstrap_id:' \
+  'recovery_binding_digest:' \
+  'first transition requires explicit proof and drill=false' \
+  'scripts/test_vps_timepad_state.py' \
+  'scripts/test_vps_timepad_supervisor.py' \
+  'scripts/test_vps_timepad_create.py' \
+  'scripts/test-vps-timepad-release-contracts.json' \
+  'check-contract --contract scripts/test-vps-timepad-release-contracts.json' \
+  'contract_check" >/dev/null' \
+  'sha256sum "${files[@]}"' \
   "if: github.ref == 'refs/heads/dev'" \
   'name: test-vps' \
   'scripts/verify-immutable-release-proof.sh' \
@@ -80,6 +103,46 @@ for text in \
   'retention=applied'; do
   require "$text" "$workflow_text" "test VPS workflow"
 done
+for text in \
+  '--deploy-lock-fd 9' \
+  'exec 9<"$state_root/.deploy.lock"' \
+  'execution_lease="$state_root/.timepad-execution.json"' \
+  'if [ -e "$execution_lease" ] || [ -L "$execution_lease" ]; then' \
+  'echo "RECOVERY_REQUIRED" >&2' \
+  '--operation deploy' \
+  '--rollout-domain "$ROLLOUT_DOMAIN"' \
+  '--bootstrap-id "$BOOTSTRAP_ID"' \
+  '--recovery-binding-digest "$RECOVERY_BINDING_DIGEST"' \
+  'if: inputs.operation == '\''deploy'\'' && inputs.run_rollback_drill' \
+  'if: inputs.operation == '\''deploy'\''' \
+  'if: inputs.operation == '\''bootstrap-guard'\'' || inputs.operation == '\''forward-recover'\''' \
+  'schema_guard=(legacy-no-transition|pre-barrier-only|post-barrier-compatible|cutover-possible|rolled-back|committed)' \
+  'operation_outcome=(bootstrapped|already-initialized)' \
+  'RECOVERY_RECONCILIATION_UNAVAILABLE' \
+  'read-state' \
+  '.current.ownedRun' \
+  'protected_states+=("$guard_run_path")'; do
+  require "$text" "$workflow_text" "guarded test-VPS workflow routing"
+done
+# Workflow dispatch delegates reconciliation to the uploaded controller.
+# Assert recovery contracts at that implementation boundary.
+for text in \
+  'live-resume' \
+  'absence-resume' \
+  'RECOVERY_PROVIDER_LIVE_PROOF_REQUIRED' \
+  'RECOVERY_PROVIDER_ABSENCE_PROOF_REQUIRED' \
+  'replacement-create-intent' \
+  'replacement-container-authorized' \
+  'replacement-provider-cleanup' \
+  'replacement-terminal-policy-intent' \
+  'replacement-policy-restored'; do
+  require "$text" "$provider_deploy_text" "guarded test-VPS controller routing"
+done
+case "$workflow_text" in
+  *'exec 9>"$state_root/.deploy.lock"'*)
+    fail "workflow truncates the inherited deploy lock"
+    ;;
+esac
 
 for text in \
   'scripts/deploy-test-vps-provider-release.sh' \
@@ -188,7 +251,6 @@ require 'state=$state_root/$run_key-$state_suffix' "$provider_deploy_text" \
 for frozen in \
   .github/workflows/promote-dev-digest-to-test-vps.yml \
   scripts/deploy-test-vps-release.sh \
-  scripts/test-vps-runtime-invariants.sh \
   scripts/production-compose.sh \
   scripts/update-production-release.sh; do
   git diff --quiet "$baseline" -- "$frozen" ||
@@ -628,7 +690,7 @@ grep -Fq 'target version must be at least v1.2.0' "$tmp/invalid-target.stderr" |
   fail "pre-floor target created deployment state before rejection"
 
 state_writer_line=$(awk '/install -d -m 700 "\$state_root"/{print NR; exit}' "$deploy")
-state_directory_line=$(awk '/state-publish/{print NR; exit}' "$provider_deploy")
+state_directory_line=$(awk '/python3 "\$provider_helper" state-publish/{print NR; exit}' "$provider_deploy")
 provider_retention_line=$(awk '/retention-check/{print NR; exit}' "$provider_deploy")
 mutation_line=$(awk '/mutation_started=true/{print NR; exit}' "$deploy")
 target_line=$(awk '/is_supported_test_vps_version "\$version"/{print NR; exit}' "$deploy")
@@ -647,6 +709,28 @@ update_line=$(awk '/"\$update_script" "\$image"/{print NR; exit}' "$deploy")
   fail "provider retention admission runs after state-directory creation"
 
 require 'runtime_check=network' "$runtime_text" "shared runtime helper"
+require 'verify_runtime_invariants requires exactly six arguments' \
+  "$runtime_text" "ordinary runtime verification contract"
+require '_verify_runtime_invariants_with_restart_policy "$@" unless-stopped' \
+  "$runtime_text" "ordinary runtime restart-policy binding"
+set +e
+MEE_SMTP_FAKE_REMOTE=true bash -c '
+  set -euo pipefail
+  source "$1"
+  verify_runtime_invariants root compose id revision version hash
+' _ "$runtime" >/dev/null 2>&1
+ordinary_runtime_status=$?
+MEE_SMTP_FAKE_REMOTE=true bash -c '
+  set -euo pipefail
+  source "$1"
+  verify_runtime_invariants root compose id revision version hash always
+' _ "$runtime" >/dev/null 2>&1
+alternate_runtime_policy_status=$?
+set -e
+[ "$ordinary_runtime_status" -eq 0 ] ||
+  fail "ordinary runtime helper no longer accepts its six-argument contract"
+[ "$alternate_runtime_policy_status" -eq 2 ] ||
+  fail "ordinary runtime helper exposed an arbitrary restart-policy argument"
 
 if [ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ]; then
   set +e

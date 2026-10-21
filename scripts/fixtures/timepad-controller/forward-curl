@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TIMEPAD_FIXTURE_CASE:?forward fixture case is required}"
+exec python3 -B "$TIMEPAD_FIXTURE_CASE/tools/forward.py" curl "$TIMEPAD_FIXTURE_CASE" "$@"
