@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.5.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.4.0...v1.5.0) (2026-10-21)
+
+
+### Features
+
+* enable governed automatic Timepad catalog ([37ee842](https://github.com/NickolayMamonov/meet-backend-v3/commit/37ee842a9260f6bcbcf830037bb9fd3d36f8d7f7))
+
+
+### Fixes
+
+* canonicalize protected descriptors ([0dab272](https://github.com/NickolayMamonov/meet-backend-v3/commit/0dab272cb5da84b919f0af6e52bfe4df02367007))
+* close retention witness descriptors on failure ([1982ece](https://github.com/NickolayMamonov/meet-backend-v3/commit/1982ece0bf9a41ac794223e5b976c858488a095b))
+* close witness descriptors on early failures ([7a48481](https://github.com/NickolayMamonov/meet-backend-v3/commit/7a484811f73518d07728cbf37f51f584a0c56893))
+* keep jq descriptor helper portable ([afa1cc1](https://github.com/NickolayMamonov/meet-backend-v3/commit/afa1cc190b8be7c37c08c3579b39b806c6de5827))
+* preserve Timepad state on apply failures ([e8f7372](https://github.com/NickolayMamonov/meet-backend-v3/commit/e8f7372422d274074f06ee5036d9d46a3b82c3c2))
+* reject unbound artifact manifests ([0584d49](https://github.com/NickolayMamonov/meet-backend-v3/commit/0584d49842288bdebabdec0c5d06475c8f4efd06))
+* retain witness descriptor ownership on failure ([72f652f](https://github.com/NickolayMamonov/meet-backend-v3/commit/72f652f0c06f080629a5deaf769eb3bb71694510))
+* select admitted ORAS layout root ([bf44261](https://github.com/NickolayMamonov/meet-backend-v3/commit/bf44261ba7237a0a7c218e7effca1bd3d8bdb07f))
+
 ## [1.4.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.3.0...v1.4.0) (2026-09-17)
 
 
