@@ -2232,6 +2232,11 @@ run_owned_child() {
   attempt_id=$(next_owned_child_attempt) || fail "OWNED_CHILD_INVALID"
   [[ "$attempt_id" =~ ^[a-f0-9]{32}:[1-9][0-9]{0,19}$ ]] ||
     fail "OWNED_CHILD_INVALID"
+  # Persist the runtime intent before launching the child. This keeps the
+  # child's fixed five-second identity handshake independent of state publish.
+  timepad_request_begin start "$attempt_id" "$6" ||
+    fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
+  fixture_create_start_trace request-published
   token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$token" =~ ^[0-9a-f]{32}$ ]] || fail "OWNED_CHILD_INVALID"
   command_digest=$(printf '%s\0' "$@" | sha256sum | awk '{print $1}')
@@ -2336,13 +2341,9 @@ sys.stdout.buffer.write(data)
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$child_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
   # The handshake grant covers establishing and durably recording ownership.
-  # Complete it before request publication obtains its independent state-write
-  # grant; both operations must not compete for the same short deadline.
   supervisor_client complete "$handshake_grant" >/dev/null ||
     fail "OWNED_CHILD_GRANT_REQUIRED"
   fixture_create_start_trace handshake-grant-completed
-  timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
-  fixture_create_start_trace request-published
   grant=$(supervisor_client grant docker 30) || fail "OWNED_CHILD_GRANT_REQUIRED"
   owned_child_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
   fixture_create_start_trace docker-grant-received
