@@ -1,9 +1,11 @@
 package dev.whysoezzy.meet.domain.entity
 
 import jakarta.persistence.*
+import org.hibernate.annotations.DynamicUpdate
 import java.time.LocalDateTime
 
 @Entity
+@DynamicUpdate
 @Table(name = "meetings")
 class Meeting(
 
@@ -84,6 +86,9 @@ class Meeting(
 
     @Column(name = "ends_at")
     var endsAt: Long? = null,
+
+    @Column(name = "timepad_eligible_until_ms")
+    var timepadEligibleUntilMs: Long? = null,
 
     @Column(name = "demo_catalog_key", length = 160, updatable = false)
     var demoCatalogKey: String? = null,

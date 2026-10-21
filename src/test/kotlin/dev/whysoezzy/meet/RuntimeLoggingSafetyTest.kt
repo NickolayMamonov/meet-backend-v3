@@ -264,7 +264,10 @@ class RuntimeLoggingSafetyTest {
         `when`(provider.source()).thenReturn(EventSource.TIMEPAD)
         doThrow(IllegalStateException(exceptionMarker))
             .`when`(provider)
-            .fetch(isNull())
+            .fetch(
+                any(dev.whysoezzy.meet.ingestion.FetchContext::class.java)
+                    ?: dev.whysoezzy.meet.ingestion.FetchContext(java.time.Instant.EPOCH, emptyList()),
+            )
         val runRepository = mock(IngestionRunRepository::class.java)
         doAnswer { invocation -> invocation.arguments[0] }
             .`when`(runRepository)
@@ -274,8 +277,10 @@ class RuntimeLoggingSafetyTest {
         val service = IngestionService(
             providers,
             mock(MeetingUpsertService::class.java),
+            mock(dev.whysoezzy.meet.ingestion.TimepadCatalogApplyService::class.java),
             runRepository,
             mock(MeetingRepository::class.java),
+            java.time.Clock.systemUTC(),
         )
 
         val events = captureApplicationLogs(profile) {
@@ -437,7 +442,11 @@ class RuntimeLoggingSafetyTest {
         val challengeMarker = SensitiveMarker("challenge cleanup exception detail", "challenge-cleanup-marker")
         val attemptMarker = SensitiveMarker("attempt cleanup exception detail", "attempt-cleanup-marker")
         val transactionManager = mock(PlatformTransactionManager::class.java)
-        `when`(transactionManager.getTransaction(any(TransactionDefinition::class.java)))
+        `when`(
+            transactionManager.getTransaction(
+                any(TransactionDefinition::class.java) ?: org.springframework.transaction.support.DefaultTransactionDefinition(),
+            ),
+        )
             .thenAnswer { SimpleTransactionStatus() }
         val challengeStore = mock(OtpChallengeStore::class.java)
         val attemptStore = mock(OtpAttemptStore::class.java)

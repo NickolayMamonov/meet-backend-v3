@@ -3,17 +3,19 @@ package dev.whysoezzy.meet.ingestion.timepad
 import dev.whysoezzy.meet.config.TimepadProperties
 import dev.whysoezzy.meet.domain.entity.EventSource
 import dev.whysoezzy.meet.ingestion.EventProvider
+import dev.whysoezzy.meet.ingestion.FetchContext
+import dev.whysoezzy.meet.ingestion.ProviderFetchResult
 import dev.whysoezzy.meet.ingestion.RawEvent
 import mu.KotlinLogging
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.stereotype.Component
-import org.springframework.web.client.RestClient
 import java.time.LocalDate
-import java.time.LocalDateTime
-import java.time.OffsetDateTime
+import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-import tools.jackson.databind.JsonNode
+import java.net.URI
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 
 private val logger = KotlinLogging.logger {}
 
@@ -21,141 +23,201 @@ private val logger = KotlinLogging.logger {}
 @ConditionalOnProperty(prefix = "app.timepad", name = ["enabled"], havingValue = "true")
 class TimepadProvider(
     private val props: TimepadProperties,
-    restClientBuilder: RestClient.Builder,
+    private val httpClient: TimepadHttpClient,
 ) : EventProvider {
-
-    private val restClient = restClientBuilder
-        .baseUrl(props.baseUrl)
-        .build()
 
     override fun source(): EventSource = EventSource.TIMEPAD
 
-    override fun fetch(since: LocalDateTime?): List<RawEvent> {
+    override fun fetch(context: FetchContext): ProviderFetchResult {
         val zone = ZoneId.of(props.zone)
-        val startMin = (since?.toLocalDate() ?: LocalDate.now()).format(DateTimeFormatter.ISO_LOCAL_DATE)
-        val startMax = LocalDate.now().plusDays(props.daysAhead).format(DateTimeFormatter.ISO_LOCAL_DATE)
-
-        val collected = mutableListOf<RawEvent>()
-        var page = 0
-        while (page < props.maxPages) {
-            val skip = page * props.pageSize
-            val response = restClient.get()
-                .uri { b ->
-                    b.path("/events.json")
-                        .queryParam("limit", props.pageSize)
-                        .queryParam("skip", skip)
-                        .queryParam("sort", "+starts_at")
-                        .queryParam("fields", "location,description_short,description_html,ends_at")
-                        .queryParam("starts_at_min", startMin)
-                        .queryParam("starts_at_max", startMax)
-                    if (props.categoryIds.isNotEmpty()) b.queryParam("category_ids", props.categoryIds.joinToString(","))
-                    if (props.keywords.isNotEmpty()) b.queryParam("keywords", props.keywords.joinToString(","))
-                    if (props.cities.isNotEmpty()) b.queryParam("cities", props.cities.joinToString(","))
-                    b.build()
+        val observedAt = context.observedAt.toEpochMilli()
+        val startMin = LocalDate.now(zone).format(DateTimeFormatter.ISO_LOCAL_DATE)
+        val startMax = LocalDate.now(zone).plusDays(180).format(DateTimeFormatter.ISO_LOCAL_DATE)
+        if (context.savedExternalIds.size > 500) return ProviderFetchResult.Incomplete("saved_id_budget")
+        return try {
+            val discovery = linkedMapOf<String, TimepadEvent>()
+            val conflictingNewIds = mutableSetOf<String>()
+            var page = 0
+            var expectedTotal: Int? = null
+            while (true) {
+                if (page >= props.maxPages) return ProviderFetchResult.Incomplete("discovery_page_budget")
+                val response = requestEvents(page * 100, startMin, startMax)
+                val total = response.total ?: return ProviderFetchResult.Incomplete("missing_total")
+                val values = response.values ?: return ProviderFetchResult.Incomplete("missing_values")
+                if (total < 0 || total > 500 || values.size > 100) {
+                    return ProviderFetchResult.Incomplete("discovery_budget")
                 }
-                .headers { h -> if (props.token.isNotBlank()) h.setBearerAuth(props.token) }
-                .retrieve()
-                .body(TimepadEventsResponse::class.java) ?: break
+                if (values.any { (it.categories?.size() ?: 0) > 64 }) {
+                    return ProviderFetchResult.Incomplete("category_budget")
+                }
+                if (values.any { (it.categories?.size() ?: 0) > 64 }) {
+                    return ProviderFetchResult.Incomplete("category_budget")
+                }
+                if (expectedTotal != null && expectedTotal != total) {
+                    return ProviderFetchResult.Incomplete("changing_total")
+                }
+                expectedTotal = total
+                values.forEach { event ->
+                    if (event.id <= 0) return ProviderFetchResult.Incomplete("invalid_id")
+                    val id = event.id.toString()
+                    if (id in conflictingNewIds) return@forEach
+                    val previous = discovery.putIfAbsent(id, event)
+                    if (previous != null && previous != event) {
+                        if (id in context.savedExternalIds) {
+                            return ProviderFetchResult.Incomplete("saved_id_conflict")
+                        }
+                        discovery.remove(id)
+                        conflictingNewIds += id
+                    }
+                }
+                page++
+                if (page * 100 >= total) break
+                if (values.size != 100) return ProviderFetchResult.Incomplete("short_page")
+            }
 
-            if (response.values.isEmpty()) break
-            response.values.forEach { event ->
-                try {
-                    collected += event.toRawEvent(zone)
-                } catch (rejection: EventMappingRejection) {
-                    logger.warn {
-                        "Timepad: skipped event source=${source()} externalId=${event.id} reason=${rejection.reason}"
+            val refreshed = linkedMapOf<String, TimepadEvent>()
+            context.savedExternalIds.chunked(100).forEach { ids ->
+                val response = requestSaved(ids)
+                val values = response.values ?: return ProviderFetchResult.Incomplete("missing_saved_values")
+                if (response.total != ids.size || values.size != ids.size || values.size > 100) {
+                    return ProviderFetchResult.Incomplete("missing_saved_id")
+                }
+                if (values.any { (it.categories?.size() ?: 0) > 64 }) {
+                    return ProviderFetchResult.Incomplete("category_budget")
+                }
+                if (values.any { (it.categories?.size() ?: 0) > 64 }) {
+                    return ProviderFetchResult.Incomplete("category_budget")
+                }
+                values.forEach { event ->
+                    val id = event.id.toString()
+                    if (id !in ids || refreshed.putIfAbsent(id, event) != null) {
+                        return ProviderFetchResult.Incomplete("saved_id_conflict")
                     }
                 }
             }
-            logger.info { "Timepad: страница ${page + 1}, получено ${response.values.size}/${response.total}" }
+            if (!refreshed.keys.containsAll(context.savedExternalIds)) {
+                return ProviderFetchResult.Incomplete("missing_saved_id")
+            }
+            refreshed.forEach { (id, event) ->
+                val discovered = discovery[id]
+                if (discovered != null && discovered != event) {
+                    return ProviderFetchResult.Incomplete("changing_saved_observation")
+                }
+                discovery[id] = event
+            }
+            if (discovery.size + conflictingNewIds.size > 1000) {
+                return ProviderFetchResult.Incomplete("observation_budget")
+            }
 
-            if (skip + response.values.size >= response.total) break
-            page++
+            val accepted = mutableListOf<RawEvent>()
+            val rejectedSaved = mutableSetOf<String>()
+            discovery.forEach { (id, event) ->
+                try {
+                    accepted += event.toRawEvent(zone, observedAt, id in context.savedExternalIds)
+                } catch (rejection: EventMappingRejection) {
+                    if (id in context.savedExternalIds) rejectedSaved += id
+                }
+            }
+            logger.info { "Timepad snapshot complete observed=${discovery.size} accepted=${accepted.size}" }
+            ProviderFetchResult.Complete(accepted.toList(), rejectedSaved.toSet(), discovery.size + conflictingNewIds.size)
+        } catch (_: Exception) {
+            logger.warn { "Timepad snapshot incomplete reason=provider_failure" }
+            ProviderFetchResult.Incomplete("provider_failure")
         }
-        logger.info { "Timepad: всего нормализовано ${collected.size} событий" }
-        return collected
     }
 
-    private fun TimepadEvent.toRawEvent(zone: ZoneId): RawEvent {
-        // poster_image / location могут прийти объектом, пустым массивом [] или отсутствовать —
-        // JsonNode.path() безопасен в любом случае (вернёт MissingNode, не упадёт).
-        val imageUrl = posterImage?.path("default_url")?.takeIf { it.isString }?.stringValue().orEmpty()
+    private fun requestEvents(skip: Int, startMin: String, startMax: String): TimepadEventsResponse =
+        httpClient.fetch(endpoint(
+            "limit" to "100",
+            "skip" to skip.toString(),
+            "sort" to "+starts_at",
+            "fields" to "location,categories,ends_at,access_status,registration_data,locale",
+            "starts_at_min" to startMin,
+            "starts_at_max" to startMax,
+        ))
 
+    private fun requestSaved(ids: List<String>): TimepadEventsResponse =
+        httpClient.fetch(endpoint(
+            "limit" to ids.size.toString(),
+            "event_ids" to ids.joinToString(","),
+            "fields" to "location,categories,ends_at,access_status,registration_data,locale",
+        ))
+
+    private fun endpoint(vararg query: Pair<String, String>): URI {
+        val base = URI(props.baseUrl)
+        val path = base.toString().trimEnd('/') + "/events.json"
+        val encoded = query.joinToString("&") { (key, value) ->
+            "${encode(key)}=${encode(value)}"
+        }
+        return URI.create("$path?$encoded")
+    }
+
+    private fun encode(value: String): String =
+        URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20")
+
+    private fun TimepadEvent.toRawEvent(zone: ZoneId, observedAt: Long, saved: Boolean): RawEvent {
+        if (id <= 0) throw EventMappingRejection("invalid_id")
+        val title = TimepadPolicy.title(name) ?: throw EventMappingRejection("invalid_title")
+        if (!TimepadPolicy.isRussianLocale(locale)) throw EventMappingRejection("locale")
+        if (!TimepadPolicy.isPublic(accessStatus)) throw EventMappingRejection("not_public")
+        if (!TimepadPolicy.registrationOpen(registrationData)) throw EventMappingRejection("registration_closed")
+        val categoryNames = TimepadPolicy.categoryNames(categories)
+        val groups = TimepadPolicy.groups(title, categoryNames) ?: throw EventMappingRejection("topic")
         val loc = location
         val city = loc?.path("city")?.takeIf { it.isString }?.stringValue().orEmpty()
         val address = loc?.path("address")?.takeIf { it.isString }?.stringValue().orEmpty()
-
         val coords = loc?.path("coordinates")
-        val lat = coords?.takeIf { it.isArray && it.size() > 0 }?.get(0)?.asString()?.toDoubleOrNull() ?: 0.0
-        val lng = coords?.takeIf { it.isArray && it.size() > 1 }?.get(1)?.asString()?.toDoubleOrNull() ?: 0.0
+        val coordinates = if (coords?.isArray == true && coords.size() >= 2) {
+            (0..1).map { index ->
+                val coordinate = coords[index]
+                when {
+                    coordinate.isNumber -> coordinate.doubleValue()
+                    coordinate.isString -> coordinate.stringValue().toDoubleOrNull()
+                    else -> null
+                }
+            }
+        } else listOf(null, null)
+        val validCoordinates = coordinates[0]?.let { it in -90.0..90.0 } == true &&
+            coordinates[1]?.let { it in -180.0..180.0 } == true
+        val lat = if (validCoordinates) coordinates[0]!! else 0.0
+        val lng = if (validCoordinates) coordinates[1]!! else 0.0
 
-        val hasPhysical = address.isNotBlank() ||
-                (city.isNotBlank() && !city.equals("Онлайн", ignoreCase = true))
-        val addr = when {
-            address.isNotBlank() -> address
-            city.isNotBlank() -> city
-            else -> "Онлайн"
-        }
-
-        val startsAtEpochMs = parseTimestamp(startsAt, zone) ?: 0L
+        val startsAtEpochMs = TimepadPolicy.parseTimestamp(startsAt, zone)
+            ?: throw EventMappingRejection("malformed_start")
         val endsAtEpochMs = if (endsAt.isNullOrBlank()) {
             null
         } else {
-            parseTimestamp(endsAt, zone) ?: throw EventMappingRejection("malformed_end")
+            TimepadPolicy.parseTimestamp(endsAt, zone) ?: throw EventMappingRejection("malformed_end")
         }
         if (endsAtEpochMs != null && endsAtEpochMs < startsAtEpochMs) {
             throw EventMappingRejection("end_before_start")
         }
+        val physicalAddress = TimepadPolicy.physicalMoscowAddress(city, address)
+            ?: throw EventMappingRejection("location")
+        if (!TimepadPolicy.eventStartAllowed(startsAtEpochMs, observedAt, saved, endsAtEpochMs)) {
+            throw EventMappingRejection("start_window")
+        }
+        val registrationUrl = TimepadPolicy.validRegistrationUrl(url, id)
+            ?: throw EventMappingRejection("registration_url")
+        val publicAssetBase = props.assetBaseUrl.trimEnd('/')
+        if (publicAssetBase.isBlank()) throw EventMappingRejection("assets_unconfigured")
 
         return RawEvent(
             sourceExternalId = id.toString(),
-            title = name,
-            description = descriptionShort?.takeIf { it.isNotBlank() } ?: descriptionHtml.orEmpty(),
-            imageUrl = imageUrl,
+            title = title,
+            description = TimepadPolicy.description(groups, startsAtEpochMs, physicalAddress),
+            imageUrl = "$publicAssetBase/timepad-assets/v1/${groups.first().asset}.png",
             startsAtEpochMs = startsAtEpochMs,
             endsAtEpochMs = endsAtEpochMs,
-            address = addr,
+            address = physicalAddress,
             latitude = lat,
             longitude = lng,
-            externalUrl = url,
-            isOnline = !hasPhysical,
-            topicKeywords = extractCategoryNames(categories),
+            externalUrl = registrationUrl,
+            isOnline = false,
+            topicKeywords = categoryNames.toSet(),
+            timepadGroups = groups.map { it.displayName },
         )
-    }
-
-    private fun parseTimestamp(value: String?, zone: ZoneId): Long? {
-        if (value.isNullOrBlank()) return null
-        // Timepad обычно отдаёт смещение без двоеточия: 2026-09-15T19:00:00+0300
-        runCatching {
-            return OffsetDateTime.parse(value, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ"))
-                .toInstant().toEpochMilli()
-        }
-        runCatching {
-            return OffsetDateTime.parse(value, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-                .toInstant().toEpochMilli()
-        }
-        runCatching {
-            return LocalDateTime.parse(value, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"))
-                .atZone(zone).toInstant().toEpochMilli()
-        }
-        runCatching {
-            return LocalDateTime.parse(value, DateTimeFormatter.ISO_LOCAL_DATE_TIME)
-                .atZone(zone).toInstant().toEpochMilli()
-        }
-        return runCatching {
-            LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE)
-                .atStartOfDay(zone).toInstant().toEpochMilli()
-        }.getOrNull()
     }
 }
 
 private class EventMappingRejection(val reason: String) : RuntimeException()
-
-private fun extractCategoryNames(node: JsonNode?): Set<String> {
-    // categories бывает массивом [{name:...}] или объектом {..:{name:...}} — обходим оба
-    if (node == null || (!node.isArray && !node.isObject)) return emptySet()
-    return node.values().asSequence()
-        .mapNotNull { el -> el.path("name").takeIf { it.isString }?.stringValue() }
-        .filter { it.isNotBlank() }
-        .toSet()
-}

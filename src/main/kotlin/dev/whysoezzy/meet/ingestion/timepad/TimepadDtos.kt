@@ -6,22 +6,22 @@ import tools.jackson.databind.JsonNode
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class TimepadEventsResponse(
-    val total: Int = 0,
-    val values: List<TimepadEvent> = emptyList(),
+    val total: Int?,
+    val values: List<TimepadEvent>?,
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class TimepadEvent(
     val id: Long,
     val name: String = "",
-    @param:JsonProperty("description_short") val descriptionShort: String? = null,
-    @param:JsonProperty("description_html") val descriptionHtml: String? = null,
     @param:JsonProperty("starts_at") val startsAt: String? = null,
     @param:JsonProperty("ends_at") val endsAt: String? = null,
     val url: String? = null,
-    @param:JsonProperty("poster_image") val posterImage: JsonNode? = null,
     val location: JsonNode? = null,
     val categories: JsonNode? = null,
+    val locale: String? = null,
+    @param:JsonProperty("access_status") val accessStatus: String? = null,
+    @param:JsonProperty("registration_data") val registrationData: JsonNode? = null,
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)

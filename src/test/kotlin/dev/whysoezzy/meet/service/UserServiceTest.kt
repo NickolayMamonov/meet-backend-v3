@@ -5,6 +5,7 @@ import dev.whysoezzy.meet.domain.repository.CommunityRepository
 import dev.whysoezzy.meet.domain.repository.RefreshTokenRepository
 import dev.whysoezzy.meet.domain.repository.TagRepository
 import dev.whysoezzy.meet.domain.repository.UserRepository
+import dev.whysoezzy.meet.domain.repository.MeetingRepository
 import dev.whysoezzy.meet.service.push.PushInstallationStore
 import org.junit.jupiter.api.Test
 import org.mockito.Mockito.mock
@@ -18,12 +19,15 @@ class UserServiceTest {
     private val tagRepository = mock(TagRepository::class.java)
     private val refreshTokenRepository = mock(RefreshTokenRepository::class.java)
     private val pushInstallationStore = mock(PushInstallationStore::class.java)
+    private val meetingRepository = mock(MeetingRepository::class.java)
     private val userService = UserService(
         userRepository,
         tagRepository,
         refreshTokenRepository,
         UserProfileMapper(),
         pushInstallationStore,
+        meetingRepository,
+        java.time.Clock.systemUTC(),
     )
 
     @Test

@@ -1,6 +1,7 @@
 package dev.whysoezzy.meet.service
 
 import dev.whysoezzy.meet.api.error.ConflictException
+import dev.whysoezzy.meet.api.error.NotFoundException
 import dev.whysoezzy.meet.domain.entity.Meeting
 import dev.whysoezzy.meet.domain.entity.MeetingStatus
 import dev.whysoezzy.meet.domain.entity.User
@@ -34,7 +35,7 @@ class MeetingServiceTest {
         val joiningUser = user("joining")
         val fullMeeting = meeting(capacity = 1, participants = mutableSetOf(existingParticipant))
 
-        `when`(meetingRepository.findById(99L)).thenReturn(Optional.of(fullMeeting))
+        `when`(meetingRepository.findVisibleById(99L, 0L)).thenReturn(fullMeeting)
         `when`(userRepository.findWithLockById(42L)).thenReturn(joiningUser)
         `when`(meetingRepository.isUserParticipant(99L, 42L)).thenReturn(false)
 
@@ -43,6 +44,28 @@ class MeetingServiceTest {
         }
 
         assertEquals("Meeting is at full capacity", exception.message)
+    }
+
+    @Test
+    fun `hidden meeting detail participants and join use existing not found behavior`() {
+        `when`(meetingRepository.findVisibleById(99L, 0L)).thenReturn(null)
+
+        assertThrows<NotFoundException> { meetingService.getMeetingById(99L, null) }
+        assertThrows<NotFoundException> { meetingService.getMeetingParticipants(99L) }
+
+        `when`(userRepository.findWithLockById(42L)).thenReturn(user("joining"))
+        assertThrows<NotFoundException> { meetingService.joinMeeting(99L, 42L) }
+    }
+
+    @Test
+    fun `hidden meetings are not found for detail participants and join`() {
+        `when`(meetingRepository.findVisibleById(99L, 0L)).thenReturn(null)
+
+        assertThrows<NotFoundException> { meetingService.getMeetingById(99L, null) }
+        assertThrows<NotFoundException> { meetingService.getMeetingParticipants(99L) }
+
+        `when`(userRepository.findWithLockById(42L)).thenReturn(user("joining"))
+        assertThrows<NotFoundException> { meetingService.joinMeeting(99L, 42L) }
     }
 
     @Test

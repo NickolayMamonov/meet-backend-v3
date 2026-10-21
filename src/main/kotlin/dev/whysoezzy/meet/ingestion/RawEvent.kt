@@ -17,4 +17,5 @@ data class RawEvent(
     val isOnline: Boolean,
     val topicKeywords: Set<String> = emptySet(), // категории источника → тегирование в W3
     val endsAtEpochMs: Long? = null,
+    val timepadGroups: List<String> = emptyList(),
 )

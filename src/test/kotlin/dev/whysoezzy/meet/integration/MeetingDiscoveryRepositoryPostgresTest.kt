@@ -2,6 +2,7 @@ package dev.whysoezzy.meet.integration
 
 import dev.whysoezzy.meet.domain.entity.Meeting
 import dev.whysoezzy.meet.domain.entity.MeetingStatus
+import dev.whysoezzy.meet.domain.entity.EventSource
 import dev.whysoezzy.meet.domain.entity.Tag
 import dev.whysoezzy.meet.domain.entity.User
 import org.junit.jupiter.api.BeforeEach
@@ -98,6 +99,31 @@ class MeetingDiscoveryRepositoryPostgresTest : IntegrationTestSupport() {
         ).map { it.id })
     }
 
+    @Test
+    fun `timepad freshness predicate filters before page limits while preserving manual and demo`() {
+        val now = 1_700_000_000_000L
+        val expired = meetings.save(timepad("expired", now + 1, now - 1))
+        val rejected = meetings.save(timepad("rejected", now + 2, null))
+        val legacy = meetings.save(timepad("legacy", now + 3, null))
+        val accepted = meetings.save(timepad("accepted", now + 4, now + 1))
+        val manual = meetings.save(meeting("manual", now + 5))
+        val demo = meetings.save(
+            timepad("demo-owned", now + 6, null).also { it.demoCatalogKey = "fixture/demo" },
+        )
+        meetings.flush()
+
+        val result = meetings.findDiscoveryMeetings(
+            MeetingStatus.ACTIVE,
+            now,
+            PageRequest.of(0, 3),
+        )
+
+        assertEquals(listOf(accepted.id, manual.id, demo.id), result.map { it.id })
+        assertTrue(expired.id !in result.map { it.id })
+        assertTrue(rejected.id !in result.map { it.id })
+        assertTrue(legacy.id !in result.map { it.id })
+    }
+
     private fun meeting(title: String, time: Long, endsAt: Long? = null) = Meeting(
         title = title,
         description = "Repository fixture",
@@ -109,4 +135,11 @@ class MeetingDiscoveryRepositoryPostgresTest : IntegrationTestSupport() {
         longitude = 0.0,
         endsAt = endsAt,
     )
+
+    private fun timepad(title: String, time: Long, eligibleUntil: Long?) =
+        meeting(title, time).also {
+            it.source = EventSource.TIMEPAD
+            it.sourceExternalId = title
+            it.timepadEligibleUntilMs = eligibleUntil
+        }
 }

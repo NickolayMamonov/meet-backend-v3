@@ -281,6 +281,8 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-classify-release-continuation.sh"
           bash "$TOOLING_SCRIPTS/test-release-publish-tooling-routing.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
+          timeout 120s bash "$TOOLING_SCRIPTS/test-timepad-manual-stop.sh"
+          timeout 120s bash "$TOOLING_SCRIPTS/test-timepad-workflow-routing.sh"
           bash "$TOOLING_SCRIPTS/test-dev-promotion-source.sh"
           bash "$TOOLING_SCRIPTS/test-dev-promotion-authorization.sh"
           bash "$TOOLING_SCRIPTS/test-promote-dev-digest-workflow.sh"
@@ -358,6 +360,8 @@ jobs:
           WORKFLOW=.github/workflows/prove-beta-backup-restore.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
           WORKFLOW=.github/workflows/promote-dev-digest-to-test-vps.yml \
+            "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
+          WORKFLOW=.github/workflows/deploy-test-vps.yml \
             "$TOOLING_SCRIPTS/validate-workflows.sh" --actionlint "$binary"
       - name: Verify Release Please state
         env:

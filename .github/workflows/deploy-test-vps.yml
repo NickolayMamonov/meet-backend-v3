@@ -13,6 +13,14 @@ on:
         required: true
         default: true
         type: boolean
+      failure_policy:
+        description: Failure handling after deployment mutation begins
+        required: true
+        default: automatic-rollback
+        type: choice
+        options:
+          - automatic-rollback
+          - manual-stop
 
 permissions:
   contents: read
@@ -31,6 +39,7 @@ jobs:
     env:
       TAG: ${{ inputs.release_tag }}
       RUN_ROLLBACK_DRILL: ${{ inputs.run_rollback_drill }}
+      FAILURE_POLICY: ${{ inputs.failure_policy }}
       HOST: ${{ vars.TEST_VPS_HOST }}
       PORT: ${{ vars.TEST_VPS_PORT }}
       SSH_USER: ${{ vars.TEST_VPS_USER }}
@@ -46,6 +55,12 @@ jobs:
           set -euo pipefail
           [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           case "$RUN_ROLLBACK_DRILL" in true|false) ;; *) exit 1 ;; esac
+          case "$FAILURE_POLICY" in automatic-rollback|manual-stop) ;; *) exit 1 ;; esac
+          if [ "$FAILURE_POLICY" = manual-stop ] &&
+            [ "$RUN_ROLLBACK_DRILL" = true ]; then
+            echo "manual-stop failure policy cannot run the rollback drill" >&2
+            exit 1
+          fi
           [[ "$HOST" =~ ^[A-Za-z0-9.-]+$ ]]
           [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]
           [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]]
@@ -316,6 +331,7 @@ jobs:
             --revision "$SOURCE_SHA" \
             --version "$VERSION" \
             --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --failure-policy "$FAILURE_POLICY" \
             --public-url "$PUBLIC_URL" \
             --mode rollback-drill 2>&1)
           status=$?
@@ -391,6 +407,7 @@ jobs:
             --revision "$SOURCE_SHA" \
             --version "$VERSION" \
             --run-key "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --failure-policy "$FAILURE_POLICY" \
             --public-url "$PUBLIC_URL" \
             --mode deploy |
             tee "$RUNNER_TEMP/deploy-output.txt"; then
