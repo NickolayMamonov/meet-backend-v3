@@ -2161,8 +2161,6 @@ run_owned_child() {
   owned_child_response=$state/.runtime-response-$attempt_id
   [ ! -e "$owned_child_response" ] && [ ! -L "$owned_child_response" ] ||
     fail "OWNED_CHILD_INVALID"
-  declare -F fixture_timepad_create_diagnostic >/dev/null &&
-    export -f fixture_timepad_create_diagnostic || :
   grant=$(supervisor_client grant child-handshake 5) || fail "OWNED_CHILD_GRANT_REQUIRED"
   handshake_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
   umask 077
