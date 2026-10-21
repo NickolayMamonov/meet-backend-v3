@@ -2131,7 +2131,7 @@ run_owned_child() {
     fixture_timepad_create_diagnostic() {
       [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
       case "${1:-}" in
-        read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released) ;;
+        read-timeout|token-mismatch|accepted|released) ;;
         *) return 0 ;;
       esac
       timeout 2s python3 - "$1" <<PY >/dev/null 2>&1 || :
@@ -2169,12 +2169,10 @@ finally:
 PY
     }
     exec {gate_fd}<>"$1"
-    fixture_timepad_create_diagnostic read-start
     if ! IFS= read -r -t 5 gate <&"$gate_fd"; then
       fixture_timepad_create_diagnostic read-timeout
       exit 125
     fi
-    fixture_timepad_create_diagnostic token-received
     exec {gate_fd}>&-
     if [ "$gate" != "$2" ]; then
       fixture_timepad_create_diagnostic token-mismatch
@@ -2225,9 +2223,7 @@ sys.stdout.buffer.write(data)
     "$released_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
   local handshake_fd
   exec {handshake_fd}<>"$fifo"
-  fixture_timepad_create_diagnostic write-start
   printf '%s\n' "$token" >&"$handshake_fd"
-  fixture_timepad_create_diagnostic write-complete
   exec {handshake_fd}>&-
   # The shell child has its own bounded wait; persist only this fixed enum so
   # the supervisor need not inherit or expose runtime-command stderr.
