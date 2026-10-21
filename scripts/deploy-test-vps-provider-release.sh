@@ -1883,8 +1883,6 @@ timepad_request_begin() {
   local operation=$1 child=${2:-} expected_container=$3 current request nonce predecessor_hash=
   current=$(timeout 10s python3 "$timepad_helper" read-state \
     --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
-  declare -F fixture_timepad_create_diagnostic >/dev/null &&
-    fixture_timepad_create_diagnostic request-read || :
   nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$nonce" =~ ^[a-f0-9]{32}$ ]] || return 1
   if [ "$(jq -er '.phase' <<<"$current")" = PREPARED ]; then
@@ -1915,16 +1913,7 @@ timepad_request_begin() {
      lifecycle:"intent",responseId:null,completionDigest:null}
     end
   ' <<<"$current") || return 1
-  declare -F fixture_timepad_create_diagnostic >/dev/null &&
-    fixture_timepad_create_diagnostic request-created || :
-  if timepad_request_publish "$request"; then
-    declare -F fixture_timepad_create_diagnostic >/dev/null &&
-      fixture_timepad_create_diagnostic request-publish-success || :
-  else
-    declare -F fixture_timepad_create_diagnostic >/dev/null &&
-      fixture_timepad_create_diagnostic request-publish-failure || :
-    return 1
-  fi
+  timepad_request_publish "$request"
 }
 
 timepad_request_acknowledge() {
@@ -2106,7 +2095,7 @@ complete_owned_child() {
 fixture_timepad_create_diagnostic() {
   [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
   case "${1:-}" in
-    child-captured|child-published|request-read|request-created|request-publish-success|request-publish-failure|request-begun|handshake-grant-completed|docker-grant-issued|release-published|read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released) ;;
+    child-captured|child-published|request-begun|handshake-grant-completed|docker-grant-issued|release-published|read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released) ;;
     *) return 0 ;;
   esac
   timeout 2s python3 - "$1" <<'PY' >/dev/null 2>&1 || :
@@ -2182,7 +2171,7 @@ run_owned_child() {
     fixture_timepad_create_diagnostic() {
       [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
       case "${1:-}" in
-        child-captured|child-published|request-read|request-created|request-publish-success|request-publish-failure|request-begun|handshake-grant-completed|docker-grant-issued|release-published|read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released) ;;
+        child-captured|child-published|request-begun|handshake-grant-completed|docker-grant-issued|release-published|read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released) ;;
         *) return 0 ;;
       esac
       timeout 2s python3 - "$1" <<PY >/dev/null 2>&1 || :
