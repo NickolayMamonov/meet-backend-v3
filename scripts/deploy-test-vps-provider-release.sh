@@ -2359,11 +2359,9 @@ sys.stdout.buffer.write(data)
       .commandDigest == $digest and .attemptId == $attempt
     ' <<<"$child_json" >/dev/null || fail "OWNED_CHILD_CAPTURE_FAILED"
   owned_child_attempt=$attempt_id
-  fixture_create_start_trace publish-advance-attempted
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$child_json" "$attempt_id" "$request" ||
     fail "OWNED_CHILD_CAPTURE_FAILED"
-  fixture_create_start_trace publish-advance-completed
   fixture_create_start_trace request-published
   # The handshake grant covers establishing and durably recording ownership.
   supervisor_client complete "$handshake_grant" >/dev/null ||
