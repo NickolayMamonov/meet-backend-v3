@@ -4196,6 +4196,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                             stage = line.partition("=")[2]
                             if stage in {
                                 "OWNED_START_CHILD_CAPTURED",
+                                "OWNED_START_REQUEST_STATE_READ",
+                                "OWNED_START_REQUEST_BUILT",
                                 "OWNED_START_REQUEST_PUBLISHED",
                                 "OWNED_START_HANDSHAKE_GRANT_COMPLETED",
                                 "OWNED_START_DOCKER_GRANT_RECEIVED",

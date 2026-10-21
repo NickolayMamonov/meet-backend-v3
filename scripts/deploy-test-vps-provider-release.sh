@@ -44,6 +44,7 @@ fixture_create_stage() {
     OWNED_CHILD_READBACK|OWNED_CHILD_STOP_STARTED|OWNED_CHILD_WAITED|\
     OWNED_CHILD_STOPPED|OWNED_CHILD_GRANT_COMPLETED|OWNED_CHILD_CLEAR_PUBLISHED|\
     OWNED_START_CHILD_CAPTURED|OWNED_START_REQUEST_PUBLISHED|\
+    OWNED_START_REQUEST_STATE_READ|OWNED_START_REQUEST_BUILT|\
     OWNED_START_HANDSHAKE_GRANT_COMPLETED|OWNED_START_DOCKER_GRANT_RECEIVED|\
     OWNED_START_RELEASE_PUBLISHED|OWNED_START_TOKEN_WRITTEN)
       case "$1" in
@@ -1928,6 +1929,7 @@ timepad_request_begin() {
   local operation=$1 child=${2:-} expected_container=$3 current request nonce predecessor_hash=
   current=$(timeout 10s python3 "$timepad_helper" read-state \
     --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
+  fixture_create_stage OWNED_START_REQUEST_STATE_READ
   nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$nonce" =~ ^[a-f0-9]{32}$ ]] || return 1
   if [ "$(jq -er '.phase' <<<"$current")" = PREPARED ]; then
@@ -1958,6 +1960,7 @@ timepad_request_begin() {
      lifecycle:"intent",responseId:null,completionDigest:null}
     end
   ' <<<"$current") || return 1
+  fixture_create_stage OWNED_START_REQUEST_BUILT
   timepad_request_publish "$request"
 }
 
