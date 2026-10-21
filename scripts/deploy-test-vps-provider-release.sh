@@ -62,6 +62,7 @@ fixture_create_start_trace() {
     publish-read-grant-requested|publish-read-grant-refused|\
     publish-read-grant-received|publish-read-helper-returned|\
     publish-read-grant-complete-refused|publish-read-grant-completed|\
+    start-refused-outstanding-request|\
     docker-grant-received|release-published|token-written) ;;
     *) return 0 ;;
   esac
@@ -1822,10 +1823,14 @@ timepad_advance() {
   local phase=$1 reason=${2:-} container_id=${3:-} config_hash=${4:-}
   local terminal_receipt=${5:-} witness_digest=${6:-} commit_substep=${7:-}
   local finalization_digest=${8:-} owned_child_json='' latest_attempt_id=${10:-}
-  local child_change=false
+  local runtime_request_json=${11:-}
+  local child_change=false runtime_request_change=false
   if [ "$#" -ge 9 ]; then
     child_change=true
     owned_child_json=$9
+  fi
+  if [ "$#" -ge 11 ] && [ -n "$runtime_request_json" ]; then
+    runtime_request_change=true
   fi
   local changes_file=$state/.timepad-changes.json
   [ ! -e "$changes_file" ] && [ ! -L "$changes_file" ] ||
@@ -1836,7 +1841,9 @@ timepad_advance() {
     --arg witness "$witness_digest" --arg substep "$commit_substep" \
     --arg finalization "$finalization_digest" \
     --arg attempt "$latest_attempt_id" --argjson child_change "$child_change" \
-    --argjson child "${owned_child_json:-null}" '
+    --argjson child "${owned_child_json:-null}" \
+    --argjson runtime_request_change "$runtime_request_change" \
+    --argjson runtime_request "${runtime_request_json:-null}" '
       {changes:
         ((if $reason == "" then {} else {reason:$reason} end) +
          (if $container == "" then {} else {containerId:$container} end) +
@@ -1847,6 +1854,7 @@ timepad_advance() {
            {providerFinalizationDigest:$finalization} end) +
          (if $substep == "" then {} else {commitSubstep:$substep} end) +
          (if $child_change then {ownedChild:$child} else {} end) +
+         (if $runtime_request_change then {runtimeRequest:$runtime_request} else {} end) +
          (if $attempt == "" then {} else {latestAttemptId:$attempt} end))}
     ' >"$changes_file"
   chmod 600 "$changes_file"
@@ -2000,11 +2008,21 @@ timepad_request_publish() {
   [ "$request_operation" != start ] || fixture_create_start_trace publish-advance-completed
 }
 
-timepad_request_begin() {
+timepad_request_build() {
   local operation=$1 child=${2:-} expected_container=$3 current request nonce predecessor_hash=
   current=$(timeout 10s python3 "$timepad_helper" read-state \
     --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
   fixture_create_start_trace request-state-read
+  if [ "$operation" = start ] &&
+    ! jq -e '.runtimeRequest == null or
+      .runtimeRequest.lifecycle == "completed" or
+      .runtimeRequest.lifecycle == "bound"' <<<"$current" >/dev/null; then
+    fixture_create_start_trace start-refused-outstanding-request
+    if [ "${recovery_retry_needed:-false}" = true ]; then
+      recovery_retry_runtime_refusal
+    fi
+    return 1
+  fi
   nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$nonce" =~ ^[a-f0-9]{32}$ ]] || return 1
   if [ "$(jq -er '.phase' <<<"$current")" = PREPARED ]; then
@@ -2036,6 +2054,12 @@ timepad_request_begin() {
     end
   ' <<<"$current") || return 1
   fixture_create_start_trace request-built
+  printf '%s\n' "$request"
+}
+
+timepad_request_begin() {
+  local request
+  request=$(timepad_request_build "$@") || return 1
   timepad_request_publish "$request"
 }
 
@@ -2217,7 +2241,7 @@ complete_owned_child() {
 }
 run_owned_child() {
   local phase=$1 attempt_id token fifo command_digest child_json
-  local released_json grant handshake_grant noclobber_was_set=false
+  local request released_json grant handshake_grant noclobber_was_set=false
   shift
   [ "$#" -gt 0 ] || fail "OWNED_CHILD_INVALID"
   if [ "$1" = create ]; then
@@ -2232,6 +2256,8 @@ run_owned_child() {
   attempt_id=$(next_owned_child_attempt) || fail "OWNED_CHILD_INVALID"
   [[ "$attempt_id" =~ ^[a-f0-9]{32}:[1-9][0-9]{0,19}$ ]] ||
     fail "OWNED_CHILD_INVALID"
+  request=$(timepad_request_build start "$attempt_id" "$6") ||
+    fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
   token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$token" =~ ^[0-9a-f]{32}$ ]] || fail "OWNED_CHILD_INVALID"
   command_digest=$(printf '%s\0' "$@" | sha256sum | awk '{print $1}')
@@ -2333,16 +2359,16 @@ sys.stdout.buffer.write(data)
       .commandDigest == $digest and .attemptId == $attempt
     ' <<<"$child_json" >/dev/null || fail "OWNED_CHILD_CAPTURE_FAILED"
   owned_child_attempt=$attempt_id
+  fixture_create_start_trace publish-advance-attempted
   timepad_advance "$phase" "" "" "" "" "" "" "" \
-    "$child_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
+    "$child_json" "$attempt_id" "$request" ||
+    fail "OWNED_CHILD_CAPTURE_FAILED"
+  fixture_create_start_trace publish-advance-completed
+  fixture_create_start_trace request-published
   # The handshake grant covers establishing and durably recording ownership.
-  # Complete it before request publication obtains its independent state-write
-  # grant; both operations must not compete for the same short deadline.
   supervisor_client complete "$handshake_grant" >/dev/null ||
     fail "OWNED_CHILD_GRANT_REQUIRED"
   fixture_create_start_trace handshake-grant-completed
-  timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
-  fixture_create_start_trace request-published
   grant=$(supervisor_client grant docker 30) || fail "OWNED_CHILD_GRANT_REQUIRED"
   owned_child_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
   fixture_create_start_trace docker-grant-received

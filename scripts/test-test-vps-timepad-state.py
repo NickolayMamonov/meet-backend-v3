@@ -1622,22 +1622,45 @@ fail() { echo "$1" >&2; exit 99; }
         self.assertNotIn("exec 9", source)
         self.assertIn('exec {gate_fd}<>"$1"', source)
         self.assertIn('read -r -t 5 gate', source)
+        self.assertLess(source.index("timepad_request_build start"),
+                        source.index("setsid bash -c"))
+        self.assertIn('"$child_json" "$attempt_id" "$request"', source)
         self.assertLess(source.index('timepad_advance "$phase"'),
                         source.index('printf \'%s\\n\' "$token"'))
         self.assertLess(source.index('timepad_advance "$phase"'),
                         source.index('supervisor_client complete "$handshake_grant"'))
-        self.assertLess(
-            source.index('supervisor_client complete "$handshake_grant"'),
-            source.index('timepad_request_begin start'),
-        )
+        self.assertNotIn("timepad_request_begin start", source)
         # The phase is metadata; the command executable remains in argv.
         self.assertIn("\n  shift\n", source)
         self.assertNotIn("\n  shift 2\n", source)
         self.assertIn('"$@" | python3', source)
-        self.assertLess(source.index('timepad_request_begin start'),
+        self.assertLess(source.index("request-published"),
                         source.index('printf \'%s\\n\' "$token"'))
         self.assertIn('supervisor_client grant child-handshake 5', source)
         self.assertIn('supervisor_client grant docker 30', source)
+
+    def test_advance_atomically_publishes_waiting_child_and_start_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            request = {"operation": "start", "lifecycle": "intent"}
+            child = {"attemptId": "a" * 32 + ":1", "lifecycle": "waiting"}
+            result = self.run_shell(r"""
+state=$1
+state_root=$1
+timepad_helper=/fixture/timepad-state.py
+fail() { echo "$1" >&2; exit 99; }
+timeout() {
+  [ "$1" = 15s ] && [ "$2" = python3 ] &&
+    [ "$3" = "$timepad_helper" ] && [ "$4" = advance ] || return 90
+  jq -c . "$state/.timepad-changes.json" >&2
+}
+""" + controller_function("timepad_advance") + r"""
+timepad_advance VERIFYING "" "" "" "" "" "" "" "$2" "$3" "$4"
+""", temporary, json.dumps(child), child["attemptId"], json.dumps(request))
+            self.assertEqual(0, result.returncode, result.stderr)
+            changes = json.loads(result.stderr)["changes"]
+            self.assertEqual(child, changes["ownedChild"])
+            self.assertEqual(request, changes["runtimeRequest"])
+            self.assertEqual(child["attemptId"], changes["latestAttemptId"])
 
     def test_healthy_unresolved_phases_normalize_before_verification_without_runtime_mutation(self) -> None:
         source = (ROOT / "deploy-test-vps-provider-release.sh").read_text(encoding="utf-8")
@@ -2299,8 +2322,9 @@ supervisor_client() {
 }
 # This fixture isolates child topology/FD9/exit propagation. Request state and
 # adapter proof have separate focused tests; the full controller matrix is blocked.
-timepad_request_begin() {
+timepad_request_build() {
   [ "$1" = start ] && [[ "$2" = *:1 ]] && [[ "$3" = f* ]]
+  printf ''
 }
 """ + functions + r"""
 status=0
@@ -4214,6 +4238,9 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                                 "publish-read-grant-received", "publish-read-helper-returned",
                                 "publish-read-grant-complete-refused",
                                 "publish-read-grant-completed",
+                                "publish-advance-attempted",
+                                "publish-advance-completed",
+                                "start-refused-outstanding-request",
                                 "handshake-grant-completed", "docker-grant-received",
                                 "release-published", "token-written",
                             }:
@@ -4251,10 +4278,19 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                     }, sort_keys=True, separators=(",", ":"))
                     self.assertEqual(original["incidentId"], after["incidentId"])
                     self.assertEqual(1, after["operationEpoch"])
-                    self.assertIn(
-                        ["accepted", "released"], handshake_events,
-                        lifecycle_diagnostic,
-                    )
+                    if fault == "stop-fails" and dispatch == 2:
+                        self.assertNotIn(
+                            "accepted", handshake_events, lifecycle_diagnostic,
+                        )
+                        self.assertIn(
+                            "start-refused-outstanding-request", request_events,
+                            lifecycle_diagnostic,
+                        )
+                    else:
+                        self.assertIn(
+                            ["accepted", "released"], handshake_events,
+                            lifecycle_diagnostic,
+                        )
                     self.assertIsNone(after["ownedChild"], lifecycle_diagnostic)
                     self.assertEqual(after["executionAttempt"], lease["attempt"])
                     self.assertEqual(
