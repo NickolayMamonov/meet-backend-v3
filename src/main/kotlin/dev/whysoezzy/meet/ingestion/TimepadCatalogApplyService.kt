@@ -5,9 +5,10 @@ import dev.whysoezzy.meet.domain.entity.IngestionRun
 import dev.whysoezzy.meet.domain.entity.IngestionStatus
 import dev.whysoezzy.meet.domain.repository.IngestionRunRepository
 import dev.whysoezzy.meet.domain.repository.MeetingRepository
-import org.springframework.stereotype.Service
-import org.springframework.transaction.annotation.Transactional
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Propagation
+import org.springframework.transaction.annotation.Transactional
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -47,6 +48,23 @@ class TimepadCatalogApplyService(
         run.skippedCount += snapshot.observedCount - snapshot.accepted.size
         run.status = IngestionStatus.SUCCESS
         run.errorMessage = null
+        run.finishedAt = LocalDateTime.now(clock)
+        return ingestionRunRepository.save(run)
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    fun reconcileApplyFailure(runId: Long, reason: String): IngestionRun {
+        val run = ingestionRunRepository.findById(runId).orElseThrow {
+            IllegalStateException("Timepad ingestion run disappeared during apply reconciliation")
+        }
+        if (run.status != IngestionStatus.RUNNING) return run
+
+        run.fetchedCount = 0
+        run.createdCount = 0
+        run.updatedCount = 0
+        run.skippedCount = 0
+        run.status = IngestionStatus.FAILED
+        run.errorMessage = "Timepad apply failed: $reason"
         run.finishedAt = LocalDateTime.now(clock)
         return ingestionRunRepository.save(run)
     }

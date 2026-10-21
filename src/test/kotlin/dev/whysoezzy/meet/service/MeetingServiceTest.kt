@@ -69,6 +69,21 @@ class MeetingServiceTest {
     }
 
     @Test
+    fun `participant can leave hidden meeting by primary key lookup`() {
+        val participant = user("leaving")
+        val hiddenMeeting = meeting(participants = mutableSetOf(participant)).also { it.id = 99L }
+        `when`(userRepository.findWithLockById(42L)).thenReturn(participant)
+        `when`(meetingRepository.findById(99L)).thenReturn(Optional.of(hiddenMeeting))
+        `when`(meetingRepository.isUserParticipant(99L, 42L)).thenReturn(true)
+
+        meetingService.leaveMeeting(99L, 42L)
+
+        assertEquals(false, hiddenMeeting.participants.contains(participant))
+        verify(meetingRepository).findById(99L)
+        verify(meetingRepository).save(hiddenMeeting)
+    }
+
+    @Test
     fun `main uses bounded repository queries with exclusions`() {
         val first = meeting(id = 1L, time = 1L)
         val popular = meeting(id = 2L, time = 2L)

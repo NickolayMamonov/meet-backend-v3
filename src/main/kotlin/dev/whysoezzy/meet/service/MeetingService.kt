@@ -131,7 +131,7 @@ class MeetingService(
 
         val user = userRepository.findWithLockById(userId)
             ?: throw NotFoundException("User not found")
-        val meeting = meetingRepository.findVisibleById(meetingId, clock.millis())
+        val meeting = meetingRepository.findById(meetingId).orElse(null)
             ?: throw NotFoundException("Meeting not found")
 
         if (!meetingRepository.isUserParticipant(meetingId, userId))

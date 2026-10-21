@@ -57,6 +57,10 @@ class TimepadProvider(
                     return ProviderFetchResult.Incomplete("changing_total")
                 }
                 expectedTotal = total
+                val expectedPageSize = (total - page * 100).coerceIn(0, 100)
+                if (values.size != expectedPageSize) {
+                    return ProviderFetchResult.Incomplete("short_page")
+                }
                 values.forEach { event ->
                     if (event.id <= 0) return ProviderFetchResult.Incomplete("invalid_id")
                     val id = event.id.toString()
@@ -72,7 +76,6 @@ class TimepadProvider(
                 }
                 page++
                 if (page * 100 >= total) break
-                if (values.size != 100) return ProviderFetchResult.Incomplete("short_page")
             }
 
             val refreshed = linkedMapOf<String, TimepadEvent>()

@@ -15,6 +15,7 @@ import java.time.Instant
 import org.springframework.dao.DataIntegrityViolationException
 import org.junit.jupiter.api.assertThrows
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 
 class TimepadCatalogPostgresTest : IntegrationTestSupport() {
@@ -100,7 +101,51 @@ class TimepadCatalogPostgresTest : IntegrationTestSupport() {
 
         assertEquals(0, meetings.count())
         assertEquals(IngestionStatus.RUNNING, ingestionRuns.findById(run.id!!).orElseThrow().status)
+
+        val reconciled = catalogApply.reconcileApplyFailure(run.id!!, "apply_failed")
+
+        assertEquals(IngestionStatus.FAILED, reconciled.status)
+        assertEquals("Timepad apply failed: apply_failed", reconciled.errorMessage)
+        assertEquals(0, reconciled.fetchedCount)
+        assertNotNull(reconciled.finishedAt)
+        assertEquals(IngestionStatus.FAILED, ingestionRuns.findById(run.id!!).orElseThrow().status)
+        assertEquals(0, meetings.count())
     }
+
+    @Test
+    fun `reconciliation preserves committed success after lost acknowledgement without replay`() {
+        val observedAt = Instant.parse("2026-10-21T10:00:00Z")
+        val run = ingestionRuns.save(IngestionRun(source = EventSource.TIMEPAD))
+
+        assertThrows<CommitAcknowledgementLostException> {
+            applyWithLostAcknowledgement(run, observedAt)
+        }
+
+        assertEquals(IngestionStatus.SUCCESS, ingestionRuns.findById(run.id!!).orElseThrow().status)
+        run.status = IngestionStatus.RUNNING
+
+        val reconciled = catalogApply.reconcileApplyFailure(run.id!!, "apply_failed")
+
+        assertEquals(IngestionStatus.SUCCESS, reconciled.status)
+        assertEquals(1, reconciled.createdCount)
+        assertEquals(IngestionStatus.SUCCESS, ingestionRuns.findById(run.id!!).orElseThrow().status)
+        assertEquals(1, meetings.count())
+    }
+
+    private fun applyWithLostAcknowledgement(run: IngestionRun, observedAt: Instant): Nothing {
+        catalogApply.apply(
+            run,
+            observedAt,
+            ProviderFetchResult.Complete(
+                accepted = listOf(raw("42", "Committed Kotlin event")),
+                rejectedSavedExternalIds = emptySet(),
+                observedCount = 1,
+            ),
+        )
+        throw CommitAcknowledgementLostException()
+    }
+
+    private class CommitAcknowledgementLostException : RuntimeException()
 
     private fun raw(id: String, title: String) = RawEvent(
         sourceExternalId = id,

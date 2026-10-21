@@ -90,4 +90,56 @@ class TimepadProviderTest {
         }
     }
 
+    @Test
+    fun `rejects truncated final discovery page and nonempty zero-total envelope`() {
+        val event = validEvent(4242)
+        val responses = listOf(
+            """{"total":2,"values":[$event]}""",
+            """{"total":0,"values":[$event]}""",
+        )
+
+        responses.forEach { payload ->
+            assertEquals(
+                ProviderFetchResult.Incomplete("short_page"),
+                fetchDiscovery(payload),
+            )
+        }
+    }
+
+    private fun fetchDiscovery(payload: String): ProviderFetchResult {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/events.json") { exchange ->
+            val body = payload.toByteArray()
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(200, body.size.toLong())
+            exchange.responseBody.use { it.write(body) }
+        }
+        server.start()
+        try {
+            val properties = TimepadProperties().apply {
+                baseUrl = "http://127.0.0.1:${server.address.port}"
+                assetBaseUrl = "https://assets.example"
+            }
+            return TimepadProvider(properties, TimepadHttpClient(properties, ObjectMapper())).fetch(
+                FetchContext(Instant.parse("2026-10-21T10:00:00Z"), emptyList()),
+            )
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    private fun validEvent(id: Int) = """
+        {
+          "id": $id,
+          "name": "Kotlin backend",
+          "locale": "ru",
+          "access_status": "public",
+          "registration_data": {"is_registration_open": true},
+          "starts_at": "2026-12-15T19:00:00+03:00",
+          "url": "https://timepad.ru/event/$id/",
+          "location": {"city": "Москва", "address": "Тестовая улица, 1"},
+          "categories": []
+        }
+    """.trimIndent()
+
 }
