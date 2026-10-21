@@ -342,6 +342,51 @@ printf '%s\n' \
 
 # shellcheck source=scripts/deploy-test-vps-provider-release.sh
 source "$provider_deploy"
+(
+  runtime_helper="$tmp/invariant-helper.sh"
+  root='/fixture root'
+  compose_script='/fixture compose.sh'
+  cat >"$runtime_helper" <<'SH'
+verify_runtime_invariants() {
+  [ "$#" -eq 6 ]
+  [ "$1" = '/fixture root' ]
+  [ "$2" = '/fixture compose.sh' ]
+  [ "$3" = image ]
+  [ "$4" = revision ]
+  [ "$5" = version ]
+  [ "$6" = hash ]
+  return "${INVARIANT_TEST_STATUS:-0}"
+}
+SH
+  # Exercise the production adapter under nounset with the four caller arguments.
+  runtime_invariants_bounded image revision version hash
+  export INVARIANT_TEST_STATUS=17
+  if runtime_invariants_bounded image revision version hash; then
+    fail "bounded runtime invariants swallowed a failed check"
+  else
+    [ "$?" -eq 17 ] || fail "bounded runtime invariants changed the failure status"
+  fi
+)
+
+# Validated false booleans are supported, not a jq -e failure after deployment.
+provider_extract=$(
+  sed -n '/^          provider_enabled=\$(jq /,/^          credential_mount_read_only=\$(jq /p' "$workflow"
+)
+[ -n "$provider_extract" ] || fail "provider boolean extraction is missing"
+for enabled in true false; do
+  (
+    # shellcheck disable=SC2034 # Read by the extracted workflow commands.
+    provider_json="{\"providerEnabled\":$enabled,\"credentialMountPresent\":$enabled,\"credentialMountReadOnly\":$enabled}"
+    provider_enabled=missing
+    credential_mount_present=missing
+    credential_mount_read_only=missing
+    eval "$provider_extract"
+    [ "$provider_enabled" = "$enabled" ]
+    [ "$credential_mount_present" = "$enabled" ]
+    [ "$credential_mount_read_only" = "$enabled" ]
+  )
+done
+
 printf '%s\n' \
   'APP_PUSH_PROVIDER_ENABLED=false' \
   'APP_PUSH_PROJECT_ID=meeting-1d258' \
