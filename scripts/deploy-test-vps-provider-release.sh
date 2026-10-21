@@ -42,7 +42,10 @@ fixture_create_stage() {
     CANDIDATE_BINDING|CANDIDATE_CORRELATION|CANDIDATE_SUPPRESS|CANDIDATE_SUPPRESSED|\
     VERIFYING_PUBLICATION|RESOURCE_REVALIDATION|CANDIDATE_START|CANDIDATE_HEALTH|\
     OWNED_CHILD_READBACK|OWNED_CHILD_STOP_STARTED|OWNED_CHILD_WAITED|\
-    OWNED_CHILD_STOPPED|OWNED_CHILD_GRANT_COMPLETED|OWNED_CHILD_CLEAR_PUBLISHED)
+    OWNED_CHILD_STOPPED|OWNED_CHILD_GRANT_COMPLETED|OWNED_CHILD_CLEAR_PUBLISHED|\
+    OWNED_START_CHILD_CAPTURED|OWNED_START_REQUEST_PUBLISHED|\
+    OWNED_START_HANDSHAKE_GRANT_COMPLETED|OWNED_START_DOCKER_GRANT_RECEIVED|\
+    OWNED_START_RELEASE_PUBLISHED|OWNED_START_TOKEN_WRITTEN)
       printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
       ;;
   esac
@@ -2212,19 +2215,25 @@ sys.stdout.buffer.write(data)
   owned_child_attempt=$attempt_id
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$child_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
+  fixture_create_stage OWNED_START_CHILD_CAPTURED
   timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
+  fixture_create_stage OWNED_START_REQUEST_PUBLISHED
   supervisor_client complete "$handshake_grant" >/dev/null ||
     fail "OWNED_CHILD_GRANT_REQUIRED"
+  fixture_create_stage OWNED_START_HANDSHAKE_GRANT_COMPLETED
   grant=$(supervisor_client grant docker 30) || fail "OWNED_CHILD_GRANT_REQUIRED"
   owned_child_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
+  fixture_create_stage OWNED_START_DOCKER_GRANT_RECEIVED
   released_json=$(jq -ce '.lifecycle="released"' <<<"$child_json") ||
     fail "OWNED_CHILD_CAPTURE_FAILED"
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$released_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
+  fixture_create_stage OWNED_START_RELEASE_PUBLISHED
   local handshake_fd
   exec {handshake_fd}<>"$fifo"
   printf '%s\n' "$token" >&"$handshake_fd"
   exec {handshake_fd}>&-
+  fixture_create_stage OWNED_START_TOKEN_WRITTEN
   # The shell child has its own bounded wait; persist only this fixed enum so
   # the supervisor need not inherit or expose runtime-command stderr.
   fixture_timepad_create_diagnostic released
