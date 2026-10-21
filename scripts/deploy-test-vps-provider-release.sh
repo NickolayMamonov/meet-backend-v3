@@ -2092,13 +2092,49 @@ complete_owned_child() {
   owned_child_grant=
   owned_child_wait_status=$status
 }
-fixture_timepad_create_diagnostic() {
-  [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
-  case "${1:-}" in
-    child-captured|child-published|request-begun|handshake-grant-completed|docker-grant-issued|release-published|read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released) ;;
-    *) return 0 ;;
-  esac
-  timeout 2s python3 - "$1" <<'PY' >/dev/null 2>&1 || :
+run_owned_child() {
+  local phase=$1 attempt_id token fifo command_digest child_json
+  local released_json grant handshake_grant noclobber_was_set=false
+  shift
+  [ "$#" -gt 0 ] || fail "OWNED_CHILD_INVALID"
+  if [ "$1" = create ]; then
+    [ "$#" -eq 2 ] || fail "RUNTIME_REQUEST_CORRELATION_REQUIRED"
+    run_owned_create "$phase" "$2"
+    return
+  fi
+  # Existing-ID requests retain their exact synchronous Docker response contract.
+  [ "$#" -eq 6 ] && [ "$1" = timeout ] && [ "$2" = --kill-after=5s ] &&
+    [ "$3" = 30s ] && [ "$4" = docker ] && [ "$5" = start ] &&
+    [[ "$6" =~ ^[a-f0-9]{64}$ ]] || fail "RUNTIME_REQUEST_CORRELATION_REQUIRED"
+  attempt_id=$(next_owned_child_attempt) || fail "OWNED_CHILD_INVALID"
+  [[ "$attempt_id" =~ ^[a-f0-9]{32}:[1-9][0-9]{0,19}$ ]] ||
+    fail "OWNED_CHILD_INVALID"
+  token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  [[ "$token" =~ ^[0-9a-f]{32}$ ]] || fail "OWNED_CHILD_INVALID"
+  command_digest=$(printf '%s\0' "$@" | sha256sum | awk '{print $1}')
+  [[ "$command_digest" =~ ^[0-9a-f]{64}$ ]] || fail "OWNED_CHILD_INVALID"
+  fifo=$state/.child-handshake-$attempt_id
+  [ ! -e "$fifo" ] && [ ! -L "$fifo" ] || fail "OWNED_CHILD_INVALID"
+  mkfifo -m 600 -- "$fifo" || fail "OWNED_CHILD_INVALID"
+  owned_child_fifo=$fifo
+  owned_child_phase=$phase
+  owned_child_response=$state/.runtime-response-$attempt_id
+  [ ! -e "$owned_child_response" ] && [ ! -L "$owned_child_response" ] ||
+    fail "OWNED_CHILD_INVALID"
+  grant=$(supervisor_client grant child-handshake 5) || fail "OWNED_CHILD_GRANT_REQUIRED"
+  handshake_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
+  umask 077
+  case $- in *C*) noclobber_was_set=true ;; esac
+  set -o noclobber
+  setsid bash -c '
+    set -euo pipefail
+    fixture_timepad_create_diagnostic() {
+      [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
+      case "${1:-}" in
+        child-started|child-captured|child-published|request-begun|read-start|read-timeout|token-received|token-mismatch|accepted|write-start|write-complete|released|intent-published|handshake-grant-completed|docker-grant-issued|release-published) ;;
+        *) return 0 ;;
+      esac
+      timeout 2s python3 - "$1" <<PY >/dev/null 2>&1 || :
 import fcntl
 import os
 import re
@@ -2131,44 +2167,7 @@ try:
 finally:
     os.close(fd)
 PY
-}
-run_owned_child() {
-  local phase=$1 attempt_id token fifo command_digest child_json
-  local released_json grant handshake_grant noclobber_was_set=false
-  shift
-  [ "$#" -gt 0 ] || fail "OWNED_CHILD_INVALID"
-  if [ "$1" = create ]; then
-    [ "$#" -eq 2 ] || fail "RUNTIME_REQUEST_CORRELATION_REQUIRED"
-    run_owned_create "$phase" "$2"
-    return
-  fi
-  # Existing-ID requests retain their exact synchronous Docker response contract.
-  [ "$#" -eq 6 ] && [ "$1" = timeout ] && [ "$2" = --kill-after=5s ] &&
-    [ "$3" = 30s ] && [ "$4" = docker ] && [ "$5" = start ] &&
-    [[ "$6" =~ ^[a-f0-9]{64}$ ]] || fail "RUNTIME_REQUEST_CORRELATION_REQUIRED"
-  attempt_id=$(next_owned_child_attempt) || fail "OWNED_CHILD_INVALID"
-  [[ "$attempt_id" =~ ^[a-f0-9]{32}:[1-9][0-9]{0,19}$ ]] ||
-    fail "OWNED_CHILD_INVALID"
-  token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-  [[ "$token" =~ ^[0-9a-f]{32}$ ]] || fail "OWNED_CHILD_INVALID"
-  command_digest=$(printf '%s\0' "$@" | sha256sum | awk '{print $1}')
-  [[ "$command_digest" =~ ^[0-9a-f]{64}$ ]] || fail "OWNED_CHILD_INVALID"
-  fifo=$state/.child-handshake-$attempt_id
-  [ ! -e "$fifo" ] && [ ! -L "$fifo" ] || fail "OWNED_CHILD_INVALID"
-  mkfifo -m 600 -- "$fifo" || fail "OWNED_CHILD_INVALID"
-  owned_child_fifo=$fifo
-  owned_child_phase=$phase
-  owned_child_response=$state/.runtime-response-$attempt_id
-  [ ! -e "$owned_child_response" ] && [ ! -L "$owned_child_response" ] ||
-    fail "OWNED_CHILD_INVALID"
-  export -f fixture_timepad_create_diagnostic
-  grant=$(supervisor_client grant child-handshake 5) || fail "OWNED_CHILD_GRANT_REQUIRED"
-  handshake_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
-  umask 077
-  case $- in *C*) noclobber_was_set=true ;; esac
-  set -o noclobber
-  setsid bash -c '
-    set -euo pipefail
+    }
     exec {gate_fd}<>"$1"
     fixture_timepad_create_diagnostic read-start
     if ! IFS= read -r -t 5 gate <&"$gate_fd"; then
@@ -2197,6 +2196,7 @@ sys.stdout.buffer.write(data)
     exit "${statuses[1]}"
   ' _ "$fifo" "$token" "$@" >"$owned_child_response" &
   owned_child_pid=$!
+  fixture_timepad_create_diagnostic child-started
   [ "$noclobber_was_set" = true ] || set +o noclobber
   child_json=
   for ((attempt = 0; attempt < 10; attempt++)); do
@@ -2219,6 +2219,7 @@ sys.stdout.buffer.write(data)
   fixture_timepad_create_diagnostic child-published
   timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
   fixture_timepad_create_diagnostic request-begun
+  fixture_timepad_create_diagnostic intent-published
   supervisor_client complete "$handshake_grant" >/dev/null ||
     fail "OWNED_CHILD_GRANT_REQUIRED"
   fixture_timepad_create_diagnostic handshake-grant-completed
