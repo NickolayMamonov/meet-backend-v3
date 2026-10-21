@@ -4196,7 +4196,8 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                             continue
                         event = line.partition("=")[2]
                         if event not in {
-                            "child-captured", "child-published", "request-read",
+                            "child-captured", "child-published", "request-read-start",
+                            "request-read-failure", "request-read-success",
                             "request-created", "request-publish-success", "request-publish-failure",
                             "request-begun",
                             "handshake-grant-completed", "docker-grant-issued", "release-published",
