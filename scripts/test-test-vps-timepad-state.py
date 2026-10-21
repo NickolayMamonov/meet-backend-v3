@@ -4204,6 +4204,10 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                                 "publish-grant-refused", "publish-grant-received",
                                 "publish-helper-returned", "publish-grant-complete-refused",
                                 "publish-grant-completed",
+                                "publish-read-grant-requested", "publish-read-grant-refused",
+                                "publish-read-grant-received", "publish-read-helper-returned",
+                                "publish-read-grant-complete-refused",
+                                "publish-read-grant-completed",
                                 "handshake-grant-completed", "docker-grant-received",
                                 "release-published", "token-written",
                             }:

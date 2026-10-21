@@ -59,6 +59,9 @@ fixture_create_start_trace() {
     publish-advance-completed|publish-grant-requested|publish-grant-refused|\
     publish-grant-received|publish-helper-returned|publish-grant-complete-refused|\
     publish-grant-completed|handshake-grant-completed|\
+    publish-read-grant-requested|publish-read-grant-refused|\
+    publish-read-grant-received|publish-read-helper-returned|\
+    publish-read-grant-complete-refused|publish-read-grant-completed|\
     docker-grant-received|release-published|token-written) ;;
     *) return 0 ;;
   esac
@@ -1068,16 +1071,28 @@ supervisor_timeout() {
     esac
   fi
   if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+    [ "${3:-}" = read-state ] && [ "${TIMEPAD_START_PUBLISH_READ:-}" = 1 ]; then
+    fixture_create_start_trace publish-read-grant-requested
+  fi
+  if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
     [ "${3:-}" = advance ]; then
     fixture_create_start_trace publish-grant-requested
   fi
   grant=$(supervisor_client grant "$wait_name" "${local_bound%s}") || {
+    if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+      [ "${3:-}" = read-state ] && [ "${TIMEPAD_START_PUBLISH_READ:-}" = 1 ]; then
+      fixture_create_start_trace publish-read-grant-refused
+    fi
     if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
       [ "${3:-}" = advance ]; then
       fixture_create_start_trace publish-grant-refused
     fi
     return 124
   }
+  if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+    [ "${3:-}" = read-state ] && [ "${TIMEPAD_START_PUBLISH_READ:-}" = 1 ]; then
+    fixture_create_start_trace publish-read-grant-received
+  fi
   if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
     [ "${3:-}" = advance ]; then
     fixture_create_start_trace publish-grant-received
@@ -1122,16 +1137,28 @@ PY
     status=$?
   fi
   if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+    [ "${3:-}" = read-state ] && [ "${TIMEPAD_START_PUBLISH_READ:-}" = 1 ]; then
+    fixture_create_start_trace publish-read-helper-returned
+  fi
+  if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
     [ "${3:-}" = advance ]; then
     fixture_create_start_trace publish-helper-returned
   fi
   supervisor_client complete "$grant_id" >/dev/null || {
+    if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+      [ "${3:-}" = read-state ] && [ "${TIMEPAD_START_PUBLISH_READ:-}" = 1 ]; then
+      fixture_create_start_trace publish-read-grant-complete-refused
+    fi
     if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
       [ "${3:-}" = advance ]; then
       fixture_create_start_trace publish-grant-complete-refused
     fi
     return 1
   }
+  if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
+    [ "${3:-}" = read-state ] && [ "${TIMEPAD_START_PUBLISH_READ:-}" = 1 ]; then
+    fixture_create_start_trace publish-read-grant-completed
+  fi
   if [ "$executable" = python3 ] && [ "${2:-}" = "$timepad_helper" ] &&
     [ "${3:-}" = advance ]; then
     fixture_create_start_trace publish-grant-completed
@@ -1931,9 +1958,12 @@ PY
 
 timepad_request_publish() {
   local request=$1 child=${2:-null} current phase changes=$state/.timepad-request-changes.json
+  local TIMEPAD_START_PUBLISH_READ=0
   local request_operation
   request_operation=$(jq -er '.operation' <<<"$request") || return 1
   if [ "$request_operation" = start ]; then
+    TIMEPAD_START_PUBLISH_READ=1
+    export TIMEPAD_START_PUBLISH_READ
     fixture_create_start_trace publish-read-attempted
   fi
   current=$(timeout 10s python3 "$timepad_helper" read-state \
