@@ -46,7 +46,41 @@ fixture_create_stage() {
     OWNED_START_CHILD_CAPTURED|OWNED_START_REQUEST_PUBLISHED|\
     OWNED_START_HANDSHAKE_GRANT_COMPLETED|OWNED_START_DOCKER_GRANT_RECEIVED|\
     OWNED_START_RELEASE_PUBLISHED|OWNED_START_TOKEN_WRITTEN)
-      printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
+      if [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
+        command timeout 2s python3 - "$1" <<'PY' >/dev/null 2>&1 || :
+import fcntl
+import os
+import re
+import stat
+import sys
+
+path = os.environ.get("TIMEPAD_FIXTURE_DIAGNOSTIC_FILE", "")
+if re.fullmatch(
+    r"/var/lib/timepad-fixture/case-[A-Za-z0-9_-]{1,64}/fixture/recovery-diagnostics",
+    path,
+) is None:
+    raise SystemExit(1)
+record = ("fixture_timepad_create_stage=" + sys.argv[1] + "\n").encode("ascii")
+path_info = os.lstat(path)
+if not stat.S_ISREG(path_info.st_mode) or stat.S_IMODE(path_info.st_mode) != 0o600:
+    raise SystemExit(1)
+fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_uid != os.geteuid()
+        or (path_info.st_dev, path_info.st_ino) != (info.st_dev, info.st_ino)
+        or info.st_size > 4096 - len(record)
+    ):
+        raise SystemExit(1)
+    if os.write(fd, record) != len(record):
+        raise SystemExit(1)
+finally:
+    os.close(fd)
+PY
+      fi
       ;;
   esac
   return 0
