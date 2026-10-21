@@ -4191,21 +4191,17 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                         4096,
                     )
                     handshake_events = []
-                    create_stages = []
+                    request_events = []
                     for line in supervisor_trace:
-                        if line.startswith("fixture_timepad_create_stage="):
-                            stage = line.partition("=")[2]
-                            if stage in {
-                                "OWNED_START_CHILD_CAPTURED",
-                                "OWNED_START_REQUEST_STATE_READ",
-                                "OWNED_START_REQUEST_BUILT",
-                                "OWNED_START_REQUEST_PUBLISHED",
-                                "OWNED_START_HANDSHAKE_GRANT_COMPLETED",
-                                "OWNED_START_DOCKER_GRANT_RECEIVED",
-                                "OWNED_START_RELEASE_PUBLISHED",
-                                "OWNED_START_TOKEN_WRITTEN",
+                        if line.startswith("fixture_timepad_create_request="):
+                            event = line.partition("=")[2]
+                            if event not in {
+                                "request-state-read", "request-built", "request-published",
+                                "handshake-grant-completed", "docker-grant-received",
+                                "release-published", "token-written",
                             }:
-                                create_stages.append(stage)
+                                self.fail("unexpected fixed request diagnostic")
+                            request_events.append(event)
                         if not line.startswith("fixture_timepad_create_handshake="):
                             continue
                         event = line.partition("=")[2]
@@ -4232,7 +4228,7 @@ class StaleRecoveryControllerTests(unittest.TestCase):
                             "workerPresent": lease["worker"] is not None,
                         },
                         "ownedChildHandshake": handshake_events,
-                        "ownedStartStages": create_stages,
+                        "ownedStartRequest": request_events,
                         "supervisorTrace": supervisor_trace,
                         "relay": relay_trace,
                     }, sort_keys=True, separators=(",", ":"))

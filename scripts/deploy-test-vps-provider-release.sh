@@ -42,19 +42,22 @@ fixture_create_stage() {
     CANDIDATE_BINDING|CANDIDATE_CORRELATION|CANDIDATE_SUPPRESS|CANDIDATE_SUPPRESSED|\
     VERIFYING_PUBLICATION|RESOURCE_REVALIDATION|CANDIDATE_START|CANDIDATE_HEALTH|\
     OWNED_CHILD_READBACK|OWNED_CHILD_STOP_STARTED|OWNED_CHILD_WAITED|\
-    OWNED_CHILD_STOPPED|OWNED_CHILD_GRANT_COMPLETED|OWNED_CHILD_CLEAR_PUBLISHED|\
-    OWNED_START_REQUEST_PUBLISHED|\
-    OWNED_START_REQUEST_STATE_READ|OWNED_START_REQUEST_BUILT|\
-    OWNED_START_HANDSHAKE_GRANT_COMPLETED|OWNED_START_DOCKER_GRANT_RECEIVED|\
-    OWNED_START_RELEASE_PUBLISHED|OWNED_START_TOKEN_WRITTEN)
-      case "$1" in
-      OWNED_START_*)
-      if [ "${TIMEPAD_FIXTURE_START_TRACE:-}" = 1 ]; then
-        printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
-      fi
-      if [ "${TIMEPAD_FIXTURE_START_TRACE:-}" = 1 ] &&
-        [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ]; then
-        command timeout 2s python3 - "$1" <<'PY' >/dev/null 2>&1 || :
+    OWNED_CHILD_STOPPED|OWNED_CHILD_GRANT_COMPLETED|OWNED_CHILD_CLEAR_PUBLISHED)
+      printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
+      ;;
+  esac
+  return 0
+}
+
+fixture_create_start_trace() {
+  [ "${TIMEPAD_FIXTURE_START_TRACE:-}" = 1 ] &&
+    [ "${TIMEPAD_FIXTURE_DIAGNOSTICS:-}" = 1 ] || return 0
+  case "${1:-}" in
+    request-state-read|request-built|request-published|handshake-grant-completed|\
+    docker-grant-received|release-published|token-written) ;;
+    *) return 0 ;;
+  esac
+  command timeout 2s python3 - "$1" <<'PY' >/dev/null 2>&1 || :
 import fcntl
 import os
 import re
@@ -67,7 +70,7 @@ if re.fullmatch(
     path,
 ) is None:
     raise SystemExit(1)
-record = ("fixture_timepad_create_stage=" + sys.argv[1] + "\n").encode("ascii")
+record = ("fixture_timepad_create_request=" + sys.argv[1] + "\n").encode("ascii")
 path_info = os.lstat(path)
 if not stat.S_ISREG(path_info.st_mode) or stat.S_IMODE(path_info.st_mode) != 0o600:
     raise SystemExit(1)
@@ -87,15 +90,6 @@ try:
 finally:
     os.close(fd)
 PY
-      fi
-      ;;
-      *)
-        printf 'fixture_timepad_create_stage=%s\n' "$1" >&2 || :
-        ;;
-      esac
-      ;;
-  esac
-  return 0
 }
 
 fixture_create_wait_status() {
@@ -1932,7 +1926,7 @@ timepad_request_begin() {
   local operation=$1 child=${2:-} expected_container=$3 current request nonce predecessor_hash=
   current=$(timeout 10s python3 "$timepad_helper" read-state \
     --root "$state_root" --deploy-lock-fd 9 | jq -ce '.current') || return 1
-  fixture_create_stage OWNED_START_REQUEST_STATE_READ
+  fixture_create_start_trace request-state-read
   nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$nonce" =~ ^[a-f0-9]{32}$ ]] || return 1
   if [ "$(jq -er '.phase' <<<"$current")" = PREPARED ]; then
@@ -1963,7 +1957,7 @@ timepad_request_begin() {
      lifecycle:"intent",responseId:null,completionDigest:null}
     end
   ' <<<"$current") || return 1
-  fixture_create_stage OWNED_START_REQUEST_BUILT
+  fixture_create_start_trace request-built
   timepad_request_publish "$request"
 }
 
@@ -2264,23 +2258,23 @@ sys.stdout.buffer.write(data)
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$child_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
   timepad_request_begin start "$attempt_id" "$6" || fail "RUNTIME_REQUEST_QUIESCENCE_UNCONFIRMED"
-  fixture_create_stage OWNED_START_REQUEST_PUBLISHED
+  fixture_create_start_trace request-published
   supervisor_client complete "$handshake_grant" >/dev/null ||
     fail "OWNED_CHILD_GRANT_REQUIRED"
-  fixture_create_stage OWNED_START_HANDSHAKE_GRANT_COMPLETED
+  fixture_create_start_trace handshake-grant-completed
   grant=$(supervisor_client grant docker 30) || fail "OWNED_CHILD_GRANT_REQUIRED"
   owned_child_grant=$(jq -er '.grantId' <<<"$grant") || fail "OWNED_CHILD_GRANT_REQUIRED"
-  fixture_create_stage OWNED_START_DOCKER_GRANT_RECEIVED
+  fixture_create_start_trace docker-grant-received
   released_json=$(jq -ce '.lifecycle="released"' <<<"$child_json") ||
     fail "OWNED_CHILD_CAPTURE_FAILED"
   timepad_advance "$phase" "" "" "" "" "" "" "" \
     "$released_json" "$attempt_id" || fail "OWNED_CHILD_CAPTURE_FAILED"
-  fixture_create_stage OWNED_START_RELEASE_PUBLISHED
+  fixture_create_start_trace release-published
   local handshake_fd
   exec {handshake_fd}<>"$fifo"
   printf '%s\n' "$token" >&"$handshake_fd"
   exec {handshake_fd}>&-
-  fixture_create_stage OWNED_START_TOKEN_WRITTEN
+  fixture_create_start_trace token-written
   # The shell child has its own bounded wait; persist only this fixed enum so
   # the supervisor need not inherit or expose runtime-command stderr.
   fixture_timepad_create_diagnostic released
