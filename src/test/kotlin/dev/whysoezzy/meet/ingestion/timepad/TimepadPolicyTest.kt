@@ -20,6 +20,7 @@ class TimepadPolicyTest {
         "high schoolers", "for your child", "kid", "teen", "teenager", "schoolboy", "schoolgirl",
         "toddlers", "preschoolers", "несовершеннолетних", "малолетнего",
         "children's Python camp", "children’s coding workshop", "для малышей", "малышам",
+        "для юных программистов 8–14 лет", "ages 8–14", "в возрасте 8–14 лет",
     ])
     fun `inflected child audience rejects title or category signals`(audience: String) {
         assertNull(TimepadPolicy.groups("Kotlin $audience", emptyList()))
@@ -34,6 +35,7 @@ class TimepadPolicyTest {
         assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Python child processes", emptyList()))
         assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin child coroutines", emptyList()))
         assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Frontend: React children props", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Python concurrency for child processes", emptyList()))
         assertNull(TimepadPolicy.groups("Kotlin", listOf("children")))
     }
 

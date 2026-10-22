@@ -115,6 +115,9 @@ class TimepadProviderTest {
             event.replace("Kotlin backend", "Children’s Python Camp"),
             event.replace("Kotlin backend", "Children's Python Camp"),
             event.replace("Kotlin backend", "Python для малышей"),
+            event.replace("Kotlin backend", "Python для юных программистов 8–14 лет"),
+            event.replace("Kotlin backend", "Python ages 8–14"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"ages 8–14\"}]"),
             event.replace("\"categories\": []", "\"categories\": [{\"name\":\"children’s coding workshop\"}]"),
             event.replace("\"categories\": []", "\"categories\": [{\"name\":\"для малышей\"}]"),
             event.replace("\"categories\": []", "\"categories\": [{\"name\":\"high schoolers\"}]"),
@@ -138,7 +141,10 @@ class TimepadProviderTest {
         // A professional event need not carry an explicit organizer age label.
         val result = fetchDiscovery("""{"total":1,"values":[$event]}""") as ProviderFetchResult.Complete
         assertEquals(1, result.accepted.size)
-        for (title in listOf("Kotlin child process management", "Frontend: React children props")) {
+        for (title in listOf(
+            "Kotlin child process management", "Frontend: React children props",
+            "Python concurrency for child processes",
+        )) {
             val technical = event.replace("Kotlin backend", title)
             for (savedIds in listOf(emptyList(), listOf("4242"))) {
                 val accepted = fetchDiscovery(

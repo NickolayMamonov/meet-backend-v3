@@ -61,6 +61,7 @@ object TimepadPolicy {
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:дошкольн|школьн|детск|подростк|малолетн|несовершеннолетн)[\\p{L}\\p{M}]*|" +
             "дет(?:и|ей|ям|ьми|ях)|реб(?:[её]нок|[её]нка|[её]нку|[её]нком|[её]нке|ята|ят|ятам|ятами|ятах)|" +
             "малыш(?:и|ей|ам|ами|ах|а|у|ом|е)?|" +
+            "юн(?:ый|ая|ое|ые|ого|ой|ых|ым|ыми|ому|ую)|" +
             "kids?|teen(?:ager)?s?|school(?:children|kids?|boys?|girls?|ers?)|" +
             "toddlers?|preschoolers?)(?![\\p{L}\\p{N}\\p{M}_])",
     )
@@ -75,9 +76,14 @@ object TimepadPolicy {
             "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val englishChildAudience = Regex(
-        "(?<![\\p{L}\\p{N}\\p{M}_])(?:for\\s+(?:(?:your|a|the|our|my|any|each)\\s+)?child(?:ren)?|" +
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:for\\s+(?:your|a|the|our|my|any|each)\\s+child(?:ren)?|" +
             "child(?:ren)?['’]s\\s+(?:[\\p{L}\\p{M}]+\\s+){0,4}" +
             "(?:camp|workshop|coding|programming|course|class|club)s?)" +
+            "(?![\\p{L}\\p{N}\\p{M}_])",
+    )
+    private val childAgeAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:ages?\\s+|(?:в\\s+возрасте|возраст)\\s+)" +
+            "(?:[1-9]|1[0-7])\\s*(?:[-–—]|to|до)\\s*(?:[1-9]|1[0-7])" +
             "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val rejectedExact = setOf(
@@ -94,7 +100,8 @@ object TimepadPolicy {
         if (categoryText.any { it in setOf("child", "children") }) return null
         if (allText.any {
             childAudience.containsMatchIn(it) || schoolAudience.containsMatchIn(it) ||
-                englishSchoolAudience.containsMatchIn(it) || englishChildAudience.containsMatchIn(it)
+                englishSchoolAudience.containsMatchIn(it) || englishChildAudience.containsMatchIn(it) ||
+                childAgeAudience.containsMatchIn(it)
         }) return null
         if (
             titleText in rejectedExact ||
