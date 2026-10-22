@@ -106,7 +106,7 @@ class ConfigurationTests(unittest.TestCase):
         self.provider.assert_not_called()
 
     def test_unsafe_lock_and_symlinked_state_rejected(self):
-        self.lock.chmod(0o644)
+        self.lock.chmod(0o666)
         with self.assertRaises(tool.Rejected):
             self.configure()
         self.lock.chmod(0o600)
@@ -114,6 +114,24 @@ class ConfigurationTests(unittest.TestCase):
         alias.symlink_to(self.state, target_is_directory=True)
         with self.assertRaises(OSError):
             tool.configure(self.env, alias, SECRET, self.runtime, self.provider)
+        self.provider.assert_not_called()
+
+    def test_existing_public_readable_empty_lock_is_preserved(self):
+        self.lock.chmod(0o644)
+        before = tool.identity(self.lock.stat())
+        self.configure()
+        self.assertEqual(tool.identity(self.lock.stat()), before)
+        self.provider.assert_called_once_with(SECRET.decode())
+        self.assertEqual(stat.S_IMODE(self.env.stat().st_mode), 0o600)
+
+    def test_nonempty_lock_never_probes_or_writes(self):
+        for mode in (0o600, 0o644):
+            with self.subTest(mode=mode):
+                self.lock.chmod(mode)
+                self.lock.write_bytes(b"unexpected")
+                with self.assertRaisesRegex(tool.Rejected, "nonempty_deployment_lock"):
+                    self.configure()
+                self.assertUnchanged()
         self.provider.assert_not_called()
 
     def test_symlink_hardlink_or_public_environment_rejected(self):

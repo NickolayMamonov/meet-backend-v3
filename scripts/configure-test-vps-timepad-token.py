@@ -55,16 +55,21 @@ def directory(path: Path) -> int:
         raise
 
 
-def private_file(parent: int, name: str) -> tuple[int, bytes, os.stat_result]:
+def private_file(parent: int, name: str, *, deployment_lock: bool = False
+                 ) -> tuple[int, bytes, os.stat_result]:
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOATIME,
                  dir_fd=parent)
     try:
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
                 or info.st_gid != 0 or info.st_nlink != 1
-                or stat.S_IMODE(info.st_mode) != 0o600):
+                or stat.S_IMODE(info.st_mode) not in (
+                    (0o600, 0o644) if deployment_lock else (0o600,))):
             raise Rejected("unsafe_private_file")
         no_acl(fd)
+        # The existing coordinator lock contains no secrets and may be world-readable.
+        if deployment_lock and info.st_size != 0:
+            raise Rejected("nonempty_deployment_lock")
         with os.fdopen(os.dup(fd), "rb") as stream:
             data = stream.read(MAX_BYTES + 1)
         if len(data) > MAX_BYTES:
@@ -201,7 +206,7 @@ def configure(env_path: Path, state: Path, raw: bytes,
     committed = False
     try:
         state_fd = directory(state)
-        lock_fd, _, _ = private_file(state_fd, ".deploy.lock")
+        lock_fd, _, _ = private_file(state_fd, ".deploy.lock", deployment_lock=True)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for name in (".provider-transaction.current", ".smtp-transaction.current"):
             try:
