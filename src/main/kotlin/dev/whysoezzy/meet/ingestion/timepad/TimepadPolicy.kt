@@ -58,9 +58,10 @@ object TimepadPolicy {
     )
     // Russian audience adjectives/nouns inflect; enumerating phrases misses singular cases.
     private val childAudience = Regex(
-        "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:дошкольн|школьн|детск|подростк)[\\p{L}\\p{M}]*|" +
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:дошкольн|школьн|детск|подростк|малолетн|несовершеннолетн)[\\p{L}\\p{M}]*|" +
             "дет(?:и|ей|ям|ьми|ях)|реб(?:[её]нок|[её]нка|[её]нку|[её]нком|[её]нке|ята|ят|ятам|ятами|ятах)|" +
-            "children|kids|teenagers|teens|schoolchildren|schoolkids)(?![\\p{L}\\p{N}\\p{M}_])",
+            "child(?:ren)?|kids?|teen(?:ager)?s?|school(?:children|kids?|boys?|girls?|ers?)|" +
+            "toddlers?|preschoolers?)(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val schoolAudience = Regex(
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:ученик|учениц|учащ)[\\p{L}\\p{M}]*\\s+" +

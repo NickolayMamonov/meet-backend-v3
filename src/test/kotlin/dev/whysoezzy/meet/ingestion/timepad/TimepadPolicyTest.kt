@@ -17,6 +17,8 @@ class TimepadPolicyTest {
         "детям", "детей", "дети", "ребёнка", "ребенку", "ребятам", "kids", "children",
         "учеников средней школы", "учащихся школы",
         "high school students", "primary school pupils", "school students", "for minors", "teens",
+        "high schoolers", "for your child", "kid", "teen", "teenager", "schoolboy", "schoolgirl",
+        "toddlers", "preschoolers", "несовершеннолетних", "малолетнего",
     ])
     fun `inflected child audience rejects title or category signals`(audience: String) {
         assertNull(TimepadPolicy.groups("Kotlin $audience", emptyList()))
