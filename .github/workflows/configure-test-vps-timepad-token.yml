@@ -1,0 +1,111 @@
+name: Configure Timepad token on test VPS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    concurrency:
+      group: test-vps-deploy-${{ github.repository }}
+      cancel-in-progress: false
+    environment:
+      name: test-vps
+    env:
+      HOST: ${{ vars.TEST_VPS_HOST }}
+      PORT: ${{ vars.TEST_VPS_PORT }}
+      SSH_USER: ${{ vars.TEST_VPS_USER }}
+      PATH_ON_HOST: ${{ vars.TEST_VPS_PATH }}
+      HOST_FINGERPRINT: ${{ vars.TEST_VPS_SSH_HOST_FINGERPRINT }}
+    steps:
+      - name: Checkout exact reviewed tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Establish strict SSH host trust
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          [ "$HOST" = 135.136.191.237 ]
+          [ "$PATH_ON_HOST" = /opt/meet-backend ]
+          [ "$SSH_USER" = root ]
+          [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]
+          [[ "$HOST_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]+$ ]]
+          umask 077
+          key_file="$RUNNER_TEMP/timepad-vps-key"
+          known_hosts="$RUNNER_TEMP/timepad-known-hosts"
+          config="$RUNNER_TEMP/timepad-ssh-config"
+          printf '%s\n' "$SSH_PRIVATE_KEY" >"$key_file"
+          ssh-keygen -y -P '' -f "$key_file" >/dev/null
+          : >"$known_hosts"
+          matched=0
+          while IFS= read -r key_line; do
+            fingerprint=$(printf '%s\n' "$key_line" |
+              ssh-keygen -lf - -E sha256 | awk '{print $2}')
+            if [ "$fingerprint" = "$HOST_FINGERPRINT" ]; then
+              printf '%s\n' "$key_line" >>"$known_hosts"
+              matched=$((matched + 1))
+            fi
+          done < <(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null)
+          [ "$matched" -eq 1 ]
+          {
+            echo 'Host test-vps'
+            echo "  HostName $HOST"
+            echo "  Port $PORT"
+            echo "  User $SSH_USER"
+            echo "  IdentityFile $key_file"
+            echo "  UserKnownHostsFile $known_hosts"
+            echo '  BatchMode yes'
+            echo '  IdentitiesOnly yes'
+            echo '  StrictHostKeyChecking yes'
+            echo '  ConnectTimeout 10'
+            echo '  ConnectionAttempts 1'
+            echo '  ServerAliveInterval 5'
+            echo '  ServerAliveCountMax 2'
+          } >"$config"
+          echo "SSH_CONFIG=$config" >>"$GITHUB_ENV"
+
+      - name: Probe credential and configure only the token
+        shell: bash
+        env:
+          TIMEPAD_TOKEN: ${{ secrets.TIMEPAD_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$TIMEPAD_TOKEN" ]
+          stage=
+          cleanup() {
+            if [ -n "$stage" ]; then
+              timeout 20s ssh -F "$SSH_CONFIG" test-vps \
+                "rm -f -- '$stage/configure-test-vps-timepad-token.py'; rmdir -- '$stage'"
+            fi
+          }
+          trap cleanup EXIT
+          candidate_stage=$(timeout 20s ssh -F "$SSH_CONFIG" test-vps \
+            "umask 077; mktemp -d '$PATH_ON_HOST/.timepad-token-config.XXXXXXXXXX'")
+          [[ "$candidate_stage" =~ ^/opt/meet-backend/\.timepad-token-config\.[A-Za-z0-9]{10}$ ]]
+          stage=$candidate_stage
+          script=scripts/configure-test-vps-timepad-token.py
+          checksum=$(sha256sum "$script" | awk '{print $1}')
+          timeout 20s scp -F "$SSH_CONFIG" "$script" \
+            "test-vps:$stage/configure-test-vps-timepad-token.py"
+          timeout 20s ssh -F "$SSH_CONFIG" test-vps \
+            "cd '$stage'; printf '%s  %s\n' '$checksum' configure-test-vps-timepad-token.py | sha256sum --status -c -"
+          # Token travels only through SSH stdin, never command arguments or a runner file.
+          printf '%s' "$TIMEPAD_TOKEN" | timeout 60s ssh -F "$SSH_CONFIG" test-vps \
+            "PYTHONDONTWRITEBYTECODE=1 timeout 50s python3 '$stage/configure-test-vps-timepad-token.py'"
+
+      - name: Remove runner SSH material
+        if: always()
+        shell: bash
+        run: |
+          rm -f -- "$RUNNER_TEMP/timepad-vps-key" \
+            "$RUNNER_TEMP/timepad-known-hosts" "$RUNNER_TEMP/timepad-ssh-config"
