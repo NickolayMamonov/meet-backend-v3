@@ -77,13 +77,12 @@ object TimepadPolicy {
     )
     private val englishChildAudience = Regex(
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:for\\s+(?:your|a|the|our|my|any|each)\\s+child(?:ren)?|" +
-            "child(?:ren)?['’]s\\s+(?:[\\p{L}\\p{M}]+\\s+){0,4}" +
-            "(?:camp|workshop|coding|programming|course|class|club)s?)" +
+            "child(?:ren)?['’]s)" +
             "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val childAgeAudience = Regex(
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:ages?\\s+|(?:в\\s+возрасте|возраст)\\s+)" +
-            "(?:[1-9]|1[0-7])\\s*(?:[-–—]|to|до)\\s*(?:[1-9]|1[0-7])" +
+            "(?:[1-9]|1[0-7])\\s*(?:[-–—]|to|до)\\s*(?:[1-9][0-9]?|1[01][0-9]|120)" +
             "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val rejectedExact = setOf(

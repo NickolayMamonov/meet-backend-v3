@@ -113,6 +113,10 @@ class TimepadProviderTest {
             event.replace("Kotlin backend", "Python for high schoolers"),
             event.replace("Kotlin backend", "Python for your child"),
             event.replace("Kotlin backend", "Children’s Python Camp"),
+            event.replace("Kotlin backend", "Children’s Python Meetup"),
+            event.replace("Kotlin backend", "Python ages 16–18"),
+            event.replace("Kotlin backend", "Python ages 8–18"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"children’s Python meetup\"}]"),
             event.replace("Kotlin backend", "Children's Python Camp"),
             event.replace("Kotlin backend", "Python для малышей"),
             event.replace("Kotlin backend", "Python для юных программистов 8–14 лет"),
@@ -144,6 +148,7 @@ class TimepadProviderTest {
         for (title in listOf(
             "Kotlin child process management", "Frontend: React children props",
             "Python concurrency for child processes",
+            "Python ages 18–25",
         )) {
             val technical = event.replace("Kotlin backend", title)
             for (savedIds in listOf(emptyList(), listOf("4242"))) {
