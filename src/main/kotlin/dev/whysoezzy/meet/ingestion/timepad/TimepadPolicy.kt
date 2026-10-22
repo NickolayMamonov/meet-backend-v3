@@ -60,11 +60,16 @@ object TimepadPolicy {
     private val childAudience = Regex(
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:дошкольн|школьн|детск|подростк)[\\p{L}\\p{M}]*|" +
             "дет(?:и|ей|ям|ьми|ях)|реб(?:[её]нок|[её]нка|[её]нку|[её]нком|[её]нке|ята|ят|ятам|ятами|ятах)|" +
-            "children|kids|teenagers)(?![\\p{L}\\p{N}\\p{M}_])",
+            "children|kids|teenagers|teens|schoolchildren|schoolkids)(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val schoolAudience = Regex(
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:ученик|учениц|учащ)[\\p{L}\\p{M}]*\\s+" +
             "(?:[\\p{L}\\p{M}]+\\s+){0,4}школ(?:а|ы|е|у|ой|ою|ам|ами|ах)?" +
+            "(?![\\p{L}\\p{N}\\p{M}_])",
+    )
+    private val englishSchoolAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:(?:high|middle|primary|secondary|elementary)\\s+)?" +
+            "school[\\s-]+(?:students?|pupils?)|for\\s+(?:pupils|minors))" +
             "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val rejectedExact = setOf(
@@ -78,7 +83,10 @@ object TimepadPolicy {
         val titleText = normalize(title)
         val categoryText = categoryNames.map(::normalize)
         val allText = listOf(titleText) + categoryText
-        if (allText.any { childAudience.containsMatchIn(it) || schoolAudience.containsMatchIn(it) }) return null
+        if (allText.any {
+            childAudience.containsMatchIn(it) || schoolAudience.containsMatchIn(it) ||
+                englishSchoolAudience.containsMatchIn(it)
+        }) return null
         if (
             titleText in rejectedExact ||
             categoryText.any { it in rejectedExact } ||

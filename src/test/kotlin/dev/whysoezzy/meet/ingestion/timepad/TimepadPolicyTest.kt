@@ -16,10 +16,17 @@ class TimepadPolicyTest {
         "школьника", "школьный", "школьная", "дошкольный", "детского", "подростковый",
         "детям", "детей", "дети", "ребёнка", "ребенку", "ребятам", "kids", "children",
         "учеников средней школы", "учащихся школы",
+        "high school students", "primary school pupils", "school students", "for minors", "teens",
     ])
     fun `inflected child audience rejects title or category signals`(audience: String) {
         assertNull(TimepadPolicy.groups("Kotlin $audience", emptyList()))
         assertNull(TimepadPolicy.groups("Kotlin", listOf(audience)))
+    }
+
+    @Test
+    fun `adult professional schools and school software topics are not audience markers`() {
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin backend school", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin software for schools", emptyList()))
     }
 
     @ParameterizedTest
