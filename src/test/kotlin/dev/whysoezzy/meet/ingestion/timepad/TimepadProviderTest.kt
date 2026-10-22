@@ -133,13 +133,15 @@ class TimepadProviderTest {
         // A professional event need not carry an explicit organizer age label.
         val result = fetchDiscovery("""{"total":1,"values":[$event]}""") as ProviderFetchResult.Complete
         assertEquals(1, result.accepted.size)
-        val technical = event.replace("Kotlin backend", "Kotlin child process management")
-        for (savedIds in listOf(emptyList(), listOf("4242"))) {
-            val accepted = fetchDiscovery(
-                """{"total":1,"values":[$technical]}""", savedIds,
-            ) as ProviderFetchResult.Complete
-            assertEquals(1, accepted.accepted.size)
-            assertTrue(accepted.rejectedSavedExternalIds.isEmpty())
+        for (title in listOf("Kotlin child process management", "Frontend: React children props")) {
+            val technical = event.replace("Kotlin backend", title)
+            for (savedIds in listOf(emptyList(), listOf("4242"))) {
+                val accepted = fetchDiscovery(
+                    """{"total":1,"values":[$technical]}""", savedIds,
+                ) as ProviderFetchResult.Complete
+                assertEquals(1, accepted.accepted.size)
+                assertTrue(accepted.rejectedSavedExternalIds.isEmpty())
+            }
         }
     }
 

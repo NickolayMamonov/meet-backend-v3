@@ -14,7 +14,7 @@ class TimepadPolicyTest {
     @ParameterizedTest
     @ValueSource(strings = [
         "школьника", "школьный", "школьная", "дошкольный", "детского", "подростковый",
-        "детям", "детей", "дети", "ребёнка", "ребенку", "ребятам", "kids", "children",
+        "детям", "детей", "дети", "ребёнка", "ребенку", "ребятам", "kids", "for children",
         "учеников средней школы", "учащихся школы",
         "high school students", "primary school pupils", "school students", "for minors", "teens",
         "high schoolers", "for your child", "kid", "teen", "teenager", "schoolboy", "schoolgirl",
@@ -32,6 +32,8 @@ class TimepadPolicyTest {
         assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin child process management", emptyList()))
         assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Python child processes", emptyList()))
         assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin child coroutines", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Frontend: React children props", emptyList()))
+        assertNull(TimepadPolicy.groups("Kotlin", listOf("children")))
     }
 
     @ParameterizedTest
