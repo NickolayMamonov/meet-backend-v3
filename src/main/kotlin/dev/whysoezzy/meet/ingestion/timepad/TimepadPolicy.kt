@@ -60,7 +60,7 @@ object TimepadPolicy {
     private val childAudience = Regex(
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:дошкольн|школьн|детск|подростк|малолетн|несовершеннолетн)[\\p{L}\\p{M}]*|" +
             "дет(?:и|ей|ям|ьми|ях)|реб(?:[её]нок|[её]нка|[её]нку|[её]нком|[её]нке|ята|ят|ятам|ятами|ятах)|" +
-            "child(?:ren)?|kids?|teen(?:ager)?s?|school(?:children|kids?|boys?|girls?|ers?)|" +
+            "children|kids?|teen(?:ager)?s?|school(?:children|kids?|boys?|girls?|ers?)|" +
             "toddlers?|preschoolers?)(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val schoolAudience = Regex(
@@ -71,6 +71,10 @@ object TimepadPolicy {
     private val englishSchoolAudience = Regex(
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:(?:high|middle|primary|secondary|elementary)\\s+)?" +
             "school[\\s-]+(?:students?|pupils?)|for\\s+(?:pupils|minors))" +
+            "(?![\\p{L}\\p{N}\\p{M}_])",
+    )
+    private val englishChildAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])for\\s+(?:(?:your|a|the|our|my|any|each)\\s+)?child" +
             "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val rejectedExact = setOf(
@@ -86,7 +90,7 @@ object TimepadPolicy {
         val allText = listOf(titleText) + categoryText
         if (allText.any {
             childAudience.containsMatchIn(it) || schoolAudience.containsMatchIn(it) ||
-                englishSchoolAudience.containsMatchIn(it)
+                englishSchoolAudience.containsMatchIn(it) || englishChildAudience.containsMatchIn(it)
         }) return null
         if (
             titleText in rejectedExact ||

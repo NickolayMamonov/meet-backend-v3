@@ -29,6 +29,9 @@ class TimepadPolicyTest {
     fun `adult professional schools and school software topics are not audience markers`() {
         assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin backend school", emptyList()))
         assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin software for schools", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin child process management", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Python child processes", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin child coroutines", emptyList()))
     }
 
     @ParameterizedTest
