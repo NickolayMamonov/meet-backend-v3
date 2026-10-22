@@ -60,6 +60,7 @@ object TimepadPolicy {
     private val childAudience = Regex(
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:дошкольн|школьн|детск|подростк|малолетн|несовершеннолетн)[\\p{L}\\p{M}]*|" +
             "дет(?:и|ей|ям|ьми|ях)|реб(?:[её]нок|[её]нка|[её]нку|[её]нком|[её]нке|ята|ят|ятам|ятами|ятах)|" +
+            "малыш(?:и|ей|ам|ами|ах|а|у|ом|е)?|" +
             "kids?|teen(?:ager)?s?|school(?:children|kids?|boys?|girls?|ers?)|" +
             "toddlers?|preschoolers?)(?![\\p{L}\\p{N}\\p{M}_])",
     )
@@ -74,7 +75,9 @@ object TimepadPolicy {
             "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val englishChildAudience = Regex(
-        "(?<![\\p{L}\\p{N}\\p{M}_])for\\s+(?:(?:your|a|the|our|my|any|each)\\s+)?child(?:ren)?" +
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:for\\s+(?:(?:your|a|the|our|my|any|each)\\s+)?child(?:ren)?|" +
+            "child(?:ren)?['’]s\\s+(?:[\\p{L}\\p{M}]+\\s+){0,4}" +
+            "(?:camp|workshop|coding|programming|course|class|club)s?)" +
             "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val rejectedExact = setOf(
