@@ -281,6 +281,7 @@ jobs:
           bash "$TOOLING_SCRIPTS/test-classify-release-continuation.sh"
           bash "$TOOLING_SCRIPTS/test-release-publish-tooling-routing.sh"
           bash "$TOOLING_SCRIPTS/test-test-vps-deploy-workflow.sh"
+          sudo bash "$TOOLING_SCRIPTS/test-test-vps-provider-startup.sh"
           timeout 120s bash "$TOOLING_SCRIPTS/test-timepad-manual-stop.sh"
           timeout 120s bash "$TOOLING_SCRIPTS/test-timepad-workflow-routing.sh"
           bash "$TOOLING_SCRIPTS/test-dev-promotion-source.sh"

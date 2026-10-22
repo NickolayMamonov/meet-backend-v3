@@ -537,6 +537,100 @@ PY
   fi
 }
 
+write_provider_marker() {
+  local phase=$1
+  local disposition=$2
+  local temporary="$state_root/.provider-transaction.$run_key.tmp"
+  case "$phase" in preparing|prepared|applying|verifying|rolling-back|finalizing) ;; *)
+    fail "RECOVERY_REQUIRED"
+    ;;
+  esac
+  case "$disposition" in none|created|reused) ;; *) fail "RECOVERY_REQUIRED" ;; esac
+  if [ "$phase" = preparing ]; then
+    [ ! -e "$provider_pointer" ] && [ ! -L "$provider_pointer" ] ||
+      fail "RECOVERY_REQUIRED"
+  fi
+  [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || fail "RECOVERY_REQUIRED"
+  umask 077
+  printf '{"schemaVersion":1,"runKey":"%s","phase":"%s","providerEnabled":%s,"durableDisposition":"%s"}\n' \
+    "$run_key" "$phase" "$provider_enabled" "$disposition" >"$temporary"
+  chmod 600 "$temporary"
+  timeout 30s python3 - "$temporary" "$state_root" <<'PY'
+import os
+import sys
+
+for path, directory in ((sys.argv[1], False), (sys.argv[2], True)):
+    flags = os.O_RDONLY | (os.O_DIRECTORY if directory else 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
+  timeout 30s mv -f -- "$temporary" "$provider_pointer"
+  timeout 30s python3 - "$state_root" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+verify_predecessor_for_cleanup() {
+  local current_container current_inspect
+  current_container=$(compose ps -q backend 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  [ -n "$current_container" ] || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  current_inspect=$(docker_container_inspect "$current_container" 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  cleanup_inspect=$current_inspect
+  runtime_invariants_bounded "$previous_id" "$previous_revision" \
+    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 || {
+      echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+      return 1
+    }
+  runtime_environment_bounded >/dev/null 2>&1 || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  if ! (verify_public_contract "$public_url" >/dev/null 2>&1); then
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  fi
+  local final_container final_inspect
+  final_container=$(compose ps -q backend 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  [ "$final_container" = "$current_container" ] || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  final_inspect=$(docker_container_inspect "$final_container" 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  cleanup_inspect=$final_inspect
+  printf '[%s,%s]' "$previous_inspect" "$final_inspect" |
+    timeout 30s python3 "$provider_helper" verify \
+      --run-key "$run_key" --state-root "$state_root" --phase predecessor \
+      >/dev/null || {
+        echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+        return 1
+      }
+}
+
 provider_release_main() {
 root=
 base_compose=
@@ -848,49 +942,6 @@ run_safety_hook() {
   fi
 }
 
-write_provider_marker() {
-  local phase=$1
-  local disposition=$2
-  local temporary="$state_root/.provider-transaction.$run_key.tmp"
-  case "$phase" in preparing|prepared|applying|verifying|rolling-back|finalizing) ;; *)
-    fail "RECOVERY_REQUIRED"
-    ;;
-  esac
-  case "$disposition" in none|created|reused) ;; *) fail "RECOVERY_REQUIRED" ;; esac
-  if [ "$phase" = preparing ]; then
-    [ ! -e "$provider_pointer" ] && [ ! -L "$provider_pointer" ] ||
-      fail "RECOVERY_REQUIRED"
-  fi
-  [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || fail "RECOVERY_REQUIRED"
-  umask 077
-  printf '{"schemaVersion":1,"runKey":"%s","phase":"%s","providerEnabled":%s,"durableDisposition":"%s"}\n' \
-    "$run_key" "$phase" "$provider_enabled" "$disposition" >"$temporary"
-  chmod 600 "$temporary"
-  timeout 30s python3 - "$temporary" "$state_root" <<'PY'
-import os
-import sys
-
-for path, directory in ((sys.argv[1], False), (sys.argv[2], True)):
-    flags = os.O_RDONLY | (os.O_DIRECTORY if directory else 0)
-    fd = os.open(path, flags)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-PY
-  timeout 30s mv -f -- "$temporary" "$provider_pointer"
-  timeout 30s python3 - "$state_root" <<'PY'
-import os
-import sys
-
-fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
-try:
-    os.fsync(fd)
-finally:
-    os.close(fd)
-PY
-}
-
 write_terminal_record() {
   local outcome=$1
   local terminal="$state/terminal.json"
@@ -1185,57 +1236,6 @@ verify_predecessor_before_writers() {
     timeout 30s python3 "$provider_helper" verify \
       --run-key "$run_key" --state-root "$state_root" --phase predecessor >/dev/null ||
     fail "PROVIDER_STATE_INVALID"
-}
-
-verify_predecessor_for_cleanup() {
-  local current_container current_inspect
-  current_container=$(compose ps -q backend 2>/dev/null) || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  [ -n "$current_container" ] || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  current_inspect=$(docker_container_inspect "$current_container" 2>/dev/null) || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  cleanup_inspect=$current_inspect
-  runtime_invariants_bounded "$previous_id" "$previous_revision" \
-    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 || {
-      echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-      return 1
-    }
-  runtime_environment_bounded >/dev/null 2>&1 || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  if ! (verify_public_contract "$public_url" >/dev/null 2>&1); then
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  fi
-  local final_container final_inspect
-  final_container=$(compose ps -q backend 2>/dev/null) || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  [ "$final_container" = "$current_container" ] || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  final_inspect=$(docker_container_inspect "$final_container" 2>/dev/null) || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  cleanup_inspect=$final_inspect
-  printf '[%s,%s]' "$previous_inspect" "$final_inspect" |
-    timeout 30s python3 "$provider_helper" verify \
-      --run-key "$run_key" --state-root "$state_root" --phase predecessor \
-      >/dev/null || {
-        echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-        return 1
-      }
 }
 
 validate_active_files_before_writers
