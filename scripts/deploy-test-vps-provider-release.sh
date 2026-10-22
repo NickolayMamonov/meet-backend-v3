@@ -580,6 +580,57 @@ finally:
 PY
 }
 
+verify_predecessor_for_cleanup() {
+  local current_container current_inspect
+  current_container=$(compose ps -q backend 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  [ -n "$current_container" ] || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  current_inspect=$(docker_container_inspect "$current_container" 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  cleanup_inspect=$current_inspect
+  runtime_invariants_bounded "$previous_id" "$previous_revision" \
+    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 || {
+      echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+      return 1
+    }
+  runtime_environment_bounded >/dev/null 2>&1 || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  if ! (verify_public_contract "$public_url" >/dev/null 2>&1); then
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  fi
+  local final_container final_inspect
+  final_container=$(compose ps -q backend 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  [ "$final_container" = "$current_container" ] || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  final_inspect=$(docker_container_inspect "$final_container" 2>/dev/null) || {
+    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+    return 1
+  }
+  cleanup_inspect=$final_inspect
+  printf '[%s,%s]' "$previous_inspect" "$final_inspect" |
+    timeout 30s python3 "$provider_helper" verify \
+      --run-key "$run_key" --state-root "$state_root" --phase predecessor \
+      >/dev/null || {
+        echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+        return 1
+      }
+}
+
 provider_release_main() {
 root=
 base_compose=
@@ -1185,57 +1236,6 @@ verify_predecessor_before_writers() {
     timeout 30s python3 "$provider_helper" verify \
       --run-key "$run_key" --state-root "$state_root" --phase predecessor >/dev/null ||
     fail "PROVIDER_STATE_INVALID"
-}
-
-verify_predecessor_for_cleanup() {
-  local current_container current_inspect
-  current_container=$(compose ps -q backend 2>/dev/null) || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  [ -n "$current_container" ] || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  current_inspect=$(docker_container_inspect "$current_container" 2>/dev/null) || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  cleanup_inspect=$current_inspect
-  runtime_invariants_bounded "$previous_id" "$previous_revision" \
-    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 || {
-      echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-      return 1
-    }
-  runtime_environment_bounded >/dev/null 2>&1 || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  if ! (verify_public_contract "$public_url" >/dev/null 2>&1); then
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  fi
-  local final_container final_inspect
-  final_container=$(compose ps -q backend 2>/dev/null) || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  [ "$final_container" = "$current_container" ] || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  final_inspect=$(docker_container_inspect "$final_container" 2>/dev/null) || {
-    echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-    return 1
-  }
-  cleanup_inspect=$final_inspect
-  printf '[%s,%s]' "$previous_inspect" "$final_inspect" |
-    timeout 30s python3 "$provider_helper" verify \
-      --run-key "$run_key" --state-root "$state_root" --phase predecessor \
-      >/dev/null || {
-        echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
-        return 1
-      }
 }
 
 validate_active_files_before_writers
