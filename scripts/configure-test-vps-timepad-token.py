@@ -161,13 +161,17 @@ def probe(token: str) -> dict:
 
 def runtime() -> tuple[str, str]:
     running = subprocess.run(
-        ["docker", "ps", "-q", "--filter", "label=com.docker.compose.service=backend"],
+        ["docker", "ps", "--no-trunc", "-q", "--filter",
+         "label=com.docker.compose.service=backend"],
         capture_output=True, check=True, timeout=10,
     ).stdout.splitlines()
     if len(running) != 1:
         raise Rejected("single_backend_required")
+    container_id = running[0].decode("ascii")
+    if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+        raise Rejected("unexpected_container_id")
     output = subprocess.run(
-        ["docker", "inspect", "meet-production-backend-1"],
+        ["docker", "inspect", container_id],
         capture_output=True, check=True, timeout=10,
     ).stdout
     if len(output) > MAX_BYTES:
@@ -175,7 +179,11 @@ def runtime() -> tuple[str, str]:
     records = json.loads(output)
     backend = records[0]
     env = dict(item.split("=", 1) for item in backend["Config"]["Env"])
-    if (len(records) != 1 or backend["Config"]["Image"] != IMAGE
+    labels = backend["Config"].get("Labels", {})
+    if (len(records) != 1 or backend["Id"] != container_id
+            or labels.get("com.docker.compose.project") != "meet-production"
+            or labels.get("com.docker.compose.service") != "backend"
+            or backend["Config"]["Image"] != IMAGE
             or not backend["State"]["Running"]
             or backend["State"]["Health"]["Status"] != "healthy"
             or env.get("TIMEPAD_ENABLED") != "false"

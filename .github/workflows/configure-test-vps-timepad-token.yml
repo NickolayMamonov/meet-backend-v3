@@ -89,9 +89,41 @@ jobs:
             fi
           }
           trap cleanup EXIT
-          candidate_stage=$(timeout 20s ssh -F "$SSH_CONFIG" test-vps \
-            "umask 077; mktemp -d '$PATH_ON_HOST/.timepad-token-config.XXXXXXXXXX'")
-          [[ "$candidate_stage" =~ ^/opt/meet-backend/\.timepad-token-config\.[A-Za-z0-9]{10}$ ]]
+          # Validate trust before staging or executing any uploaded root helper.
+          candidate_stage=$(timeout 20s ssh -F "$SSH_CONFIG" test-vps python3 - <<'PY_STAGE'
+          import os
+          from pathlib import Path
+          import secrets
+          import stat
+
+          def make_stage(root):
+              if os.geteuid() != 0 or not root.is_absolute() or ".." in root.parts:
+                  raise RuntimeError("unsafe staging root")
+              os.umask(0o077)
+              fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              try:
+                  for part in (None, *root.parts[1:]):
+                      if part is not None:
+                          child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                          dir_fd=fd)
+                          os.close(fd)
+                          fd = child
+                      info = os.fstat(fd)
+                      if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+                          raise RuntimeError("unsafe staging permissions")
+                      if any(x.startswith("system.posix_acl_") for x in os.listxattr(fd)):
+                          raise RuntimeError("unsafe staging ACL")
+                  name = ".timepad-token-config." + secrets.token_hex(16)
+                  os.mkdir(name, 0o700, dir_fd=fd)
+                  return str(root / name)
+              finally:
+                  os.close(fd)
+
+          if __name__ == "__main__":
+              print(make_stage(Path("/opt/meet-backend")))
+          PY_STAGE
+          )
+          [[ "$candidate_stage" =~ ^/opt/meet-backend/\.timepad-token-config\.[a-f0-9]{32}$ ]]
           stage=$candidate_stage
           script=scripts/configure-test-vps-timepad-token.py
           checksum=$(sha256sum "$script" | awk '{print $1}')

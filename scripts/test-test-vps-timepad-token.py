@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import Mock, patch
 
@@ -273,18 +274,22 @@ class WorkflowTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    ID = "a" * 64
+
     def backend(self):
-        return {"Id": "backend", "Config": {"Image": tool.IMAGE, "Env": [
+        return {"Id": self.ID, "Config": {"Image": tool.IMAGE, "Labels": {
+            "com.docker.compose.project": "meet-production",
+            "com.docker.compose.service": "backend"}, "Env": [
             "TIMEPAD_ENABLED=false", "INGESTION_ENABLED=false"]},
                 "State": {"Running": True, "Health": {"Status": "healthy"},
                           "StartedAt": "fixture"}}
 
     def test_expected_runtime_returns_stable_identity(self):
         with patch.object(tool.subprocess, "run", side_effect=[
-            Mock(stdout=b"backend\n"),
+            Mock(stdout=(self.ID + "\n").encode()),
             Mock(stdout=json.dumps([self.backend()]).encode()),
         ]):
-            self.assertEqual(tool.runtime(), ("backend", "fixture"))
+            self.assertEqual(tool.runtime(), (self.ID, "fixture"))
 
     def test_extra_backend_or_wrong_image_rejected(self):
         with patch.object(tool.subprocess, "run", return_value=Mock(stdout=b"a\nb\n")):
@@ -293,10 +298,59 @@ class RuntimeTests(unittest.TestCase):
         backend = self.backend()
         backend["Config"]["Image"] = "unapproved-image"
         with patch.object(tool.subprocess, "run", side_effect=[
-            Mock(stdout=b"backend\n"), Mock(stdout=json.dumps([backend]).encode()),
+            Mock(stdout=(self.ID + "\n").encode()), Mock(stdout=json.dumps([backend]).encode()),
         ]):
             with self.assertRaisesRegex(tool.Rejected, "unexpected_runtime"):
                 tool.runtime()
+
+    def test_counted_container_identity_and_project_must_match(self):
+        for change in ("id", "project", "service"):
+            backend = self.backend()
+            if change == "id":
+                backend["Id"] = "b" * 64
+            else:
+                key = "com.docker.compose." + change
+                backend["Config"]["Labels"][key] = "different"
+            with self.subTest(change=change), patch.object(tool.subprocess, "run", side_effect=[
+                Mock(stdout=(self.ID + "\n").encode()), Mock(stdout=json.dumps([backend]).encode()),
+            ]) as run:
+                with self.assertRaisesRegex(tool.Rejected, "unexpected_runtime"):
+                    tool.runtime()
+                self.assertEqual(run.call_args_list[1].args[0], ["docker", "inspect", self.ID])
+
+
+class StagingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir="/root")
+        self.root = Path(self.tmp.name)
+        text = (Path(__file__).resolve().parents[1] / ".github/workflows/"
+                "configure-test-vps-timepad-token.yml").read_text()
+        code = text.split("<<'PY_STAGE'\n", 1)[1].split("\n          PY_STAGE", 1)[0]
+        namespace = {"__name__": "hermetic_staging_test"}
+        exec(compile(textwrap.dedent(code), "workflow_staging", "exec"), namespace)
+        self.stage = namespace["make_stage"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_actual_workflow_staging_is_root_private(self):
+        stage = Path(self.stage(self.root))
+        self.assertEqual(stage.parent, self.root)
+        self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o700)
+        self.assertEqual(stage.stat().st_uid, 0)
+        self.assertEqual(list(stage.iterdir()), [])
+
+    def test_unsafe_root_or_ancestor_rejected_before_staging(self):
+        for mode in (0o777, 0o775):
+            self.root.chmod(mode)
+            with self.assertRaisesRegex(RuntimeError, "unsafe staging permissions"):
+                self.stage(self.root)
+            self.assertEqual(list(self.root.iterdir()), [])
+        self.root.chmod(0o700)
+        alias = self.root / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(OSError):
+            self.stage(alias)
 
 
 if __name__ == "__main__":

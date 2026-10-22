@@ -5,13 +5,17 @@ in environment `test-vps`. Adding the secret alone does not configure the VPS.
 The workflow is manual and `dev`-only; merge, dispatch and provider access
 require separate operator approval. It targets only the confirmed test VPS.
 
-The workflow verifies existing SSH host trust and the staged helper checksum,
+Before uploading or executing a helper as root, the workflow checks every staging
+ancestor for root ownership, no group/world write access, no symlinks and no ACLs,
+then creates a root-only private directory. It verifies existing SSH host trust
+and the staged helper checksum,
 then sends the token through SSH stdin. It never prints the value, places it
 in command arguments, uploads it as an artifact or stores a runner token file.
 
 The helper requires the existing deployment lock, no unresolved provider/SMTP
 transaction, a private root-owned environment file and the healthy single
-approved 1.5.0 backend with both Timepad and ingestion OFF. It makes one
+approved 1.5.0 backend with both Timepad and ingestion OFF. It inspects the exact
+sole running backend ID and verifies its Compose project/service labels. It makes one
 authenticated HTTPS request to the fixed Timepad events endpoint with the
 production query, no redirects and finite body/time bounds.
 
