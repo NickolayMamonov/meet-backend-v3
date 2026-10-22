@@ -452,9 +452,9 @@ jobs:
           provider_json=$(grep -E '^\{"schemaVersion":1,' \
             "$RUNNER_TEMP/deploy-output.txt" | tail -n 1)
           validate_provider_json "$provider_json" committed
-          provider_enabled=$(jq -er '.providerEnabled' <<<"$provider_json")
-          credential_mount_present=$(jq -er '.credentialMountPresent' <<<"$provider_json")
-          credential_mount_read_only=$(jq -er '.credentialMountReadOnly' <<<"$provider_json")
+          provider_enabled=$(jq -r '.providerEnabled' <<<"$provider_json")
+          credential_mount_present=$(jq -r '.credentialMountPresent' <<<"$provider_json")
+          credential_mount_read_only=$(jq -r '.credentialMountReadOnly' <<<"$provider_json")
           {
             echo "PROVIDER_ENABLED=$provider_enabled"
             echo "CREDENTIAL_MOUNT_PRESENT=$credential_mount_present"

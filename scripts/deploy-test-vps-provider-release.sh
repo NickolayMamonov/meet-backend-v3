@@ -187,6 +187,14 @@ runtime_release_field_bounded() {
   ' _ "$runtime_helper" "$root" "$1"
 }
 
+runtime_invariants_bounded() {
+  timeout 60s bash -c '
+    set -euo pipefail
+    source "$1"
+    verify_runtime_invariants "$2" "$3" "$4" "$5" "$6" "$7"
+  ' _ "$runtime_helper" "$root" "$compose_script" "$1" "$2" "$3" "$4"
+}
+
 configuration_file_identity() {
   timeout 30s python3 - "$1" <<'PY'
 import hashlib
@@ -659,14 +667,6 @@ runtime_environment_bounded() {
     source "$1"
     verify_environment_matches_container "$2" "$3"
   ' _ "$runtime_helper" "$root" "$compose_script"
-}
-
-runtime_invariants_bounded() {
-  timeout 60s bash -c '
-    set -euo pipefail
-    source "$1"
-    verify_runtime_invariants "$2" "$3" "$4" "$5" "$6" "$7"
-  ' _ "$runtime_helper" "$root" "$compose_script" "$1" "$2" "$3" "$4" "$5"
 }
 
 state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
