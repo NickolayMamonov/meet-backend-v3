@@ -537,6 +537,49 @@ PY
   fi
 }
 
+write_provider_marker() {
+  local phase=$1
+  local disposition=$2
+  local temporary="$state_root/.provider-transaction.$run_key.tmp"
+  case "$phase" in preparing|prepared|applying|verifying|rolling-back|finalizing) ;; *)
+    fail "RECOVERY_REQUIRED"
+    ;;
+  esac
+  case "$disposition" in none|created|reused) ;; *) fail "RECOVERY_REQUIRED" ;; esac
+  if [ "$phase" = preparing ]; then
+    [ ! -e "$provider_pointer" ] && [ ! -L "$provider_pointer" ] ||
+      fail "RECOVERY_REQUIRED"
+  fi
+  [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || fail "RECOVERY_REQUIRED"
+  umask 077
+  printf '{"schemaVersion":1,"runKey":"%s","phase":"%s","providerEnabled":%s,"durableDisposition":"%s"}\n' \
+    "$run_key" "$phase" "$provider_enabled" "$disposition" >"$temporary"
+  chmod 600 "$temporary"
+  timeout 30s python3 - "$temporary" "$state_root" <<'PY'
+import os
+import sys
+
+for path, directory in ((sys.argv[1], False), (sys.argv[2], True)):
+    flags = os.O_RDONLY | (os.O_DIRECTORY if directory else 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
+  timeout 30s mv -f -- "$temporary" "$provider_pointer"
+  timeout 30s python3 - "$state_root" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
 provider_release_main() {
 root=
 base_compose=
@@ -846,49 +889,6 @@ run_safety_hook() {
     [ "$missing_admin" = 403 ] && [ "$wrong_admin" = 403 ] ||
       fail "admin guard did not reject unauthenticated requests"
   fi
-}
-
-write_provider_marker() {
-  local phase=$1
-  local disposition=$2
-  local temporary="$state_root/.provider-transaction.$run_key.tmp"
-  case "$phase" in preparing|prepared|applying|verifying|rolling-back|finalizing) ;; *)
-    fail "RECOVERY_REQUIRED"
-    ;;
-  esac
-  case "$disposition" in none|created|reused) ;; *) fail "RECOVERY_REQUIRED" ;; esac
-  if [ "$phase" = preparing ]; then
-    [ ! -e "$provider_pointer" ] && [ ! -L "$provider_pointer" ] ||
-      fail "RECOVERY_REQUIRED"
-  fi
-  [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || fail "RECOVERY_REQUIRED"
-  umask 077
-  printf '{"schemaVersion":1,"runKey":"%s","phase":"%s","providerEnabled":%s,"durableDisposition":"%s"}\n' \
-    "$run_key" "$phase" "$provider_enabled" "$disposition" >"$temporary"
-  chmod 600 "$temporary"
-  timeout 30s python3 - "$temporary" "$state_root" <<'PY'
-import os
-import sys
-
-for path, directory in ((sys.argv[1], False), (sys.argv[2], True)):
-    flags = os.O_RDONLY | (os.O_DIRECTORY if directory else 0)
-    fd = os.open(path, flags)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-PY
-  timeout 30s mv -f -- "$temporary" "$provider_pointer"
-  timeout 30s python3 - "$state_root" <<'PY'
-import os
-import sys
-
-fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
-try:
-    os.fsync(fd)
-finally:
-    os.close(fd)
-PY
 }
 
 write_terminal_record() {
