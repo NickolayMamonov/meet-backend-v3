@@ -58,7 +58,14 @@ object TimepadPolicy {
     )
     // Russian audience adjectives/nouns inflect; enumerating phrases misses singular cases.
     private val childAudience = Regex(
-        "(?<![\\p{L}\\p{N}\\p{M}_])(?:дошкольн|школьн|детск|подростк)[\\p{L}\\p{M}]*(?![\\p{L}\\p{N}\\p{M}_])",
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:дошкольн|школьн|детск|подростк)[\\p{L}\\p{M}]*|" +
+            "дет(?:и|ей|ям|ьми|ях)|реб(?:[её]нок|[её]нка|[её]нку|[её]нком|[её]нке|ята|ят|ятам|ятами|ятах)|" +
+            "children|kids|teenagers)(?![\\p{L}\\p{N}\\p{M}_])",
+    )
+    private val schoolAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:ученик|учениц|учащ)[\\p{L}\\p{M}]*\\s+" +
+            "(?:[\\p{L}\\p{M}]+\\s+){0,4}школ(?:а|ы|е|у|ой|ою|ам|ами|ах)?" +
+            "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val rejectedExact = setOf(
         "test", "demo", "тест", "тестовое событие", "демонстрационное событие",
@@ -71,7 +78,7 @@ object TimepadPolicy {
         val titleText = normalize(title)
         val categoryText = categoryNames.map(::normalize)
         val allText = listOf(titleText) + categoryText
-        if (allText.any(childAudience::containsMatchIn)) return null
+        if (allText.any { childAudience.containsMatchIn(it) || schoolAudience.containsMatchIn(it) }) return null
         if (
             titleText in rejectedExact ||
             categoryText.any { it in rejectedExact } ||
