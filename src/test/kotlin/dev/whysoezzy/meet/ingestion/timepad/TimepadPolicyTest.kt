@@ -12,6 +12,13 @@ import kotlin.test.assertTrue
 
 class TimepadPolicyTest {
     @ParameterizedTest
+    @ValueSource(strings = ["школьника", "школьный", "школьная", "дошкольный", "детского", "подростковый"])
+    fun `inflected child audience rejects title or category signals`(audience: String) {
+        assertNull(TimepadPolicy.groups("Kotlin $audience", emptyList()))
+        assertNull(TimepadPolicy.groups("Kotlin", listOf(audience)))
+    }
+
+    @ParameterizedTest
     @ValueSource(
         strings = [
             "Android", "Kotlin", "Java", "Python", "backend", "frontend", "DevOps", "Kubernetes",

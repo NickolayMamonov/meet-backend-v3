@@ -104,6 +104,10 @@ class TimepadProviderTest {
             event.replace("Kotlin backend", "Product manager meetup"),
             event.replace("Kotlin backend", "Kotlin for children"),
             event.replace("Kotlin backend", "Kotlin для школьников"),
+            event.replace("Kotlin backend", "Kotlin для школьника"),
+            event.replace("Kotlin backend", "Школьный хакатон по Kotlin"),
+            event.replace("Kotlin backend", "Дошкольная разработка на Kotlin"),
+            event.replace("Kotlin backend", "Kotlin подростковый клуб"),
             event.replace("\"categories\": []", "\"categories\": [{\"id\":379,\"name\":\"Other\"}]"),
         )
         rejected.forEach { value ->

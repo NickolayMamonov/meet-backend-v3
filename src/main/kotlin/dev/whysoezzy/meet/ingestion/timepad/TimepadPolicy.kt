@@ -56,6 +56,10 @@ object TimepadPolicy {
         "детский", "детская", "детское", "детские", "школьникам", "школьников",
         "подросткам", "детско-родительский", "детско-родительская",
     )
+    // Russian audience adjectives/nouns inflect; enumerating phrases misses singular cases.
+    private val childAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:дошкольн|школьн|детск|подростк)[\\p{L}\\p{M}]*(?![\\p{L}\\p{N}\\p{M}_])",
+    )
     private val rejectedExact = setOf(
         "test", "demo", "тест", "тестовое событие", "демонстрационное событие",
     )
@@ -67,6 +71,7 @@ object TimepadPolicy {
         val titleText = normalize(title)
         val categoryText = categoryNames.map(::normalize)
         val allText = listOf(titleText) + categoryText
+        if (allText.any(childAudience::containsMatchIn)) return null
         if (
             titleText in rejectedExact ||
             categoryText.any { it in rejectedExact } ||
