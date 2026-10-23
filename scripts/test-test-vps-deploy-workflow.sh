@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -26,7 +27,7 @@ deploy_text=$(<"$deploy")
 runtime_text=$(<"$runtime")
 provider_deploy_text=$(<"$provider_deploy")
 provider_helper_text=$(<"$provider_helper")
-# shellcheck source=scripts/deploy-test-vps-release.sh
+# shellcheck source=deploy-test-vps-release.sh
 source "$deploy"
 
 require() {
@@ -340,7 +341,7 @@ printf '%s\n' \
 ! grep -Fq '{"schemaVersion":1' "$provider_evidence_summary" ||
   fail "provider summary retained raw provider JSON"
 
-# shellcheck source=scripts/deploy-test-vps-provider-release.sh
+# shellcheck source=deploy-test-vps-provider-release.sh
 source "$provider_deploy"
 (
   runtime_helper="$tmp/invariant-helper.sh"

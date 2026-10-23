@@ -89,6 +89,8 @@ require 'inputs.ref || github.event.pull_request.head.sha || github.sha' \
   'explicit-ref/PR-head/default checkout precedence'
 require 'EXPLICIT_REF: ${{ inputs.ref }}' \
   'explicit caller ref recording'
+require 'shellcheck --external-sources --severity=warning "${shell_files[@]}"' \
+  'ShellCheck sourced helper analysis across split tooling/source checkouts'
 require 'elif [ -n "$EXPLICIT_REF" ]; then' \
   'explicit caller ref branch'
 require 'echo "reviewed source ref: $EXPLICIT_REF"' \

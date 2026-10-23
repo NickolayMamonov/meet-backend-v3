@@ -260,7 +260,7 @@ jobs:
           for script in "${shell_files[@]}"; do
             bash -n "$script"
           done
-          shellcheck --severity=warning "${shell_files[@]}"
+          shellcheck --external-sources --severity=warning "${shell_files[@]}"
           bash "$TOOLING_SCRIPTS/test-release-asset-inventory.sh"
           bash "$TOOLING_SCRIPTS/test-release-page-normalization.sh"
           bash "$TOOLING_SCRIPTS/test-release-registry-state.sh"
