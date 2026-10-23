@@ -13,7 +13,7 @@ grep -Fq 'BETA_RECOVERY_INJECT_COLLISION_FAILURE' "$root/scripts/test-beta-recov
 grep -Fq 'cleanup_collision_resources' "$root/scripts/test-beta-recovery-restore-docker.sh"
 grep -Fq 'fake-docker.sh' "$backend_ci"
 grep -Fq 'bash -n "$script"' "$backend_ci"
-grep -Fq 'shellcheck --severity=warning "${shell_files[@]}"' "$backend_ci"
+grep -Fq 'shellcheck --external-sources --severity=warning "${shell_files[@]}"' "$backend_ci"
 grep -Fq 'WORKFLOW=.github/workflows/ci.yml' "$backend_ci"
 grep -Fq 'WORKFLOW=.github/workflows/prove-beta-backup-restore.yml' "$backend_ci"
 postgres_image='postgres:16-alpine@sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2'
