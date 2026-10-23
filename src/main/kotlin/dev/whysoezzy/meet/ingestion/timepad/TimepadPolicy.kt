@@ -76,9 +76,10 @@ object TimepadPolicy {
             "(?![\\p{L}\\p{N}\\p{M}_])",
     )
     private val englishChildAudience = Regex(
-        "(?<![\\p{L}\\p{N}\\p{M}_])(?:for\\s+(?:your|a|the|our|my|any|each)\\s+child(?:ren)?|" +
-            "child(?:ren)?['’]s)" +
-            "(?![\\p{L}\\p{N}\\p{M}_])",
+        "(?<![\\p{L}\\p{N}\\p{M}_])child(?:ren)?(?![\\p{L}\\p{N}\\p{M}_])" +
+            "(?!\\s+(?:process(?:es)?|coroutines?|props?|components?|nodes?|threads?|tasks?|" +
+            "elements?|objects?|classes|class|actors?|contexts?|routes?|views?)" +
+            "(?![\\p{L}\\p{N}\\p{M}_]))",
     )
     private val childAgeAudience = Regex(
         "(?<![\\p{L}\\p{N}\\p{M}_])(?:ages?\\s+|(?:в\\s+возрасте|возраст)\\s+)" +
@@ -96,7 +97,6 @@ object TimepadPolicy {
         val titleText = normalize(title)
         val categoryText = categoryNames.map(::normalize)
         val allText = listOf(titleText) + categoryText
-        if (categoryText.any { it in setOf("child", "children") }) return null
         if (allText.any {
             childAudience.containsMatchIn(it) || schoolAudience.containsMatchIn(it) ||
                 englishSchoolAudience.containsMatchIn(it) || englishChildAudience.containsMatchIn(it) ||

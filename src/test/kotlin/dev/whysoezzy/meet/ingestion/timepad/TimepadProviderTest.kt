@@ -114,6 +114,8 @@ class TimepadProviderTest {
             event.replace("Kotlin backend", "Python for your child"),
             event.replace("Kotlin backend", "Children’s Python Camp"),
             event.replace("Kotlin backend", "Children’s Python Meetup"),
+            event.replace("Kotlin backend", "Python: children learn to code"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"children learn to code\"}]"),
             event.replace("Kotlin backend", "Python ages 16–18"),
             event.replace("Kotlin backend", "Python ages 8–18"),
             event.replace("\"categories\": []", "\"categories\": [{\"name\":\"children’s Python meetup\"}]"),

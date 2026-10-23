@@ -22,6 +22,7 @@ class TimepadPolicyTest {
         "children's Python camp", "children’s coding workshop", "для малышей", "малышам",
         "для юных программистов 8–14 лет", "ages 8–14", "в возрасте 8–14 лет",
         "children’s Python meetup", "ages 16–18", "ages 8–18", "ages 16–25",
+        "children learn to code", "child", "children",
     ])
     fun `inflected child audience rejects title or category signals`(audience: String) {
         assertNull(TimepadPolicy.groups("Kotlin $audience", emptyList()))
