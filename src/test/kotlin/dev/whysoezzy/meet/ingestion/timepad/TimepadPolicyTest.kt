@@ -12,6 +12,37 @@ import kotlin.test.assertTrue
 
 class TimepadPolicyTest {
     @ParameterizedTest
+    @ValueSource(strings = [
+        "школьника", "школьный", "школьная", "дошкольный", "детского", "подростковый",
+        "детям", "детей", "дети", "ребёнка", "ребенку", "ребятам", "kids", "for children",
+        "учеников средней школы", "учащихся школы",
+        "high school students", "primary school pupils", "school students", "for minors", "teens",
+        "high schoolers", "for your child", "kid", "teen", "teenager", "schoolboy", "schoolgirl",
+        "toddlers", "preschoolers", "несовершеннолетних", "малолетнего",
+        "children's Python camp", "children’s coding workshop", "для малышей", "малышам",
+        "для юных программистов 8–14 лет", "ages 8–14", "в возрасте 8–14 лет",
+        "children’s Python meetup", "ages 16–18", "ages 8–18", "ages 16–25",
+        "children learn to code", "child", "children",
+    ])
+    fun `inflected child audience rejects title or category signals`(audience: String) {
+        assertNull(TimepadPolicy.groups("Kotlin $audience", emptyList()))
+        assertNull(TimepadPolicy.groups("Kotlin", listOf(audience)))
+    }
+
+    @Test
+    fun `adult professional schools and school software topics are not audience markers`() {
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin backend school", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin software for schools", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin child process management", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Python child processes", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Kotlin child coroutines", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Frontend: React children props", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Python concurrency for child processes", emptyList()))
+        assertEquals(listOf(TimepadGroup.IT), TimepadPolicy.groups("Python ages 18–25", emptyList()))
+        assertNull(TimepadPolicy.groups("Kotlin", listOf("children")))
+    }
+
+    @ParameterizedTest
     @ValueSource(
         strings = [
             "Android", "Kotlin", "Java", "Python", "backend", "frontend", "DevOps", "Kubernetes",

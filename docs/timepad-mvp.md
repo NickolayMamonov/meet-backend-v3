@@ -46,6 +46,19 @@ For emergency withdrawal, stop the backend.
 
 ## Limits and evidence
 
+First-launch discovery is restricted to Moscow (`cities=Москва`) and Timepad's
+IT/internet category (`category_ids=452`), excluding children (`379`).
+The independent local policy still requires a professional IT signal and rejects
+children/school events, including saved-ID refreshes. Product/UX-only events are
+not in this first-launch scope; an explicit organizer `18+` label is not required.
+The generic IT/internet category alone never establishes professional eligibility;
+a specific IT keyword in the title or category text is required. All discovery
+pages must still fit the complete 500-event budget; no first-page truncation.
+Audience matching is conservative: ambiguous `child`/`children` wording is
+excluded unless followed by a recognized technical noun (for example process,
+coroutine, or props). This can omit adult events whose audience is unclear;
+text and provider labels are not proof of the organizer's actual audience.
+
 The feed fails closed on incomplete snapshots and bounded catalog limits.
 No qualifying catalog is not evidence of success; do not invent events or
 weaken policy to populate the app. The 72-hour expiry bounds stale exposure

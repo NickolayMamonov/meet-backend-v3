@@ -56,6 +56,36 @@ object TimepadPolicy {
         "детский", "детская", "детское", "детские", "школьникам", "школьников",
         "подросткам", "детско-родительский", "детско-родительская",
     )
+    // Russian audience adjectives/nouns inflect; enumerating phrases misses singular cases.
+    private val childAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:дошкольн|школьн|детск|подростк|малолетн|несовершеннолетн)[\\p{L}\\p{M}]*|" +
+            "дет(?:и|ей|ям|ьми|ях)|реб(?:[её]нок|[её]нка|[её]нку|[её]нком|[её]нке|ята|ят|ятам|ятами|ятах)|" +
+            "малыш(?:и|ей|ам|ами|ах|а|у|ом|е)?|" +
+            "юн(?:ый|ая|ое|ые|ого|ой|ых|ым|ыми|ому|ую)|" +
+            "kids?|teen(?:ager)?s?|school(?:children|kids?|boys?|girls?|ers?)|" +
+            "toddlers?|preschoolers?)(?![\\p{L}\\p{N}\\p{M}_])",
+    )
+    private val schoolAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:ученик|учениц|учащ)[\\p{L}\\p{M}]*\\s+" +
+            "(?:[\\p{L}\\p{M}]+\\s+){0,4}школ(?:а|ы|е|у|ой|ою|ам|ами|ах)?" +
+            "(?![\\p{L}\\p{N}\\p{M}_])",
+    )
+    private val englishSchoolAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:(?:(?:high|middle|primary|secondary|elementary)\\s+)?" +
+            "school[\\s-]+(?:students?|pupils?)|for\\s+(?:pupils|minors))" +
+            "(?![\\p{L}\\p{N}\\p{M}_])",
+    )
+    private val englishChildAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])child(?:ren)?(?![\\p{L}\\p{N}\\p{M}_])" +
+            "(?!\\s+(?:process(?:es)?|coroutines?|props?|components?|nodes?|threads?|tasks?|" +
+            "elements?|objects?|classes|class|actors?|contexts?|routes?|views?)" +
+            "(?![\\p{L}\\p{N}\\p{M}_]))",
+    )
+    private val childAgeAudience = Regex(
+        "(?<![\\p{L}\\p{N}\\p{M}_])(?:ages?\\s+|(?:в\\s+возрасте|возраст)\\s+)" +
+            "(?:[1-9]|1[0-7])\\s*(?:[-–—]|to|до)\\s*(?:[1-9][0-9]?|1[01][0-9]|120)" +
+            "(?![\\p{L}\\p{N}\\p{M}_])",
+    )
     private val rejectedExact = setOf(
         "test", "demo", "тест", "тестовое событие", "демонстрационное событие",
     )
@@ -67,6 +97,11 @@ object TimepadPolicy {
         val titleText = normalize(title)
         val categoryText = categoryNames.map(::normalize)
         val allText = listOf(titleText) + categoryText
+        if (allText.any {
+            childAudience.containsMatchIn(it) || schoolAudience.containsMatchIn(it) ||
+                englishSchoolAudience.containsMatchIn(it) || englishChildAudience.containsMatchIn(it) ||
+                childAgeAudience.containsMatchIn(it)
+        }) return null
         if (
             titleText in rejectedExact ||
             categoryText.any { it in rejectedExact } ||

@@ -137,6 +137,9 @@ class TimepadProvider(
             "fields" to "location,categories,ends_at,access_status,registration_data,locale",
             "starts_at_min" to startMin,
             "starts_at_max" to startMax,
+            "cities" to "Москва",
+            "category_ids" to "452",
+            "category_ids_exclude" to "379",
         ))
 
     private fun requestSaved(ids: List<String>): TimepadEventsResponse =
@@ -166,6 +169,11 @@ class TimepadProvider(
         if (!TimepadPolicy.registrationOpen(registrationData)) throw EventMappingRejection("registration_closed")
         val categoryNames = TimepadPolicy.categoryNames(categories)
         val groups = TimepadPolicy.groups(title, categoryNames) ?: throw EventMappingRejection("topic")
+        // Revalidate saved IDs too: discovery filters do not constrain their refresh.
+        if (TimepadGroup.IT !in groups) throw EventMappingRejection("not_professional_it")
+        if (categories?.values()?.any { it.path("id").asInt(-1) == 379 } == true) {
+            throw EventMappingRejection("children_category")
+        }
         val loc = location
         val city = loc?.path("city")?.takeIf { it.isString }?.stringValue().orEmpty()
         val address = loc?.path("address")?.takeIf { it.isString }?.stringValue().orEmpty()

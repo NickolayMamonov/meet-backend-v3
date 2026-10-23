@@ -10,6 +10,8 @@ import org.springframework.boot.test.system.CapturedOutput
 import org.springframework.boot.test.system.OutputCaptureExtension
 import tools.jackson.databind.ObjectMapper
 import java.net.InetSocketAddress
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.ZoneId
@@ -85,8 +87,79 @@ class TimepadProviderTest {
             assertEquals(setOf("ИТ и интернет"), event.topicKeywords)
             assertFalse(event.isOnline)
             assertContains(requestQuery.get(), "ends_at")
+            val query = URLDecoder.decode(requestQuery.get(), StandardCharsets.UTF_8)
+            assertContains(query, "cities=Москва")
+            assertContains(query, "category_ids=452")
+            assertContains(query, "category_ids_exclude=379")
         } finally {
             server.stop(0)
+        }
+    }
+
+    @Test
+    fun `adult professional IT scope is enforced independently of discovery filters`() {
+        val event = validEvent(4242)
+        val rejected = listOf(
+            event.replace("Kotlin backend", "Figma UX meetup"),
+            event.replace("Kotlin backend", "Product manager meetup"),
+            event.replace("Kotlin backend", "Kotlin for children"),
+            event.replace("Kotlin backend", "Kotlin для школьников"),
+            event.replace("Kotlin backend", "Kotlin для школьника"),
+            event.replace("Kotlin backend", "Школьный хакатон по Kotlin"),
+            event.replace("Kotlin backend", "Дошкольная разработка на Kotlin"),
+            event.replace("Kotlin backend", "Kotlin подростковый клуб"),
+            event.replace("Kotlin backend", "Python детям"),
+            event.replace("Kotlin backend", "Python for high school students"),
+            event.replace("Kotlin backend", "Python for high schoolers"),
+            event.replace("Kotlin backend", "Python for your child"),
+            event.replace("Kotlin backend", "Children’s Python Camp"),
+            event.replace("Kotlin backend", "Children’s Python Meetup"),
+            event.replace("Kotlin backend", "Python: children learn to code"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"children learn to code\"}]"),
+            event.replace("Kotlin backend", "Python ages 16–18"),
+            event.replace("Kotlin backend", "Python ages 8–18"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"children’s Python meetup\"}]"),
+            event.replace("Kotlin backend", "Children's Python Camp"),
+            event.replace("Kotlin backend", "Python для малышей"),
+            event.replace("Kotlin backend", "Python для юных программистов 8–14 лет"),
+            event.replace("Kotlin backend", "Python ages 8–14"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"ages 8–14\"}]"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"children’s coding workshop\"}]"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"для малышей\"}]"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"high schoolers\"}]"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"for your child\"}]"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"high school students\"}]"),
+            event.replace("Kotlin backend", "Kotlin для учеников средней школы"),
+            event.replace("Kotlin backend", "Kotlin для учащихся школы"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"Python детям\"}]"),
+            event.replace("\"categories\": []", "\"categories\": [{\"name\":\"учеников средней школы\"}]"),
+            event.replace("\"categories\": []", "\"categories\": [{\"id\":379,\"name\":\"Other\"}]"),
+        )
+        rejected.forEach { value ->
+            val result = fetchDiscovery("""{"total":1,"values":[$value]}""") as ProviderFetchResult.Complete
+            assertTrue(result.accepted.isEmpty())
+            val saved = fetchDiscovery(
+                """{"total":1,"values":[$value]}""", listOf("4242"),
+            ) as ProviderFetchResult.Complete
+            assertTrue(saved.accepted.isEmpty())
+            assertEquals(setOf("4242"), saved.rejectedSavedExternalIds)
+        }
+        // A professional event need not carry an explicit organizer age label.
+        val result = fetchDiscovery("""{"total":1,"values":[$event]}""") as ProviderFetchResult.Complete
+        assertEquals(1, result.accepted.size)
+        for (title in listOf(
+            "Kotlin child process management", "Frontend: React children props",
+            "Python concurrency for child processes",
+            "Python ages 18–25",
+        )) {
+            val technical = event.replace("Kotlin backend", title)
+            for (savedIds in listOf(emptyList(), listOf("4242"))) {
+                val accepted = fetchDiscovery(
+                    """{"total":1,"values":[$technical]}""", savedIds,
+                ) as ProviderFetchResult.Complete
+                assertEquals(1, accepted.accepted.size)
+                assertTrue(accepted.rejectedSavedExternalIds.isEmpty())
+            }
         }
     }
 
@@ -106,7 +179,7 @@ class TimepadProviderTest {
         }
     }
 
-    private fun fetchDiscovery(payload: String): ProviderFetchResult {
+    private fun fetchDiscovery(payload: String, savedIds: List<String> = emptyList()): ProviderFetchResult {
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         server.createContext("/events.json") { exchange ->
             val body = payload.toByteArray()
@@ -121,7 +194,7 @@ class TimepadProviderTest {
                 assetBaseUrl = "https://assets.example"
             }
             return TimepadProvider(properties, TimepadHttpClient(properties, ObjectMapper())).fetch(
-                FetchContext(Instant.parse("2026-10-21T10:00:00Z"), emptyList()),
+                FetchContext(Instant.parse("2026-10-21T10:00:00Z"), savedIds),
             )
         } finally {
             server.stop(0)
