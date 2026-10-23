@@ -164,12 +164,15 @@ for stale in \
 done
 grep -Fq 'gh release verify-asset <tag>' <<<"$runbook" ||
   fail "runbook does not use parameterized asset verification"
-grep -Fq 'continuation_id=377201468' <<<"$controller" || fail "continuation ID is not exact"
-grep -Fq 'continuation_tag=v1.3.0' <<<"$controller" || fail "continuation tag is not exact"
-grep -Fq 'continuation_version=1.3.0' <<<"$controller" || fail "continuation version is not exact"
-grep -Fq 'continuation_source=a7abfe04f6852f479291a4710ebdee23e9ae8a34' <<<"$controller" || fail "continuation source is not exact"
 for required_text in \
-  'continuation_state=$(scripts/classify-release-continuation.sh \' \
+  '377201468 1.3.0 a7abfe04f6852f479291a4710ebdee23e9ae8a34' \
+  '421705542 1.5.1 51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce' \
+  'while read -r candidate_id candidate_version candidate_source; do' \
+  'candidate_state=$(scripts/classify-release-continuation.sh \' \
+  '--release-id "$candidate_id"' \
+  '--tag "v$candidate_version"' \
+  '--source-sha "$candidate_source"' \
+  'multiple pending authorized continuations' \
   'case "$continuation_state" in' \
   'pending)' \
   'published|absent)' \

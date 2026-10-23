@@ -61,17 +61,16 @@ done
 [ "$tag" != v1.1.0 ] || fail "permanently denied tag"
 [ "$source_sha" != 36ffd11ea4d35147f1df9c1cafa6a330300c1339 ] ||
   fail "permanently denied source"
-if [ "$release_id" != 377201468 ] ||
-   [ "$tag" != v1.3.0 ] ||
-   [ "$version" != 1.3.0 ] ||
-   [ "$source_sha" != a7abfe04f6852f479291a4710ebdee23e9ae8a34 ]; then
-  fail "only the exact quarantined v1.3.0 draft may continue"
-fi
+case "$release_id/$tag/$version/$source_sha" in
+  377201468/v1.3.0/1.3.0/a7abfe04f6852f479291a4710ebdee23e9ae8a34 | \
+  421705542/v1.5.1/1.5.1/51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce) ;;
+  *) fail "only an exact authorized empty draft may continue" ;;
+esac
 
 [ -f "$releases_file" ] || usage
 continuation_state=$("$ROOT_DIR/scripts/classify-release-continuation.sh" \
-  --release-id 377201468 --tag v1.3.0 \
-  --source-sha a7abfe04f6852f479291a4710ebdee23e9ae8a34 \
+  --release-id "$release_id" --tag "$tag" \
+  --source-sha "$source_sha" \
   --releases-file "$releases_file") ||
   fail "continuation release classification failed"
 [ "$continuation_state" = pending ] ||

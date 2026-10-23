@@ -97,21 +97,33 @@ jobs:
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
             scripts/normalize-release-pages.sh >"$releases_before"
           printf 'RELEASES_BEFORE_FILE=%s\n' "$releases_before" >>"$GITHUB_ENV"
-          continuation_id=377201468
-          continuation_tag=v1.3.0
-          continuation_version=1.3.0
-          continuation_source=a7abfe04f6852f479291a4710ebdee23e9ae8a34
-          continuation_state=$(scripts/classify-release-continuation.sh \
-            --release-id "$continuation_id" --tag "$continuation_tag" \
-            --source-sha "$continuation_source" \
-            --releases-file "$releases_before")
+          continuation_state=absent
+          while read -r candidate_id candidate_version candidate_source; do
+            candidate_state=$(scripts/classify-release-continuation.sh \
+              --release-id "$candidate_id" --tag "v$candidate_version" \
+              --source-sha "$candidate_source" --releases-file "$releases_before")
+            if [ "$candidate_state" = pending ]; then
+              [ "$continuation_state" != pending ] || {
+                echo "multiple pending authorized continuations" >&2
+                exit 1
+              }
+              continuation_state=pending
+              continuation_id=$candidate_id
+              continuation_version=$candidate_version
+              continuation_tag=v$candidate_version
+              continuation_source=$candidate_source
+            fi
+          done <<'CONTINUATIONS'
+          377201468 1.3.0 a7abfe04f6852f479291a4710ebdee23e9ae8a34
+          421705542 1.5.1 51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce
+          CONTINUATIONS
           case "$continuation_state" in
             pending)
-              registry_state="$RUNNER_TEMP/v1.3.0-continuation-registry.txt"
+              registry_state="$RUNNER_TEMP/$continuation_tag-continuation-registry.txt"
               scripts/release-registry-state.sh inspect \
                 ghcr.io/nickolaymamonov/meet-backend-v3 \
                 "$continuation_version" "$continuation_source" \
-                --quarantine-file "$RUNNER_TEMP/v1.3.0-continuation-quarantine.json" \
+                --quarantine-file "$RUNNER_TEMP/$continuation_tag-continuation-quarantine.json" \
                 >"$registry_state"
               descriptor=$(scripts/admit-empty-release-continuation.sh \
                 --repository "$GITHUB_REPOSITORY" --repo-dir . --dev-ref origin/dev \

@@ -28,10 +28,9 @@ grep -Fq 'release_version: ${{ steps.route.outputs.version }}' <<<"$controller"
 grep -Fq 'echo "tag=$PRE_TAG" >>"$GITHUB_OUTPUT"' <<<"$route_step"
 grep -Fq 'echo "version=$PRE_VERSION" >>"$GITHUB_OUTPUT"' <<<"$route_step"
 for invariant in \
-  'continuation_id=377201468' \
-  'continuation_tag=v1.3.0' \
-  'continuation_version=1.3.0' \
-  'continuation_source=a7abfe04f6852f479291a4710ebdee23e9ae8a34'; do
+  '377201468 1.3.0 a7abfe04f6852f479291a4710ebdee23e9ae8a34' \
+  '421705542 1.5.1 51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce' \
+  'multiple pending authorized continuations'; do
   grep -Fq "$invariant" <<<"$controller"
 done
 continuation_call=$(awk '
@@ -52,15 +51,15 @@ if grep -Fq 'steps.route.outputs.release_tag' <<<"$controller" ||
 fi
 
 classifier_call=$(awk '
-  /continuation_state=\$\(scripts\/classify-release-continuation.sh/ { in_call=1 }
+  /candidate_state=\$\(scripts\/classify-release-continuation.sh/ { in_call=1 }
   in_call { print }
   in_call && /--releases-file/ { exit }
 ' <<<"$pre_action_step")
 [ "$(grep -Fc 'scripts/classify-release-continuation.sh' <<<"$pre_action_step")" -eq 1 ]
 for classifier_arg in \
-  '--release-id "$continuation_id"' \
-  '--tag "$continuation_tag"' \
-  '--source-sha "$continuation_source"' \
+  '--release-id "$candidate_id"' \
+  '--tag "v$candidate_version"' \
+  '--source-sha "$candidate_source"' \
   '--releases-file "$releases_before"'; do
   grep -Fq -- "$classifier_arg" <<<"$classifier_call"
 done
@@ -69,11 +68,8 @@ classification_setup=$(sed -n \
   <<<"$pre_action_step")
 grep -Fq 'scripts/classify-release-continuation.sh' <<<"$classification_setup"
 grep -Fq 'case "$continuation_state" in' <<<"$pre_action_step"
-if grep -Eq '^[[:space:]]+(if|elif|while|until)[[:space:]]' \
-     <<<"$classification_setup"; then
-  echo "continuation classifier call must be unconditional" >&2
-  exit 1
-fi
+grep -Fq 'while read -r candidate_id candidate_version candidate_source; do' <<<"$classification_setup"
+grep -Fq "done <<'CONTINUATIONS'" <<<"$classification_setup"
 if grep -Fq 'jq ' <<<"$pre_action_step" ||
    grep -Fq 'continuation_count' <<<"$pre_action_step" ||
    grep -Fq -- '--argjson id' <<<"$pre_action_step" ||
