@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.5.1](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.5.0...v1.5.1) (2026-10-23)
+
+
+### Fixes
+
+* accept existing secure empty deployment lock for token setup ([317f819](https://github.com/NickolayMamonov/meet-backend-v3/commit/317f81925d331a360a6b27317c0c01822dd9fe68))
+* add manual protected Timepad token configuration ([828e2e5](https://github.com/NickolayMamonov/meet-backend-v3/commit/828e2e5a8c4afc73c408d7b81c05cfbd2a2c9ee4))
+* bound Timepad discovery to adult professional IT in Moscow ([f9be1b2](https://github.com/NickolayMamonov/meet-backend-v3/commit/f9be1b2531db2d35e64b7e315ed2e1eafa281582))
+* configure Timepad token through a protected manual workflow ([dbd5880](https://github.com/NickolayMamonov/meet-backend-v3/commit/dbd5880d6ba889e7a3981ee0fad2d1b40574ee63))
+* conservatively classify ambiguous child audience wording ([8cdc45a](https://github.com/NickolayMamonov/meet-backend-v3/commit/8cdc45adf1399104ceb94795f2eccaed44ea092f))
+* cover explicit child and school student audiences ([72b826a](https://github.com/NickolayMamonov/meet-backend-v3/commit/72b826a7c76c3cdfd205d06d52a36df60cce6abc))
+* cover singular and plural child audience nouns ([4f4c01d](https://github.com/NickolayMamonov/meet-backend-v3/commit/4f4c01dab6bdfa6a04adc1681f8a94760a02e911))
+* **deploy:** define predecessor cleanup before signal dispatch ([5eca323](https://github.com/NickolayMamonov/meet-backend-v3/commit/5eca3237cf02ce9f99fca5f17186c4327d3244c7))
+* **deploy:** define transaction marker writer before coordinator startup ([cbf0df5](https://github.com/NickolayMamonov/meet-backend-v3/commit/cbf0df58ce99a017fbd0f48b7cfac1020fa17939))
+* **deploy:** initialize provider transaction marker writer before first call ([e736b0b](https://github.com/NickolayMamonov/meet-backend-v3/commit/e736b0b648a54945a759f7ced5d4bd5ff4657f31))
+* **deploy:** preserve invariant arguments and disabled-provider evidence ([fbd61f7](https://github.com/NickolayMamonov/meet-backend-v3/commit/fbd61f786ba84464332b6592c7e8bd52b0a548b8))
+* **deploy:** unblock bounded invariant checks and false provider evidence ([a67b12a](https://github.com/NickolayMamonov/meet-backend-v3/commit/a67b12ae6ef35bbcd9895467a9e9f1725143ade7))
+* distinguish child audience from technical child processes ([e11d8d2](https://github.com/NickolayMamonov/meet-backend-v3/commit/e11d8d2b9f076a2015053e2402c1b7392de0e92b))
+* distinguish empty deployment lock from private token environment ([16970df](https://github.com/NickolayMamonov/meet-backend-v3/commit/16970dffcb47547599a74764e64a3a8e776f83f4))
+* distinguish explicit child ages and technical process context ([c0cc86e](https://github.com/NickolayMamonov/meet-backend-v3/commit/c0cc86e04cdf4650899bba67bf1a4ff2915a72e3))
+* handle child possessives and mixed-age audience ranges ([ed6e35a](https://github.com/NickolayMamonov/meet-backend-v3/commit/ed6e35a53ec34fe121036993fcc535de8948b43c))
+* recognize possessive child activity and toddler audience phrases ([59294f2](https://github.com/NickolayMamonov/meet-backend-v3/commit/59294f237dfffeee85add8b8a12e2b0a3c75d860))
+* reject explicit English school student audiences ([09f5d3a](https://github.com/NickolayMamonov/meet-backend-v3/commit/09f5d3aa330c7f75c584bcec4067b99bcbabea5d))
+* reject inflected school and child audience indicators ([385d593](https://github.com/NickolayMamonov/meet-backend-v3/commit/385d593f43f08a60dfc7913ba2abeae2b5334079))
+* retain technical React children topics ([ebc5d29](https://github.com/NickolayMamonov/meet-backend-v3/commit/ebc5d29edafeba7899b284fc1b741d93adab6311))
+* scope Timepad discovery to Moscow professional IT ([2bb3e89](https://github.com/NickolayMamonov/meet-backend-v3/commit/2bb3e8987d3ce8887a1f0c3ff75e6e6d2816c295))
+* validate root staging and bind Timepad runtime gate to container identity ([52daf0b](https://github.com/NickolayMamonov/meet-backend-v3/commit/52daf0b8505fa43bc330e0d01e1f116ac1fe644a))
+
 ## [1.5.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.4.0...v1.5.0) (2026-10-21)
 
 
