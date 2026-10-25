@@ -44,7 +44,13 @@ class TimepadVenueMatcherTest {
             "Новодмитровская ул., 1с1",
             "  НОВОДМИТРОВСКАЯ 1 СТР 1  ",
             "Новодмитровская, 1с 1",
+            "Новодмитровская,1, стр 1",
+            "Новодмитровская,дом 1, строение 1",
         ).forEach { assertEquals(expected, TimepadVenueMatcher.parseInput(it), it) }
+        assertEquals(
+            TimepadVenueMatcher.Venue("новодмитровская", "1", null),
+            TimepadVenueMatcher.parseInput("Новодмитровская,1"),
+        )
         assertEquals(
             expected,
             TimepadVenueMatcher.parseCandidate(candidate(road = "улица Новодмитровская", house = "1 с 1")).venue,
