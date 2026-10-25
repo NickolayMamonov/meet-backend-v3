@@ -111,7 +111,9 @@ class GeocodingService(
                 "${props.baseUrl.trimEnd('/')}/search?key=${encode(props.apiKey)}" +
                     "&q=${encode(query)}&format=json$parameters",
             )
-            require(uri.scheme == "https" || props.baseUrl.startsWith("http://127.0.0.1:")) {
+            require(uri.rawUserInfo == null && uri.host != null && uri.rawFragment == null &&
+                (uri.scheme == "https" || (uri.scheme == "http" && uri.host == "127.0.0.1"))
+            ) {
                 "Geocoding transport requires HTTPS"
             }
             val timeout = Duration.ofNanos(minOf(REQUEST_TIMEOUT.toNanos(), deadline - System.nanoTime()))

@@ -21,6 +21,29 @@ import kotlin.test.assertTrue
 
 class GeocodingServiceTest {
     @Test
+    fun `crafted HTTP authority is rejected before sending a key to non-loopback transport`() {
+        val calls = AtomicInteger()
+        val server = server { calls.incrementAndGet(); eligible("55", "37") }
+        val port = server.address.port
+        for (base in listOf(
+            "http://127.0.0.1:$port@localhost:$port",
+            "http://127.0.0.1:$port@127.0.0.1:$port",
+            "https://unwanted-user@127.0.0.1:$port",
+        )) {
+            val service = GeocodingService(
+                RestClient.builder(), GeocoderProperties(true, "synthetic-secret-marker", base), ObjectMapper(),
+            )
+            try {
+                assertNull(service.geocodeTimepad("Новодмитровская, 1, стр 1"))
+                assertEquals(0, calls.get())
+            } finally {
+                service.shutdown()
+            }
+        }
+        server.stop(0)
+    }
+
+    @Test
     fun `Timepad failure logging does not disclose key address coordinates or provider text`() {
         val address = "Sensitivevenue, 1"
         val server = server(status = 500) { "PRIVATE-PROVIDER-PAYLOAD 12.345678901 34.567890123" }
