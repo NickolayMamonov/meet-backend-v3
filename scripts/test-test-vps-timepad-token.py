@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -14,6 +15,10 @@ import tempfile
 import textwrap
 import unittest
 from unittest.mock import Mock, patch
+
+# CI runs this harness as root before unprivileged fixtures copy the checkout.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 SPEC = importlib.util.spec_from_file_location(
     "timepad_token", Path(__file__).with_name("configure-test-vps-timepad-token.py"))
@@ -278,6 +283,35 @@ class ProbeTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_root_harnesses_leave_checkout_copyable_without_bytecode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            scripts = root / "scripts"
+            shutil.copytree(Path(__file__).resolve().parent, scripts,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            for arguments in (
+                ["test-test-vps-timepad-token.py",
+                 "WorkflowTests.test_trust_functions_are_shared_without_changing_callers"],
+                ["test-test-vps-locationiq-diagnostic.py"],
+            ):
+                result = subprocess.run(
+                    [sys.executable, str(scripts / arguments[0]), *arguments[1:]],
+                    env=environment, umask=0o077, capture_output=True,
+                    text=True, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(list(scripts.rglob("*.pyc")), [])
+            self.assertEqual(list(scripts.rglob("__pycache__")), [])
+            destination = root / "unprivileged"
+            destination.mkdir()
+            os.chown(destination, 65534, 65534)
+            result = subprocess.run(
+                ["cp", "-R", str(scripts), str(destination / "scripts")],
+                user=65534, group=65534, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_trust_functions_are_shared_without_changing_callers(self):
         import test_vps_file_trust as trust
         for name in ("Rejected", "no_acl", "directory", "private_file", "identity"):

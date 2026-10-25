@@ -16,6 +16,10 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
+# Apply before dynamic imports and propagate to isolated Python subprocess tests.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 SPEC = importlib.util.spec_from_file_location(
     "locationiq_diagnostic", Path(__file__).with_name("diagnose-test-vps-locationiq.py"))
 tool = importlib.util.module_from_spec(SPEC)
