@@ -11,6 +11,7 @@ on:
         options:
           - timepad-token
           - locationiq-diagnostic
+          - locationiq-delivery-off
 
 permissions:
   contents: read
@@ -41,7 +42,7 @@ jobs:
           set -euo pipefail
           mode=${REQUESTED_MODE:-timepad-token}
           case "$mode" in
-            timepad-token|locationiq-diagnostic) ;;
+            timepad-token|locationiq-diagnostic|locationiq-delivery-off) ;;
             *) echo "unsupported operation mode" >&2; exit 1 ;;
           esac
           printf 'mode=%s\n' "$mode" >>"$GITHUB_OUTPUT"
@@ -53,7 +54,7 @@ jobs:
           fetch-depth: 1
 
       - name: Establish strict SSH host trust
-        if: steps.operation.outputs.mode == 'timepad-token' || steps.operation.outputs.mode == 'locationiq-diagnostic'
+        if: steps.operation.outputs.mode == 'timepad-token' || steps.operation.outputs.mode == 'locationiq-diagnostic' || steps.operation.outputs.mode == 'locationiq-delivery-off'
         shell: bash
         env:
           SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
@@ -101,7 +102,7 @@ jobs:
 
       - name: Stage selected reviewed helper and shared trust module
         id: stage
-        if: steps.operation.outputs.mode == 'timepad-token' || steps.operation.outputs.mode == 'locationiq-diagnostic'
+        if: steps.operation.outputs.mode == 'timepad-token' || steps.operation.outputs.mode == 'locationiq-diagnostic' || steps.operation.outputs.mode == 'locationiq-delivery-off'
         shell: bash
         env:
           MODE: ${{ steps.operation.outputs.mode }}
@@ -115,6 +116,10 @@ jobs:
             locationiq-diagnostic)
               script=scripts/diagnose-test-vps-locationiq.py
               helper=diagnose-test-vps-locationiq.py
+              ;;
+            locationiq-delivery-off)
+              script=scripts/configure-test-vps-locationiq.py
+              helper=configure-test-vps-locationiq.py
               ;;
             *) echo "unsupported operation mode" >&2; exit 1 ;;
           esac
@@ -195,6 +200,22 @@ jobs:
             timeout --signal=TERM --kill-after=2s 48s ssh -F "$SSH_CONFIG" test-vps \
               "cd '$STAGE' && ulimit -c 0 && PYTHONDONTWRITEBYTECODE=1 timeout --signal=TERM --kill-after=2s 45s python3 '$STAGE/diagnose-test-vps-locationiq.py'"
 
+      - name: Configure LocationIQ delivery OFF
+        if: steps.operation.outputs.mode == 'locationiq-delivery-off'
+        shell: bash
+        env:
+          LOCATIONIQ_KEY: ${{ secrets.LOCATIONIQ_KEY }}
+          STAGE: ${{ steps.stage.outputs.stage }}
+        run: |
+          set +x
+          set -euo pipefail
+          [ -n "$LOCATIONIQ_KEY" ]
+          [[ "$STAGE" =~ ^/opt/meet-backend/\.timepad-token-config\.[a-f0-9]{32}$ ]]
+          # The helper consumes key bytes only from stdin; it never probes the provider.
+          printf '%s' "$LOCATIONIQ_KEY" |
+            timeout --signal=TERM --kill-after=2s 48s ssh -F "$SSH_CONFIG" test-vps \
+              "cd '$STAGE' && ulimit -c 0 && PYTHONDONTWRITEBYTECODE=1 timeout --signal=TERM --kill-after=2s 45s python3 '$STAGE/configure-test-vps-locationiq.py'"
+
       - name: Remove exact staged tooling
         if: ${{ always() && steps.stage.outputs.stage != '' }}
         shell: bash
@@ -205,7 +226,7 @@ jobs:
           set -euo pipefail
           [[ "$STAGE" =~ ^/opt/meet-backend/\.timepad-token-config\.[a-f0-9]{32}$ ]]
           case "$HELPER" in
-            configure-test-vps-timepad-token.py|diagnose-test-vps-locationiq.py) ;;
+            configure-test-vps-timepad-token.py|diagnose-test-vps-locationiq.py|configure-test-vps-locationiq.py) ;;
             *) echo "unsupported staged helper" >&2; exit 1 ;;
           esac
           timeout 20s ssh -F "$SSH_CONFIG" test-vps \

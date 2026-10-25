@@ -75,3 +75,33 @@ exact-ref/mode and fixed conditional two-GET/output/cleanup permission, fresh
 registered-workflow/protection admission, and operator confirmation of secret
 custody. This change neither checks secret inventory nor establishes that the
 secret has been added.
+
+## LocationIQ key delivery with geocoding held OFF
+
+`locationiq-delivery-off` is a separate manual mode in the same protected
+CONFIG workflow. It stages and checksum-verifies only
+`configure-test-vps-locationiq.py` and the shared file-trust module, then
+passes `LOCATIONIQ_KEY` to that helper over SSH stdin. It performs no
+LocationIQ/provider request, Timepad request, restart, recreate, Compose-up,
+import, or geocoding enablement. The workflow retains strict SSH host trust,
+the `test-vps` environment and shared deployment lock; its selected helper
+and trust module must be removed individually and staging cleanup must succeed.
+
+The helper validates the existing deployment/runtime and environment-file
+trust, accepts only bounded safe key material, and atomically publishes
+`LOCATIONIQ_KEY` together with an explicit `GEOCODER_ENABLED=false`. An absent
+key may be set; an identical key is idempotent; a conflicting nonempty key
+rejects the whole operation without rotation. A missing enable flag is added
+as false; canonical true is set false; false remains false; malformed or
+duplicate controlled assignments reject the operation. Other environment
+bytes and line endings are preserved. An already active geocoder or runtime
+identity/state mismatch is rejected; the persistent file alone does not prove
+the already-running process environment is OFF.
+
+The delivery mode does not restart or recreate the process, so it does not
+activate a key in the running backend. If publication occurs but durability
+confirmation fails, the helper reports an uncertain-published outcome and
+exits nonzero: stop and reconcile before any retry. No automatic restore,
+restart, or enable action is part of this mode. Any future activation requires
+separate authority and a reviewed sequence bound to the approved new backend
+deployment window; this delivery mode cannot enable geocoding.
