@@ -8,8 +8,15 @@ import dev.whysoezzy.meet.domain.repository.IngestionRunRepository
 import dev.whysoezzy.meet.ingestion.ProviderFetchResult
 import dev.whysoezzy.meet.ingestion.RawEvent
 import dev.whysoezzy.meet.ingestion.TimepadCatalogApplyService
+import dev.whysoezzy.meet.ingestion.Coordinates
+import dev.whysoezzy.meet.ingestion.EventProvider
+import dev.whysoezzy.meet.ingestion.FetchContext
+import dev.whysoezzy.meet.ingestion.GeocodingService
+import dev.whysoezzy.meet.ingestion.IngestionService
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import org.springframework.beans.factory.annotation.Autowired
 import java.time.Instant
 import org.springframework.dao.DataIntegrityViolationException
@@ -17,15 +24,109 @@ import org.junit.jupiter.api.assertThrows
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
+import kotlin.test.assertFalse
+import org.springframework.test.context.bean.override.mockito.MockitoBean
+import org.springframework.transaction.PlatformTransactionManager
+import org.springframework.transaction.support.TransactionTemplate
+import org.springframework.transaction.support.TransactionSynchronizationManager
+import org.mockito.Mockito.doAnswer
+import org.mockito.Mockito.verify
+import org.mockito.Mockito.times
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class TimepadCatalogPostgresTest : IntegrationTestSupport() {
     @Autowired
     private lateinit var catalogApply: TimepadCatalogApplyService
     @Autowired
     private lateinit var ingestionRuns: IngestionRunRepository
+    @Autowired private lateinit var ingestion: IngestionService
+    @Autowired private lateinit var transactions: PlatformTransactionManager
+    @MockitoBean private lateinit var geocoding: GeocodingService
 
     @BeforeEach
     fun clearDatabase() = resetDatabase()
+
+    @ParameterizedTest
+    @ValueSource(strings = ["timestamp", "address", "replacement", "insertion"])
+    fun `HTTP preparation holds no transaction or row lock and concurrent saved change rejects its point`(
+        change: String,
+    ) {
+        val event = raw("concurrent-http", "Synthetic backend event")
+        if (change != "insertion") {
+            catalogApply.apply(
+                ingestionRuns.save(IngestionRun(EventSource.TIMEPAD)), Instant.now(),
+                ProviderFetchResult.Complete(listOf(event), emptySet(), 1),
+            )
+        }
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val observed = AtomicReference<Instant>()
+        doAnswer {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive())
+            entered.countDown()
+            assertTrue(release.await(5, TimeUnit.SECONDS))
+            Coordinates(12.0, 34.0)
+        }.`when`(geocoding).geocodeTimepad(event.address)
+        val provider = object : EventProvider {
+            override fun source() = EventSource.TIMEPAD
+            override fun fetch(context: FetchContext): ProviderFetchResult {
+                observed.set(context.observedAt)
+                return ProviderFetchResult.Complete(listOf(event), emptySet(), 1)
+            }
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<IngestionRun> { ingestion.runProvider(provider) }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            TransactionTemplate(transactions).apply { timeout = 2 }.executeWithoutResult {
+                jdbcTemplate.execute("SET LOCAL lock_timeout = '1s'")
+                val locked = meetings.findForUpdateBySourceAndSourceExternalId(
+                    EventSource.TIMEPAD, event.sourceExternalId,
+                )
+                when (change) {
+                    "timestamp" -> {
+                        locked!!.ingestedAt = locked.ingestedAt!!.plusSeconds(1)
+                        meetings.saveAndFlush(locked)
+                    }
+                    "address" -> {
+                        locked!!.address = "Other synthetic road 2"
+                        meetings.saveAndFlush(locked)
+                    }
+                    else -> {
+                        if (locked != null) {
+                            meetings.delete(locked)
+                            meetings.flush()
+                        }
+                        meetings.saveAndFlush(
+                            Meeting(
+                                event.title, "", "", event.startsAtEpochMs, "01.01.2026",
+                                event.address, 0.0, 0.0, source = EventSource.TIMEPAD,
+                                sourceExternalId = event.sourceExternalId,
+                                ingestedAt = java.time.LocalDateTime.now(),
+                            ),
+                        )
+                    }
+                }
+            }
+            release.countDown()
+            val run = result.get(10, TimeUnit.SECONDS)
+            assertEquals(IngestionStatus.SUCCESS, run.status)
+            assertEquals(1, run.fetchedCount)
+            assertEquals(1, run.updatedCount)
+            val saved = meetings.findBySourceAndSourceExternalId(EventSource.TIMEPAD, event.sourceExternalId)!!
+            assertEquals(Coordinates(0.0, 0.0), Coordinates(saved.latitude, saved.longitude))
+            assertEquals(observed.get().plusSeconds(72 * 60 * 60).toEpochMilli(), saved.timepadEligibleUntilMs)
+            verify(geocoding, times(1)).geocodeTimepad(event.address)
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS))
+        }
+    }
 
     @Test
     fun `complete observation upserts idempotently and revokes rejected saved event`() {

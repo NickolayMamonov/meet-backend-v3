@@ -27,13 +27,14 @@ class TimepadCatalogApplyService(
         run: IngestionRun,
         observedAt: Instant,
         snapshot: ProviderFetchResult.Complete,
+        prepared: PreparedTimepadPoint? = null,
     ): IngestionRun {
         jdbc.execute("SET LOCAL lock_timeout = '1s'")
         jdbc.execute("SET LOCAL statement_timeout = '5s'")
         val eligibleUntil = observedAt.plus(Duration.ofHours(72)).toEpochMilli()
         run.fetchedCount = snapshot.observedCount
         snapshot.accepted.forEach { event ->
-            when (upsertService.upsertTimepad(event, eligibleUntil)) {
+            when (upsertService.upsertTimepad(event, eligibleUntil, prepared)) {
                 UpsertResult.CREATED -> run.createdCount++
                 UpsertResult.UPDATED -> run.updatedCount++
                 UpsertResult.SKIPPED -> run.skippedCount++

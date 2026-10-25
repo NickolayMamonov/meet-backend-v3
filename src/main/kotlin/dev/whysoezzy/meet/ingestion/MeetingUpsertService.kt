@@ -31,9 +31,21 @@ class MeetingUpsertService(
         upsertInternal(source, raw, topicClassifier.classify(raw), null)
 
     @Transactional
-    fun upsertTimepad(raw: RawEvent, eligibleUntilMs: Long): UpsertResult {
+    fun upsertTimepad(
+        raw: RawEvent,
+        eligibleUntilMs: Long,
+        prepared: PreparedTimepadPoint? = null,
+    ): UpsertResult {
         require(raw.timepadGroups.isNotEmpty())
-        return upsertInternal(EventSource.TIMEPAD, raw, raw.timepadGroups.toSet(), eligibleUntilMs)
+        return upsertInternal(EventSource.TIMEPAD, raw, raw.timepadGroups.toSet(), eligibleUntilMs, prepared)
+    }
+
+    // Called by nontransactional ingestion before catalog apply acquires any row locks.
+    fun prepareTimepadPoint(raw: RawEvent, saved: SavedTimepadVenue?): PreparedTimepadPoint? {
+        if (!TimepadCoordinateEnrichment.needsPoint(raw, saved)) return null
+        return geocodingService.geocodeTimepad(raw.address)?.let {
+            PreparedTimepadPoint(raw.sourceExternalId, raw.address, saved, it)
+        }
     }
 
     private fun upsertInternal(
@@ -41,6 +53,7 @@ class MeetingUpsertService(
         raw: RawEvent,
         topics: Set<String>,
         eligibleUntilMs: Long?,
+        prepared: PreparedTimepadPoint? = null,
     ): UpsertResult {
         if (topics.isEmpty() && onlyMatchingTopics) return UpsertResult.SKIPPED
 
@@ -56,7 +69,10 @@ class MeetingUpsertService(
         }
 
         val (lat, lng) = if (source == EventSource.TIMEPAD) {
-            raw.latitude to raw.longitude
+            val point = TimepadCoordinateEnrichment.select(
+                raw, existing?.let(SavedTimepadVenue::from), prepared,
+            )
+            point.latitude to point.longitude
         } else {
             resolveCoordinates(
                 raw = raw,
