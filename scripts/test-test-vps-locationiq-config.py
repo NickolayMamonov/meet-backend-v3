@@ -103,12 +103,25 @@ class ConfigurationTests(unittest.TestCase):
             BASE + b"X=\0\n", BASE + b"X=\tbad\n", BASE[:-1],
             BASE + b"SPRING_APPLICATION_JSON={}\n",
             BASE + b"APP_GEOCODER_ENABLED=true\n",
+            BASE + b"_JAVA_OPTIONS=-Dapp.geocoder.enabled=true\n",
+            BASE + b"app_geocoder_enabled=true\n",
+            BASE + b"geocoder_enabled=false\n",
+            BASE + b"SPRING_CONFIG_IMPORT=optional:file:/other\n",
             BASE + b"JAVA_TOOL_OPTIONS=-Dapp.geocoder.enabled=true\n")
         for before in invalid:
             self.env.write_bytes(before)
             with self.assertRaises(tool.Rejected):
                 self.configure()
             self.assertEqual(self.env.read_bytes(), before)
+        for name in ("app.geocoder.enabled", "app-geocoder-enabled",
+                     "spring.config.import", "spring.application.json",
+                     "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"):
+            before = BASE + name.encode() + b"=true\n"
+            self.env.write_bytes(before)
+            with self.subTest(name=name):
+                with self.assertRaises(tool.Rejected):
+                    self.configure()
+                self.assertEqual(self.env.read_bytes(), before)
 
     def test_key_input_budgets(self):
         for raw in (b"", b"a\n", b"a=b", b"a" * 4097, b"$x", b" a", b"\xff", b"a\0"):
@@ -237,6 +250,13 @@ class RuntimeTests(unittest.TestCase):
                     ["JAVA_TOOL_OPTIONS=-Dapp.geocoder.enabled=true"]):
             with self.assertRaises(tool.Rejected):
                 self.runtime(record(env))
+        for name in ("_JAVA_OPTIONS", "app.geocoder.enabled", "app-geocoder-enabled",
+                     "app_geocoder_enabled", "APP_GEOCODER_APIKEY",
+                     "spring.config.import", "SPRING_CONFIG_NAME",
+                     "spring.application.json", "geocoder_enabled"):
+            with self.subTest(name=name):
+                with self.assertRaises(tool.Rejected):
+                    self.runtime(record([name + "=true"]))
         for field, value in (("Running", False), ("Health", {"Status": "unhealthy"})):
             backend = record()
             backend["State"][field] = value

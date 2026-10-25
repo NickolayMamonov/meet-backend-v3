@@ -26,14 +26,19 @@ MAX_KEY = 4096
 MAX_BYTES = 1_048_576
 CONTROLLED = ("LOCATIONIQ_KEY", "GEOCODER_ENABLED")
 OVERRIDES = ("APP_GEOCODER_ENABLED", "APP_GEOCODER_API_KEY",
-             "SPRING_APPLICATION_JSON", "JDK_JAVA_OPTIONS",
+             "SPRING_APPLICATION_JSON", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS",
              "JAVA_OPTS", "SPRING_CONFIG_LOCATION", "SPRING_CONFIG_ADDITIONAL_LOCATION")
 DEFAULT_JAVA_OPTIONS = "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
 
 
 def ambiguous(name: str, value: str) -> bool:
-    return bool(value) and (name in OVERRIDES or name.startswith("APP_GEOCODER_") or
-                           (name == "JAVA_TOOL_OPTIONS" and value != DEFAULT_JAVA_OPTIONS))
+    normalized = name.upper().replace("-", "_").replace(".", "_")
+    if normalized in CONTROLLED and name != normalized:
+        return True
+    return (normalized.startswith("APP_GEOCODER_")
+            or normalized.startswith("SPRING_CONFIG_")
+            or (bool(value) and (normalized in OVERRIDES or
+                (normalized == "JAVA_TOOL_OPTIONS" and value != DEFAULT_JAVA_OPTIONS))))
 
 
 def validate_key(raw: bytes) -> str:
