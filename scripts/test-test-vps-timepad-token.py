@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -276,6 +278,20 @@ class ProbeTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_trust_functions_are_shared_without_changing_callers(self):
+        import test_vps_file_trust as trust
+        for name in ("Rejected", "no_acl", "directory", "private_file", "identity"):
+            self.assertIs(getattr(tool, name), getattr(trust, name))
+
+    def test_diagnostic_and_workflow_regressions(self):
+        scripts = Path(__file__).resolve().parent
+        for command in (
+            [sys.executable, str(scripts / "test-test-vps-locationiq-diagnostic.py")],
+            ["bash", str(scripts / "test-locationiq-diagnostic-workflow.sh")],
+        ):
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_manual_secret_stdin_and_shared_lock_routing(self):
         text = (Path(__file__).resolve().parents[1] / ".github/workflows/"
                 "configure-test-vps-timepad-token.yml").read_text()
