@@ -72,7 +72,7 @@ class IngestionService(
             return ingestionRunRepository.save(run)
         }
         try {
-            val (observedAt, fetched) = try {
+            val (observedAt, fetched, savedVenues) = try {
                 val observedAt = clock.instant()
                 val saved = meetingRepository.findTop501BySourceAndSourceExternalIdNotNullOrderByIdAsc(
                     EventSource.TIMEPAD,
@@ -80,9 +80,12 @@ class IngestionService(
                 if (saved.size > MAX_SAVED_IDS) {
                     return finishIncomplete(run, "saved_id_budget")
                 }
+                val savedVenues = saved.associate {
+                    it.sourceExternalId to SavedTimepadVenue.from(it)
+                }
                 ingestionRunRepository.save(run)
                 val context = FetchContext(observedAt, saved.mapNotNull { it.sourceExternalId }.toList())
-                observedAt to provider.fetch(context)
+                Triple(observedAt, provider.fetch(context), savedVenues)
             } catch (_: Exception) {
                 logger.error { "Ingestion provider failed: source=TIMEPAD reason=provider_failure" }
                 return finishIncomplete(run, "provider_failure")
@@ -90,8 +93,22 @@ class IngestionService(
             return when (fetched) {
                 is ProviderFetchResult.Incomplete -> finishIncomplete(run, fetched.reason)
                 is ProviderFetchResult.Complete -> {
+                    val candidate = fetched.accepted.firstOrNull {
+                        TimepadCoordinateEnrichment.needsPoint(it, savedVenues[it.sourceExternalId])
+                    }
+                    val prepared = candidate?.let {
+                        try {
+                            upsertService.prepareTimepadPoint(it, savedVenues[it.sourceExternalId])
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            null
+                        } catch (_: Exception) {
+                            logger.warn { "Timepad enrichment failed: reason=enrichment_failure" }
+                            null
+                        }
+                    }
                     try {
-                        timepadApplyService.apply(run, observedAt, fetched)
+                        timepadApplyService.apply(run, observedAt, fetched, prepared)
                     } catch (_: Exception) {
                         timepadApplyService.reconcileApplyFailure(
                             run.id ?: throw IllegalStateException("Timepad ingestion run was not persisted"),
