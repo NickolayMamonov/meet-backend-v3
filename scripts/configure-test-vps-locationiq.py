@@ -29,6 +29,10 @@ OVERRIDES = ("APP_GEOCODER_ENABLED", "APP_GEOCODER_API_KEY",
              "SPRING_APPLICATION_JSON", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS",
              "JAVA_OPTS", "SPRING_CONFIG_LOCATION", "SPRING_CONFIG_ADDITIONAL_LOCATION")
 DEFAULT_JAVA_OPTIONS = "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+CHILD_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+             "LC_ALL": "C", "HOME": "/root", "PYTHONDONTWRITEBYTECODE": "1",
+             # Override persisted currentContext as well as inherited endpoints.
+             "DOCKER_HOST": "unix:///var/run/docker.sock"}
 
 
 def ambiguous(name: str, value: str) -> bool:
@@ -88,7 +92,8 @@ def candidate(before: bytes, key: str) -> bytes:
 
 def command(arguments: list[str]) -> bytes:
     """Bound Docker inspection in memory and time; never persist its secret env."""
-    child = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    child = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             env=dict(CHILD_ENV))
     output = bytearray()
     try:
         with selectors.DefaultSelector() as selector:

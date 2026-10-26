@@ -224,6 +224,50 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_inspections_pin_local_daemon_despite_poisoned_contexts(self):
+        # A real child models Docker's endpoint precedence without invoking Docker.
+        script = """
+import json, os, pathlib, sys
+context = os.environ.get('DOCKER_CONTEXT')
+host = os.environ.get('DOCKER_HOST')
+config = pathlib.Path(os.environ.get('DOCKER_CONFIG', os.environ['HOME'] + '/.docker'))
+persisted = json.loads((config / 'config.json').read_text()) if (config / 'config.json').exists() else {}
+endpoint = context or host or persisted.get('currentContext', 'default')
+assert endpoint == 'unix:///var/run/docker.sock'
+assert 'DOCKER_CONTEXT' not in os.environ and 'DOCKER_CONFIG' not in os.environ
+assert 'DOCKER_TLS_VERIFY' not in os.environ and 'DOCKER_CERT_PATH' not in os.environ
+print('local-only')
+"""
+        with tempfile.TemporaryDirectory(dir="/root") as tmp:
+            root = Path(tmp)
+            config = root / ".docker"
+            config.mkdir()
+            (config / "config.json").write_text('{"currentContext":"remote-poison"}')
+            # Substitute only HOME to expose an actual poisoned persisted config.
+            controlled = dict(tool.CHILD_ENV, HOME=str(root))
+            poisoned = {"HOME": str(root), "DOCKER_CONTEXT": "remote-inherited",
+                        "DOCKER_HOST": "tcp://remote:2375", "DOCKER_CONFIG": str(config),
+                        "DOCKER_TLS_VERIFY": "1", "DOCKER_CERT_PATH": "/poison"}
+            with patch.dict(os.environ, poisoned), patch.object(tool, "CHILD_ENV", controlled):
+                self.assertEqual(tool.command([sys.executable, "-c", script]), b"local-only\n")
+
+    def test_all_runtime_inspections_use_controlled_environment(self):
+        popen = subprocess.Popen
+        environments = []
+        def child(arguments, **kwargs):
+            environments.append(kwargs["env"])
+            output = (CONTAINER + "\n") if arguments[1] == "ps" else json.dumps([record()])
+            return popen([sys.executable, "-c", "import sys; sys.stdout.write(" + repr(output) + ")"],
+                         **kwargs)
+        with patch.dict(os.environ, {"DOCKER_CONTEXT": "remote", "HOME": "/poison",
+                                    "DOCKER_HOST": "tcp://remote:2375"}), \
+                patch.object(tool.subprocess, "Popen", side_effect=child):
+            self.assertEqual(tool.runtime(), (CONTAINER, "same"))
+        self.assertEqual(environments, [tool.CHILD_ENV, tool.CHILD_ENV])
+        self.assertEqual(tool.CHILD_ENV["DOCKER_HOST"], "unix:///var/run/docker.sock")
+        self.assertEqual(set(tool.CHILD_ENV), {"PATH", "LC_ALL", "HOME",
+                                             "PYTHONDONTWRITEBYTECODE", "DOCKER_HOST"})
+
     def runtime(self, backend):
         with patch.object(tool, "command", side_effect=[
                 (CONTAINER + "\n").encode(), json.dumps([backend]).encode()]) as command:
