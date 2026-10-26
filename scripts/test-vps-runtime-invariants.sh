@@ -141,6 +141,18 @@ verify_environment_matches_container() {
   local root=$1
   local compose_script=$2
   local container line name
+  if [ "$#" -gt 2 ]; then
+    [ "$3" = --pending-locationiq-off ] && [ "$#" -eq 9 ] || return 1
+    container=$(runtime_compose "$root" "$compose_script" ps -q backend)
+    [[ "$container" =~ ^[0-9a-f]{64}$ ]] || return 1
+    docker inspect "$container" |
+      PYTHONDONTWRITEBYTECODE=1 timeout 30s python3 \
+        "$(dirname "$compose_script")/test-vps-locationiq-pending-off.py" \
+        --phase predecessor --env-file "$root/.env.production" \
+        --image "$4" --revision "$5" --version "$6" --image-id "$7" \
+        --previous-id "$8" --previous-started "$9" >/dev/null
+    return
+  fi
   declare -A runtime_environment=()
   container=$(runtime_compose "$root" "$compose_script" ps -q backend)
   [ -n "$container" ] || return 1
@@ -379,7 +391,7 @@ verify_runtime_invariants() {
   [ "$(docker inspect "$backend" \
     --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
     "https://github.com/NickolayMamonov/meet-backend-v3" ]
-  verify_environment_matches_container "$root" "$compose_script"
+  verify_environment_matches_container "$root" "$compose_script" "${@:7}"
   docker exec "$backend" sh -ec 'test -w /data/uploads'
   echo "runtime_check=image image_id=$expected_id runtime_user=10001:10001"
   mapfile -t mounts < <(

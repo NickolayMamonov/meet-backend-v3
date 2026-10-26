@@ -43,8 +43,32 @@ require() {
   esac
 }
 
+preflight_block=$(awk '
+  /^      - name: Protected test-VPS preflight$/ { active=1 }
+  active && /^      - name: / && !/Protected test-VPS preflight/ { exit }
+  active { print }
+' "$workflow")
+preflight_run=$(awk '
+  /^        run: \|$/ { active=1; next }
+  active && /^        [^ ]/ { exit }
+  active { sub(/^          /, ""); print }
+' <<<"$preflight_block")
+[ -n "$preflight_run" ] || { echo "workflow preflight run block missing" >&2; exit 1; }
+
 for text in \
   'workflow_dispatch:' \
+  'apply_pending_locationiq_off:' \
+  'default: false' \
+  'pending-locationiq-off' \
+  'APPLY_PENDING_LOCATIONIQ_OFF' \
+  '423828315' \
+  '462b52b403c73027a262e183d1bd9ae4964938d8' \
+  '05b0f337120f533bfaebbc597ff523d91aaa3a85' \
+  'sha256:1f2c56da34fa905553739f79bf91647d0087ec72159efc40828ba91622033d4b' \
+  'sha256:9178741bc9fd1e9319acab54252e908fa2d439e66f628d0da20c169837c60cfe' \
+  'scripts/test-vps-locationiq-pending-off.py' \
+  'scripts/configure-test-vps-locationiq.py' \
+  'scripts/test_vps_file_trust.py' \
   "if: github.ref == 'refs/heads/dev'" \
   'name: test-vps' \
   'scripts/verify-immutable-release-proof.sh' \
@@ -81,6 +105,21 @@ for text in \
   'retention=applied'; do
   require "$text" "$workflow_text" "test VPS workflow"
 done
+release_line=$(grep -nF 'name: Resolve and verify published immutable release' "$workflow" | cut -d: -f1)
+ssh_line=$(grep -nF 'name: Establish strict SSH host trust' "$workflow" | cut -d: -f1)
+stage_line=$(grep -nF 'name: Stage checksum-bound deployment tooling' "$workflow" | cut -d: -f1)
+deploy_line=$(grep -nF 'name: Deploy selected release successfully' "$workflow" | cut -d: -f1)
+[ "$release_line" -lt "$ssh_line" ] && [ "$ssh_line" -lt "$stage_line" ] &&
+  [ "$stage_line" -lt "$deploy_line" ] ||
+  { echo "pending transition guards/staging/deploy order changed" >&2; exit 1; }
+deploy_step=$(awk '/^      - name: Deploy selected release successfully$/{active=1}
+  active && /^      - name: / && !/Deploy selected release successfully/{exit}
+  active{print}' "$workflow")
+[[ "$deploy_step" == *'pending_args+=(--pending-locationiq-off)'* ]] &&
+  [[ "$deploy_step" == *'"${pending_args[@]}"'* ]] ||
+  { echo "pending flag is not conditionally routed to deployment" >&2; exit 1; }
+[[ "$deploy_step" != *'pending_args+=(--pending-locationiq-off)'*rollback* ]] ||
+  { echo "pending flag leaked to rollback drill" >&2; exit 1; }
 
 for text in \
   'scripts/deploy-test-vps-provider-release.sh' \
@@ -189,7 +228,6 @@ require 'state=$state_root/$run_key-$state_suffix' "$provider_deploy_text" \
 for frozen in \
   .github/workflows/promote-dev-digest-to-test-vps.yml \
   scripts/deploy-test-vps-release.sh \
-  scripts/test-vps-runtime-invariants.sh \
   scripts/production-compose.sh \
   scripts/update-production-release.sh; do
   git diff --quiet "$baseline" -- "$frozen" ||
@@ -252,6 +290,7 @@ require 'is_supported_test_vps_version "$previous_version"' "$deploy_text" \
   "test VPS predecessor floor"
 
 tmp=$(mktemp -d)
+printf '%s\n' "$preflight_run" >"$tmp/preflight.sh"
 cleanup() {
   local status=$?
   trap - EXIT
@@ -259,6 +298,42 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+
+valid_env() {
+  env -i PATH="$PATH" TAG="$1" RUN_ROLLBACK_DRILL="$2" \
+    FAILURE_POLICY="$3" APPLY_PENDING_LOCATIONIQ_OFF="$4" \
+    HOST=example.test PORT=22 SSH_USER=root PATH_ON_HOST=/opt/meet-backend \
+    HOST_FINGERPRINT=SHA256:abc SSH_PRIVATE_KEY='-----BEGIN OPENSSH PRIVATE KEY-----' \
+    bash "$tmp/preflight.sh" >"$tmp/preflight.out" 2>"$tmp/preflight.err"
+}
+for tuple in 'v1.6.0 false manual-stop true' 'v1.2.0 true automatic-rollback false' \
+  'v1.6.0 false automatic-rollback false' 'v1.6.0 false manual-stop false'; do
+  read -r tag drill policy optin <<<"$tuple"
+  valid_env "$tag" "$drill" "$policy" "$optin" ||
+    { echo "workflow preflight rejected valid tuple: $tuple" >&2; exit 1; }
+done
+for tuple in 'v1.2.0 false manual-stop true' 'v1.6.0 true manual-stop true' \
+  'v1.6.0 false automatic-rollback true' 'v1.6.0 true automatic-rollback true'; do
+  read -r tag drill policy optin <<<"$tuple"
+  if valid_env "$tag" "$drill" "$policy" "$optin"; then
+    echo "workflow preflight accepted incompatible pending transition: $tuple" >&2
+    exit 1
+  fi
+done
+for optin in unset maybe; do
+  if [ "$optin" = unset ]; then
+    if ! env -i PATH="$PATH" TAG=v1.6.0 RUN_ROLLBACK_DRILL=false FAILURE_POLICY=manual-stop \
+      HOST=example.test PORT=22 SSH_USER=root PATH_ON_HOST=/opt/meet-backend \
+      HOST_FINGERPRINT=SHA256:abc SSH_PRIVATE_KEY='-----BEGIN OPENSSH PRIVATE KEY-----' \
+      bash "$tmp/preflight.sh" >/dev/null 2>&1; then
+      echo "workflow preflight rejected default strict mode" >&2; exit 1
+    fi
+  else
+    if valid_env v1.6.0 false manual-stop "$optin"; then
+      echo "workflow preflight accepted malformed opt-in boolean" >&2; exit 1
+    fi
+  fi
+done
 
 for text in \
   '(keys | sort) == [' \
@@ -346,6 +421,7 @@ source "$provider_deploy"
 (
   runtime_helper="$tmp/invariant-helper.sh"
   root='/fixture root'
+  # shellcheck disable=SC2034 # Read by the extracted runtime invariant function.
   compose_script='/fixture compose.sh'
   cat >"$runtime_helper" <<'SH'
 verify_runtime_invariants() {

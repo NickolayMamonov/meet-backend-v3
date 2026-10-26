@@ -191,8 +191,33 @@ runtime_invariants_bounded() {
   timeout 60s bash -c '
     set -euo pipefail
     source "$1"
-    verify_runtime_invariants "$2" "$3" "$4" "$5" "$6" "$7"
-  ' _ "$runtime_helper" "$root" "$compose_script" "$1" "$2" "$3" "$4"
+    verify_runtime_invariants "$2" "$3" "$4" "$5" "$6" "$7" "${@:8}"
+  ' _ "$runtime_helper" "$root" "$compose_script" "$@"
+}
+
+pending_predecessor_proof() {
+  [ "$pending_locationiq_off" = true ] || return 0
+  [ "$(configuration_file_identity "$root/.env.production")" = "$pending_identity" ] ||
+    fail "PROVIDER_STATE_INVALID"
+  runtime_environment_bounded "${pending_policy[@]}" ||
+    fail "PROVIDER_STATE_INVALID"
+}
+
+pending_candidate_proof() {
+  [ "$pending_locationiq_off" = true ] || return 0
+  local current
+  current=$(compose ps -q backend)
+  [[ "$current" =~ ^[0-9a-f]{64}$ ]] || fail "RECOVERY_REQUIRED"
+  [ "$current" = "$candidate_container" ] || fail "RECOVERY_REQUIRED"
+  docker_container_inspect "$current" |
+    PYTHONDONTWRITEBYTECODE=1 timeout 30s python3 "$pending_verifier" \
+      --phase candidate --env-file "$root/.env.production" \
+      --pending-file "$state/config.env.production" \
+      --image "$image" --revision "$revision" --version "$version" \
+      --image-id "$target_id" --previous-id "$previous_container" \
+      --previous-started "$previous_started" --expected-id "$candidate_container" \
+      --expected-started "$candidate_started" >/dev/null ||
+    fail "RECOVERY_REQUIRED"
 }
 
 configuration_file_identity() {
@@ -582,6 +607,12 @@ PY
 
 verify_predecessor_for_cleanup() {
   local current_container current_inspect
+  if [ "${pending_locationiq_off:-false}" = true ]; then
+    [ "$(configuration_file_identity "$root/.env.production")" = "$pending_identity" ] || {
+      echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+      return 1
+    }
+  fi
   current_container=$(compose ps -q backend 2>/dev/null) || {
     echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
     return 1
@@ -596,11 +627,11 @@ verify_predecessor_for_cleanup() {
   }
   cleanup_inspect=$current_inspect
   runtime_invariants_bounded "$previous_id" "$previous_revision" \
-    "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 || {
+    "$previous_version" "$previous_runtime_hash" "${pending_policy[@]}" >/dev/null 2>&1 || {
       echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
       return 1
     }
-  runtime_environment_bounded >/dev/null 2>&1 || {
+  runtime_environment_bounded "${pending_policy[@]}" >/dev/null 2>&1 || {
     echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
     return 1
   }
@@ -629,6 +660,12 @@ verify_predecessor_for_cleanup() {
         echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
         return 1
       }
+  if [ "${pending_locationiq_off:-false}" = true ]; then
+    [ "$(configuration_file_identity "$root/.env.production")" = "$pending_identity" ] || {
+      echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+      return 1
+    }
+  fi
 }
 
 provider_release_main() {
@@ -641,6 +678,8 @@ run_key=
 mode=
 failure_policy=automatic-rollback
 failure_policy_set=false
+pending_locationiq_off=false
+pending_policy=()
 closed_beta_safety=false
 public_url=
 state_mode=
@@ -653,6 +692,11 @@ while [ "$#" -gt 0 ]; do
     --version) [ "$#" -ge 2 ] && [ -z "$version" ] || usage; version=$2; shift 2 ;;
     --run-key) [ "$#" -ge 2 ] && [ -z "$run_key" ] || usage; run_key=$2; shift 2 ;;
     --mode) [ "$#" -ge 2 ] && [ -z "$mode" ] || usage; mode=$2; shift 2 ;;
+    --pending-locationiq-off)
+      [ "$pending_locationiq_off" = false ] || usage
+      pending_locationiq_off=true
+      shift
+      ;;
     --failure-policy)
       [ "$#" -ge 2 ] && [ "$failure_policy_set" = false ] || usage
       failure_policy=$2
@@ -694,6 +738,10 @@ case "$failure_policy" in automatic-rollback|manual-stop) ;; *) usage ;; esac
 if [ "$failure_policy" = manual-stop ] && [ "$mode" = rollback-drill ]; then
   fail "manual-stop failure policy does not permit rollback-drill"
 fi
+if [ "$pending_locationiq_off" = true ]; then
+  [ "$failure_policy" = manual-stop ] && [ "$mode" = deploy ] &&
+    [ "$closed_beta_safety" = false ] || usage
+fi
 if [ -n "$public_url" ]; then
   [[ "$public_url" =~ ^https://[^/]+$ ]] || usage
 fi
@@ -729,6 +777,7 @@ update_script=$script_dir/update-production-release.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
 safety_hook=$script_dir/verify-test-vps-closed-beta-state.sh
 provider_helper=$script_dir/test-vps-provider-credential.py
+pending_verifier=$script_dir/test-vps-locationiq-pending-off.py
 [ -x "$compose_script" ] || fail "reviewed Compose wrapper is unavailable"
 [ -x "$update_script" ] || fail "reviewed release updater is unavailable"
 [ -r "$runtime_helper" ] || fail "runtime invariant helper is unavailable"
@@ -759,8 +808,8 @@ runtime_environment_bounded() {
   timeout 60s bash -c '
     set -euo pipefail
     source "$1"
-    verify_environment_matches_container "$2" "$3"
-  ' _ "$runtime_helper" "$root" "$compose_script"
+    verify_environment_matches_container "$2" "$3" "${@:4}"
+  ' _ "$runtime_helper" "$root" "$compose_script" "$@"
 }
 
 state_root=${TEST_VPS_STATE_ROOT:-/var/lib/meet-test-vps-deploy}
@@ -835,10 +884,37 @@ previous_runtime_hash=$(docker_container_inspect "$previous_container" \
   --format '{{index .Config.Labels "com.docker.compose.config-hash"}}') ||
   fail "PROVIDER_STATE_INVALID"
 [[ "$previous_runtime_hash" =~ ^[0-9a-f]{64}$ ]]
+if [ "$pending_locationiq_off" = true ]; then
+  # Read-only exact target admission precedes the narrow predecessor policy.
+  pending_identity=$(configuration_file_identity "$root/.env.production") ||
+    fail "PROVIDER_STATE_INVALID"
+  previous_started=$(docker_container_inspect "$previous_container" --format '{{.State.StartedAt}}') ||
+    fail "PROVIDER_STATE_INVALID"
+  target_id=$(docker_image_inspect "$image" --format '{{.Id}}') ||
+    fail "PROVIDER_STATE_INVALID"
+  PYTHONDONTWRITEBYTECODE=1 timeout 30s python3 "$pending_verifier" \
+    --phase predecessor --env-file "$root/.env.production" \
+    --image "$image" --revision "$revision" --version "$version" \
+    --image-id "$target_id" < <(docker_container_inspect "$previous_container") >/dev/null ||
+    fail "PROVIDER_STATE_INVALID"
+  [ "$(docker_image_inspect "$image" --format \
+    '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision" ] &&
+  [ "$(docker_image_inspect "$image" --format \
+    '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version" ] &&
+  [ "$(docker_image_inspect "$image" --format \
+    '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
+    "https://github.com/NickolayMamonov/meet-backend-v3" ] &&
+  [ "$(docker_image_inspect "$image" --format '{{.Config.User}}')" = 10001:10001 ] ||
+    fail "PROVIDER_STATE_INVALID"
+  [ "$(configuration_file_identity "$root/.env.production")" = "$pending_identity" ] ||
+    fail "PROVIDER_STATE_INVALID"
+  pending_policy=(--pending-locationiq-off "$image" "$revision" "$version" "$target_id"
+    "$previous_container" "$previous_started")
+fi
 runtime_invariants_bounded "$previous_id" "$previous_revision" \
-  "$previous_version" "$previous_runtime_hash" >/dev/null 2>&1 ||
+  "$previous_version" "$previous_runtime_hash" "${pending_policy[@]}" >/dev/null 2>&1 ||
   fail "PROVIDER_STATE_INVALID"
-runtime_environment_bounded >/dev/null 2>&1 ||
+runtime_environment_bounded "${pending_policy[@]}" >/dev/null 2>&1 ||
   fail "running container does not match the current production environment"
 previous_inspect=$(docker_container_inspect "$previous_container" 2>/dev/null) ||
   fail "PROVIDER_STATE_INVALID"
@@ -859,6 +935,7 @@ provider_enabled=$(jq -r '.providerEnabled' <<<"$provider_observed")
 # from an abandoned ordinary run directory to retention.
 write_provider_marker preparing none
 
+pending_predecessor_proof
 snapshot_configuration
 validate_configuration_boundary "$state/config.env.production"
 printf '%s\n' "$previous_image" >"$state/previous-image"
@@ -1007,8 +1084,13 @@ recovery_deadline_check() {
 trap provider_release_on_exit EXIT
 trap 'exit 143' TERM INT HUP
 
-target_id=$(docker_image_inspect "$image" --format '{{.Id}}') ||
-  fail "PROVIDER_STATE_INVALID"
+if [ "$pending_locationiq_off" = true ]; then
+  [ "$(docker_image_inspect "$image" --format '{{.Id}}')" = "$target_id" ] ||
+    fail "PROVIDER_STATE_INVALID"
+else
+  target_id=$(docker_image_inspect "$image" --format '{{.Id}}') ||
+    fail "PROVIDER_STATE_INVALID"
+fi
 [ "$(docker_image_inspect "$image" \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision" ] ||
   fail "PROVIDER_STATE_INVALID"
@@ -1132,6 +1214,7 @@ make_environment_candidate "$state/config.env.production" \
   "$state/config.env.previous" "$previous_image" "$previous_revision" \
   "$previous_version" || fail "PROVIDER_STATE_INVALID"
 
+pending_predecessor_proof
 printf '%s' "$previous_inspect" |
   timeout 30s python3 "$provider_helper" prepare \
     --run-key "$run_key" --state-root "$state_root" >/dev/null ||
@@ -1240,6 +1323,7 @@ verify_predecessor_before_writers() {
 
 validate_active_files_before_writers
 verify_predecessor_before_writers
+pending_predecessor_proof
 validate_configuration_boundary "$state/config.env.production"
 write_provider_marker applying "$durable_disposition"
 mutation_started=true
@@ -1268,6 +1352,10 @@ compose_up -d --no-deps --no-build --pull never --force-recreate \
 candidate_container=$(compose ps -q backend)
 candidate_inspect=$(docker_container_inspect "$candidate_container" 2>/dev/null) ||
   fail "RECOVERY_REQUIRED"
+if [ "$pending_locationiq_off" = true ]; then
+  candidate_started=$(jq -er '.[0].State.StartedAt | select(type == "string" and length > 0)' \
+    <<<"$candidate_inspect") || fail "RECOVERY_REQUIRED"
+fi
 target_hash=$(docker_container_inspect "$candidate_container" \
   --format '{{index .Config.Labels "com.docker.compose.config-hash"}}') ||
   fail "RECOVERY_REQUIRED"
@@ -1279,6 +1367,7 @@ printf '[%s,%s]' "$previous_inspect" "$candidate_inspect" |
   fail "PROVIDER_STATE_INVALID"
 runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
   >/dev/null 2>&1 || fail "PROVIDER_STATE_INVALID"
+pending_candidate_proof
 verify_public_contract "$public_url"
 run_safety_hook candidate "$image" "$target_id" \
   "$revision" "$version" "$target_hash"
@@ -1292,6 +1381,7 @@ fi
 run_safety_hook final "$image" "$target_id" \
   "$revision" "$version" "$target_hash"
 validate_configuration_boundary "$state/config.env.target"
+pending_candidate_proof
 provider_finish committed "$candidate_inspect"
 mutation_started=false
 rollback_complete=true

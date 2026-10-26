@@ -323,3 +323,7 @@ for signal_name in TERM INT HUP; do
 done
 
 echo "provider startup fixture passed: CLI startup marker publication and TERM/INT/HUP cleanup dispatch with successful and failed predecessor proofs"
+
+# Exercise the pending policy through the actual CLI with fake infrastructure,
+# including pre-writer cleanup and post-writer manual-stop failures.
+python3 -B "$ROOT_DIR/scripts/test-test-vps-locationiq-pending-off.py" IntegrationTests
