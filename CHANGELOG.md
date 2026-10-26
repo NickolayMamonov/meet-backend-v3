@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.6.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.5.1...v1.6.0) (2026-10-26)
+
+
+### Features
+
+* add exact-image protected LocationIQ enable operation ([0bf1da7](https://github.com/NickolayMamonov/meet-backend-v3/commit/0bf1da7f53fc91c8b669deef662a0b5e24901350))
+* add protected LocationIQ delivery with explicit geocoder off ([5f50c0c](https://github.com/NickolayMamonov/meet-backend-v3/commit/5f50c0c6cb71f53e842a4c5a46730782e547e0fd))
+* add protected LocationIQ key delivery with geocoding held off ([16eca40](https://github.com/NickolayMamonov/meet-backend-v3/commit/16eca405ac4f5d5b7137ae353f4625568513ac05))
+* **ingestion:** prepare bounded Timepad venue enrichment before catalog apply ([04cdf4f](https://github.com/NickolayMamonov/meet-backend-v3/commit/04cdf4fecb11a13ea786bbaf1f67c6b332b15827))
+* **ops:** prepare bounded LocationIQ fixture diagnostic mode ([4c7465a](https://github.com/NickolayMamonov/meet-backend-v3/commit/4c7465a75addcfd09240ec5fc2c84f576b9ab760))
+* **ops:** prepare source-only bounded LocationIQ diagnostic ([2d18095](https://github.com/NickolayMamonov/meet-backend-v3/commit/2d18095a4a8677f2842587abda099f410d14045c))
+
+
+### Fixes
+
+* **ingestion:** validate parsed geocoder authority before transport ([436bbc7](https://github.com/NickolayMamonov/meet-backend-v3/commit/436bbc76c8fb4592cde55b4f35ab8452c37186d7))
+* pin enable-only Docker commands to local daemon ([6016f64](https://github.com/NickolayMamonov/meet-backend-v3/commit/6016f64ccfe72a307fd535709110120aee419ecf))
+* reject alternate geocoder enable configuration channels ([1d199b8](https://github.com/NickolayMamonov/meet-backend-v3/commit/1d199b8bd4be95196ed42fb8fa24a66c7e576dba))
+* **release:** admit exact empty v1.5.1 continuation ([21175d3](https://github.com/NickolayMamonov/meet-backend-v3/commit/21175d3ff2029b6adfc8eddc17a1a4e20ea92b92))
+* **release:** admit exact empty v1.5.1 continuation ([9f1c2fe](https://github.com/NickolayMamonov/meet-backend-v3/commit/9f1c2fef05d1465ae446a61e7b64aa44d3e4903f))
+* safely enrich Timepad coordinates before catalog transactions ([516aa3e](https://github.com/NickolayMamonov/meet-backend-v3/commit/516aa3ed8a110fc4fe1dfbd26bdc1efecf5d2644))
+* **test:** prevent privileged diagnostic harness bytecode writes ([c19fbc1](https://github.com/NickolayMamonov/meet-backend-v3/commit/c19fbc1b834449043a70d539a61040cead623f46))
+
 ## [1.5.1](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.5.0...v1.5.1) (2026-10-23)
 
 
