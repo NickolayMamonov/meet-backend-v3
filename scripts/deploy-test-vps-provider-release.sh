@@ -858,7 +858,7 @@ compose_up() {
   timeout 240s bash -c '
     set -euo pipefail
     source "$1"
-    runtime_compose "$2" "$3" "${@:4}"
+    runtime_compose "$2" "$3" up "${@:4}"
   ' _ "$runtime_helper" "$root" "$compose_script" "$@" 2>/dev/null
 }
 

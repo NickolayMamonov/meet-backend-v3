@@ -8,6 +8,7 @@ import copy
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import shutil
@@ -276,6 +277,70 @@ verify_environment_matches_container "$2" "$1/production-compose.sh" "${@:3}"
         self.assertNotIn(KEY.encode(), result.stdout + result.stderr)
 
 
+class ComposeRoutingTests(unittest.TestCase):
+    def test_real_wrapper_argv(self):
+        """Exercise helper routing without replacing runtime_compose or the wrapper."""
+        source = (SCRIPTS / "deploy-test-vps-provider-release.sh").read_text()
+        functions = []
+        for name in ("compose", "compose_up"):
+            match = re.search(r"^" + name + r"\(\) \{\n.*?^\}", source, re.M | re.S)
+            self.assertIsNotNone(match)
+            functions.append(match.group())
+        calls = re.findall(r"^\s*compose_up (-d.*?backend)", source, re.M | re.S)
+        self.assertEqual(len(calls), 2)
+        expected = ["-d", "--no-deps", "--no-build", "--pull", "never",
+                    "--force-recreate", "--wait", "--wait-timeout", "180", "backend"]
+        for call in calls:
+            self.assertEqual(call.replace("\\\n", " ").split(), expected)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".env.production").write_text("FIXTURE=literal\n")
+            wrapper = root / "production-compose.sh"
+            shutil.copyfile(SCRIPTS / wrapper.name, wrapper)
+            wrapper.chmod(0o755)
+            docker = root / "docker"
+            docker.write_text("#!/usr/bin/env python3\nimport json,sys\n"
+                              "print(json.dumps(sys.argv[1:]))\n")
+            docker.chmod(0o755)
+            state = root / "state"
+            state.mkdir()
+            for active in (False, True):
+                if active:
+                    for name in ("active-compose.yml", "active-runtime.override.yml"):
+                        (state / name).write_text("# argv fixture only\n")
+                for operation, command, suffix in (
+                    ("forward", "compose_up " + calls[1], ["up"] + expected),
+                    ("rollback", "compose_up " + calls[0], ["up"] + expected),
+                    ("stop", "compose stop backend", ["stop", "backend"]),
+                ):
+                    with self.subTest(active=active, operation=operation):
+                        script = "\n".join(functions) + """
+runtime_helper=$1
+compose_script=$2
+root=$3
+""" + command
+                        env = dict(os.environ, PATH=str(root) + ":" + os.environ["PATH"],
+                                   PRODUCTION_STATE_DIR=str(state),
+                                   MEE_SMTP_FAKE_REMOTE="false",
+                                   RUNTIME_USE_REVIEWED_COMPOSE="false")
+                        env.pop("RUNTIME_BASE_COMPOSE", None)
+                        result = subprocess.run(
+                            ["bash", "-euc", script, "_",
+                             str(SCRIPTS / "test-vps-runtime-invariants.sh"),
+                             str(wrapper), str(root)],
+                            env=env, capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        argv = json.loads(result.stdout)
+                        files = ["-f", str(state / "active-compose.yml")] if active else [
+                            "-f", str(root / "docker-compose.production.yml")]
+                        if active:
+                            files += ["-f", str(state / "active-runtime.override.yml")]
+                        self.assertEqual(argv, [
+                            "compose", "-p", "meet-production", "--project-directory",
+                            str(root), "--env-file", ".env.production", *files, *suffix])
+                        self.assertEqual(argv.count("up"), operation != "stop")
+
+
 class IntegrationTests(unittest.TestCase):
     """Real deploy CLI, private files and pure policy; all infrastructure is fake."""
     def run_case(self, failure="", opted=True, extra=()):
@@ -505,7 +570,8 @@ elif kind == "compose":
     elif args and args[0] == "stop":
         trace("stop")
         if failure == "stop": die()
-    elif args and args[0] == "-d":
+    elif args == ["up", "-d", "--no-deps", "--no-build", "--pull", "never",
+                  "--force-recreate", "--wait", "--wait-timeout", "180", "backend"]:
         trace("up-new")
         (r / "new").touch()
         if failure.startswith("signal-"):
