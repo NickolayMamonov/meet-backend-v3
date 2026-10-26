@@ -660,6 +660,12 @@ verify_predecessor_for_cleanup() {
         echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
         return 1
       }
+  if [ "${pending_locationiq_off:-false}" = true ]; then
+    [ "$(configuration_file_identity "$root/.env.production")" = "$pending_identity" ] || {
+      echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+      return 1
+    }
+  fi
 }
 
 provider_release_main() {

@@ -403,14 +403,16 @@ verify_runtime_invariants() {
                     self.assertEqual(after, BASE)
 
     def test_cleanup_rejects_changed_pending_key_and_retains_recovery_marker(self):
-        result, trace, after = self.run_case("prepared-key-race")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("up-new", trace)
-        self.assertNotIn("stop", trace)
-        self.assertNotIn("finish", trace)
-        self.assertIn("recovery-marker-retained", trace)
-        self.assertIn(b"RECOVERY_REQUIRED", result.stderr)
-        self.assertNotEqual(after, BASE)
+        for failure in ("prepared-key-race", "cleanup-key-race"):
+            with self.subTest(failure=failure):
+                result, trace, after = self.run_case(failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("up-new", trace)
+                self.assertNotIn("stop", trace)
+                self.assertNotIn("finish", trace)
+                self.assertIn("recovery-marker-retained", trace)
+                self.assertIn(b"RECOVERY_REQUIRED", result.stderr)
+                self.assertNotEqual(after, BASE)
 
     def test_real_cli_postwrite_failures_manual_stop_never_rollback(self):
         for failure in ("env-update", "recreate", "candidate-key", "candidate-on", "candidate-alias",
@@ -470,7 +472,11 @@ def record():
     return rec
 if kind == "provider":
     cmd = args[0]
-    if cmd in ("check","retention-check","check-image","verify"): pass
+    if cmd in ("check","retention-check","check-image"): pass
+    elif cmd == "verify":
+        if failure == "cleanup-key-race" and not (r / "prewriter-failed").exists():
+            (r / "prewriter-failed").touch()
+            die()
     elif cmd == "state-publish":
         state = pathlib.Path(args[args.index("--state-root")+1])
         (state / "123-1-final-deploy").mkdir(mode=0o700)
@@ -532,6 +538,10 @@ elif kind == "docker":
         print(json.dumps({"services":{"backend":{"environment":dict(x.split("=",1) for x in rec["Config"]["Env"])}}}))
     else: die()
 elif kind == "curl":
+    if failure == "cleanup-key-race" and (r / "prewriter-failed").exists():
+        path = r / "app/.env.production"
+        path.write_text(path.read_text().replace(
+            os.environ["CASE_KEY"], "MOCK_RACED_PENDING_NOT_REAL"))
     url = next(x for x in args if x.startswith(("https://", "http://")))
     if "/admin/" in url:
         print("403",end="")
