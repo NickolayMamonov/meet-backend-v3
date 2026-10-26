@@ -433,6 +433,8 @@ class BudgetTests(unittest.TestCase):
         selector.__exit__ = Mock(return_value=False)
         selector.select.return_value = [(None, None)]
         with patch.dict(os.environ, {"PRODUCTION_ROOT": "/bad", "RUNTIME_BASE_COMPOSE": "/bad",
+                                    "DOCKER_HOST": "tcp://remote:2375", "DOCKER_CONTEXT": "remote",
+                                    "DOCKER_CONFIG": "/bad",
                                     "MEE_SMTP_FAKE_REMOTE": "true", "_JAVA_OPTIONS": "bad"}), \
                 patch.object(tool.subprocess, "Popen", return_value=child) as popen, \
                 patch.object(tool.selectors, "DefaultSelector", return_value=selector), \
@@ -440,6 +442,10 @@ class BudgetTests(unittest.TestCase):
                 patch.object(tool.os, "killpg", side_effect=ProcessLookupError):
             commands.run(["docker", "ps"])
         self.assertEqual(popen.call_args.kwargs["env"], tool.CHILD_ENV)
+        self.assertEqual(popen.call_args.kwargs["env"]["DOCKER_HOST"],
+                         "unix:///var/run/docker.sock")
+        self.assertNotIn("DOCKER_CONTEXT", popen.call_args.kwargs["env"])
+        self.assertNotIn("DOCKER_CONFIG", popen.call_args.kwargs["env"])
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
     def test_group_is_killed_and_reaped_before_tracking_cleared(self):

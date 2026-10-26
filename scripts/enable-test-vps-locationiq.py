@@ -36,7 +36,9 @@ SOURCE = "https://github.com/NickolayMamonov/meet-backend-v3"
 LIMIT = 1_048_576
 SIGNALS = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
 CHILD_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-             "LC_ALL": "C", "HOME": "/root", "PYTHONDONTWRITEBYTECODE": "1"}
+             "LC_ALL": "C", "HOME": "/root", "PYTHONDONTWRITEBYTECODE": "1",
+             # Override persisted currentContext for inspections and the wrapper.
+             "DOCKER_HOST": "unix:///var/run/docker.sock"}
 
 
 @dataclass(frozen=True)
