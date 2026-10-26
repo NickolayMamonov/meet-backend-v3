@@ -322,11 +322,11 @@ for tuple in 'v1.2.0 false manual-stop true' 'v1.6.0 true manual-stop true' \
 done
 for optin in unset maybe; do
   if [ "$optin" = unset ]; then
-    if env -i PATH="$PATH" TAG=v1.6.0 RUN_ROLLBACK_DRILL=false FAILURE_POLICY=manual-stop \
+    if ! env -i PATH="$PATH" TAG=v1.6.0 RUN_ROLLBACK_DRILL=false FAILURE_POLICY=manual-stop \
       HOST=example.test PORT=22 SSH_USER=root PATH_ON_HOST=/opt/meet-backend \
       HOST_FINGERPRINT=SHA256:abc SSH_PRIVATE_KEY='-----BEGIN OPENSSH PRIVATE KEY-----' \
       bash "$tmp/preflight.sh" >/dev/null 2>&1; then
-      echo "workflow preflight accepted absent opt-in boolean" >&2; exit 1
+      echo "workflow preflight rejected default strict mode" >&2; exit 1
     fi
   else
     if valid_env v1.6.0 false manual-stop "$optin"; then
