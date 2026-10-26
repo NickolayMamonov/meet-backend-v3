@@ -607,6 +607,12 @@ PY
 
 verify_predecessor_for_cleanup() {
   local current_container current_inspect
+  if [ "${pending_locationiq_off:-false}" = true ]; then
+    [ "$(configuration_file_identity "$root/.env.production")" = "$pending_identity" ] || {
+      echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
+      return 1
+    }
+  fi
   current_container=$(compose ps -q backend 2>/dev/null) || {
     echo "test VPS deployment failed: RECOVERY_REQUIRED" >&2
     return 1

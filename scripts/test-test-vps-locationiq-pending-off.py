@@ -353,6 +353,8 @@ verify_runtime_invariants() {
             self.assertNotIn(b"OTHER=unchanged", output)
             self.assertNotIn(__import__("hashlib").sha256(KEY.encode()).hexdigest().encode(), output)
             trace = (root / "trace").read_text() if (root / "trace").exists() else ""
+            if (state / ".provider-transaction.current").exists():
+                trace += "recovery-marker-retained\n"
             self.assertNotIn("rollback", trace)
             self.assertLessEqual(trace.count("up-new"), 1)
             self.assertNotIn("up-old", trace)
@@ -399,6 +401,16 @@ verify_runtime_invariants() {
                 self.assertNotIn("stop", trace)
                 if failure != "snapshot-race":
                     self.assertEqual(after, BASE)
+
+    def test_cleanup_rejects_changed_pending_key_and_retains_recovery_marker(self):
+        result, trace, after = self.run_case("prepared-key-race")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("up-new", trace)
+        self.assertNotIn("stop", trace)
+        self.assertNotIn("finish", trace)
+        self.assertIn("recovery-marker-retained", trace)
+        self.assertIn(b"RECOVERY_REQUIRED", result.stderr)
+        self.assertNotEqual(after, BASE)
 
     def test_real_cli_postwrite_failures_manual_stop_never_rollback(self):
         for failure in ("env-update", "recreate", "candidate-key", "candidate-on", "candidate-alias",
@@ -473,6 +485,10 @@ if kind == "provider":
                                      "providerEnabled":False,"durableDisposition":"none"}))
         marker.chmod(0o600)
         (r / "prepared").touch()
+        if failure == "prepared-key-race":
+            path = r / "app/.env.production"
+            path.write_text(path.read_text().replace(
+                os.environ["CASE_KEY"], "MOCK_RACED_PENDING_NOT_REAL"))
         if failure == "prepare": die()
     elif cmd == "finish":
         if failure == "finish": die()
