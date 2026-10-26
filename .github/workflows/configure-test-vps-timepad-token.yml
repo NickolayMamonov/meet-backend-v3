@@ -12,6 +12,27 @@ on:
           - timepad-token
           - locationiq-diagnostic
           - locationiq-delivery-off
+          - locationiq-enable-only
+      expected_source_sha:
+        description: Approved 40-character source commit for enable-only
+        type: string
+        required: false
+      expected_image_digest:
+        description: Approved repository image digest for enable-only
+        type: string
+        required: false
+      expected_image_id:
+        description: Approved local platform image ID for enable-only
+        type: string
+        required: false
+      expected_version:
+        description: Approved canonical application version for enable-only
+        type: string
+        required: false
+      deployment_run_key:
+        description: Approved deployment run ID and attempt (run-attempt)
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -20,7 +41,7 @@ jobs:
   configure:
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: ${{ inputs.mode == 'locationiq-enable-only' && 10 || 5 }}
     concurrency:
       group: test-vps-deploy-${{ github.repository }}
       cancel-in-progress: false
@@ -38,14 +59,36 @@ jobs:
         shell: bash
         env:
           REQUESTED_MODE: ${{ inputs.mode }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ inputs.expected_image_digest }}
+          EXPECTED_IMAGE_ID: ${{ inputs.expected_image_id }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          DEPLOYMENT_RUN_KEY: ${{ inputs.deployment_run_key }}
         run: |
           set -euo pipefail
           mode=${REQUESTED_MODE:-timepad-token}
           case "$mode" in
-            timepad-token|locationiq-diagnostic|locationiq-delivery-off) ;;
+            timepad-token|locationiq-diagnostic|locationiq-delivery-off|locationiq-enable-only) ;;
             *) echo "unsupported operation mode" >&2; exit 1 ;;
           esac
           printf 'mode=%s\n' "$mode" >>"$GITHUB_OUTPUT"
+          if [ "$mode" = locationiq-enable-only ]; then
+            for value in "$EXPECTED_SOURCE_SHA" "$EXPECTED_IMAGE_DIGEST" "$EXPECTED_IMAGE_ID" "$EXPECTED_VERSION" "$DEPLOYMENT_RUN_KEY"; do
+              [ "${#value}" -le 128 ]
+            done
+            [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$EXPECTED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+            [[ "$EXPECTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+            [[ "$EXPECTED_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            [[ "$DEPLOYMENT_RUN_KEY" =~ ^[1-9][0-9]*-[1-9][0-9]*$ ]]
+            {
+              printf 'expected_source_sha=%s\n' "$EXPECTED_SOURCE_SHA"
+              printf 'expected_image_digest=%s\n' "$EXPECTED_IMAGE_DIGEST"
+              printf 'expected_image_id=%s\n' "$EXPECTED_IMAGE_ID"
+              printf 'expected_version=%s\n' "$EXPECTED_VERSION"
+              printf 'deployment_run_key=%s\n' "$DEPLOYMENT_RUN_KEY"
+            } >>"$GITHUB_OUTPUT"
+          fi
 
       - name: Checkout exact reviewed tooling
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -54,7 +97,7 @@ jobs:
           fetch-depth: 1
 
       - name: Establish strict SSH host trust
-        if: steps.operation.outputs.mode == 'timepad-token' || steps.operation.outputs.mode == 'locationiq-diagnostic' || steps.operation.outputs.mode == 'locationiq-delivery-off'
+        if: steps.operation.outputs.mode == 'timepad-token' || steps.operation.outputs.mode == 'locationiq-diagnostic' || steps.operation.outputs.mode == 'locationiq-delivery-off' || steps.operation.outputs.mode == 'locationiq-enable-only'
         shell: bash
         env:
           SSH_PRIVATE_KEY: ${{ secrets.TEST_VPS_SSH_PRIVATE_KEY }}
@@ -102,7 +145,7 @@ jobs:
 
       - name: Stage selected reviewed helper and shared trust module
         id: stage
-        if: steps.operation.outputs.mode == 'timepad-token' || steps.operation.outputs.mode == 'locationiq-diagnostic' || steps.operation.outputs.mode == 'locationiq-delivery-off'
+        if: steps.operation.outputs.mode == 'timepad-token' || steps.operation.outputs.mode == 'locationiq-diagnostic' || steps.operation.outputs.mode == 'locationiq-delivery-off' || steps.operation.outputs.mode == 'locationiq-enable-only'
         shell: bash
         env:
           MODE: ${{ steps.operation.outputs.mode }}
@@ -120,6 +163,10 @@ jobs:
             locationiq-delivery-off)
               script=scripts/configure-test-vps-locationiq.py
               helper=configure-test-vps-locationiq.py
+              ;;
+            locationiq-enable-only)
+              script=scripts/enable-test-vps-locationiq.py
+              helper=enable-test-vps-locationiq.py
               ;;
             *) echo "unsupported operation mode" >&2; exit 1 ;;
           esac
@@ -167,6 +214,10 @@ jobs:
               "cd '$candidate_stage'; printf '%s  %s\n' '$checksum' '$target' | sha256sum --status -c -"
           }
           stage_file "$script" "$helper"
+          if [ "$MODE" = locationiq-enable-only ]; then
+            stage_file scripts/configure-test-vps-locationiq.py configure-test-vps-locationiq.py
+            stage_file scripts/production-compose.sh production-compose.sh
+          fi
           stage_file scripts/test_vps_file_trust.py test_vps_file_trust.py
 
       - name: Probe credential and configure only the token
@@ -216,25 +267,152 @@ jobs:
             timeout --signal=TERM --kill-after=2s 48s ssh -F "$SSH_CONFIG" test-vps \
               "cd '$STAGE' && ulimit -c 0 && PYTHONDONTWRITEBYTECODE=1 timeout --signal=TERM --kill-after=2s 45s python3 '$STAGE/configure-test-vps-locationiq.py'"
 
+      - name: Enable LocationIQ only for approved deployed image
+        id: enable
+        if: steps.operation.outputs.mode == 'locationiq-enable-only'
+        shell: bash
+        env:
+          STAGE: ${{ steps.stage.outputs.stage }}
+          SOURCE_SHA: ${{ steps.operation.outputs.expected_source_sha }}
+          IMAGE_DIGEST: ${{ steps.operation.outputs.expected_image_digest }}
+          IMAGE_ID: ${{ steps.operation.outputs.expected_image_id }}
+          VERSION: ${{ steps.operation.outputs.expected_version }}
+          DEPLOYMENT_RUN_KEY: ${{ steps.operation.outputs.deployment_run_key }}
+        run: |
+          set +x
+          set -euo pipefail
+          [[ "$STAGE" =~ ^/opt/meet-backend/\.timepad-token-config\.[a-f0-9]{32}$ ]]
+          umask 077
+          result_file=$(mktemp "$RUNNER_TEMP/locationiq-enable-result.XXXXXX")
+          error_file=$(mktemp "$RUNNER_TEMP/locationiq-enable-error.XXXXXX")
+          trap 'rm -f -- "$result_file" "$error_file"' EXIT
+          ssh_status=0
+          (
+            ulimit -f 8
+            timeout --signal=TERM --kill-after=2s 350s ssh -F "$SSH_CONFIG" test-vps \
+            "cd '$STAGE' && ulimit -c 0 && export PYTHONDONTWRITEBYTECODE=1 && timeout --signal=TERM --kill-after=2s 340s python3 '$STAGE/enable-test-vps-locationiq.py' '$SOURCE_SHA' '$IMAGE_DIGEST' '$IMAGE_ID' '$VERSION' '$DEPLOYMENT_RUN_KEY'" \
+              >"$result_file" 2>"$error_file"
+          ) || ssh_status=$?
+
+          parsed=$(python3 - "$result_file" <<'PY_STATUS'
+          import json
+          import pathlib
+          import sys
+
+          def pairs(items):
+              result = {}
+              for key, value in items:
+                  if key in result:
+                      raise ValueError("duplicate")
+                  result[key] = value
+              return result
+
+          try:
+              with pathlib.Path(sys.argv[1]).open("rb") as stream:
+                  raw = stream.read(4097)
+              if len(raw) > 4096 or len(raw.splitlines()) != 1:
+                  raise ValueError("shape")
+              value = json.loads(raw, object_pairs_hook=pairs)
+              if type(value) is not dict or set(value) != {"outcome", "published", "stop"}:
+                  raise ValueError("fields")
+              outcome, published, stop = value["outcome"], value["published"], value["stop"]
+              if type(published) is not bool or outcome not in {
+                  "committed", "rejected", "manual_intervention_required"
+              } or stop not in {
+                  "not_attempted", "verified_stopped", "command_completed", "failed", "unknown"
+              }:
+                  raise ValueError("values")
+              if outcome == "committed" and (published is not True or stop != "not_attempted"):
+                  raise ValueError("commit")
+              print(f"{outcome}\t{str(published).lower()}\t{stop}")
+          except Exception:
+              print("unknown\tunknown\tunknown")
+          PY_STATUS
+          )
+          IFS=$'\t' read -r helper_outcome published stop_status <<<"$parsed"
+          if [ "$ssh_status" -ne 0 ]; then
+            helper_outcome=unknown
+            published=unknown
+            stop_status=unknown
+          fi
+          case "$helper_outcome" in
+            committed|rejected|manual_intervention_required|unknown) ;;
+            *) helper_outcome=unknown; published=unknown; stop_status=unknown ;;
+          esac
+          {
+            printf 'helper_outcome=%s\n' "$helper_outcome"
+            printf 'published=%s\n' "$published"
+            printf 'stop_status=%s\n' "$stop_status"
+          } >>"$GITHUB_OUTPUT"
+          if [ "$ssh_status" -ne 0 ] || [ "$helper_outcome" != committed ]; then
+            exit 1
+          fi
+
       - name: Remove exact staged tooling
+        id: staged_cleanup
         if: ${{ always() && steps.stage.outputs.stage != '' }}
         shell: bash
         env:
           HELPER: ${{ steps.stage.outputs.helper }}
           STAGE: ${{ steps.stage.outputs.stage }}
+          MODE: ${{ steps.operation.outputs.mode }}
         run: |
           set -euo pipefail
           [[ "$STAGE" =~ ^/opt/meet-backend/\.timepad-token-config\.[a-f0-9]{32}$ ]]
-          case "$HELPER" in
-            configure-test-vps-timepad-token.py|diagnose-test-vps-locationiq.py|configure-test-vps-locationiq.py) ;;
-            *) echo "unsupported staged helper" >&2; exit 1 ;;
+          case "$MODE:$HELPER" in
+            timepad-token:configure-test-vps-timepad-token.py|locationiq-diagnostic:diagnose-test-vps-locationiq.py|locationiq-delivery-off:configure-test-vps-locationiq.py)
+              timeout 20s ssh -F "$SSH_CONFIG" test-vps \
+                "rm -f -- '$STAGE/$HELPER' '$STAGE/test_vps_file_trust.py' && rmdir -- '$STAGE'"
+              ;;
+            locationiq-enable-only:enable-test-vps-locationiq.py)
+              timeout 20s ssh -F "$SSH_CONFIG" test-vps \
+                "rm -f -- '$STAGE/enable-test-vps-locationiq.py' '$STAGE/configure-test-vps-locationiq.py' '$STAGE/production-compose.sh' '$STAGE/test_vps_file_trust.py' && rmdir -- '$STAGE'"
+              ;;
+            *) echo "unsupported staged tooling selection" >&2; exit 1 ;;
           esac
-          timeout 20s ssh -F "$SSH_CONFIG" test-vps \
-            "rm -f -- '$STAGE/$HELPER' '$STAGE/test_vps_file_trust.py' && rmdir -- '$STAGE'"
 
       - name: Remove runner SSH material
+        id: runner_cleanup
         if: always()
         shell: bash
         run: |
+          set -euo pipefail
           rm -f -- "$RUNNER_TEMP/timepad-vps-key" \
             "$RUNNER_TEMP/timepad-known-hosts" "$RUNNER_TEMP/timepad-ssh-config"
+
+      - name: Report enable-only final classification
+        if: ${{ always() && steps.operation.outputs.mode == 'locationiq-enable-only' }}
+        shell: bash
+        env:
+          HELPER_OUTCOME: ${{ steps.enable.outputs.helper_outcome }}
+          PUBLISHED: ${{ steps.enable.outputs.published }}
+          STOP_STATUS: ${{ steps.enable.outputs.stop_status }}
+          ENABLE_STEP: ${{ steps.enable.outcome }}
+          STAGED_CLEANUP: ${{ steps.staged_cleanup.outcome }}
+          RUNNER_CLEANUP: ${{ steps.runner_cleanup.outcome }}
+        run: |
+          set -euo pipefail
+          helper_outcome=${HELPER_OUTCOME:-unknown}
+          published=${PUBLISHED:-unknown}
+          stop_status=${STOP_STATUS:-unknown}
+          if [ "$STAGED_CLEANUP" != success ] || [ "$RUNNER_CLEANUP" != success ]; then
+            workflow_outcome=manual_intervention_required
+          elif [ "$helper_outcome" = committed ] && [ "$ENABLE_STEP" = success ]; then
+            workflow_outcome=committed
+          elif [ "$helper_outcome" = rejected ] && [ "$ENABLE_STEP" = failure ]; then
+            workflow_outcome=rejected
+          else
+            workflow_outcome=manual_intervention_required
+          fi
+          {
+            printf '## LocationIQ enable-only result\n\n'
+            printf -- '- Helper outcome: `%s`\n' "$helper_outcome"
+            printf -- '- Published: `%s`\n' "$published"
+            printf -- '- Stop status: `%s`\n' "$stop_status"
+            printf -- '- Workflow outcome: `%s`\n' "$workflow_outcome"
+            printf '\nLate workflow cleanup does not run the helper manual-stop path.\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [ "$workflow_outcome" = committed ]; then
+            exit 0
+          fi
+          exit 1

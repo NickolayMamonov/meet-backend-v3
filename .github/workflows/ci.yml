@@ -284,6 +284,7 @@ jobs:
           sudo bash "$TOOLING_SCRIPTS/test-test-vps-provider-startup.sh"
           sudo python3 "$TOOLING_SCRIPTS/test-test-vps-timepad-token.py"
           sudo python3 "$TOOLING_SCRIPTS/test-test-vps-locationiq-config.py"
+          sudo python3 "$TOOLING_SCRIPTS/test-test-vps-locationiq-enable.py"
           timeout 120s bash "$TOOLING_SCRIPTS/test-timepad-manual-stop.sh"
           timeout 120s bash "$TOOLING_SCRIPTS/test-timepad-workflow-routing.sh"
           bash "$TOOLING_SCRIPTS/test-dev-promotion-source.sh"

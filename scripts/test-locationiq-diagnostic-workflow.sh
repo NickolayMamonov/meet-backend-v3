@@ -50,11 +50,12 @@ require_text 'default: timepad-token' "$workflow"
 require_text '- timepad-token' "$workflow"
 require_text '- locationiq-diagnostic' "$workflow"
 require_text '- locationiq-delivery-off' "$workflow"
+require_text '- locationiq-enable-only' "$workflow"
 require_text "if: github.ref == 'refs/heads/dev'" "$workflow"
 require_text 'name: test-vps' "$workflow"
 require_text 'test-vps-deploy-${{ github.repository }}' "$workflow"
 require_text 'cancel-in-progress: false' "$workflow"
-require_text 'timeout-minutes: 5' "$workflow"
+require_text "timeout-minutes: \${{ inputs.mode == 'locationiq-enable-only' && 10 || 5 }}" "$workflow"
 require_text 'ref: ${{ github.sha }}' "$workflow"
 require_text 'StrictHostKeyChecking yes' "$workflow"
 
@@ -64,9 +65,10 @@ stage=$(step_block 'Stage selected reviewed helper and shared trust module')
 timepad=$(step_block 'Probe credential and configure only the token')
 diagnostic=$(step_block 'Run LocationIQ fixture diagnostic only')
 delivery=$(step_block 'Configure LocationIQ delivery OFF')
+enable=$(step_block 'Enable LocationIQ only for approved deployed image')
 cleanup=$(step_block 'Remove exact staged tooling')
 runner_cleanup=$(step_block 'Remove runner SSH material')
-for name in validation ssh_trust stage timepad diagnostic delivery cleanup runner_cleanup; do
+for name in validation ssh_trust stage timepad diagnostic delivery enable cleanup runner_cleanup; do
   [ -n "${!name}" ] || fail "missing workflow step: $name"
 done
 
@@ -79,20 +81,40 @@ stage_line=$(line_of 'name: Stage selected reviewed helper and shared trust modu
 timepad_line=$(line_of 'name: Probe credential and configure only the token')
 diagnostic_line=$(line_of 'name: Run LocationIQ fixture diagnostic only')
 delivery_line=$(line_of 'name: Configure LocationIQ delivery OFF')
+enable_line=$(line_of 'name: Enable LocationIQ only for approved deployed image')
 [ "$validation_line" -lt "$ssh_line" ] &&
   [ "$validation_line" -lt "$stage_line" ] &&
   [ "$validation_line" -lt "$timepad_line" ] &&
   [ "$validation_line" -lt "$diagnostic_line" ] &&
-  [ "$validation_line" -lt "$delivery_line" ] ||
+  [ "$validation_line" -lt "$delivery_line" ] &&
+  [ "$validation_line" -lt "$enable_line" ] ||
   fail "mode validation must precede SSH setup, staging, and secret-bearing steps"
 
 validation_run=$(step_run "$validation")
 printf '%s\n' "$validation_run" >"$TMP/validate-mode.sh"
-for mode in '' timepad-token locationiq-diagnostic locationiq-delivery-off; do
+for mode in '' timepad-token locationiq-diagnostic locationiq-delivery-off locationiq-enable-only; do
   output=$TMP/mode-output
   : >"$output"
-  GITHUB_OUTPUT=$output REQUESTED_MODE=$mode bash "$TMP/validate-mode.sh"
+  GITHUB_OUTPUT=$output REQUESTED_MODE=$mode \
+    EXPECTED_SOURCE_SHA=0123456789abcdef0123456789abcdef01234567 \
+    EXPECTED_IMAGE_DIGEST=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+    EXPECTED_IMAGE_ID=sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 \
+    EXPECTED_VERSION=1.2.3 DEPLOYMENT_RUN_KEY=123-1 bash "$TMP/validate-mode.sh"
   grep -Fxq "mode=${mode:-timepad-token}" "$output" || fail "mode was not accepted: $mode"
+done
+export EXPECTED_SOURCE_SHA=0123456789abcdef0123456789abcdef01234567
+export EXPECTED_IMAGE_DIGEST=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+export EXPECTED_IMAGE_ID=sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+export EXPECTED_VERSION=1.2.3 DEPLOYMENT_RUN_KEY=123-1
+for field in EXPECTED_SOURCE_SHA EXPECTED_IMAGE_DIGEST EXPECTED_IMAGE_ID EXPECTED_VERSION DEPLOYMENT_RUN_KEY; do
+  for invalid in '' 'bad;echo unsafe' "$(printf '9%.0s' {1..129})"; do
+    : >"$TMP/invalid-input-output"
+    if env "$field=$invalid" REQUESTED_MODE=locationiq-enable-only \
+      GITHUB_OUTPUT="$TMP/invalid-input-output" bash "$TMP/validate-mode.sh" \
+      >"$TMP/invalid-input.stdout" 2>"$TMP/invalid-input.stderr"; then
+      fail "malformed enable tuple field accepted: $field"
+    fi
+  done
 done
 output=$TMP/mode-output
 : >"$output"
@@ -104,7 +126,10 @@ fi
 grep -Fq 'unsupported operation mode' "$TMP/invalid.stderr" ||
   fail "invalid mode rejection is not explicit"
 require_text 'mode=${REQUESTED_MODE:-timepad-token}' "$validation_run"
-require_text 'timepad-token|locationiq-diagnostic|locationiq-delivery-off' "$validation_run"
+require_text 'locationiq-enable-only' "$validation_run"
+for input in EXPECTED_SOURCE_SHA EXPECTED_IMAGE_DIGEST EXPECTED_IMAGE_ID EXPECTED_VERSION DEPLOYMENT_RUN_KEY; do
+  require_text "$input" "$validation_run"
+done
 reject_text '${{ inputs.mode }}' "$validation_run"
 
 for mode in timepad-token locationiq-diagnostic locationiq-delivery-off; do
@@ -130,14 +155,24 @@ require_text 'secrets.LOCATIONIQ_KEY' "$diagnostic"
 require_text 'secrets.LOCATIONIQ_KEY' "$delivery"
 reject_text 'TIMEPAD_TOKEN' "$stage"
 reject_text 'LOCATIONIQ_KEY' "$stage"
+reject_text 'LOCATIONIQ_KEY' "$enable"
+reject_text 'TIMEPAD_TOKEN' "$enable"
+require_text '340s python3' "$enable"
+require_text '350s ssh' "$enable"
+require_text 'object_pairs_hook=pairs' "$enable"
+require_text '"committed", "rejected", "manual_intervention_required"' "$enable"
+require_text 'locationiq-enable-only:enable-test-vps-locationiq.py' "$(step_run "$cleanup")"
 
 stage_run=$(step_run "$stage")
 require_text 'timepad-token)' "$stage_run"
 require_text 'locationiq-diagnostic)' "$stage_run"
 require_text 'locationiq-delivery-off)' "$stage_run"
+require_text 'locationiq-enable-only)' "$stage_run"
 require_text 'scripts/configure-test-vps-timepad-token.py' "$stage_run"
 require_text 'scripts/diagnose-test-vps-locationiq.py' "$stage_run"
 require_text 'scripts/configure-test-vps-locationiq.py' "$stage_run"
+require_text 'scripts/enable-test-vps-locationiq.py' "$stage_run"
+require_text 'stage_file scripts/production-compose.sh production-compose.sh' "$stage_run"
 require_text 'stage_file scripts/test_vps_file_trust.py test_vps_file_trust.py' "$stage_run"
 require_text 'checksum=$(sha256sum "$source" | awk' "$stage_run"
 require_text 'sha256sum --status -c -' "$stage_run"
@@ -190,8 +225,10 @@ cleanup_run=$(step_run "$cleanup")
 require_text 'always()' "$cleanup"
 require_text 'HELPER: ${{ steps.stage.outputs.helper }}' "$cleanup"
 require_text 'STAGE: ${{ steps.stage.outputs.stage }}' "$cleanup"
-require_text 'configure-test-vps-timepad-token.py|diagnose-test-vps-locationiq.py|configure-test-vps-locationiq.py' \
+require_text 'timepad-token:configure-test-vps-timepad-token.py|locationiq-diagnostic:diagnose-test-vps-locationiq.py|locationiq-delivery-off:configure-test-vps-locationiq.py' \
   "$cleanup_run"
+require_text 'locationiq-enable-only:enable-test-vps-locationiq.py' "$cleanup_run"
+require_text 'production-compose.sh' "$cleanup_run"
 require_text "\$STAGE/\$HELPER" "$cleanup_run"
 require_text "\$STAGE/test_vps_file_trust.py" "$cleanup_run"
 require_text 'rmdir --' "$cleanup_run"
@@ -203,6 +240,8 @@ printf '%s\n' "$stage_run" >"$TMP/stage.sh"
 printf '%s\n' "$timepad_run" >"$TMP/timepad.sh"
 printf '%s\n' "$diagnostic_run" >"$TMP/diagnostic.sh"
 printf '%s\n' "$delivery_run" >"$TMP/delivery.sh"
+printf '%s\n' "$(step_run "$enable")" >"$TMP/enable.sh"
+printf '%s\n' "$(step_run "$(step_block 'Report enable-only final classification')")" >"$TMP/classify.sh"
 printf '%s\n' "$cleanup_run" >"$TMP/cleanup.sh"
 
 # Execute the actual run blocks with local SSH/SCP doubles. No remote command,
@@ -225,6 +264,16 @@ ssh() {
     command=${command//"$FIXTURE_STAGE"/"$MOCK_REMOTE"}
     bash -c "$command"
   elif [[ "$command" == *'python3 '* ]]; then
+    if [[ "$command" == *'enable-test-vps-locationiq.py'* ]]; then
+      echo helper >>"$MOCK_LOG"
+      case "$MOCK_FAIL" in
+        helper) return 47 ;;
+        timeout) return 124 ;;
+        invalid-status) printf 'not-json-%s\n' "$FIXTURE_KEY"; return 0 ;;
+        rejected) printf '%s\n' '{"outcome":"rejected","published":false,"stop":"not_attempted"}'; return 1 ;;
+        *) printf '%s\n' '{"outcome":"committed","published":true,"stop":"not_attempted"}'; return 0 ;;
+      esac
+    fi
     local key
     key=$(command cat)
     [ "$key" = "$FIXTURE_KEY" ] || return 44
@@ -259,8 +308,12 @@ export FIXTURE_KEY=MOCK-KEY-NOT-A-REAL-SECRET-123
 export SSH_CONFIG="$TMP/mock-ssh-config"
 touch "$SSH_CONFIG"
 
-for mode in timepad-token locationiq-diagnostic locationiq-delivery-off; do
-  for failure in none transfer module-transfer checksum helper timeout cleanup; do
+for mode in timepad-token locationiq-diagnostic locationiq-delivery-off locationiq-enable-only; do
+  failures='none transfer module-transfer checksum helper timeout cleanup'
+  if [ "$mode" = locationiq-enable-only ]; then
+    failures="$failures invalid-status rejected runner-cleanup"
+  fi
+  for failure in $failures; do
     case_dir="$TMP/$mode-$failure"
     mkdir "$case_dir"
     export MOCK_REMOTE="$case_dir/stage" MOCK_LOG="$case_dir/log" MOCK_FAIL=$failure
@@ -278,11 +331,18 @@ for mode in timepad-token locationiq-diagnostic locationiq-delivery-off; do
       timepad-token) [ "$HELPER" = configure-test-vps-timepad-token.py ] ;;
       locationiq-diagnostic) [ "$HELPER" = diagnose-test-vps-locationiq.py ] ;;
       locationiq-delivery-off) [ "$HELPER" = configure-test-vps-locationiq.py ] ;;
+      locationiq-enable-only) [ "$HELPER" = enable-test-vps-locationiq.py ] ;;
     esac || fail "selected mode staged the wrong helper"
     if [ "$stage_status" -eq 0 ]; then
-      [ "$(grep -c '^checksum$' "$MOCK_LOG")" -eq 2 ] ||
+      expected_checksums=2
+      if [ "$mode" = locationiq-enable-only ]; then expected_checksums=4; fi
+      [ "$(grep -c '^checksum$' "$MOCK_LOG")" -eq "$expected_checksums" ] ||
         fail "helper and module must both be checksum verified"
       expected_files=$(printf '%s\n' "$HELPER" test_vps_file_trust.py | sort)
+      if [ "$mode" = locationiq-enable-only ]; then
+        expected_files=$(printf '%s\n' "$HELPER" test_vps_file_trust.py \
+          configure-test-vps-locationiq.py production-compose.sh | sort)
+      fi
       staged_files=$(find "$MOCK_REMOTE" -maxdepth 1 -type f -printf '%f\n' | sort)
       [ "$staged_files" = "$expected_files" ] ||
         fail "only the selected helper and shared trust module may be staged"
@@ -290,11 +350,17 @@ for mode in timepad-token locationiq-diagnostic locationiq-delivery-off; do
         operation="$TMP/timepad.sh"
       elif [ "$mode" = locationiq-delivery-off ]; then
         operation="$TMP/delivery.sh"
+      elif [ "$mode" = locationiq-enable-only ]; then
+        operation="$TMP/enable.sh"
       else
         operation="$TMP/diagnostic.sh"
       fi
       operation_status=0
-      if [ "$mode" = timepad-token ]; then
+      if [ "$mode" = locationiq-enable-only ]; then
+        export RUNNER_TEMP="$case_dir" SOURCE_SHA=$EXPECTED_SOURCE_SHA IMAGE_DIGEST=$EXPECTED_IMAGE_DIGEST
+        export IMAGE_ID=$EXPECTED_IMAGE_ID VERSION=$EXPECTED_VERSION
+        bash "$operation" >"$case_dir/helper.stdout" 2>"$case_dir/helper.stderr" || operation_status=$?
+      elif [ "$mode" = timepad-token ]; then
         TIMEPAD_TOKEN=$FIXTURE_KEY bash "$operation" \
           >"$case_dir/helper.stdout" 2>"$case_dir/helper.stderr" || operation_status=$?
       else
@@ -302,7 +368,7 @@ for mode in timepad-token locationiq-diagnostic locationiq-delivery-off; do
           >"$case_dir/helper.stdout" 2>"$case_dir/helper.stderr" || operation_status=$?
       fi
       case "$failure" in
-        helper|timeout) [ "$operation_status" -ne 0 ] || fail "helper failure was hidden" ;;
+        helper|timeout|invalid-status|rejected) [ "$operation_status" -ne 0 ] || fail "helper failure was hidden" ;;
         *) [ "$operation_status" -eq 0 ] || fail "mock operation unexpectedly failed" ;;
       esac
     else
@@ -320,6 +386,34 @@ for mode in timepad-token locationiq-diagnostic locationiq-delivery-off; do
     else
       [ "$cleanup_status" -eq 0 ] && [ ! -e "$MOCK_REMOTE" ] ||
         fail "exact staged helper and module were not cleaned"
+    fi
+    if [ "$mode" = locationiq-enable-only ]; then
+      export HELPER_OUTCOME PUBLISHED STOP_STATUS ENABLE_STEP STAGED_CLEANUP RUNNER_CLEANUP
+      HELPER_OUTCOME=$(sed -n 's/^helper_outcome=//p' "$GITHUB_OUTPUT")
+      PUBLISHED=$(sed -n 's/^published=//p' "$GITHUB_OUTPUT")
+      STOP_STATUS=$(sed -n 's/^stop_status=//p' "$GITHUB_OUTPUT")
+      ENABLE_STEP=failure
+      if [ "$stage_status" -eq 0 ] && [ "$operation_status" -eq 0 ]; then ENABLE_STEP=success; fi
+      STAGED_CLEANUP=success
+      if [ "$cleanup_status" -ne 0 ]; then STAGED_CLEANUP=failure; fi
+      RUNNER_CLEANUP=success
+      if [ "$failure" = runner-cleanup ]; then RUNNER_CLEANUP=failure; fi
+      export GITHUB_STEP_SUMMARY="$case_dir/summary"
+      classification=0
+      bash "$TMP/classify.sh" >"$case_dir/classify.stdout" 2>"$case_dir/classify.stderr" || classification=$?
+      if [ "$failure" = none ]; then
+        [ "$classification" -eq 0 ] || fail "successful enable misclassified"
+      else
+        [ "$classification" -ne 0 ] || fail "enable failure hidden"
+      fi
+      if [ "$failure" = cleanup ] || [ "$failure" = runner-cleanup ]; then
+        grep -Fq 'Helper outcome: `committed`' "$GITHUB_STEP_SUMMARY" || fail "late cleanup erased commit"
+        grep -Fq 'Stop status: `not_attempted`' "$GITHUB_STEP_SUMMARY" || fail "late cleanup invented stop"
+      elif [ "$failure" = helper ] || [ "$failure" = timeout ] || [ "$failure" = invalid-status ]; then
+        grep -Fxq 'published=unknown' "$GITHUB_OUTPUT" || fail "unknown publication claimed false"
+      fi
+      [ -z "$(find "$case_dir" -name 'locationiq-enable-result.*' -o -name 'locationiq-enable-error.*')" ] ||
+        fail "private status capture not removed"
     fi
     if grep -RqF "$FIXTURE_KEY" "$case_dir"; then
       fail "mock credential persisted in staging or output"

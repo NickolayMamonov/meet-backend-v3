@@ -105,3 +105,31 @@ exits nonzero: stop and reconcile before any retry. No automatic restore,
 restart, or enable action is part of this mode. Any future activation requires
 separate authority and a reviewed sequence bound to the approved new backend
 deployment window; this delivery mode cannot enable geocoding.
+
+## LocationIQ enable-only for an approved deployed image
+
+`locationiq-enable-only` is a separate manual CONFIG workflow mode. It accepts
+only five non-secret values: the approved source commit SHA, repository image
+digest, local image ID, canonical application version, and deployment run key
+(`run-attempt`). Obtain each from reviewed source/deployment evidence for the
+exact deployment; do not infer an image ID from a digest or reuse a tuple from
+another run. The workflow validates formats before SSH and passes individually
+quoted scalar arguments. It does not accept or transfer `LOCATIONIQ_KEY`.
+
+Before enablement, the approved new image must already be deployed and healthy
+with persistent `GEOCODER_ENABLED=false`, and the running backend must have
+been verified OFF. The helper validates that tuple and locked runtime/file
+state, then performs one same-image Compose recreate. This is global backend
+activation, not a one-request test: normal application traffic can make
+LocationIQ calls afterward. This workflow grants no dispatch or activation
+authority; that consequence requires separate operator authorization.
+
+The helper owns its bounded manual-stop boundary. Rejection, uncertainty, or
+manual intervention must be reconciled before retry; the workflow does not
+roll back, restore configuration, or rerun the helper. `committed` requires a
+successful SSH exit and valid bounded helper status JSON. Missing, malformed,
+truncated, or transport-failed status is unknown. Late staged-file or runner
+SSH-material cleanup failure is workflow intervention/failure while
+preserving the observed helper outcome; it does not mean the helper's
+manual-stop path ran. This mode performs no provider probe or credential
+rotation.
