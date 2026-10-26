@@ -133,3 +133,35 @@ SSH-material cleanup failure is workflow intervention/failure while
 preserving the observed helper outcome; it does not mean the helper's
 manual-stop path ran. This mode performs no provider probe or credential
 rotation.
+
+## First v1.6.0 deployment with pending LocationIQ key held OFF
+
+The provider-release workflow has a separate `apply_pending_locationiq_off`
+opt-in, default false. It is narrowly bound to the reviewed v1.6.0 source,
+release and image tuple and requires `failure_policy=manual-stop` with the
+rollback drill disabled. All ordinary deployments retain strict environment
+matching. This exception is not inferred from key presence and does not permit
+credential writes, key rotation, enabling geocoding, or restarting the old
+image.
+
+The transition is intended to carry the already-pending canonical key and an
+explicit `GEOCODER_ENABLED=false` through one deployment of the approved new
+image. The deployment proves the candidate is a new healthy instance with the
+same intended key explicitly OFF before commit. No provider API call or
+migration is added by the exception; existing public health probes and the
+workflow's existing retention behavior still apply. Manual-stop means
+post-mutation uncertainty requires operator reconciliation; there is no
+automatic rollback or restoration of prior configuration. The opt-in only
+selects the narrowly defined predecessor-comparison policy and grants no
+dispatch, target-access, or activation authority by itself.
+
+Existing startup Flyway migrations can still change the database; named database
+and upload volumes are preserved, not read-only. Existing ingestion and Timepad
+settings remain effective (including scheduled ingestion when enabled); OFF
+geocoding is not an ingestion freeze. Existing Firebase credential validation
+and private snapshots remain, without a provider API test or credential rotation.
+The successful no-drill path retains its public probes, including unauthorized
+and wrong-key bootstrap rejection checks. Retention can remove older eligible
+owned states/tooling and can fail after service commit; such a late failure does
+not prove the backend stopped. A completed stop command likewise is not a
+verified-stop guarantee.
