@@ -316,8 +316,20 @@ status=0
 CURL_ACTION=KILL invoke "$case_dir" 2>"$case_dir/sigkill.stderr" || status=$?
 [ "$status" -ne 0 ] || fail "SIGKILL fixture unexpectedly succeeded"
 shopt -s nullglob
-leftovers=("$case_dir"/output/runtime.json.response.* "$case_dir"/output/runtime.json.headers.*)
-[ "${#leftovers[@]}" -gt 0 ] || fail "SIGKILL did not leave expected crash evidence"
+leftovers=()
+response_count=0
+header_count=0
+for path in "$case_dir"/output/runtime.json.response.* "$case_dir"/output/runtime.json.headers.*; do
+  case "$path" in
+    *.UNRELATED) continue ;;
+    *.response.*) response_count=$((response_count + 1)) ;;
+    *.headers.*) header_count=$((header_count + 1)) ;;
+  esac
+  [ -f "$path" ] && [ ! -L "$path" ] || fail "SIGKILL evidence is not a regular file"
+  leftovers+=("$path")
+done
+[ "$response_count" -eq 1 ] && [ "$header_count" -eq 1 ] ||
+  fail "SIGKILL did not leave both probe-owned response and header temporaries"
 before=$(printf '%s\n' "${leftovers[@]}" | sort | xargs -r sha256sum)
 unset CURL_ACTION
 invoke "$case_dir"
