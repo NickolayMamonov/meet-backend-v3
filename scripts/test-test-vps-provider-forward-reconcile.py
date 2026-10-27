@@ -24,8 +24,8 @@ SPEC = importlib.util.spec_from_file_location(
     "provider_credential", SCRIPTS / "test-vps-provider-credential.py")
 helper = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(helper)
-OLD = "6d4a33264076" + "a" * 52
-OLD_IMAGE = "sha256:8e40528c34d" + "b" * 53
+OLD = "6d4a332640760361207d36297752b0265eae6a445396ea5a5b6f8c51a47f1f7b"
+OLD_IMAGE = "sha256:8e405258c34d70d6b42d226458c381f55df47d37fa743b754e1066e05f3ae1a0"
 NEW = "c" * 64
 NEW_IMAGE = "sha256:" + "d" * 64
 REVISION = "e" * 40
@@ -362,6 +362,30 @@ class ForwardTests(FixtureTests):
         fixture.complete()
         self.assertFalse(fixture.fallback.exists())
         self.assertTrue(fixture.archive.is_dir())
+
+    def test_full_predecessor_image_identity_is_pinned(self):
+        fixture = self.fresh()
+        self.assertEqual(
+            helper._forward_stopped(fixture.backend, fixture.original_files)["imageId"],
+            OLD_IMAGE)
+        self.assertEqual(fixture.backend["Id"], OLD)
+        wrong_images = (
+            OLD_IMAGE[:-1] + "1",  # Same correct prefix, different full identity.
+            "sha256:8e40528c34d" + "b" * 53,  # Historical typo-derived fixture.
+            OLD_IMAGE[:-1],
+            OLD_IMAGE + "0",
+        )
+        for wrong in wrong_images:
+            with self.subTest(image=wrong):
+                fixture = self.fresh()
+                fixture.backend["Image"] = wrong
+                fixture.original_files["previous-image-id"] = (wrong + "\n").encode()
+                with self.assertRaises(helper.ProviderError):
+                    helper._forward_stopped(fixture.backend, fixture.original_files)
+        fixture = self.fresh()
+        fixture.original_files["previous-image-id"] = (wrong_images[0] + "\n").encode()
+        with self.assertRaises(helper.ProviderError):
+            helper._forward_stopped(fixture.backend, fixture.original_files)
 
     def test_preflight_failures_never_publish_or_adopt(self):
         mutations = {
