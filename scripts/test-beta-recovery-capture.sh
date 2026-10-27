@@ -22,6 +22,7 @@ grep -Fq 'pg_database_size(current_database())' "$backup"; grep -Fq 'validate_up
 grep -Fq 'jq -cS' "$backup"; grep -Fq 'capacity_ok' "$backup"; grep -Fq -- '--reference-list' "$backup"
 grep -Fq 'decimal_add' "$media"; grep -Fq 'ln -- "$candidate" "$output"' "$media"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
+bash "$root/scripts/test-test-vps-recovery-runtime.sh"
 fixture=$(mktemp -d); references=$(mktemp -d)
 trap '[ "${KEEP_BETA_RECOVERY_FIXTURE:-0}" = 1 ] || rm -r -- "$fixture" "$references"' EXIT HUP INT TERM
 mkdir -p "$fixture/avatars" "$fixture/meetings" "$fixture/communities"

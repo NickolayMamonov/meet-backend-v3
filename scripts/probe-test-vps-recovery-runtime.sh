@@ -34,8 +34,57 @@ config_hash=$(docker inspect "$container" --format '{{index .Config.Labels "com.
 [[ "$config_hash" =~ ^[0-9a-f]{64}$ ]] || fail "runtime config identity unavailable"
 uploads=$(docker inspect "$container" --format '{{range .Mounts}}{{if eq .Destination "/data/uploads"}}{{printf "%s|%s" .Type .Name}}{{end}}{{end}}')
 [ "$uploads" = "volume|meet-production_uploads_data" ] || fail "uploads mount differs"
-meetings=$(mktemp "$output.response.XXXXXX"); headers=$(mktemp "$output.headers.XXXXXX")
-trap 'rm -f -- "$meetings" "$headers"' EXIT HUP INT TERM
+allocations=()
+pending_signal=0
+cleanup(){
+  local status=$? cleanup_status=0 path
+  trap - EXIT HUP INT TERM
+  for path in "${allocations[@]}"; do
+    if ! rm -f -- "$path"; then
+      cleanup_status=1
+    fi
+  done
+  if [ "$cleanup_status" -ne 0 ]; then
+    echo "test VPS recovery probe failed: temporary-file cleanup failed" >&2
+    [ "$status" -ne 0 ] || status=1
+  fi
+  exit "$status"
+}
+forget_allocation(){
+  local path=$1 remaining=() allocated
+  for allocated in "${allocations[@]}"; do
+    [ "$allocated" = "$path" ] || remaining+=("$allocated")
+  done
+  allocations=("${remaining[@]}")
+}
+allocate_temp(){
+  local template=$1 path allocation_status
+  pending_signal=0
+  trap 'pending_signal=129' HUP
+  trap 'pending_signal=130' INT
+  trap 'pending_signal=143' TERM
+  if path=$(mktemp "$template"); then
+    allocations+=("$path")
+  else
+    allocation_status=$?
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ "$pending_signal" -eq 0 ] || exit "$pending_signal"
+    return "$allocation_status"
+  fi
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  [ "$pending_signal" -eq 0 ] || exit "$pending_signal"
+  allocated_temp=$path
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+allocate_temp "$output.response.XXXXXX"; meetings=$allocated_temp
+allocate_temp "$output.headers.XXXXXX"; headers=$allocated_temp
 [ "$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 -o "$meetings" -w '%{http_code}' "$url/meetings")" = 200 ] ||
   fail "meetings status differs"
 jq -e 'type == "array"' "$meetings" >/dev/null || fail "meetings response is not JSON array"
@@ -44,10 +93,10 @@ jq -e 'type == "array"' "$meetings" >/dev/null || fail "meetings response is not
 curl --silent --show-error --proto '=http' -D "$headers" -o /dev/null \
   "${url/https:\/\//http://}/meetings" || fail "HTTP redirect probe failed"
 grep -Eiq '^location:[[:space:]]*https://' "$headers" || fail "HTTP does not redirect to HTTPS"
-tmp=$output.tmp.$$
-trap 'rm -f -- "$tmp" "$meetings" "$headers"' EXIT HUP INT TERM
+allocate_temp "$output.tmp.XXXXXX"; tmp=$allocated_temp
 jq -cnS --arg image "$image" --arg hash "$config_hash" \
   '{schema:"meet-backend/test-vps-recovery-runtime/v1",healthy:true,
     runtime:{imageId:$image,configHash:$hash,health:"healthy",uploadsMount:"volume"},
     https:{meetingsStatus:"200",actuatorStatus:"404",httpRedirectHttps:true,meetingsJson:true}}' >"$tmp"
-chmod 600 "$tmp"; mv -f -- "$tmp" "$output"; trap - EXIT HUP INT TERM
+chmod 600 "$tmp"; mv -f -- "$tmp" "$output"
+forget_allocation "$tmp"
