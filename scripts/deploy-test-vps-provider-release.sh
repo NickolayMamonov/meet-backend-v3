@@ -14,7 +14,7 @@ is_supported_test_vps_version() {
 }
 
 usage() {
-  echo "usage: $0 --root PATH --base-compose PATH --image IMAGE@sha256:DIGEST --revision SHA --version VERSION --run-key KEY --mode deploy|rollback-drill [--failure-policy automatic-rollback|manual-stop] [--closed-beta-safety --state-mode empty-closed|closed-beta-demo] [--public-url https://HOST]" >&2
+  echo "usage: $0 --root PATH --base-compose PATH --image IMAGE@sha256:DIGEST --revision SHA --version VERSION --run-key KEY --mode deploy|rollback-drill [--failure-policy automatic-rollback|manual-stop] [--pending-locationiq-off] [--reconcile-failed-40368479855-forward] [--closed-beta-safety --state-mode empty-closed|closed-beta-demo] [--public-url https://HOST]" >&2
   exit 2
 }
 
@@ -40,6 +40,33 @@ provider_release_on_exit() {
 }
 
 provider_release_stop_backend() {
+  if [ "${reconcile_failed_40368479855_forward:-false}" = true ]; then
+    local observed inspection
+    observed=$(compose ps -a -q backend) || return 1
+    if ! [[ "$observed" =~ ^[0-9a-f]{64}$ ]] ||
+      [ "$observed" = "$previous_container" ] ||
+      { [ -n "${candidate_container:-}" ] && [ "$observed" != "$candidate_container" ]; }; then
+      echo "manual_intervention_required=true backend_stop=identity-uncertain" >&2
+      return 1
+    fi
+    inspection=$(docker_container_inspect "$observed") || return 1
+    jq -e --arg id "$observed" --arg image_id "$target_id" \
+      --arg image "$image" --arg started "${candidate_started:-}" '
+      length == 1 and .[0].Id == $id and .[0].Image == $image_id and
+      .[0].Config.Image == $image and
+      .[0].Config.Labels["com.docker.compose.project"] == "meet-production" and
+      .[0].Config.Labels["com.docker.compose.service"] == "backend" and
+      ($started == "" or .[0].State.StartedAt == $started)
+    ' <<<"$inspection" >/dev/null || return 1
+    echo "manual_intervention_required=true backend_stop=attempted" >&2
+    if provider_release_docker_bounded stop "$observed" >/dev/null 2>&1; then
+      echo "manual_intervention_required=true backend_stop=completed" >&2
+    else
+      echo "manual_intervention_required=true backend_stop=failed" >&2
+      return 1
+    fi
+    return 0
+  fi
   echo "manual_intervention_required=true backend_stop=attempted" >&2
   if compose stop backend; then
     echo "manual_intervention_required=true backend_stop=completed" >&2
@@ -52,6 +79,158 @@ provider_release_stop_backend() {
 fail() {
   echo "test VPS deployment failed: $1" >&2
   exit 1
+}
+
+provider_release_pin_docker() {
+  if [ "${DOCKER_HOST+x}" = x ] ||
+    { [ -n "${DOCKER_CONTEXT:-}" ] && [ "$DOCKER_CONTEXT" != default ]; } ||
+    [ "${MEE_SMTP_FAKE_REMOTE:-false}" != false ] ||
+    [ -n "${RUNTIME_BASE_COMPOSE:-}" ] ||
+    [ "${RUNTIME_USE_REVIEWED_COMPOSE:-false}" != false ] ||
+    [ "${PRODUCTION_STATE_DIR:-/var/lib/meet-production}" != /var/lib/meet-production ]; then
+    fail "RECOVERY_REQUIRED"
+  fi
+  [ "$(timeout 10s docker context inspect default \
+    --format '{{.Endpoints.docker.Host}}' 2>/dev/null)" = unix:///var/run/docker.sock ] &&
+    [ "$(timeout 10s docker context show 2>/dev/null)" = default ] ||
+    fail "RECOVERY_REQUIRED"
+  # exec in production-compose.sh intentionally uses the real CLI, so bind its
+  # environment too. Direct inspections and child invariant shells use --host.
+  unset DOCKER_CONTEXT
+  export DOCKER_HOST=unix:///var/run/docker.sock
+  docker() {
+    local argument
+    for argument in "$@"; do
+      case "$argument" in --host*|--context*|-H*) return 1 ;; esac
+    done
+    command docker --host=unix:///var/run/docker.sock "$@"
+  }
+  export -f docker
+}
+
+provider_release_docker_bounded() {
+  timeout 30s bash -c 'docker "$@"' _ "$@"
+}
+
+provider_release_forward() {
+  local previous_platform target_platform rendered bundle previous_snapshot
+  local postgres_witness volume_witness final_inspect final_id
+  previous_container=$(compose ps -a -q backend)
+  [[ "$previous_container" =~ ^[0-9a-f]{64}$ ]] || fail "RECOVERY_REQUIRED"
+  previous_inspect=$(docker_container_inspect "$previous_container") ||
+    fail "RECOVERY_REQUIRED"
+  previous_id=$(jq -er '.[0].Image' <<<"$previous_inspect")
+  previous_revision=$(jq -er '.[0].Config.Labels["org.opencontainers.image.revision"]' \
+    <<<"$previous_inspect")
+  previous_version=$(jq -er '.[0].Config.Labels["org.opencontainers.image.version"]' \
+    <<<"$previous_inspect")
+  previous_started=$(jq -er '.[0].State.StartedAt' <<<"$previous_inspect")
+  previous_platform=$(docker_image_inspect "$previous_id") || fail "RECOVERY_REQUIRED"
+  target_image_inspect=$(docker_image_inspect "$image") || fail "RECOVERY_REQUIRED"
+  target_id=$(jq -er '.[0].Id' <<<"$target_image_inspect")
+  target_platform=$(docker_image_inspect \
+    ghcr.io/nickolaymamonov/meet-backend-v3@sha256:9178741bc9fd1e9319acab54252e908fa2d439e66f628d0da20c169837c60cfe) ||
+    fail "RECOVERY_REQUIRED"
+  rendered=$(compose config --format json) || fail "RECOVERY_REQUIRED"
+  postgres_witness=$(forward_postgres_witness) || fail "RECOVERY_REQUIRED"
+  volume_witness=$(provider_release_docker_bounded volume inspect \
+    meet-production_postgres_data meet-production_uploads_data 2>/dev/null) ||
+    fail "RECOVERY_REQUIRED"
+  bundle=$(jq -cn --argjson backend "$previous_inspect" \
+    --argjson old "$previous_platform" --argjson target "$target_image_inspect" \
+    --argjson platform "$target_platform" --argjson config "$rendered" \
+    '{backend:$backend,previousImage:$old,targetImage:$target,
+      platformImage:$platform,rendered:$config}')
+  printf '%s' "$bundle" |
+    timeout 60s python3 -B "$provider_helper" forward-adopt \
+      --state-root "$state_root" --run-key "$run_key" \
+      --deployment-root "$root" --base-compose "$base_compose" >/dev/null ||
+    fail "RECOVERY_REQUIRED"
+  provider_enabled=$(jq -er '.providerEnabled | tostring' "$provider_pointer")
+  durable_disposition=$(jq -er '.durableDisposition' "$provider_pointer")
+  previous_snapshot=$previous_inspect
+  mutation_started=false
+  credential_prepared=false
+  rollback_complete=false
+  candidate_container=
+  candidate_started=
+  trap provider_release_on_exit EXIT
+  trap 'exit 143' TERM INT HUP
+  [ "$(compose ps -a -q backend)" = "$previous_container" ] &&
+    [ "$(forward_postgres_witness)" = "$postgres_witness" ] &&
+    [ "$(provider_release_docker_bounded volume inspect \
+      meet-production_postgres_data meet-production_uploads_data 2>/dev/null)" = "$volume_witness" ] &&
+    [ "$(docker_image_inspect "$image")" = "$target_image_inspect" ] &&
+    [ "$(compose config --format json)" = "$rendered" ] ||
+    fail "RECOVERY_REQUIRED"
+  previous_inspect=$(docker_container_inspect "$previous_container") ||
+    fail "RECOVERY_REQUIRED"
+  [ "$previous_inspect" = "$previous_snapshot" ] || fail "RECOVERY_REQUIRED"
+  printf '%s' "$previous_inspect" |
+    timeout 30s python3 -B "$provider_helper" forward-revalidate \
+      --state-root "$state_root" --run-key "$run_key" >/dev/null ||
+    fail "RECOVERY_REQUIRED"
+  # No updater, active-file installation, credential preparation, or old restart.
+  mutation_started=true
+  compose_up -d --no-deps --no-build --pull never --force-recreate \
+    --wait --wait-timeout 180 backend >/dev/null
+  candidate_container=$(compose ps -a -q backend)
+  [[ "$candidate_container" =~ ^[0-9a-f]{64}$ ]] &&
+    [ "$candidate_container" != "$previous_container" ] || fail "RECOVERY_REQUIRED"
+  candidate_inspect=$(docker_container_inspect "$candidate_container") ||
+    fail "RECOVERY_REQUIRED"
+  candidate_started=$(jq -er '.[0].State.StartedAt' <<<"$candidate_inspect")
+  target_hash=$(jq -er '.[0].Config.Labels["com.docker.compose.config-hash"]' \
+    <<<"$candidate_inspect")
+  [[ "$target_hash" =~ ^[0-9a-f]{64}$ ]] || fail "RECOVERY_REQUIRED"
+  timeout 30s python3 -B "$provider_helper" forward-phase \
+    --state-root "$state_root" --run-key "$run_key" --phase verifying ||
+    fail "RECOVERY_REQUIRED"
+  printf '[%s,%s]' "$previous_inspect" "$candidate_inspect" |
+    timeout 30s python3 -B "$provider_helper" verify \
+      --state-root "$state_root" --run-key "$run_key" --phase candidate >/dev/null ||
+    fail "RECOVERY_REQUIRED"
+  runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
+    >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
+  pending_candidate_proof
+  verify_public_contract "$public_url"
+  [ "$(forward_postgres_witness)" = "$postgres_witness" ] &&
+    [ "$(provider_release_docker_bounded volume inspect \
+      meet-production_postgres_data meet-production_uploads_data 2>/dev/null)" = "$volume_witness" ] ||
+    fail "RECOVERY_REQUIRED"
+  final_id=$(compose ps -a -q backend)
+  [ "$final_id" = "$candidate_container" ] || fail "RECOVERY_REQUIRED"
+  final_inspect=$(docker_container_inspect "$final_id") || fail "RECOVERY_REQUIRED"
+  [ "$(jq -er '.[0].State.StartedAt' <<<"$final_inspect")" = "$candidate_started" ] ||
+    fail "RECOVERY_REQUIRED"
+  runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
+    >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
+  pending_candidate_proof
+  printf '%s' "$final_inspect" |
+    timeout 60s python3 -B "$provider_helper" forward-complete \
+      --state-root "$state_root" --run-key "$run_key" ||
+    fail "RECOVERY_REQUIRED"
+  mutation_started=false
+  rollback_complete=true
+  echo "reconciliation=completed origin_run_key=40368479855-1 successor_run_key=$run_key"
+  echo "deployment=completed image_id=$target_id version=$version revision=$revision"
+}
+
+forward_postgres_witness() {
+  local postgres inspection
+  postgres=$(compose ps -a -q postgres)
+  [[ "$postgres" =~ ^[0-9a-f]{64}$ ]] || return 1
+  inspection=$(docker_container_inspect "$postgres") || return 1
+  jq -ce '
+    select(length == 1) | .[0] |
+    select(.State.Running == true and .State.Health.Status == "healthy" and
+      .Config.Labels["com.docker.compose.project"] == "meet-production" and
+      .Config.Labels["com.docker.compose.service"] == "postgres" and
+      (.HostConfig.PortBindings == {} or .HostConfig.PortBindings == null) and
+      ([.Mounts[] | select(.Destination == "/var/lib/postgresql/data") |
+        [.Type,.Name]] == [["volume","meet-production_postgres_data"]])) |
+    {Id,Image,Config,HostConfig,Mounts,networks:.NetworkSettings.Networks}
+  ' <<<"$inspection"
 }
 
 verify_production_env_settings() {
@@ -679,6 +858,7 @@ mode=
 failure_policy=automatic-rollback
 failure_policy_set=false
 pending_locationiq_off=false
+reconcile_failed_40368479855_forward=false
 pending_policy=()
 closed_beta_safety=false
 public_url=
@@ -695,6 +875,11 @@ while [ "$#" -gt 0 ]; do
     --pending-locationiq-off)
       [ "$pending_locationiq_off" = false ] || usage
       pending_locationiq_off=true
+      shift
+      ;;
+    --reconcile-failed-40368479855-forward)
+      [ "$reconcile_failed_40368479855_forward" = false ] || usage
+      reconcile_failed_40368479855_forward=true
       shift
       ;;
     --failure-policy)
@@ -741,6 +926,18 @@ fi
 if [ "$pending_locationiq_off" = true ]; then
   [ "$failure_policy" = manual-stop ] && [ "$mode" = deploy ] &&
     [ "$closed_beta_safety" = false ] || usage
+fi
+if [ "$reconcile_failed_40368479855_forward" = true ]; then
+  [ "$pending_locationiq_off" = true ] &&
+    [ "$failure_policy" = manual-stop ] &&
+    [ "$mode" = deploy ] &&
+    [ "$closed_beta_safety" = false ] &&
+    [ "$version" = 1.6.0 ] &&
+    [ "$revision" = 462b52b403c73027a262e183d1bd9ae4964938d8 ] &&
+    [ "$image" = "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:1f2c56da34fa905553739f79bf91647d0087ec72159efc40828ba91622033d4b" ] &&
+    [[ "$run_key" =~ ^[0-9]+-1$ ]] &&
+    [ "$run_key" != 40368479855-1 ] || usage
+  [ -n "$public_url" ] || usage
 fi
 if [ -n "$public_url" ]; then
   [[ "$public_url" =~ ^https://[^/]+$ ]] || usage
@@ -789,10 +986,18 @@ timeout 30s python3 "$provider_helper" check >/dev/null ||
 source "$runtime_helper"
 
 docker_image_inspect() {
+  if [ "$reconcile_failed_40368479855_forward" = true ]; then
+    provider_release_docker_bounded image inspect "$@" 2>/dev/null || return 1
+    return 0
+  fi
   timeout 30s docker image inspect "$@" 2>/dev/null
 }
 
 docker_container_inspect() {
+  if [ "$reconcile_failed_40368479855_forward" = true ]; then
+    provider_release_docker_bounded inspect "$@" 2>/dev/null || return 1
+    return 0
+  fi
   timeout 30s docker inspect "$@" 2>/dev/null
 }
 
@@ -820,8 +1025,26 @@ provider_pointer=$state_root/.provider-transaction.current
 state_suffix=final-deploy
 [ "$mode" = rollback-drill ] && state_suffix=rollback-drill
 state=$state_root/$run_key-$state_suffix
-install -d -m 700 "$state_root"
-exec 9>"$state_root/.deploy.lock"
+if [ "$reconcile_failed_40368479855_forward" = true ]; then
+  [ -d "$state_root" ] && [ ! -L "$state_root" ] &&
+    [ -f "$state_root/.deploy.lock" ] && [ ! -L "$state_root/.deploy.lock" ] ||
+    fail "RECOVERY_REQUIRED"
+  timeout 10s python3 - "$state_root/.deploy.lock" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+info = os.lstat(path)
+if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) not in (0o600, 0o644)):
+    raise SystemExit(1)
+PY
+  exec 9<>"$state_root/.deploy.lock"
+else
+  install -d -m 700 "$state_root"
+  exec 9>"$state_root/.deploy.lock"
+fi
 flock -n 9 || fail "another test VPS deployment is active"
 if [ "$closed_beta_safety" = true ]; then
   [ -f "$safety_hook" ] && [ ! -L "$safety_hook" ] && [ -x "$safety_hook" ] ||
@@ -833,18 +1056,24 @@ fi
 if [ -e "$smtp_pointer" ] || [ -L "$smtp_pointer" ]; then
   fail "SMTP transaction is active; reconcile it with the SMTP tooling first"
 fi
-if [ -e "$provider_pointer" ] || [ -L "$provider_pointer" ]; then
+if [ "$reconcile_failed_40368479855_forward" = true ]; then
+  provider_release_pin_docker
+fi
+if [ "$reconcile_failed_40368479855_forward" != true ] &&
+  { [ -e "$provider_pointer" ] || [ -L "$provider_pointer" ]; }; then
   fail "RECOVERY_REQUIRED"
 fi
-timeout 30s python3 "$provider_helper" retention-check \
-  --state-root "$state_root" >/dev/null ||
-  fail "RECOVERY_REQUIRED"
+if [ "$reconcile_failed_40368479855_forward" != true ]; then
+  timeout 30s python3 "$provider_helper" retention-check \
+    --state-root "$state_root" >/dev/null ||
+    fail "RECOVERY_REQUIRED"
 
-timeout 30s python3 "$provider_helper" state-publish \
-  --state-root "$state_root" \
-  --run-key "$run_key" \
-  --state-kind "$state_suffix" >/dev/null ||
-  fail "RECOVERY_REQUIRED"
+  timeout 30s python3 "$provider_helper" state-publish \
+    --state-root "$state_root" \
+    --run-key "$run_key" \
+    --state-kind "$state_suffix" >/dev/null ||
+    fail "RECOVERY_REQUIRED"
+fi
 
 compose() {
   timeout 30s bash -c '
@@ -861,6 +1090,11 @@ compose_up() {
     runtime_compose "$2" "$3" up "${@:4}"
   ' _ "$runtime_helper" "$root" "$compose_script" "$@" 2>/dev/null
 }
+
+if [ "$reconcile_failed_40368479855_forward" = true ]; then
+  provider_release_forward
+  return
+fi
 
 previous_image=$(runtime_release_field_bounded BACKEND_IMAGE) ||
   fail "PROVIDER_STATE_INVALID"

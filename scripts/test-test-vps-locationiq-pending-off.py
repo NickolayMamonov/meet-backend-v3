@@ -152,6 +152,46 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(tool.Rejected):
                 tool.verify("predecessor", BASE, records, IMAGE_ID)
 
+    def test_stopped_predecessor_comparator_does_not_claim_health(self):
+        backend = record()
+        backend["State"].update(
+            Running=False, Status="exited", ExitCode=143, Paused=False,
+            Restarting=False, Dead=False, FinishedAt="2026-10-26T17:30:24.669192243Z")
+        observed = tool.stopped_predecessor_record(
+            [backend], backend["Id"], "2026-10-26T17:30:24.669192243Z"
+        )
+        tool.compare_predecessor_environment(BASE, observed)
+        for expected_id, finished in (
+            ("wrong", "2026-10-26T17:30:24.669192243Z"),
+            (backend["Id"], "2026-10-26T17:30:24.669192244Z"),
+        ):
+            with self.assertRaises(tool.Rejected):
+                tool.stopped_predecessor_record([backend], expected_id, finished)
+        with self.assertRaises(tool.Rejected):
+            tool.one_record([backend])
+        drifted = json.loads(json.dumps(backend))
+        drifted["Config"]["Env"].append("OTHER=changed")
+        with self.assertRaises(tool.Rejected):
+            tool.compare_predecessor_environment(
+                BASE,
+                tool.stopped_predecessor_record(
+                    [drifted], drifted["Id"],
+                    "2026-10-26T17:30:24.669192243Z",
+                ),
+            )
+        with self.assertRaises(tool.Rejected):
+            tool.stopped_predecessor_record(
+                [backend, backend], backend["Id"],
+                "2026-10-26T17:30:24.669192243Z",
+            )
+        running = json.loads(json.dumps(backend))
+        running["State"]["Running"] = True
+        with self.assertRaises(tool.Rejected):
+            tool.stopped_predecessor_record(
+                [running], running["Id"],
+                "2026-10-26T17:30:24.669192243Z",
+            )
+
     def test_fixed_public_tuple_not_caller_arbitrary_authorization(self):
         args = [tool.IMAGE, tool.REVISION, tool.VERSION, IMAGE_ID]
         tool.approved(*args)
@@ -287,7 +327,7 @@ class ComposeRoutingTests(unittest.TestCase):
             self.assertIsNotNone(match)
             functions.append(match.group())
         calls = re.findall(r"^\s*compose_up (-d.*?backend)", source, re.M | re.S)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         expected = ["-d", "--no-deps", "--no-build", "--pull", "never",
                     "--force-recreate", "--wait", "--wait-timeout", "180", "backend"]
         for call in calls:

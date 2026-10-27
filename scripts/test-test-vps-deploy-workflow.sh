@@ -10,6 +10,7 @@ runtime=scripts/test-vps-runtime-invariants.sh
 provider_deploy=scripts/deploy-test-vps-provider-release.sh
 provider_helper=scripts/test-vps-provider-credential.py
 provider_tests=scripts/test-test-vps-provider-credential.py
+forward_tests=scripts/test-test-vps-provider-forward-reconcile.py
 provider_runtime=scripts/test-test-vps-provider-runtime.sh
 retention_fixture=scripts/test-test-vps-retention.sh
 public_probes=scripts/test-test-vps-public-probes.sh
@@ -20,6 +21,7 @@ baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
 [ -f "$workflow" ] && [ -f "$deploy" ] && [ -f "$runtime" ] &&
   [ -f "$provider_deploy" ] && [ -f "$provider_helper" ] &&
   [ -f "$provider_tests" ] && [ -f "$provider_runtime" ] &&
+  [ -f "$forward_tests" ] &&
   [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
   [ -f "$public_probe" ] && [ -f "$closed_beta_fixture" ]
 workflow_text=$(<"$workflow")
@@ -58,9 +60,11 @@ preflight_run=$(awk '
 for text in \
   'workflow_dispatch:' \
   'apply_pending_locationiq_off:' \
+  'reconcile_failed_40368479855_forward:' \
   'default: false' \
   'pending-locationiq-off' \
   'APPLY_PENDING_LOCATIONIQ_OFF' \
+  'RECONCILE_FAILED_40368479855_FORWARD' \
   '423828315' \
   '462b52b403c73027a262e183d1bd9ae4964938d8' \
   '05b0f337120f533bfaebbc597ff523d91aaa3a85' \
@@ -120,6 +124,9 @@ deploy_step=$(awk '/^      - name: Deploy selected release successfully$/{active
   { echo "pending flag is not conditionally routed to deployment" >&2; exit 1; }
 [[ "$deploy_step" != *'pending_args+=(--pending-locationiq-off)'*rollback* ]] ||
   { echo "pending flag leaked to rollback drill" >&2; exit 1; }
+[[ "$deploy_step" == *'reconcile_args+=(--reconcile-failed-40368479855-forward)'* ]] &&
+  [[ "$deploy_step" == *'"${reconcile_args[@]}"'* ]] ||
+  { echo "forward reconciliation flag is not conditionally routed" >&2; exit 1; }
 
 for text in \
   'scripts/deploy-test-vps-provider-release.sh' \
@@ -235,6 +242,11 @@ for frozen in \
 done
 
 python3 -B "$provider_tests"
+if [ "$(id -u)" -eq 0 ]; then
+  python3 -B "$forward_tests"
+else
+  sudo --non-interactive python3 -B "$forward_tests"
+fi
 if [ "$(uname -s)" = Linux ]; then
   timeout 120s bash "$public_probes"
 else
@@ -317,6 +329,34 @@ for tuple in 'v1.2.0 false manual-stop true' 'v1.6.0 true manual-stop true' \
   read -r tag drill policy optin <<<"$tuple"
   if valid_env "$tag" "$drill" "$policy" "$optin"; then
     echo "workflow preflight accepted incompatible pending transition: $tuple" >&2
+    exit 1
+  fi
+done
+if ! env -i PATH="$PATH" TAG=v1.6.0 RUN_ROLLBACK_DRILL=false \
+  FAILURE_POLICY=manual-stop APPLY_PENDING_LOCATIONIQ_OFF=true \
+  RECONCILE_FAILED_40368479855_FORWARD=true GITHUB_RUN_ID=99999999999 \
+  GITHUB_RUN_ATTEMPT=1 HOST=example.test PORT=22 SSH_USER=root \
+  PATH_ON_HOST=/opt/meet-backend HOST_FINGERPRINT=SHA256:abc \
+  SSH_PRIVATE_KEY='-----BEGIN OPENSSH PRIVATE KEY-----' \
+  bash "$tmp/preflight.sh" >/dev/null 2>&1; then
+  echo "workflow preflight rejected valid first-attempt forward opt-in" >&2
+  exit 1
+fi
+for invalid in \
+  'v1.2.0 false manual-stop true 99999999999 1' \
+  'v1.6.0 true manual-stop true 99999999999 1' \
+  'v1.6.0 false automatic-rollback true 99999999999 1' \
+  'v1.6.0 false manual-stop true 40368479855 1' \
+  'v1.6.0 false manual-stop true 99999999999 2'; do
+  read -r tag drill policy off run attempt <<<"$invalid"
+  if env -i PATH="$PATH" TAG="$tag" RUN_ROLLBACK_DRILL="$drill" \
+    FAILURE_POLICY="$policy" APPLY_PENDING_LOCATIONIQ_OFF="$off" \
+    RECONCILE_FAILED_40368479855_FORWARD=true GITHUB_RUN_ID="$run" \
+    GITHUB_RUN_ATTEMPT="$attempt" HOST=example.test PORT=22 SSH_USER=root \
+    PATH_ON_HOST=/opt/meet-backend HOST_FINGERPRINT=SHA256:abc \
+    SSH_PRIVATE_KEY='-----BEGIN OPENSSH PRIVATE KEY-----' \
+    bash "$tmp/preflight.sh" >/dev/null 2>&1; then
+    echo "workflow preflight accepted invalid forward opt-in: $invalid" >&2
     exit 1
   fi
 done

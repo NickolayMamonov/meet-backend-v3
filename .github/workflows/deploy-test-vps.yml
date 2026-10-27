@@ -26,6 +26,11 @@ on:
         required: true
         default: false
         type: boolean
+      reconcile_failed_40368479855_forward:
+        description: Reconcile the exact failed v1.6.0 deployment forward
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -46,6 +51,7 @@ jobs:
       RUN_ROLLBACK_DRILL: ${{ inputs.run_rollback_drill }}
       FAILURE_POLICY: ${{ inputs.failure_policy }}
       APPLY_PENDING_LOCATIONIQ_OFF: ${{ inputs.apply_pending_locationiq_off }}
+      RECONCILE_FAILED_40368479855_FORWARD: ${{ inputs.reconcile_failed_40368479855_forward }}
       HOST: ${{ vars.TEST_VPS_HOST }}
       PORT: ${{ vars.TEST_VPS_PORT }}
       SSH_USER: ${{ vars.TEST_VPS_USER }}
@@ -64,6 +70,18 @@ jobs:
           case "$FAILURE_POLICY" in automatic-rollback|manual-stop) ;; *) exit 1 ;; esac
           APPLY_PENDING_LOCATIONIQ_OFF=${APPLY_PENDING_LOCATIONIQ_OFF-false}
           case "$APPLY_PENDING_LOCATIONIQ_OFF" in true|false) ;; *) exit 1 ;; esac
+          RECONCILE_FAILED_40368479855_FORWARD=${RECONCILE_FAILED_40368479855_FORWARD-false}
+          case "$RECONCILE_FAILED_40368479855_FORWARD" in true|false) ;; *) exit 1 ;; esac
+          if [ "$RECONCILE_FAILED_40368479855_FORWARD" = true ] &&
+            { [ "$TAG" != v1.6.0 ] || [ "$FAILURE_POLICY" != manual-stop ] ||
+              [ "$RUN_ROLLBACK_DRILL" != false ] ||
+              [ "$APPLY_PENDING_LOCATIONIQ_OFF" != true ] ||
+              [ "$GITHUB_RUN_ATTEMPT" != 1 ] ||
+              [ "$PATH_ON_HOST" != /opt/meet-backend ] ||
+              [ "$GITHUB_RUN_ID" = 40368479855 ]; }; then
+            echo "forward reconciliation requires the exact v1.6.0/OFF/manual-stop initial attempt and a new run" >&2
+            exit 1
+          fi
           if [ "$APPLY_PENDING_LOCATIONIQ_OFF" = true ] &&
             { [ "$TAG" != v1.6.0 ] || [ "$FAILURE_POLICY" != manual-stop ] ||
               [ "$RUN_ROLLBACK_DRILL" != false ]; }; then
@@ -161,6 +179,27 @@ jobs:
               .artifactAttestation == true and
               .evidence == ["image-index.json","image-inspect.txt"]
             ' "$release_dir/release-manifest.json" >/dev/null
+
+          if [ "$RECONCILE_FAILED_40368479855_FORWARD" = true ]; then
+            jq -e '
+              type == "object" and .id == 423828315 and
+              .tag_name == "v1.6.0" and
+              .target_commitish == "462b52b403c73027a262e183d1bd9ae4964938d8"
+            ' "$release_dir/release.json" >/dev/null
+            jq -e '
+              .schema == "meet-backend/release-evidence/v1" and
+              .version == "1.6.0" and .releaseId == 423828315 and
+              .sourceSha == "462b52b403c73027a262e183d1bd9ae4964938d8" and
+              .digest == "sha256:1f2c56da34fa905553739f79bf91647d0087ec72159efc40828ba91622033d4b" and
+              .platform == "linux/amd64"
+            ' "$release_dir/release-manifest.json" >/dev/null
+            jq -e '
+              [.manifests[] |
+                select(.platform.os == "linux" and
+                  .platform.architecture == "amd64") | .digest] ==
+              ["sha256:9178741bc9fd1e9319acab54252e908fa2d439e66f628d0da20c169837c60cfe"]
+            ' "$release_dir/image-index.json" >/dev/null
+          fi
 
           timeout 30s docker buildx imagetools inspect "$IMAGE@$digest" --raw \
             >"$release_dir/live-image-index.json"
@@ -312,11 +351,16 @@ jobs:
         run: |
           set -euo pipefail
           target_id=$(timeout 300s ssh -F "$SSH_CONFIG" test-vps bash -s -- \
-            "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
+            "$IMAGE@$DIGEST" "$SOURCE_SHA" "$VERSION" \
+            "$RECONCILE_FAILED_40368479855_FORWARD" "$REMOTE_TOOLING" <<'REMOTE'
           set -euo pipefail
           image=$1
           revision=$2
           version=$3
+          if [ "$4" = true ]; then
+            source "$5/scripts/deploy-test-vps-provider-release.sh"
+            provider_release_pin_docker
+          fi
           timeout 240s docker pull "$image" >/dev/null
           test "$(timeout 30s docker image inspect "$image" \
             --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
@@ -427,8 +471,12 @@ jobs:
         run: |
           set -euo pipefail
           pending_args=()
+          reconcile_args=()
           if [ "$APPLY_PENDING_LOCATIONIQ_OFF" = true ]; then
             pending_args+=(--pending-locationiq-off)
+          fi
+          if [ "$RECONCILE_FAILED_40368479855_FORWARD" = true ]; then
+            reconcile_args+=(--reconcile-failed-40368479855-forward)
           fi
           if ! timeout 900s ssh -F "$SSH_CONFIG" test-vps \
             "$REMOTE_TOOLING/scripts/deploy-test-vps-provider-release.sh" \
@@ -441,6 +489,7 @@ jobs:
             --failure-policy "$FAILURE_POLICY" \
             --public-url "$PUBLIC_URL" \
             "${pending_args[@]}" \
+            "${reconcile_args[@]}" \
             --mode deploy |
             tee "$RUNNER_TEMP/deploy-output.txt"; then
             echo "RECOVERY_REQUIRED" >&2
@@ -498,11 +547,16 @@ jobs:
         run: |
           set -euo pipefail
           runtime=$(timeout 180s ssh -F "$SSH_CONFIG" test-vps bash -s -- \
-            "$TARGET_IMAGE_ID" "$SOURCE_SHA" "$VERSION" <<'REMOTE'
+            "$TARGET_IMAGE_ID" "$SOURCE_SHA" "$VERSION" \
+            "$RECONCILE_FAILED_40368479855_FORWARD" "$REMOTE_TOOLING" <<'REMOTE'
           set -euo pipefail
           expected_id=$1
           revision=$2
           version=$3
+          if [ "$4" = true ]; then
+            source "$5/scripts/deploy-test-vps-provider-release.sh"
+            provider_release_pin_docker
+          fi
           mapfile -t backends < <(timeout 30s docker ps -q \
             --filter label=com.docker.compose.project=meet-production \
             --filter label=com.docker.compose.service=backend)
@@ -599,12 +653,18 @@ jobs:
           set -euo pipefail
           if ! timeout 300s ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$PATH_ON_HOST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-            "$REMOTE_TOOLING" <<'REMOTE'
+            "$REMOTE_TOOLING" "$RECONCILE_FAILED_40368479855_FORWARD" <<'REMOTE'
           set -euo pipefail
           root=$1
           run_id=$2
           run_attempt=$3
           tooling=$4
+          docker_selection=()
+          if [ "${5:-false}" = true ]; then
+            source "$tooling/scripts/deploy-test-vps-provider-release.sh"
+            provider_release_pin_docker
+            docker_selection=(DOCKER_HOST=unix:///var/run/docker.sock)
+          fi
           tooling_prefix="$root/.test-vps-tooling-"
           state_root=/var/lib/meet-test-vps-deploy
           [[ "$run_id" =~ ^[0-9]+$ ]] && [[ "$run_attempt" =~ ^[0-9]+$ ]]
@@ -641,7 +701,7 @@ jobs:
           compose_refs() {
             local rendered
             rendered=$(timeout 30s env -i PATH="$PATH" HOME=/root COMPOSE_PROJECT_NAME=meet-production \
-              docker compose --project-directory "$root" \
+              "${docker_selection[@]}" docker compose --project-directory "$root" \
               --env-file "$root/.env.production" "$@" config --format json 2>/dev/null) ||
               return 1
             refs=$(jq -r '

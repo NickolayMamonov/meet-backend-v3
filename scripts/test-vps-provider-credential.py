@@ -10,8 +10,13 @@ transaction.
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
 import ctypes
 import errno
+import hashlib
+import importlib.util
+import io
 import json
 import os
 import re
@@ -40,6 +45,22 @@ STATE_RUN_KEY_RE = r"^[0-9]+-[0-9]+$"
 OWNER_MARKER = "provider-owner.json"
 OWNER = "meet-test-vps-provider"
 STATE_KINDS = frozenset(("final-deploy", "rollback-drill"))
+FORWARD_ORIGIN_KEY = "40368479855-1"
+FORWARD_ORIGIN_STATE = FORWARD_ORIGIN_KEY + "-final-deploy"
+FORWARD_ROOT = "/opt/meet-backend"
+FORWARD_ACTIVE_ROOT = "/var/lib/meet-production"
+FORWARD_FINISHED = "2026-10-26T17:30:24.669192243Z"
+FORWARD_ARCHIVE = (
+    "/var/lib/meet-test-vps-incident-archive/"
+    "40368479855-1-forward-reconciled"
+)
+FORWARD_TARGET = {
+    "releaseId": 423828315,
+    "version": "1.6.0",
+    "source": "462b52b403c73027a262e183d1bd9ae4964938d8",
+    "indexDigest": "sha256:1f2c56da34fa905553739f79bf91647d0087ec72159efc40828ba91622033d4b",
+    "amd64ManifestDigest": "sha256:9178741bc9fd1e9319acab54252e908fa2d439e66f628d0da20c169837c60cfe",
+}
 RENAME_NOREPLACE = 1
 PUSH_KEYS = (
     "APP_PUSH_PROVIDER_ENABLED",
@@ -684,6 +705,7 @@ def _rename_noreplace(
     *,
     expected_source_fd: int | None = None,
     expected_source_inode: tuple[int, int] | None = None,
+    destination_directory_fd: int | None = None,
 ) -> None:
     if (
         not source
@@ -728,7 +750,7 @@ def _rename_noreplace(
     result = renameat2(
         directory_fd,
         os.fsencode(source),
-        directory_fd,
+        directory_fd if destination_directory_fd is None else destination_directory_fd,
         os.fsencode(destination),
         RENAME_NOREPLACE,
     )
@@ -823,7 +845,7 @@ def _open_private_state_file(path: str) -> tuple[int, os.stat_result, bytes]:
         ):
             _fail("recovery")
         _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
-        data = _read_fd_bounded(fd, MAX_OWNER_BYTES)
+        data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
         final = os.fstat(fd)
         if _identity(info) != _identity(final):
             _fail("recovery")
@@ -857,7 +879,7 @@ def _open_private_state_file_at(
         ):
             _fail("recovery")
         _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
-        data = _read_fd_bounded(fd, MAX_OWNER_BYTES)
+        data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
         final = os.fstat(fd)
         if _identity(info) != _identity(final):
             _fail("recovery")
@@ -1152,6 +1174,1530 @@ def _validate_identity(value: Any) -> None:
             for key in record
         ):
             _fail("recovery")
+
+
+FORWARD_IDENTITY_KEYS = frozenset(
+    {"device", "inode", "mode", "uid", "gid", "nlink", "size", "mtimeNs", "ctimeNs"}
+)
+FORWARD_SOURCE_KEYS = frozenset(
+    {"role", "path", "kind", "identity", "snapshotRef", "bytesBase64"}
+)
+FORWARD_STOPPED_KEYS = frozenset(
+    {
+        "containerId", "imageId", "revision", "version", "configHash",
+        "startedAt", "finishedAt", "status", "exitCode", "running", "paused",
+        "restarting", "dead", "envSnapshotRef", "envComparison", "staticInspect",
+    }
+)
+FORWARD_REQUIRED_CHILDREN = frozenset({
+    OWNER_MARKER, "config.env.production", "config.env.production.identity",
+    "config.env.target", "config.env.target.identity", "config.env.previous",
+    "config.base-compose.yml", "config.base-compose.yml.identity",
+    "candidate-active-compose.yml", "candidate-active-compose.identity",
+    "candidate-active-runtime.yml", "candidate-active-runtime.identity",
+    "previous-image", "previous-image-id", "previous-revision", "previous-version",
+    "previous-runtime-config-hash", "target-runtime.override.yml",
+})
+
+
+def _forward_identity(value: Any) -> None:
+    if (not isinstance(value, dict) or set(value) != FORWARD_IDENTITY_KEYS
+            or any(type(item) is not int or item < 0 for item in value.values())):
+        _fail("recovery")
+
+
+def _forward_identity_from_stat(info: os.stat_result) -> dict[str, int]:
+    return {
+        "device": int(info.st_dev),
+        "inode": int(info.st_ino),
+        "mode": int(info.st_mode),
+        "uid": int(info.st_uid),
+        "gid": int(info.st_gid),
+        "nlink": int(info.st_nlink),
+        "size": int(info.st_size),
+        "mtimeNs": int(info.st_mtime_ns),
+        "ctimeNs": int(info.st_ctime_ns),
+    }
+
+
+def _forward_path(value: Any) -> None:
+    if (not isinstance(value, str) or not value.startswith("/")
+            or "\x00" in value
+            or any(part in ("", ".", "..") for part in value.split("/")[1:])):
+        _fail("recovery")
+
+
+def _forward_external_paths(successor: str) -> dict[str, str]:
+    return {
+        "production-env": FORWARD_ROOT + "/.env.production",
+        "fallback-compose": FORWARD_ROOT + "/docker-compose.production.yml",
+        "original-base": FORWARD_ROOT + "/.test-vps-tooling-" +
+                         FORWARD_ORIGIN_KEY + "/docker-compose.production.yml",
+        "reviewed-base": FORWARD_ROOT + "/.test-vps-tooling-" +
+                         successor + "/docker-compose.production.yml",
+        "active-compose": FORWARD_ACTIVE_ROOT + "/active-compose.yml",
+        "active-runtime": FORWARD_ACTIVE_ROOT + "/active-runtime.override.yml",
+    }
+
+
+def _forward_static(inspect: dict[str, Any]) -> dict[str, Any]:
+    """Only the nonsecret fields compared by stopped-runtime admission."""
+    config, host = inspect["Config"], inspect["HostConfig"]
+    mounts = [{
+        "type": mount.get("Type", ""),
+        "source": mount.get("Name") or mount.get("Source", ""),
+        "destination": mount.get("Destination", ""),
+        "readOnly": not mount.get("RW", True),
+        "propagation": mount.get("Propagation", ""),
+    } for mount in _mounts(inspect)]
+    networks = [{
+        "network": name, "aliases": sorted(value.get("Aliases") or []),
+        "driverOpts": value.get("DriverOpts") or {},
+        "ipAddress": value.get("IPAddress", ""),
+        "ipPrefixLen": value.get("IPPrefixLen", 0),
+        "gateway": value.get("Gateway", ""),
+        "globalIpv6Address": value.get("GlobalIPv6Address", ""),
+        "globalIpv6PrefixLen": value.get("GlobalIPv6PrefixLen", 0),
+        "ipv6Gateway": value.get("IPv6Gateway", ""),
+        "links": sorted(value.get("Links") or []),
+    } for name, value in sorted(inspect["NetworkSettings"]["Networks"].items())]
+    return {
+        "entrypoint": config.get("Entrypoint"),
+        "cmd": config.get("Cmd"),
+        "user": config.get("User"),
+        "mounts": sorted(mounts, key=lambda item: item["destination"]),
+        "networks": networks,
+        "hardening": {
+            "readOnly": host["ReadonlyRootfs"],
+            "restart": host["RestartPolicy"]["Name"],
+            "logging": host["LogConfig"]["Type"],
+            "capDrop": sorted(host["CapDrop"]),
+            "securityOpt": sorted(host["SecurityOpt"]),
+            "tmpfs": host["Tmpfs"],
+            "memory": host["Memory"],
+            "healthcheck": config["Healthcheck"]["Test"],
+            "ports": host["PortBindings"],
+            "privileged": host.get("Privileged", False),
+            "capAdd": host.get("CapAdd") or [],
+            "init": host.get("Init"),
+            "networkMode": host.get("NetworkMode"),
+            "pidMode": host.get("PidMode", ""),
+            "ipcMode": host.get("IpcMode", "private"),
+            "devices": host.get("Devices") or [],
+        },
+    }
+
+
+def _validate_forward_static(value: Any) -> None:
+    if (not isinstance(value, dict) or set(value) != {
+            "entrypoint", "cmd", "user", "mounts", "networks", "hardening"}
+            or value["entrypoint"] != ["java", "-jar", "app.jar"]
+            or value["cmd"] not in (None, [])
+            or value["user"] != "10001:10001"
+            or not isinstance(value["mounts"], list)
+            or not isinstance(value["networks"], list)
+            or len(value["networks"]) != 1):
+        _fail("recovery")
+    network = value["networks"][0]
+    if (not isinstance(network, dict) or set(network) != {
+            "network", "aliases", "driverOpts", "ipAddress", "ipPrefixLen", "gateway",
+            "globalIpv6Address", "globalIpv6PrefixLen", "ipv6Gateway", "links"}
+            or network["network"] != "meet-production_default"
+            or any(not isinstance(network[key], str) for key in (
+                "network", "ipAddress", "gateway", "globalIpv6Address", "ipv6Gateway"))
+            or any(type(network[key]) is not int or network[key] < 0
+                   for key in ("ipPrefixLen", "globalIpv6PrefixLen"))
+            or not isinstance(network["driverOpts"], dict)
+            or any(not isinstance(key, str) or not isinstance(item, str)
+                   for key, item in network["driverOpts"].items())):
+        _fail("recovery")
+    for key in ("aliases", "links"):
+        if (not isinstance(network[key], list)
+                or any(not isinstance(item, str) for item in network[key])
+                or network[key] != sorted(set(network[key]))):
+            _fail("recovery")
+    destinations = []
+    for mount in value["mounts"]:
+        if (not isinstance(mount, dict) or set(mount) != {
+                "type", "source", "destination", "readOnly", "propagation"}
+                or any(not isinstance(mount[key], str) for key in (
+                    "type", "source", "destination", "propagation"))
+                or type(mount["readOnly"]) is not bool):
+            _fail("recovery")
+        destinations.append(mount["destination"])
+        if mount["destination"] == "/data/uploads":
+            if (mount["type"] != "volume"
+                    or mount["source"] != "meet-production_uploads_data"
+                    or mount["readOnly"]):
+                _fail("recovery")
+        elif mount["destination"] == "/tmp":
+            if mount["type"] != "tmpfs":
+                _fail("recovery")
+        elif mount["destination"] == CONTAINER_CREDENTIAL_PATH:
+            if mount["type"] != "bind" or not mount["readOnly"]:
+                _fail("recovery")
+        else:
+            _fail("recovery")
+    if (destinations != sorted(set(destinations))
+            or "/data/uploads" not in destinations):
+        _fail("recovery")
+    hardening = value["hardening"]
+    if (not isinstance(hardening, dict) or set(hardening) != {
+            "readOnly", "restart", "logging", "capDrop", "securityOpt", "tmpfs",
+            "memory", "healthcheck", "ports", "privileged", "capAdd", "init",
+            "networkMode", "pidMode", "ipcMode", "devices"}
+            or hardening["readOnly"] is not True
+            or hardening["restart"] != "unless-stopped"
+            or hardening["logging"] != "local"
+            or hardening["privileged"] is not False
+            or hardening["capAdd"] != []
+            or hardening["init"] is not True
+            or hardening["networkMode"] != "meet-production_default"
+            or hardening["pidMode"] != ""
+            or hardening["ipcMode"] != "private"
+            or hardening["devices"] != []
+            or hardening["capDrop"] != ["ALL"]
+            or hardening["securityOpt"] != ["no-new-privileges:true"]
+            or not isinstance(hardening["tmpfs"], dict)
+            or set(hardening["tmpfs"]) != {"/tmp"}
+            or not isinstance(hardening["tmpfs"]["/tmp"], str)
+            or type(hardening["memory"]) is not int or hardening["memory"] <= 0
+            or hardening["healthcheck"] != [
+                "CMD", "curl", "--fail", "--silent", "--show-error",
+                "http://127.0.0.1:8080/meetings"]
+            or not isinstance(hardening["ports"], dict)
+            or set(hardening["ports"]) != {"8080/tcp"}):
+        _fail("recovery")
+    ports = hardening["ports"]["8080/tcp"]
+    if (not isinstance(ports, list) or len(ports) != 1
+            or not isinstance(ports[0], dict)
+            or set(ports[0]) != {"HostIp", "HostPort"}
+            or ports[0]["HostIp"] != "127.0.0.1"
+            or not isinstance(ports[0]["HostPort"], str)
+            or not re.fullmatch(r"[1-9][0-9]{0,4}", ports[0]["HostPort"])
+            or int(ports[0]["HostPort"]) > 65535):
+        _fail("recovery")
+
+
+def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any]:
+    """Strictly validate the immutable origin-to-successor ownership receipt."""
+    value = _json(data, "recovery")
+    expected = {
+        "schemaVersion", "originRunKey", "successorRunKey", "originState",
+        "originCredentialRunKey", "target", "originalMarker",
+        "originalStateIdentity", "plannedArchive", "sourceWitnesses",
+        "stoppedWitness",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        _fail("recovery")
+    if (type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1
+            or value["originRunKey"] != FORWARD_ORIGIN_KEY
+            or value["successorRunKey"] != successor_key
+            or value["originState"] != FORWARD_ORIGIN_STATE):
+        _fail("recovery")
+    if (not isinstance(successor_key, str)
+            or re.fullmatch(r"[1-9][0-9]*-1", successor_key) is None
+            or successor_key == FORWARD_ORIGIN_KEY):
+        _fail("recovery")
+    marker = value["originalMarker"]
+    if (not isinstance(marker, dict) or set(marker) != {"bytesBase64", "identity"}
+            or not isinstance(marker["bytesBase64"], str)):
+        _fail("recovery")
+    try:
+        import base64
+        marker_bytes = base64.b64decode(marker["bytesBase64"], validate=True)
+    except (ValueError, TypeError):
+        _fail("recovery")
+    if base64.b64encode(marker_bytes).decode("ascii") != marker["bytesBase64"]:
+        _fail("recovery")
+    _forward_identity(marker["identity"])
+    marker_value = _json(marker_bytes, "recovery")
+    if (not isinstance(marker_value, dict)
+            or set(marker_value) != {
+                "schemaVersion", "runKey", "phase", "providerEnabled",
+                "durableDisposition",
+            }
+            or type(marker_value["schemaVersion"]) is not int
+            or marker_value["schemaVersion"] != 1
+            or marker_value["runKey"] != FORWARD_ORIGIN_KEY
+            or marker_value["phase"] != "applying"
+            or type(marker_value["providerEnabled"]) is not bool
+            or marker_value["durableDisposition"] not in ("none", "created", "reused")):
+        _fail("recovery")
+    enabled = marker_value["providerEnabled"]
+    if ((enabled and marker_value["durableDisposition"] not in ("created", "reused"))
+            or (not enabled and marker_value["durableDisposition"] != "none")):
+        _fail("recovery")
+    if value["originCredentialRunKey"] != (FORWARD_ORIGIN_KEY if enabled else None):
+        _fail("recovery")
+    if value["target"] != FORWARD_TARGET:
+        _fail("recovery")
+    _forward_identity(value["originalStateIdentity"])
+    archive = value["plannedArchive"]
+    if (not isinstance(archive, dict) or set(archive) != {"path", "parentIdentity"}
+            or archive["path"] != FORWARD_ARCHIVE):
+        _fail("recovery")
+    _forward_identity(archive["parentIdentity"])
+    witnesses = value["sourceWitnesses"]
+    if not isinstance(witnesses, list) or not witnesses:
+        _fail("recovery")
+    previous = ""
+    copied_bytes = 0
+    origin_paths = 0
+    owner_paths = 0
+    origin_directory = None
+    source_children: set[str] = set()
+    external_roles: set[str] = set()
+    for witness in witnesses:
+        if not isinstance(witness, dict) or set(witness) != FORWARD_SOURCE_KEYS:
+            _fail("recovery")
+        role, path, kind = witness["role"], witness["path"], witness["kind"]
+        if (not isinstance(role, str) or not role or not isinstance(path, str)
+                or path <= previous):
+            _fail("recovery")
+        previous = path
+        _forward_path(path)
+        _forward_identity(witness["identity"])
+        identity = witness["identity"]
+        if (identity["uid"] != 0 or identity["gid"] != 0
+                or kind == "directory" and identity["mode"] != stat.S_IFDIR | 0o700
+                or kind == "regular-file" and (
+                    identity["mode"] not in (stat.S_IFREG | 0o600, stat.S_IFREG | 0o644)
+                    or role not in _forward_external_paths(successor_key)
+                    and identity["mode"] != stat.S_IFREG | 0o600)):
+            _fail("recovery")
+        if path.endswith("/" + FORWARD_ORIGIN_STATE):
+            if role != "origin-state" or kind != "directory":
+                _fail("recovery")
+            if witness["identity"] != value["originalStateIdentity"]:
+                _fail("recovery")
+            origin_paths += 1
+            origin_directory = path.rstrip("/")
+        elif (path.endswith("/" + FORWARD_ORIGIN_STATE + "/" + OWNER_MARKER)
+              and origin_directory is not None):
+            if (role != "owner-marker" or kind != "regular-file"
+                    or witness["snapshotRef"] is not None
+                    or not isinstance(witness["bytesBase64"], str)):
+                _fail("recovery")
+            try:
+                owner_bytes = base64.b64decode(
+                    witness["bytesBase64"], validate=True
+                )
+            except (ValueError, TypeError):
+                _fail("recovery")
+            if base64.b64encode(owner_bytes).decode("ascii") != witness["bytesBase64"]:
+                _fail("recovery")
+            _parse_state_marker(
+                owner_bytes, FORWARD_ORIGIN_KEY, "final-deploy"
+            )
+            owner_paths += 1
+            source_children.add(OWNER_MARKER)
+        elif role in _forward_external_paths(successor_key):
+            if (path != _forward_external_paths(successor_key)[role]
+                    or kind != "regular-file"
+                    or witness["snapshotRef"] is None
+                    or witness["bytesBase64"] is not None):
+                _fail("recovery")
+            external_roles.add(role)
+        else:
+            if origin_directory is None or not path.startswith(origin_directory + "/"):
+                _fail("recovery")
+            relative = path[len(origin_directory) + 1:]
+            if ("/" in relative or relative not in RETENTION_CHILDREN
+                    or relative == OWNER_MARKER
+                    or role != "state-snapshot" or kind != "regular-file"):
+                _fail("recovery")
+            if relative in ("terminal.json", "forward-adoption.json", "forward-acceptance.json"):
+                _fail("recovery")
+            source_children.add(relative)
+            if witness["snapshotRef"] != relative or witness["bytesBase64"] is not None:
+                _fail("recovery")
+        if kind == "directory":
+            if witness["snapshotRef"] is not None or witness["bytesBase64"] is not None:
+                _fail("recovery")
+        elif kind == "regular-file":
+            ref, encoded = witness["snapshotRef"], witness["bytesBase64"]
+            if witness["identity"]["nlink"] != 1:
+                _fail("recovery")
+            if ((ref is None) == (encoded is None)
+                    or ref is not None and (
+                        not isinstance(ref, str) or ref not in RETENTION_CHILDREN
+                    )
+                    or encoded is not None and not isinstance(encoded, str)):
+                _fail("recovery")
+            if encoded is not None:
+                try:
+                    raw = base64.b64decode(encoded, validate=True)
+                except (ValueError, TypeError):
+                    _fail("recovery")
+                if base64.b64encode(raw).decode("ascii") != encoded:
+                    _fail("recovery")
+                copied_bytes += len(raw)
+        else:
+            _fail("recovery")
+    if (origin_paths != 1 or owner_paths != 1 or origin_directory is None
+            or not FORWARD_REQUIRED_CHILDREN <= source_children
+            or external_roles != set(_forward_external_paths(successor_key))):
+        _fail("recovery")
+    stopped = value["stoppedWitness"]
+    if not isinstance(stopped, dict) or set(stopped) != FORWARD_STOPPED_KEYS:
+        _fail("recovery")
+    if (not re.fullmatch(r"[0-9a-f]{64}", stopped["containerId"] or "")
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", stopped["imageId"] or "")
+            or not re.fullmatch(r"[0-9a-f]{40}", stopped["revision"] or "")
+            or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", stopped["version"] or "")
+            or not re.fullmatch(r"[0-9a-f]{64}", stopped["configHash"] or "")
+            or not isinstance(stopped["startedAt"], str)
+            or stopped["finishedAt"] != FORWARD_FINISHED
+            or not stopped["startedAt"]
+            or stopped["status"] != "exited" or type(stopped["exitCode"]) is not int
+            or stopped["exitCode"] != 143
+            or any(type(stopped[name]) is not bool for name in (
+                "running", "paused", "restarting", "dead"))
+            or stopped["running"] or stopped["paused"] or stopped["restarting"] or stopped["dead"]
+            or stopped["envSnapshotRef"] != "config.env.production"
+            or stopped["envComparison"] != "pending-off-predecessor-pass"):
+        _fail("recovery")
+    _validate_forward_static(stopped["staticInspect"])
+    if copied_bytes > MAX_WITNESS_BYTES or len(data) > MAX_WITNESS_BYTES:
+        _fail("recovery")
+    return value
+
+
+def _validate_forward_acceptance(data: bytes, adoption_data: bytes,
+                                 successor_key: str) -> dict[str, Any]:
+    value = _json(data, "recovery")
+    if not isinstance(value, dict) or set(value) != {
+        "schemaVersion", "originRunKey", "successorRunKey", "adoptionSha256",
+        "target", "candidate", "checks", "plannedArchive",
+    }:
+        _fail("recovery")
+    adoption = _validate_forward_adoption(adoption_data, successor_key)
+    candidate = value["candidate"]
+    checks = value["checks"]
+    if (type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1
+            or value["originRunKey"] != FORWARD_ORIGIN_KEY
+            or value["successorRunKey"] != successor_key
+            or value["adoptionSha256"] != hashlib.sha256(adoption_data).hexdigest()
+            or value["target"] != FORWARD_TARGET
+            or value["plannedArchive"] != FORWARD_ARCHIVE
+            or not isinstance(candidate, dict)
+            or set(candidate) != {"containerId", "startedAt", "platformImageId"}
+            or not re.fullmatch(r"[0-9a-f]{64}", candidate["containerId"] or "")
+            or not isinstance(candidate["startedAt"], str) or not candidate["startedAt"]
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", candidate["platformImageId"] or "")
+            or candidate["containerId"] == adoption["stoppedWitness"]["containerId"]
+            or not isinstance(checks, dict)
+            or set(checks) != {"runtime", "pendingOff", "provider", "publicHealth"}
+            or any(result != "pass" for result in checks.values())):
+        _fail("recovery")
+    return value
+
+
+def _forward_receipt_for_run(
+    state_root: str,
+    successor_key: str,
+) -> tuple[dict[str, Any], bytes] | None:
+    name = successor_key + "-final-deploy"
+    state_path = os.path.join(state_root, name)
+    receipt_path = os.path.join(state_path, "forward-adoption.json")
+    if not os.path.lexists(receipt_path):
+        return None
+    _validate_state_directory(state_path, name)
+    receipt_fd, _, receipt_data = _open_private_state_file(receipt_path)
+    os.close(receipt_fd)
+    return _validate_forward_adoption(receipt_data, successor_key), receipt_data
+
+
+def _forward_witness_data(
+    adoption: dict[str, Any],
+    state_root: str,
+    path: str,
+) -> bytes | None:
+    witness = next(
+        (item for item in adoption["sourceWitnesses"] if item["path"] == path),
+        None,
+    )
+    if witness is None:
+        _fail("recovery")
+    _forward_path(path)
+    if witness["kind"] == "directory":
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            _fail("recovery")
+        try:
+            info = os.fstat(fd)
+            _acl_is_safe(
+                f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery"
+            )
+            if _forward_identity_from_stat(info) != witness["identity"]:
+                _fail("recovery")
+        finally:
+            os.close(fd)
+        return None
+    fd, info, data = _open_private_state_file(path)
+    try:
+        if _forward_identity_from_stat(info) != witness["identity"]:
+            _fail("recovery")
+    finally:
+        os.close(fd)
+    if witness["snapshotRef"] is not None:
+        ref_fd, _, expected = _open_private_state_file(
+            os.path.join(
+                state_root,
+                adoption["successorRunKey"] + "-final-deploy",
+                witness["snapshotRef"],
+            )
+        )
+        os.close(ref_fd)
+    else:
+        import base64
+        expected = base64.b64decode(witness["bytesBase64"], validate=True)
+    if data != expected:
+        _fail("recovery")
+    return data
+
+
+def _forward_adopt_boundary(stage: str) -> None:
+    """Crash-injection seam for proving pointer replacement is always atomic."""
+    return None
+
+
+def _forward_adoption_interlocks(root_fd: int, state_root: str) -> None:
+    origin = FORWARD_ORIGIN_STATE
+    pointer_name = ".provider-transaction.current"
+    pointer_fd, _, pointer_data = _open_private_state_file(
+        os.path.join(state_root, pointer_name)
+    )
+    try:
+        pointer = _json(pointer_data, "recovery")
+    finally:
+        os.close(pointer_fd)
+    if (not isinstance(pointer, dict)
+            or set(pointer) != {"schemaVersion", "runKey", "phase",
+                                "providerEnabled", "durableDisposition"}):
+        _fail("recovery")
+    for name in _iter_directory_fd_names(root_fd):
+        if name in (origin, pointer_name):
+            continue
+        if name == ".smtp-transaction.current" or name.startswith(
+            (".provider-transaction.", ".provider-state.")
+        ):
+            _fail("recovery")
+        if name == ".deploy.lock":
+            _forward_read_external(os.path.join(state_root, name))
+            continue
+        if re.fullmatch(
+            r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name
+        ):
+            info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                _fail("recovery")
+            fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+            try:
+                if not _same_inode(os.fstat(fd), info):
+                    _fail("recovery")
+                try:
+                    os.stat(OWNER_MARKER, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    # Match ordinary retention: numeric legacy states without
+                    # an owner marker remain opaque and are never cleaned here.
+                    continue
+                _owned_state_fd(fd, name, require_terminal=True)
+                children = _bounded_retention_children(fd)
+                if children is None:
+                    _fail("recovery")
+                _validate_forward_retention_fd(
+                    fd, state_root, name, children
+                )
+            finally:
+                os.close(fd)
+            continue
+        _fail("recovery")
+    transaction_parent = _rooted(HOST_CREDENTIAL_PARENT, "")
+    parent_fd = _open_optional_directory_reference(transaction_parent)
+    if parent_fd is not None:
+        try:
+            transactions = {
+                name for name in _iter_directory_fd_names(parent_fd)
+                if name.startswith(".transaction-")
+            }
+            allowed = (
+                {".transaction-" + FORWARD_ORIGIN_KEY}
+                if pointer["providerEnabled"] is True else set()
+            )
+            if transactions != allowed:
+                _fail("recovery")
+        finally:
+            os.close(parent_fd)
+
+
+def _forward_archive_preflight(
+    state_root: str,
+    root_info: os.stat_result,
+    adoption: dict[str, Any],
+) -> None:
+    _check_ancestors(FORWARD_ARCHIVE, category="recovery")
+    parent = os.path.dirname(FORWARD_ARCHIVE)
+    try:
+        parent_info = os.stat(parent, follow_symlinks=False)
+    except OSError:
+        _fail("recovery")
+    if (not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != 0
+            or stat.S_IMODE(parent_info.st_mode) != 0o700
+            or parent_info.st_dev != root_info.st_dev
+            or _forward_identity_from_stat(parent_info)
+            != adoption["plannedArchive"]["parentIdentity"]):
+        _fail("recovery")
+    _acl_is_safe(parent, category="recovery")
+    try:
+        os.stat(FORWARD_ARCHIVE, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError:
+        _fail("recovery")
+    _fail("recovery")
+
+
+def _forward_validate_origin(
+    state_root: str,
+    root_fd: int,
+    adoption: dict[str, Any],
+    snapshots: dict[str, bytes],
+) -> None:
+    origin_name = FORWARD_ORIGIN_STATE
+    origin_fd = os.open(
+        origin_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=root_fd,
+    )
+    try:
+        origin_info = os.fstat(origin_fd)
+        origin_path_info = os.stat(
+            origin_name, dir_fd=root_fd, follow_symlinks=False
+        )
+        if (_forward_identity_from_stat(origin_info)
+                != adoption["originalStateIdentity"]
+                or _forward_identity_from_stat(origin_path_info)
+                != adoption["originalStateIdentity"]):
+            _fail("recovery")
+        _validate_state_directory_fd(origin_fd, origin_name)
+        if (_forward_identity_from_stat(os.fstat(origin_fd))
+                != adoption["originalStateIdentity"]
+                or _forward_identity_from_stat(os.stat(
+                    origin_name, dir_fd=root_fd, follow_symlinks=False
+                )) != adoption["originalStateIdentity"]):
+            _fail("recovery")
+        children: dict[str, dict[str, Any]] = {}
+        for witness in adoption["sourceWitnesses"]:
+            path = witness["path"]
+            if path == os.path.join(state_root, origin_name):
+                continue
+            prefix = os.path.join(state_root, origin_name) + "/"
+            if not path.startswith(prefix):
+                _forward_validate_external(witness, snapshots)
+                continue
+            child = path[len(prefix):]
+            if "/" in child or child in children:
+                _fail("recovery")
+            children[child] = witness
+        if set(_iter_directory_fd_names(origin_fd)) != set(children):
+            _fail("recovery")
+        for child, witness in children.items():
+            info = os.stat(child, dir_fd=origin_fd, follow_symlinks=False)
+            if _forward_identity_from_stat(info) != witness["identity"]:
+                _fail("recovery")
+            if child == "terminal.json":
+                _fail("recovery")
+            if witness["kind"] == "directory":
+                if not stat.S_ISDIR(info.st_mode):
+                    _fail("recovery")
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                _fail("recovery")
+            fd, opened, content = _open_private_state_file_at(origin_fd, child)
+            try:
+                if _forward_identity_from_stat(opened) != witness["identity"]:
+                    _fail("recovery")
+            finally:
+                os.close(fd)
+            final_path_info = os.stat(
+                child, dir_fd=origin_fd, follow_symlinks=False
+            )
+            if _forward_identity_from_stat(final_path_info) != witness["identity"]:
+                _fail("recovery")
+            if witness["role"] == "owner-marker":
+                expected = base64.b64decode(witness["bytesBase64"], validate=True)
+            elif witness["snapshotRef"] is not None:
+                expected = snapshots[witness["snapshotRef"]]
+            else:
+                expected = base64.b64decode(witness["bytesBase64"], validate=True)
+            if content != expected:
+                _fail("recovery")
+        try:
+            os.stat("terminal.json", dir_fd=origin_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            _fail("recovery")
+        if (_forward_identity_from_stat(os.fstat(origin_fd))
+                != adoption["originalStateIdentity"]
+                or _forward_identity_from_stat(os.stat(
+                    origin_name, dir_fd=root_fd, follow_symlinks=False))
+                != adoption["originalStateIdentity"]):
+            _fail("recovery")
+    finally:
+        os.close(origin_fd)
+
+
+def _forward_read_external(path: str) -> tuple[dict[str, int], bytes]:
+    _check_ancestors(path, category="recovery")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                or stat.S_IMODE(info.st_mode) not in (0o600, 0o644)
+                or info.st_nlink != 1):
+            _fail("recovery")
+        _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+        data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
+        identity = _forward_identity_from_stat(info)
+        if (identity != _forward_identity_from_stat(os.fstat(fd))
+                or identity != _forward_identity_from_stat(
+                    os.stat(path, follow_symlinks=False))):
+            _fail("recovery")
+        return identity, data
+    finally:
+        os.close(fd)
+
+
+def _forward_validate_external(witness: dict[str, Any],
+                               snapshots: dict[str, bytes]) -> None:
+    identity, data = _forward_read_external(witness["path"])
+    if (identity != witness["identity"]
+            or data != snapshots[witness["snapshotRef"]]):
+        _fail("recovery")
+
+
+def _forward_saved_identity(data: bytes, actual: dict[str, int],
+                            content: bytes) -> None:
+    # Existing configuration witnesses predate the receipt and use this exact
+    # colon-delimited representation. Do not rebase an old inode onto new tooling.
+    expected = ":".join(str(actual[key]) for key in (
+        "device", "inode", "mode", "uid", "gid", "size", "mtimeNs", "ctimeNs"
+    )) + ":" + hashlib.sha256(content).hexdigest() + "\n"
+    if data != expected.encode():
+        _fail("recovery")
+
+
+def _forward_deployment_lock(state_root: str) -> None:
+    path = os.path.join(state_root, ".deploy.lock")
+    identity, data = _forward_read_external(path)
+    if data or _forward_identity_from_stat(os.fstat(9)) != identity:
+        _fail("recovery")
+    if fcntl is None:
+        _fail("prerequisite")
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _forward_pending_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "forward_pending", os.path.join(os.path.dirname(__file__),
+                                       "test-vps-locationiq-pending-off.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _forward_stopped(inspect: dict[str, Any],
+                     snapshots: dict[str, bytes]) -> dict[str, Any]:
+    pending = _forward_pending_module()
+    try:
+        pending.stopped_predecessor_record(
+            [inspect], inspect["Id"], FORWARD_FINISHED)
+        pending.compare_predecessor_environment(
+            snapshots["config.env.production"], inspect)
+    except (ValueError, pending.Rejected):
+        _fail("recovery")
+    labels = inspect["Config"]["Labels"]
+    fields = {
+        "imageId": "previous-image-id", "revision": "previous-revision",
+        "version": "previous-version", "configHash": "previous-runtime-config-hash",
+    }
+    result = {
+        "containerId": inspect["Id"], "imageId": inspect["Image"],
+        "revision": labels["org.opencontainers.image.revision"],
+        "version": labels["org.opencontainers.image.version"],
+        "configHash": labels["com.docker.compose.config-hash"],
+        "startedAt": inspect["State"]["StartedAt"],
+        "finishedAt": inspect["State"]["FinishedAt"],
+        "status": inspect["State"]["Status"], "exitCode": inspect["State"]["ExitCode"],
+        **{name.lower(): inspect["State"][name] for name in (
+            "Running", "Paused", "Restarting", "Dead")},
+        "envSnapshotRef": "config.env.production",
+        "envComparison": "pending-off-predecessor-pass",
+        "staticInspect": _forward_static(inspect),
+    }
+    for field, snapshot in fields.items():
+        if snapshots[snapshot] != (result[field] + "\n").encode():
+            _fail("recovery")
+    if (not result["containerId"].startswith("6d4a33264076")
+            or not result["imageId"].startswith("sha256:8e40528c34d")
+            or inspect["Config"]["Image"] + "\n" !=
+            snapshots["previous-image"].decode()
+            or labels["org.opencontainers.image.source"] !=
+            "https://github.com/NickolayMamonov/meet-backend-v3"):
+        _fail("recovery")
+    _validate_forward_static(result["staticInspect"])
+    return result
+
+
+def _forward_credential_preflight(marker: dict[str, Any],
+                                  inspect: dict[str, Any]) -> None:
+    enabled, _ = _provider_state(inspect)
+    _, _, source = _provider_mount(inspect, enabled, allow_external_source=True)
+    if marker["providerEnabled"] != enabled:
+        _fail("recovery")
+    tx = _transaction(HOST_CREDENTIAL_PARENT, FORWARD_ORIGIN_KEY)
+    if not enabled:
+        if marker["durableDisposition"] != "none" or os.path.lexists(tx):
+            _fail("recovery")
+        return
+    if marker["durableDisposition"] not in ("created", "reused") or source is None:
+        _fail("recovery")
+    _validate_transaction(tx)
+    snapshot = _read_private(os.path.join(tx, "snapshot"))
+    identity = _json(_read_private(os.path.join(tx, "identity.json")), "recovery")
+    _validate_identity(identity)
+    _validate_credential(snapshot)
+    source_identity, source_data = _read_existing(source, source=True)
+    durable_identity, durable_data = _read_existing(HOST_CREDENTIAL_PATH)
+    if (source_data != snapshot or source_identity != identity["predecessor"]
+            or durable_data != snapshot or durable_identity != identity["durable"]):
+        _fail("recovery")
+    if marker["durableDisposition"] == "created":
+        _verify_created_publication(tx, HOST_CREDENTIAL_PATH, identity, snapshot)
+    elif set(os.listdir(tx)) != {"snapshot", "identity.json"}:
+        _fail("recovery")
+
+
+def _forward_image(image: dict[str, Any], image_id: str,
+                   revision: str, version: str) -> None:
+    config = image["Config"]
+    labels = config["Labels"]
+    if (image["Id"] != image_id or config["User"] != "10001:10001"
+            or config.get("Entrypoint") != ["java", "-jar", "app.jar"]
+            or config.get("Cmd") not in (None, [])
+            or labels["org.opencontainers.image.revision"] != revision
+            or labels["org.opencontainers.image.version"] != version
+            or labels["org.opencontainers.image.source"] !=
+            "https://github.com/NickolayMamonov/meet-backend-v3"):
+        _fail("recovery")
+    _image_admission(image)
+
+
+def _forward_rendered(config: dict[str, Any], backend: dict[str, Any],
+                       target: dict[str, Any], env: bytes) -> None:
+    pending = _forward_pending_module()
+    values = pending.file_environment(env)
+    service = config["services"]["backend"]
+    if (set(config["services"]) != {"backend", "postgres"}
+            or service["image"] != pending.IMAGE
+            or service.get("pull_policy") != "never"
+            or service.get("user") != "10001:10001"
+            or service.get("read_only") is not True
+            or service.get("privileged", False) is not False
+            or service.get("network_mode") is not None
+            or service.get("cap_add", []) != []
+            or service.get("cap_drop") != ["ALL"]
+            or service.get("security_opt") != ["no-new-privileges:true"]
+            or service.get("restart") != "unless-stopped"
+            or service["logging"]["driver"] != "local"
+            or service["mem_limit"] != backend["HostConfig"]["Memory"]
+            or service.get("entrypoint") is not None
+            or service.get("command") is not None):
+        _fail("recovery")
+    effective = dict(_env_entries(target))
+    effective.update(service["environment"])
+    if any(effective.get(key) != value for key, value in values.items()):
+        _fail("recovery")
+    proposed = {
+        "Config": {"Env": [key + "=" + value for key, value in effective.items()]},
+        "Mounts": [],
+    }
+    if _effective_tuple(proposed) != _effective_tuple(backend):
+        _fail("recovery")
+    ports = service["ports"]
+    expected_port = backend["HostConfig"]["PortBindings"]["8080/tcp"][0]
+    if (len(ports) != 1 or ports[0].get("host_ip") != "127.0.0.1"
+            or ports[0].get("target") != 8080
+            or str(ports[0].get("published")) != expected_port["HostPort"]
+            or ports[0].get("protocol", "tcp") != "tcp"):
+        _fail("recovery")
+    mounts = service["volumes"]
+    enabled = _provider_state(backend)[0]
+    expected_destinations = {"/data/uploads"}
+    if enabled:
+        expected_destinations.add(CONTAINER_CREDENTIAL_PATH)
+    if {mount["target"] for mount in mounts} != expected_destinations:
+        _fail("recovery")
+    if len(mounts) != len(expected_destinations):
+        _fail("recovery")
+    for mount in mounts:
+        if mount["target"] == "/data/uploads":
+            if (mount["type"] != "volume" or mount["source"] != "uploads_data"
+                    or mount.get("read_only", False)):
+                _fail("recovery")
+        elif (mount["type"] != "bind" or mount["source"] != HOST_CREDENTIAL_PATH
+                or mount.get("read_only") is not True
+                or mount["bind"].get("create_host_path") is not False):
+            _fail("recovery")
+    if (service["healthcheck"]["test"] !=
+            backend["Config"]["Healthcheck"]["Test"]
+            or set(config["volumes"]) != {"postgres_data", "uploads_data"}
+            or config["volumes"]["postgres_data"]["name"] !=
+            "meet-production_postgres_data"
+            or config["volumes"]["uploads_data"]["name"] !=
+            "meet-production_uploads_data"):
+        _fail("recovery")
+
+
+def _forward_admission(state_root: str, run_key: str, deployment_root: str,
+                       base_compose: str, inspection_data: bytes) -> None:
+    """Build all witnesses from fixed contracts; callers cannot supply receipts."""
+    paths = _forward_external_paths(run_key)
+    if (deployment_root != FORWARD_ROOT or base_compose != paths["reviewed-base"]
+            or not re.fullmatch(r"[1-9][0-9]*-1", run_key)
+            or run_key == FORWARD_ORIGIN_KEY):
+        _fail("recovery")
+    _forward_deployment_lock(state_root)
+    bundle = _json(inspection_data, "recovery")
+    if not isinstance(bundle, dict) or set(bundle) != {
+            "backend", "previousImage", "targetImage", "platformImage", "rendered"}:
+        _fail("recovery")
+    origin = os.path.join(state_root, FORWARD_ORIGIN_STATE)
+    _validate_state_directory(origin, FORWARD_ORIGIN_STATE)
+    origin_info = os.stat(origin, follow_symlinks=False)
+    names = set(os.listdir(origin))
+    forbidden = {
+        "terminal.json", "forward-adoption.json", "forward-acceptance.json",
+        "predecessor.json", "candidate.json", "final.json", "rollback.json",
+        "frozen-assets.json",
+    }
+    if (not FORWARD_REQUIRED_CHILDREN <= names or not names <= RETENTION_CHILDREN
+            or names & forbidden):
+        _fail("recovery")
+    snapshots: dict[str, bytes] = {}
+    aggregate_size = 0
+    witnesses = [{
+        "role": "origin-state", "path": origin, "kind": "directory",
+        "identity": _forward_identity_from_stat(origin_info),
+        "snapshotRef": None, "bytesBase64": None,
+    }]
+    for name in sorted(names):
+        fd, info, content = _open_private_state_file(os.path.join(origin, name))
+        os.close(fd)
+        aggregate_size += len(content)
+        if aggregate_size > MAX_WITNESS_BYTES:
+            _fail("recovery")
+        embedded = name == OWNER_MARKER or name.endswith(".identity")
+        if not embedded:
+            snapshots[name] = content
+        witnesses.append({
+            "role": "owner-marker" if name == OWNER_MARKER else "state-snapshot",
+            "path": os.path.join(origin, name), "kind": "regular-file",
+            "identity": _forward_identity_from_stat(info),
+            "snapshotRef": None if embedded else name,
+            "bytesBase64": base64.b64encode(content).decode() if embedded else None,
+        })
+    original_files = {
+        os.path.basename(witness["path"]): base64.b64decode(witness["bytesBase64"])
+        if witness["bytesBase64"] is not None else snapshots[witness["snapshotRef"]]
+        for witness in witnesses if witness["kind"] == "regular-file"
+    }
+    # Identity records are copied too, not only embedded: existing tools continue
+    # to read the original witness format in the successor state.
+    snapshots.update({name: data for name, data in original_files.items()
+                      if name != OWNER_MARKER})
+    for witness in witnesses:
+        if witness["role"] == "state-snapshot":
+            witness["snapshotRef"] = os.path.basename(witness["path"])
+            witness["bytesBase64"] = None
+    refs = {
+        "production-env": "config.env.target",
+        "original-base": "config.base-compose.yml",
+        "reviewed-base": "config.base-compose.yml",
+        "active-compose": "candidate-active-compose.yml",
+        "active-runtime": "candidate-active-runtime.yml",
+    }
+    for role, path in paths.items():
+        identity, content = _forward_read_external(path)
+        if role == "fallback-compose":
+            matches = sorted(name for name, data in snapshots.items()
+                             if name.endswith(".yml") and data == content)
+            if not matches:
+                _fail("recovery")
+            ref = matches[0]
+        else:
+            ref = refs[role]
+        if content != snapshots[ref]:
+            _fail("recovery")
+        saved = {
+            "production-env": "config.env.target.identity",
+            "original-base": "config.base-compose.yml.identity",
+            "active-compose": "candidate-active-compose.identity",
+            "active-runtime": "candidate-active-runtime.identity",
+        }.get(role)
+        if saved:
+            _forward_saved_identity(original_files[saved], identity, content)
+        witnesses.append({
+            "role": role, "path": path, "kind": "regular-file",
+            "identity": identity, "snapshotRef": ref, "bytesBase64": None,
+        })
+    if (snapshots["candidate-active-compose.yml"] != snapshots["config.base-compose.yml"]
+            or snapshots["candidate-active-runtime.yml"] !=
+            snapshots["target-runtime.override.yml"]):
+        _fail("recovery")
+    pending = _forward_pending_module()
+    before = pending.file_environment(snapshots["config.env.production"])
+    replacements = {
+        "BACKEND_IMAGE": pending.IMAGE, "BACKEND_REVISION": pending.REVISION,
+        "BACKEND_VERSION": pending.VERSION,
+    }
+    lines = []
+    for line in snapshots["config.env.production"].decode().splitlines(keepends=True):
+        name = line.split("=", 1)[0]
+        if name in replacements:
+            ending = line[len(line.rstrip("\r\n")):]
+            line = name + "=" + replacements[name] + ending
+        lines.append(line)
+    if (not set(replacements) <= set(before)
+            or "".join(lines).encode() != snapshots["config.env.target"]
+            or snapshots["config.env.previous"] != snapshots["config.env.production"]
+            or any(before[key] + "\n" != snapshots[name].decode() for key, name in (
+                ("BACKEND_IMAGE", "previous-image"),
+                ("BACKEND_REVISION", "previous-revision"),
+                ("BACKEND_VERSION", "previous-version")))):
+        _fail("recovery")
+    backend = _inspect(json.dumps(bundle["backend"]).encode())
+    stopped = _forward_stopped(backend, snapshots)
+    old_image = _inspect(json.dumps(bundle["previousImage"]).encode())
+    _forward_image(old_image, stopped["imageId"], stopped["revision"], stopped["version"])
+    target = _inspect(json.dumps(bundle["targetImage"]).encode())
+    platform = _inspect(json.dumps(bundle["platformImage"]).encode())
+    target_id = target["Id"]
+    if not isinstance(target_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", target_id):
+        _fail("recovery")
+    _forward_image(target, target_id, FORWARD_TARGET["source"], FORWARD_TARGET["version"])
+    _forward_image(platform, target_id, FORWARD_TARGET["source"], FORWARD_TARGET["version"])
+    if target.get("Architecture") != "amd64" or target.get("Os") != "linux":
+        _fail("recovery")
+    _forward_rendered(bundle["rendered"], backend, target, snapshots["config.env.target"])
+    pointer_fd, pointer_info, pointer_data = _open_private_state_file(
+        os.path.join(state_root, ".provider-transaction.current"))
+    os.close(pointer_fd)
+    marker = _marker(state_root, FORWARD_ORIGIN_KEY)
+    _forward_credential_preflight(marker, backend)
+    adoption = {
+        "schemaVersion": 1, "originRunKey": FORWARD_ORIGIN_KEY,
+        "successorRunKey": run_key, "originState": FORWARD_ORIGIN_STATE,
+        "originCredentialRunKey": FORWARD_ORIGIN_KEY if marker["providerEnabled"] else None,
+        "target": FORWARD_TARGET,
+        "originalMarker": {
+            "bytesBase64": base64.b64encode(pointer_data).decode(),
+            "identity": _forward_identity_from_stat(pointer_info),
+        },
+        "originalStateIdentity": _forward_identity_from_stat(origin_info),
+        "plannedArchive": {
+            "path": FORWARD_ARCHIVE,
+            "parentIdentity": _forward_identity_from_stat(
+                os.stat(os.path.dirname(FORWARD_ARCHIVE), follow_symlinks=False)),
+        },
+        "sourceWitnesses": sorted(witnesses, key=lambda item: item["path"]),
+        "stoppedWitness": stopped,
+    }
+    encoded = json.dumps(adoption, separators=(",", ":")).encode()
+    intended_key = before["LOCATIONIQ_KEY"].encode()
+    if intended_key in encoded or base64.b64encode(intended_key) in encoded:
+        _fail("recovery")
+    _validate_forward_adoption(encoded, run_key)
+    _forward_adopt(state_root, json.dumps({
+        "adoptionReceiptBase64": base64.b64encode(encoded).decode(),
+        "snapshots": {name: base64.b64encode(data).decode()
+                      for name, data in snapshots.items()},
+    }, separators=(",", ":")).encode(),
+        before_commit=lambda: _forward_credential_preflight(marker, backend))
+
+
+def _forward_adopt(state_root: str, request_data: bytes,
+                   before_commit: Any = None) -> None:
+    request = _json(request_data, "recovery")
+    if (not isinstance(request, dict)
+            or set(request) != {"adoptionReceiptBase64", "snapshots"}
+            or not isinstance(request["adoptionReceiptBase64"], str)
+            or not isinstance(request["snapshots"], dict)):
+        _fail("recovery")
+    try:
+        receipt_data = base64.b64decode(
+            request["adoptionReceiptBase64"], validate=True
+        )
+    except (ValueError, TypeError):
+        _fail("recovery")
+    if (base64.b64encode(receipt_data).decode("ascii")
+            != request["adoptionReceiptBase64"]):
+        _fail("recovery")
+    receipt = _json(receipt_data, "recovery")
+    successor_key = receipt.get("successorRunKey") if isinstance(receipt, dict) else None
+    if not isinstance(successor_key, str):
+        _fail("recovery")
+    _run_key(successor_key)
+    adoption = _validate_forward_adoption(receipt_data, successor_key)
+    if len(request_data) > MAX_WITNESS_BYTES * 2:
+        _fail("recovery")
+
+    snapshot_refs = {
+        witness["snapshotRef"]
+        for witness in adoption["sourceWitnesses"]
+        if witness["kind"] == "regular-file"
+        and witness["snapshotRef"] is not None
+    }
+    snapshots: dict[str, bytes] = {}
+    for name, encoded in request["snapshots"].items():
+        if (not isinstance(name, str) or name not in snapshot_refs
+                or name not in RETENTION_CHILDREN
+                or name in (OWNER_MARKER, "terminal.json",
+                            "forward-adoption.json", "forward-acceptance.json")
+                or not isinstance(encoded, str)):
+            _fail("recovery")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            _fail("recovery")
+        if base64.b64encode(content).decode("ascii") != encoded:
+            _fail("recovery")
+        snapshots[name] = content
+    if set(snapshots) != snapshot_refs:
+        _fail("recovery")
+    if (
+        len(receipt_data) + sum(map(len, snapshots.values()))
+        + sum(map(len, (base64.b64decode(
+            witness["bytesBase64"], validate=True
+        ) for witness in adoption["sourceWitnesses"]
+          if witness["bytesBase64"] is not None)))
+        > MAX_WITNESS_BYTES
+    ):
+        _fail("recovery")
+
+    expected_root = _validate_retention_state_root_path(state_root)
+    root_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    staging = ".provider-state." + successor_key + "-final-deploy.tmp"
+    destination = successor_key + "-final-deploy"
+    temporary_pointer = ".provider-transaction." + successor_key + ".forward"
+    credential_parent_fd = None
+    try:
+        if not _same_inode(os.fstat(root_fd), expected_root):
+            _fail("recovery")
+        _lock_directory(root_fd)
+        root_info = os.fstat(root_fd)
+        if (not _same_inode(root_info, expected_root)
+                or _forward_identity_from_stat(root_info)
+                != _forward_identity_from_stat(os.stat(
+                    state_root, follow_symlinks=False))):
+            _fail("recovery")
+        _validate_retention_state_root_fd(root_fd)
+        credential_parent_fd = _open_optional_directory_reference(HOST_CREDENTIAL_PARENT)
+        if credential_parent_fd is not None:
+            _lock_directory(credential_parent_fd)
+        _forward_adoption_interlocks(root_fd, state_root)
+        _forward_archive_preflight(state_root, root_info, adoption)
+        try:
+            os.stat(destination, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            _fail("recovery")
+        for candidate in (staging, temporary_pointer):
+            try:
+                os.stat(candidate, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            _fail("recovery")
+
+        pointer_name = ".provider-transaction.current"
+        pointer_path_info = os.stat(
+            pointer_name, dir_fd=root_fd, follow_symlinks=False
+        )
+        pointer_fd, pointer_info, pointer_data = _open_private_state_file(
+            os.path.join(state_root, pointer_name)
+        )
+        try:
+            original_marker = adoption["originalMarker"]
+            if (_forward_identity_from_stat(pointer_path_info)
+                    != _forward_identity_from_stat(pointer_info)
+                    or _forward_identity_from_stat(pointer_info)
+                    != original_marker["identity"]
+                    or pointer_data != base64.b64decode(
+                        original_marker["bytesBase64"], validate=True)):
+                _fail("recovery")
+            marker = _json(pointer_data, "recovery")
+            if (not isinstance(marker, dict)
+                    or set(marker) != {"schemaVersion", "runKey", "phase",
+                                       "providerEnabled", "durableDisposition"}
+                    or type(marker["schemaVersion"]) is not int
+                    or marker["schemaVersion"] != 1
+                    or marker["runKey"] != FORWARD_ORIGIN_KEY
+                    or marker["phase"] != "applying"
+                    or type(marker["providerEnabled"]) is not bool
+                    or marker["durableDisposition"] not in ("none", "created", "reused")
+                    or marker["providerEnabled"]
+                    != (marker["durableDisposition"] != "none")):
+                _fail("recovery")
+        finally:
+            os.close(pointer_fd)
+
+        _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+        if before_commit is not None:
+            before_commit()
+
+        os.mkdir(staging, 0o700, dir_fd=root_fd)
+        staging_fd = os.open(
+            staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        try:
+            os.fchown(staging_fd, 0, 0)
+            os.fchmod(staging_fd, 0o700)
+            _write_private_at(
+                staging_fd, OWNER_MARKER,
+                _state_marker(successor_key, "final-deploy"), 0o600,
+            )
+            _write_private_at(staging_fd, "forward-adoption.json", receipt_data, 0o600)
+            for name in sorted(snapshots):
+                _write_private_at(staging_fd, name, snapshots[name], 0o600)
+            os.fsync(staging_fd)
+            _validate_state_directory_fd(staging_fd, destination)
+            os.fsync(root_fd)
+            _forward_adopt_boundary("state-staged")
+            _rename_noreplace(
+                root_fd, staging, destination,
+                expected_source_fd=staging_fd,
+                expected_source_inode=(
+                    os.fstat(staging_fd).st_dev, os.fstat(staging_fd).st_ino
+                ),
+            )
+            published_fd = os.open(
+                destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+            try:
+                published_info = os.fstat(published_fd)
+                published_path_info = os.stat(
+                    destination, dir_fd=root_fd, follow_symlinks=False
+                )
+                if (not _same_inode(published_info, os.fstat(staging_fd))
+                        or not _same_inode(published_path_info, published_info)):
+                    _fail("recovery")
+                _validate_state_directory_fd(published_fd, destination)
+            finally:
+                os.close(published_fd)
+            os.fsync(root_fd)
+            _forward_adopt_boundary("state-published")
+        finally:
+            os.close(staging_fd)
+
+        _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+        successor_marker = dict(marker)
+        successor_marker["runKey"] = successor_key
+        successor_marker["phase"] = "applying"
+        successor_data = json.dumps(
+            successor_marker, separators=(",", ":"), sort_keys=True
+        ).encode()
+        _write_private_at(root_fd, temporary_pointer, successor_data, 0o600)
+
+        # Revalidate both owners at the ownership linearization boundary.
+        _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+        current_path_info = os.stat(
+            pointer_name, dir_fd=root_fd, follow_symlinks=False
+        )
+        current_fd, current_info, current_data = _open_private_state_file(
+            os.path.join(state_root, pointer_name)
+        )
+        try:
+            if (_forward_identity_from_stat(current_path_info)
+                    != _forward_identity_from_stat(current_info)
+                    or _forward_identity_from_stat(current_info)
+                    != adoption["originalMarker"]["identity"]
+                    or current_data != pointer_data):
+                _fail("recovery")
+        finally:
+            os.close(current_fd)
+        _forward_adopt_boundary("pointer-ready")
+        if before_commit is not None:
+            before_commit()
+        _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+        _forward_archive_preflight(state_root, os.fstat(root_fd), adoption)
+        if (credential_parent_fd is not None and not _same_inode(
+                os.fstat(credential_parent_fd),
+                os.stat(HOST_CREDENTIAL_PARENT, follow_symlinks=False))):
+            _fail("recovery")
+        check_fd, check_info, check_data = _open_private_state_file_at(root_fd, pointer_name)
+        os.close(check_fd)
+        if (_forward_identity_from_stat(check_info) != adoption["originalMarker"]["identity"]
+                or check_data != pointer_data):
+            _fail("recovery")
+        os.replace(
+            temporary_pointer, pointer_name,
+            src_dir_fd=root_fd, dst_dir_fd=root_fd,
+        )
+        _forward_adopt_boundary("pointer-renamed")
+        os.fsync(root_fd)
+        _forward_adopt_boundary("pointer-replaced")
+    finally:
+        if credential_parent_fd is not None:
+            os.close(credential_parent_fd)
+        os.close(root_fd)
+    _result(marker["providerEnabled"], False, False, "forward-adopted")
+
+
+def _forward_snapshots(state_root: str, adoption: dict[str, Any]) -> dict[str, bytes]:
+    result = {}
+    state_path = os.path.join(state_root, adoption["successorRunKey"] + "-final-deploy")
+    total = 0
+    for name in sorted({witness["snapshotRef"] for witness in adoption["sourceWitnesses"]
+                        if witness["snapshotRef"] is not None}):
+        fd, _, data = _open_private_state_file(os.path.join(state_path, name))
+        os.close(fd)
+        total += len(data)
+        if total > MAX_WITNESS_BYTES:
+            _fail("recovery")
+        result[name] = data
+    return result
+
+
+def _forward_revalidate(state_root: str, run_key: str, inspection_data: bytes) -> None:
+    _forward_deployment_lock(state_root)
+    receipt = _forward_receipt_for_run(state_root, run_key)
+    if receipt is None:
+        _fail("recovery")
+    adoption, _ = receipt
+    marker = _marker(state_root, run_key)
+    if marker["phase"] != "applying":
+        _fail("recovery")
+    snapshots = _forward_snapshots(state_root, adoption)
+    root_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+        _forward_archive_preflight(state_root, os.fstat(root_fd), adoption)
+    finally:
+        os.close(root_fd)
+    backend = _inspect(inspection_data)
+    if _forward_stopped(backend, snapshots) != adoption["stoppedWitness"]:
+        _fail("recovery")
+    _forward_credential_preflight(marker, backend)
+    _result(marker["providerEnabled"], False, False, "forward-revalidated")
+
+
+def _forward_phase(state_root: str, run_key: str, phase: str) -> None:
+    _forward_deployment_lock(state_root)
+    if phase not in ("verifying", "finalizing"):
+        _fail("recovery")
+    receipt = _forward_receipt_for_run(state_root, run_key)
+    if receipt is None:
+        _fail("recovery")
+    parent_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _lock_directory(parent_fd)
+        fd, info, data = _open_private_state_file_at(
+            parent_fd, ".provider-transaction.current")
+        try:
+            marker = _marker(state_root, run_key)
+            if marker["phase"] != {"verifying": "applying", "finalizing": "verifying"}[phase]:
+                _fail("recovery")
+            marker["phase"] = phase
+            temporary = ".provider-transaction." + run_key + ".forward-phase"
+            _write_private_at(parent_fd, temporary,
+                              json.dumps(marker, separators=(",", ":")).encode(), 0o600)
+            current_fd, current, current_data = _open_private_state_file_at(
+                parent_fd, ".provider-transaction.current")
+            os.close(current_fd)
+            if (_forward_identity_from_stat(current) != _forward_identity_from_stat(info)
+                    or current_data != data):
+                _fail("recovery")
+            os.replace(temporary, ".provider-transaction.current",
+                       src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> None:
+    _forward_deployment_lock(state_root)
+    receipt = _forward_receipt_for_run(state_root, run_key)
+    if receipt is None:
+        _fail("recovery")
+    adoption, adoption_data = receipt
+    marker = _marker(state_root, run_key)
+    if marker["phase"] != "verifying":
+        _fail("recovery")
+    candidate = _inspect(inspection_data)
+    snapshots = _forward_snapshots(state_root, adoption)
+    pending = _forward_pending_module()
+    try:
+        pending.verify(
+            "candidate", snapshots["config.env.target"], [candidate],
+            candidate["Image"], adoption["stoppedWitness"]["containerId"],
+            adoption["stoppedWitness"]["startedAt"], snapshots["config.env.production"],
+            candidate["Id"], candidate["State"]["StartedAt"])
+    except (ValueError, pending.Rejected):
+        _fail("recovery")
+    # A receipt never substitutes for final provider and private file checks.
+    with contextlib.redirect_stdout(io.StringIO()):
+        _verify(run_key, "", inspection_data, "candidate", state_root)
+    acceptance = {
+        "schemaVersion": 1, "originRunKey": FORWARD_ORIGIN_KEY,
+        "successorRunKey": run_key, "adoptionSha256": hashlib.sha256(adoption_data).hexdigest(),
+        "target": FORWARD_TARGET,
+        "candidate": {"containerId": candidate["Id"],
+                      "startedAt": candidate["State"]["StartedAt"],
+                      "platformImageId": candidate["Image"]},
+        "checks": {name: "pass" for name in ("runtime", "pendingOff", "provider", "publicHealth")},
+        "plannedArchive": FORWARD_ARCHIVE,
+    }
+    acceptance_data = json.dumps(acceptance, separators=(",", ":")).encode()
+    _validate_forward_acceptance(acceptance_data, adoption_data, run_key)
+    _forward_phase(state_root, run_key, "finalizing")
+    root_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    state_name = run_key + "-final-deploy"
+    state_fd = os.open(os.path.join(state_root, state_name),
+                       os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    archive_parent_fd = os.open(os.path.dirname(FORWARD_ARCHIVE),
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _lock_directory(root_fd)
+        _lock_directory(state_fd)
+        _lock_directory(archive_parent_fd)
+        _validate_state_directory_fd(state_fd, state_name)
+        _validate_retention_state_root_fd(root_fd)
+        _revalidate_retention_state_root_path(state_root, os.fstat(root_fd))
+        if (_forward_identity_from_stat(os.fstat(archive_parent_fd))
+                != adoption["plannedArchive"]["parentIdentity"]):
+            _fail("recovery")
+        _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+        _forward_archive_preflight(state_root, os.fstat(root_fd), adoption)
+        for name in ("forward-acceptance.json", "terminal.json"):
+            try:
+                os.stat(name, dir_fd=state_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            _fail("recovery")
+        _forward_adopt_boundary("acceptance-before")
+        _write_private_at(state_fd, "forward-acceptance.json", acceptance_data, 0o600)
+        _forward_adopt_boundary("acceptance-file-synced")
+        os.fsync(state_fd)
+        _forward_adopt_boundary("acceptance-directory-synced")
+        _forward_adopt_boundary("credential-cleanup-before")
+        durable_before = None
+        durable_info_before = None
+        if marker["providerEnabled"]:
+            durable_info_before = os.stat(HOST_CREDENTIAL_PATH, follow_symlinks=False)
+            _, durable_before = _read_existing(HOST_CREDENTIAL_PATH)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _finish(run_key, state_root, "", "committed", inspection_data)
+        _forward_adopt_boundary("credential-cleanup-after")
+        if os.path.lexists(_transaction(HOST_CREDENTIAL_PARENT, FORWARD_ORIGIN_KEY)):
+            _fail("recovery")
+        if marker["providerEnabled"]:
+            _, durable_after = _read_existing(HOST_CREDENTIAL_PATH)
+            durable_info_after = os.stat(HOST_CREDENTIAL_PATH, follow_symlinks=False)
+            if (durable_after != durable_before
+                    or not _same_inode(durable_info_after, durable_info_before)
+                    or durable_info_after.st_nlink != 1):
+                _fail("recovery")
+        _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+        _forward_archive_preflight(state_root, os.fstat(root_fd), adoption)
+        origin_fd = os.open(FORWARD_ORIGIN_STATE,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            _forward_adopt_boundary("archive-before")
+            _rename_noreplace(
+                root_fd, FORWARD_ORIGIN_STATE, os.path.basename(FORWARD_ARCHIVE),
+                expected_source_fd=origin_fd,
+                expected_source_inode=(os.fstat(origin_fd).st_dev, os.fstat(origin_fd).st_ino),
+                destination_directory_fd=archive_parent_fd)
+            _forward_adopt_boundary("archive-renamed")
+            _validate_forward_archive(adoption, state_root, require_source_absent=True)
+            _forward_adopt_boundary("archive-source-parent-sync-before")
+            os.fsync(root_fd)
+            _forward_adopt_boundary("archive-source-parent-synced")
+            _forward_adopt_boundary("archive-target-parent-sync-before")
+            os.fsync(archive_parent_fd)
+            _forward_adopt_boundary("archive-target-parent-synced")
+        finally:
+            os.close(origin_fd)
+        terminal_data = json.dumps({
+            "schemaVersion": 1, "runKey": run_key, "outcome": "committed",
+            "providerEnabled": marker["providerEnabled"],
+        }, separators=(",", ":")).encode()
+        _forward_adopt_boundary("terminal-before")
+        _write_private_at(state_fd, "terminal.json", terminal_data, 0o600)
+        _forward_adopt_boundary("terminal-file-synced")
+        os.fsync(state_fd)
+        _forward_adopt_boundary("terminal-directory-synced")
+        _validate_forward_retention_fd(
+            state_fd, state_root, state_name, _bounded_retention_children(state_fd))
+        pointer_fd, info, pointer_data = _open_private_state_file_at(
+            root_fd, ".provider-transaction.current")
+        os.close(pointer_fd)
+        if _marker(state_root, run_key)["phase"] != "finalizing":
+            _fail("recovery")
+        _forward_adopt_boundary("pointer-unlink-before")
+        _witnessed_unlink(
+            root_fd, ".provider-transaction.current",
+            expected_identity=_identity(info), expected_data=pointer_data,
+            uid=0, gid=0, mode=0o600, link_count=1)
+        _forward_adopt_boundary("pointer-unlinked")
+        os.fsync(root_fd)
+        _forward_adopt_boundary("pointer-unlink-parent-synced")
+    finally:
+        os.close(root_fd)
+        os.close(state_fd)
+        os.close(archive_parent_fd)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _retention_check("", state_root)
+    _result(marker["providerEnabled"], marker["providerEnabled"],
+            marker["providerEnabled"], "committed")
+
+
+def _credential_owner_key(
+    run_key: str,
+    state_root: str,
+    enabled: bool,
+) -> str:
+    receipt = _forward_receipt_for_run(state_root, run_key)
+    if receipt is None:
+        return run_key
+    adoption, _ = receipt
+    expected = FORWARD_ORIGIN_KEY if enabled else None
+    if adoption["originCredentialRunKey"] != expected:
+        _fail("recovery")
+    original = _json(base64.b64decode(adoption["originalMarker"]["bytesBase64"]),
+                     "recovery")
+    marker = _marker(state_root, run_key)
+    if any(marker[key] != original[key] for key in (
+            "providerEnabled", "durableDisposition")):
+        _fail("recovery")
+    # The immutable adoption binding authorizes only this original transaction
+    # alias. Existing verify/finish code reopens the transaction and validates
+    # its secret snapshot, identity, publication hard link, and durable file;
+    # those credential descendants are not copied into the new state or placed
+    # in sourceWitnesses, whose external entries are limited to config/tooling.
+    return FORWARD_ORIGIN_KEY if enabled else run_key
 
 
 def _validate_transaction(tx: str) -> None:
@@ -1594,6 +3140,9 @@ def _verify(
 ) -> None:
     if phase not in ("predecessor", "candidate", "rollback"):
         _fail("provider")
+    if (state_root and _forward_receipt_for_run(state_root, run_key) is not None
+            and phase != "candidate"):
+        _fail("recovery")
     inspect, previous = _inspect_records(inspect_data)
     enabled, _ = _provider_state(inspect)
     if previous is not None and _effective_tuple(inspect) != _effective_tuple(previous):
@@ -1656,7 +3205,13 @@ def _verify(
         destination = _rooted(HOST_CREDENTIAL_PATH, root)
         durable_identity, durable = _read_existing(destination)
         _validate_credential(durable)
-        tx = _transaction(_rooted(HOST_CREDENTIAL_PARENT, root), run_key)
+        credential_run_key = (
+            _credential_owner_key(run_key, state_root, enabled)
+            if state_root else run_key
+        )
+        tx = _transaction(
+            _rooted(HOST_CREDENTIAL_PARENT, root), credential_run_key
+        )
         snapshot_path = os.path.join(tx, "snapshot")
         if phase in ("predecessor", "candidate", "rollback") and state_root:
             _validate_transaction(tx)
@@ -1692,11 +3247,22 @@ def _finish(run_key: str, state_root: str, root: str, outcome: str, inspect_data
         allow_external_source=outcome == "rolled-back",
     )
     parent = _rooted(HOST_CREDENTIAL_PARENT, root)
-    tx = _transaction(parent, run_key)
     marker = _marker(state_root, run_key)
+    receipt = _forward_receipt_for_run(state_root, run_key)
+    if receipt is not None:
+        if outcome != "committed" or marker["phase"] != "finalizing":
+            _fail("recovery")
+        acceptance_fd, _, acceptance_data = _open_private_state_file(os.path.join(
+            state_root, run_key + "-final-deploy", "forward-acceptance.json"))
+        os.close(acceptance_fd)
+        _validate_forward_acceptance(acceptance_data, receipt[1], run_key)
     disposition = marker["durableDisposition"]
     if marker["providerEnabled"] != enabled:
         _fail("recovery")
+    credential_run_key = _credential_owner_key(
+        run_key, state_root, enabled
+    )
+    tx = _transaction(parent, credential_run_key)
     if enabled and disposition not in ("created", "reused"):
         _fail("recovery")
     if disposition != "none" and (
@@ -2161,6 +3727,9 @@ def _retention_classify(
                         continue
                     _owned_state_fd(state_fd, name, require_terminal=True)
                     child_names = _bounded_retention_children(state_fd)
+                    _validate_forward_retention_fd(
+                        state_fd, state_root, name, child_names
+                    )
                     if child_names is not None:
                         encoded_name = json.dumps(
                             name,
@@ -2291,15 +3860,177 @@ RETENTION_CHILDREN = frozenset(
         "config.base-compose.yml.identity",
     }
 )
+FORWARD_RETENTION_CHILDREN = frozenset(
+    {"forward-adoption.json", "forward-acceptance.json"}
+)
 
 
 def _bounded_retention_children(directory_fd: int) -> set[str] | None:
     names: set[str] = set()
     for name in _iter_directory_fd_names(directory_fd):
-        if name not in RETENTION_CHILDREN:
+        if name not in RETENTION_CHILDREN | FORWARD_RETENTION_CHILDREN:
             return None
         names.add(name)
     return names
+
+
+def _validate_forward_archive(
+    adoption: dict[str, Any],
+    state_root: str,
+    *,
+    require_source_absent: bool,
+) -> None:
+    archive_path = FORWARD_ARCHIVE
+    archive_root = os.path.dirname(archive_path)
+    try:
+        _check_ancestors(archive_path, category="recovery")
+        root_info = os.stat(archive_root, follow_symlinks=False)
+        archive_info = os.stat(archive_path, follow_symlinks=False)
+    except OSError:
+        _fail("recovery")
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+            or not stat.S_ISDIR(archive_info.st_mode)
+            or archive_info.st_uid != 0 or stat.S_IMODE(archive_info.st_mode) != 0o700):
+        _fail("recovery")
+    _acl_is_safe(archive_root, category="recovery")
+    _acl_is_safe(archive_path, category="recovery")
+    source_identity = adoption["originalStateIdentity"]
+    actual_archive_identity = _forward_identity_from_stat(archive_info)
+    # Rename may alter only directory metadata fields; inode, type, ownership,
+    # and permissions remain the identity proof for the archived state root.
+    for key in FORWARD_IDENTITY_KEYS - {"ctimeNs"}:
+        if actual_archive_identity[key] != source_identity[key]:
+            _fail("recovery")
+    state_path = os.path.join(state_root, FORWARD_ORIGIN_STATE)
+    if require_source_absent and os.path.lexists(state_path):
+        _fail("recovery")
+
+    expected: dict[str, dict[str, Any]] = {}
+    root_witnesses = 0
+    for witness in adoption["sourceWitnesses"]:
+        path = witness["path"]
+        if path == state_path:
+            if witness["kind"] != "directory":
+                _fail("recovery")
+            root_witnesses += 1
+            if witness["identity"] != source_identity:
+                _fail("recovery")
+            continue
+        if path.startswith(state_path + "/"):
+            relative = path[len(state_path) + 1:]
+            if "/" in relative or relative in ("", ".", "..") or relative in expected:
+                _fail("recovery")
+            expected[relative] = witness
+    if root_witnesses != 1:
+        _fail("recovery")
+    parent_identity = _forward_identity_from_stat(root_info)
+    for key in ("device", "inode", "mode", "uid", "gid"):
+        if parent_identity[key] != adoption["plannedArchive"]["parentIdentity"][key]:
+            _fail("recovery")
+    try:
+        actual_names = set(os.listdir(archive_path))
+    except OSError:
+        _fail("recovery")
+    if actual_names != set(expected):
+        _fail("recovery")
+    archive_fd = os.open(
+        archive_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        if (_forward_identity_from_stat(os.fstat(archive_fd))
+                != actual_archive_identity):
+            _fail("recovery")
+        for name, witness in expected.items():
+            try:
+                info = os.stat(name, dir_fd=archive_fd, follow_symlinks=False)
+            except OSError:
+                _fail("recovery")
+            identity = witness["identity"]
+            if _forward_identity_from_stat(info) != identity:
+                _fail("recovery")
+            if witness["kind"] == "directory":
+                if not stat.S_ISDIR(info.st_mode):
+                    _fail("recovery")
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                _fail("recovery")
+            fd, opened, data = _open_private_state_file_at(archive_fd, name)
+            try:
+                if _forward_identity_from_stat(opened) != identity:
+                    _fail("recovery")
+                if witness["snapshotRef"] is not None:
+                    reference_fd, _, reference = _open_private_state_file(
+                        os.path.join(state_root, adoption["successorRunKey"]
+                                     + "-final-deploy", witness["snapshotRef"])
+                    )
+                    os.close(reference_fd)
+                    if data != reference:
+                        _fail("recovery")
+                else:
+                    import base64
+                    embedded = base64.b64decode(witness["bytesBase64"], validate=True)
+                    if data != embedded:
+                        _fail("recovery")
+            finally:
+                os.close(fd)
+        if (_forward_identity_from_stat(os.fstat(archive_fd))
+                != _forward_identity_from_stat(os.stat(
+                    archive_path, follow_symlinks=False))):
+            _fail("recovery")
+    finally:
+        os.close(archive_fd)
+
+
+def _validate_forward_retention_fd(
+    state_fd: int,
+    state_root: str,
+    state_name: str,
+    child_names: set[str] | None,
+) -> None:
+    if child_names is None:
+        if {"forward-adoption.json", "forward-acceptance.json"} & set(
+                _iter_directory_fd_names(state_fd)):
+            _fail("recovery")
+        return
+    has_adoption = "forward-adoption.json" in (child_names or set())
+    has_acceptance = "forward-acceptance.json" in (child_names or set())
+    if has_adoption != has_acceptance:
+        _fail("recovery")
+    if not has_adoption:
+        return
+    successor, kind = _state_parts(state_name)
+    if kind != "final-deploy":
+        _fail("recovery")
+    adoption_fd, _, adoption_data = _open_private_state_file_at(
+        state_fd, "forward-adoption.json"
+    )
+    acceptance_fd, _, acceptance_data = _open_private_state_file_at(
+        state_fd, "forward-acceptance.json"
+    )
+    try:
+        adoption = _validate_forward_adoption(adoption_data, successor)
+        _validate_forward_acceptance(
+            acceptance_data, adoption_data, successor
+        )
+    finally:
+        os.close(adoption_fd)
+        os.close(acceptance_fd)
+    terminal_fd, _, terminal_data = _open_private_state_file_at(
+        state_fd, "terminal.json"
+    )
+    os.close(terminal_fd)
+    outcome, enabled = _parse_terminal_state_data(terminal_data, state_name)
+    original_marker = _json(base64.b64decode(
+        adoption["originalMarker"]["bytesBase64"]), "recovery")
+    if outcome != "committed" or enabled != original_marker["providerEnabled"]:
+        _fail("recovery")
+    _validate_forward_archive(adoption, state_root, require_source_absent=True)
+    transaction = _transaction(
+        HOST_CREDENTIAL_PARENT, FORWARD_ORIGIN_KEY
+    )
+    if os.path.lexists(transaction):
+        _fail("recovery")
 
 
 def _retention_delete(
@@ -2406,6 +4137,9 @@ def _retention_delete(
             names = _bounded_retention_children(state_fd)
             if not names:
                 _fail("recovery")
+            _validate_forward_retention_fd(
+                state_fd, state_root, name, names
+            )
             if OWNER_MARKER not in names or "terminal.json" not in names:
                 _fail("recovery")
             for child in names:
@@ -2531,6 +4265,10 @@ def _parser() -> argparse.ArgumentParser:
             "verify",
             "finish",
             "state-publish",
+            "forward-adopt",
+            "forward-revalidate",
+            "forward-phase",
+            "forward-complete",
             "retention-list",
             "retention-check",
             "retention-delete",
@@ -2544,6 +4282,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--protected-state", action="append", default=[])
     parser.add_argument("--retention-state", default="")
     parser.add_argument("--state-kind", default="")
+    parser.add_argument("--deployment-root", default="")
+    parser.add_argument("--base-compose", default="")
     return parser
 
 
@@ -2581,6 +4321,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             _finish(args.run_key, args.state_root, "", args.outcome, _bounded_stdin(MAX_INSPECTION_BYTES))
         elif args.command == "state-publish":
             _state_publish(args.state_root, args.run_key, args.state_kind)
+        elif args.command == "forward-adopt":
+            _forward_admission(args.state_root, args.run_key, args.deployment_root,
+                               args.base_compose, _bounded_stdin(MAX_INSPECTION_BYTES))
+        elif args.command == "forward-revalidate":
+            _forward_revalidate(args.state_root, args.run_key,
+                                 _bounded_stdin(MAX_INSPECTION_BYTES))
+        elif args.command == "forward-phase":
+            _forward_phase(args.state_root, args.run_key, args.phase)
+        elif args.command == "forward-complete":
+            _forward_complete(args.state_root, args.run_key,
+                              _bounded_stdin(MAX_INSPECTION_BYTES))
         elif args.command == "retention-list":
             _retention_list(
                 "",
@@ -2606,7 +4357,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     except ProviderError as exc:
         sys.stderr.write(exc.category + "\n")
         return 1
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
         sys.stderr.write(ERRORS["recovery"] + "\n")
         return 1
 

@@ -143,6 +143,81 @@ Failed runs remain available until a later successful deployment applies
 retention. The active Compose/runtime files under `/var/lib/meet-production`
 are outside the cleanup roots and must still exist after cleanup.
 
+## Exact failed v1.6.0/OFF forward reconciliation
+
+`Reconcile the exact failed v1.6.0 deployment forward` is a separate,
+default-off workflow input for the single failed run `40368479855-1`. It is
+not a general retry or rollback switch. It is valid only with release `v1.6.0`,
+the approved immutable release/index/amd64 manifest tuple, the pending
+LocationIQ OFF transition enabled, `manual-stop`, rollback drill disabled,
+and a new workflow run on its initial attempt. The failed run's key is never
+reused as a deployment key.
+
+The remote coordinator admits only the exact still-owned `applying` marker and
+its complete private witnesses, the sole stopped predecessor with its
+full-container identity, unchanged active/configuration bytes, exact Docker
+local endpoint, original provider credential ownership, and literal
+`GEOCODER_ENABLED=false` with the original intended key preserved privately.
+The old marker remains present while a new run's private adoption receipt is
+durably prepared; one atomic pointer replacement transfers ownership. There is
+no marker deletion, ordinary retry, manual Compose command, old-image restart,
+or rollback fallback. From the first service writer, failures attempt to stop
+only the identity-proven new backend and preserve the recovery marker/state.
+If that identity is uncertain, no guessed container is stopped.
+
+This route is fixed to `/opt/meet-backend`. The existing deployment lock must
+be a safe regular file and is opened without truncation or creation. The
+original `.test-vps-tooling-40368479855-1/docker-compose.production.yml` must
+still match its saved identity; freshly staged Compose must match the original
+reviewed bytes, not that old inode. The root fallback Compose must match a
+retained original Compose snapshot and is never rewritten. The stopped
+container must retain exit `143` and exact finish time
+`2026-10-26T17:30:24.669192243Z`. Its version is derived from the original
+previous-version/environment witnesses and actual image labels; no fixture
+version or abbreviated image ID supplies that evidence.
+
+The helper rejects unexpected inherited Docker host/context and wrapper
+selection, establishes `unix:///var/run/docker.sock`, and pins inspections,
+replacement and failure cleanup to it. The workflow pins its target pull,
+post-commit inspection and retention to the same endpoint for this opt-in.
+Exactly one workflow-owned `up` replaces `backend`; no updater, active-file
+installation or credential preparation is repeated. PostgreSQL and volume
+identities are compared in memory before and after the candidate checks.
+
+Success requires the new candidate's normal runtime, pending-OFF, provider,
+and public checks; credential finalization; immutable acceptance evidence; and
+an identity-verified atomic archive of the original failed state at
+`/var/lib/meet-test-vps-incident-archive/40368479855-1-forward-reconciled`.
+The new run alone receives a committed terminal. The old failed run is not
+rewritten as successful, and the incident archive is outside automatic
+retention. Any incomplete adoption, acceptance, archive, or cleanup remains a
+manual intervention state and is not automatically replayed.
+
+The trusted archive parent must already exist, be root-owned mode `0700`,
+and share the deployment state's filesystem; an existing destination blocks
+admission. The helper never creates or repairs that prerequisite and never
+falls back to copy/delete. Two immutable mode-`0600` receipts bind the original
+owner/source/stopped witnesses and the new candidate acceptance. The original
+credential transaction remains at its original key until authenticated finish;
+created/reused rules and publication hard links remain intact. There is no
+extra credential copy, secret digest or third witness file.
+
+Completed retention requires both matching receipts, the new committed
+terminal, the actual identity/content-verified archive, the absent former
+state path and the absent original credential transaction. It does not reopen
+vanished transaction state or recheck historical active files/containers.
+Only the new state is eligible for normal bounded retention; the archive is
+permanently excluded in this scope. A failure after durable runtime commit is
+a workflow failure reported separately from service state, not an enable
+authorization or a reason to replay finalization.
+
+This transition starts the ordinary application, Flyway, health-check,
+provider, and scheduler lifecycles while preserving existing Timepad settings.
+Geocoder OFF does not disable Timepad; a scheduled job may make its normal
+external request and catalog writes during the deployment window. Obtain
+separate live execution consent and disclose those effects before selecting
+the opt-in. The workflow does not enable the geocoder or run a provider probe.
+
 ## Yandex SMTP transaction workflow
 
 The **Configure Yandex SMTP on test VPS** workflow is the only supported path
