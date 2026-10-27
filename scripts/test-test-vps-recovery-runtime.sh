@@ -6,6 +6,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 probe=$script_dir/probe-test-vps-recovery-runtime.sh
 for tool in bash jq mktemp; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
 [[ $(uname -s) == Linux ]] || fail "isolated Linux fixture required"
+real_jq=$(command -v jq)
 bash -n "$probe"
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT HUP INT TERM
@@ -14,6 +15,9 @@ make_case(){
   local case_dir="$fixture/$1"
   mkdir -p "$case_dir/bin" "$case_dir/root" "$case_dir/output"
   printf 'BACKEND_IMAGE=offline-fixture\n' >"$case_dir/root/.env.production"
+  for suffix in response.UNRELATED headers.UNRELATED tmp.UNRELATED; do
+    printf 'unrelated:%s\n' "$suffix" >"$case_dir/output/runtime.json.$suffix"
+  done
   cat >"$case_dir/bin/compose" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -84,6 +88,19 @@ if [ "${SIGNAL_MKTEMP_AT:-0}" -eq "$count" ]; then
 fi
 printf '%s\n' "$path"
 EOF
+  cat >"$case_dir/bin/jq" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${FAIL_JQ_STAGE:-}" in
+  validation) [ "${1:-}" != -e ] || exit 86 ;;
+  serialization)
+    if [[ "$*" == *meet-backend/test-vps-recovery-runtime/v1* ]]; then
+      exit 87
+    fi
+    ;;
+esac
+exec "$REAL_JQ" "$@"
+EOF
   cat >"$case_dir/bin/rm" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -111,6 +128,9 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 /bin/chmod "$@"
+if [ "${FAIL_CHMOD:-0}" = 1 ]; then
+  exit 88
+fi
 if [ -n "${SIGNAL_BEFORE_PUBLISH:-}" ]; then
   kill "-${SIGNAL_BEFORE_PUBLISH}" "$PROBE_PID"
 fi
@@ -122,6 +142,7 @@ invoke(){
   local case_dir=$1
   shift
   env CALL_LOG="$case_dir/calls.log" \
+    REAL_JQ="$real_jq" \
     MKTEMP_COUNT_FILE="$case_dir/mktemp-count" \
     CURL_COUNT_FILE="$case_dir/curl-count" \
     PATH="$case_dir/bin:$PATH" \
@@ -131,6 +152,14 @@ invoke(){
       --public-url https://api.whysoezzy.online "$@"
 }
 
+assert_unrelated_files(){
+  local case_dir=$1 suffix
+  for suffix in response.UNRELATED headers.UNRELATED tmp.UNRELATED; do
+    [ "$(cat "$case_dir/output/runtime.json.$suffix")" = "unrelated:$suffix" ] ||
+      fail "unrelated similarly named file changed: $suffix"
+  done
+}
+
 assert_no_allocations(){
   local case_dir=$1 file
   for file in "$case_dir"/output/runtime.json.response.* \
@@ -138,23 +167,17 @@ assert_no_allocations(){
     case "$file" in *.UNRELATED) continue;; esac
     [ ! -e "$file" ] || fail "temporary survived cleanup: $file"
   done
+  assert_unrelated_files "$case_dir"
 }
 
 # Success preserves the output contract, mode, and unrelated lookalikes.
 make_case success
 success="$fixture/success"
-for suffix in response.UNRELATED headers.UNRELATED tmp.UNRELATED; do
-  printf 'unrelated:%s\n' "$suffix" >"$success/output/runtime.json.$suffix"
-done
 invoke "$success"
 jq -e '.schema=="meet-backend/test-vps-recovery-runtime/v1" and .healthy==true and
   .runtime.health=="healthy" and .https.meetingsJson==true' "$success/output/runtime.json" >/dev/null
 [ "$(stat -c '%a' "$success/output/runtime.json")" = 600 ] || fail "published mode changed"
 assert_no_allocations "$success"
-for suffix in response.UNRELATED headers.UNRELATED tmp.UNRELATED; do
-  [ "$(cat "$success/output/runtime.json.$suffix")" = "unrelated:$suffix" ] ||
-    fail "unrelated similarly named file was changed"
-done
 
 # Fail each allocation in turn; successful prior allocations are cleaned.
 for allocation in 1 2 3; do
@@ -169,6 +192,32 @@ for allocation in 1 2 3; do
   assert_no_allocations "$case_dir"
   [ ! -e "$case_dir/output/runtime.json" ] || fail "failed allocation published output"
 done
+
+make_case jq-validation-failure
+case_dir="$fixture/jq-validation-failure"
+status=0
+FAIL_JQ_STAGE=validation invoke "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr" || status=$?
+[ "$status" -eq 1 ] || fail "jq validation failure status changed to $status"
+grep -Fq 'meetings response is not JSON array' "$case_dir/stderr" ||
+  fail "jq validation failure was not propagated"
+assert_no_allocations "$case_dir"
+[ ! -e "$case_dir/output/runtime.json" ] || fail "jq validation failure published output"
+
+make_case jq-serialization-failure
+case_dir="$fixture/jq-serialization-failure"
+status=0
+FAIL_JQ_STAGE=serialization invoke "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr" || status=$?
+[ "$status" -eq 87 ] || fail "jq serialization failure status changed to $status"
+assert_no_allocations "$case_dir"
+[ ! -e "$case_dir/output/runtime.json" ] || fail "jq serialization failure published output"
+
+make_case chmod-failure
+case_dir="$fixture/chmod-failure"
+status=0
+FAIL_CHMOD=1 invoke "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr" || status=$?
+[ "$status" -eq 88 ] || fail "chmod failure status changed to $status"
+assert_no_allocations "$case_dir"
+[ ! -e "$case_dir/output/runtime.json" ] || fail "chmod failure published output"
 
 make_case curl-failure
 case_dir="$fixture/curl-failure"
@@ -197,8 +246,16 @@ grep -Fq 'temporary-file cleanup failed' "$case_dir/stderr" ||
   fail "cleanup failure was not diagnosed"
 jq -e '.healthy==true' "$case_dir/output/runtime.json" >/dev/null ||
   fail "cleanup failure unexpectedly removed the published output"
-[ "$(find "$case_dir/output" -maxdepth 1 -name 'runtime.json.response.*' | wc -l)" -eq 1 ] ||
+[ "$(find "$case_dir/output" -maxdepth 1 -name 'runtime.json.response.*' ! -name '*.UNRELATED' | wc -l)" -eq 1 ] ||
   fail "cleanup failure did not leave the failed unlink visible"
+[ "$(find "$case_dir/output" -maxdepth 1 -name 'runtime.json.headers.*' ! -name '*.UNRELATED' | wc -l)" -eq 0 ] ||
+  fail "cleanup failure did not remove the owned header temporary"
+[ "$(find "$case_dir/output" -maxdepth 1 -name 'runtime.json.tmp.*' ! -name '*.UNRELATED' | wc -l)" -eq 0 ] ||
+  fail "cleanup failure did not remove the owned publication temporary"
+for file in response.UNRELATED headers.UNRELATED tmp.UNRELATED; do
+  [ "$(cat "$case_dir/output/runtime.json.$file")" = "unrelated:$file" ] ||
+    fail "cleanup failure changed an unrelated lookalike: $file"
+done
 
 # Signals at each allocation and HTTP boundary must exit immediately and
 # clean invocation-owned files.
@@ -267,4 +324,4 @@ invoke "$case_dir"
 after=$(printf '%s\n' "${leftovers[@]}" | sort | xargs -r sha256sum)
 [ "$before" = "$after" ] || fail "later invocation swept historical crash evidence"
 jq -e '.healthy==true' "$case_dir/output/runtime.json" >/dev/null
-echo "test VPS recovery runtime allocation contract passed: success=2 mktemp-failure=3 curl-failure=1 rename-failure=1 cleanup-failure=1 allocation-signals=9 http-signals=9 prepublish-signals=3 postpublish-signals=3 sigkill-no-sweep=1"
+echo "test VPS recovery runtime allocation contract passed: success=2 mktemp-failure=3 jq-validation-failure=1 jq-serialization-failure=1 chmod-failure=1 curl-failure=1 rename-failure=1 cleanup-failure=1 allocation-signals=9 http-signals=9 prepublish-signals=3 postpublish-signals=3 sigkill-no-sweep=1"
