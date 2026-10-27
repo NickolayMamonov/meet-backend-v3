@@ -7,6 +7,7 @@ sys.dont_write_bytecode = True
 import base64
 import contextlib
 import copy
+import errno
 import hashlib
 import importlib.util
 import io
@@ -14,6 +15,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
+import stat
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -188,6 +192,15 @@ class Fixture:
                   info.st_size, info.st_mtime_ns, info.st_ctime_ns)
         return (":".join(map(str, fields)) + ":" +
                 hashlib.sha256(Path(path).read_bytes()).hexdigest() + "\n").encode()
+
+    def historical_original(self):
+        path = Path(self.paths["original-base"])
+        path.chmod(0o644)
+        os.chown(path, 1001, 1001)
+        name = "config.base-compose.yml.identity"
+        data = self.saved_identity(path)
+        self.write(self.origin / name, data)
+        self.original_files[name] = data
 
     def backend_record(self):
         return {
@@ -678,8 +691,362 @@ class ForwardTests(FixtureTests):
             self.assertFalse((fixture.successor / "forward-acceptance.json").exists())
 
 
+class HistoricalOriginalTests(FixtureTests):
+    """Real Linux ownership/ACL/inode behavior, with read-only reject evidence."""
+
+    def historical(self):
+        fixture = self.fresh()
+        fixture.historical_original()
+        return fixture
+
+    @staticmethod
+    def inventory(root):
+        result = {}
+        for path in (root, *root.rglob("*")):
+            info = path.lstat()
+            identity = helper._forward_identity_from_stat(info)
+            data = path.read_bytes() if stat.S_ISREG(info.st_mode) else None
+            result[str(path.relative_to(root))] = (identity, data, tuple(sorted(
+                (name, os.getxattr(path, name, follow_symlinks=False))
+                for name in os.listxattr(path, follow_symlinks=False))))
+        return result
+
+    def rejected_unchanged(self, fixture, operation=None):
+        before = self.inventory(fixture.root)
+        with self.assertRaises((helper.ProviderError, OSError)):
+            (operation or fixture.admit)()
+        self.assertEqual(self.inventory(fixture.root), before)
+
+    @staticmethod
+    def owner_write(path):
+        # Owners may retain an open fd even under root-private ancestry.
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            subprocess.run([sys.executable, "-B", "-c",
+                            "import os,sys; os.setgid(1001); os.setuid(1001); "
+                            "os.pwrite(int(sys.argv[1]), b'X', 0)",
+                            str(fd)], pass_fds=(fd,), check=True, timeout=10)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def acl(path, default=False):
+        # Linux POSIX ACL v2: named UID 1001, not a mock of the xattr API.
+        mode = stat.S_IMODE(path.stat().st_mode)
+        entries = ((1, mode >> 6 & 7, 0xffffffff), (2, 4, 1001),
+                   (4, 0, 0xffffffff), (16, mode >> 3 & 7, 0xffffffff),
+                   (32, mode & 7, 0xffffffff))
+        os.setxattr(path, "system.posix_acl_" + ("default" if default else "access"),
+                    struct.pack("<I", 2) + b"".join(
+                        struct.pack("<HHI", *entry) for entry in entries))
+        assert stat.S_IMODE(path.stat().st_mode) == mode
+
+    def test_historical_all_boundaries_and_retention_preserve_contract(self):
+        for disposition in ("none", "created", "reused"):
+            with self.subTest(disposition=disposition):
+                fixture = self.fresh(disposition)
+                fixture.historical_original()
+                before = self.inventory(fixture.app)
+                fixture.admit()
+                receipt = (fixture.successor / "forward-adoption.json").read_bytes()
+                witness = next(item for item in json.loads(receipt)["sourceWitnesses"]
+                               if item["role"] == "original-base")
+                self.assertEqual((witness["identity"]["uid"], witness["identity"]["gid"]),
+                                 (1001, 1001))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    helper._forward_revalidate(str(fixture.states), SUCCESSOR,
+                                               encode([fixture.backend]))
+                fixture.phase()
+                fixture.complete()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    helper._retention_check("", str(fixture.states))
+                self.assertEqual(self.inventory(fixture.app), before)
+                self.assertEqual((fixture.archive / "config.base-compose.yml.identity").read_bytes(),
+                                 fixture.original_files["config.base-compose.yml.identity"])
+
+    def test_only_exact_owner_mode_and_fixed_path_are_eligible_even_with_saved_match(self):
+        for uid, gid, mode in ((1001, 1001, 0o600), (1002, 1002, 0o644),
+                               (1001, 0, 0o644), (0, 1001, 0o644),
+                               (1001, 1001, 0o640), (1001, 1001, 0o666)):
+            with self.subTest(uid=uid, gid=gid, mode=mode):
+                fixture = self.historical()
+                path = Path(fixture.paths["original-base"])
+                os.chown(path, uid, gid)
+                path.chmod(mode)
+                name = "config.base-compose.yml.identity"
+                fixture.original_files[name] = fixture.saved_identity(path)
+                Fixture.write(fixture.origin / name, fixture.original_files[name])
+                if (uid, gid, mode) == (1001, 1001, 0o600):
+                    fixture.admit()
+                else:
+                    self.rejected_unchanged(fixture)
+        fixture = self.historical()
+        for path in (fixture.paths["reviewed-base"], str(fixture.fallback),
+                     str(fixture.app) + "/../base"):
+            with self.assertRaises(helper.ProviderError):
+                helper._forward_read_original_base(path, str(fixture.origin),
+                                                   fixture.original_files)
+
+    def test_exact_byte_budget_and_over_budget_are_bounded(self):
+        fixture = self.historical()
+        path = Path(fixture.paths["original-base"])
+        content = b"x" * helper.MAX_WITNESS_BYTES
+        path.write_bytes(content)
+        for name, data in (("config.base-compose.yml", content),
+                           ("config.base-compose.yml.identity", fixture.saved_identity(path))):
+            Fixture.write(fixture.origin / name, data)
+            fixture.original_files[name] = data
+        identity, actual = helper._forward_read_original_base(
+            str(path), str(fixture.origin), fixture.original_files)
+        self.assertEqual(actual, content)
+        self.assertEqual(identity["size"], helper.MAX_WITNESS_BYTES)
+        with path.open("ab") as stream:
+            stream.write(b"x")
+        self.rejected_unchanged(fixture, lambda: helper._forward_read_original_base(
+            str(path), str(fixture.origin), fixture.original_files))
+
+    def test_every_saved_field_and_malformed_record_reject_readonly(self):
+        for index in range(9):
+            with self.subTest(field=index):
+                fixture = self.historical()
+                saved = fixture.origin / "config.base-compose.yml.identity"
+                fields = saved.read_text().rstrip("\n").split(":")
+                fields[index] = ("0" * 64 if index == 8 else str(int(fields[index]) + 1))
+                saved.write_bytes((":".join(fields) + "\n").encode())
+                self.rejected_unchanged(fixture)
+        for shape in ("truncated", "extra", "newline", "garbage"):
+            with self.subTest(shape=shape):
+                fixture = self.historical()
+                saved = fixture.origin / "config.base-compose.yml.identity"
+                data = saved.read_bytes()
+                saved.write_bytes({"truncated": data[:-20], "extra": data[:-1] + b":0\n",
+                                   "newline": data[:-1], "garbage": b"invalid\n"}[shape])
+                self.rejected_unchanged(fixture)
+
+    def test_leaf_metadata_bytes_and_type_hostility_reject_readonly(self):
+        cases = ("inode", "uid", "gid", "mode", "hardlink", "size", "mtime",
+                 "bytes", "symlink", "fifo", "socket", "device", "budget")
+        for case in cases:
+            with self.subTest(case=case):
+                fixture = self.historical()
+                path = Path(fixture.paths["original-base"])
+                if case == "inode":
+                    ForwardTests.swap_same_bytes(path)
+                    os.chown(path, 1001, 1001)
+                    path.chmod(0o644)
+                elif case == "uid":
+                    os.chown(path, 1002, 1001)
+                elif case == "gid":
+                    os.chown(path, 1001, 1002)
+                elif case == "mode":
+                    path.chmod(0o600)
+                elif case == "hardlink":
+                    os.link(path, fixture.root / "alias")
+                elif case == "mtime":
+                    info = path.stat()
+                    os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+                elif case in ("size", "bytes"):
+                    path.write_bytes(b"services: []\n" if case == "bytes" else b"larger\n" * 4)
+                elif case == "budget":
+                    with path.open("wb") as stream:
+                        stream.truncate(helper.MAX_WITNESS_BYTES + 1)
+                else:
+                    path.unlink()
+                    if case == "symlink":
+                        path.symlink_to(fixture.paths["reviewed-base"])
+                    elif case == "fifo":
+                        os.mkfifo(path)
+                    elif case == "socket":
+                        with socket.socket(socket.AF_UNIX) as sock:
+                            sock.bind(str(path))
+                    else:
+                        os.mknod(path, stat.S_IFCHR | 0o600, os.makedev(1, 3))
+                self.rejected_unchanged(fixture)
+
+    def test_strict_roles_and_untrusted_saved_authority_reject_readonly(self):
+        for role in ("original-base", "reviewed-base", "production-env",
+                     "active-compose", "active-runtime", "lock"):
+            with self.subTest(role=role):
+                fixture = self.historical()
+                path = (fixture.states / ".deploy.lock" if role == "lock"
+                        else Path(fixture.paths[role]))
+                os.chown(path, 1001, 1001)
+                with self.assertRaises(helper.ProviderError):
+                    helper._forward_read_external(str(path))
+                if role != "original-base":
+                    self.rejected_unchanged(fixture)
+        for name in (helper.OWNER_MARKER, "config.base-compose.yml",
+                     "config.base-compose.yml.identity"):
+            for mutation in ("owner", "gid", "mode", "symlink"):
+                with self.subTest(authority=name, mutation=mutation):
+                    fixture = self.historical()
+                    path = fixture.origin / name
+                    if mutation == "owner":
+                        os.chown(path, 1001, 1001)
+                    elif mutation == "gid":
+                        os.chown(path, 0, 1001)
+                    elif mutation == "mode":
+                        path.chmod(0o644)
+                    else:
+                        data = path.read_bytes()
+                        path.unlink()
+                        Fixture.write(fixture.root / "untrusted-saved", data)
+                        path.symlink_to(fixture.root / "untrusted-saved")
+                    self.rejected_unchanged(fixture)
+
+    def test_ancestor_trust_and_real_access_default_acls_reject(self):
+        for case in ("symlink", "writable", "owner", "access", "default",
+                     "leaf-access", "saved-access", "unsupported"):
+            with self.subTest(case=case):
+                fixture = self.historical()
+                path = Path(fixture.paths["original-base"])
+                parent = path.parent
+                if case == "symlink":
+                    saved = parent.with_name("moved")
+                    parent.rename(saved)
+                    parent.symlink_to(saved, target_is_directory=True)
+                elif case == "writable":
+                    parent.chmod(0o720)
+                elif case == "owner":
+                    os.chown(parent, 1001, 1001)
+                elif case in ("access", "default"):
+                    self.acl(parent, default=case == "default")
+                elif case == "leaf-access":
+                    self.acl(path)
+                elif case == "saved-access":
+                    self.acl(fixture.origin / "config.base-compose.yml.identity")
+                if case == "unsupported":
+                    with mock.patch.object(helper.os, "getxattr",
+                                           side_effect=OSError(errno.ENOTSUP, "fixture")):
+                        self.rejected_unchanged(fixture)
+                else:
+                    self.rejected_unchanged(fixture)
+
+    def test_forged_receipt_role_path_snapshot_and_identity_reject(self):
+        for case in ("role", "path", "fallback", "traversal", "snapshotRef", "uid", "gid", "nlink"):
+            with self.subTest(case=case):
+                fixture = self.historical()
+                fixture.admit()
+                value = json.loads((fixture.successor / "forward-adoption.json").read_bytes())
+                witness = next(item for item in value["sourceWitnesses"]
+                               if item["role"] == "original-base")
+                if case == "role":
+                    witness["role"] = "reviewed-base"
+                elif case in ("path", "fallback", "traversal"):
+                    witness["path"] = {"path": fixture.paths["reviewed-base"],
+                                       "fallback": str(fixture.fallback),
+                                       "traversal": str(fixture.app) + "/../base"}[case]
+                    value["sourceWitnesses"].sort(key=lambda item: item["path"])
+                elif case == "snapshotRef":
+                    witness["snapshotRef"] = "candidate-active-compose.yml"
+                else:
+                    witness["identity"][case] += 1
+                with self.assertRaises(helper.ProviderError):
+                    helper._validate_forward_adoption(encode(value), SUCCESSOR)
+
+    def test_owner_writes_fail_revalidate_complete_and_pointer_publication(self):
+        for boundary in ("revalidate", "complete", "pointer-ready"):
+            with self.subTest(boundary=boundary):
+                fixture = self.historical()
+                path = Path(fixture.paths["original-base"])
+                if boundary == "pointer-ready":
+                    def write(stage):
+                        if stage == boundary:
+                            self.owner_write(path)
+                    with mock.patch.object(helper, "_forward_adopt_boundary", side_effect=write):
+                        with self.assertRaises(helper.ProviderError):
+                            fixture.admit()
+                    self.assertEqual(fixture.marker()["runKey"], helper.FORWARD_ORIGIN_KEY)
+                else:
+                    fixture.admit()
+                    if boundary == "complete":
+                        fixture.phase()
+                    self.owner_write(path)
+                    operation = (fixture.complete if boundary == "complete" else lambda:
+                                 helper._forward_revalidate(str(fixture.states), SUCCESSOR,
+                                                            encode([fixture.backend])))
+                    self.rejected_unchanged(fixture, operation)
+                    self.assertEqual(fixture.marker()["runKey"], SUCCESSOR)
+                self.assertFalse(fixture.archive.exists())
+                self.assertFalse((fixture.successor / "forward-acceptance.json").exists())
+
+    def test_receipt_cannot_rebase_saved_authority_on_revalidation(self):
+        fixture = self.historical()
+        fixture.admit()
+        path = Path(fixture.paths["original-base"])
+        # Restore the same bytes but alter ctime using the real owner's fd.
+        self.owner_write(path)
+        path.write_bytes(fixture.original_files["config.base-compose.yml"])
+        receipt_path = fixture.successor / "forward-adoption.json"
+        receipt = json.loads(receipt_path.read_bytes())
+        witness = next(item for item in receipt["sourceWitnesses"]
+                       if item["role"] == "original-base")
+        witness["identity"] = helper._forward_identity_from_stat(path.stat())
+        receipt_path.write_bytes(encode(receipt))
+        helper._validate_forward_adoption(receipt_path.read_bytes(), SUCCESSOR)
+        self.rejected_unchanged(fixture, lambda: helper._forward_revalidate(
+            str(fixture.states), SUCCESSOR, encode([fixture.backend])))
+        self.assertEqual((fixture.origin / "config.base-compose.yml.identity").read_bytes(),
+                         fixture.original_files["config.base-compose.yml.identity"])
+
+    def test_adopt_request_cannot_supply_replacement_saved_authority(self):
+        fixture = self.historical()
+        with mock.patch.object(helper, "_forward_adopt") as capture:
+            fixture.admit()
+        request = json.loads(capture.call_args.args[1])
+        path = Path(fixture.paths["original-base"])
+        self.owner_write(path)
+        path.write_bytes(fixture.original_files["config.base-compose.yml"])
+        receipt = json.loads(base64.b64decode(request["adoptionReceiptBase64"]))
+        witness = next(item for item in receipt["sourceWitnesses"]
+                       if item["role"] == "original-base")
+        witness["identity"] = helper._forward_identity_from_stat(path.stat())
+        request["adoptionReceiptBase64"] = base64.b64encode(encode(receipt)).decode()
+        request["snapshots"]["config.base-compose.yml.identity"] = base64.b64encode(
+            fixture.saved_identity(path)).decode()
+        self.rejected_unchanged(fixture, lambda: helper._forward_adopt(
+            str(fixture.states), encode(request)))
+        self.unchanged(fixture)
+
+    def test_descriptor_pinning_rejects_read_and_ancestor_swaps_without_leaks(self):
+        for case in ("owner-write", "leaf-rename", "ancestor-symlink", "ancestor-rename"):
+            with self.subTest(case=case):
+                fixture = self.historical()
+                path = Path(fixture.paths["original-base"])
+                original_read = helper._read_fd_bounded
+                fired = False
+                def raced(fd, limit):
+                    nonlocal fired
+                    data = original_read(fd, limit)
+                    if not fired and os.fstat(fd).st_uid == 1001:
+                        fired = True
+                        if case == "owner-write":
+                            self.owner_write(path)
+                        elif case == "leaf-rename":
+                            ForwardTests.swap_same_bytes(path)
+                            os.chown(path, 1001, 1001)
+                            path.chmod(0o644)
+                        else:
+                            parent = path.parent
+                            moved = parent.with_name("moved")
+                            parent.rename(moved)
+                            if case == "ancestor-symlink":
+                                parent.symlink_to(moved, target_is_directory=True)
+                            else:
+                                parent.mkdir(mode=0o700)
+                                Fixture.write(path, data)
+                    return data
+                fds = len(os.listdir("/proc/self/fd"))
+                with mock.patch.object(helper, "_read_fd_bounded", side_effect=raced):
+                    with self.assertRaises((helper.ProviderError, OSError)):
+                        fixture.admit()
+                self.assertTrue(fired)
+                self.assertEqual(len(os.listdir("/proc/self/fd")), fds)
+                self.unchanged(fixture)
+
+
 FAKE_DOCKER = r'''#!/usr/bin/env python3
-import json, os, pathlib, re, sys
+import base64, json, os, pathlib, re, stat, subprocess, sys
 root = pathlib.Path(os.environ["FORWARD_FIXTURE"])
 args = sys.argv[1:]
 explicit = args[:1] == ["--host=unix:///var/run/docker.sock"]
@@ -757,6 +1124,25 @@ elif args[:1] == ["stop"]:
         sys.exit(1)
 elif args[:1] == ["compose"]:
     operation = next((arg for arg in args if arg in ("ps", "config", "up", "port", "stop")), "")
+    inputs = []
+    if operation == "up" and failure == "owner-write-after-validation":
+        path = data["originalBase"]
+        fd = os.open(path, os.O_WRONLY)
+        subprocess.run([sys.executable, "-B", "-c",
+                        "import os,sys; os.setgid(1001); os.setuid(1001); "
+                        "os.pwrite(int(sys.argv[1]), b'X', 0)", str(fd)],
+                       pass_fds=(fd,), check=True, timeout=10)
+        os.close(fd)
+    for index, arg in enumerate(args):
+        if arg != "-f":
+            continue
+        path = pathlib.Path(args[index + 1])
+        info = path.stat()
+        inputs.append({"path": str(path), "uid": info.st_uid, "gid": info.st_gid,
+                       "mode": stat.S_IMODE(info.st_mode), "nlink": info.st_nlink,
+                       "bytes": base64.b64encode(path.read_bytes()).decode()})
+    with (root / "consumer-trace").open("a") as stream:
+        stream.write(json.dumps({"operation": operation, "inputs": inputs}) + "\n")
     if operation == "ps":
         print(data["postgres"]["Id"] if args[-1] == "postgres" else backend["Id"])
     elif operation == "config":
@@ -805,8 +1191,10 @@ else:
 class ShellIntegrationTests(FixtureTests):
     """Actual release helper, Compose wrapper and healthy runtime invariant code."""
 
-    def run_shell(self, disposition="none", failure="", overrides=None):
+    def run_shell(self, disposition="none", failure="", overrides=None, historical=False):
         fixture = self.fresh(disposition)
+        if historical:
+            fixture.historical_original()
         stage = Path(fixture.paths["reviewed-base"]).parent / "scripts"
         stage.mkdir(mode=0o700)
         for name in (
@@ -840,6 +1228,7 @@ class ShellIntegrationTests(FixtureTests):
             "postgres": postgres, "rendered": fixture.rendered,
             "volumes": [{"Name": "meet-production_uploads_data"},
                         {"Name": "meet-production_postgres_data"}],
+            "originalBase": fixture.paths["original-base"],
         }))
         bin_dir = fixture.root / "bin"
         Fixture.write(bin_dir / "docker", FAKE_DOCKER.encode(), 0o755)
@@ -850,7 +1239,8 @@ class ShellIntegrationTests(FixtureTests):
         for key in ("DOCKER_HOST", "DOCKER_CONTEXT", "MEE_SMTP_FAKE_REMOTE",
                     "PRODUCTION_STATE_DIR", "RUNTIME_BASE_COMPOSE", "RUNTIME_USE_REVIEWED_COMPOSE"):
             env.pop(key, None)
-        env.update(overrides or {})
+        env.update({key: fixture.paths["original-base"] if value == "HISTORICAL" else value
+                    for key, value in (overrides or {}).items()})
         # Parent fixture releases its lock; the actual coordinator must acquire it.
         helper.fcntl.flock(9, helper.fcntl.LOCK_UN)
         fallback_before = fixture.saved_identity(fixture.fallback)
@@ -870,6 +1260,57 @@ class ShellIntegrationTests(FixtureTests):
         trace = [json.loads(line) for line in (fixture.root / "trace").read_text().splitlines()
                  ] if (fixture.root / "trace").exists() else []
         return fixture, result, trace
+
+    def assert_private_consumers(self, fixture):
+        observations = [json.loads(line) for line in
+                        (fixture.root / "consumer-trace").read_text().splitlines()]
+        self.assertTrue(any(item["operation"] == "up" for item in observations))
+        expected = {
+            fixture.paths["active-compose"]: fixture.original_files["config.base-compose.yml"],
+            fixture.paths["active-runtime"]: fixture.original_files["target-runtime.override.yml"],
+        }
+        for observation in observations:
+            self.assertEqual({item["path"] for item in observation["inputs"]}, set(expected))
+            for item in observation["inputs"]:
+                self.assertEqual((item["uid"], item["gid"], item["mode"], item["nlink"]),
+                                 (0, 0, 0o600, 1))
+                self.assertEqual(base64.b64decode(item["bytes"]), expected[item["path"]])
+
+    def test_historical_coordinator_consumes_only_authenticated_private_copies(self):
+        for overrides in ({}, {"PRODUCTION_BASE_COMPOSE": "HISTORICAL",
+                               "PRODUCTION_USE_REVIEWED_COMPOSE": "true",
+                               "PRODUCTION_ROOT": "/unexpected",
+                               "COMPOSE_FILE": "HISTORICAL"}):
+            with self.subTest(overrides=overrides):
+                fixture, result, _ = self.run_shell(historical=True, overrides=overrides)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assert_private_consumers(fixture)
+
+    def test_owner_write_after_validation_never_enters_compose_or_acceptance(self):
+        fixture, result, trace = self.run_shell(
+            historical=True, failure="owner-write-after-validation")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_private_consumers(fixture)
+        self.assertTrue(Path(fixture.paths["original-base"]).read_bytes().startswith(b"X"))
+        self.assertEqual(len([entry for entry in trace if "up" in entry["argv"]]), 1)
+        self.assertTrue(fixture.origin.exists())
+        self.assertFalse(fixture.archive.exists())
+        self.assertFalse((fixture.successor / "forward-acceptance.json").exists())
+        self.assertFalse((fixture.successor / "terminal.json").exists())
+
+    def test_historical_runtime_selection_overrides_block_before_mutation(self):
+        for overrides in (
+            {"RUNTIME_BASE_COMPOSE": "HISTORICAL"},
+            {"RUNTIME_USE_REVIEWED_COMPOSE": "true"},
+            {"PRODUCTION_STATE_DIR": "HISTORICAL"},
+        ):
+            with self.subTest(overrides=overrides):
+                fixture, result, trace = self.run_shell(historical=True, overrides=overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.unchanged(fixture)
+                self.assertFalse([entry for entry in trace if any(
+                    arg in ("up", "stop", "start", "restart") for arg in entry["argv"])])
+                self.assertFalse((fixture.root / "consumer-trace").exists())
 
     def test_real_coordinator_success_all_dispositions(self):
         for disposition in ("created", "reused", "none"):

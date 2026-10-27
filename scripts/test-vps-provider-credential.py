@@ -1239,6 +1239,16 @@ def _forward_external_paths(successor: str) -> dict[str, str]:
     }
 
 
+def _forward_original_base_witness(witness: dict[str, Any]) -> bool:
+    return (
+        witness["role"] == "original-base"
+        and witness["path"] == _forward_external_paths("")["original-base"]
+        and witness["kind"] == "regular-file"
+        and witness["snapshotRef"] == "config.base-compose.yml"
+        and witness["bytesBase64"] is None
+    )
+
+
 def _forward_static(inspect: dict[str, Any]) -> dict[str, Any]:
     """Only the nonsecret fields compared by stopped-runtime admission."""
     config, host = inspect["Config"], inspect["HostConfig"]
@@ -1458,7 +1468,13 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
         _forward_path(path)
         _forward_identity(witness["identity"])
         identity = witness["identity"]
-        if (identity["uid"] != 0 or identity["gid"] != 0
+        historical_original = (
+            _forward_original_base_witness(witness)
+            and (identity["uid"], identity["gid"]) == (1001, 1001)
+        )
+        # This permits only the shape. The root-private saved identity and bytes
+        # are authenticated again by origin validation before any mutation.
+        if ((identity["uid"] != 0 or identity["gid"] != 0) and not historical_original
                 or kind == "directory" and identity["mode"] != stat.S_IFDIR | 0o700
                 or kind == "regular-file" and (
                     identity["mode"] not in (stat.S_IFREG | 0o600, stat.S_IFREG | 0o644)
@@ -1495,7 +1511,8 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
             if (path != _forward_external_paths(successor_key)[role]
                     or kind != "regular-file"
                     or witness["snapshotRef"] is None
-                    or witness["bytesBase64"] is not None):
+                    or witness["bytesBase64"] is not None
+                    or role == "original-base" and not _forward_original_base_witness(witness)):
                 _fail("recovery")
             external_roles.add(role)
         else:
@@ -1798,7 +1815,8 @@ def _forward_validate_origin(
                 continue
             prefix = os.path.join(state_root, origin_name) + "/"
             if not path.startswith(prefix):
-                _forward_validate_external(witness, snapshots)
+                _forward_validate_external(
+                    witness, snapshots, os.path.join(state_root, origin_name))
                 continue
             child = path[len(prefix):]
             if "/" in child or child in children:
@@ -1874,9 +1892,104 @@ def _forward_read_external(path: str) -> tuple[dict[str, int], bytes]:
         os.close(fd)
 
 
+@contextlib.contextmanager
+def _forward_pinned_parent(path: str) -> Iterable[tuple[int, str]]:
+    """Keep every trusted ancestor open, including its named-entry binding."""
+    _forward_path(path)
+    parts = path.split("/")[1:]
+    descriptors = [os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)]
+    identities = []
+    try:
+        for index in range(len(parts)):
+            fd = descriptors[-1]
+            info = os.fstat(fd)
+            if (info.st_uid != 0
+                    or stat.S_IMODE(info.st_mode) & 0o022):
+                _fail("recovery")
+            _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+            identities.append(_forward_identity_from_stat(info))
+            if index < len(parts) - 1:
+                descriptors.append(os.open(
+                    parts[index], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=fd))
+        yield descriptors[-1], parts[-1]
+        for index, (fd, identity) in enumerate(zip(descriptors, identities)):
+            if identity != _forward_identity_from_stat(os.fstat(fd)):
+                _fail("recovery")
+            _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+            if index and identity != _forward_identity_from_stat(os.stat(
+                    parts[index - 1], dir_fd=descriptors[index - 1],
+                    follow_symlinks=False)):
+                _fail("recovery")
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def _forward_read_original_base(
+    path: str, origin: str, snapshots: dict[str, bytes],
+) -> tuple[dict[str, int], bytes]:
+    """Authenticate historical evidence; Compose consumes its private copy."""
+    if (path != _forward_external_paths("")["original-base"]
+            or os.path.basename(origin) != FORWARD_ORIGIN_STATE):
+        _fail("recovery")
+    with _forward_pinned_parent(os.path.join(origin, OWNER_MARKER)) as (origin_fd, _):
+        info = os.fstat(origin_fd)
+        if (info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o700):
+            _fail("recovery")
+        trusted = {}
+        with contextlib.ExitStack() as stack:
+            for name in (OWNER_MARKER, "config.base-compose.yml",
+                         "config.base-compose.yml.identity"):
+                fd, before, data = _open_private_state_file_at(origin_fd, name)
+                stack.callback(os.close, fd)
+                identity = _forward_identity_from_stat(before)
+                if before.st_gid != 0:
+                    _fail("recovery")
+                trusted[name] = (fd, identity, data)
+            _parse_state_marker(
+                trusted[OWNER_MARKER][2], FORWARD_ORIGIN_KEY, "final-deploy")
+            for name in ("config.base-compose.yml", "config.base-compose.yml.identity"):
+                if trusted[name][2] != snapshots[name]:
+                    _fail("recovery")
+            with _forward_pinned_parent(path) as (parent_fd, name):
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                             | os.O_NOATIME, dir_fd=parent_fd)
+                stack.callback(os.close, fd)
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or (info.st_uid, info.st_gid) not in ((0, 0), (1001, 1001))
+                        or stat.S_IMODE(info.st_mode) not in (0o600, 0o644)):
+                    _fail("recovery")
+                _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+                identity = _forward_identity_from_stat(info)
+                data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
+                if data != trusted["config.base-compose.yml"][2]:
+                    _fail("recovery")
+                _forward_saved_identity(trusted["config.base-compose.yml.identity"][2],
+                                        identity, data)
+                original_identity, original_data = identity, data
+                for saved_name, (saved_fd, saved_identity, saved_data) in trusted.items():
+                    if (_read_fd_bounded(saved_fd, MAX_WITNESS_BYTES) != saved_data
+                            or _forward_identity_from_stat(os.fstat(saved_fd)) != saved_identity
+                            or _forward_identity_from_stat(os.stat(
+                                saved_name, dir_fd=origin_fd,
+                                follow_symlinks=False)) != saved_identity):
+                        _fail("recovery")
+                if (_read_fd_bounded(fd, MAX_WITNESS_BYTES) != data
+                        or _forward_identity_from_stat(os.fstat(fd)) != identity
+                        or _forward_identity_from_stat(os.stat(
+                            name, dir_fd=parent_fd, follow_symlinks=False)) != identity):
+                    _fail("recovery")
+    return original_identity, original_data
+
+
 def _forward_validate_external(witness: dict[str, Any],
-                               snapshots: dict[str, bytes]) -> None:
-    identity, data = _forward_read_external(witness["path"])
+                               snapshots: dict[str, bytes], origin: str) -> None:
+    if _forward_original_base_witness(witness):
+        identity, data = _forward_read_original_base(witness["path"], origin, snapshots)
+    else:
+        identity, data = _forward_read_external(witness["path"])
     if (identity != witness["identity"]
             or data != snapshots[witness["snapshotRef"]]):
         _fail("recovery")
@@ -2135,7 +2248,10 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
         "active-runtime": "candidate-active-runtime.yml",
     }
     for role, path in paths.items():
-        identity, content = _forward_read_external(path)
+        if role == "original-base":
+            identity, content = _forward_read_original_base(path, origin, snapshots)
+        else:
+            identity, content = _forward_read_external(path)
         ref = refs[role]
         if content != snapshots[ref]:
             _fail("recovery")
@@ -2504,6 +2620,8 @@ def _forward_phase(state_root: str, run_key: str, phase: str) -> None:
     parent_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         _lock_directory(parent_fd)
+        _forward_validate_origin(
+            state_root, parent_fd, receipt[0], _forward_snapshots(state_root, receipt[0]))
         fd, info, data = _open_private_state_file_at(
             parent_fd, ".provider-transaction.current")
         try:
