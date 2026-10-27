@@ -1945,7 +1945,8 @@ def _forward_stopped(inspect: dict[str, Any],
         if snapshots[snapshot] != (result[field] + "\n").encode():
             _fail("recovery")
     if (not result["containerId"].startswith("6d4a33264076")
-            or not result["imageId"].startswith("sha256:8e40528c34d")
+            or result["imageId"] !=
+            "sha256:8e405258c34d70d6b42d226458c381f55df47d37fa743b754e1066e05f3ae1a0"
             or inspect["Config"]["Image"] + "\n" !=
             snapshots["previous-image"].decode()
             or labels["org.opencontainers.image.source"] !=
