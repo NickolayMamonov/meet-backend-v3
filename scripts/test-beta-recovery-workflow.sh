@@ -785,6 +785,7 @@ scripts/run-beta-recovery-capture-stage.sh
 scripts/run-beta-recovery-capture.sh
 scripts/run-beta-recovery-remote-probe.sh
 scripts/run-beta-recovery-restore.sh
+scripts/test_vps_state_admission.py
 scripts/validate-beta-recovery-artifact-retention.sh
 EOF
 extract_paths() { grep -oE 'scripts/[A-Za-z0-9._-]+' | LC_ALL=C sort -u; }

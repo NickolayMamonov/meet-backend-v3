@@ -73,6 +73,7 @@ for text in \
   'scripts/test-vps-locationiq-pending-off.py' \
   'scripts/configure-test-vps-locationiq.py' \
   'scripts/test_vps_file_trust.py' \
+  'scripts/test_vps_state_admission.py' \
   "if: github.ref == 'refs/heads/dev'" \
   'name: test-vps' \
   'scripts/verify-immutable-release-proof.sh' \

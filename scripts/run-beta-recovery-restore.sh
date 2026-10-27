@@ -495,6 +495,7 @@ workflow_file=.github/workflows/prove-beta-backup-restore.yml
 [ "$(sha256sum "$workflow_file" | awk '{print $1}')" = "$workflow" ] ||
   fail "workflow contract digest differs"
 actual_tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh \
+  scripts/test_vps_state_admission.py \
   scripts/run-beta-recovery-capture.sh \
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
   scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \

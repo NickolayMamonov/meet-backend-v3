@@ -326,6 +326,65 @@ class FixtureTests(unittest.TestCase):
 
 
 class ForwardTests(FixtureTests):
+    def test_mixed_producer_assets_preserved_through_all_phases_and_retention(self):
+        import runpy
+        producer = runpy.run_path(str(SCRIPTS / "test-test-vps-state-admission.py"))
+        fixture = self.fresh()
+        producer["beta"](fixture.states)
+        producer["generation"](fixture.states)
+        Fixture.write(fixture.states / ".smtp-last-good.current",
+                      b"fixture-apply-ABC123\n")
+        (fixture.states / ".smtp-transactions").mkdir(mode=0o700)
+        legacy = fixture.states / "123-1-final-deploy"
+        legacy.mkdir(mode=0o755)
+        Fixture.write(legacy / "unowned", b"fictional")
+        before = {name: producer["snapshot"](fixture.states / name)
+                  for name in ("beta-recovery-fixture-123", ".smtp-last-good-generations",
+                               ".smtp-transactions", legacy.name)}
+        fixture.admit()
+        helper._forward_revalidate(str(fixture.states), SUCCESSOR, encode([fixture.backend]))
+        fixture.phase()
+        fixture.complete()
+        with contextlib.redirect_stdout(io.StringIO()):
+            helper._retention_check("", str(fixture.states))
+            helper._retention_delete(str(fixture.states), str(fixture.successor))
+        for name, saved in before.items():
+            self.assertEqual(producer["snapshot"](fixture.states / name), saved)
+
+    def test_new_foreign_entries_at_every_adoption_boundary_block_next_mutation(self):
+        for boundary in ("state-staged", "state-published", "pointer-ready"):
+            with self.subTest(boundary=boundary):
+                fixture = self.fresh()
+                sidecar = fixture.states / ".runtime.foreign.body"
+                def inject(stage):
+                    if stage == boundary:
+                        Fixture.write(sidecar, b"unbound")
+                with mock.patch.object(helper, "_forward_adopt_boundary", side_effect=inject):
+                    with self.assertRaises(helper.ProviderError):
+                        fixture.admit()
+                self.assertEqual(fixture.marker()["runKey"], helper.FORWARD_ORIGIN_KEY)
+                self.assertEqual(sidecar.read_bytes(), b"unbound")
+                self.assertFalse(fixture.archive.exists())
+
+    def test_new_foreign_entries_at_completion_boundaries_block_next_mutation(self):
+        for boundary in ("acceptance-before", "credential-cleanup-before",
+                         "archive-before", "terminal-before", "pointer-unlink-before"):
+            with self.subTest(boundary=boundary):
+                fixture = self.fresh()
+                fixture.admit()
+                fixture.phase()
+                sidecar = fixture.states / ".smtp-transaction.current"
+                def inject(stage):
+                    if stage == boundary:
+                        Fixture.write(sidecar, b"COMMITTED")
+                with mock.patch.object(helper, "_forward_adopt_boundary", side_effect=inject):
+                    with self.assertRaises(helper.ProviderError):
+                        fixture.complete()
+                self.assertEqual(sidecar.read_bytes(), b"COMMITTED")
+                self.assertTrue(fixture.pointer.exists())
+                if boundary == "acceptance-before":
+                    self.assertFalse((fixture.successor / "forward-acceptance.json").exists())
+
     def test_created_reused_disabled_full_finalize_and_retention(self):
         for disposition in ("created", "reused", "none"):
             with self.subTest(disposition=disposition):
@@ -1201,6 +1260,7 @@ class ShellIntegrationTests(FixtureTests):
             "deploy-test-vps-provider-release.sh", "test-vps-provider-credential.py",
             "test-vps-runtime-invariants.sh", "test-vps-locationiq-pending-off.py",
             "test_vps_file_trust.py", "configure-test-vps-locationiq.py",
+            "test_vps_state_admission.py",
             "production-compose.sh", "update-production-release.sh"):
             text = (SCRIPTS / name).read_text()
             # Only path constants are remapped in the private fixture copy.

@@ -312,6 +312,7 @@ jobs:
             scripts/test-vps-locationiq-pending-off.py
             scripts/configure-test-vps-locationiq.py
             scripts/test_vps_file_trust.py
+            scripts/test_vps_state_admission.py
           )
           for file in "${files[@]}"; do
             mkdir -p "$stage/$(dirname "$file")"

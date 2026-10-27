@@ -71,7 +71,7 @@ cleanup_payload() {
 }
 trap cleanup_payload EXIT
 
-for command_name in awk basename cat cp curl date dirname docker find flock grep id install jq mktemp mv rm sed sha256sum sort stat sync tr wc; do
+for command_name in awk basename cat cp curl date dirname docker find flock grep id install jq mktemp mv python3 rm sed sha256sum sort stat sync tr wc; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail_result precheck_failed 20
 done
@@ -86,6 +86,7 @@ fi
 [ -x "$(dirname -- "${BASH_SOURCE[0]}")/production-config-digest.sh" ] ||
   fail_result precheck_failed 20
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[ -f "$script_dir/test_vps_state_admission.py" ] || fail_result precheck_failed 20
 compose_script=$script_dir/production-compose.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
 # shellcheck source=/dev/null
@@ -266,20 +267,11 @@ validate_generation() {
   for key in "${manifest_keys[@]}"; do
     [ -n "${generation_manifest[$key]+present}" ] || return 1
   done
-  [ "${generation_manifest[schema]:-}" = 2 ] || return 1
-  [ "${generation_manifest[generation]:-}" = "$generation" ] || return 1
-  [[ "${generation_manifest[env_sha256]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "${generation_manifest[non_email_config_sha256]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "${generation_manifest[non_email_runtime_fingerprint]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "${generation_manifest[runtime_fingerprint]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "${generation_manifest[release_image]:-}" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] ||
-    return 1
-  [[ "${generation_manifest[release_version]:-}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
-    return 1
-  [[ "${generation_manifest[release_revision]:-}" =~ ^[0-9a-f]{40}$ ]] || return 1
-  [ "$(sha256_file "$directory/env")" = "${generation_manifest[env_sha256]}" ] || return 1
-  [ "$(non_email_config_digest_file "$directory/env")" = \
-    "${generation_manifest[non_email_config_sha256]}" ] || return 1
+  # Keep producer hashing (including its fake-remote fixture contract) separate
+  # from admission's filesystem envelope; share only the pure record schema.
+  python3 -B "$script_dir/test_vps_state_admission.py" smtp-manifest \
+    "$generation" "$directory/manifest" "$(sha256_file "$directory/env")" \
+    "$(non_email_config_digest_file "$directory/env")"
 }
 
 declare -A journal=()

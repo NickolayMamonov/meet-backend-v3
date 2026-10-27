@@ -36,11 +36,12 @@ if [ "$mode" = capture ]; then
     [ -n "$age_os" ] && [ -n "$age_arch" ] || usage
 fi
 [[ "$public_url" =~ ^https://[^/]+$ ]] || fail "public HTTPS URL is required"
-for tool in docker flock jq stat find mktemp; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
+for tool in docker flock jq stat find mktemp python3; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
 if [ "$mode" = capture ]; then
   for tool in realpath sha256sum uname; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
 fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[ -f "$script_dir/test_vps_state_admission.py" ] || fail "record validator unavailable"
 compose=${compose:-${PRODUCTION_COMPOSE_SCRIPT:-"$script_dir/production-compose.sh"}}
 backup=${backup:-${BETA_BACKUP_SCRIPT:-"$script_dir/backup-production.sh"}}
 probe=${probe:-${RECOVERY_PROBE_SCRIPT:-"$script_dir/probe-test-vps-recovery-runtime.sh"}}
@@ -93,14 +94,9 @@ probe_runtime(){
 }
 owned='["private/capture-runtime.json","private/post-capture.json","private/capture-result.json","private/capture-database-proof.json","private/capture-media-proof.json","private/postgres.dump.age","private/uploads.tar.gz.age","staging"]'
 validate_journal(){
-  jq -e --argjson owned "$owned" 'type=="object" and
-    (keys|sort)==["capturedContainerId","capturedContainerSafe","capturedImageId","capturedRuntimeDigest","currentRuntimeHealthy","ownedPaths","phase","recoveryId","schema","state"] and
-    .schema=="meet-backend/beta-recovery-journal/v1" and (.recoveryId|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")) and
-    (((.state=="nonterminal") and (.phase=="pre_stop" or .phase=="snapshot_complete" or .phase=="runtime_verified")) or
-     ((.state=="terminal") and (.phase=="incident_resolved" or .phase=="superseded"))) and
-    (.capturedContainerId|test("^[0-9a-f]{12,64}$")) and (.capturedImageId|test("^sha256:[0-9a-f]{64}$")) and
-    (.capturedRuntimeDigest|test("^[0-9a-f]{64}$")) and (.currentRuntimeHealthy==true) and
-    (.capturedContainerSafe==true) and .ownedPaths==$owned' "$1" >/dev/null
+  # Normalize with the existing JSON parser before pure schema validation.
+  # Admission's raw-byte/ACL/size policy must not change producer whitespace.
+  jq -c . "$1" | python3 -B "$script_dir/test_vps_state_admission.py" beta-journal -
 }
 clean_owned(){
   local state=$1 path
@@ -145,12 +141,8 @@ terminalize(){
 }
 validate_incident(){
   local incident=$1 expected_id=$2 expected_status=$3
-  jq -e --arg id "$expected_id" --arg status "$expected_status" '
-    type=="object" and (keys|sort)==["recoveryId","sanitized","schema","status"] and
-    .schema=="meet-backend/beta-recovery-incident/v1" and .recoveryId==$id and
-    .status==$status and ($status=="incident_resolved" or $status=="superseded") and
-    .sanitized==true
-  ' "$incident" >/dev/null
+  jq -c . "$incident" | python3 -B "$script_dir/test_vps_state_admission.py" \
+    beta-incident - "$expected_id" "$expected_status"
 }
 reconcile_states(){
   local state state_id journal current expected image running mount fresh hash count=0 summary terminal_phase
@@ -216,7 +208,7 @@ published=(); pre_tmp=''
 cleanup_staged(){
   local file status=0
   case "$script_dir" in /tmp/beta-recovery-*|/var/tmp/beta-recovery-*)
-    for file in run-beta-recovery-capture.sh backup-production.sh probe-test-vps-recovery-runtime.sh production-compose.sh beta-recovery-database-proof.sql beta-recovery-media-proof.sh age; do
+    for file in run-beta-recovery-capture.sh test_vps_state_admission.py backup-production.sh probe-test-vps-recovery-runtime.sh production-compose.sh beta-recovery-database-proof.sql beta-recovery-media-proof.sh age; do
       [ ! -e "$script_dir/$file" ] || rm -f -- "$script_dir/$file" || status=1
       [ ! -e "$script_dir/$file" ] || status=1
     done;; esac
