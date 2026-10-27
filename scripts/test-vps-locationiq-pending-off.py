@@ -69,6 +69,24 @@ def file_environment(data):
     return values
 
 
+def compare_predecessor_environment(data, backend):
+    """Apply the same narrow pending-key/OFF exception to a stopped record."""
+    values = file_environment(data)
+    observed = entries(backend["Config"]["Env"])
+    for name, value in values.items():
+        if name not in CONTROLLED and observed.get(name) != value:
+            raise Rejected("unrelated_environment_changed")
+    flag = observed.get("GEOCODER_ENABLED", "true")
+    key = observed.get("LOCATIONIQ_KEY", "")
+    if flag not in ("true", "false"):
+        raise Rejected("invalid_runtime_flag")
+    if key:
+        off.validate_key(key.encode("utf-8"))
+        if key != values["LOCATIONIQ_KEY"] or flag == "true":
+            raise Rejected("predecessor_key_or_activation_conflict")
+    return values
+
+
 def one_record(value):
     if not isinstance(value, list) or len(value) != 1:
         raise Rejected("single_backend_required")
@@ -86,9 +104,48 @@ def one_record(value):
     return backend
 
 
+def stopped_predecessor_record(value, expected_id, expected_finished):
+    """Validate a sole stopped Compose backend without claiming runtime health."""
+    if not isinstance(value, list) or len(value) != 1:
+        raise Rejected("single_backend_required")
+    backend = value[0]
+    state = backend.get("State")
+    labels = backend.get("Config", {}).get("Labels", {})
+    if (not isinstance(backend.get("Id"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", backend["Id"])
+            or not isinstance(expected_id, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_id)
+            or backend["Id"] != expected_id
+            or not isinstance(state, dict)
+            or state.get("Running") is not False
+            or state.get("Status") != "exited"
+            or type(state.get("ExitCode")) is not int
+            or state.get("ExitCode") != 143
+            or not isinstance(expected_finished, str)
+            or state.get("FinishedAt") != expected_finished
+            or state.get("Paused") is not False
+            or state.get("Restarting") is not False
+            or state.get("Dead") is not False
+            or labels.get("com.docker.compose.project") != "meet-production"
+            or labels.get("com.docker.compose.service") != "backend"
+            or backend.get("Config", {}).get("Entrypoint") != ["java", "-jar", "app.jar"]
+            or backend.get("Config", {}).get("Cmd") not in (None, [])):
+        raise Rejected("unexpected_stopped_runtime")
+    return backend
+
+
 def verify(phase, data, records, image_id, previous_id="", previous_started="",
            pending=None, expected_id="", expected_started=""):
     values = file_environment(data)
+    if phase == "stopped-predecessor":
+        if (not previous_id or
+                not re.fullmatch(r"[0-9a-f]{64}", previous_id)):
+            raise Rejected("missing_stopped_identity")
+        backend = stopped_predecessor_record(
+            records, previous_id, "2026-10-26T17:30:24.669192243Z"
+        )
+        compare_predecessor_environment(data, backend)
+        return
     backend = one_record(records)
     observed = entries(backend["Config"]["Env"])
     for name, value in values.items():
@@ -97,14 +154,7 @@ def verify(phase, data, records, image_id, previous_id="", previous_started="",
         if observed.get(name) != value:
             raise Rejected("unrelated_environment_changed")
     if phase == "predecessor":
-        flag = observed.get("GEOCODER_ENABLED", "true")
-        key = observed.get("LOCATIONIQ_KEY", "")
-        if flag not in ("true", "false"):
-            raise Rejected("invalid_runtime_flag")
-        if key:
-            off.validate_key(key.encode("utf-8"))
-            if key != values["LOCATIONIQ_KEY"] or flag == "true":
-                raise Rejected("predecessor_key_or_activation_conflict")
+        compare_predecessor_environment(data, backend)
         if previous_id and (backend["Id"] != previous_id
                             or backend["State"]["StartedAt"] != previous_started):
             raise Rejected("predecessor_changed")
@@ -146,10 +196,12 @@ def verify(phase, data, records, image_id, previous_id="", previous_started="",
 def main():
     try:
         parser = argparse.ArgumentParser()
-        parser.add_argument("--phase", choices=("predecessor", "candidate"), required=True)
+        parser.add_argument("--phase", choices=("predecessor", "stopped-predecessor",
+                                                 "candidate"), required=True)
         for name in ("env-file", "image", "revision", "version", "image-id"):
             parser.add_argument("--" + name, required=True)
         for name in ("previous-id", "previous-started", "pending-file",
+                     "expected-stopped-id",
                      "expected-id", "expected-started"):
             parser.add_argument("--" + name, default="")
         args = parser.parse_args()
