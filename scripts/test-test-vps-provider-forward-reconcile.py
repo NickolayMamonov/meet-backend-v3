@@ -89,7 +89,8 @@ class Fixture:
         os.replace(replacement, self.paths["production-env"])
         self.write(self.paths["original-base"], b"services: {}\n")
         self.write(self.paths["reviewed-base"], b"services: {}\n")
-        self.write(self.paths["fallback-compose"], b"services: {}\n")
+        self.fallback = self.app / "docker-compose.production.yml"
+        self.write(self.fallback, b"# unrelated root fallback: no historical witness\n")
         self.write(self.paths["active-compose"], b"services: {}\n")
         self.write(self.paths["active-runtime"], b"services: {backend: {}}\n")
         self.write(self.states / ".deploy.lock", b"")
@@ -318,10 +319,14 @@ class ForwardTests(FixtureTests):
                 fixture = self.fresh(disposition)
                 before = {role: (Path(path).read_bytes(), os.stat(path).st_ino)
                           for role, path in fixture.paths.items()}
+                fallback_before = fixture.saved_identity(fixture.fallback)
                 fixture.admit()
                 self.assertEqual(fixture.marker()["runKey"], SUCCESSOR)
                 self.assertEqual(fixture.marker()["durableDisposition"], disposition)
                 receipt = (fixture.successor / "forward-adoption.json").read_bytes()
+                witnesses = json.loads(receipt)["sourceWitnesses"]
+                self.assertNotIn(str(fixture.fallback), [item["path"] for item in witnesses])
+                self.assertNotIn("fallback-compose", [item["role"] for item in witnesses])
                 self.assertNotIn(KEY.encode(), receipt)
                 self.assertNotIn(b"fictional@example.invalid", receipt)
                 helper._forward_revalidate(str(fixture.states), SUCCESSOR, encode([fixture.backend]))
@@ -340,6 +345,7 @@ class ForwardTests(FixtureTests):
                     self.assertEqual((fixture.archive / name).read_bytes(), data)
                 self.assertEqual({role: (Path(path).read_bytes(), os.stat(path).st_ino)
                                   for role, path in fixture.paths.items()}, before)
+                self.assertEqual(fixture.saved_identity(fixture.fallback), fallback_before)
                 with contextlib.redirect_stdout(io.StringIO()):
                     helper._retention_check("", str(fixture.states))
                     helper._retention_delete(str(fixture.states), str(fixture.successor))
@@ -347,6 +353,15 @@ class ForwardTests(FixtureTests):
                 self.assertTrue(fixture.archive.exists())
                 if fixture.enabled:
                     self.assertEqual(os.stat(helper.HOST_CREDENTIAL_PATH).st_nlink, 1)
+
+    def test_root_fallback_is_not_an_admission_source(self):
+        fixture = self.fresh()
+        fixture.fallback.unlink()
+        fixture.admit()
+        fixture.phase()
+        fixture.complete()
+        self.assertFalse(fixture.fallback.exists())
+        self.assertTrue(fixture.archive.is_dir())
 
     def test_preflight_failures_never_publish_or_adopt(self):
         mutations = {
@@ -814,6 +829,7 @@ class ShellIntegrationTests(FixtureTests):
         env.update(overrides or {})
         # Parent fixture releases its lock; the actual coordinator must acquire it.
         helper.fcntl.flock(9, helper.fcntl.LOCK_UN)
+        fallback_before = fixture.saved_identity(fixture.fallback)
         result = subprocess.run([
             "bash", str(stage / "deploy-test-vps-provider-release.sh"),
             "--root", str(fixture.app), "--base-compose", fixture.paths["reviewed-base"],
@@ -822,6 +838,7 @@ class ShellIntegrationTests(FixtureTests):
             "--failure-policy", "manual-stop", "--pending-locationiq-off",
             "--reconcile-failed-40368479855-forward", "--public-url", "https://fixture.invalid",
         ], env=env, capture_output=True, timeout=90)
+        self.assertEqual(fixture.saved_identity(fixture.fallback), fallback_before)
         output = result.stdout + result.stderr
         for secret in (KEY.encode(), b"fictional@example.invalid",
                        hashlib.sha256(KEY.encode()).hexdigest().encode()):

@@ -1230,7 +1230,6 @@ def _forward_path(value: Any) -> None:
 def _forward_external_paths(successor: str) -> dict[str, str]:
     return {
         "production-env": FORWARD_ROOT + "/.env.production",
-        "fallback-compose": FORWARD_ROOT + "/docker-compose.production.yml",
         "original-base": FORWARD_ROOT + "/.test-vps-tooling-" +
                          FORWARD_ORIGIN_KEY + "/docker-compose.production.yml",
         "reviewed-base": FORWARD_ROOT + "/.test-vps-tooling-" +
@@ -2136,14 +2135,7 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
     }
     for role, path in paths.items():
         identity, content = _forward_read_external(path)
-        if role == "fallback-compose":
-            matches = sorted(name for name, data in snapshots.items()
-                             if name.endswith(".yml") and data == content)
-            if not matches:
-                _fail("recovery")
-            ref = matches[0]
-        else:
-            ref = refs[role]
+        ref = refs[role]
         if content != snapshots[ref]:
             _fail("recovery")
         saved = {

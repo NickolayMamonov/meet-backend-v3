@@ -169,9 +169,9 @@ This route is fixed to `/opt/meet-backend`. The existing deployment lock must
 be a safe regular file and is opened without truncation or creation. The
 original `.test-vps-tooling-40368479855-1/docker-compose.production.yml` must
 still match its saved identity; freshly staged Compose must match the original
-reviewed bytes, not that old inode. The root fallback Compose must match a
-retained original Compose snapshot and is never rewritten. The stopped
-container must retain exit `143` and exact finish time
+reviewed bytes, not that old inode. The root fallback Compose is never rewritten;
+it is not an admission source and no historical baseline for it is required.
+The stopped container must retain exit `143` and exact finish time
 `2026-10-26T17:30:24.669192243Z`. Its version is derived from the original
 previous-version/environment witnesses and actual image labels; no fixture
 version or abbreviated image ID supplies that evidence.
