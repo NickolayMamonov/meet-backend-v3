@@ -326,6 +326,25 @@ class FixtureTests(unittest.TestCase):
 
 
 class ForwardTests(FixtureTests):
+    def test_competing_deployment_lock_blocks_admission_without_publication(self):
+        fixture = self.fresh()
+        helper.fcntl.flock(9, helper.fcntl.LOCK_UN)
+        contender = subprocess.Popen([
+            sys.executable, "-B", "-c",
+            "import fcntl,sys; f=open(sys.argv[1],'rb'); "
+            "fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); sys.stdin.read()",
+            str(fixture.states / ".deploy.lock")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(contender.stdout.readline(), b"locked\n")
+            with self.assertRaises((helper.ProviderError, BlockingIOError)):
+                fixture.admit()
+            self.unchanged(fixture)
+        finally:
+            contender.communicate(input=b"", timeout=10)
+            self.assertEqual(contender.returncode, 0)
+        helper.fcntl.flock(9, helper.fcntl.LOCK_EX | helper.fcntl.LOCK_NB)
+
     def test_mixed_producer_assets_preserved_through_all_phases_and_retention(self):
         import runpy
         producer = runpy.run_path(str(SCRIPTS / "test-test-vps-state-admission.py"))

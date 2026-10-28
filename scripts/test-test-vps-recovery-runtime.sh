@@ -148,7 +148,7 @@ invoke(){
     PATH="$case_dir/bin:$PATH" \
     bash -c 'PROBE_PID=$$; export PROBE_PID; exec bash "$@"' \
       bash "$probe" --root "$case_dir/root" \
-      --compose-script "$case_dir/bin/compose" --output "$case_dir/output/runtime.json" \
+      --compose-script "$case_dir/bin/compose" --output "$case_dir/output/${PROBE_OUTPUT_BASENAME:-runtime.json}" \
       --public-url https://api.whysoezzy.online "$@"
 }
 
@@ -178,6 +178,23 @@ jq -e '.schema=="meet-backend/test-vps-recovery-runtime/v1" and .healthy==true a
   .runtime.health=="healthy" and .https.meetingsJson==true' "$success/output/runtime.json" >/dev/null
 [ "$(stat -c '%a' "$success/output/runtime.json")" = 600 ] || fail "published mode changed"
 assert_no_allocations "$success"
+
+for destination in .pre-capture.fixture .runtime.fixture; do
+  make_case "hidden-$destination"
+  case_dir="$fixture/hidden-$destination"
+  printf 'unrelated\n' >"$case_dir/output/$destination.response.UNRELATED"
+  PROBE_OUTPUT_BASENAME=$destination invoke "$case_dir"
+  jq -e '.healthy==true' "$case_dir/output/$destination" >/dev/null
+  [ "$(stat -c '%a' "$case_dir/output/$destination")" = 600 ] ||
+    fail "hidden destination mode changed"
+  [ "$(cat "$case_dir/output/$destination.response.UNRELATED")" = unrelated ] ||
+    fail "hidden destination unrelated file changed"
+  for path in "$case_dir/output/$destination".response.* \
+    "$case_dir/output/$destination".headers.* "$case_dir/output/$destination".tmp.*; do
+    case "$path" in *.UNRELATED) continue;; esac
+    [ ! -e "$path" ] || fail "hidden destination leaked sidecar"
+  done
+done
 
 # Fail each allocation in turn; successful prior allocations are cleaned.
 for allocation in 1 2 3; do
@@ -336,4 +353,53 @@ invoke "$case_dir"
 after=$(printf '%s\n' "${leftovers[@]}" | sort | xargs -r sha256sum)
 [ "$before" = "$after" ] || fail "later invocation swept historical crash evidence"
 jq -e '.healthy==true' "$case_dir/output/runtime.json" >/dev/null
-echo "test VPS recovery runtime allocation contract passed: success=2 mktemp-failure=3 jq-validation-failure=1 jq-serialization-failure=1 chmod-failure=1 curl-failure=1 rename-failure=1 cleanup-failure=1 allocation-signals=9 http-signals=9 prepublish-signals=3 postpublish-signals=3 sigkill-no-sweep=1"
+# Kill at allocation boundaries and classify the actual surviving inodes under
+# trusted ancestry, rather than fabricated lookalike records.
+classifier_cases=0
+for allocation in 1 2; do
+  make_case "killed-allocation-$allocation"
+  case_dir="$fixture/killed-allocation-$allocation"
+  status=0
+  SIGNAL_MKTEMP_AT=$allocation SIGNAL_AT_MKTEMP=KILL \
+    PROBE_OUTPUT_BASENAME=.runtime.fixture invoke "$case_dir" 2>"$case_dir/sigkill.stderr" || status=$?
+  [ "$status" -ne 0 ] || fail "allocation SIGKILL unexpectedly succeeded"
+  survivors=("$case_dir"/output/.runtime.fixture.response.* "$case_dir"/output/.runtime.fixture.headers.*)
+  [ "${#survivors[@]}" -eq "$allocation" ] || fail "wrong allocation SIGKILL survivor count"
+  if [ "$(id -u)" -eq 0 ]; then
+    python3 -B - "$script_dir" "${survivors[@]}" <<'PY'
+import os, pathlib, sys, tempfile
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+import test_vps_state_admission as admission
+with tempfile.TemporaryDirectory(dir="/root") as temporary:
+    root = pathlib.Path(temporary)
+    for source in sys.argv[2:]:
+        source = pathlib.Path(source)
+        identity = admission.identity(source.stat())
+        destination = root / source.name
+        source.rename(destination)
+        # Rename may update ctime; all other inode/byte evidence is retained.
+        actual = admission.identity(destination.stat())
+        assert actual[:-1] == identity[:-1]
+    def snapshot():
+        return {p.name: (admission.identity(p.stat()), p.read_bytes())
+                for p in root.iterdir()}
+    before = snapshot()
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            admission.Inventory(fd, set())
+        except admission.Rejected as exc:
+            assert str(exc) == "unbound_probe_sidecar", exc
+        else:
+            raise AssertionError("actual SIGKILL leftovers admitted")
+        assert snapshot() == before
+    finally:
+        os.close(fd)
+PY
+    classifier_cases=$((classifier_cases + 1))
+  else
+    echo "classifier SIGKILL preservation subcase requires Linux/root; not run" >&2
+  fi
+done
+echo "test VPS recovery runtime allocation contract passed: success=4 hidden-prefixes=2 mktemp-failure=3 jq-validation-failure=1 jq-serialization-failure=1 chmod-failure=1 curl-failure=1 rename-failure=1 cleanup-failure=1 allocation-signals=9 http-signals=9 prepublish-signals=3 postpublish-signals=3 sigkill-no-sweep=1 sigkill-allocations=2 classifier-preservation=$classifier_cases"

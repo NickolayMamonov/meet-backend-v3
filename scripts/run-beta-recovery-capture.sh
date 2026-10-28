@@ -94,9 +94,9 @@ probe_runtime(){
 }
 owned='["private/capture-runtime.json","private/post-capture.json","private/capture-result.json","private/capture-database-proof.json","private/capture-media-proof.json","private/postgres.dump.age","private/uploads.tar.gz.age","staging"]'
 validate_journal(){
-  # Normalize with the existing JSON parser before pure schema validation.
-  # Admission's raw-byte/ACL/size policy must not change producer whitespace.
-  jq -c . "$1" | python3 -B "$script_dir/test_vps_state_admission.py" beta-journal -
+  local filter
+  filter=$(python3 -B "$script_dir/test_vps_state_admission.py" producer-beta-filter journal) || return 1
+  jq -e --argjson owned "$owned" "$filter" "$1" >/dev/null
 }
 clean_owned(){
   local state=$1 path
@@ -141,8 +141,9 @@ terminalize(){
 }
 validate_incident(){
   local incident=$1 expected_id=$2 expected_status=$3
-  jq -c . "$incident" | python3 -B "$script_dir/test_vps_state_admission.py" \
-    beta-incident - "$expected_id" "$expected_status"
+  local filter
+  filter=$(python3 -B "$script_dir/test_vps_state_admission.py" producer-beta-filter incident) || return 1
+  jq -e --arg id "$expected_id" --arg status "$expected_status" "$filter" "$incident" >/dev/null
 }
 reconcile_states(){
   local state state_id journal current expected image running mount fresh hash count=0 summary terminal_phase

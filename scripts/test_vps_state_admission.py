@@ -42,6 +42,34 @@ MANIFEST_KEYS = frozenset((
     "release_version", "release_revision",
 ))
 
+# Producers retain their native jq/Bash evaluators. These fixed schemas never
+# receive payloads; Inventory's stricter Python readers remain independently bounded.
+PRODUCER_BETA_FILTERS = {
+    "journal": r'''type=="object" and
+    (keys|sort)==["capturedContainerId","capturedContainerSafe","capturedImageId","capturedRuntimeDigest","currentRuntimeHealthy","ownedPaths","phase","recoveryId","schema","state"] and
+    .schema=="meet-backend/beta-recovery-journal/v1" and (.recoveryId|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")) and
+    (((.state=="nonterminal") and (.phase=="pre_stop" or .phase=="snapshot_complete" or .phase=="runtime_verified")) or
+     ((.state=="terminal") and (.phase=="incident_resolved" or .phase=="superseded"))) and
+    (.capturedContainerId|test("^[0-9a-f]{12,64}$")) and (.capturedImageId|test("^sha256:[0-9a-f]{64}$")) and
+    (.capturedRuntimeDigest|test("^[0-9a-f]{64}$")) and (.currentRuntimeHealthy==true) and
+    (.capturedContainerSafe==true) and .ownedPaths==$owned''',
+    "incident": r'''type=="object" and (keys|sort)==["recoveryId","sanitized","schema","status"] and
+    .schema=="meet-backend/beta-recovery-incident/v1" and .recoveryId==$id and
+    .status==$status and ($status=="incident_resolved" or $status=="superseded") and
+    .sanitized==true''',
+}
+PRODUCER_SMTP_SCHEMA = (
+    ("schema", ""),
+    ("generation", ""),
+    ("env_sha256", r"^[0-9a-f]{64}$"),
+    ("non_email_config_sha256", r"^[0-9a-f]{64}$"),
+    ("non_email_runtime_fingerprint", r"^[0-9a-f]{64}$"),
+    ("runtime_fingerprint", r"^[0-9a-f]{64}$"),
+    ("release_image", r"^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$"),
+    ("release_version", r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"),
+    ("release_revision", r"^[0-9a-f]{40}$"),
+)
+
 
 class Rejected(Exception):
     """Bounded, nonsecret reason only."""
@@ -475,6 +503,9 @@ def main() -> int:
     import argparse
     parser = argparse.ArgumentParser(description="Read-only producer record validation")
     sub = parser.add_subparsers(dest="mode", required=True)
+    producer_beta = sub.add_parser("producer-beta-filter")
+    producer_beta.add_argument("kind", choices=tuple(PRODUCER_BETA_FILTERS))
+    sub.add_parser("producer-smtp-schema")
     beta = sub.add_parser("beta-journal")
     beta.add_argument("path")
     incident = sub.add_parser("beta-incident")
@@ -494,7 +525,12 @@ def main() -> int:
     manifest.add_argument("config_digest")
     args = parser.parse_args()
     try:
-        if args.mode == "beta-journal":
+        if args.mode == "producer-beta-filter":
+            print(PRODUCER_BETA_FILTERS[args.kind])
+        elif args.mode == "producer-smtp-schema":
+            for key, pattern in PRODUCER_SMTP_SCHEMA:
+                print(f"{key}\t{pattern}")
+        elif args.mode == "beta-journal":
             beta_journal(_record_file(args.path, RECORD_BYTES))
         elif args.mode == "beta-incident":
             beta_incident(_record_file(args.path, RECORD_BYTES), args.recovery_id, args.phase)

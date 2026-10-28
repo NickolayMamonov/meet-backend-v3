@@ -253,11 +253,14 @@ validate_generation() {
   [ "$(stat -c '%a' "$directory" 2>/dev/null)" = 700 ] || return 1
   [ "$(stat -c '%a' "$directory/manifest" 2>/dev/null)" = 600 ] || return 1
   generation_manifest=()
-  local -a manifest_keys=(
-    schema generation env_sha256 non_email_config_sha256
-    non_email_runtime_fingerprint runtime_fingerprint
-    release_image release_version release_revision
-  )
+  local schema pattern
+  local -a manifest_keys=()
+  local -A manifest_patterns=()
+  schema=$(python3 -B "$script_dir/test_vps_state_admission.py" producer-smtp-schema) || return 1
+  while IFS=$'\t' read -r key pattern; do
+    manifest_keys+=("$key")
+    manifest_patterns[$key]=$pattern
+  done <<<"$schema"
   while IFS='=' read -r key value || [ -n "$key" ]; do
     [[ "$key" =~ ^[a-z][a-z0-9_]*$ ]] || return 1
     case " ${manifest_keys[*]} " in *" $key "*) ;; *) return 1 ;; esac
@@ -267,11 +270,15 @@ validate_generation() {
   for key in "${manifest_keys[@]}"; do
     [ -n "${generation_manifest[$key]+present}" ] || return 1
   done
-  # Keep producer hashing (including its fake-remote fixture contract) separate
-  # from admission's filesystem envelope; share only the pure record schema.
-  python3 -B "$script_dir/test_vps_state_admission.py" smtp-manifest \
-    "$generation" "$directory/manifest" "$(sha256_file "$directory/env")" \
-    "$(non_email_config_digest_file "$directory/env")"
+  [ "${generation_manifest[schema]:-}" = 2 ] || return 1
+  [ "${generation_manifest[generation]:-}" = "$generation" ] || return 1
+  for key in "${manifest_keys[@]}"; do
+    pattern=${manifest_patterns[$key]}
+    [ -z "$pattern" ] || [[ "${generation_manifest[$key]}" =~ $pattern ]] || return 1
+  done
+  [ "$(sha256_file "$directory/env")" = "${generation_manifest[env_sha256]}" ] || return 1
+  [ "$(non_email_config_digest_file "$directory/env")" = \
+    "${generation_manifest[non_email_config_sha256]}" ] || return 1
 }
 
 declare -A journal=()
