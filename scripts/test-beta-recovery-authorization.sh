@@ -110,6 +110,7 @@ mkdir "$tmp/valid"
 run_authorization valid "$tmp/valid" "$tmp/valid-output"
 grep -Fxq 'authorized=true' "$tmp/valid-output"
 expected_tooling_digest=$(cd "$source" && for file in scripts/authorize-beta-recovery.sh \
+  scripts/test_vps_state_admission.py \
   scripts/run-beta-recovery-capture-stage.sh scripts/run-beta-recovery-capture.sh \
   scripts/run-beta-recovery-restore.sh \
   scripts/build-beta-recovery-evidence.sh scripts/run-beta-recovery-remote-probe.sh \

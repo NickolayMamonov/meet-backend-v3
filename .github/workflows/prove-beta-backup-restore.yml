@@ -317,6 +317,7 @@ jobs:
             --media-script scripts/beta-recovery-media-proof.sh \
             --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
             --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh \
+              scripts/test_vps_state_admission.py \
               scripts/run-beta-recovery-capture.sh scripts/run-beta-recovery-restore.sh \
               scripts/build-beta-recovery-evidence.sh \
               scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \
@@ -382,6 +383,7 @@ jobs:
             --temp-root "$restore_temp" \
             --source-sha "${{ inputs.source_sha }}" --repository "$GITHUB_REPOSITORY" \
             --tooling-digest "$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh \
+              scripts/test_vps_state_admission.py \
               scripts/run-beta-recovery-capture.sh scripts/run-beta-recovery-restore.sh \
               scripts/build-beta-recovery-evidence.sh \
               scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \

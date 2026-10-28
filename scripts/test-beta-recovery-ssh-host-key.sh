@@ -1203,6 +1203,7 @@ semantic_workspace=$consumer_root/semantic-workspace
 export SOURCE_SHA=0123456789abcdef0123456789abcdef01234567
 mkdir -p "$semantic_workspace/scripts"
 tooling_files=(
+  scripts/test_vps_state_admission.py
   scripts/authorize-beta-recovery.sh
   scripts/backup-production.sh
   scripts/beta-recovery-database-proof.sql

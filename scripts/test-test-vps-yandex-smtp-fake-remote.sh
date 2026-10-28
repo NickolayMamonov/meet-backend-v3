@@ -7,6 +7,15 @@ TIMEOUT_SECONDS=${FAKE_REMOTE_CASE_TIMEOUT_SECONDS:-180}
 TIMEOUT=$(command -v timeout)
 WAIT_SECONDS=${FAKE_REMOTE_WAIT_SECONDS:-240}
 TMP=$(mktemp -d)
+mkdir "$TMP/tooling"
+for name in configure-test-vps-yandex-smtp.sh production-compose.sh \
+  production-config-digest.sh test-vps-runtime-invariants.sh \
+  test_vps_state_admission.py; do
+  cp -- "$ROOT_DIR/scripts/$name" "$TMP/tooling/$name"
+done
+(cd "$TMP/tooling" && sha256sum -- test_vps_state_admission.py >SHA256SUMS &&
+  sha256sum -c SHA256SUMS >/dev/null)
+TOOL=$TMP/tooling/configure-test-vps-yandex-smtp.sh
 active_pids=()
 
 descendant_pids() {

@@ -170,6 +170,7 @@ jq -e '
 ' <<<"$restore_branches" >/dev/null ||
   fail "closed-beta-restore must allow exactly the dev branch"
 files=(
+  scripts/test_vps_state_admission.py
   scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh
   scripts/run-beta-recovery-capture.sh
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh

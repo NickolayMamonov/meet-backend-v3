@@ -23,7 +23,12 @@ import re
 import secrets
 import stat
 import sys
-from typing import Any, Iterable
+from functools import cache
+from typing import Any, Iterable, TYPE_CHECKING
+
+sys.dont_write_bytecode = True
+if TYPE_CHECKING:
+    import test_vps_state_admission as state_admission
 
 try:
     import fcntl
@@ -1239,6 +1244,16 @@ def _forward_external_paths(successor: str) -> dict[str, str]:
     }
 
 
+def _forward_original_base_witness(witness: dict[str, Any]) -> bool:
+    return (
+        witness["role"] == "original-base"
+        and witness["path"] == _forward_external_paths("")["original-base"]
+        and witness["kind"] == "regular-file"
+        and witness["snapshotRef"] == "config.base-compose.yml"
+        and witness["bytesBase64"] is None
+    )
+
+
 def _forward_static(inspect: dict[str, Any]) -> dict[str, Any]:
     """Only the nonsecret fields compared by stopped-runtime admission."""
     config, host = inspect["Config"], inspect["HostConfig"]
@@ -1458,7 +1473,13 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
         _forward_path(path)
         _forward_identity(witness["identity"])
         identity = witness["identity"]
-        if (identity["uid"] != 0 or identity["gid"] != 0
+        historical_original = (
+            _forward_original_base_witness(witness)
+            and (identity["uid"], identity["gid"]) == (1001, 1001)
+        )
+        # This permits only the shape. The root-private saved identity and bytes
+        # are authenticated again by origin validation before any mutation.
+        if ((identity["uid"] != 0 or identity["gid"] != 0) and not historical_original
                 or kind == "directory" and identity["mode"] != stat.S_IFDIR | 0o700
                 or kind == "regular-file" and (
                     identity["mode"] not in (stat.S_IFREG | 0o600, stat.S_IFREG | 0o644)
@@ -1495,7 +1516,8 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
             if (path != _forward_external_paths(successor_key)[role]
                     or kind != "regular-file"
                     or witness["snapshotRef"] is None
-                    or witness["bytesBase64"] is not None):
+                    or witness["bytesBase64"] is not None
+                    or role == "original-base" and not _forward_original_base_witness(witness)):
                 _fail("recovery")
             external_roles.add(role)
         else:
@@ -1663,8 +1685,25 @@ def _forward_adopt_boundary(stage: str) -> None:
     return None
 
 
-def _forward_adoption_interlocks(root_fd: int, state_root: str) -> None:
-    origin = FORWARD_ORIGIN_STATE
+@cache
+def _forward_state_module() -> Any:
+    """Only forward recovery depends on the checksum-staged local classifier."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "test_vps_state_admission.py")
+    spec = importlib.util.spec_from_file_location("_provider_state_admission", path)
+    if spec is None or spec.loader is None:
+        _fail("recovery")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except (OSError, ImportError):
+        sys.modules.pop(spec.name, None)
+        _fail("recovery")
+    return module
+
+
+def _forward_adoption_interlocks(root_fd: int, state_root: str) -> state_admission.Inventory:
     pointer_name = ".provider-transaction.current"
     pointer_fd, _, pointer_data = _open_private_state_file(
         os.path.join(state_root, pointer_name)
@@ -1677,16 +1716,33 @@ def _forward_adoption_interlocks(root_fd: int, state_root: str) -> None:
             or set(pointer) != {"schemaVersion", "runKey", "phase",
                                 "providerEnabled", "durableDisposition"}):
         _fail("recovery")
-    for name in _iter_directory_fd_names(root_fd):
-        if name in (origin, pointer_name):
+    inventory = _forward_inventory(root_fd, state_root)
+    try:
+        _forward_credential_interlocks(pointer)
+        return inventory
+    except BaseException:
+        inventory.close()
+        raise
+
+
+def _forward_inventory(root_fd: int, state_root: str,
+                       successor: str | None = None) -> state_admission.Inventory:
+    state_admission = _forward_state_module()
+    own = {FORWARD_ORIGIN_STATE, ".provider-transaction.current", ".deploy.lock"}
+    if successor is not None:
+        own.add(successor + "-final-deploy")
+    opaque = set()
+    try:
+        root_names = state_admission.names(root_fd, state_admission.ROOT_ENTRIES)
+    except (state_admission.Rejected, OSError):
+        _fail("recovery")
+    for name in root_names:
+        if name in own:
             continue
         if name == ".smtp-transaction.current" or name.startswith(
             (".provider-transaction.", ".provider-state.")
         ):
             _fail("recovery")
-        if name == ".deploy.lock":
-            _forward_read_external(os.path.join(state_root, name))
-            continue
         if re.fullmatch(
             r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name
         ):
@@ -1705,6 +1761,7 @@ def _forward_adoption_interlocks(root_fd: int, state_root: str) -> None:
                 except FileNotFoundError:
                     # Match ordinary retention: numeric legacy states without
                     # an owner marker remain opaque and are never cleaned here.
+                    opaque.add(name)
                     continue
                 _owned_state_fd(fd, name, require_terminal=True)
                 children = _bounded_retention_children(fd)
@@ -1715,8 +1772,30 @@ def _forward_adoption_interlocks(root_fd: int, state_root: str) -> None:
                 )
             finally:
                 os.close(fd)
+            opaque.add(name)
             continue
+    _forward_read_external(os.path.join(state_root, ".deploy.lock"))
+    try:
+        inventory = state_admission.Inventory(root_fd, own, opaque, state_root)
+        if inventory.root_names != root_names:
+            inventory.close()
+            _fail("recovery")
+        return inventory
+    except (state_admission.Rejected, OSError, ValueError):
         _fail("recovery")
+
+
+def _forward_inventory_recheck(inventory: state_admission.Inventory, *,
+                               added: frozenset[str] = frozenset(),
+                               removed: frozenset[str] = frozenset()) -> None:
+    state_admission = _forward_state_module()
+    try:
+        inventory.recheck(added=added, removed=removed)
+    except (state_admission.Rejected, OSError, ValueError):
+        _fail("recovery")
+
+
+def _forward_credential_interlocks(pointer: dict[str, Any]) -> None:
     transaction_parent = _rooted(HOST_CREDENTIAL_PARENT, "")
     parent_fd = _open_optional_directory_reference(transaction_parent)
     if parent_fd is not None:
@@ -1798,7 +1877,8 @@ def _forward_validate_origin(
                 continue
             prefix = os.path.join(state_root, origin_name) + "/"
             if not path.startswith(prefix):
-                _forward_validate_external(witness, snapshots)
+                _forward_validate_external(
+                    witness, snapshots, os.path.join(state_root, origin_name))
                 continue
             child = path[len(prefix):]
             if "/" in child or child in children:
@@ -1874,9 +1954,104 @@ def _forward_read_external(path: str) -> tuple[dict[str, int], bytes]:
         os.close(fd)
 
 
+@contextlib.contextmanager
+def _forward_pinned_parent(path: str) -> Iterable[tuple[int, str]]:
+    """Keep every trusted ancestor open, including its named-entry binding."""
+    _forward_path(path)
+    parts = path.split("/")[1:]
+    descriptors = [os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)]
+    identities = []
+    try:
+        for index in range(len(parts)):
+            fd = descriptors[-1]
+            info = os.fstat(fd)
+            if (info.st_uid != 0
+                    or stat.S_IMODE(info.st_mode) & 0o022):
+                _fail("recovery")
+            _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+            identities.append(_forward_identity_from_stat(info))
+            if index < len(parts) - 1:
+                descriptors.append(os.open(
+                    parts[index], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=fd))
+        yield descriptors[-1], parts[-1]
+        for index, (fd, identity) in enumerate(zip(descriptors, identities)):
+            if identity != _forward_identity_from_stat(os.fstat(fd)):
+                _fail("recovery")
+            _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+            if index and identity != _forward_identity_from_stat(os.stat(
+                    parts[index - 1], dir_fd=descriptors[index - 1],
+                    follow_symlinks=False)):
+                _fail("recovery")
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def _forward_read_original_base(
+    path: str, origin: str, snapshots: dict[str, bytes],
+) -> tuple[dict[str, int], bytes]:
+    """Authenticate historical evidence; Compose consumes its private copy."""
+    if (path != _forward_external_paths("")["original-base"]
+            or os.path.basename(origin) != FORWARD_ORIGIN_STATE):
+        _fail("recovery")
+    with _forward_pinned_parent(os.path.join(origin, OWNER_MARKER)) as (origin_fd, _):
+        info = os.fstat(origin_fd)
+        if (info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o700):
+            _fail("recovery")
+        trusted = {}
+        with contextlib.ExitStack() as stack:
+            for name in (OWNER_MARKER, "config.base-compose.yml",
+                         "config.base-compose.yml.identity"):
+                fd, before, data = _open_private_state_file_at(origin_fd, name)
+                stack.callback(os.close, fd)
+                identity = _forward_identity_from_stat(before)
+                if before.st_gid != 0:
+                    _fail("recovery")
+                trusted[name] = (fd, identity, data)
+            _parse_state_marker(
+                trusted[OWNER_MARKER][2], FORWARD_ORIGIN_KEY, "final-deploy")
+            for name in ("config.base-compose.yml", "config.base-compose.yml.identity"):
+                if trusted[name][2] != snapshots[name]:
+                    _fail("recovery")
+            with _forward_pinned_parent(path) as (parent_fd, name):
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                             | os.O_NOATIME, dir_fd=parent_fd)
+                stack.callback(os.close, fd)
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or (info.st_uid, info.st_gid) not in ((0, 0), (1001, 1001))
+                        or stat.S_IMODE(info.st_mode) not in (0o600, 0o644)):
+                    _fail("recovery")
+                _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
+                identity = _forward_identity_from_stat(info)
+                data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
+                if data != trusted["config.base-compose.yml"][2]:
+                    _fail("recovery")
+                _forward_saved_identity(trusted["config.base-compose.yml.identity"][2],
+                                        identity, data)
+                original_identity, original_data = identity, data
+                for saved_name, (saved_fd, saved_identity, saved_data) in trusted.items():
+                    if (_read_fd_bounded(saved_fd, MAX_WITNESS_BYTES) != saved_data
+                            or _forward_identity_from_stat(os.fstat(saved_fd)) != saved_identity
+                            or _forward_identity_from_stat(os.stat(
+                                saved_name, dir_fd=origin_fd,
+                                follow_symlinks=False)) != saved_identity):
+                        _fail("recovery")
+                if (_read_fd_bounded(fd, MAX_WITNESS_BYTES) != data
+                        or _forward_identity_from_stat(os.fstat(fd)) != identity
+                        or _forward_identity_from_stat(os.stat(
+                            name, dir_fd=parent_fd, follow_symlinks=False)) != identity):
+                    _fail("recovery")
+    return original_identity, original_data
+
+
 def _forward_validate_external(witness: dict[str, Any],
-                               snapshots: dict[str, bytes]) -> None:
-    identity, data = _forward_read_external(witness["path"])
+                               snapshots: dict[str, bytes], origin: str) -> None:
+    if _forward_original_base_witness(witness):
+        identity, data = _forward_read_original_base(witness["path"], origin, snapshots)
+    else:
+        identity, data = _forward_read_external(witness["path"])
     if (identity != witness["identity"]
             or data != snapshots[witness["snapshotRef"]]):
         _fail("recovery")
@@ -2135,7 +2310,10 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
         "active-runtime": "candidate-active-runtime.yml",
     }
     for role, path in paths.items():
-        identity, content = _forward_read_external(path)
+        if role == "original-base":
+            identity, content = _forward_read_original_base(path, origin, snapshots)
+        else:
+            identity, content = _forward_read_external(path)
         ref = refs[role]
         if content != snapshots[ref]:
             _fail("recovery")
@@ -2291,6 +2469,7 @@ def _forward_adopt(state_root: str, request_data: bytes,
     destination = successor_key + "-final-deploy"
     temporary_pointer = ".provider-transaction." + successor_key + ".forward"
     credential_parent_fd = None
+    inventory = None
     try:
         if not _same_inode(os.fstat(root_fd), expected_root):
             _fail("recovery")
@@ -2305,7 +2484,7 @@ def _forward_adopt(state_root: str, request_data: bytes,
         credential_parent_fd = _open_optional_directory_reference(HOST_CREDENTIAL_PARENT)
         if credential_parent_fd is not None:
             _lock_directory(credential_parent_fd)
-        _forward_adoption_interlocks(root_fd, state_root)
+        inventory = _forward_adoption_interlocks(root_fd, state_root)
         _forward_archive_preflight(state_root, root_info, adoption)
         try:
             os.stat(destination, dir_fd=root_fd, follow_symlinks=False)
@@ -2356,6 +2535,7 @@ def _forward_adopt(state_root: str, request_data: bytes,
         if before_commit is not None:
             before_commit()
 
+        _forward_inventory_recheck(inventory)
         os.mkdir(staging, 0o700, dir_fd=root_fd)
         staging_fd = os.open(
             staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -2375,6 +2555,7 @@ def _forward_adopt(state_root: str, request_data: bytes,
             _validate_state_directory_fd(staging_fd, destination)
             os.fsync(root_fd)
             _forward_adopt_boundary("state-staged")
+            _forward_inventory_recheck(inventory, added=frozenset({staging}))
             _rename_noreplace(
                 root_fd, staging, destination,
                 expected_source_fd=staging_fd,
@@ -2403,6 +2584,7 @@ def _forward_adopt(state_root: str, request_data: bytes,
             os.close(staging_fd)
 
         _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+        _forward_inventory_recheck(inventory, added=frozenset({destination}))
         successor_marker = dict(marker)
         successor_marker["runKey"] = successor_key
         successor_marker["phase"] = "applying"
@@ -2413,6 +2595,8 @@ def _forward_adopt(state_root: str, request_data: bytes,
 
         # Revalidate both owners at the ownership linearization boundary.
         _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+        _forward_inventory_recheck(
+            inventory, added=frozenset({destination, temporary_pointer}))
         current_path_info = os.stat(
             pointer_name, dir_fd=root_fd, follow_symlinks=False
         )
@@ -2442,6 +2626,8 @@ def _forward_adopt(state_root: str, request_data: bytes,
         if (_forward_identity_from_stat(check_info) != adoption["originalMarker"]["identity"]
                 or check_data != pointer_data):
             _fail("recovery")
+        _forward_inventory_recheck(
+            inventory, added=frozenset({destination, temporary_pointer}))
         os.replace(
             temporary_pointer, pointer_name,
             src_dir_fd=root_fd, dst_dir_fd=root_fd,
@@ -2450,6 +2636,8 @@ def _forward_adopt(state_root: str, request_data: bytes,
         os.fsync(root_fd)
         _forward_adopt_boundary("pointer-replaced")
     finally:
+        if inventory is not None:
+            inventory.close()
         if credential_parent_fd is not None:
             os.close(credential_parent_fd)
         os.close(root_fd)
@@ -2483,8 +2671,10 @@ def _forward_revalidate(state_root: str, run_key: str, inspection_data: bytes) -
     snapshots = _forward_snapshots(state_root, adoption)
     root_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        _forward_validate_origin(state_root, root_fd, adoption, snapshots)
-        _forward_archive_preflight(state_root, os.fstat(root_fd), adoption)
+        with _forward_inventory(root_fd, state_root, run_key) as inventory:
+            _forward_validate_origin(state_root, root_fd, adoption, snapshots)
+            _forward_archive_preflight(state_root, os.fstat(root_fd), adoption)
+            _forward_inventory_recheck(inventory)
     finally:
         os.close(root_fd)
     backend = _inspect(inspection_data)
@@ -2504,29 +2694,43 @@ def _forward_phase(state_root: str, run_key: str, phase: str) -> None:
     parent_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         _lock_directory(parent_fd)
-        fd, info, data = _open_private_state_file_at(
-            parent_fd, ".provider-transaction.current")
+        inventory = _forward_inventory(parent_fd, state_root, run_key)
         try:
-            marker = _marker(state_root, run_key)
-            if marker["phase"] != {"verifying": "applying", "finalizing": "verifying"}[phase]:
-                _fail("recovery")
-            marker["phase"] = phase
-            temporary = ".provider-transaction." + run_key + ".forward-phase"
-            _write_private_at(parent_fd, temporary,
-                              json.dumps(marker, separators=(",", ":")).encode(), 0o600)
-            current_fd, current, current_data = _open_private_state_file_at(
-                parent_fd, ".provider-transaction.current")
-            os.close(current_fd)
-            if (_forward_identity_from_stat(current) != _forward_identity_from_stat(info)
-                    or current_data != data):
-                _fail("recovery")
-            os.replace(temporary, ".provider-transaction.current",
-                       src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            os.fsync(parent_fd)
+            _forward_publish_phase(state_root, run_key, phase, receipt, parent_fd, inventory)
         finally:
-            os.close(fd)
+            inventory.close()
     finally:
         os.close(parent_fd)
+
+
+def _forward_publish_phase(state_root: str, run_key: str, phase: str,
+                           receipt: Any, parent_fd: int,
+                           inventory: state_admission.Inventory) -> None:
+    _forward_validate_origin(
+        state_root, parent_fd, receipt[0], _forward_snapshots(state_root, receipt[0]))
+    fd, info, data = _open_private_state_file_at(
+        parent_fd, ".provider-transaction.current")
+    try:
+        marker = _marker(state_root, run_key)
+        if marker["phase"] != {"verifying": "applying", "finalizing": "verifying"}[phase]:
+            _fail("recovery")
+        marker["phase"] = phase
+        temporary = ".provider-transaction." + run_key + ".forward-phase"
+        _forward_inventory_recheck(inventory)
+        _write_private_at(parent_fd, temporary,
+                          json.dumps(marker, separators=(",", ":")).encode(), 0o600)
+        current_fd, current, current_data = _open_private_state_file_at(
+            parent_fd, ".provider-transaction.current")
+        os.close(current_fd)
+        if (_forward_identity_from_stat(current) != _forward_identity_from_stat(info)
+                or current_data != data):
+            _fail("recovery")
+        _forward_inventory_recheck(inventory, added=frozenset({temporary}))
+        os.replace(temporary, ".provider-transaction.current",
+                   src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(fd)
 
 
 def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> None:
@@ -2571,6 +2775,7 @@ def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> 
                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     archive_parent_fd = os.open(os.path.dirname(FORWARD_ARCHIVE),
                                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    inventory = None
     try:
         _lock_directory(root_fd)
         _lock_directory(state_fd)
@@ -2578,6 +2783,7 @@ def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> 
         _validate_state_directory_fd(state_fd, state_name)
         _validate_retention_state_root_fd(root_fd)
         _revalidate_retention_state_root_path(state_root, os.fstat(root_fd))
+        inventory = _forward_inventory(root_fd, state_root, run_key)
         if (_forward_identity_from_stat(os.fstat(archive_parent_fd))
                 != adoption["plannedArchive"]["parentIdentity"]):
             _fail("recovery")
@@ -2590,11 +2796,13 @@ def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> 
                 continue
             _fail("recovery")
         _forward_adopt_boundary("acceptance-before")
+        _forward_inventory_recheck(inventory)
         _write_private_at(state_fd, "forward-acceptance.json", acceptance_data, 0o600)
         _forward_adopt_boundary("acceptance-file-synced")
         os.fsync(state_fd)
         _forward_adopt_boundary("acceptance-directory-synced")
         _forward_adopt_boundary("credential-cleanup-before")
+        _forward_inventory_recheck(inventory)
         durable_before = None
         durable_info_before = None
         if marker["providerEnabled"]:
@@ -2618,6 +2826,7 @@ def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> 
                             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
         try:
             _forward_adopt_boundary("archive-before")
+            _forward_inventory_recheck(inventory)
             _rename_noreplace(
                 root_fd, FORWARD_ORIGIN_STATE, os.path.basename(FORWARD_ARCHIVE),
                 expected_source_fd=origin_fd,
@@ -2638,6 +2847,7 @@ def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> 
             "providerEnabled": marker["providerEnabled"],
         }, separators=(",", ":")).encode()
         _forward_adopt_boundary("terminal-before")
+        _forward_inventory_recheck(inventory, removed=frozenset({FORWARD_ORIGIN_STATE}))
         _write_private_at(state_fd, "terminal.json", terminal_data, 0o600)
         _forward_adopt_boundary("terminal-file-synced")
         os.fsync(state_fd)
@@ -2650,6 +2860,7 @@ def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> 
         if _marker(state_root, run_key)["phase"] != "finalizing":
             _fail("recovery")
         _forward_adopt_boundary("pointer-unlink-before")
+        _forward_inventory_recheck(inventory, removed=frozenset({FORWARD_ORIGIN_STATE}))
         _witnessed_unlink(
             root_fd, ".provider-transaction.current",
             expected_identity=_identity(info), expected_data=pointer_data,
@@ -2658,6 +2869,8 @@ def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> 
         os.fsync(root_fd)
         _forward_adopt_boundary("pointer-unlink-parent-synced")
     finally:
+        if inventory is not None:
+            inventory.close()
         os.close(root_fd)
         os.close(state_fd)
         os.close(archive_parent_fd)

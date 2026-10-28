@@ -109,6 +109,7 @@ else
 fi
 printf '%s\n' age-install age-keygen age-encrypt-database age-encrypt-uploads >>"$fixture/events.log"
 tooling_digest=$(cd "$root" && for file in \
+  scripts/test_vps_state_admission.py \
   scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh \
   scripts/run-beta-recovery-capture.sh \
   scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \

@@ -71,7 +71,7 @@ cleanup_payload() {
 }
 trap cleanup_payload EXIT
 
-for command_name in awk basename cat cp curl date dirname docker find flock grep id install jq mktemp mv rm sed sha256sum sort stat sync tr wc; do
+for command_name in awk basename cat cp curl date dirname docker find flock grep id install jq mktemp mv python3 rm sed sha256sum sort stat sync tr wc; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail_result precheck_failed 20
 done
@@ -86,6 +86,7 @@ fi
 [ -x "$(dirname -- "${BASH_SOURCE[0]}")/production-config-digest.sh" ] ||
   fail_result precheck_failed 20
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[ -f "$script_dir/test_vps_state_admission.py" ] || fail_result precheck_failed 20
 compose_script=$script_dir/production-compose.sh
 runtime_helper=$script_dir/test-vps-runtime-invariants.sh
 # shellcheck source=/dev/null
@@ -252,11 +253,14 @@ validate_generation() {
   [ "$(stat -c '%a' "$directory" 2>/dev/null)" = 700 ] || return 1
   [ "$(stat -c '%a' "$directory/manifest" 2>/dev/null)" = 600 ] || return 1
   generation_manifest=()
-  local -a manifest_keys=(
-    schema generation env_sha256 non_email_config_sha256
-    non_email_runtime_fingerprint runtime_fingerprint
-    release_image release_version release_revision
-  )
+  local schema pattern
+  local -a manifest_keys=()
+  local -A manifest_patterns=()
+  schema=$(python3 -B "$script_dir/test_vps_state_admission.py" producer-smtp-schema) || return 1
+  while IFS=$'\t' read -r key pattern; do
+    manifest_keys+=("$key")
+    manifest_patterns[$key]=$pattern
+  done <<<"$schema"
   while IFS='=' read -r key value || [ -n "$key" ]; do
     [[ "$key" =~ ^[a-z][a-z0-9_]*$ ]] || return 1
     case " ${manifest_keys[*]} " in *" $key "*) ;; *) return 1 ;; esac
@@ -268,15 +272,10 @@ validate_generation() {
   done
   [ "${generation_manifest[schema]:-}" = 2 ] || return 1
   [ "${generation_manifest[generation]:-}" = "$generation" ] || return 1
-  [[ "${generation_manifest[env_sha256]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "${generation_manifest[non_email_config_sha256]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "${generation_manifest[non_email_runtime_fingerprint]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "${generation_manifest[runtime_fingerprint]:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "${generation_manifest[release_image]:-}" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] ||
-    return 1
-  [[ "${generation_manifest[release_version]:-}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
-    return 1
-  [[ "${generation_manifest[release_revision]:-}" =~ ^[0-9a-f]{40}$ ]] || return 1
+  for key in "${manifest_keys[@]}"; do
+    pattern=${manifest_patterns[$key]}
+    [ -z "$pattern" ] || [[ "${generation_manifest[$key]}" =~ $pattern ]] || return 1
+  done
   [ "$(sha256_file "$directory/env")" = "${generation_manifest[env_sha256]}" ] || return 1
   [ "$(non_email_config_digest_file "$directory/env")" = \
     "${generation_manifest[non_email_config_sha256]}" ] || return 1

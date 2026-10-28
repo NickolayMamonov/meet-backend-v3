@@ -22,8 +22,22 @@ grep -Fq 'pg_database_size(current_database())' "$backup"; grep -Fq 'validate_up
 grep -Fq 'jq -cS' "$backup"; grep -Fq 'capacity_ok' "$backup"; grep -Fq -- '--reference-list' "$backup"
 grep -Fq 'decimal_add' "$media"; grep -Fq 'ln -- "$candidate" "$output"' "$media"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
+bash "$root/scripts/test-test-vps-recovery-runtime.sh"
 fixture=$(mktemp -d); references=$(mktemp -d)
 trap '[ "${KEEP_BETA_RECOVERY_FIXTURE:-0}" = 1 ] || rm -r -- "$fixture" "$references"' EXIT HUP INT TERM
+tooling=$references/tooling
+mkdir "$tooling"
+for name in run-beta-recovery-capture.sh backup-production.sh \
+  probe-test-vps-recovery-runtime.sh production-compose.sh \
+  beta-recovery-database-proof.sql beta-recovery-media-proof.sh \
+  test_vps_state_admission.py; do
+  cp -- "$root/scripts/$name" "$tooling/$name"
+done
+(cd "$tooling" && sha256sum -- test_vps_state_admission.py >SHA256SUMS &&
+  sha256sum -c SHA256SUMS >/dev/null)
+capture=$tooling/run-beta-recovery-capture.sh
+backup=$tooling/backup-production.sh
+media=$tooling/beta-recovery-media-proof.sh
 mkdir -p "$fixture/avatars" "$fixture/meetings" "$fixture/communities"
 printf avatar >"$fixture/avatars/a.bin"; printf meeting >"$fixture/meetings/m.bin"; printf community >"$fixture/communities/c.bin"
 media_output=$references/proof.json; bash "$media" --root "$fixture" --output "$media_output"

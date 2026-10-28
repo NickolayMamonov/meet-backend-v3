@@ -153,6 +153,7 @@ jobs:
             scripts/production-config-digest.sh
             scripts/test-vps-runtime-invariants.sh
             scripts/configure-test-vps-yandex-smtp.sh
+            scripts/test_vps_state_admission.py
           )
           for file in "${files[@]}"; do
             mkdir -p "$stage/$(dirname "$file")"

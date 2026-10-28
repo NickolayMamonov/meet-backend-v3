@@ -43,6 +43,7 @@ for text in \
   'deploy_failed_rollback_succeeded:22' \
   'deploy_failed_rollback_failed:23' \
   'Safe SMTP summary' \
+  'scripts/test_vps_state_admission.py' \
   'Cleanup SMTP transport' \
   'Enforce transaction result'; do
   require "$text" "$workflow_text" "SMTP workflow"

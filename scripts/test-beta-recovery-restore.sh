@@ -56,7 +56,17 @@ if grep -Eq 'docker (container|volume|network) rm[^|]*\|\|[[:space:]]*true' "$sc
   echo "cleanup masks Docker removal failures" >&2
   exit 1
 fi
-if grep -Eiq 'TEST_VPS|SSH_PRIVATE_KEY|TEST_VPS_HOST|postgresql?://' "$script"; then
+module_registration='  scripts/test_vps_state_admission.py \'
+custody_pattern='TEST_VPS|SSH_PRIVATE_KEY|TEST_VPS_HOST|postgresql?://'
+grep -Fxq "$module_registration" "$script"
+# Only the complete tooling-list line is exempt; extra tokens retain custody checks.
+for hostile_registration in "$module_registration SSH_PRIVATE_KEY" "SSH_PRIVATE_KEY $module_registration"; do
+  if ! grep -Fvx "$module_registration" <<<"$hostile_registration" | grep -Eiq "$custody_pattern"; then
+    echo "restore custody guard ignores extra material on a tooling line" >&2
+    exit 1
+  fi
+done
+if grep -Fvx "$module_registration" "$script" | grep -Ei "$custody_pattern" >/dev/null; then
   echo "restore script contains forbidden VPS or secret-custody material" >&2
   exit 1
 fi
@@ -198,6 +208,7 @@ run_restore_fixture() {
     https:{meetingsStatus:"200",actuatorStatus:"404",httpRedirectHttps:true,meetingsJson:true}}' \
     >"$case_dir/runtime.json"
   tooling=$(for file in scripts/authorize-beta-recovery.sh scripts/run-beta-recovery-capture-stage.sh \
+    scripts/test_vps_state_admission.py \
     scripts/run-beta-recovery-capture.sh \
     scripts/run-beta-recovery-restore.sh scripts/build-beta-recovery-evidence.sh \
     scripts/run-beta-recovery-remote-probe.sh scripts/production-compose.sh \

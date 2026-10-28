@@ -209,7 +209,7 @@ read_frame() {
   case "$name" in
     run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|\
     production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|\
-    age|age-recipient) ;;
+    test_vps_state_admission.py|age|age-recipient) ;;
     *) exit 1 ;;
   esac
   [[ "$expected_length" =~ ^[0-9]+$ ]]
@@ -406,7 +406,7 @@ send_capture_file() {
   case "$name" in
     run-beta-recovery-capture.sh|backup-production.sh|probe-test-vps-recovery-runtime.sh|\
     production-compose.sh|beta-recovery-database-proof.sql|beta-recovery-media-proof.sh|\
-    age|age-recipient) ;;
+    test_vps_state_admission.py|age|age-recipient) ;;
     *) return 1 ;;
   esac
   mode=$(stat -c '%a' -- "$source")
@@ -424,6 +424,7 @@ send_capture_file() {
   } | ssh "${ssh_opts[@]}" "$SSH_USER@$HOST" "$receive_remote_cmd"
 }
 send_capture_file scripts/run-beta-recovery-capture.sh run-beta-recovery-capture.sh
+send_capture_file scripts/test_vps_state_admission.py test_vps_state_admission.py
 send_capture_file scripts/backup-production.sh backup-production.sh
 send_capture_file scripts/probe-test-vps-recovery-runtime.sh probe-test-vps-recovery-runtime.sh
 send_capture_file scripts/production-compose.sh production-compose.sh
@@ -543,6 +544,7 @@ chmod 600 "$RUNNER_TEMP/"*.age "$RUNNER_TEMP/"*.json
 cleanup_remote || { echo "remote staging cleanup failed" >&2; exit 1; }
 mkdir "$RUNNER_TEMP/artifact"
 tooling_digest=$(for file in scripts/authorize-beta-recovery.sh \
+    scripts/test_vps_state_admission.py \
     scripts/run-beta-recovery-capture-stage.sh scripts/run-beta-recovery-capture.sh \
     scripts/run-beta-recovery-restore.sh \
     scripts/build-beta-recovery-evidence.sh scripts/run-beta-recovery-remote-probe.sh \
