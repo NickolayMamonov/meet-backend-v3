@@ -16,9 +16,78 @@ import subprocess
 import tempfile
 import unittest
 import shutil
+import re
+import resource
+import builtins
 from unittest import mock
 
 import test_vps_state_admission as admission
+
+
+BASELINE = "017dcb555d87be9b63c226a591af6836546c345e"
+ORACLE_FILES = [
+    dict(originalPath="scripts/run-beta-recovery-capture.sh",
+         fixturePath=BASELINE + "/run-beta-recovery-capture.sh",
+         gitBlob="423e5f9abe85f60ff50483e919f0b86608ddd2d8", size=19396,
+         sha256="d0e8d883ffa55f31b757cdefa13f786aa7620969c2121f74f943121a44d5fbd5",
+         functions=["validate_journal", "validate_incident"]),
+    dict(originalPath="scripts/configure-test-vps-yandex-smtp.sh",
+         fixturePath=BASELINE + "/configure-test-vps-yandex-smtp.sh",
+         gitBlob="a55e00b8b84ea1f801abaa446d28adc8b41e8365", size=44923,
+         sha256="4c287db8dc6cc43691c5850e6780488997e50d0de41d9b6e604dea59e67acef0",
+         functions=["sha256_file", "non_email_config_digest_file", "validate_generation"]),
+]
+
+
+def retained_functions(data, selected):
+    functions = []
+    ranges = []
+    for name in selected:
+        starts = list(re.finditer(
+            rb"^" + name.encode() + rb"\(\)[ \t]*\{[ \t]*$", data, re.M))
+        if len(starts) != 1:
+            raise ValueError("oracle definition boundary")
+        start = starts[0]
+        end = re.search(rb"^\}[ \t]*$", data[start.end():], re.M)
+        if end is None:
+            raise ValueError("oracle closing boundary")
+        stop = start.end() + end.end()
+        if any(start.start() < right and stop > left for left, right in ranges):
+            raise ValueError("oracle overlapping functions")
+        ranges.append((start.start(), stop))
+        functions.append(data[start.start():stop].decode("utf-8"))
+    return "\n".join(functions)
+
+
+def retained_oracles(root=None):
+    root = root or Path(__file__).resolve().parent / "fixtures/state-admission-legacy"
+    with (root / "provenance.json").open("rb") as stream:
+        data = stream.read(4097)
+    if len(data) > 4096:
+        raise ValueError("oracle provenance budget")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate oracle provenance key")
+            result[key] = value
+        return result
+    actual = json.loads(data, object_pairs_hook=unique)
+    expected = dict(schemaVersion=1, baselineCommit=BASELINE, files=ORACLE_FILES)
+    # Canonical JSON comparison also distinguishes booleans from integers.
+    if json.dumps(actual, sort_keys=True) != json.dumps(expected, sort_keys=True):
+        raise ValueError("oracle provenance mismatch")
+    result = {}
+    for record in ORACLE_FILES:
+        path = root / record["fixturePath"]
+        if path.stat().st_mode & 0o111:
+            raise ValueError("executable historical entrypoint")
+        with path.open("rb") as stream:
+            data = stream.read(record["size"] + 1)
+        if len(data) != record["size"] or hashlib.sha256(data).hexdigest() != record["sha256"]:
+            raise ValueError("oracle bytes mismatch")
+        result[Path(record["originalPath"]).name] = retained_functions(data, record["functions"])
+    return result
 
 
 def journal(recovery_id="fixture-123", phase="incident_resolved"):
@@ -84,28 +153,14 @@ def snapshot(root):
 
 
 class SchemaTests(unittest.TestCase):
-    def test_retained_local_git_legacy_differential_corpus(self):
-        # Local pre-extraction baseline, never fetch and never source entrypoints.
-        baseline = "017dcb555d87be9b63c226a591af6836546c345e"
-        if not shutil.which("git"):
-            self.skipTest("local Git required for retained baseline differential")
-        def definitions(filename, selected):
-            result = subprocess.run(["git", "show", f"{baseline}:scripts/{filename}"],
-                                    capture_output=True)
-            if result.returncode:
-                self.skipTest("retained local baseline object unavailable")
-            source = result.stdout.decode()
-            functions = []
-            for name in selected:
-                start = source.index(name + "()")
-                functions.append(source[start:source.index("\n}", start) + 2])
-            return "\n".join(functions)
+    def test_authenticated_retained_legacy_differential_corpus(self):
+        # Authenticated original bytes, independent of Git and current producers.
+        for tool in ("bash", "jq"):
+            self.assertIsNotNone(shutil.which(tool), f"required oracle tool: {tool}")
+        legacy = retained_oracles()
         scripts = Path(__file__).resolve().parent
-        legacy_beta = definitions("run-beta-recovery-capture.sh",
-                                  ("validate_journal", "validate_incident"))
-        legacy_smtp = definitions("configure-test-vps-yandex-smtp.sh",
-                                  ("sha256_file", "non_email_config_digest_file",
-                                   "validate_generation"))
+        legacy_beta = legacy["run-beta-recovery-capture.sh"]
+        legacy_smtp = legacy["configure-test-vps-yandex-smtp.sh"]
         def current(filename, selected):
             source = (scripts / filename).read_text()
             return "\n".join(source[(start := source.index(name + "()")):
@@ -116,6 +171,14 @@ class SchemaTests(unittest.TestCase):
                            ("sha256_file", "non_email_config_digest_file", "validate_generation"))
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             root = Path(temporary)
+            tools = root / "oracle-tools"
+            tools.mkdir()
+            for tool in ("bash", "jq", "python3", "sha256sum", "awk", "find", "stat"):
+                target = shutil.which(tool)
+                self.assertIsNotNone(target, f"required oracle tool: {tool}")
+                (tools / tool).symlink_to(target)
+            environment = dict(os.environ, PATH=str(tools))
+            self.assertIsNone(shutil.which("git", path=environment["PATH"]))
             record = root / "record"
             observed = set()
             def compare(old, new, setup, invocation, label, expected=None):
@@ -123,7 +186,8 @@ class SchemaTests(unittest.TestCase):
                 for functions in (old, new):
                     command = setup + "\n" + functions + "\n" + invocation
                     result = subprocess.run(["bash", "-c", command, "legacy",
-                                             str(root), str(scripts)], capture_output=True)
+                                             str(root), str(scripts)], capture_output=True,
+                                            env=environment)
                     outcomes.append(result.returncode)
                 self.assertEqual(outcomes[0], outcomes[1], label)
                 if expected is not None:
@@ -277,12 +341,73 @@ class SchemaTests(unittest.TestCase):
                         + mismatch + "\n" + functions
                         + '\nnon_email_config_digest_file "$1/candidate.env"')
                     result = subprocess.run(["bash", "-c", command, "fake", str(root)],
-                                            capture_output=True, check=True)
+                                            capture_output=True, check=True, env=environment)
                     outputs.append(result.stdout)
                 expected = (b"1" if mismatch == "true" else b"2") * 64 + b"\n"
                 self.assertEqual(outputs, [expected, expected], "fake candidate digest parity")
             self.assertIn(0, observed)
             self.assertTrue(any(code != 0 for code in observed))
+        print(f"RETAINED_ORACLE_PASS baseline={BASELINE} skips=0", flush=True)
+
+    def test_low_rlimit_inventory_workers(self):
+        for limit in (64, 1024):
+            result = subprocess.run(
+                [sys.executable, "-B", __file__, "--resource-worker", str(limit)],
+                capture_output=True, timeout=240)
+            self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
+            print(result.stdout.decode(), end="", flush=True)
+
+    def test_retained_oracle_missing_tamper_and_provenance_fail(self):
+        original = Path(__file__).resolve().parent / "fixtures/state-admission-legacy"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "oracle"
+            def reset():
+                if root.exists():
+                    shutil.rmtree(root)
+                shutil.copytree(original, root)
+            reset()
+            self.assertEqual(len(retained_oracles(root)), 2)
+            path = root / ORACLE_FILES[0]["fixturePath"]
+            raw = path.read_bytes()
+            for data in (raw[:-1], raw + b"\n", raw.replace(b"validate_journal", b"INVALID_journal", 1)):
+                write(path, data)
+                with self.assertRaises(ValueError):
+                    retained_oracles(root)
+            reset()
+            (root / ORACLE_FILES[0]["fixturePath"]).unlink()
+            with self.assertRaises(FileNotFoundError):
+                retained_oracles(root)
+            reset()
+            provenance = root / "provenance.json"
+            raw = provenance.read_bytes()
+            for data in (b" " * 4097, raw.replace(b'"schemaVersion":1', b'"schemaVersion":true'),
+                         raw.replace(b'"schemaVersion":1', b'"schemaVersion":1,"schemaVersion":1'),
+                         raw.replace(BASELINE.encode(), b"0" * 40)):
+                write(provenance, data)
+                with self.assertRaises((ValueError, json.JSONDecodeError)):
+                    retained_oracles(root)
+            reset()
+            path = root / ORACLE_FILES[0]["fixturePath"]
+            path.chmod(0o700)
+            with self.assertRaises(ValueError):
+                retained_oracles(root)
+
+    def test_retained_function_boundaries_are_strict(self):
+        for raw, selected in (
+                (b"a(){\n}\n", ["missing"]),
+                (b"a(){\n}\na(){\n}\n", ["a"]),
+                (b"a(){\n true\n", ["a"]),
+                (b"a(){\nb(){\n}\n}\n", ["a", "b"])):
+            with self.assertRaises(ValueError):
+                retained_functions(raw, selected)
+
+    def test_missing_required_oracle_tools_is_failure_not_skip(self):
+        actual = shutil.which
+        for missing in ("bash", "jq"):
+            with mock.patch.object(shutil, "which",
+                                   side_effect=lambda tool: None if tool == missing else actual(tool)):
+                with self.assertRaises(AssertionError):
+                    self.test_authenticated_retained_legacy_differential_corpus()
 
     def test_producer_schemas_are_static_and_strict_admission_stays_single_object(self):
         scripts = Path(__file__).resolve().parent
@@ -846,9 +971,9 @@ class InventoryTests(unittest.TestCase):
         empty = self.root / "exact-own"
         empty.mkdir(mode=0o700)
         with self.inventory({empty.name}) as inventory:
-            inventory._directory(inventory.root, empty.name, admission.MAX_DEPTH)
+            inventory._directory((), empty.name, admission.MAX_DEPTH)
             with self.assertRaises(admission.Rejected):
-                inventory._directory(inventory.root, empty.name, admission.MAX_DEPTH + 1)
+                inventory._directory((), empty.name, admission.MAX_DEPTH + 1)
 
     def test_actual_root_entry_limit_and_complete_enumeration(self):
         for number in range(admission.ROOT_ENTRIES):
@@ -1089,18 +1214,102 @@ os.close(fd)
             self.assertRaises(OSError, self.inventory)
         nested = self.root / "owned"
         nested.mkdir(mode=0o700)
+        paths = [nested]
+        for depth in range(2, 6):
+            paths.append(paths[-1] / ("d" + str(depth)))
+            paths[-1].mkdir(mode=0o700)
         with self.inventory({nested.name}) as inventory:
-            parent = inventory.root
-            for depth in range(1, 6):
-                path = nested if depth == 1 else nested / ("d" + str(depth))
-                if depth > 1:
-                    path.mkdir(mode=0o700)
+            parent = ()
+            for depth, path in enumerate(paths, 1):
                 if depth == 5:
                     with self.assertRaises(admission.Rejected):
                         inventory._directory(parent, path.name, depth)
                 else:
-                    parent = inventory._directory(parent, path.name, depth).fd
-                nested = path
+                    parent = inventory._directory(parent, path.name, depth).components
+
+    def test_every_resource_acquisition_and_post_acquisition_failure_closes(self):
+        generation(self.root)
+        beta(self.root)
+        before = snapshot(self.root)
+        baseline = len(os.listdir("/proc/self/fd"))
+        # Includes failures after successful acquisition, before registration.
+        targets = ((os, "dup"), (os, "open"), (os, "fstat"),
+                   (os, "getxattr"), (os, "scandir"),
+                   (builtins, "open"), (admission.Inventory, "_remember"))
+        for rechecking in (False, True):
+            for owner, name in targets:
+                actual = getattr(owner, name)
+                calls = [0]
+                def counted(*args, **kwargs):
+                    calls[0] += 1
+                    return actual(*args, **kwargs)
+                inv = self.inventory() if rechecking else None
+                try:
+                    with mock.patch.object(owner, name, side_effect=counted,
+                                           autospec=owner is admission.Inventory):
+                        if rechecking:
+                            inv.recheck()
+                        else:
+                            with self.inventory():
+                                pass
+                finally:
+                    if inv is not None:
+                        inv.close()
+                total = calls[0]
+                for position in range(1, total + 1):
+                    for code in (24, 23):  # EMFILE / ENFILE, no inherited limits changed.
+                        with self.subTest(recheck=rechecking, operation=name,
+                                          position=position, errno=code):
+                            inv = self.inventory() if rechecking else None
+                            seen = [0]
+                            def failing(*args, **kwargs):
+                                seen[0] += 1
+                                if seen[0] == position:
+                                    raise OSError(code, "fictional resource exhaustion")
+                                return actual(*args, **kwargs)
+                            try:
+                                with mock.patch.object(owner, name, side_effect=failing,
+                                                       autospec=owner is admission.Inventory):
+                                    with self.assertRaises(admission.Rejected):
+                                        if rechecking:
+                                            inv.recheck()
+                                        else:
+                                            with self.inventory():
+                                                self.fail("resource failure accepted")
+                            finally:
+                                if inv is not None:
+                                    inv.close()
+                                    inv.close()
+                            self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+                            self.assertEqual(snapshot(self.root), before)
+                            os.fstat(self.fd)  # The caller's borrowed FD is still usable.
+        for _ in range(100):
+            with mock.patch.object(os, "dup", side_effect=OSError(24, "exhausted")):
+                with self.assertRaises(admission.Rejected):
+                    self.inventory()
+        self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+
+    def test_long_ancestry_metadata_changes_and_persistent_replacement(self):
+        nested = self.root
+        for number in range(80):
+            nested = nested / f"a{number}"
+            nested.mkdir(mode=0o700)
+        fd = os.open(nested, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with admission.Inventory(fd, set(), root_path=str(nested)) as inv:
+                self.assertLessEqual(inv.peak_owned_fds, 16)
+                sibling = self.root / "unrelated-own-sibling"
+                sibling.mkdir(mode=0o700)
+                inv.recheck()  # Trusted ancestors' mutable timestamps/link counts are allowed.
+                ancestor = nested.parent
+                moved = ancestor.with_name("moved")
+                ancestor.rename(moved)
+                ancestor.mkdir(mode=0o700)
+                (ancestor / nested.name).mkdir(mode=0o700)
+                with self.assertRaises(admission.Rejected):
+                    inv.recheck()
+        finally:
+            os.close(fd)
 
     def test_bounds_exact_and_one_over(self):
         # Exercise policy limits with small injected caps and real enumeration.
@@ -1133,5 +1342,126 @@ os.close(fd)
             self.reject_unchanged()
 
 
-if __name__ == "__main__":
-    unittest.main()
+def resource_worker(limit):
+    """A child-only limit; no mutation of the invoking test/CI process limit."""
+    case = InventoryTests()
+    case.setUp()
+    old = resource.getrlimit(resource.RLIMIT_NOFILE)
+    def count():
+        return len(os.listdir("/proc/self/fd"))
+    try:
+        for number in range(1364):
+            generation(case.root, f"g{number}")
+        for number in range(2):
+            beta(case.root, recovery_id=f"fixture-{number:03d}")
+        saved = snapshot(case.root)
+        baseline = count()
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limit, old[1]))
+        actual_open, actual_dup, actual_scandir, actual_file = (
+            os.open, os.dup, os.scandir, builtins.open)
+        observed = [0]
+        def measure(function):
+            def wrapped(*args, **kwargs):
+                result = function(*args, **kwargs)
+                observed[0] = max(observed[0], count() - baseline)
+                return result
+            return wrapped
+        with mock.patch.object(os, "open", side_effect=measure(actual_open)), \
+                mock.patch.object(os, "dup", side_effect=measure(actual_dup)), \
+                mock.patch.object(os, "scandir", side_effect=measure(actual_scandir)), \
+                mock.patch.object(builtins, "open", side_effect=measure(actual_file)):
+            inventory = case.inventory()
+            try:
+                assert inventory.entries == admission.DESCENDANT_ENTRIES
+                inventory.recheck()
+                inventory.recheck()
+                assert inventory.peak_owned_fds <= 16
+            finally:
+                inventory.close()
+                inventory.close()
+        assert observed[0] <= 16, observed
+        assert count() == baseline
+        assert snapshot(case.root) == saved
+        # Actual one-over descendant inventory must reject, not truncate.
+        (case.root / "beta-recovery-fixture-000" / "private").mkdir(mode=0o700)
+        saved = snapshot(case.root)
+        try:
+            with case.inventory():
+                raise AssertionError("one-over inventory accepted")
+        except admission.Rejected:
+            pass
+        assert count() == baseline and snapshot(case.root) == saved
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            nested = Path(temporary)
+            ancestry = []
+            for number in range(80):
+                nested = nested / f"a{number}"
+                nested.mkdir(mode=0o700)
+                ancestry.append(nested)
+            fd = os.open(nested, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with admission.Inventory(fd, set(), root_path=str(nested)) as inventory:
+                    inventory.recheck()
+                    assert inventory.peak_owned_fds <= 16
+            finally:
+                os.close(fd)
+                # shutil's recursive safe rmtree retains an FD per level.
+                for path in reversed(ancestry):
+                    path.rmdir()
+        assert count() == baseline
+        # Independent root budget:4096 opaque roots, then one-over.
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            opaque = {f"{n}-1-final-deploy" for n in range(admission.ROOT_ENTRIES)}
+            for name in opaque:
+                (root / name).mkdir(mode=0o755)
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with admission.Inventory(fd, set(), opaque) as inventory:
+                    inventory.recheck()
+                    assert inventory.peak_owned_fds <= 16
+                (root / "extra").mkdir(mode=0o700)
+                try:
+                    with admission.Inventory(fd, set(), opaque):
+                        raise AssertionError("one-over root budget accepted")
+                except admission.Rejected:
+                    pass
+            finally:
+                os.close(fd)
+        assert count() == baseline
+        # Real kernel exhaustion, with cleanup after releasing unrelated fillers.
+        for cap in (8, 16, 32):
+            resource.setrlimit(resource.RLIMIT_NOFILE, (cap, old[1]))
+            fillers = []
+            try:
+                while True:
+                    try:
+                        fillers.append(os.open("/dev/null", os.O_RDONLY))
+                    except OSError as exc:
+                        assert exc.errno == 24
+                        break
+                try:
+                    with case.inventory():
+                        raise AssertionError("inventory accepted without descriptor headroom")
+                except admission.Rejected:
+                    pass
+            finally:
+                for fd in fillers:
+                    os.close(fd)
+                resource.setrlimit(resource.RLIMIT_NOFILE, (limit, old[1]))
+            assert count() == baseline
+        print(f"LOW_RLIMIT_PASS limit={limit} descendants=4096 root=4096 "
+              f"one_over=rejected measured_peak={observed[0]} cleanup_delta=0", flush=True)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, old)
+        case.tearDown()
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--resource-worker":
+    resource_worker(int(sys.argv[2]))
+elif __name__ == "__main__":
+    program = unittest.main(exit=False)
+    if program.result.wasSuccessful() and not program.result.skipped:
+        print(f"ADMISSION_SUITE_PASS tests={program.result.testsRun} skips=0", flush=True)
+    else:
+        sys.exit(1)

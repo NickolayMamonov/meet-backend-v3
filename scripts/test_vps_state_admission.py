@@ -11,6 +11,7 @@ import json
 import os
 import re
 import stat
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 
 ROOT_ENTRIES = 4096
@@ -20,6 +21,7 @@ RECORD_BYTES = 64 * 1024
 ENV_BYTES = 1024 * 1024
 TOTAL_BYTES = 16 * 1024 * 1024
 NAME_BYTES = 255
+MAX_OWNED_FDS = 16
 GENERATIONS = ".smtp-last-good-generations"
 SELECTOR = ".smtp-last-good.current"
 TRANSACTIONS = ".smtp-transactions"
@@ -213,6 +215,8 @@ def no_acl(fd: int) -> None:
         except OSError as exc:
             if exc.errno == errno.ENODATA:
                 continue
+            if exc.errno in (errno.EMFILE, errno.ENFILE):
+                raise Rejected("resource_budget") from None
             raise Rejected("acl_unavailable") from None
         raise Rejected("unsafe_acl")
 
@@ -236,47 +240,62 @@ class Classification:
     reason: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class _Witness:
-    parent: int
-    name: str
-    fd: int
+    components: tuple[str, ...]
     saved: tuple[int, ...]
+    mount: str
     children: frozenset[str] | None
     data: bytes | None
 
 
+@dataclass(frozen=True)
+class _Ancestor:
+    name: str
+    saved: tuple[int, ...]
+    mount: str
+
+
 class Inventory:
-    """Pinned foreign witnesses; caller owns deploy lock and exact own artifacts.
+    """Checkpoint-authenticated foreign snapshots with one retained root anchor.
 
     Exclusions identify existing provider-owned root names, never a wildcard.
     The complete root name set is still retained and rechecked across publication.
+    Replay detects saved-evidence differences, not historical swap-and-restore;
+    closing temporary descriptors does not promise continuous inode custody.
     Close on every path (including rejected classification).
     """
     def __init__(self, root_fd: int, excluded: set[str], opaque: set[str] = frozenset(),
                  root_path: str | None = None):
-        self.root = os.dup(root_fd)
-        self.witnesses: list[_Witness] = []
+        self.root = None
+        self._resources = ExitStack()
+        self._owned_fds = 0
+        self._peak_owned_fds = 0
+        self.witnesses: dict[tuple[str, ...], _Witness] = {}
         self.opaque: list[_Witness] = []
-        self.ancestors: list[_Witness] = []
+        self.ancestors: tuple[_Ancestor, ...] = ()
         self.excluded = frozenset(excluded)
         self.results: dict[str, Classification] = {}
         self.entries = 0
         self.bytes_read = 0
         try:
+            self.root = self._resources.enter_context(
+                self._descriptor(lambda: os.dup(root_fd)))
             root = os.fstat(self.root)
             self.root_identity = identity(root)
             self.device = root.st_dev
+            self.root_mount = self._mount_id(self.root)
             self._trust(self.root, root, True)
             self._pin_ancestry(root_path or os.readlink(f"/proc/self/fd/{self.root}"))
-            self.root_names = names(self.root, ROOT_ENTRIES)
+            self.root_names = self._names(self.root, ROOT_ENTRIES)
             require(POINTER not in self.root_names, "smtp_transaction")
             for name in opaque:
                 require(name in self.root_names and name not in self.excluded)
-                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                             dir_fd=self.root)
-                self.opaque.append(_Witness(self.root, name, fd,
-                                            identity(os.fstat(fd)), None, None))
+                with self._opened(self.root, name, True) as fd:
+                    witness = _Witness((name,), identity(os.fstat(fd)),
+                                       self._mount_id(fd), None, None)
+                    self._binding(self.root, witness, directory=True)
+                    self.opaque.append(witness)
             # Complete inventory first; dependent selector validation comes last.
             foreign = self.root_names - self.excluded - opaque
             allowed = {GENERATIONS, SELECTOR, TRANSACTIONS}
@@ -286,43 +305,93 @@ class Inventory:
                             (".runtime.", ".pre-capture.")) else "unknown")
             generations = set()
             if GENERATIONS in foreign:
-                directory = self._directory(self.root, GENERATIONS, 1)
+                directory = self._directory((), GENERATIONS, 1)
                 generations = set(directory.children)
                 for name in generations:
                     generation_name(name)
-                    child = self._directory(directory.fd, name, 2)
+                    child = self._directory(directory.components, name, 2)
                     require(child.children == {"env", "manifest"})
-                    env = self._file(child.fd, "env", ENV_BYTES)
-                    manifest = self._file(child.fd, "manifest", RECORD_BYTES)
+                    env = self._file(child.components, "env", ENV_BYTES)
+                    manifest = self._file(child.components, "manifest", RECORD_BYTES)
                     generation_record(name, env, manifest)
                 self.results[GENERATIONS] = Classification("smtp-generations", "preserve", "valid")
             if TRANSACTIONS in foreign:
-                directory = self._directory(self.root, TRANSACTIONS, 1)
+                directory = self._directory((), TRANSACTIONS, 1)
                 require(not directory.children, "orphan_smtp_transaction")
                 self.results[TRANSACTIONS] = Classification("smtp-empty-transactions", "preserve", "empty")
             for name in foreign:
                 if not name.startswith("beta-recovery-"):
                     continue
-                directory = self._directory(self.root, name, 1)
+                directory = self._directory((), name, 1)
                 require(directory.children in (
                     {"journal.json", "incident.json"},
                     {"journal.json", "incident.json", "private"}), "beta_not_clean")
-                journal = beta_journal(self._file(directory.fd, "journal.json", RECORD_BYTES))
+                journal = beta_journal(self._file(directory.components, "journal.json", RECORD_BYTES))
                 require(journal["recoveryId"] == name[len("beta-recovery-"):]
                         and journal["state"] == "terminal", "beta_nonterminal")
-                beta_incident(self._file(directory.fd, "incident.json", RECORD_BYTES),
+                beta_incident(self._file(directory.components, "incident.json", RECORD_BYTES),
                               journal["recoveryId"], journal["phase"])
                 if "private" in directory.children:
-                    require(not self._directory(directory.fd, "private", 2).children,
+                    require(not self._directory(directory.components, "private", 2).children,
                             "beta_not_clean")
                 self.results[name] = Classification("beta-terminal", "preserve", "clean_terminal")
             if SELECTOR in foreign:
-                selector_value(self._file(self.root, SELECTOR, NAME_BYTES + 1), generations)
+                selector_value(self._file((), SELECTOR, NAME_BYTES + 1), generations)
                 self.results[SELECTOR] = Classification("smtp-selector", "preserve", "bound")
             self.recheck(read_bytes=False)
+        except OSError as exc:
+            self.close()
+            self._resource_error(exc)
+            raise
         except BaseException:
             self.close()
             raise
+
+    @property
+    def owned_fds(self) -> int:
+        return self._owned_fds
+
+    @property
+    def peak_owned_fds(self) -> int:
+        return self._peak_owned_fds
+
+    @staticmethod
+    def _resource_error(exc: OSError) -> None:
+        if exc.errno in (errno.EMFILE, errno.ENFILE):
+            raise Rejected("resource_budget") from None
+
+    @contextmanager
+    def _fd_slot(self):
+        # Includes implicit scandir duplicates and fdinfo readers, not just os.open.
+        # Descendants: root 1 + depth 4 + leaf 1 + binding 1 + fdinfo 1 = 8.
+        # Scandir runs outside binding/fdinfo; rolling ancestry peaks at 5.
+        require(self._owned_fds < MAX_OWNED_FDS, "resource_budget")
+        self._owned_fds += 1
+        self._peak_owned_fds = max(self._peak_owned_fds, self._owned_fds)
+        try:
+            yield
+        except OSError as exc:
+            self._resource_error(exc)
+            raise
+        finally:
+            self._owned_fds -= 1
+
+    @contextmanager
+    def _descriptor(self, acquire):
+        with self._fd_slot():
+            fd = acquire()
+            try:
+                yield fd
+            finally:
+                os.close(fd)
+
+    def _mount_id(self, fd: int) -> str:
+        with self._fd_slot():
+            return self._mount(fd)
+
+    def _names(self, fd: int, limit: int) -> frozenset[str]:
+        with self._fd_slot():
+            return names(fd, limit)
 
     def _trust(self, fd: int, info: os.stat_result, directory: bool) -> None:
         require(info.st_dev == self.device
@@ -332,7 +401,7 @@ class Inventory:
                      stat.S_ISREG(info.st_mode) and info.st_nlink == 1), "unsafe_inode")
         no_acl(fd)
         # Linux mount IDs detect bind mounts even on the same device.
-        require(self._mount(fd) == self._mount(self.root), "mount_escape")
+        require(self._mount_id(fd) == self.root_mount, "mount_escape")
 
     @staticmethod
     def _mount(fd: int) -> str:
@@ -342,31 +411,74 @@ class Inventory:
                     return line.strip()
         raise Rejected("mount_unavailable")
 
-    def _open(self, parent: int, name: str, directory: bool) -> _Witness:
+    @contextmanager
+    def _opened(self, parent: int, name: str, directory: bool):
         before = os.stat(name, dir_fd=parent, follow_symlinks=False)
         require(stat.S_ISDIR(before.st_mode) if directory else
                 stat.S_ISREG(before.st_mode), "unsafe_type")
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOATIME
         if directory:
             flags |= os.O_DIRECTORY
-        fd = os.open(name, flags, dir_fd=parent)
-        try:
+        with self._descriptor(lambda: os.open(name, flags, dir_fd=parent)) as fd:
             info = os.fstat(fd)
             require(identity(info) == identity(before), "inode_changed")
-            self._trust(fd, info, directory)
-            witness = _Witness(parent, name, fd, identity(info), None, None)
-            self.witnesses.append(witness)
-            return witness
-        except BaseException:
-            os.close(fd)
-            raise
+            yield fd
 
-    def _directory(self, parent: int, name: str, depth: int) -> _Witness:
+    def _remember(self, witness: _Witness) -> None:
+        require(witness.components not in self.witnesses, "duplicate_witness")
+        self.witnesses[witness.components] = witness
+
+    @contextmanager
+    def _walk(self, components: tuple[str, ...]):
+        require(len(components) <= MAX_DEPTH, "depth_budget")
+        with ExitStack() as scopes:
+            parent = self.root
+            for length in range(1, len(components) + 1):
+                witness = self.witnesses[components[:length]]
+                require(witness.children is not None, "unsafe_type")
+                parent = scopes.enter_context(self._checked(parent, witness))
+            yield parent
+
+    def _validate(self, fd: int, witness: _Witness, *, opaque: bool = False) -> None:
+        info = os.fstat(fd)
+        require(identity(info) == witness.saved, "witness_changed")
+        require(self._mount_id(fd) == witness.mount, "mount_escape")
+        if not opaque:
+            self._trust(fd, info, witness.children is not None)
+
+    @contextmanager
+    def _checked(self, parent: int, witness: _Witness, *, opaque: bool = False):
+        directory = opaque or witness.children is not None
+        with self._opened(parent, witness.components[-1], directory) as fd:
+            self._validate(fd, witness, opaque=opaque)
+            self._binding(parent, witness, directory=directory)
+            yield fd
+            self._validate(fd, witness, opaque=opaque)
+            self._binding(parent, witness, directory=directory)
+
+    def _directory(self, parent: tuple[str, ...], name: str, depth: int) -> _Witness:
         require(depth <= MAX_DEPTH, "depth_budget")
-        witness = self._open(parent, name, True)
-        witness.children = names(witness.fd, DESCENDANT_ENTRIES - self.entries)
-        self.entries += len(witness.children)
-        return witness
+        return self._capture(parent, name, directory=True)
+
+    def _capture(self, parent: tuple[str, ...], name: str, *,
+                 directory: bool, limit: int = 0) -> _Witness:
+        require(len(parent) + 1 <= MAX_DEPTH + (not directory), "depth_budget")
+        with self._walk(parent) as parent_fd:
+            with self._opened(parent_fd, name, directory) as fd:
+                info = os.fstat(fd)
+                self._trust(fd, info, directory)
+                mount = self._mount_id(fd)
+                children = (self._names(fd, DESCENDANT_ENTRIES - self.entries)
+                            if directory else None)
+                data = None if directory else self._read(fd, limit)
+                witness = _Witness(parent + (name,), identity(info), mount,
+                                   children, data)
+                self._validate(fd, witness)
+                self._binding(parent_fd, witness, directory=directory)
+                self._remember(witness)
+                if children is not None:
+                    self.entries += len(children)
+                return witness
 
     def _read(self, fd: int, limit: int) -> bytes:
         size = os.fstat(fd).st_size
@@ -387,90 +499,103 @@ class Inventory:
     def _pin_ancestry(self, path: str) -> None:
         require(path.startswith("/") and all(part not in ("", ".", "..")
                 for part in path.split("/")[1:]), "root_path")
-        parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        self.ancestors.append(_Witness(parent, "", parent,
-                                       identity(os.fstat(parent)), None, None))
-        for name in path.split("/")[1:]:
-            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                            dir_fd=parent)
-            self.ancestors.append(_Witness(parent, name, child,
-                                           identity(os.fstat(child)), None, None))
-            parent = child
-        require(identity(os.fstat(parent)) == self.root_identity, "root_binding")
-        self._check_ancestry()
+        self._ancestry(path.split("/")[1:], capture=True)
 
     def _check_ancestry(self) -> None:
-        for witness in self.ancestors:
-            info = os.fstat(witness.fd)
-            require(identity(info)[:5] == witness.saved[:5]
-                    and info.st_uid == 0 and info.st_gid == 0
-                    and not stat.S_IMODE(info.st_mode) & 0o022, "unsafe_ancestor")
-            no_acl(witness.fd)
-            if witness.name:
-                self._binding(witness, directory=True, ancestor=True)
+        self._ancestry([item.name for item in self.ancestors[1:]], capture=False)
 
-    def _binding(self, witness: _Witness, *, directory: bool,
+    def _ancestor(self, fd: int, saved: _Ancestor) -> None:
+        info = os.fstat(fd)
+        require(identity(info)[:5] == saved.saved[:5]
+                and info.st_uid == 0 and info.st_gid == 0
+                and not stat.S_IMODE(info.st_mode) & 0o022, "unsafe_ancestor")
+        no_acl(fd)
+        require(self._mount_id(fd) == saved.mount, "mount_escape")
+
+    def _ancestry(self, components: list[str], *, capture: bool) -> None:
+        # Only parent+child are live, independent of absolute ancestry length.
+        saved = []
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOATIME
+        with ExitStack() as parent_scope:
+            parent = parent_scope.enter_context(self._descriptor(lambda: os.open("/", flags)))
+            first = (_Ancestor("", identity(os.fstat(parent)), self._mount_id(parent))
+                     if capture else self.ancestors[0])
+            self._ancestor(parent, first)
+            saved.append(first)
+            for index, name in enumerate(components, 1):
+                with ExitStack() as child_scope:
+                    child = child_scope.enter_context(
+                        self._descriptor(lambda: os.open(name, flags, dir_fd=parent)))
+                    witness = (_Ancestor(name, identity(os.fstat(child)), self._mount_id(child))
+                               if capture else self.ancestors[index])
+                    self._ancestor(child, witness)
+                    binding = _Witness((name,), witness.saved, witness.mount, frozenset(), None)
+                    self._binding(parent, binding, directory=True, ancestor=True)
+                    self._ancestor(parent, saved[-1])
+                    saved.append(witness)
+                    parent_scope.close()
+                    parent_scope.enter_context(child_scope.pop_all())
+                    parent = child
+            require(identity(os.fstat(parent))[:5] == self.root_identity[:5]
+                    and self._mount_id(parent) == self.root_mount, "root_binding")
+        if capture:
+            self.ancestors = tuple(saved)
+
+    def _binding(self, parent: int, witness: _Witness, *, directory: bool,
                  ancestor: bool = False) -> None:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOATIME
         if directory:
             flags |= os.O_DIRECTORY
-        fd = os.open(witness.name, flags, dir_fd=witness.parent)
-        try:
+        with self._descriptor(lambda: os.open(witness.components[-1], flags,
+                                              dir_fd=parent)) as fd:
             actual = identity(os.fstat(fd))
             require((actual[:5] == witness.saved[:5] if ancestor else
                      actual == witness.saved)
-                    and self._mount(fd) == self._mount(witness.fd), "named_binding")
-        finally:
-            os.close(fd)
+                    and self._mount_id(fd) == witness.mount, "named_binding")
 
-    def _file(self, parent: int, name: str, limit: int) -> bytes:
-        witness = self._open(parent, name, False)
-        witness.data = self._read(witness.fd, limit)
-        require(identity(os.fstat(witness.fd)) == witness.saved, "file_changed")
+    def _file(self, parent: tuple[str, ...], name: str, limit: int) -> bytes:
+        witness = self._capture(parent, name, directory=False, limit=limit)
         return witness.data
 
     def recheck(self, *, added: frozenset[str] = frozenset(),
                 removed: frozenset[str] = frozenset(), read_bytes: bool = True) -> None:
         """Exact own-name deltas only; never absorb new foreign evidence."""
+        try:
+            self._recheck(added=added, removed=removed, read_bytes=read_bytes)
+        except OSError as exc:
+            self._resource_error(exc)
+            raise
+
+    def _recheck(self, *, added: frozenset[str], removed: frozenset[str],
+                 read_bytes: bool) -> None:
         root = identity(os.fstat(self.root))
         self._check_ancestry()
         require(root[:5] == self.root_identity[:5], "root_changed")
         self._trust(self.root, os.fstat(self.root), True)
-        require(names(self.root, ROOT_ENTRIES) == (self.root_names - removed) | added,
+        require(self._names(self.root, ROOT_ENTRIES) == (self.root_names - removed) | added,
                 "root_inventory_changed")
         self.bytes_read = 0
         for witness in self.opaque:
-            require(identity(os.fstat(witness.fd)) == witness.saved
-                    and identity(os.stat(witness.name, dir_fd=witness.parent,
-                                         follow_symlinks=False)) == witness.saved,
-                    "opaque_changed")
-            self._binding(witness, directory=True)
-        for witness in self.witnesses:
-            require(identity(os.fstat(witness.fd)) == witness.saved
-                    and identity(os.stat(witness.name, dir_fd=witness.parent,
-                                         follow_symlinks=False)) == witness.saved,
-                    "witness_changed")
-            self._binding(witness, directory=witness.children is not None)
-            self._trust(witness.fd, os.fstat(witness.fd), witness.children is not None)
-            if witness.children is not None:
-                require(names(witness.fd, DESCENDANT_ENTRIES) == witness.children,
-                        "descendants_changed")
-            elif read_bytes:
-                require(self._read(witness.fd, len(witness.data)) == witness.data,
-                        "bytes_changed")
-                require(identity(os.fstat(witness.fd)) == witness.saved, "file_changed")
-        require(names(self.root, ROOT_ENTRIES) == (self.root_names - removed) | added,
+            with self._checked(self.root, witness, opaque=True):
+                pass
+        for witness in self.witnesses.values():
+            with self._walk(witness.components[:-1]) as parent:
+                with self._checked(parent, witness) as fd:
+                    if witness.children is not None:
+                        require(self._names(fd, DESCENDANT_ENTRIES) == witness.children,
+                                "descendants_changed")
+                    elif read_bytes:
+                        require(self._read(fd, len(witness.data)) == witness.data,
+                                "bytes_changed")
+        require(self._names(self.root, ROOT_ENTRIES) == (self.root_names - removed) | added,
                 "root_inventory_changed")
 
     def close(self) -> None:
-        for witness in reversed(self.witnesses + self.opaque + self.ancestors):
-            os.close(witness.fd)
+        self._resources.close()
         self.witnesses.clear()
         self.opaque.clear()
-        self.ancestors.clear()
-        if self.root is not None:
-            os.close(self.root)
-            self.root = None
+        self.ancestors = ()
+        self.root = None
 
     def __enter__(self):
         return self

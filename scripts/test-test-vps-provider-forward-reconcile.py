@@ -21,6 +21,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import resource
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -384,6 +385,137 @@ class ForwardTests(FixtureTests):
                 self.assertEqual(fixture.marker()["runKey"], helper.FORWARD_ORIGIN_KEY)
                 self.assertEqual(sidecar.read_bytes(), b"unbound")
                 self.assertFalse(fixture.archive.exists())
+
+    def test_low_rlimit_large_foreign_production_workers(self):
+        for limit in (64, 1024):
+            result = subprocess.run(
+                [sys.executable, "-B", __file__, "--resource-worker", str(limit)],
+                capture_output=True, timeout=300)
+            self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
+            print(result.stdout.decode(), end="", flush=True)
+
+    def test_resource_failures_preserve_exact_adoption_publications(self):
+        module = helper._forward_state_module()
+        actual = module.Inventory.recheck
+        staging = ".provider-state." + SUCCESSOR + "-final-deploy.tmp"
+        temporary = ".provider-transaction." + SUCCESSOR + ".forward"
+        for boundary, staged, published, temp in (
+                ("before-staging", False, False, False),
+                ("state-staged", True, False, False),
+                ("state-published", False, True, False),
+                ("temporary-written", False, True, True),
+                ("pointer-ready", False, True, True)):
+            for code in (errno.EMFILE, errno.ENFILE):
+                with self.subTest(boundary=boundary, errno=code):
+                    fixture = self.fresh()
+                    baseline = len(os.listdir("/proc/self/fd"))
+                    armed = [boundary == "before-staging"]
+                    calls = [0]
+                    def hook(stage):
+                        if stage == boundary:
+                            armed[0] = True
+                    def recheck(inv, *args, **kwargs):
+                        calls[0] += 1
+                        # Constructor's initial recheck must finish first.
+                        ready = armed[0] and calls[0] > 1
+                        if boundary == "temporary-written":
+                            ready = temporary in kwargs.get("added", ())
+                        if ready:
+                            with mock.patch.object(os, "open",
+                                                   side_effect=OSError(code, "fictional exhaustion")):
+                                return actual(inv, *args, **kwargs)
+                        return actual(inv, *args, **kwargs)
+                    with mock.patch.object(helper, "_forward_adopt_boundary", side_effect=hook), \
+                            mock.patch.object(module.Inventory, "recheck", new=recheck):
+                        with self.assertRaises(helper.ProviderError):
+                            fixture.admit()
+                    self.assertEqual((fixture.states / staging).exists(), staged)
+                    self.assertEqual(fixture.successor.exists(), published)
+                    self.assertEqual((fixture.states / temporary).exists(), temp)
+                    self.assertEqual(fixture.marker()["runKey"], helper.FORWARD_ORIGIN_KEY)
+                    self.assertFalse(fixture.archive.exists())
+                    self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+
+    def test_resource_failures_preserve_exact_completion_publications(self):
+        module = helper._forward_state_module()
+        actual = module.Inventory.recheck
+        for boundary, accepted, archived, terminal in (
+                ("acceptance-before", False, False, False),
+                ("credential-cleanup-before", True, False, False),
+                ("archive-before", True, False, False),
+                ("terminal-before", True, True, False),
+                ("pointer-unlink-before", True, True, True)):
+            for code in (errno.EMFILE, errno.ENFILE):
+                with self.subTest(boundary=boundary, errno=code):
+                    fixture = self.fresh()
+                    fixture.admit()
+                    fixture.phase()
+                    baseline = len(os.listdir("/proc/self/fd"))
+                    armed = [False]
+                    def hook(stage):
+                        if stage == boundary:
+                            armed[0] = True
+                    def recheck(inv, *args, **kwargs):
+                        if armed[0]:
+                            with mock.patch.object(os, "open",
+                                                   side_effect=OSError(code, "fictional exhaustion")):
+                                return actual(inv, *args, **kwargs)
+                        return actual(inv, *args, **kwargs)
+                    with mock.patch.object(helper, "_forward_adopt_boundary", side_effect=hook), \
+                            mock.patch.object(module.Inventory, "recheck", new=recheck):
+                        with self.assertRaises(helper.ProviderError):
+                            fixture.complete()
+                    self.assertEqual((fixture.successor / "forward-acceptance.json").exists(), accepted)
+                    self.assertEqual(fixture.archive.exists(), archived)
+                    self.assertEqual(fixture.origin.exists(), not archived)
+                    self.assertEqual((fixture.successor / "terminal.json").exists(), terminal)
+                    self.assertEqual(fixture.marker()["phase"], "finalizing")
+                    self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+
+    def test_resource_failures_preserve_exact_phase_publications(self):
+        module = helper._forward_state_module()
+        actual = module.Inventory.recheck
+        temporary = ".provider-transaction." + SUCCESSOR + ".forward-phase"
+        for phase in ("verifying", "finalizing"):
+            for after_write in (False, True):
+                fixture = self.fresh()
+                fixture.admit()
+                if phase == "finalizing":
+                    fixture.phase()
+                original = fixture.pointer.read_bytes()
+                baseline = len(os.listdir("/proc/self/fd"))
+                calls = [0]
+                def recheck(inv, *args, **kwargs):
+                    calls[0] += 1
+                    # Constructor, then the two phase-publication checkpoints.
+                    if calls[0] == (3 if after_write else 2):
+                        with mock.patch.object(os, "open",
+                                               side_effect=OSError(errno.EMFILE, "fictional exhaustion")):
+                            return actual(inv, *args, **kwargs)
+                    return actual(inv, *args, **kwargs)
+                with mock.patch.object(module.Inventory, "recheck", new=recheck):
+                    with self.assertRaises(helper.ProviderError):
+                        helper._forward_phase(str(fixture.states), SUCCESSOR, phase)
+                self.assertEqual(fixture.pointer.read_bytes(), original)
+                self.assertEqual((fixture.states / temporary).exists(), after_write)
+                self.assertFalse(fixture.archive.exists())
+                self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+
+    def test_constructor_exhaustion_blocks_before_any_adoption_publication(self):
+        module = helper._forward_state_module()
+        actual = module.Inventory.__init__
+        fixture = self.fresh()
+        baseline = len(os.listdir("/proc/self/fd"))
+        def exhausted(inv, *args, **kwargs):
+            with mock.patch.object(os, "dup", side_effect=OSError(errno.EMFILE, "fictional exhaustion")):
+                actual(inv, *args, **kwargs)
+        with mock.patch.object(module.Inventory, "__init__", new=exhausted):
+            with self.assertRaises(helper.ProviderError):
+                fixture.admit()
+        self.unchanged(fixture)
+        self.assertFalse(any(name.name.startswith((".provider-state.", ".provider-transaction." + SUCCESSOR))
+                             for name in fixture.states.iterdir()))
+        self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
 
     def test_new_foreign_entries_at_completion_boundaries_block_next_mutation(self):
         for boundary in ("acceptance-before", "credential-cleanup-before",
@@ -1443,5 +1575,35 @@ class ShellIntegrationTests(FixtureTests):
                 self.assertEqual(Path(fixture.paths["production-env"]).read_bytes(), fixture.target_env)
 
 
-if __name__ == "__main__":
+def resource_worker(limit):
+    import runpy
+    producer = runpy.run_path(str(SCRIPTS / "test-test-vps-state-admission.py"))
+    fixture = Fixture()
+    old = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        for number in range(1364):
+            producer["generation"](fixture.states, f"g{number}")
+        for number in range(2):
+            producer["beta"](fixture.states, recovery_id=f"fixture-{number:03d}")
+        saved = {name: producer["snapshot"](fixture.states / name)
+                 for name in (".smtp-last-good-generations",
+                              "beta-recovery-fixture-000", "beta-recovery-fixture-001")}
+        baseline = len(os.listdir("/proc/self/fd"))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limit, old[1]))
+        fixture.admit()
+        helper._forward_revalidate(str(fixture.states), SUCCESSOR, encode([fixture.backend]))
+        fixture.phase()
+        fixture.complete()
+        for name, value in saved.items():
+            assert producer["snapshot"](fixture.states / name) == value
+        assert len(os.listdir("/proc/self/fd")) == baseline
+        print(f"PRODUCTION_LOW_RLIMIT_PASS limit={limit} descendants=4096 cleanup_delta=0", flush=True)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, old)
+        fixture.close()
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--resource-worker":
+    resource_worker(int(sys.argv[2]))
+elif __name__ == "__main__":
     unittest.main()
