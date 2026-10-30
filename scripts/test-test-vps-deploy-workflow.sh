@@ -25,6 +25,11 @@ baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
   [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
   [ -f "$public_probe" ] && [ -f "$closed_beta_fixture" ]
 workflow_text=$(<"$workflow")
+extract_line=$(grep -nF 'tar --no-same-owner -xf "$stage/tooling.tar" -C "$stage"' "$workflow" | cut -d: -f1)
+checksum_line=$(grep -nF 'sha256sum -c SHA256SUMS' "$workflow" | cut -d: -f1)
+[[ "$extract_line" =~ ^[0-9]+$ && "$checksum_line" =~ ^[0-9]+$ ]] &&
+  [ "$extract_line" -lt "$checksum_line" ] ||
+  { echo "root tooling extraction must discard runner ownership before checksum verification" >&2; exit 1; }
 deploy_text=$(<"$deploy")
 runtime_text=$(<"$runtime")
 provider_deploy_text=$(<"$provider_deploy")
