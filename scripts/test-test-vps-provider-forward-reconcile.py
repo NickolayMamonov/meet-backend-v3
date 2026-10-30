@@ -326,6 +326,73 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(Path(fixture.paths["production-env"]).read_bytes(), fixture.target_env)
 
 
+class StagedOwnershipTests(unittest.TestCase):
+    def test_runner_tar_is_normalized_before_native_reviewed_base_admission(self):
+        workflow = (SCRIPTS.parent / ".github/workflows/deploy-test-vps.yml").read_text()
+        extraction = [line.strip() for line in workflow.splitlines()
+                      if 'tar ' in line and '"$stage/tooling.tar"' in line]
+        self.assertEqual(extraction, ['tar --no-same-owner -xf "$stage/tooling.tar" -C "$stage"'])
+        files = ("docker-compose.production.yml",
+                 "scripts/deploy-test-vps-provider-release.sh",
+                 "scripts/test-vps-provider-credential.py")
+        # /tmp is intentionally not a trusted ancestor for the native reader.
+        with tempfile.TemporaryDirectory(prefix="staging-owner-", dir="/") as directory:
+            root = Path(directory)
+            root.chmod(0o755)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            for name in files:
+                path = inputs / name
+                path.parent.mkdir(exist_ok=True)
+                path.write_bytes((SCRIPTS.parent / name).read_bytes())
+                path.chmod(0o644)
+            runner = root / "runner"
+            runner.mkdir()
+            os.chown(runner, 1001, 1001)
+
+            def runner_identity():
+                os.setgroups([])
+                os.setgid(1001)
+                os.setuid(1001)
+
+            subprocess.run(["bash", "-c", '''
+                set -euo pipefail
+                source=$1; stage=$2/stage; archive=$2/tooling.tar
+                mkdir -p "$stage/scripts"
+                files=(docker-compose.production.yml
+                  scripts/deploy-test-vps-provider-release.sh
+                  scripts/test-vps-provider-credential.py)
+                for file in "${files[@]}"; do cp -- "$source/$file" "$stage/$file"; done
+                chmod 755 "$stage"/scripts/*.sh "$stage"/scripts/test-vps-provider-credential.py
+                (cd "$stage"; sha256sum "${files[@]}" > SHA256SUMS)
+                tar -C "$stage" -cf "$archive" "${files[@]}" SHA256SUMS
+                ''', "_", str(inputs), str(runner)], check=True, preexec_fn=runner_identity)
+            for normalized in (False, True):
+                with self.subTest(normalized=normalized):
+                    stage = root / ("normalized" if normalized else "preserved")
+                    stage.mkdir(mode=0o700)
+                    shutil.copyfile(runner / "tooling.tar", stage / "tooling.tar")
+                    command = extraction[0] if normalized else 'tar -xf "$stage/tooling.tar" -C "$stage"'
+                    subprocess.run(["bash", "-c",
+                                    'set -euo pipefail; stage=$1; ' + command +
+                                    '; (cd "$stage"; sha256sum -c SHA256SUMS); chmod 755 "$stage"/scripts/*.sh',
+                                    "_", str(stage)], check=True, stdout=subprocess.PIPE)
+                    for name in files:
+                        info = (stage / name).stat()
+                        self.assertEqual((info.st_uid, info.st_gid),
+                                         (0, 0) if normalized else (1001, 1001))
+                        self.assertEqual(stat.S_IMODE(info.st_mode),
+                                         0o644 if name == files[0] else 0o755)
+                        self.assertEqual((stage / name).read_bytes(), (inputs / name).read_bytes())
+                    if normalized:
+                        _, content = helper._forward_read_external(str(stage / files[0]))
+                        self.assertEqual(content, (inputs / files[0]).read_bytes())
+                    else:
+                        with self.assertRaises(helper.ProviderError) as error:
+                            helper._forward_read_external(str(stage / files[0]))
+                        self.assertEqual(error.exception.category, "RECOVERY_REQUIRED")
+
+
 class ForwardTests(FixtureTests):
     def test_competing_deployment_lock_blocks_admission_without_publication(self):
         fixture = self.fresh()

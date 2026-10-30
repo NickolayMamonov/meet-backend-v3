@@ -338,7 +338,7 @@ jobs:
           timeout 120s ssh -F "$SSH_CONFIG" test-vps bash -s -- "$remote" <<'REMOTE'
           set -euo pipefail
           stage=$1
-          tar -xf "$stage/tooling.tar" -C "$stage"
+          tar --no-same-owner -xf "$stage/tooling.tar" -C "$stage"
           (
             cd "$stage"
             sha256sum -c SHA256SUMS
