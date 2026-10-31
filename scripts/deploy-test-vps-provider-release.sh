@@ -1555,7 +1555,7 @@ durable_disposition=$(timeout 5s jq -er \
   --arg run_key "$run_key" --argjson enabled "$provider_enabled" '
     select(
       type == "object" and
-      .schemaVersion == 1 and
+      .schemaVersion == 2 and
       .runKey == $run_key and
       .phase == "preparing" and
       .providerEnabled == $enabled
