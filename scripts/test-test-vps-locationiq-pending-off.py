@@ -584,7 +584,9 @@ def record():
     return rec
 if kind == "provider":
     cmd = args[0]
-    if cmd in ("check","retention-check","check-image"): pass
+    if cmd in ("check","retention-check"): pass
+    elif cmd in ("check-image", "target-proof-check"):
+        json.load(sys.stdin)
     elif cmd == "verify":
         if failure == "cleanup-key-race" and not (r / "prewriter-failed").exists():
             (r / "prewriter-failed").touch()
