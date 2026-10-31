@@ -25,6 +25,83 @@ baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
   [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
   [ -f "$public_probe" ] && [ -f "$closed_beta_fixture" ]
 workflow_text=$(<"$workflow")
+python3 - "$workflow" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text()
+step = text.split("      - name: Capture runtime and public HTTPS evidence\n", 1)[1]
+start = step.index("          target_proof_base64=")
+header, remote = step[start:].split("<<'REMOTE'\n", 1)
+decode = next(line.strip() for line in remote.splitlines()
+              if line.strip().startswith("target_proof="))
+proof = json.dumps({"indexRef": "fixture@sha256:" + "a" * 64,
+                    "rawIndexBase64": "eyJzY2hlbWFWZXJzaW9uIjoyfQ=="},
+                   separators=(",", ":"))
+# OpenSSH joins command arguments into a remote shell command. Model that
+# boundary locally, without any socket, rather than preserving argv in a stub.
+script = """
+set -euo pipefail
+timeout() { shift; "$@"; }
+ssh() {
+  while [ "$1" != bash ]; do shift; done
+  bash -c "$*"
+}
+SSH_CONFIG=fixture
+TARGET_IMAGE_ID=sha256:fixture
+SOURCE_SHA=fixture
+VERSION=1.6.0
+RECONCILE_FAILED_40368479855_FORWARD=false
+REMOTE_TOOLING=/fixture
+GITHUB_RUN_ID=123
+GITHUB_RUN_ATTEMPT=1
+TARGET_IMAGE_PROOF=$1
+""" + header + "<<'REMOTE'\nset -euo pipefail\n" + decode + """
+printf '%s' "$target_proof"
+REMOTE
+)
+printf '%s' "$runtime"
+"""
+result = subprocess.run(["bash", "-c", script, "_", proof],
+                        capture_output=True, text=True, check=True)
+assert result.stdout == proof, result.stdout
+PY
+python3 - "$provider_runtime" "$provider_helper" <<'PY'
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+import tempfile
+from unittest.mock import patch
+
+runtime, helper = sys.argv[1:]
+text = pathlib.Path(runtime).read_text()
+block = text.split('"$target_index_file" <<\'PY\' 2>/dev/null\n', 1)[1].split("\nPY", 1)[0]
+raw = pathlib.Path("scripts/fixtures/selected-platform/image-index.json").read_bytes().removesuffix(b"\n")
+digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+target = "ghcr.io/nickolaymamonov/meet-backend-v3@" + digest
+previous = "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:" + "e" * 64
+record = {"Id": digest, "Os": "linux", "Architecture": "amd64",
+          "RepoDigests": [target], "Config": {"Env": [], "User": "10001:10001",
+          "Labels": {
+              "org.opencontainers.image.source": "https://github.com/NickolayMamonov/meet-backend-v3",
+              "org.opencontainers.image.revision": "462b52b403c73027a262e183d1bd9ae4964938d8",
+              "org.opencontainers.image.version": "1.6.0"}}}
+def inspect(argv, **kwargs):
+    assert argv[:3] == ["docker", "image", "inspect"]
+    assert argv[3] in (previous, target)
+    value = record if argv[3] == target else {"Config": {"Env": []}}
+    return subprocess.CompletedProcess(argv, 0, stdout=json.dumps([value]))
+with tempfile.TemporaryDirectory() as directory:
+    index = pathlib.Path(directory) / "image-index.json"
+    index.write_bytes(raw)
+    with patch.object(sys, "argv", ["_", helper, previous, target, str(index)]), \
+            patch("subprocess.run", side_effect=inspect):
+        exec(compile(block, runtime, "exec"), {"__name__": "__main__"})
+PY
 platform_pulls=$(grep -Ec 'docker pull --platform=linux/amd64 ' "$workflow")
 [ "$platform_pulls" -eq 2 ] ||
   { echo "both existing image pulls must explicitly select linux/amd64" >&2; exit 1; }

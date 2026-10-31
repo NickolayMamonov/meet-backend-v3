@@ -12,6 +12,7 @@ prerequisite_missing() {
 filesystem_only=false
 previous_image=
 target_image=
+target_index_file=
 transport_source_host=${MEE2_93_IMAGE_TRANSPORT_SOURCE:-}
 transport_target_host=${MEE2_93_IMAGE_TRANSPORT_TARGET:-}
 transport_loaded=false
@@ -112,8 +113,13 @@ while [ "$#" -gt 0 ]; do
       target_image=$2
       shift 2
       ;;
+    --target-index)
+      [ "$#" -ge 2 ] && [ -z "$target_index_file" ] || exit 2
+      target_index_file=$2
+      shift 2
+      ;;
     *)
-      echo "usage: $0 --filesystem-only | --previous-image IMAGE@sha256:DIGEST --target-image IMAGE@sha256:DIGEST" >&2
+      echo "usage: $0 --filesystem-only | --previous-image IMAGE@sha256:DIGEST --target-image IMAGE@sha256:DIGEST --target-index FILE" >&2
       exit 2
       ;;
   esac
@@ -124,6 +130,8 @@ if [ "$filesystem_only" = false ]; then
     prerequisite_missing
   [[ "$target_image" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] ||
     prerequisite_missing
+  [ -n "$target_index_file" ] && [ -f "$target_index_file" ] &&
+    [ ! -L "$target_index_file" ] || prerequisite_missing
   [ "$previous_image" != "$target_image" ] || prerequisite_missing
   command -v docker >/dev/null 2>&1 || {
     prerequisite_missing
@@ -426,13 +434,21 @@ PY
   [[ "$postgres_expected_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
     prerequisite_missing
   timeout 30s python3 - "$ROOT_DIR/scripts/test-vps-provider-credential.py" \
-    "$previous_image" "$target_image" <<'PY' 2>/dev/null
+    "$previous_image" "$target_image" "$target_index_file" <<'PY' 2>/dev/null
+import base64
+import importlib.util
 import json
+import pathlib
 import subprocess
 import sys
 
-helper, *images = sys.argv[1:]
-for image in images:
+helper_path, previous_ref, target_ref, index_path = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("provider_helper", helper_path)
+helper = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = helper
+spec.loader.exec_module(helper)
+
+def inspect(image):
     result = subprocess.run(
         ["docker", "image", "inspect", image],
         check=True,
@@ -440,13 +456,33 @@ for image in images:
         stderr=subprocess.DEVNULL,
         text=True,
     )
-    subprocess.run(
-        ["python3", helper, "check-image"],
-        check=True,
-        input=result.stdout,
-        text=True,
-        stdout=subprocess.DEVNULL,
-    )
+    return json.loads(result.stdout)
+
+previous = helper._inspect(json.dumps(inspect(previous_ref)).encode())
+helper._image_admission(previous)
+
+index_bytes = pathlib.Path(index_path).read_bytes()
+index = json.loads(index_bytes)
+selected = [
+    descriptor["digest"] for descriptor in index["manifests"]
+    if descriptor.get("platform", {}).get("os") == "linux"
+    and descriptor.get("platform", {}).get("architecture") == "amd64"
+]
+if len(selected) != 1:
+    raise SystemExit(1)
+target_proof = {
+    "indexRef": target_ref,
+    "rawIndexBase64": base64.b64encode(index_bytes).decode("ascii"),
+    "selectedPlatform": "linux/amd64",
+    "selectedManifestDigest": selected[0],
+    "engineImageId": inspect(target_ref)[0]["Id"],
+}
+target_request = json.dumps({
+    "imageInspect": inspect(target_ref),
+    "targetImageProof": target_proof,
+}, separators=(",", ":")).encode()
+target, _ = helper._check_image_request(target_request)
+helper._image_admission(target)
 PY
 
   matrix_fixture=$(mktemp -d /var/lib/meet-provider-image.XXXXXX 2>/dev/null) ||

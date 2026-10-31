@@ -568,10 +568,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          target_proof_base64=$(printf '%s' "$TARGET_IMAGE_PROOF" | base64 -w0)
           runtime=$(timeout 180s ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$TARGET_IMAGE_ID" "$SOURCE_SHA" "$VERSION" \
             "$RECONCILE_FAILED_40368479855_FORWARD" "$REMOTE_TOOLING" \
-            "$TARGET_IMAGE_PROOF" "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" <<'REMOTE'
+            "$target_proof_base64" "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" <<'REMOTE'
           set -euo pipefail
           expected_id=$1
           revision=$2
@@ -580,7 +581,7 @@ jobs:
             source "$5/scripts/deploy-test-vps-provider-release.sh"
             provider_release_pin_docker
           fi
-          target_proof=$6
+          target_proof=$(printf '%s' "$6" | base64 --decode)
           run_key=$7
           mapfile -t backends < <(timeout 30s docker ps -q \
             --filter label=com.docker.compose.project=meet-production \
