@@ -1335,6 +1335,8 @@ with (root / "trace").open("a") as stream:
                             "context": os.environ.get("DOCKER_CONTEXT")}) + "\n")
 failure = os.environ.get("FORWARD_FAILURE", "")
 if args[:2] == ["context", "inspect"]:
+    if failure == "pin":
+        sys.exit(1)
     print("tcp://unexpected:2375" if failure == "endpoint" else "unix:///var/run/docker.sock")
     sys.exit()
 if args == ["context", "show"]:
@@ -1401,6 +1403,10 @@ elif args[:1] == ["stop"]:
         sys.exit(1)
 elif args[:1] == ["compose"]:
     operation = next((arg for arg in args if arg in ("ps", "config", "up", "port", "stop")), "")
+    if failure == "predecessor" and operation == "ps" and args[-1:] == ["backend"]:
+        sys.exit(1)
+    if failure == "rendered-witness" and operation == "config":
+        sys.exit(1)
     inputs = []
     if operation == "up" and failure == "owner-write-after-validation":
         path = data["originalBase"]
@@ -1468,7 +1474,8 @@ else:
 class ShellIntegrationTests(FixtureTests):
     """Actual release helper, Compose wrapper and healthy runtime invariant code."""
 
-    def run_shell(self, disposition="none", failure="", overrides=None, historical=False):
+    def run_shell(self, disposition="none", failure="", overrides=None, historical=False,
+                  workflow_route=False):
         fixture = self.fresh(disposition)
         if historical:
             fixture.historical_original()
@@ -1510,7 +1517,38 @@ class ShellIntegrationTests(FixtureTests):
         }))
         bin_dir = fixture.root / "bin"
         Fixture.write(bin_dir / "docker", FAKE_DOCKER.encode(), 0o755)
-        Fixture.write(bin_dir / "curl", FAKE_CURL.encode(), 0o755)
+        public_url = ("https://api.whysoezzy.online" if workflow_route
+                      else "https://fixture.invalid")
+        Fixture.write(bin_dir / "curl",
+                      FAKE_CURL.replace("https://fixture.invalid", public_url).encode(), 0o755)
+        if failure == "adoption-jq":
+            real_jq = shutil.which("jq")
+            if real_jq is None:
+                self.fail("jq is required for the adoption-boundary fixture")
+            Fixture.write(bin_dir / "jq", (
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "if '.providerEnabled | tostring' in sys.argv:\n"
+                "    sys.exit(42)\n"
+                f"os.execv({real_jq!r}, [{real_jq!r}, *sys.argv[1:]])\n"
+            ).encode(), 0o755)
+        if failure in ("native-adoption", "revalidation", "forward-complete"):
+            real_python = shutil.which("python3")
+            if real_python is None:
+                self.fail("python3 is required for the native-boundary fixture")
+            Fixture.write(bin_dir / "python3", (
+                f"#!{real_python}\n"
+                "import os, pathlib, sys\n"
+                "args = sys.argv[1:]\n"
+                "command = {'native-adoption': 'forward-adopt', "
+                "'revalidation': 'forward-revalidate', "
+                "'forward-complete': 'forward-complete'}.get("
+                "os.environ.get('FORWARD_FAILURE'))\n"
+                "if len(args) > 1 and pathlib.Path(args[1]).name == "
+                "'test-vps-provider-credential.py' and command in args:\n"
+                "    sys.exit(42)\n"
+                f"os.execv({real_python!r}, [{real_python!r}, *args])\n"
+            ).encode(), 0o755)
         env = dict(os.environ, PATH=str(bin_dir) + ":" + os.environ["PATH"],
                    FORWARD_FIXTURE=str(fixture.root), FORWARD_FAILURE=failure,
                    TEST_VPS_STATE_ROOT=str(fixture.states), PYTHONDONTWRITEBYTECODE="1")
@@ -1522,14 +1560,78 @@ class ShellIntegrationTests(FixtureTests):
         # Parent fixture releases its lock; the actual coordinator must acquire it.
         helper.fcntl.flock(9, helper.fcntl.LOCK_UN)
         fallback_before = fixture.saved_identity(fixture.fallback)
-        result = subprocess.run([
+        helper_argv = [
             "bash", str(stage / "deploy-test-vps-provider-release.sh"),
             "--root", str(fixture.app), "--base-compose", fixture.paths["reviewed-base"],
             "--image", IMAGE, "--revision", helper.FORWARD_TARGET["source"],
             "--version", "1.6.0", "--run-key", SUCCESSOR, "--mode", "deploy",
             "--failure-policy", "manual-stop", "--pending-locationiq-off",
-            "--reconcile-failed-40368479855-forward", "--public-url", "https://fixture.invalid",
-        ], env=env, capture_output=True, timeout=90)
+            "--reconcile-failed-40368479855-forward", "--public-url", public_url,
+        ]
+        if workflow_route:
+            workflow = (SCRIPTS.parent / ".github/workflows/deploy-test-vps.yml").read_text()
+            deploy = workflow.split(
+                "      - name: Deploy selected release successfully\n", 1
+            )[1].split("      - name:", 1)[0]
+            body = deploy.split("        run: |\n", 1)[1]
+            body = "\n".join(line[10:] for line in body.splitlines())
+            body = body.split(
+                'grep -Fq "deployment=completed image_id=$TARGET_IMAGE_ID"', 1
+            )[0]
+            original_run = subprocess.run
+
+            def route_workflow(argv, *args, **kwargs):
+                if (isinstance(argv, list) and len(argv) > 1 and argv[0] == "bash"
+                        and str(argv[1]).endswith("/deploy-test-vps-provider-release.sh")):
+                    values = {argv[index]: argv[index + 1] for index in range(2, 16, 2)}
+                    routed_env = dict(kwargs["env"])
+                    ssh = Path(routed_env["FORWARD_FIXTURE"]) / "bin/ssh"
+                    Fixture.write(ssh, b"""#!/usr/bin/env python3
+import json,os,pathlib,subprocess,sys
+a=sys.argv[1:]
+assert a[:3] == ["-F", "OFFLINE_ONLY", "test-vps"]
+pathlib.Path(os.environ["FORWARD_FIXTURE"],"actual-ssh-argv.json").write_text(json.dumps(a))
+status = subprocess.call(["/usr/bin/bash"]+a[3:])
+pathlib.Path(os.environ["FORWARD_FIXTURE"],"helper-exit.json").write_text(json.dumps(status))
+sys.exit(status)
+""", 0o755)
+                    routed_env.update(
+                        SSH_CONFIG="OFFLINE_ONLY",
+                        REMOTE_TOOLING=str(Path(argv[1]).parent.parent),
+                        PATH_ON_HOST=values["--root"],
+                        IMAGE="ghcr.io/nickolaymamonov/meet-backend-v3",
+                        DIGEST=helper.FORWARD_TARGET["indexDigest"],
+                        SOURCE_SHA=helper.FORWARD_TARGET["source"],
+                        VERSION="1.6.0",
+                        GITHUB_RUN_ID=SUCCESSOR.split("-", 1)[0],
+                        GITHUB_RUN_ATTEMPT="1",
+                        FAILURE_POLICY="manual-stop",
+                        PUBLIC_URL=public_url,
+                        APPLY_PENDING_LOCATIONIQ_OFF="true",
+                        RECONCILE_FAILED_40368479855_FORWARD="true",
+                        RUNNER_TEMP=str(fixture.root),
+                    )
+                    kwargs["env"] = routed_env
+                    result = original_run(["bash", "-c", body], *args, **kwargs)
+                    routed = json.loads(
+                        (fixture.root / "actual-ssh-argv.json").read_text())
+                    expected = [
+                        str(argv[1]), "--root", values["--root"],
+                        "--base-compose", values["--base-compose"],
+                        "--image", IMAGE, "--revision", helper.FORWARD_TARGET["source"],
+                        "--version", "1.6.0", "--run-key", SUCCESSOR,
+                        "--failure-policy", "manual-stop", "--public-url",
+                        public_url, "--pending-locationiq-off",
+                        "--reconcile-failed-40368479855-forward", "--mode", "deploy",
+                    ]
+                    self.assertEqual(routed[3:], expected)
+                    return result
+                return original_run(argv, *args, **kwargs)
+
+            with mock.patch.object(subprocess, "run", side_effect=route_workflow):
+                result = subprocess.run(helper_argv, env=env, capture_output=True, timeout=90)
+        else:
+            result = subprocess.run(helper_argv, env=env, capture_output=True, timeout=90)
         self.assertEqual(fixture.saved_identity(fixture.fallback), fallback_before)
         output = result.stdout + result.stderr
         for secret in (KEY.encode(), b"fictional@example.invalid",
@@ -1640,6 +1742,101 @@ class ShellIntegrationTests(FixtureTests):
                 self.assertTrue(fixture.origin.exists())
                 self.assertFalse((fixture.successor / "terminal.json").exists())
                 self.assertEqual(Path(fixture.paths["production-env"]).read_bytes(), fixture.target_env)
+
+    @mock.patch(__name__ + ".SUCCESSOR", "41190844821-1")
+    def test_forward_recovery_phase_markers_are_safe_and_ordered(self):
+        def golden(failure=""):
+            return self.run_shell("reused", failure=failure, historical=True,
+                                  workflow_route=True)
+
+        def assert_phase(result, phase):
+            self.assertEqual(result.returncode, 1, result.stderr.decode())
+            self.assertEqual(
+                [line for line in result.stderr.splitlines()
+                 if line.startswith(b"recovery_failure_phase=")],
+                [f"recovery_failure_phase={phase}".encode()])
+
+        fixture, result, _ = golden()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertNotIn(b"recovery_failure_phase=", result.stderr)
+        boundaries = [
+            b"recovery_boundary=adoption-accepted",
+            b"recovery_boundary=revalidation-accepted",
+            b"recovery_boundary=service-mutation-begin",
+        ]
+        positions = [result.stderr.find(marker) for marker in boundaries]
+        self.assertTrue(all(position >= 0 for position in positions), result.stderr.decode())
+        self.assertEqual(positions, sorted(positions))
+
+        # A compose-up failure is an ordinary command failure after the explicit
+        # mutation boundary. The EXIT handler must preserve its status and
+        # perform the existing identity-checked manual stop.
+        fixture, result, trace = golden("recreate")
+        assert_phase(result, "service-mutation")
+        self.assertIn(b"backend_stop=completed", result.stderr)
+        stops = [entry for entry in trace if entry["argv"][0] == "stop"]
+        self.assertEqual([entry["argv"] for entry in stops], [["stop", NEW]])
+        self.assertTrue(fixture.origin.exists())
+        self.assertFalse((fixture.successor / "terminal.json").exists())
+        self.assertNotIn(str(fixture.root).encode(), result.stdout + result.stderr)
+        self.assertNotIn(KEY.encode(), result.stdout + result.stderr)
+
+        for failure, phase, adopted, mutated in (
+            ("pin", "docker-pin", False, False),
+            ("predecessor", "predecessor", False, False),
+            ("rendered-witness", "rendered-witness", False, False),
+            ("native-adoption", "native-adoption", False, False),
+            ("revalidation", "revalidation", True, False),
+            ("forward-complete", "forward-complete", True, True),
+        ):
+            with self.subTest(failure=failure):
+                fixture, result, trace = golden(failure)
+                assert_phase(result, phase)
+                self.assertIn(b"RECOVERY_REQUIRED", result.stderr.splitlines())
+                writes = [entry for entry in trace if any(
+                    arg in ("up", "stop", "start", "restart")
+                    for arg in entry["argv"])]
+                if mutated:
+                    self.assertTrue(any("up" in entry["argv"] for entry in writes))
+                    self.assertEqual([entry["argv"] for entry in writes
+                                      if entry["argv"][0] == "stop"], [["stop", NEW]])
+                else:
+                    self.assertFalse([entry for entry in writes
+                                      if entry["argv"][0] != "up"])
+                    self.assertFalse([entry for entry in writes
+                                      if entry["argv"][0] == "up"])
+                if adopted:
+                    self.assertEqual(fixture.marker()["runKey"], SUCCESSOR)
+                else:
+                    self.assertEqual(fixture.marker()["runKey"],
+                                     helper.FORWARD_ORIGIN_KEY)
+                self.assertNotIn(str(fixture.root).encode(),
+                                 result.stdout + result.stderr)
+                self.assertNotIn(KEY.encode(), result.stdout + result.stderr)
+
+        # jq is an ordinary shell command here (no `|| fail` wrapper). Injecting
+        # its failure proves set -e reaches the replacement EXIT handler after
+        # native adoption but before any revalidation or service mutation.
+        fixture, result, trace = golden("adoption-jq")
+        assert_phase(result, "adoption-accepted")
+        self.assertEqual(json.loads((fixture.root / "helper-exit.json").read_text()), 42)
+        self.assertEqual(fixture.marker()["runKey"], SUCCESSOR)
+        self.assertFalse([entry for entry in trace if any(
+            arg in ("up", "stop", "start", "restart") for arg in entry["argv"])])
+        self.assertTrue(fixture.origin.exists())
+        self.assertFalse((fixture.successor / "terminal.json").exists())
+        self.assertNotIn(str(fixture.root).encode(), result.stdout + result.stderr)
+        self.assertNotIn(KEY.encode(), result.stdout + result.stderr)
+
+        # A failed post-mutation proof is reported at the proof boundary and
+        # retains the same safe-stop behavior as the existing public probe path.
+        fixture, result, trace = golden("public")
+        assert_phase(result, "backend-proof")
+        self.assertIn(b"backend_stop=completed", result.stderr)
+        stops = [entry for entry in trace if entry["argv"][0] == "stop"]
+        self.assertEqual([entry["argv"] for entry in stops], [["stop", NEW]])
+        self.assertNotIn(str(fixture.root).encode(), result.stdout + result.stderr)
+        self.assertNotIn(KEY.encode(), result.stdout + result.stderr)
 
 
 def resource_worker(limit):
