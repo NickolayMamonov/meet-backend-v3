@@ -38,6 +38,55 @@ SUCCESSOR = "99999999999-1"
 KEY = "FICTIONAL_LOCATIONIQ_KEY_ONLY"
 IMAGE = "ghcr.io/nickolaymamonov/meet-backend-v3@" + helper.FORWARD_TARGET["indexDigest"]
 SOURCE = "https://github.com/NickolayMamonov/meet-backend-v3"
+INDEX_BYTES = (SCRIPTS / "fixtures" / "selected-platform" / "image-index.json"
+               ).read_bytes().removesuffix(b"\n")
+if hashlib.sha256(INDEX_BYTES).hexdigest() != helper.FORWARD_TARGET[
+        "indexDigest"].removeprefix("sha256:"):
+    raise AssertionError("fixture must contain the exact release index bytes, without terminal LF")
+if hashlib.sha256(INDEX_BYTES).hexdigest() != "1f2c56da34fa905553739f79bf91647d0087ec72159efc40828ba91622033d4b":
+    raise AssertionError("selected-platform release-index fixture digest changed")
+IMAGE_ENGINE_ID = helper.FORWARD_TARGET["indexDigest"]
+
+
+def target_image_proof():
+    return {
+        "indexRef": IMAGE,
+        "rawIndexBase64": base64.b64encode(INDEX_BYTES).decode("ascii"),
+        "selectedPlatform": "linux/amd64",
+        "selectedManifestDigest": helper.FORWARD_TARGET["amd64ManifestDigest"],
+        "engineImageId": IMAGE_ENGINE_ID,
+    }
+
+
+def target_image_inspect(engine_image_id=IMAGE_ENGINE_ID):
+    return {
+        "Id": engine_image_id,
+        "Architecture": "amd64",
+        "Os": "linux",
+        "RepoDigests": [IMAGE],
+        "Config": {
+            "Env": [
+                "APP_PUSH_PROVIDER_ENABLED=false",
+                "APP_PUSH_DISCOVERY_ENABLED=false",
+                "APP_PUSH_DISPATCH_ENABLED=false",
+                "APP_PUSH_DIAGNOSTIC_ENABLED=false",
+                "APP_PUSH_MAINTENANCE_ENABLED=false",
+                "APP_PUSH_PROJECT_ID=meeting-1d258",
+            ],
+            "User": "10001:10001",
+            "Entrypoint": ["java", "-jar", "app.jar"],
+            "Cmd": [],
+            "Labels": {
+                "org.opencontainers.image.source": SOURCE,
+                "org.opencontainers.image.revision": helper.FORWARD_TARGET["source"],
+                "org.opencontainers.image.version": helper.FORWARD_TARGET["version"],
+            },
+        },
+        "Mounts": [
+            {"Type": "volume", "Destination": "/data/uploads"},
+            {"Type": "tmpfs", "Destination": "/tmp"},
+        ],
+    }
 
 
 def encode(value):
@@ -161,11 +210,13 @@ class Fixture:
             self.write(self.origin / name, data)
         self.original_files = files
         self.old_image = self.image_record(OLD_IMAGE, REVISION, "1.5.2")
-        self.target = self.image_record(NEW_IMAGE, helper.FORWARD_TARGET["source"], "1.6.0")
+        self.target = self.image_record(IMAGE_ENGINE_ID, helper.FORWARD_TARGET["source"], "1.6.0")
+        self.target["RepoDigests"] = [IMAGE]
+        self.target_proof = target_image_proof()
         self.rendered = self.rendered_record()
         self.candidate = copy.deepcopy(self.backend)
         self.candidate["Id"] = NEW
-        self.candidate["Image"] = NEW_IMAGE
+        self.candidate["Image"] = IMAGE_ENGINE_ID
         self.candidate["Config"].update(
             Image=IMAGE, Env=self.target_env.decode().splitlines())
         self.candidate["Config"]["Labels"].update({
@@ -273,8 +324,12 @@ class Fixture:
 
     def bundle(self):
         return encode({"backend": [self.backend], "previousImage": [self.old_image],
-                       "targetImage": [self.target], "platformImage": [self.target],
+                       "targetImage": [self.target],
+                       "targetImageProof": self.target_proof,
                        "rendered": self.rendered})
+
+    def bundle_mutate_proof(self, **changes):
+        self.target_proof.update(changes)
 
     def admit(self):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -324,6 +379,150 @@ class FixtureTests(unittest.TestCase):
         self.assertFalse(fixture.successor.exists())
         self.assertFalse(fixture.archive.exists())
         self.assertEqual(Path(fixture.paths["production-env"]).read_bytes(), fixture.target_env)
+
+
+class TargetImageStateProofTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir="/root")
+        self.root = Path(self.tmp.name)
+        self.run_key = "55555555555-1"
+        self.state_name = self.run_key + "-final-deploy"
+        self.state = self.root / self.state_name
+        self.proof = target_image_proof()
+        self.proof_data = encode(self.proof)
+        self.request = encode({
+            "imageInspect": [target_image_inspect()],
+            "targetImageProof": self.proof,
+        })
+        with contextlib.redirect_stdout(io.StringIO()):
+            helper._state_publish(
+                str(self.root), self.run_key, "final-deploy", self.request
+            )
+        self.marker_path = self.state / helper.OWNER_MARKER
+        self.proof_path = self.state / helper.TARGET_IMAGE_PROOF
+        self.container = target_image_inspect()
+        self.container.update(Id="f" * 64, Image=self.proof["engineImageId"])
+        self.container["Config"]["Image"] = self.proof["indexRef"]
+        Fixture.write(
+            self.root / ".provider-transaction.current",
+            encode({
+                "schemaVersion": 2,
+                "runKey": self.run_key,
+                "phase": "verifying",
+                "providerEnabled": False,
+                "durableDisposition": "none",
+                "targetImageProofSha256": hashlib.sha256(
+                    self.proof_data
+                ).hexdigest(),
+            }),
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_schema_two_state_binds_saved_proof_and_rejects_removal_swap_and_downgrade(self):
+        original_marker = self.marker_path.read_bytes()
+        marker = json.loads(original_marker)
+        self.assertEqual(marker["schemaVersion"], 2)
+        self.assertEqual(
+            marker["targetImageProofSha256"],
+            hashlib.sha256(self.proof_data).hexdigest(),
+        )
+        self.assertEqual(self.proof_path.read_bytes(), self.proof_data)
+        self.assertEqual(
+            helper._validate_state_directory(str(self.state), self.state_name),
+            (self.run_key, "final-deploy"),
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            helper._target_proof_check(
+                str(self.root), self.run_key, "final-deploy", self.request
+            )
+
+        changed = target_image_proof()
+        changed["engineImageId"] = "sha256:" + "b" * 64
+        self.proof_path.write_bytes(encode(changed))
+        with self.assertRaises(helper.ProviderError):
+            helper._validate_state_directory(str(self.state), self.state_name)
+
+        self.proof_path.unlink()
+        with self.assertRaises(helper.ProviderError):
+            helper._validate_state_directory(str(self.state), self.state_name)
+
+        self.proof_path.write_bytes(self.proof_data)
+        marker["schemaVersion"] = 1
+        marker.pop("targetImageProofSha256")
+        self.marker_path.write_bytes(encode(marker))
+        with self.assertRaises(helper.ProviderError):
+            helper._validate_state_directory(str(self.state), self.state_name)
+        self.marker_path.write_bytes(original_marker)
+
+    def test_target_proof_check_rejects_a_valid_but_different_engine_id(self):
+        engine_id = "sha256:" + "b" * 64
+        proof = target_image_proof()
+        proof["engineImageId"] = engine_id
+        request = encode({
+            "imageInspect": [target_image_inspect(engine_id)],
+            "targetImageProof": proof,
+        })
+        with self.assertRaises(helper.ProviderError):
+            helper._target_proof_check(
+                str(self.root), self.run_key, "final-deploy", request
+            )
+
+    def test_candidate_verify_and_committed_finish_bind_both_container_image_fields(self):
+        def verify(container):
+            helper._verify(
+                self.run_key, "", encode([container]), "candidate", str(self.root)
+            )
+
+        def finish(container):
+            helper._finish(
+                self.run_key, str(self.root), "", "committed", encode([container])
+            )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            verify(self.container)
+            with mock.patch.object(
+                helper, "HOST_CREDENTIAL_PARENT", str(self.root / "credentials")
+            ):
+                finish(self.container)
+
+        for operation in (verify, finish):
+            for field, replacement in (
+                ("Image", NEW_IMAGE),
+                ("Config.Image", "ghcr.io/foreign/image@sha256:" + "b" * 64),
+            ):
+                container = copy.deepcopy(self.container)
+                if field == "Image":
+                    container["Image"] = replacement
+                else:
+                    container["Config"]["Image"] = replacement
+                with self.subTest(operation=operation.__name__, field=field):
+                    with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+                        helper,
+                        "HOST_CREDENTIAL_PARENT",
+                        str(self.root / "credentials"),
+                    ), self.assertRaises(helper.ProviderError):
+                        operation(container)
+
+    def test_candidate_verify_and_committed_finish_reject_missing_proof_state(self):
+        shutil.rmtree(self.state)
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+            helper, "HOST_CREDENTIAL_PARENT", str(self.root / "credentials")
+        ):
+            operations = (
+                lambda: helper._verify(
+                    self.run_key, "", encode([self.container]), "candidate",
+                    str(self.root),
+                ),
+                lambda: helper._finish(
+                    self.run_key, str(self.root), "", "committed",
+                    encode([self.container]),
+                ),
+            )
+            for operation in operations:
+                with self.assertRaises(helper.ProviderError):
+                    operation()
 
 
 class StagedOwnershipTests(unittest.TestCase):
@@ -694,6 +893,16 @@ class ForwardTests(FixtureTests):
             "activation": lambda f: f.backend["Config"]["Env"].extend(
                 ["LOCATIONIQ_KEY=" + KEY, "GEOCODER_ENABLED=true"]),
             "platform": lambda f: f.target.update(Architecture="arm64"),
+            "os": lambda f: f.target.update(Os="windows"),
+            "user": lambda f: f.target["Config"].update(User="0"),
+            "target-source": lambda f: f.target["Config"]["Labels"].update(
+                {"org.opencontainers.image.source": "https://example.invalid/source"}),
+            "target-version": lambda f: f.target["Config"]["Labels"].update(
+                {"org.opencontainers.image.version": "1.5.2"}),
+            "repo-digest": lambda f: f.target.update(RepoDigests=[]),
+            "engine-image-id": lambda f: f.target.update(Id=NEW_IMAGE),
+            "proof-manifest": lambda f: f.bundle_mutate_proof(
+                selectedManifestDigest="sha256:" + "a" * 64),
             "target-label": lambda f: f.target["Config"]["Labels"].update(
                 {"org.opencontainers.image.revision": REVISION}),
             "target-render": lambda f: f.rendered["services"]["backend"].update(image="wrong"),
@@ -758,6 +967,16 @@ class ForwardTests(FixtureTests):
         with self.assertRaises((helper.ProviderError, OSError)):
             fixture.admit()
         self.assertEqual((fixture.successor / "forward-adoption.json").read_bytes(), raw)
+
+    def test_adopted_pointer_rejects_deleted_successor_proof_state(self):
+        fixture = self.fresh()
+        fixture.admit()
+        fixture.phase()
+        self.assertEqual(fixture.marker()["schemaVersion"], 2)
+        shutil.rmtree(fixture.successor)
+        with self.assertRaises(helper.ProviderError):
+            helper._verify(SUCCESSOR, "", encode([fixture.candidate]),
+                           "candidate", str(fixture.states))
 
     def test_adoption_crashes_keep_one_authoritative_pointer_and_never_replay(self):
         stages = ("state-staged", "state-published", "pointer-ready",
@@ -949,7 +1168,7 @@ class ForwardTests(FixtureTests):
         with self.assertRaises(helper.ProviderError):
             fixture.admit()
         self.unchanged(fixture)
-        for mutation in ("key", "id", "files", "provider"):
+        for mutation in ("key", "id", "image-id", "config-image", "files", "provider"):
             fixture = self.fresh()
             fixture.admit()
             fixture.phase()
@@ -957,6 +1176,10 @@ class ForwardTests(FixtureTests):
                 fixture.candidate["Config"]["Env"].append("LOCATIONIQ_KEY=other")
             elif mutation == "id":
                 fixture.candidate["Id"] = OLD
+            elif mutation == "image-id":
+                fixture.candidate["Image"] = NEW_IMAGE
+            elif mutation == "config-image":
+                fixture.candidate["Config"]["Image"] = "ghcr.io/foreign/image:latest"
             elif mutation == "files":
                 self.swap_same_bytes(Path(fixture.paths["active-compose"]))
             else:
@@ -966,7 +1189,6 @@ class ForwardTests(FixtureTests):
             self.assertTrue(fixture.pointer.exists())
             self.assertTrue(fixture.origin.exists())
             self.assertFalse((fixture.successor / "forward-acceptance.json").exists())
-
 
 class HistoricalOriginalTests(FixtureTests):
     """Real Linux ownership/ACL/inode behavior, with read-only reject evidence."""
@@ -1381,8 +1603,8 @@ def output(value):
 if args[:2] == ["image", "inspect"]:
     ref = args[2]
     value = data["previousImage"] if ref == data["backend"]["Image"] else data["targetImage"]
-    if failure == "platform" and "9178741b" in ref:
-        value["Id"] = "sha256:" + "0" * 64
+    if failure == "platform" and "1f2c56da34fa9055" in ref:
+        value["Architecture"] = "arm64"
     output(value)
 elif args[:1] == ["inspect"]:
     identifier = args[1]
@@ -1481,6 +1703,7 @@ class ShellIntegrationTests(FixtureTests):
             fixture.historical_original()
         stage = Path(fixture.paths["reviewed-base"]).parent / "scripts"
         stage.mkdir(mode=0o700)
+        Fixture.write(stage.parent / "image-index.json", INDEX_BYTES, 0o600)
         for name in (
             "deploy-test-vps-provider-release.sh", "test-vps-provider-credential.py",
             "test-vps-runtime-invariants.sh", "test-vps-locationiq-pending-off.py",

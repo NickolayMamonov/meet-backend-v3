@@ -12,6 +12,7 @@ prerequisite_missing() {
 filesystem_only=false
 previous_image=
 target_image=
+target_index_file=
 transport_source_host=${MEE2_93_IMAGE_TRANSPORT_SOURCE:-}
 transport_target_host=${MEE2_93_IMAGE_TRANSPORT_TARGET:-}
 transport_loaded=false
@@ -112,8 +113,13 @@ while [ "$#" -gt 0 ]; do
       target_image=$2
       shift 2
       ;;
+    --target-index)
+      [ "$#" -ge 2 ] && [ -z "$target_index_file" ] || exit 2
+      target_index_file=$2
+      shift 2
+      ;;
     *)
-      echo "usage: $0 --filesystem-only | --previous-image IMAGE@sha256:DIGEST --target-image IMAGE@sha256:DIGEST" >&2
+      echo "usage: $0 --filesystem-only | --previous-image IMAGE@sha256:DIGEST --target-image IMAGE@sha256:DIGEST --target-index FILE" >&2
       exit 2
       ;;
   esac
@@ -124,6 +130,8 @@ if [ "$filesystem_only" = false ]; then
     prerequisite_missing
   [[ "$target_image" =~ ^ghcr\.io/nickolaymamonov/meet-backend-v3@sha256:[0-9a-f]{64}$ ]] ||
     prerequisite_missing
+  [ -n "$target_index_file" ] && [ -f "$target_index_file" ] &&
+    [ ! -L "$target_index_file" ] || prerequisite_missing
   [ "$previous_image" != "$target_image" ] || prerequisite_missing
   command -v docker >/dev/null 2>&1 || {
     prerequisite_missing
@@ -426,13 +434,21 @@ PY
   [[ "$postgres_expected_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
     prerequisite_missing
   timeout 30s python3 - "$ROOT_DIR/scripts/test-vps-provider-credential.py" \
-    "$previous_image" "$target_image" <<'PY' 2>/dev/null
+    "$previous_image" "$target_image" "$target_index_file" <<'PY' 2>/dev/null
+import base64
+import importlib.util
 import json
+import pathlib
 import subprocess
 import sys
 
-helper, *images = sys.argv[1:]
-for image in images:
+helper_path, previous_ref, target_ref, index_path = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("provider_helper", helper_path)
+helper = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = helper
+spec.loader.exec_module(helper)
+
+def inspect(image):
     result = subprocess.run(
         ["docker", "image", "inspect", image],
         check=True,
@@ -440,13 +456,33 @@ for image in images:
         stderr=subprocess.DEVNULL,
         text=True,
     )
-    subprocess.run(
-        ["python3", helper, "check-image"],
-        check=True,
-        input=result.stdout,
-        text=True,
-        stdout=subprocess.DEVNULL,
-    )
+    return json.loads(result.stdout)
+
+previous = helper._inspect(json.dumps(inspect(previous_ref)).encode())
+helper._image_admission(previous)
+
+index_bytes = pathlib.Path(index_path).read_bytes()
+index = json.loads(index_bytes)
+selected = [
+    descriptor["digest"] for descriptor in index["manifests"]
+    if descriptor.get("platform", {}).get("os") == "linux"
+    and descriptor.get("platform", {}).get("architecture") == "amd64"
+]
+if len(selected) != 1:
+    raise SystemExit(1)
+target_proof = {
+    "indexRef": target_ref,
+    "rawIndexBase64": base64.b64encode(index_bytes).decode("ascii"),
+    "selectedPlatform": "linux/amd64",
+    "selectedManifestDigest": selected[0],
+    "engineImageId": inspect(target_ref)[0]["Id"],
+}
+target_request = json.dumps({
+    "imageInspect": inspect(target_ref),
+    "targetImageProof": target_proof,
+}, separators=(",", ":")).encode()
+target, _ = helper._check_image_request(target_request)
+helper._image_admission(target)
 PY
 
   matrix_fixture=$(mktemp -d /var/lib/meet-provider-image.XXXXXX 2>/dev/null) ||
@@ -1561,6 +1597,35 @@ helper = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = helper
 spec.loader.exec_module(helper)
 
+import base64
+import hashlib
+
+index_bytes = pathlib.Path(
+    "scripts/fixtures/selected-platform/image-index.json"
+).read_bytes().removesuffix(b"\n")
+index_digest = "sha256:" + hashlib.sha256(index_bytes).hexdigest()
+assert index_digest == "sha256:1f2c56da34fa905553739f79bf91647d0087ec72159efc40828ba91622033d4b"
+index_ref = "ghcr.io/nickolaymamonov/meet-backend-v3@" + index_digest
+target_image_proof = {
+    "indexRef": index_ref,
+    "rawIndexBase64": base64.b64encode(index_bytes).decode("ascii"),
+    "selectedPlatform": "linux/amd64",
+    "selectedManifestDigest": "sha256:9178741bc9fd1e9319acab54252e908fa2d439e66f628d0da20c169837c60cfe",
+    "engineImageId": index_digest,
+}
+target_image = {
+    "Id": index_digest, "Os": "linux", "Architecture": "amd64",
+    "RepoDigests": [index_ref],
+    "Config": {"Env": [], "User": "10001:10001", "Labels": {
+        "org.opencontainers.image.source": "https://github.com/NickolayMamonov/meet-backend-v3",
+        "org.opencontainers.image.revision": "462b52b403c73027a262e183d1bd9ae4964938d8",
+        "org.opencontainers.image.version": "1.6.0",
+    }},
+}
+target_image_request = json.dumps({
+    "imageInspect": [target_image], "targetImageProof": target_image_proof,
+}, separators=(",", ":")).encode()
+
 parent = fixture / "credentials"
 parent.mkdir(mode=0o700)
 os.chown(parent, 0, 0)
@@ -1591,7 +1656,8 @@ published_root.mkdir(mode=0o700)
 os.chown(published_root, 0, 0)
 state_publish_output = io.StringIO()
 with contextlib.redirect_stdout(state_publish_output):
-    helper._state_publish(str(published_root), "123456789-1", "final-deploy")
+    helper._state_publish(
+        str(published_root), "123456789-1", "final-deploy", target_image_request)
 assert json.loads(state_publish_output.getvalue()) == {
     "schemaVersion": 1,
     "providerEnabled": False,
@@ -1601,13 +1667,16 @@ assert json.loads(state_publish_output.getvalue()) == {
 }
 published_state = published_root / "123456789-1-final-deploy"
 assert (published_state / helper.OWNER_MARKER).read_bytes() == helper._state_marker(
-    "123456789-1", "final-deploy"
+    "123456789-1", "final-deploy",
+    target_image_proof=json.dumps(
+        target_image_proof, separators=(",", ":")).encode()
 )
 expect_collision = published_root / "456-1-final-deploy"
 expect_collision.mkdir(mode=0o700)
 os.chown(expect_collision, 0, 0)
 try:
-    helper._state_publish(str(published_root), "456-1", "final-deploy")
+    helper._state_publish(
+        str(published_root), "456-1", "final-deploy", target_image_request)
 except helper.ProviderError as error:
     assert error.category == "RECOVERY_REQUIRED"
 else:
@@ -1635,6 +1704,7 @@ try:
         str(publication_race_root),
         "123456790-1",
         "final-deploy",
+        target_image_request,
     )
 except helper.ProviderError as error:
     assert error.category == "RECOVERY_REQUIRED"
@@ -1670,6 +1740,7 @@ try:
         str(publication_interlock_root),
         "123456791-1",
         "final-deploy",
+        target_image_request,
     )
 except helper.ProviderError as error:
     assert error.category == "RECOVERY_REQUIRED"
@@ -1746,6 +1817,7 @@ try:
         str(publication_source_race_root),
         "123456792-1",
         "final-deploy",
+        target_image_request,
     )
 except helper.ProviderError as error:
     assert error.category == "RECOVERY_REQUIRED"
@@ -2376,11 +2448,12 @@ expect_provider_error(
 )
 os.chown(unsafe_state_root, 0, 0)
 shutil.rmtree(unsafe_state_root)
-for child in sorted(helper.RETENTION_CHILDREN - {"provider-owner.json", "terminal.json"}):
+legacy_children = helper.RETENTION_CHILDREN - {helper.TARGET_IMAGE_PROOF}
+for child in sorted(legacy_children - {"provider-owner.json", "terminal.json"}):
     retention_state = retention_root / "77-1-final-deploy"
     retention_state.mkdir(mode=0o700)
     os.chown(retention_state, 0, 0)
-    for state_child in helper.RETENTION_CHILDREN:
+    for state_child in legacy_children:
         path = retention_state / state_child
         if state_child == "provider-owner.json":
             path.write_bytes(
@@ -2789,6 +2862,7 @@ expect_fault(
         str(fault_publication_root),
         "97-1",
         "final-deploy",
+        target_image_request,
     )
 )
 helper.os.fsync = original_fsync

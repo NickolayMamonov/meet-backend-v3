@@ -39,6 +39,7 @@ SCHEMA_VERSION = 1
 MAX_INSPECTION_BYTES = 8 * 1024 * 1024
 MAX_CREDENTIAL_BYTES = 1024 * 1024
 MAX_WITNESS_BYTES = 16 * 1024 * 1024
+MAX_TARGET_INDEX_BYTES = min(MAX_INSPECTION_BYTES, MAX_WITNESS_BYTES)
 MAX_JSON_DEPTH = 32
 MAX_OWNER_BYTES = 4096
 CONTAINER_CREDENTIAL_PATH = "/run/secrets/meet-firebase-service-account.json"
@@ -48,6 +49,8 @@ EXPECTED_PROJECT = "meeting-1d258"
 RUN_KEY_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 STATE_RUN_KEY_RE = r"^[0-9]+-[0-9]+$"
 OWNER_MARKER = "provider-owner.json"
+TARGET_IMAGE_PROOF = "target-image-proof.json"
+TARGET_IMAGE_REPOSITORY = "ghcr.io/nickolaymamonov/meet-backend-v3"
 OWNER = "meet-test-vps-provider"
 STATE_KINDS = frozenset(("final-deploy", "rollback-drill"))
 FORWARD_ORIGIN_KEY = "40368479855-1"
@@ -591,6 +594,130 @@ def _inspect(data: bytes) -> dict[str, Any]:
     return value
 
 
+def _validate_target_image_proof(
+    proof: Any,
+    image: dict[str, Any] | None,
+    *,
+    forward: bool = False,
+) -> dict[str, Any]:
+    proof_keys = {
+        "indexRef",
+        "rawIndexBase64",
+        "selectedPlatform",
+        "selectedManifestDigest",
+        "engineImageId",
+    }
+    category = "recovery" if forward else "provider"
+    if not isinstance(proof, dict) or set(proof) != proof_keys:
+        _fail(category)
+    index_ref = proof["indexRef"]
+    match = re.fullmatch(
+        re.escape(TARGET_IMAGE_REPOSITORY) + r"@(sha256:[0-9a-f]{64})",
+        index_ref if isinstance(index_ref, str) else "",
+    )
+    engine_id = proof["engineImageId"]
+    if (match is None or proof["selectedPlatform"] != "linux/amd64"
+            or not isinstance(engine_id, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", engine_id) is None
+            or not isinstance(proof["selectedManifestDigest"], str)
+            or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", proof["selectedManifestDigest"]
+            ) is None):
+        _fail(category)
+    encoded_index = proof["rawIndexBase64"]
+    if not isinstance(encoded_index, str):
+        _fail(category)
+    try:
+        raw_index = base64.b64decode(encoded_index, validate=True)
+    except (ValueError, TypeError):
+        _fail(category)
+    if (not raw_index or len(raw_index) > MAX_TARGET_INDEX_BYTES
+            or base64.b64encode(raw_index).decode("ascii") != encoded_index
+            or hashlib.sha256(raw_index).hexdigest() != match.group(1)[7:]):
+        _fail(category)
+    index = _json(raw_index, category)
+    if (not isinstance(index, dict)
+            or type(index.get("schemaVersion")) is not int
+            or index["schemaVersion"] != 2
+            or index.get("mediaType") !=
+            "application/vnd.oci.image.index.v1+json"
+            or not isinstance(index.get("manifests"), list)
+            or not index["manifests"]):
+        _fail(category)
+    selected: list[str] = []
+    for descriptor in index["manifests"]:
+        if not isinstance(descriptor, dict):
+            _fail(category)
+        digest = descriptor.get("digest")
+        size = descriptor.get("size")
+        platform = descriptor.get("platform")
+        if (descriptor.get("mediaType") !=
+                "application/vnd.oci.image.manifest.v1+json"
+                or not isinstance(digest, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+                or type(size) is not int or size <= 0
+                or not isinstance(platform, dict)
+                or not isinstance(platform.get("os"), str)
+                or not isinstance(platform.get("architecture"), str)):
+            _fail(category)
+        if (platform["os"], platform["architecture"]) == ("linux", "amd64"):
+            if platform.get("variant") not in (None, ""):
+                _fail(category)
+            selected.append(digest)
+    if (len(selected) != 1
+            or proof["selectedManifestDigest"] != selected[0]):
+        _fail(category)
+    if forward and (
+        match.group(1) != FORWARD_TARGET["indexDigest"]
+        or selected[0] != FORWARD_TARGET["amd64ManifestDigest"]
+    ):
+        _fail("recovery")
+    if image is not None:
+        config = image.get("Config")
+        if not isinstance(config, dict):
+            _fail(category)
+        labels = config.get("Labels")
+        revision = labels.get("org.opencontainers.image.revision") if isinstance(labels, dict) else None
+        version = labels.get("org.opencontainers.image.version") if isinstance(labels, dict) else None
+        repo_digests = image.get("RepoDigests")
+        if (
+            image.get("Id") != engine_id
+            or image.get("Os") != "linux"
+            or image.get("Architecture") != "amd64"
+            or not isinstance(repo_digests, list)
+            or index_ref not in repo_digests
+            or config.get("User") != "10001:10001"
+            or not isinstance(labels, dict)
+            or labels.get("org.opencontainers.image.source") !=
+            "https://github.com/NickolayMamonov/meet-backend-v3"
+            or re.fullmatch(
+                r"[0-9a-f]{40}",
+                revision if isinstance(revision, str) else "",
+            ) is None
+            or re.fullmatch(
+                r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
+                version if isinstance(version, str) else "",
+            ) is None
+        ):
+            _fail(category)
+        if forward:
+            _forward_image(
+                image, engine_id,
+                FORWARD_TARGET["source"], FORWARD_TARGET["version"]
+            )
+    return proof
+
+
+def _check_image_request(data: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
+    request = _json(data, "provider")
+    if (not isinstance(request, dict)
+            or set(request) != {"imageInspect", "targetImageProof"}):
+        _fail("provider")
+    image = _inspect(json.dumps(request["imageInspect"]).encode())
+    proof = _validate_target_image_proof(request["targetImageProof"], image)
+    return image, proof
+
+
 def _inspect_records(data: bytes) -> tuple[dict[str, Any], dict[str, Any] | None]:
     value = _json(data)
     if isinstance(value, list) and len(value) == 2 and all(
@@ -775,41 +902,165 @@ def _state_parts(name: str) -> tuple[str, str]:
     return match.group("run"), match.group("kind")
 
 
-def _state_marker(run_key: str, state_kind: str) -> bytes:
+def _state_marker(
+    run_key: str,
+    state_kind: str,
+    *,
+    target_image_proof: bytes | None = None,
+) -> bytes:
     if re.fullmatch(STATE_RUN_KEY_RE, run_key) is None or state_kind not in STATE_KINDS:
         _fail("recovery")
-    return json.dumps(
-        {
-            "schemaVersion": 1,
-            "owner": OWNER,
-            "runKey": run_key,
-            "stateKind": state_kind,
-        },
-        separators=(",", ":"),
-    ).encode()
+    value = {
+        "schemaVersion": 2 if target_image_proof is not None else 1,
+        "owner": OWNER,
+        "runKey": run_key,
+        "stateKind": state_kind,
+    }
+    if target_image_proof is not None:
+        value["targetImageProofSha256"] = hashlib.sha256(
+            target_image_proof
+        ).hexdigest()
+    return json.dumps(value, separators=(",", ":")).encode()
 
 
-def _parse_state_marker(data: bytes, run_key: str, state_kind: str) -> None:
+def _parse_state_marker(
+    data: bytes,
+    run_key: str,
+    state_kind: str,
+) -> tuple[int, str | None]:
     if len(data) > MAX_OWNER_BYTES:
         _fail("recovery")
     value = _json(data, "recovery")
-    if not isinstance(value, dict) or set(value) != {
-        "schemaVersion",
-        "owner",
-        "runKey",
-        "stateKind",
-    }:
+    if not isinstance(value, dict):
+        _fail("recovery")
+    schema_version = value.get("schemaVersion")
+    expected = {
+        "schemaVersion", "owner", "runKey", "stateKind",
+    }
+    if schema_version == 2:
+        expected.add("targetImageProofSha256")
+    if set(value) != expected:
         _fail("recovery")
     if (
         type(value["schemaVersion"]) is not int
-        or value["schemaVersion"] != 1
+        or value["schemaVersion"] not in (1, 2)
         or value["owner"] != OWNER
         or value["runKey"] != run_key
         or value["stateKind"] != state_kind
         or not isinstance(value["owner"], str)
         or not isinstance(value["runKey"], str)
         or not isinstance(value["stateKind"], str)
+        or schema_version == 2
+        and (
+            not isinstance(value["targetImageProofSha256"], str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", value["targetImageProofSha256"]
+            ) is None
+        )
     ):
+        _fail("recovery")
+    return schema_version, value.get("targetImageProofSha256")
+
+
+def _validate_state_image_proof(
+    path: str,
+    schema_version: int,
+    expected_digest: str | None,
+) -> None:
+    proof_path = os.path.join(path, TARGET_IMAGE_PROOF)
+    if schema_version == 1:
+        if os.path.lexists(proof_path):
+            _fail("recovery")
+        return
+    fd, _, data = _open_private_state_file(proof_path)
+    os.close(fd)
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        _fail("recovery")
+    proof = _json(data, "recovery")
+    _validate_target_image_proof(proof, None)
+
+
+def _validate_state_image_proof_fd(
+    directory_fd: int,
+    schema_version: int,
+    expected_digest: str | None,
+) -> None:
+    try:
+        os.stat(TARGET_IMAGE_PROOF, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if schema_version == 1:
+            return
+        _fail("recovery")
+    if schema_version == 1:
+        _fail("recovery")
+    fd, _, data = _open_private_state_file_at(directory_fd, TARGET_IMAGE_PROOF)
+    os.close(fd)
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        _fail("recovery")
+    proof = _json(data, "recovery")
+    _validate_target_image_proof(proof, None)
+
+
+def _validate_state_target_container(
+    state_root: str,
+    run_key: str,
+    inspect: dict[str, Any],
+) -> None:
+    forward = _forward_receipt_for_run(state_root, run_key)
+    if forward is not None:
+        proof_data = json.dumps(
+            forward[0]["targetImageProof"], separators=(",", ":")
+        ).encode()
+        transaction = _marker(state_root, run_key)
+        if (
+            transaction.get("schemaVersion") != 2
+            or hashlib.sha256(proof_data).hexdigest()
+            != transaction.get("targetImageProofSha256")
+        ):
+            _fail("recovery")
+        proof = forward[0]["targetImageProof"]
+        if (
+            inspect.get("Image") != proof["engineImageId"]
+            or not isinstance(inspect.get("Config"), dict)
+            or inspect["Config"].get("Image") != proof["indexRef"]
+        ):
+            _fail("recovery")
+        return
+    transaction = _marker(state_root, run_key)
+    for state_kind in ("final-deploy", "rollback-drill"):
+        name = f"{run_key}-{state_kind}"
+        path = os.path.join(state_root, name)
+        if not os.path.lexists(path):
+            continue
+        _validate_state_directory(path, name)
+        marker_fd, _, marker_data = _open_private_state_file(
+            os.path.join(path, OWNER_MARKER)
+        )
+        os.close(marker_fd)
+        schema_version, _ = _parse_state_marker(marker_data, run_key, state_kind)
+        if schema_version == 1 and transaction.get("schemaVersion") == 1:
+            return
+        if schema_version != 2:
+            _fail("recovery")
+        proof_fd, _, proof_data = _open_private_state_file(
+            os.path.join(path, TARGET_IMAGE_PROOF)
+        )
+        os.close(proof_fd)
+        proof = _json(proof_data, "recovery")
+        if (
+            transaction.get("schemaVersion") != 2
+            or hashlib.sha256(proof_data).hexdigest()
+            != transaction.get("targetImageProofSha256")
+        ):
+            _fail("recovery")
+        if (
+            inspect.get("Image") != proof["engineImageId"]
+            or not isinstance(inspect.get("Config"), dict)
+            or inspect["Config"].get("Image") != proof["indexRef"]
+        ):
+            _fail("recovery")
+        return
+    if transaction.get("schemaVersion") == 2:
         _fail("recovery")
 
 
@@ -830,7 +1081,8 @@ def _validate_state_directory(path: str, name: str) -> tuple[str, str]:
         or stat.S_IMODE(marker_info.st_mode) != 0o600
     ):
         _fail("recovery")
-    _parse_state_marker(data, run_key, state_kind)
+    schema_version, proof_digest = _parse_state_marker(data, run_key, state_kind)
+    _validate_state_image_proof(path, schema_version, proof_digest)
     return run_key, state_kind
 
 
@@ -918,8 +1170,15 @@ def _ensure_state_root(state_root: str) -> os.stat_result:
     return os.stat(state_root, follow_symlinks=False)
 
 
-def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
-    _state_marker(run_key, state_kind)
+def _state_publish(
+    state_root: str,
+    run_key: str,
+    state_kind: str,
+    request_data: bytes,
+) -> None:
+    _, proof = _check_image_request(request_data)
+    proof_data = json.dumps(proof, separators=(",", ":")).encode()
+    _state_marker(run_key, state_kind, target_image_proof=proof_data)
     expected_root = _ensure_state_root(state_root)
     name = f"{run_key}-{state_kind}"
     temporary = f".provider-state.{name}.tmp"
@@ -954,7 +1213,15 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
             _write_private_at(
                 temporary_fd,
                 OWNER_MARKER,
-                _state_marker(run_key, state_kind),
+                _state_marker(
+                    run_key, state_kind, target_image_proof=proof_data
+                ),
+                0o600,
+            )
+            _write_private_at(
+                temporary_fd,
+                TARGET_IMAGE_PROOF,
+                proof_data,
                 0o600,
             )
             os.fsync(temporary_fd)
@@ -1009,6 +1276,31 @@ def _state_publish(state_root: str, run_key: str, state_kind: str) -> None:
     finally:
         os.close(parent_fd)
     _result(False, False, False, "published")
+
+
+def _target_proof_check(
+    state_root: str,
+    run_key: str,
+    state_kind: str,
+    request_data: bytes,
+) -> None:
+    if re.fullmatch(STATE_RUN_KEY_RE, run_key) is None:
+        _fail("recovery")
+    name = f"{run_key}-{state_kind}"
+    parsed_run, parsed_kind = _state_parts(name)
+    if parsed_run != run_key or parsed_kind != state_kind:
+        _fail("recovery")
+    state_path = os.path.join(state_root, name)
+    _validate_state_directory(state_path, name)
+    proof_fd, _, proof_data = _open_private_state_file(
+        os.path.join(state_path, TARGET_IMAGE_PROOF)
+    )
+    os.close(proof_fd)
+    saved_proof = _json(proof_data, "recovery")
+    _, supplied_proof = _check_image_request(request_data)
+    if saved_proof != supplied_proof:
+        _fail("recovery")
+    _result(False, False, False, "target-proof-checked")
 
 
 def _read_existing(path: str, source: bool = False) -> tuple[dict[str, int], bytes]:
@@ -1092,18 +1384,29 @@ def _record(tx: str, predecessor: dict[str, int], durable: dict[str, int]) -> No
 def _marker(state_root: str, run_key: str) -> dict[str, Any]:
     path = os.path.join(state_root, ".provider-transaction.current")
     value = _json(_read_private(path), "recovery")
-    if set(value) != {
+    legacy_keys = {
         "schemaVersion",
         "runKey",
         "phase",
         "providerEnabled",
         "durableDisposition",
-    }:
+    }
+    expected_keys = set(legacy_keys)
+    if isinstance(value, dict) and value.get("schemaVersion") == 2:
+        expected_keys.add("targetImageProofSha256")
+    if not isinstance(value, dict) or set(value) != expected_keys:
         _fail("recovery")
     if (
         type(value["schemaVersion"]) is not int
-        or value["schemaVersion"] != SCHEMA_VERSION
+        or value["schemaVersion"] not in (SCHEMA_VERSION, 2)
         or value["runKey"] != run_key
+        or value["schemaVersion"] == 2
+        and (
+            not isinstance(value["targetImageProofSha256"], str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", value["targetImageProofSha256"]
+            ) is None
+        )
     ):
         _fail("recovery")
     if value["phase"] not in (
@@ -1399,7 +1702,7 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
     expected = {
         "schemaVersion", "originRunKey", "successorRunKey", "originState",
         "originCredentialRunKey", "target", "originalMarker",
-        "originalStateIdentity", "plannedArchive", "sourceWitnesses",
+        "targetImageProof", "originalStateIdentity", "plannedArchive", "sourceWitnesses",
         "stoppedWitness",
     }
     if not isinstance(value, dict) or set(value) != expected:
@@ -1446,6 +1749,7 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
         _fail("recovery")
     if value["target"] != FORWARD_TARGET:
         _fail("recovery")
+    _validate_target_image_proof(value["targetImageProof"], None, forward=True)
     _forward_identity(value["originalStateIdentity"])
     archive = value["plannedArchive"]
     if (not isinstance(archive, dict) or set(archive) != {"path", "parentIdentity"}
@@ -1607,6 +1911,8 @@ def _validate_forward_acceptance(data: bytes, adoption_data: bytes,
             or not re.fullmatch(r"[0-9a-f]{64}", candidate["containerId"] or "")
             or not isinstance(candidate["startedAt"], str) or not candidate["startedAt"]
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", candidate["platformImageId"] or "")
+            or candidate["platformImageId"] !=
+            adoption["targetImageProof"]["engineImageId"]
             or candidate["containerId"] == adoption["stoppedWitness"]["containerId"]
             or not isinstance(checks, dict)
             or set(checks) != {"runtime", "pendingOff", "provider", "publicHealth"}
@@ -1627,7 +1933,14 @@ def _forward_receipt_for_run(
     _validate_state_directory(state_path, name)
     receipt_fd, _, receipt_data = _open_private_state_file(receipt_path)
     os.close(receipt_fd)
-    return _validate_forward_adoption(receipt_data, successor_key), receipt_data
+    adoption = _validate_forward_adoption(receipt_data, successor_key)
+    proof_fd, _, proof_data = _open_private_state_file(
+        os.path.join(state_path, TARGET_IMAGE_PROOF)
+    )
+    os.close(proof_fd)
+    if _json(proof_data, "recovery") != adoption["targetImageProof"]:
+        _fail("recovery")
+    return adoption, receipt_data
 
 
 def _forward_witness_data(
@@ -2252,7 +2565,7 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
     _forward_deployment_lock(state_root)
     bundle = _json(inspection_data, "recovery")
     if not isinstance(bundle, dict) or set(bundle) != {
-            "backend", "previousImage", "targetImage", "platformImage", "rendered"}:
+            "backend", "previousImage", "targetImage", "targetImageProof", "rendered"}:
         _fail("recovery")
     origin = os.path.join(state_root, FORWARD_ORIGIN_STATE)
     _validate_state_directory(origin, FORWARD_ORIGIN_STATE)
@@ -2359,14 +2672,10 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
     old_image = _inspect(json.dumps(bundle["previousImage"]).encode())
     _forward_image(old_image, stopped["imageId"], stopped["revision"], stopped["version"])
     target = _inspect(json.dumps(bundle["targetImage"]).encode())
-    platform = _inspect(json.dumps(bundle["platformImage"]).encode())
-    target_id = target["Id"]
-    if not isinstance(target_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", target_id):
-        _fail("recovery")
-    _forward_image(target, target_id, FORWARD_TARGET["source"], FORWARD_TARGET["version"])
-    _forward_image(platform, target_id, FORWARD_TARGET["source"], FORWARD_TARGET["version"])
-    if target.get("Architecture") != "amd64" or target.get("Os") != "linux":
-        _fail("recovery")
+    target_proof = _validate_target_image_proof(
+        bundle["targetImageProof"], target, forward=True
+    )
+    target_id = target_proof["engineImageId"]
     _forward_rendered(bundle["rendered"], backend, target, snapshots["config.env.target"])
     pointer_fd, pointer_info, pointer_data = _open_private_state_file(
         os.path.join(state_root, ".provider-transaction.current"))
@@ -2378,6 +2687,7 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
         "successorRunKey": run_key, "originState": FORWARD_ORIGIN_STATE,
         "originCredentialRunKey": FORWARD_ORIGIN_KEY if marker["providerEnabled"] else None,
         "target": FORWARD_TARGET,
+        "targetImageProof": target_proof,
         "originalMarker": {
             "bytesBase64": base64.b64encode(pointer_data).decode(),
             "identity": _forward_identity_from_stat(pointer_info),
@@ -2544,9 +2854,19 @@ def _forward_adopt(state_root: str, request_data: bytes,
         try:
             os.fchown(staging_fd, 0, 0)
             os.fchmod(staging_fd, 0o700)
+            proof_data = json.dumps(
+                adoption["targetImageProof"], separators=(",", ":")
+            ).encode()
             _write_private_at(
                 staging_fd, OWNER_MARKER,
-                _state_marker(successor_key, "final-deploy"), 0o600,
+                _state_marker(
+                    successor_key, "final-deploy",
+                    target_image_proof=proof_data,
+                ),
+                0o600,
+            )
+            _write_private_at(
+                staging_fd, TARGET_IMAGE_PROOF, proof_data, 0o600
             )
             _write_private_at(staging_fd, "forward-adoption.json", receipt_data, 0o600)
             for name in sorted(snapshots):
@@ -2586,8 +2906,14 @@ def _forward_adopt(state_root: str, request_data: bytes,
         _forward_validate_origin(state_root, root_fd, adoption, snapshots)
         _forward_inventory_recheck(inventory, added=frozenset({destination}))
         successor_marker = dict(marker)
+        successor_marker["schemaVersion"] = 2
         successor_marker["runKey"] = successor_key
         successor_marker["phase"] = "applying"
+        successor_marker["targetImageProofSha256"] = hashlib.sha256(
+            json.dumps(
+                adoption["targetImageProof"], separators=(",", ":")
+            ).encode()
+        ).hexdigest()
         successor_data = json.dumps(
             successor_marker, separators=(",", ":"), sort_keys=True
         ).encode()
@@ -2743,6 +3069,12 @@ def _forward_complete(state_root: str, run_key: str, inspection_data: bytes) -> 
     if marker["phase"] != "verifying":
         _fail("recovery")
     candidate = _inspect(inspection_data)
+    if (
+        candidate.get("Image") != adoption["targetImageProof"]["engineImageId"]
+        or candidate.get("Config", {}).get("Image") !=
+        adoption["targetImageProof"]["indexRef"]
+    ):
+        _fail("recovery")
     snapshots = _forward_snapshots(state_root, adoption)
     pending = _forward_pending_module()
     try:
@@ -3350,6 +3682,8 @@ def _verify(
             and phase != "candidate"):
         _fail("recovery")
     inspect, previous = _inspect_records(inspect_data)
+    if phase == "candidate" and state_root:
+        _validate_state_target_container(state_root, run_key, inspect)
     enabled, _ = _provider_state(inspect)
     if previous is not None and _effective_tuple(inspect) != _effective_tuple(previous):
         _fail("provider")
@@ -3446,6 +3780,8 @@ def _finish(run_key: str, state_root: str, root: str, outcome: str, inspect_data
     if outcome not in ("committed", "rolled-back"):
         _fail("provider")
     inspect = _inspect(inspect_data)
+    if outcome == "committed":
+        _validate_state_target_container(state_root, run_key, inspect)
     enabled, _ = _provider_state(inspect)
     present, read_only, source = _provider_mount(
         inspect,
@@ -3670,7 +4006,8 @@ def _validate_state_directory_fd(directory_fd: int, name: str) -> tuple[str, str
         or stat.S_IMODE(marker_info.st_mode) != 0o600
     ):
         _fail("recovery")
-    _parse_state_marker(data, run_key, state_kind)
+    schema_version, proof_digest = _parse_state_marker(data, run_key, state_kind)
+    _validate_state_image_proof_fd(directory_fd, schema_version, proof_digest)
     return run_key, state_kind
 
 
@@ -4035,6 +4372,7 @@ RETENTION_CHILDREN = frozenset(
     {
         "terminal.json",
         OWNER_MARKER,
+        TARGET_IMAGE_PROOF,
         "previous-active-compose.yml",
         "previous-active-compose.identity",
         "previous-active-runtime.yml",
@@ -4471,6 +4809,7 @@ def _parser() -> argparse.ArgumentParser:
             "verify",
             "finish",
             "state-publish",
+            "target-proof-check",
             "forward-adopt",
             "forward-revalidate",
             "forward-phase",
@@ -4499,7 +4838,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         if args.command == "check":
             _check()
         elif args.command == "check-image":
-            _image_admission(_inspect(_bounded_stdin(MAX_INSPECTION_BYTES)))
+            image, _ = _check_image_request(_bounded_stdin(MAX_INSPECTION_BYTES))
+            _image_admission(image)
             _result(False, False, False, "checked")
         elif args.command == "observe":
             inspect = _inspect(_bounded_stdin(MAX_INSPECTION_BYTES))
@@ -4526,7 +4866,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             _run_key(args.run_key)
             _finish(args.run_key, args.state_root, "", args.outcome, _bounded_stdin(MAX_INSPECTION_BYTES))
         elif args.command == "state-publish":
-            _state_publish(args.state_root, args.run_key, args.state_kind)
+            _state_publish(
+                args.state_root, args.run_key, args.state_kind,
+                _bounded_stdin(MAX_INSPECTION_BYTES),
+            )
+        elif args.command == "target-proof-check":
+            _target_proof_check(
+                args.state_root, args.run_key, args.state_kind,
+                _bounded_stdin(MAX_INSPECTION_BYTES),
+            )
         elif args.command == "forward-adopt":
             _forward_admission(args.state_root, args.run_key, args.deployment_root,
                                args.base_compose, _bounded_stdin(MAX_INSPECTION_BYTES))

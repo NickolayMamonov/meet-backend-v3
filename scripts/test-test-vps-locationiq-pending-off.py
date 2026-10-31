@@ -389,6 +389,9 @@ class IntegrationTests(unittest.TestCase):
             app, stage, state = root / "app", root / "scripts", root / "state"
             app.mkdir()
             stage.mkdir()
+            (root / "image-index.json").write_bytes(
+                (SCRIPTS / "fixtures/selected-platform/image-index.json")
+                .read_bytes().removesuffix(b"\n"))
             state.mkdir(mode=0o700)
             (app / ".env.production").write_bytes(BASE)
             (app / ".env.production").chmod(0o600)
@@ -412,7 +415,11 @@ class IntegrationTests(unittest.TestCase):
 runtime_compose() { python3 "$CASE_FAKE" compose "${@:3}"; }
 runtime_image_id() { echo "$CASE_OLD_IMAGE_ID"; }
 verify_runtime_invariants() {
-  verify_environment_matches_container "$1" "$2" "${@:7}"
+  if [ "${7:-}" = --target-image-proof ]; then
+    verify_environment_matches_container "$1" "$2" "${@:9}"
+  else
+    verify_environment_matches_container "$1" "$2" "${@:7}"
+  fi
 }
 """)
             (stage / "production-compose.sh").write_text("#!/bin/bash\nexit 99\n")
@@ -577,14 +584,20 @@ def record():
     return rec
 if kind == "provider":
     cmd = args[0]
-    if cmd in ("check","retention-check","check-image"): pass
+    if cmd in ("check","retention-check"): pass
+    elif cmd in ("check-image", "target-proof-check"):
+        json.load(sys.stdin)
     elif cmd == "verify":
         if failure == "cleanup-key-race" and not (r / "prewriter-failed").exists():
             (r / "prewriter-failed").touch()
             die()
     elif cmd == "state-publish":
         state = pathlib.Path(args[args.index("--state-root")+1])
-        (state / "123-1-final-deploy").mkdir(mode=0o700)
+        owned = state / "123-1-final-deploy"
+        owned.mkdir(mode=0o700)
+        request = json.load(sys.stdin)
+        (owned / "target-image-proof.json").write_text(
+            json.dumps(request["targetImageProof"], separators=(",", ":")))
     elif cmd == "observe":
         print(json.dumps({"schemaVersion":1,"providerEnabled":False,"credentialMountPresent":False,
                           "credentialMountReadOnly":False,"outcome":"observed"}))
@@ -592,8 +605,9 @@ if kind == "provider":
             with (r / "app/.env.production").open("a") as f: f.write("# raced\n")
     elif cmd == "prepare":
         marker = r / "state/.provider-transaction.current"
-        marker.write_text(json.dumps({"schemaVersion":1,"runKey":"123-1","phase":"preparing",
-                                     "providerEnabled":False,"durableDisposition":"none"}))
+        marker_data = json.loads(marker.read_text())
+        marker_data.update(phase="preparing", providerEnabled=False, durableDisposition="none")
+        marker.write_text(json.dumps(marker_data))
         marker.chmod(0o600)
         (r / "prepared").touch()
         if failure == "prepared-key-race":
@@ -631,7 +645,14 @@ elif kind == "docker":
         elif "image.version" in fmt: print("1.6.0")
         elif "image.source" in fmt: print("https://github.com/NickolayMamonov/meet-backend-v3")
         elif ".Config.User" in fmt: print("10001:10001")
-        else: print(json.dumps([{"Config":{"Env":[]}}]))
+        else: print(json.dumps([{
+            "Id": os.environ["CASE_IMAGE_ID"],
+            "Os": "linux", "Architecture": "amd64",
+            "RepoDigests": [os.environ["CASE_IMAGE"]],
+            "Config": {"Env": [], "User": "10001:10001", "Labels": {
+                "org.opencontainers.image.source": "https://github.com/NickolayMamonov/meet-backend-v3",
+                "org.opencontainers.image.revision": os.environ["CASE_REVISION"],
+                "org.opencontainers.image.version": "1.6.0"}}}]))
     elif args and args[0] == "inspect":
         rec = record()
         fmt = args[args.index("--format")+1] if "--format" in args else ""

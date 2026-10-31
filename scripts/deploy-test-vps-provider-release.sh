@@ -134,7 +134,7 @@ provider_release_docker_bounded() {
 }
 
 provider_release_forward() {
-  local previous_platform target_platform rendered bundle previous_snapshot
+  local previous_platform rendered bundle previous_snapshot
   local postgres_witness volume_witness final_inspect final_id
   recovery_phase=predecessor
   previous_container=$(compose ps -a -q backend)
@@ -150,8 +150,7 @@ provider_release_forward() {
   previous_platform=$(docker_image_inspect "$previous_id") || fail "RECOVERY_REQUIRED"
   target_image_inspect=$(docker_image_inspect "$image") || fail "RECOVERY_REQUIRED"
   target_id=$(jq -er '.[0].Id' <<<"$target_image_inspect")
-  target_platform=$(docker_image_inspect \
-    ghcr.io/nickolaymamonov/meet-backend-v3@sha256:9178741bc9fd1e9319acab54252e908fa2d439e66f628d0da20c169837c60cfe) ||
+  target_image_proof=$(target_image_proof_build "$image" "$target_image_inspect") ||
     fail "RECOVERY_REQUIRED"
   recovery_phase='rendered-witness'
   rendered=$(compose config --format json) || fail "RECOVERY_REQUIRED"
@@ -161,9 +160,9 @@ provider_release_forward() {
     fail "RECOVERY_REQUIRED"
   bundle=$(jq -cn --argjson backend "$previous_inspect" \
     --argjson old "$previous_platform" --argjson target "$target_image_inspect" \
-    --argjson platform "$target_platform" --argjson config "$rendered" \
+    --argjson proof "$target_image_proof" --argjson config "$rendered" \
     '{backend:$backend,previousImage:$old,targetImage:$target,
-      platformImage:$platform,rendered:$config}')
+      targetImageProof:$proof,rendered:$config}')
   recovery_phase='native-adoption'
   printf '%s' "$bundle" |
     timeout 60s python3 -B "$provider_helper" forward-adopt \
@@ -197,6 +196,7 @@ provider_release_forward() {
     timeout 30s python3 -B "$provider_helper" forward-revalidate \
       --state-root "$state_root" --run-key "$run_key" >/dev/null ||
     fail "RECOVERY_REQUIRED"
+  target_image_proof_check
   # No updater, active-file installation, credential preparation, or old restart.
   recovery_phase='revalidation-accepted'
   echo "recovery_boundary=revalidation-accepted" >&2
@@ -222,7 +222,9 @@ provider_release_forward() {
     timeout 30s python3 -B "$provider_helper" verify \
       --state-root "$state_root" --run-key "$run_key" --phase candidate >/dev/null ||
     fail "RECOVERY_REQUIRED"
+  target_image_proof_check
   runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
+    --target-image-proof "$target_image_proof" \
     >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
   pending_candidate_proof
   verify_public_contract "$public_url"
@@ -235,7 +237,9 @@ provider_release_forward() {
   final_inspect=$(docker_container_inspect "$final_id") || fail "RECOVERY_REQUIRED"
   [ "$(jq -er '.[0].State.StartedAt' <<<"$final_inspect")" = "$candidate_started" ] ||
     fail "RECOVERY_REQUIRED"
+  target_image_proof_check
   runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
+    --target-image-proof "$target_image_proof" \
     >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
   pending_candidate_proof
   recovery_phase='forward-complete'
@@ -405,6 +409,46 @@ runtime_invariants_bounded() {
     source "$1"
     verify_runtime_invariants "$2" "$3" "$4" "$5" "$6" "$7" "${@:8}"
   ' _ "$runtime_helper" "$root" "$compose_script" "$@"
+}
+
+target_image_proof_build() {
+  local image_ref=$1 image_inspect=$2 index_file="$script_dir/../image-index.json"
+  local selected_manifest raw_index engine_image_id index_bytes
+  [ -f "$index_file" ] && [ ! -L "$index_file" ] ||
+    fail "PROVIDER_STATE_INVALID"
+  index_bytes=$(wc -c <"$index_file") || fail "PROVIDER_STATE_INVALID"
+  [[ "$index_bytes" =~ ^[0-9]+$ ]] && [ "$index_bytes" -gt 0 ] &&
+    [ "$index_bytes" -le 8388608 ] || fail "PROVIDER_STATE_INVALID"
+  selected_manifest=$(jq -er '
+    [.manifests[] | select(.platform.os == "linux" and
+      .platform.architecture == "amd64") | .digest] |
+      if length == 1 then .[0] else error("platform descriptor") end
+  ' "$index_file") || fail "PROVIDER_STATE_INVALID"
+  raw_index=$(base64 -w 0 "$index_file") || fail "PROVIDER_STATE_INVALID"
+  engine_image_id=$(jq -er '.[0].Id' <<<"$image_inspect") ||
+    fail "PROVIDER_STATE_INVALID"
+  jq -cn --arg indexRef "$image_ref" --arg rawIndexBase64 "$raw_index" \
+    --arg selectedManifestDigest "$selected_manifest" \
+    --arg engineImageId "$engine_image_id" \
+    '{indexRef:$indexRef,rawIndexBase64:$rawIndexBase64,
+      selectedPlatform:"linux/amd64",
+      selectedManifestDigest:$selectedManifestDigest,
+      engineImageId:$engineImageId}'
+}
+
+target_image_request() {
+  jq -cn --argjson imageInspect "$1" --argjson targetImageProof "$2" \
+    '{imageInspect:$imageInspect,targetImageProof:$targetImageProof}'
+}
+
+target_image_proof_check() {
+  local current
+  current=$(docker_image_inspect "$image") || fail "PROVIDER_STATE_INVALID"
+  target_image_request "$current" "$target_image_proof" |
+    timeout 30s python3 "$provider_helper" target-proof-check \
+      --state-root "$state_root" --run-key "$run_key" \
+      --state-kind "$state_suffix" >/dev/null ||
+    fail "PROVIDER_STATE_INVALID"
 }
 
 pending_predecessor_proof() {
@@ -789,8 +833,12 @@ write_provider_marker() {
   fi
   [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || fail "RECOVERY_REQUIRED"
   umask 077
-  printf '{"schemaVersion":1,"runKey":"%s","phase":"%s","providerEnabled":%s,"durableDisposition":"%s"}\n' \
-    "$run_key" "$phase" "$provider_enabled" "$disposition" >"$temporary"
+  local proof_digest
+  proof_digest=$(sha256sum "$state/target-image-proof.json" 2>/dev/null | cut -d' ' -f1) ||
+    fail "RECOVERY_REQUIRED"
+  [[ "$proof_digest" =~ ^[0-9a-f]{64}$ ]] || fail "RECOVERY_REQUIRED"
+  printf '{"schemaVersion":2,"runKey":"%s","phase":"%s","providerEnabled":%s,"durableDisposition":"%s","targetImageProofSha256":"%s"}\n' \
+    "$run_key" "$phase" "$provider_enabled" "$disposition" "$proof_digest" >"$temporary"
   chmod 600 "$temporary"
   timeout 30s python3 - "$temporary" "$state_root" <<'PY'
 import os
@@ -1104,11 +1152,20 @@ if [ "$reconcile_failed_40368479855_forward" != true ] &&
   fail "RECOVERY_REQUIRED"
 fi
 if [ "$reconcile_failed_40368479855_forward" != true ]; then
+  target_image_inspect=$(docker_image_inspect "$image") ||
+    fail "PROVIDER_STATE_INVALID"
+  target_id=$(jq -er '.[0].Id' <<<"$target_image_inspect") ||
+    fail "PROVIDER_STATE_INVALID"
+  target_image_proof=$(target_image_proof_build "$image" "$target_image_inspect") ||
+    fail "PROVIDER_STATE_INVALID"
+  target_image_request_json=$(target_image_request \
+    "$target_image_inspect" "$target_image_proof")
   timeout 30s python3 "$provider_helper" retention-check \
     --state-root "$state_root" >/dev/null ||
     fail "RECOVERY_REQUIRED"
 
-  timeout 30s python3 "$provider_helper" state-publish \
+  printf '%s' "$target_image_request_json" |
+    timeout 30s python3 "$provider_helper" state-publish \
     --state-root "$state_root" \
     --run-key "$run_key" \
     --state-kind "$state_suffix" >/dev/null ||
@@ -1382,9 +1439,10 @@ if [ "$mode" = rollback-drill ] && [ "$target_id" = "$previous_id" ]; then
 fi
 target_image_inspect=$(docker_image_inspect "$image" 2>/dev/null) ||
   fail "PROVIDER_STATE_INVALID"
-printf '%s' "$target_image_inspect" |
+target_image_request "$target_image_inspect" "$target_image_proof" |
   timeout 30s python3 "$provider_helper" check-image >/dev/null ||
   fail "PROVIDER_STATE_INVALID"
+target_image_proof_check
 run_safety_hook predecessor "$previous_image" "$previous_id" \
   "$previous_revision" "$previous_version" "$previous_runtime_hash"
 
@@ -1497,7 +1555,7 @@ durable_disposition=$(timeout 5s jq -er \
   --arg run_key "$run_key" --argjson enabled "$provider_enabled" '
     select(
       type == "object" and
-      .schemaVersion == 1 and
+      .schemaVersion == 2 and
       .runKey == $run_key and
       .phase == "preparing" and
       .providerEnabled == $enabled
@@ -1600,6 +1658,7 @@ verify_predecessor_before_writers
 pending_predecessor_proof
 validate_configuration_boundary "$state/config.env.production"
 write_provider_marker applying "$durable_disposition"
+target_image_proof_check
 mutation_started=true
 validate_configuration_boundary "$state/config.env.production"
 timeout 30s install -m 600 "$state/config.base-compose.yml" "$active_compose" ||
@@ -1639,7 +1698,9 @@ printf '[%s,%s]' "$previous_inspect" "$candidate_inspect" |
   timeout 30s python3 "$provider_helper" verify \
     --run-key "$run_key" --state-root "$state_root" --phase candidate >/dev/null ||
   fail "PROVIDER_STATE_INVALID"
+target_image_proof_check
 runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
+  --target-image-proof "$target_image_proof" \
   >/dev/null 2>&1 || fail "PROVIDER_STATE_INVALID"
 pending_candidate_proof
 verify_public_contract "$public_url"
@@ -1655,8 +1716,18 @@ fi
 run_safety_hook final "$image" "$target_id" \
   "$revision" "$version" "$target_hash"
 validate_configuration_boundary "$state/config.env.target"
+target_image_proof_check
+runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
+  --target-image-proof "$target_image_proof" \
+  >/dev/null 2>&1 || fail "PROVIDER_STATE_INVALID"
 pending_candidate_proof
-provider_finish committed "$candidate_inspect"
+final_candidate_inspect=$(docker_container_inspect "$candidate_container") ||
+  fail "PROVIDER_STATE_INVALID"
+[ "$(jq -er '.[0].Id' <<<"$final_candidate_inspect")" = "$candidate_container" ] &&
+  [ "$(jq -er '.[0].State.StartedAt' <<<"$final_candidate_inspect")" = \
+    "$candidate_started" ] ||
+  fail "PROVIDER_STATE_INVALID"
+provider_finish committed "$final_candidate_inspect"
 mutation_started=false
 rollback_complete=true
 echo "deployment=completed image_id=$target_id version=$version revision=$revision"
