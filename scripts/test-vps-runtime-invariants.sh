@@ -344,7 +344,22 @@ verify_runtime_invariants() {
   local expected_version=$5
   local expected_hash=$6
   local backend postgres binding address memory
+  local target_image_proof=
+  local -a environment_options=()
   local -a mounts postgres_mounts
+  environment_options=("${@:7}")
+  local -a filtered_options=()
+  while [ "${#environment_options[@]}" -gt 0 ]; do
+    if [ "${environment_options[0]}" = --target-image-proof ]; then
+      [ -z "$target_image_proof" ] && [ "${#environment_options[@]}" -ge 2 ] || return 1
+      target_image_proof=${environment_options[1]}
+      environment_options=("${environment_options[@]:2}")
+    else
+      filtered_options+=("${environment_options[0]}")
+      environment_options=("${environment_options[@]:1}")
+    fi
+  done
+  environment_options=("${filtered_options[@]}")
   if [ "${MEE_SMTP_FAKE_REMOTE:-false}" = true ]; then
     return 0
   fi
@@ -355,6 +370,18 @@ verify_runtime_invariants() {
   [ "$(docker inspect "$backend" --format '{{.State.Running}}')" = true ]
   [ "$(docker inspect "$backend" --format '{{.State.Health.Status}}')" = healthy ]
   [ "$(docker inspect "$backend" --format '{{.Image}}')" = "$expected_id" ]
+  if [ -n "$target_image_proof" ]; then
+    local expected_image helper_dir image_inspect image_request
+    expected_image=$(jq -er '.indexRef' <<<"$target_image_proof")
+    [ "$(docker inspect "$backend" --format '{{.Config.Image}}')" = "$expected_image" ]
+    helper_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    image_inspect=$(docker image inspect "$expected_id")
+    image_request=$(jq -cn --argjson imageInspect "$image_inspect" \
+      --argjson targetImageProof "$target_image_proof" \
+      '{imageInspect:$imageInspect,targetImageProof:$targetImageProof}')
+    printf '%s' "$image_request" |
+      python3 "$helper_dir/test-vps-provider-credential.py" check-image >/dev/null
+  fi
   [ "$(docker inspect "$backend" \
     --format '{{index .Config.Labels "com.docker.compose.project"}}')" = meet-production ]
   [ "$(docker inspect "$backend" \
@@ -391,7 +418,8 @@ verify_runtime_invariants() {
   [ "$(docker inspect "$backend" \
     --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = \
     "https://github.com/NickolayMamonov/meet-backend-v3" ]
-  verify_environment_matches_container "$root" "$compose_script" "${@:7}"
+  verify_environment_matches_container "$root" "$compose_script" \
+    "${environment_options[@]}"
   docker exec "$backend" sh -ec 'test -w /data/uploads'
   echo "runtime_check=image image_id=$expected_id runtime_user=10001:10001"
   mapfile -t mounts < <(

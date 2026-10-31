@@ -25,6 +25,14 @@ baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
   [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
   [ -f "$public_probe" ] && [ -f "$closed_beta_fixture" ]
 workflow_text=$(<"$workflow")
+platform_pulls=$(grep -Ec 'docker pull --platform=linux/amd64 ' "$workflow")
+[ "$platform_pulls" -eq 2 ] ||
+  { echo "both existing image pulls must explicitly select linux/amd64" >&2; exit 1; }
+if grep -Eq 'docker (image )?(tag|pull).*9178741b|docker image inspect.*9178741b' \
+  "$workflow" "$provider_deploy"; then
+  echo "selected-platform proof must not require a local child reference" >&2
+  exit 1
+fi
 extract_line=$(grep -nF 'tar --no-same-owner -xf "$stage/tooling.tar" -C "$stage"' "$workflow" | cut -d: -f1)
 checksum_line=$(grep -nF 'sha256sum -c SHA256SUMS' "$workflow" | cut -d: -f1)
 [[ "$extract_line" =~ ^[0-9]+$ && "$checksum_line" =~ ^[0-9]+$ ]] &&
@@ -471,7 +479,13 @@ source "$provider_deploy"
   compose_script='/fixture compose.sh'
   cat >"$runtime_helper" <<'SH'
 verify_runtime_invariants() {
-  [ "$#" -eq 6 ]
+  if [ -n "${INVARIANT_EXPECT_PROOF:-}" ]; then
+    [ "$#" -eq 8 ]
+    [ "$7" = --target-image-proof ]
+    [ "$8" = "$INVARIANT_EXPECT_PROOF" ]
+  else
+    [ "$#" -eq 6 ]
+  fi
   [ "$1" = '/fixture root' ]
   [ "$2" = '/fixture compose.sh' ]
   [ "$3" = image ]
@@ -483,6 +497,10 @@ verify_runtime_invariants() {
 SH
   # Exercise the production adapter under nounset with the four caller arguments.
   runtime_invariants_bounded image revision version hash
+  export INVARIANT_EXPECT_PROOF='{"indexRef":"immutable reference","engineImageId":"opaque identity"}'
+  runtime_invariants_bounded image revision version hash \
+    --target-image-proof "$INVARIANT_EXPECT_PROOF"
+  unset INVARIANT_EXPECT_PROOF
   export INVARIANT_TEST_STATUS=17
   if runtime_invariants_bounded image revision version hash; then
     fail "bounded runtime invariants swallowed a failed check"

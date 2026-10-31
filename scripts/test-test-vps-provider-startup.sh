@@ -19,6 +19,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+stage=$fixture/tooling
+mkdir -p "$stage/scripts"
+cp -- "$ROOT_DIR"/scripts/*.sh "$ROOT_DIR"/scripts/*.py "$stage/scripts/"
+cp -- "$provider_release_script" "$stage/scripts/deploy-test-vps-provider-release.sh"
+chmod 755 "$stage/scripts/"*.sh
+provider_release_script=$stage/scripts/deploy-test-vps-provider-release.sh
+python3 - "$ROOT_DIR/scripts/fixtures/selected-platform/image-index.json" \
+  "$stage/image-index.json" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[2]).write_bytes(Path(sys.argv[1]).read_bytes().removesuffix(b"\n"))
+PY
+
 fake_bin=$fixture/bin
 mkdir -p "$fake_bin"
 cat >"$fake_bin/docker" <<'DOCKER'
@@ -46,7 +60,21 @@ case "$command_name" in
         *) exit 1 ;;
       esac
     else
-      # The intentional failure occurs only after provider marker publication.
+      # Admit the target proof before publication; fail the later image gate.
+      if [ -z "$format" ] && [ ! -e "$TRACE_FILE.target-admitted" ]; then
+        touch "$TRACE_FILE.target-admitted"
+        jq -cn --arg id "$TARGET_ID" --arg image "$TARGET_IMAGE" \
+          --arg revision "$SOURCE_SHA" '
+          [{
+            Id:$id, Os:"linux", Architecture:"amd64", RepoDigests:[$image],
+            Config:{Env:[], User:"10001:10001", Labels:{
+              "org.opencontainers.image.source":"https://github.com/NickolayMamonov/meet-backend-v3",
+              "org.opencontainers.image.revision":$revision,
+              "org.opencontainers.image.version":"1.3.0"
+            }}
+          }]'
+        exit 0
+      fi
       exit 1
     fi
     ;;
@@ -84,7 +112,8 @@ fixture_fail() {
 
 previous_image=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 previous_id=sha256:0000000000000000000000000000000000000000000000000000000000000000
-target_image=ghcr.io/nickolaymamonov/meet-backend-v3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+target_id=sha256:1f2c56da34fa905553739f79bf91647d0087ec72159efc40828ba91622033d4b
+target_image=ghcr.io/nickolaymamonov/meet-backend-v3@$target_id
 source_sha=0123456789abcdef0123456789abcdef01234567
 runtime_hash=1111111111111111111111111111111111111111111111111111111111111111
 
@@ -159,6 +188,7 @@ ENV
       TRACE_FILE="$trace" \
       PREVIOUS_IMAGE="$previous_image" \
       PREVIOUS_ID="$previous_id" \
+      TARGET_ID="$target_id" TARGET_IMAGE="$target_image" SOURCE_SHA="$source_sha" \
       PROVIDER_INSPECT="$provider_inspect" \
       RUNTIME_HASH="$runtime_hash" \
       bash "$provider_release_script" \
@@ -183,9 +213,10 @@ ENV
     [ -f "$pointer" ] && [ ! -L "$pointer" ] ||
       fixture_fail "preparing marker was not published"
     jq -e --arg key "$run_key" --argjson enabled "$provider_enabled" '
-      .schemaVersion == 1 and .runKey == $key and
+      .schemaVersion == 2 and .runKey == $key and
       .phase == "preparing" and .providerEnabled == $enabled and
-      .durableDisposition == "none"
+      .durableDisposition == "none" and
+      (.targetImageProofSha256 | test("^[0-9a-f]{64}$"))
     ' "$pointer" >/dev/null ||
       fixture_fail "preparing marker does not contain the expected recovery evidence"
     [ "$(stat -c '%a' "$pointer")" = 600 ] ||

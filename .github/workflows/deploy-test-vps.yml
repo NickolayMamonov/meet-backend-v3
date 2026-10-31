@@ -238,7 +238,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          timeout 240s docker pull "$IMAGE@$DIGEST" >/dev/null
+          timeout 240s docker pull --platform=linux/amd64 "$IMAGE@$DIGEST" >/dev/null
           test "$(timeout 30s docker image inspect "$IMAGE@$DIGEST" \
             --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
           test "$(timeout 30s docker image inspect "$IMAGE@$DIGEST" \
@@ -318,6 +318,8 @@ jobs:
             mkdir -p "$stage/$(dirname "$file")"
             cp -- "$file" "$stage/$file"
           done
+          cp -- "$RUNNER_TEMP/release/image-index.json" "$stage/image-index.json"
+          files+=(image-index.json)
           chmod 755 "$stage"/scripts/*.sh "$stage"/scripts/test-vps-provider-credential.py
           (
             cd "$stage"
@@ -362,7 +364,11 @@ jobs:
             source "$5/scripts/deploy-test-vps-provider-release.sh"
             provider_release_pin_docker
           fi
-          timeout 240s docker pull "$image" >/dev/null
+          timeout 240s docker pull --platform=linux/amd64 "$image" >/dev/null
+          timeout 30s docker image inspect "$image" --format '{{json .RepoDigests}}' |
+            jq -e --arg image "$image" 'type == "array" and index($image) != null' >/dev/null
+          test "$(timeout 30s docker image inspect "$image" --format '{{.Os}}')" = linux
+          test "$(timeout 30s docker image inspect "$image" --format '{{.Architecture}}')" = amd64
           test "$(timeout 30s docker image inspect "$image" \
             --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
             "$revision"
@@ -375,7 +381,22 @@ jobs:
           REMOTE
           )
           [[ "$target_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          selected_manifest=$(jq -er '
+            [.manifests[] | select(.platform.os == "linux" and
+              .platform.architecture == "amd64") | .digest] |
+              if length == 1 then .[0] else error("platform descriptor") end
+          ' "$RUNNER_TEMP/release/image-index.json")
+          raw_index=$(base64 -w 0 "$RUNNER_TEMP/release/image-index.json")
+          target_proof=$(jq -cn --arg indexRef "$IMAGE@$DIGEST" \
+            --arg rawIndexBase64 "$raw_index" \
+            --arg selectedManifestDigest "$selected_manifest" \
+            --arg engineImageId "$target_id" \
+            '{indexRef:$indexRef,rawIndexBase64:$rawIndexBase64,
+              selectedPlatform:"linux/amd64",
+              selectedManifestDigest:$selectedManifestDigest,
+              engineImageId:$engineImageId}')
           echo "TARGET_IMAGE_ID=$target_id" >>"$GITHUB_ENV"
+          echo "TARGET_IMAGE_PROOF=$target_proof" >>"$GITHUB_ENV"
 
       - name: Exercise automatic image rollback
         if: inputs.run_rollback_drill
@@ -549,7 +570,8 @@ jobs:
           set -euo pipefail
           runtime=$(timeout 180s ssh -F "$SSH_CONFIG" test-vps bash -s -- \
             "$TARGET_IMAGE_ID" "$SOURCE_SHA" "$VERSION" \
-            "$RECONCILE_FAILED_40368479855_FORWARD" "$REMOTE_TOOLING" <<'REMOTE'
+            "$RECONCILE_FAILED_40368479855_FORWARD" "$REMOTE_TOOLING" \
+            "$TARGET_IMAGE_PROOF" "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" <<'REMOTE'
           set -euo pipefail
           expected_id=$1
           revision=$2
@@ -558,6 +580,8 @@ jobs:
             source "$5/scripts/deploy-test-vps-provider-release.sh"
             provider_release_pin_docker
           fi
+          target_proof=$6
+          run_key=$7
           mapfile -t backends < <(timeout 30s docker ps -q \
             --filter label=com.docker.compose.project=meet-production \
             --filter label=com.docker.compose.service=backend)
@@ -569,6 +593,20 @@ jobs:
           database=${postgres[0]}
           image_id=$(timeout 30s docker inspect "$backend" --format '{{.Image}}')
           [ "$image_id" = "$expected_id" ]
+          expected_image=$(jq -er '.indexRef' <<<"$target_proof")
+          [ "$(timeout 30s docker inspect "$backend" --format '{{.Config.Image}}')" = \
+            "$expected_image" ]
+          image_inspect=$(timeout 30s docker image inspect "$expected_id")
+          image_request=$(jq -cn --argjson imageInspect "$image_inspect" \
+            --argjson targetImageProof "$target_proof" \
+            '{imageInspect:$imageInspect,targetImageProof:$targetImageProof}')
+          printf '%s' "$image_request" |
+            timeout 30s python3 "$5/scripts/test-vps-provider-credential.py" \
+              check-image >/dev/null
+          printf '%s' "$image_request" |
+            timeout 30s python3 "$5/scripts/test-vps-provider-credential.py" \
+              target-proof-check --state-root /var/lib/meet-test-vps-deploy \
+              --run-key "$run_key" --state-kind final-deploy >/dev/null
           [ "$(timeout 30s docker image inspect "$image_id" \
             --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
             "$revision" ]
