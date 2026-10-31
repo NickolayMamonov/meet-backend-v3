@@ -21,6 +21,7 @@ usage() {
 provider_release_on_exit() {
   local status=$?
   trap - EXIT
+  provider_release_report_failure "$status"
   if [ "$status" -ne 0 ] && [ "$rollback_complete" = false ]; then
     if [ "$mutation_started" = true ]; then
       if [ "$failure_policy" = manual-stop ]; then
@@ -36,6 +37,26 @@ provider_release_on_exit() {
       fi
     fi
   fi
+  exit "$status"
+}
+
+provider_release_report_failure() {
+  [ "$1" -ne 0 ] &&
+    [ "${reconcile_failed_40368479855_forward:-false}" = true ] || return 0
+  # Never turn shell state, command text, or native error payloads into log data.
+  case "${recovery_phase:-}" in
+    preflight|state-lock|docker-pin|predecessor|rendered-witness|native-adoption|\
+      adoption-accepted|revalidation|revalidation-accepted|service-mutation|\
+      backend-proof|forward-complete)
+      echo "recovery_failure_phase=$recovery_phase" >&2 ;;
+    *) echo "recovery_failure_phase=unclassified" >&2 ;;
+  esac
+}
+
+provider_release_preflight_exit() {
+  local status=$?
+  trap - EXIT
+  provider_release_report_failure "$status"
   exit "$status"
 }
 
@@ -115,6 +136,7 @@ provider_release_docker_bounded() {
 provider_release_forward() {
   local previous_platform target_platform rendered bundle previous_snapshot
   local postgres_witness volume_witness final_inspect final_id
+  recovery_phase=predecessor
   previous_container=$(compose ps -a -q backend)
   [[ "$previous_container" =~ ^[0-9a-f]{64}$ ]] || fail "RECOVERY_REQUIRED"
   previous_inspect=$(docker_container_inspect "$previous_container") ||
@@ -131,6 +153,7 @@ provider_release_forward() {
   target_platform=$(docker_image_inspect \
     ghcr.io/nickolaymamonov/meet-backend-v3@sha256:9178741bc9fd1e9319acab54252e908fa2d439e66f628d0da20c169837c60cfe) ||
     fail "RECOVERY_REQUIRED"
+  recovery_phase='rendered-witness'
   rendered=$(compose config --format json) || fail "RECOVERY_REQUIRED"
   postgres_witness=$(forward_postgres_witness) || fail "RECOVERY_REQUIRED"
   volume_witness=$(provider_release_docker_bounded volume inspect \
@@ -141,11 +164,14 @@ provider_release_forward() {
     --argjson platform "$target_platform" --argjson config "$rendered" \
     '{backend:$backend,previousImage:$old,targetImage:$target,
       platformImage:$platform,rendered:$config}')
+  recovery_phase='native-adoption'
   printf '%s' "$bundle" |
     timeout 60s python3 -B "$provider_helper" forward-adopt \
       --state-root "$state_root" --run-key "$run_key" \
       --deployment-root "$root" --base-compose "$base_compose" >/dev/null ||
     fail "RECOVERY_REQUIRED"
+  recovery_phase='adoption-accepted'
+  echo "recovery_boundary=adoption-accepted" >&2
   provider_enabled=$(jq -er '.providerEnabled | tostring' "$provider_pointer")
   durable_disposition=$(jq -er '.durableDisposition' "$provider_pointer")
   previous_snapshot=$previous_inspect
@@ -156,6 +182,7 @@ provider_release_forward() {
   candidate_started=
   trap provider_release_on_exit EXIT
   trap 'exit 143' TERM INT HUP
+  recovery_phase=revalidation
   [ "$(compose ps -a -q backend)" = "$previous_container" ] &&
     [ "$(forward_postgres_witness)" = "$postgres_witness" ] &&
     [ "$(provider_release_docker_bounded volume inspect \
@@ -171,9 +198,14 @@ provider_release_forward() {
       --state-root "$state_root" --run-key "$run_key" >/dev/null ||
     fail "RECOVERY_REQUIRED"
   # No updater, active-file installation, credential preparation, or old restart.
+  recovery_phase='revalidation-accepted'
+  echo "recovery_boundary=revalidation-accepted" >&2
   mutation_started=true
+  recovery_phase='service-mutation'
+  echo "recovery_boundary=service-mutation-begin" >&2
   compose_up -d --no-deps --no-build --pull never --force-recreate \
     --wait --wait-timeout 180 backend >/dev/null
+  recovery_phase='backend-proof'
   candidate_container=$(compose ps -a -q backend)
   [[ "$candidate_container" =~ ^[0-9a-f]{64}$ ]] &&
     [ "$candidate_container" != "$previous_container" ] || fail "RECOVERY_REQUIRED"
@@ -206,6 +238,7 @@ provider_release_forward() {
   runtime_invariants_bounded "$target_id" "$revision" "$version" "$target_hash" \
     >/dev/null 2>&1 || fail "RECOVERY_REQUIRED"
   pending_candidate_proof
+  recovery_phase='forward-complete'
   printf '%s' "$final_inspect" |
     timeout 60s python3 -B "$provider_helper" forward-complete \
       --state-root "$state_root" --run-key "$run_key" ||
@@ -948,6 +981,11 @@ elif [ -n "$state_mode" ]; then
   usage
 fi
 
+if [ "$reconcile_failed_40368479855_forward" = true ]; then
+  recovery_phase=preflight
+  trap provider_release_preflight_exit EXIT
+fi
+
 for command_name in docker curl jq flock python3 timeout; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "$command_name is required"
@@ -1026,6 +1064,7 @@ state_suffix=final-deploy
 [ "$mode" = rollback-drill ] && state_suffix=rollback-drill
 state=$state_root/$run_key-$state_suffix
 if [ "$reconcile_failed_40368479855_forward" = true ]; then
+  recovery_phase='state-lock'
   [ -d "$state_root" ] && [ ! -L "$state_root" ] &&
     [ -f "$state_root/.deploy.lock" ] && [ ! -L "$state_root/.deploy.lock" ] ||
     fail "RECOVERY_REQUIRED"
@@ -1057,6 +1096,7 @@ if [ -e "$smtp_pointer" ] || [ -L "$smtp_pointer" ]; then
   fail "SMTP transaction is active; reconcile it with the SMTP tooling first"
 fi
 if [ "$reconcile_failed_40368479855_forward" = true ]; then
+  recovery_phase='docker-pin'
   provider_release_pin_docker
 fi
 if [ "$reconcile_failed_40368479855_forward" != true ] &&
