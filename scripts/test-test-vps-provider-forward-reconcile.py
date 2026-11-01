@@ -380,6 +380,163 @@ class FixtureTests(unittest.TestCase):
         self.assertFalse(fixture.archive.exists())
         self.assertEqual(Path(fixture.paths["production-env"]).read_bytes(), fixture.target_env)
 
+    def test_forward_adoption_attributes_target_proof_rejection_without_mutation(self):
+        fixture = self.fresh()
+        fixture.bundle_mutate_proof(selectedPlatform="linux/arm64")
+        with self.assertRaises(helper.ProviderError) as raised:
+            fixture.admit()
+        self.assertEqual(raised.exception.category, "RECOVERY_REQUIRED")
+        self.assertEqual(raised.exception.check, "target-proof-platform")
+        self.unchanged(fixture)
+
+    def test_forward_adoption_attributes_source_identity_and_content_failures(self):
+        for field, check in (
+            ("identity", "origin-witness-identity"),
+            ("content", "origin-witness-content"),
+        ):
+            with self.subTest(field=field):
+                fixture = self.fresh()
+                # Drive a source-witness mismatch through the exact shared
+                # validator without changing any filesystem state.
+                witness = {
+                    "path": fixture.paths["production-env"],
+                    "role": "production-env",
+                    "snapshotRef": "config.env.target",
+                    "identity": helper._forward_identity_from_stat(
+                        os.stat(fixture.paths["production-env"])
+                    ),
+                }
+                snapshots = {"config.env.target": fixture.target_env}
+                if field == "identity":
+                    witness["identity"] = {}
+                else:
+                    snapshots["config.env.target"] = b"changed"
+                with self.assertRaises(helper.ProviderError) as raised:
+                    helper._forward_validate_external(
+                        witness, snapshots, str(fixture.origin)
+                    )
+                self.assertEqual(raised.exception.category, "RECOVERY_REQUIRED")
+                self.assertEqual(raised.exception.check, check)
+                self.unchanged(fixture)
+
+    def test_forward_adoption_attributes_inventory_recheck_leaf(self):
+        fixture = self.fresh()
+        sidecar = fixture.states / ".foreign-after-stage"
+
+        def inject(stage):
+            if stage == "state-staged":
+                Fixture.write(sidecar, b"foreign")
+
+        with mock.patch.object(helper, "_forward_adopt_boundary", side_effect=inject):
+            with self.assertRaises(helper.ProviderError) as raised:
+                fixture.admit()
+        self.assertEqual(raised.exception.category, "RECOVERY_REQUIRED")
+        self.assertEqual(raised.exception.check, "inventory-root-entries")
+        self.assertEqual(fixture.marker()["runKey"], helper.FORWARD_ORIGIN_KEY)
+        self.assertEqual(sidecar.read_bytes(), b"foreign")
+        self.assertFalse(fixture.archive.exists())
+
+    def test_forward_adoption_attributes_pointer_replace_and_sync_errors(self):
+        for failure, expected_run, check in (
+            ("replace", helper.FORWARD_ORIGIN_KEY, "pointer-replace"),
+            ("sync", SUCCESSOR, "pointer-replace-sync"),
+        ):
+            with self.subTest(failure=failure):
+                fixture = self.fresh()
+
+                if failure == "replace":
+                    patches = [
+                        mock.patch.object(
+                            helper.os, "replace",
+                            side_effect=OSError("injected pointer replace failure"),
+                        )
+                    ]
+                else:
+                    pointer_replaced = [False]
+                    original_replace = helper.os.replace
+                    original_fsync = helper.os.fsync
+
+                    def replace_then_mark(*args, **kwargs):
+                        result = original_replace(*args, **kwargs)
+                        pointer_replaced[0] = True
+                        return result
+
+                    def fail_pointer_sync(fd):
+                        if pointer_replaced[0]:
+                            raise OSError("injected pointer directory sync failure")
+                        return original_fsync(fd)
+
+                    patches = [
+                        mock.patch.object(
+                            helper.os, "replace", side_effect=replace_then_mark
+                        ),
+                        mock.patch.object(
+                            helper.os, "fsync", side_effect=fail_pointer_sync
+                        ),
+                    ]
+                with contextlib.ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    with self.assertRaises(helper.ProviderError) as raised:
+                        fixture.admit()
+                self.assertEqual(raised.exception.category, "RECOVERY_REQUIRED")
+                self.assertEqual(raised.exception.check, check)
+                self.assertEqual(raised.exception.reason, "other")
+                self.assertEqual(fixture.marker()["runKey"], expected_run)
+                self.assertFalse(fixture.archive.exists())
+
+    def test_forward_adopt_cli_emits_one_fixed_safe_attribution_before_category(self):
+        for check, reason in (
+            ("target-proof-platform", "rejected"),
+            ("pointer-replace-sync", "other"),
+        ):
+            with self.subTest(check=check):
+                stderr = io.StringIO()
+                args = mock.Mock(command="forward-adopt")
+                parser = mock.Mock()
+                parser.parse_args.return_value = args
+                with (mock.patch.object(helper, "_parser", return_value=parser),
+                      mock.patch.object(
+                          helper, "_forward_admission",
+                          side_effect=helper.ProviderError(
+                              "RECOVERY_REQUIRED", check, reason
+                          ),
+                      ),
+                      mock.patch.object(helper, "_bounded_stdin", return_value=b""),
+                      mock.patch.object(helper.sys, "stderr", stderr)):
+                    result = helper.main([])
+                self.assertEqual(result, 1)
+                self.assertEqual(
+                    stderr.getvalue(),
+                    f"forward_adopt_rejected_check={check} reason={reason}\n"
+                    "RECOVERY_REQUIRED\n",
+                )
+
+    def test_uninstrumented_forward_adopt_rejection_keeps_category_only_output(self):
+        stderr = io.StringIO()
+        args = mock.Mock(command="forward-adopt")
+        parser = mock.Mock()
+        parser.parse_args.return_value = args
+        with (mock.patch.object(helper, "_parser", return_value=parser),
+              mock.patch.object(
+                  helper, "_forward_admission",
+                  side_effect=helper.ProviderError("RECOVERY_REQUIRED"),
+              ),
+              mock.patch.object(helper, "_bounded_stdin", return_value=b""),
+              mock.patch.object(helper.sys, "stderr", stderr)):
+            result = helper.main([])
+        self.assertEqual(result, 1)
+        self.assertEqual(stderr.getvalue(), "RECOVERY_REQUIRED\n")
+
+    def test_forward_adopt_json_depth_rejection_keeps_legacy_provider_category(self):
+        nested = []
+        for _ in range(helper.MAX_JSON_DEPTH + 2):
+            nested = [nested]
+        with self.assertRaises(helper.ProviderError) as raised:
+            helper._json(encode(nested), "recovery", "target-proof-index")
+        self.assertEqual(raised.exception.category, "PROVIDER_STATE_INVALID")
+        self.assertIsNone(raised.exception.check)
+
 
 class TargetImageStateProofTests(unittest.TestCase):
     def setUp(self):
@@ -1117,8 +1274,22 @@ class ForwardTests(FixtureTests):
                             raise OSError("fixture fsync interruption")
                         return real_sync(fd)
                     with mock.patch.object(helper.os, "fsync", side_effect=interrupted):
-                        with self.assertRaises(OSError):
-                            (fixture.admit if operation_name == "adopt" else fixture.complete)()
+                        operation = (
+                            fixture.admit if operation_name == "adopt"
+                            else fixture.complete
+                        )
+                        if operation_name == "adopt" and failed_sync == total:
+                            with self.assertRaises(helper.ProviderError) as raised:
+                                operation()
+                            self.assertEqual(
+                                raised.exception.category, "RECOVERY_REQUIRED"
+                            )
+                            self.assertEqual(
+                                raised.exception.check, "pointer-replace-sync"
+                            )
+                        else:
+                            with self.assertRaises(OSError):
+                                operation()
                     if fixture.pointer.exists():
                         self.assertIn(fixture.marker()["runKey"], (helper.FORWARD_ORIGIN_KEY, SUCCESSOR))
                     else:
