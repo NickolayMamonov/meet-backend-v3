@@ -99,13 +99,43 @@ ERRORS = {
 
 
 class ProviderError(Exception):
-    def __init__(self, category: str):
+    def __init__(self, category: str, check: str | None = None,
+                 reason: str = "rejected"):
         super().__init__(category)
         self.category = category
+        self.check = check
+        self.reason = reason
 
 
-def _fail(category: str) -> None:
-    raise ProviderError(ERRORS[category])
+def _fail(category: str, check: str | None = None) -> None:
+    raise ProviderError(ERRORS[category], check)
+
+
+FORWARD_ADOPT_CHECKS = frozenset({
+    "target-proof-shape",
+    "target-proof-reference",
+    "target-proof-identity",
+    "target-proof-index",
+    "target-proof-platform",
+    "target-proof-image-identity",
+    "origin-witness-content",
+    "origin-witness-identity",
+    "inventory-root-identity",
+    "inventory-root-entries",
+    "inventory-witness-identity",
+    "inventory-witness-content",
+    "inventory-descendants",
+    "inventory-named-binding",
+    "inventory-mount",
+    "inventory-acl",
+    "inventory-resource",
+    "origin-file-identity",
+    "pointer-replace",
+    "pointer-replace-sync",
+})
+FORWARD_ADOPT_REASONS = frozenset({
+    "missing", "denied", "changed", "rejected", "other",
+})
 
 
 def _lock_directory(fd: int) -> None:
@@ -121,11 +151,12 @@ def _bounded_stdin(limit: int) -> bytes:
     return data
 
 
-def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+def _pairs(pairs: list[tuple[str, Any]], category: str = "provider",
+           check: str | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            _fail("provider")
+            _fail(category, check)
         result[key] = value
     return result
 
@@ -143,11 +174,15 @@ def _depth(value: Any, level: int = 0) -> None:
             _depth(item, level + 1)
 
 
-def _json(data: bytes, category: str = "provider") -> Any:
+def _json(data: bytes, category: str = "provider",
+          check: str | None = None) -> Any:
     try:
-        value = json.loads(data.decode("utf-8"), object_pairs_hook=_pairs)
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=lambda pairs: _pairs(pairs, category, check),
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, ProviderError):
-        _fail(category)
+        _fail(category, check)
     _depth(value)
     return value
 
@@ -608,34 +643,43 @@ def _validate_target_image_proof(
         "engineImageId",
     }
     category = "recovery" if forward else "provider"
+    def reject(check: str) -> None:
+        _fail(category, check if forward else None)
+
     if not isinstance(proof, dict) or set(proof) != proof_keys:
-        _fail(category)
+        reject("target-proof-shape")
     index_ref = proof["indexRef"]
     match = re.fullmatch(
         re.escape(TARGET_IMAGE_REPOSITORY) + r"@(sha256:[0-9a-f]{64})",
         index_ref if isinstance(index_ref, str) else "",
     )
     engine_id = proof["engineImageId"]
-    if (match is None or proof["selectedPlatform"] != "linux/amd64"
-            or not isinstance(engine_id, str)
+    if match is None:
+        reject("target-proof-reference")
+    if proof["selectedPlatform"] != "linux/amd64":
+        reject("target-proof-platform")
+    if (not isinstance(engine_id, str)
             or re.fullmatch(r"sha256:[0-9a-f]{64}", engine_id) is None
             or not isinstance(proof["selectedManifestDigest"], str)
             or re.fullmatch(
                 r"sha256:[0-9a-f]{64}", proof["selectedManifestDigest"]
             ) is None):
-        _fail(category)
+        reject("target-proof-identity")
     encoded_index = proof["rawIndexBase64"]
     if not isinstance(encoded_index, str):
-        _fail(category)
+        reject("target-proof-index")
     try:
         raw_index = base64.b64decode(encoded_index, validate=True)
     except (ValueError, TypeError):
-        _fail(category)
+        reject("target-proof-index")
     if (not raw_index or len(raw_index) > MAX_TARGET_INDEX_BYTES
             or base64.b64encode(raw_index).decode("ascii") != encoded_index
             or hashlib.sha256(raw_index).hexdigest() != match.group(1)[7:]):
-        _fail(category)
-    index = _json(raw_index, category)
+        reject("target-proof-index")
+    index = _json(
+        raw_index, category,
+        "target-proof-index" if forward else None,
+    )
     if (not isinstance(index, dict)
             or type(index.get("schemaVersion")) is not int
             or index["schemaVersion"] != 2
@@ -643,11 +687,11 @@ def _validate_target_image_proof(
             "application/vnd.oci.image.index.v1+json"
             or not isinstance(index.get("manifests"), list)
             or not index["manifests"]):
-        _fail(category)
+        reject("target-proof-index")
     selected: list[str] = []
     for descriptor in index["manifests"]:
         if not isinstance(descriptor, dict):
-            _fail(category)
+            reject("target-proof-index")
         digest = descriptor.get("digest")
         size = descriptor.get("size")
         platform = descriptor.get("platform")
@@ -659,23 +703,23 @@ def _validate_target_image_proof(
                 or not isinstance(platform, dict)
                 or not isinstance(platform.get("os"), str)
                 or not isinstance(platform.get("architecture"), str)):
-            _fail(category)
+            reject("target-proof-index")
         if (platform["os"], platform["architecture"]) == ("linux", "amd64"):
             if platform.get("variant") not in (None, ""):
-                _fail(category)
+                reject("target-proof-platform")
             selected.append(digest)
     if (len(selected) != 1
             or proof["selectedManifestDigest"] != selected[0]):
-        _fail(category)
+        reject("target-proof-platform")
     if forward and (
         match.group(1) != FORWARD_TARGET["indexDigest"]
         or selected[0] != FORWARD_TARGET["amd64ManifestDigest"]
     ):
-        _fail("recovery")
+        _fail("recovery", "target-proof-platform")
     if image is not None:
         config = image.get("Config")
         if not isinstance(config, dict):
-            _fail(category)
+            reject("target-proof-image-identity")
         labels = config.get("Labels")
         revision = labels.get("org.opencontainers.image.revision") if isinstance(labels, dict) else None
         version = labels.get("org.opencontainers.image.version") if isinstance(labels, dict) else None
@@ -699,11 +743,12 @@ def _validate_target_image_proof(
                 version if isinstance(version, str) else "",
             ) is None
         ):
-            _fail(category)
+            reject("target-proof-image-identity")
         if forward:
             _forward_image(
                 image, engine_id,
-                FORWARD_TARGET["source"], FORWARD_TARGET["version"]
+                FORWARD_TARGET["source"], FORWARD_TARGET["version"],
+                "target-proof-image-identity",
             )
     return proof
 
@@ -2104,7 +2149,20 @@ def _forward_inventory_recheck(inventory: state_admission.Inventory, *,
     state_admission = _forward_state_module()
     try:
         inventory.recheck(added=added, removed=removed)
-    except (state_admission.Rejected, OSError, ValueError):
+    except state_admission.Rejected as exc:
+        checks = {
+            "root_changed": "inventory-root-identity",
+            "root_inventory_changed": "inventory-root-entries",
+            "witness_changed": "inventory-witness-identity",
+            "bytes_changed": "inventory-witness-content",
+            "descendants_changed": "inventory-descendants",
+            "named_binding": "inventory-named-binding",
+            "mount_escape": "inventory-mount",
+            "unsafe_acl": "inventory-acl",
+            "resource_budget": "inventory-resource",
+        }
+        _fail("recovery", checks.get(str(exc)))
+    except (OSError, ValueError):
         _fail("recovery")
 
 
@@ -2365,9 +2423,10 @@ def _forward_validate_external(witness: dict[str, Any],
         identity, data = _forward_read_original_base(witness["path"], origin, snapshots)
     else:
         identity, data = _forward_read_external(witness["path"])
-    if (identity != witness["identity"]
-            or data != snapshots[witness["snapshotRef"]]):
-        _fail("recovery")
+    if identity != witness["identity"]:
+        _fail("recovery", "origin-witness-identity")
+    if data != snapshots[witness["snapshotRef"]]:
+        _fail("recovery", "origin-witness-content")
 
 
 def _forward_saved_identity(data: bytes, actual: dict[str, int],
@@ -2378,7 +2437,7 @@ def _forward_saved_identity(data: bytes, actual: dict[str, int],
         "device", "inode", "mode", "uid", "gid", "size", "mtimeNs", "ctimeNs"
     )) + ":" + hashlib.sha256(content).hexdigest() + "\n"
     if data != expected.encode():
-        _fail("recovery")
+        _fail("recovery", "origin-file-identity")
 
 
 def _forward_deployment_lock(state_root: str) -> None:
@@ -2474,7 +2533,8 @@ def _forward_credential_preflight(marker: dict[str, Any],
 
 
 def _forward_image(image: dict[str, Any], image_id: str,
-                   revision: str, version: str) -> None:
+                   revision: str, version: str,
+                   check: str | None = None) -> None:
     config = image["Config"]
     labels = config["Labels"]
     if (image["Id"] != image_id or config["User"] != "10001:10001"
@@ -2484,7 +2544,7 @@ def _forward_image(image: dict[str, Any], image_id: str,
             or labels["org.opencontainers.image.version"] != version
             or labels["org.opencontainers.image.source"] !=
             "https://github.com/NickolayMamonov/meet-backend-v3"):
-        _fail("recovery")
+        _fail("recovery", check)
     _image_admission(image)
 
 
@@ -2954,12 +3014,22 @@ def _forward_adopt(state_root: str, request_data: bytes,
             _fail("recovery")
         _forward_inventory_recheck(
             inventory, added=frozenset({destination, temporary_pointer}))
-        os.replace(
-            temporary_pointer, pointer_name,
-            src_dir_fd=root_fd, dst_dir_fd=root_fd,
-        )
+        try:
+            os.replace(
+                temporary_pointer, pointer_name,
+                src_dir_fd=root_fd, dst_dir_fd=root_fd,
+            )
+        except OSError:
+            raise ProviderError(
+                ERRORS["recovery"], "pointer-replace", "other"
+            ) from None
         _forward_adopt_boundary("pointer-renamed")
-        os.fsync(root_fd)
+        try:
+            os.fsync(root_fd)
+        except OSError:
+            raise ProviderError(
+                ERRORS["recovery"], "pointer-replace-sync", "other"
+            ) from None
         _forward_adopt_boundary("pointer-replaced")
     finally:
         if inventory is not None:
@@ -4833,8 +4903,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    command = None
     try:
         args = _parser().parse_args(list(argv) if argv is not None else None)
+        command = args.command
         if args.command == "check":
             _check()
         elif args.command == "check-image":
@@ -4909,6 +4981,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
         return 0
     except ProviderError as exc:
+        if (command == "forward-adopt"
+                and exc.check in FORWARD_ADOPT_CHECKS
+                and exc.reason in FORWARD_ADOPT_REASONS):
+            sys.stderr.write(
+                "forward_adopt_rejected_check=" + exc.check
+                + " reason=" + exc.reason + "\n"
+            )
         sys.stderr.write(exc.category + "\n")
         return 1
     except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
