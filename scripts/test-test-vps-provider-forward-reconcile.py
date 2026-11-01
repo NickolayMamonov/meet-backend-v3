@@ -1163,6 +1163,83 @@ class StagedOwnershipTests(unittest.TestCase):
 
 
 class ForwardTests(FixtureTests):
+    def test_rendered_memory_requires_a_canonical_exact_positive_match(self):
+        fixture = self.fresh()
+
+        for inspected in (True, False, 805306368.0, 0, -1, 805306367, "805306368"):
+            with self.subTest(inspected=repr(inspected)):
+                backend = copy.deepcopy(fixture.backend)
+                backend["HostConfig"]["Memory"] = inspected
+                with self.assertRaises(helper.ProviderError) as error:
+                    helper._forward_rendered(
+                        fixture.rendered, backend, fixture.target, fixture.target_env)
+                self.assertEqual(error.exception.check, "rendered-hardening")
+
+        for rendered in (
+                True, False, 805306368.0, 0, -1, "+805306368", "-805306368",
+                " 805306368", "805306368 ", "805306368b", "0805306368",
+                "805306367", "805306369"):
+            with self.subTest(rendered=repr(rendered)):
+                config = copy.deepcopy(fixture.rendered)
+                config["services"]["backend"]["mem_limit"] = rendered
+                with self.assertRaises(helper.ProviderError) as error:
+                    helper._forward_rendered(
+                        config, fixture.backend, fixture.target, fixture.target_env)
+                self.assertEqual(error.exception.check, "rendered-hardening")
+
+        for rendered in (805306368, "805306368"):
+            with self.subTest(accepted=repr(rendered)):
+                config = copy.deepcopy(fixture.rendered)
+                config["services"]["backend"]["mem_limit"] = rendered
+                helper._forward_rendered(
+                    config, fixture.backend, fixture.target, fixture.target_env)
+
+    def test_production_compose_memory_normalization_matches_forward_admission(self):
+        compose = shutil.which("docker")
+        if compose is None:
+            self.skipTest("Docker Compose CLI is unavailable")
+        try:
+            version = subprocess.run(
+                [compose, "compose", "version"], capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            self.skipTest("Docker Compose CLI is unavailable")
+        if version.returncode != 0:
+            self.skipTest("Docker Compose CLI is unavailable")
+
+        process_env = {
+            key: os.environ[key]
+            for key in ("PATH", "HOME", "SYSTEMROOT", "WINDIR", "USERPROFILE")
+            if key in os.environ
+        }
+        process_env.update({
+            "BACKEND_IMAGE": IMAGE,
+            "BACKEND_VERSION": "1.6.0",
+            "BACKEND_REVISION": "e" * 40,
+            "DB_NAME": "fictional_db",
+            "DB_USERNAME": "fictional_user",
+            "DB_PASSWORD": "fictional_password",
+            "APP_JWT_SECRET": "fictional_jwt_secret",
+            "APP_STORAGE_BASE_URL": "https://example.invalid/uploads",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            project_dir = Path(directory)
+            (project_dir / ".env.production").write_bytes(b"")
+            result = subprocess.run(
+                [compose, "compose", "--project-directory", str(project_dir),
+                 "-f", str(SCRIPTS.parent / "docker-compose.production.yml"),
+                 "config", "--format", "json", "--no-env-resolution"],
+                cwd=project_dir, env=process_env, capture_output=True,
+                text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered_memory = json.loads(result.stdout)["services"]["backend"]["mem_limit"]
+        self.assertIs(type(rendered_memory), str)
+        self.assertEqual(rendered_memory, "805306368")
+
+        fixture = self.fresh()
+        fixture.rendered["services"]["backend"]["mem_limit"] = rendered_memory
+        helper._forward_rendered(
+            fixture.rendered, fixture.backend, fixture.target, fixture.target_env)
+
     def test_competing_deployment_lock_blocks_admission_without_publication(self):
         fixture = self.fresh()
         helper.fcntl.flock(9, helper.fcntl.LOCK_UN)

@@ -2907,7 +2907,15 @@ def _forward_rendered_record(config: dict[str, Any], backend: dict[str, Any],
             or service.get("security_opt") != ["no-new-privileges:true"]
             or service.get("restart") != "unless-stopped"
             or service["logging"]["driver"] != "local"
-            or service["mem_limit"] != backend["HostConfig"]["Memory"]
+            or type(backend["HostConfig"]["Memory"]) is not int
+            or backend["HostConfig"]["Memory"] <= 0
+            or not (
+                (type(service["mem_limit"]) is int
+                 and service["mem_limit"] > 0
+                 and service["mem_limit"] == backend["HostConfig"]["Memory"])
+                or (type(service["mem_limit"]) is str
+                    and service["mem_limit"] == str(backend["HostConfig"]["Memory"]))
+            )
             or service.get("entrypoint") is not None
             or service.get("command") is not None):
         _fail("recovery", "rendered-hardening")
