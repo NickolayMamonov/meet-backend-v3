@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.6.1](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.6.0...v1.6.1) (2026-11-01)
+
+
+### Fixes
+
+* accept proof-bound transaction pointer after prepare ([b795b2f](https://github.com/NickolayMamonov/meet-backend-v3/commit/b795b2f1e1fbcd25345738a7ca97628dbf250fd7))
+* admit validated foreign recovery state without mutation ([a58a09a](https://github.com/NickolayMamonov/meet-backend-v3/commit/a58a09a251e4c84f748b95ce1e03f49e6e9683b4))
+* authenticate recovery inputs and admit terminal metadata safely ([c052430](https://github.com/NickolayMamonov/meet-backend-v3/commit/c0524302ac38f32a24b90d7d0d2d240ef0e99119))
+* bind delivery-OFF inspections to local Docker daemon ([24abf5c](https://github.com/NickolayMamonov/meet-backend-v3/commit/24abf5cc672b21521e0744b32ad4ec08d415b13f))
+* bind selected platform proof to opaque Docker image identity ([6926e98](https://github.com/NickolayMamonov/meet-backend-v3/commit/6926e9847abac275577ff38b72a1b309c7abc0d6))
+* bound first v1.6.0 pending LocationIQ OFF transition ([466a9e7](https://github.com/NickolayMamonov/meet-backend-v3/commit/466a9e74a5bdabf606d0e0e283cffbf5f664d04e))
+* bound first v1.6.0 pending LocationIQ OFF transition ([addf74a](https://github.com/NickolayMamonov/meet-backend-v3/commit/addf74af9452d8e910fda030bf297c11f45479a3))
+* bound recovery inventory descriptors and retain authenticated oracle ([559cc58](https://github.com/NickolayMamonov/meet-backend-v3/commit/559cc5807afcf09c49f9969688f57e4971dc5fe4))
+* **deploy:** attribute reachable native adoption failures ([5213c4f](https://github.com/NickolayMamonov/meet-backend-v3/commit/5213c4f5ad0ae7a815ed9b9b52112a2812ae0145))
+* **deploy:** attribute reachable native adoption failures ([58dce47](https://github.com/NickolayMamonov/meet-backend-v3/commit/58dce47cf89b7332612cb7ebdbd66af6a9a71583))
+* **deploy:** attribute selected native adoption rejections ([c251bc6](https://github.com/NickolayMamonov/meet-backend-v3/commit/c251bc6b7bc9650fd58bce422ba14393b9f61f72))
+* **deploy:** attribute selected native adoption rejections ([7c9b383](https://github.com/NickolayMamonov/meet-backend-v3/commit/7c9b383c07f6edce0bce3c38262f74fc62d56b1c))
+* **deploy:** keep root fallback outside recovery admission ([a53f073](https://github.com/NickolayMamonov/meet-backend-v3/commit/a53f0736baac4a8ff7f1324d82bbeea98f45095d))
+* **deploy:** pin exact observed predecessor image identity ([7b26640](https://github.com/NickolayMamonov/meet-backend-v3/commit/7b26640fe16e90307d8f17f9d97c56ce55435792))
+* **deploy:** pin exact observed predecessor image identity ([0fd9de0](https://github.com/NickolayMamonov/meet-backend-v3/commit/0fd9de019cb78f6d67220bb6a8d3e5f742a1080e))
+* **deploy:** reconcile exact failed v1.6.0 deployment forward ([dd1d558](https://github.com/NickolayMamonov/meet-backend-v3/commit/dd1d558d2e2cb2a21d91a2beacabfcf9de209cfb))
+* **deploy:** reconcile exact failed v1.6.0 deployment forward ([a9a948e](https://github.com/NickolayMamonov/meet-backend-v3/commit/a9a948e368b1e6dab06db4d029e183f77fd59f1b))
+* normalize staged deployment tooling ownership ([34f3b8a](https://github.com/NickolayMamonov/meet-backend-v3/commit/34f3b8a72c20872ec36fb93b6a0e4bb42b090621))
+* normalize staged deployment tooling ownership ([0190f00](https://github.com/NickolayMamonov/meet-backend-v3/commit/0190f00f64624e0ace26f81ae36a5ca8b570685f))
+* pin delivery-off inspections to controlled local Docker daemon ([a87acb9](https://github.com/NickolayMamonov/meet-backend-v3/commit/a87acb9a31add5b54cae4b51912a80a0fafa3e7f))
+* preserve native producer validation and complete admission evidence ([749ebeb](https://github.com/NickolayMamonov/meet-backend-v3/commit/749ebeb0a107a46750688cfb2129f8503a62eb88))
+* preserve selected-platform proof across SSH evidence transport ([a713bf7](https://github.com/NickolayMamonov/meet-backend-v3/commit/a713bf7d61021149a9968c0ef71652e4543b19d5))
+* recheck pending witness immediately before cleanup finalization ([8efb282](https://github.com/NickolayMamonov/meet-backend-v3/commit/8efb282607f4677b1139fb4c4b59a698ba397133))
+* **recovery:** authenticate historical original compose witness ([f04cecd](https://github.com/NickolayMamonov/meet-backend-v3/commit/f04cecdd4a9f8f716174b87ec3be0e03b6a5e190))
+* **recovery:** clean runtime probe allocations ([75fd5d3](https://github.com/NickolayMamonov/meet-backend-v3/commit/75fd5d3c4a8a60b1a062c631e21784d29e6cac48))
+* retain pending-file witness during predecessor cleanup ([1a3e16a](https://github.com/NickolayMamonov/meet-backend-v3/commit/1a3e16aca01190e539f2bcfa28853d78711b4beb))
+* retain strict defaults for extracted legacy preflight callers ([503b6b5](https://github.com/NickolayMamonov/meet-backend-v3/commit/503b6b592123cf013e2e0ae8f78291de6d7ca80e))
+* **test-vps:** forward explicit up verb through provider compose helper ([a763499](https://github.com/NickolayMamonov/meet-backend-v3/commit/a763499684e20656c1b3dea29f665c479a36d319))
+* **test-vps:** preserve explicit Compose up routing ([6431708](https://github.com/NickolayMamonov/meet-backend-v3/commit/64317088ae3de2ef12f67303e153bd1566ffefb3))
+
 ## [1.6.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.5.1...v1.6.0) (2026-10-26)
 
 
