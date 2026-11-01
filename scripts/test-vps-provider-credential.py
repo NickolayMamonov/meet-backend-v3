@@ -107,32 +107,136 @@ class ProviderError(Exception):
         self.reason = reason
 
 
-def _fail(category: str, check: str | None = None) -> None:
-    raise ProviderError(ERRORS[category], check)
+def _fail(category: str, check: str | None = None,
+          reason: str = "rejected") -> None:
+    raise ProviderError(ERRORS[category], check, reason)
 
 
-FORWARD_ADOPT_CHECKS = frozenset({
-    "target-proof-shape",
-    "target-proof-reference",
-    "target-proof-identity",
-    "target-proof-index",
-    "target-proof-platform",
-    "target-proof-image-identity",
-    "origin-witness-content",
-    "origin-witness-identity",
-    "inventory-root-identity",
-    "inventory-root-entries",
-    "inventory-witness-identity",
-    "inventory-witness-content",
-    "inventory-descendants",
-    "inventory-named-binding",
-    "inventory-mount",
-    "inventory-acl",
-    "inventory-resource",
-    "origin-file-identity",
-    "pointer-replace",
-    "pointer-replace-sync",
-})
+def _os_error(check: str, error: OSError,
+              category: str = "recovery") -> ProviderError:
+    # Never include strerror, filenames, or exception text in public output.
+    reason = {
+        errno.ENOENT: "missing",
+        errno.EACCES: "denied",
+        errno.EPERM: "denied",
+        errno.ESTALE: "changed",
+    }.get(error.errno, "other")
+    return ProviderError(ERRORS[category], check, reason)
+
+
+def _close_fd(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError as exc:
+        raise _os_error("descriptor-close", exc) from None
+
+
+FORWARD_ADOPT_CHECKS = frozenset("""
+    stdin-read stdin-shape json-content json-decoding result-write
+    descriptor-close directory-lock directory-scan filesystem-acl
+    ancestor-open ancestor-inspection ancestor-metadata ancestor-close
+    protected-parent-open protected-parent-path protected-parent-walk
+    protected-reference-binding protected-reference-path protected-reference-symlink
+    state-name state-root-fstat state-root-metadata state-root-path state-root-stat
+    state-directory-fstat state-directory-metadata state-directory-stat state-directory-type
+    state-proof-digest state-proof-presence state-proof-stat state-proof-version
+    state-rename state-rename-name state-rename-source state-rename-support
+    owner-marker-binding owner-marker-fields owner-marker-metadata
+    owner-marker-request owner-marker-shape owner-marker-size
+    private-file-identity private-file-metadata private-file-name
+    private-file-open private-file-read
+    private-write-close private-write-content private-write-name private-write-open
+    witness-read witness-size
+    transaction-marker-binding transaction-marker-disposition
+    transaction-marker-phase transaction-marker-provider transaction-marker-shape
+
+    target-proof-shape target-proof-reference target-proof-identity target-proof-index
+    target-proof-platform target-proof-image-identity previous-image-binding image-record-shape
+    pending-module-load pending-module-shape
+    stopped-predecessor stopped-environment stopped-snapshot-binding stopped-image-binding
+    stopped-record-shape stopped-static-shape stopped-network-shape stopped-network-aliases
+    stopped-mount-shape stopped-upload-mount stopped-tmpfs-mount stopped-credential-mount
+    stopped-mount-destination stopped-mount-set stopped-hardening stopped-ports
+    rendered-shape rendered-hardening rendered-environment rendered-provider rendered-ports
+    rendered-mount-set rendered-mount-count rendered-upload-mount rendered-credential-mount
+    rendered-health-volumes
+
+    deployment-lock-acquire deployment-lock-binding deployment-lock-descriptor
+    admission-arguments admission-bundle admission-origin-inventory admission-origin-children
+    admission-snapshot-budget admission-source-content admission-active-snapshots
+    admission-environment-transition admission-environment-shape
+    admission-archive-parent admission-secret-reflection
+    external-file-open external-file-metadata external-file-identity external-file-read
+    pinned-ancestor-root-open pinned-ancestor-metadata pinned-ancestor-identity
+    pinned-ancestor-binding pinned-ancestor-inspection
+    historical-base-path historical-origin-stat historical-origin-metadata
+    historical-authority-group historical-authority-content historical-authority-recheck
+    historical-authority-stat historical-base-open historical-base-stat
+    historical-base-metadata historical-base-content historical-base-recheck
+    historical-base-recheck-stat
+    origin-witness-identity origin-witness-content origin-file-identity
+    origin-directory-open origin-directory-identity origin-directory-recheck
+    origin-child-name origin-child-set origin-child-identity origin-terminal-absent
+    origin-child-type origin-child-open-identity origin-child-named-identity origin-child-content
+    origin-directory-final-identity origin-directory-read
+    archive-parent-stat archive-parent-identity archive-destination-stat archive-destination-absent
+
+    credential-provider-binding credential-disabled-transaction credential-disposition
+    credential-source-binding credential-reused-children credential-transaction-interlock
+    credential-parent-metadata credential-parent-identity credential-parent-open
+    credential-transaction-type credential-transaction-stat credential-transaction-metadata
+    credential-transaction-list credential-transaction-children credential-transaction-required
+    credential-transaction-symlink credential-snapshot-open credential-snapshot-metadata
+    credential-snapshot-size credential-snapshot-read credential-snapshot-close
+    credential-identity-shape credential-identity-version credential-identity-fields
+    credential-identity-values credential-file-read credential-publication-type
+    credential-publication-read credential-publication-stat credential-publication-binding
+
+    inventory-module-spec inventory-module-load inventory-pointer-shape
+    inventory-root-scan inventory-transaction-interlock inventory-state-stat inventory-state-type
+    inventory-state-open inventory-state-identity inventory-state-children inventory-state-read
+    inventory-constructor-io inventory-constructor-value inventory-recheck-io inventory-recheck-value
+    inventory-close inventory-root-identity inventory-root-entries inventory-witness-identity
+    inventory-witness-content inventory-descendants inventory-named-binding inventory-root-binding
+    inventory-mount inventory-mount-unavailable inventory-acl inventory-acl-unavailable
+    inventory-resource inventory-entry-budget inventory-name-budget inventory-depth-budget
+    inventory-file-budget inventory-read-budget inventory-record-budget inventory-short-read
+    inventory-root-path inventory-ancestor inventory-inode inventory-type inventory-duplicate-witness
+    inventory-duplicate-key inventory-json inventory-record inventory-generation-name
+    inventory-manifest-encoding inventory-selector-encoding inventory-selector
+    inventory-dangling-selector inventory-smtp-transaction inventory-orphan-transaction
+    inventory-beta-cleanliness inventory-beta-terminal inventory-probe-sidecar inventory-unknown-entry
+
+    receipt-file-identity receipt-source-path receipt-shape receipt-origin receipt-successor
+    receipt-marker-shape receipt-marker-encoding receipt-marker-binding receipt-marker-disposition
+    receipt-credential-owner receipt-target receipt-archive receipt-witness-list receipt-witness-shape
+    receipt-witness-order receipt-witness-metadata receipt-origin-witness receipt-origin-identity
+    receipt-owner-witness receipt-owner-encoding receipt-external-witness receipt-child-path
+    receipt-child-role receipt-child-forbidden receipt-child-snapshot receipt-directory-payload
+    receipt-file-links receipt-file-payload receipt-file-encoding receipt-witness-kind
+    receipt-witness-set receipt-stopped-shape receipt-stopped-binding receipt-size
+
+    adopt-request-shape adopt-receipt-encoding adopt-successor adopt-request-budget
+    adopt-snapshot-name adopt-snapshot-encoding adopt-snapshot-set adopt-snapshot-budget
+    adopt-root-open adopt-root-stat adopt-root-identity adopt-root-binding adopt-destination-stat
+    adopt-destination-absent adopt-temporary-stat adopt-temporary-absent adopt-pointer-stat
+    adopt-pointer-witness adopt-pointer-binding adopt-staging-create adopt-staging-open
+    adopt-staging-metadata adopt-staging-stat adopt-staging-sync adopt-staging-parent-sync adopt-published-open
+    adopt-published-identity adopt-published-stat adopt-published-parent-sync
+    adopt-pointer-recheck-stat adopt-pointer-recheck adopt-credential-parent-binding
+    adopt-credential-parent-stat adopt-archive-root-stat
+    adopt-pointer-final-witness pointer-replace pointer-replace-sync
+
+    acceptance-shape acceptance-binding terminal-shape terminal-binding terminal-metadata
+    retained-receipt-children retained-receipt-pair retained-receipt-kind retained-terminal-binding
+    retained-credential-transaction retained-archive-stat retained-archive-metadata
+    retained-archive-identity retained-archive-source-absent retained-archive-witness-kind
+    retained-archive-witness-identity retained-archive-child-name retained-archive-witness-count
+    retained-archive-parent-identity retained-archive-list retained-archive-child-set
+    retained-archive-open retained-archive-open-identity retained-archive-child-stat
+    retained-archive-child-identity retained-archive-child-type retained-archive-child-open-identity
+    retained-archive-child-content retained-archive-final-identity retained-archive-read
+""".split())
 FORWARD_ADOPT_REASONS = frozenset({
     "missing", "denied", "changed", "rejected", "other",
 })
@@ -141,11 +245,19 @@ FORWARD_ADOPT_REASONS = frozenset({
 def _lock_directory(fd: int) -> None:
     if fcntl is None:
         _fail("prerequisite")
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        raise _os_error("directory-lock", exc) from None
 
 
 def _bounded_stdin(limit: int) -> bytes:
-    data = sys.stdin.buffer.read(limit + 1)
+    try:
+        data = sys.stdin.buffer.read(limit + 1)
+    except OSError as exc:
+        raise _os_error("stdin-read", exc) from None
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "stdin-shape")
     if len(data) > limit:
         _fail("provider")
     return data
@@ -175,7 +287,7 @@ def _depth(value: Any, level: int = 0) -> None:
 
 
 def _json(data: bytes, category: str = "provider",
-          check: str | None = None) -> Any:
+          check: str | None = "json-content") -> Any:
     try:
         value = json.loads(
             data.decode("utf-8"),
@@ -183,6 +295,8 @@ def _json(data: bytes, category: str = "provider",
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ProviderError):
         _fail(category, check)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "json-decoding")
     _depth(value)
     return value
 
@@ -196,18 +310,21 @@ def _run_key(value: str) -> str:
 
 
 def _result(enabled: bool, present: bool, read_only: bool, outcome: str) -> None:
-    print(
-        json.dumps(
-            {
-                "schemaVersion": SCHEMA_VERSION,
-                "providerEnabled": bool(enabled),
-                "credentialMountPresent": bool(present),
-                "credentialMountReadOnly": bool(read_only),
-                "outcome": outcome,
-            },
-            separators=(",", ":"),
+    try:
+        print(
+            json.dumps(
+                {
+                    "schemaVersion": SCHEMA_VERSION,
+                    "providerEnabled": bool(enabled),
+                    "credentialMountPresent": bool(present),
+                    "credentialMountReadOnly": bool(read_only),
+                    "outcome": outcome,
+                },
+                separators=(",", ":"),
+            )
         )
-    )
+    except OSError as exc:
+        raise _os_error("result-write", exc) from None
 
 
 def _mode_is_safe(mode: int, *, source: bool = False) -> bool:
@@ -251,9 +368,9 @@ def _acl_is_safe(
                 errno.EOPNOTSUPP if hasattr(errno, "EOPNOTSUPP") else errno.ENOTSUP,
             ):
                 _fail("prerequisite")
-            _fail(category)
+            raise _os_error("filesystem-acl", exc, category) from None
         else:
-            _fail(category)
+            _fail(category, "filesystem-acl")
     return True
 
 
@@ -268,13 +385,16 @@ def _components(path: str) -> tuple[str, list[str]]:
 
 def _check_ancestors(path: str, *, category: str = "credential") -> None:
     base, parts = _components(path)
-    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise _os_error("ancestor-open", exc) from None
     try:
         root_info = os.fstat(fd)
         if root_info.st_uid != 0 or stat.S_IMODE(root_info.st_mode) & (
             stat.S_IWGRP | stat.S_IWOTH
         ):
-            _fail(category)
+            _fail(category, "ancestor-metadata")
         _acl_is_safe(
             f"/proc/self/fd/{fd}",
             follow_symlinks=True,
@@ -289,14 +409,19 @@ def _check_ancestors(path: str, *, category: str = "credential") -> None:
             if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & (
                 stat.S_IWGRP | stat.S_IWOTH
             ):
-                _fail(category)
+                _fail(category, "ancestor-metadata")
             _acl_is_safe(
                 f"/proc/self/fd/{fd}",
                 follow_symlinks=True,
                 category=category,
             )
+    except OSError as exc:
+        raise _os_error("ancestor-inspection", exc) from None
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise _os_error("ancestor-close", exc) from None
 
 
 def _open_regular(path: str, *, max_bytes: int, source: bool = False) -> tuple[int, os.stat_result, bytes]:
@@ -343,8 +468,11 @@ def _open_regular(path: str, *, max_bytes: int, source: bool = False) -> tuple[i
         if _identity(after) != _identity(final) or after.st_size != final.st_size:
             _fail("changed")
         return fd, before, bytes(data)
+    except OSError as exc:
+        _close_fd(fd)
+        raise _os_error("credential-file-read", exc) from None
     except Exception:
-        os.close(fd)
+        _close_fd(fd)
         raise
 
 
@@ -379,15 +507,18 @@ def _stable_entry_identity(info: os.stat_result) -> tuple[int, ...]:
 
 
 def _read_fd_bounded(fd: int, limit: int) -> bytes:
-    os.lseek(fd, 0, os.SEEK_SET)
-    data = bytearray()
-    while len(data) <= limit:
-        chunk = os.read(fd, min(65536, limit + 1 - len(data)))
-        if not chunk:
-            break
-        data.extend(chunk)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = bytearray()
+        while len(data) <= limit:
+            chunk = os.read(fd, min(65536, limit + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+    except OSError as exc:
+        raise _os_error("witness-read", exc) from None
     if len(data) > limit:
-        _fail("recovery")
+        _fail("recovery", "witness-size")
     return bytes(data)
 
 
@@ -635,6 +766,18 @@ def _validate_target_image_proof(
     *,
     forward: bool = False,
 ) -> dict[str, Any]:
+    try:
+        return _target_image_proof_record(proof, image, forward=forward)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "target-proof-shape")
+
+
+def _target_image_proof_record(
+    proof: Any,
+    image: dict[str, Any] | None,
+    *,
+    forward: bool = False,
+) -> dict[str, Any]:
     proof_keys = {
         "indexRef",
         "rawIndexBase64",
@@ -847,13 +990,16 @@ def _write_private_at(
     gid: int = 0,
 ) -> None:
     if not name or "/" in name or "\x00" in name:
-        _fail("recovery")
-    fd = os.open(
-        name,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        mode,
-        dir_fd=directory_fd,
-    )
+        _fail("recovery", "private-write-name")
+    try:
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise _os_error("private-write-open", exc) from None
     try:
         offset = 0
         while offset < len(data):
@@ -863,8 +1009,13 @@ def _write_private_at(
         os.fchmod(fd, mode)
         _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
         os.fsync(fd)
+    except OSError as exc:
+        raise _os_error("private-write-content", exc) from None
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise _os_error("private-write-close", exc) from None
 
 
 def _rename_noreplace_boundary(
@@ -892,14 +1043,17 @@ def _rename_noreplace(
         or "\x00" in source
         or "\x00" in destination
     ):
-        _fail("recovery")
+        _fail("recovery", "state-rename-name")
     if expected_source_fd is not None:
-        opened = os.fstat(expected_source_fd)
-        current = os.stat(
-            source,
-            dir_fd=directory_fd,
-            follow_symlinks=False,
-        )
+        try:
+            opened = os.fstat(expected_source_fd)
+            current = os.stat(
+                source,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise _os_error("state-rename-source", exc) from None
         if (
             not stat.S_ISDIR(opened.st_mode)
             or not stat.S_ISDIR(current.st_mode)
@@ -909,13 +1063,13 @@ def _rename_noreplace(
                 and (opened.st_dev, opened.st_ino) != expected_source_inode
             )
         ):
-            _fail("recovery")
+            _fail("recovery", "state-rename-source", "changed")
     _rename_noreplace_boundary(directory_fd, source, destination)
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = libc.renameat2
     except (AttributeError, OSError):
-        _fail("recovery")
+        _fail("recovery", "state-rename-support")
     renameat2.argtypes = (
         ctypes.c_int,
         ctypes.c_char_p,
@@ -933,8 +1087,7 @@ def _rename_noreplace(
     )
     if result != 0:
         # EEXIST, ENOSYS and unsupported filesystems are all recovery states.
-        ctypes.get_errno()
-        _fail("recovery")
+        raise _os_error("state-rename", OSError(ctypes.get_errno(), "")) from None
 
 
 def _state_parts(name: str) -> tuple[str, str]:
@@ -943,7 +1096,7 @@ def _state_parts(name: str) -> tuple[str, str]:
         name,
     )
     if match is None:
-        _fail("recovery")
+        _fail("recovery", "state-name")
     return match.group("run"), match.group("kind")
 
 
@@ -954,7 +1107,7 @@ def _state_marker(
     target_image_proof: bytes | None = None,
 ) -> bytes:
     if re.fullmatch(STATE_RUN_KEY_RE, run_key) is None or state_kind not in STATE_KINDS:
-        _fail("recovery")
+        _fail("recovery", "owner-marker-request")
     value = {
         "schemaVersion": 2 if target_image_proof is not None else 1,
         "owner": OWNER,
@@ -974,10 +1127,10 @@ def _parse_state_marker(
     state_kind: str,
 ) -> tuple[int, str | None]:
     if len(data) > MAX_OWNER_BYTES:
-        _fail("recovery")
+        _fail("recovery", "owner-marker-size")
     value = _json(data, "recovery")
     if not isinstance(value, dict):
-        _fail("recovery")
+        _fail("recovery", "owner-marker-shape")
     schema_version = value.get("schemaVersion")
     expected = {
         "schemaVersion", "owner", "runKey", "stateKind",
@@ -985,7 +1138,7 @@ def _parse_state_marker(
     if schema_version == 2:
         expected.add("targetImageProofSha256")
     if set(value) != expected:
-        _fail("recovery")
+        _fail("recovery", "owner-marker-fields")
     if (
         type(value["schemaVersion"]) is not int
         or value["schemaVersion"] not in (1, 2)
@@ -1003,7 +1156,7 @@ def _parse_state_marker(
             ) is None
         )
     ):
-        _fail("recovery")
+        _fail("recovery", "owner-marker-binding")
     return schema_version, value.get("targetImageProofSha256")
 
 
@@ -1015,12 +1168,12 @@ def _validate_state_image_proof(
     proof_path = os.path.join(path, TARGET_IMAGE_PROOF)
     if schema_version == 1:
         if os.path.lexists(proof_path):
-            _fail("recovery")
+            _fail("recovery", "state-proof-version")
         return
     fd, _, data = _open_private_state_file(proof_path)
-    os.close(fd)
+    _close_fd(fd)
     if hashlib.sha256(data).hexdigest() != expected_digest:
-        _fail("recovery")
+        _fail("recovery", "state-proof-digest", "changed")
     proof = _json(data, "recovery")
     _validate_target_image_proof(proof, None)
 
@@ -1035,13 +1188,15 @@ def _validate_state_image_proof_fd(
     except FileNotFoundError:
         if schema_version == 1:
             return
-        _fail("recovery")
+        _fail("recovery", "state-proof-presence", "missing")
+    except OSError as exc:
+        raise _os_error("state-proof-stat", exc) from None
     if schema_version == 1:
-        _fail("recovery")
+        _fail("recovery", "state-proof-version")
     fd, _, data = _open_private_state_file_at(directory_fd, TARGET_IMAGE_PROOF)
-    os.close(fd)
+    _close_fd(fd)
     if hashlib.sha256(data).hexdigest() != expected_digest:
-        _fail("recovery")
+        _fail("recovery", "state-proof-digest", "changed")
     proof = _json(data, "recovery")
     _validate_target_image_proof(proof, None)
 
@@ -1112,20 +1267,23 @@ def _validate_state_target_container(
 def _validate_state_directory(path: str, name: str) -> tuple[str, str]:
     run_key, state_kind = _state_parts(name)
     if os.path.islink(path) or not os.path.isdir(path):
-        _fail("recovery")
-    info = os.stat(path, follow_symlinks=False)
+        _fail("recovery", "state-directory-type")
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise _os_error("state-directory-stat", exc) from None
     if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
-        _fail("recovery")
+        _fail("recovery", "state-directory-metadata")
     _acl_is_safe(path, category="recovery")
     marker = os.path.join(path, OWNER_MARKER)
     fd, marker_info, data = _open_private_state_file(marker)
-    os.close(fd)
+    _close_fd(fd)
     if (
         marker_info.st_uid != 0
         or marker_info.st_nlink != 1
         or stat.S_IMODE(marker_info.st_mode) != 0o600
     ):
-        _fail("recovery")
+        _fail("recovery", "owner-marker-metadata")
     schema_version, proof_digest = _parse_state_marker(data, run_key, state_kind)
     _validate_state_image_proof(path, schema_version, proof_digest)
     return run_key, state_kind
@@ -1135,8 +1293,8 @@ def _open_private_state_file(path: str) -> tuple[int, os.stat_result, bytes]:
     _check_ancestors(path, category="recovery")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        _fail("recovery")
+    except OSError as exc:
+        raise _os_error("private-file-open", exc) from None
     try:
         info = os.fstat(fd)
         if (
@@ -1145,15 +1303,18 @@ def _open_private_state_file(path: str) -> tuple[int, os.stat_result, bytes]:
             or stat.S_IMODE(info.st_mode) != 0o600
             or info.st_nlink != 1
         ):
-            _fail("recovery")
+            _fail("recovery", "private-file-metadata")
         _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
         data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
         final = os.fstat(fd)
         if _identity(info) != _identity(final):
-            _fail("recovery")
+            _fail("recovery", "private-file-identity", "changed")
         return fd, info, data
+    except OSError as exc:
+        _close_fd(fd)
+        raise _os_error("private-file-read", exc) from None
     except Exception:
-        os.close(fd)
+        _close_fd(fd)
         raise
 
 
@@ -1162,15 +1323,15 @@ def _open_private_state_file_at(
     name: str,
 ) -> tuple[int, os.stat_result, bytes]:
     if not name or "/" in name or "\x00" in name:
-        _fail("recovery")
+        _fail("recovery", "private-file-name")
     try:
         fd = os.open(
             name,
             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=directory_fd,
         )
-    except OSError:
-        _fail("recovery")
+    except OSError as exc:
+        raise _os_error("private-file-open", exc) from None
     try:
         info = os.fstat(fd)
         if (
@@ -1179,15 +1340,18 @@ def _open_private_state_file_at(
             or stat.S_IMODE(info.st_mode) != 0o600
             or info.st_nlink != 1
         ):
-            _fail("recovery")
+            _fail("recovery", "private-file-metadata")
         _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
         data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
         final = os.fstat(fd)
         if _identity(info) != _identity(final):
-            _fail("recovery")
+            _fail("recovery", "private-file-identity", "changed")
         return fd, info, data
+    except OSError as exc:
+        _close_fd(fd)
+        raise _os_error("private-file-read", exc) from None
     except Exception:
-        os.close(fd)
+        _close_fd(fd)
         raise
 
 
@@ -1353,7 +1517,7 @@ def _read_existing(path: str, source: bool = False) -> tuple[dict[str, int], byt
     try:
         return _identity(info), data
     finally:
-        os.close(fd)
+        _close_fd(fd)
 
 
 def _revalidate_open_source(
@@ -1387,12 +1551,12 @@ def _read_private(path: str) -> bytes:
     _check_ancestors(path, category="recovery")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        _fail("recovery")
+    except OSError as exc:
+        raise _os_error("credential-snapshot-open", exc) from None
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
-            _fail("recovery")
+            _fail("recovery", "credential-snapshot-metadata")
         _acl_is_safe(
             f"/proc/self/fd/{fd}",
             follow_symlinks=True,
@@ -1405,10 +1569,15 @@ def _read_private(path: str) -> bytes:
                 break
             data.extend(chunk)
         if len(data) > MAX_CREDENTIAL_BYTES:
-            _fail("recovery")
+            _fail("recovery", "credential-snapshot-size")
         return bytes(data)
+    except OSError as exc:
+        raise _os_error("credential-snapshot-read", exc) from None
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise _os_error("credential-snapshot-close", exc) from None
 
 
 def _record(tx: str, predecessor: dict[str, int], durable: dict[str, int]) -> None:
@@ -1440,7 +1609,7 @@ def _marker(state_root: str, run_key: str) -> dict[str, Any]:
     if isinstance(value, dict) and value.get("schemaVersion") == 2:
         expected_keys.add("targetImageProofSha256")
     if not isinstance(value, dict) or set(value) != expected_keys:
-        _fail("recovery")
+        _fail("recovery", "transaction-marker-shape")
     if (
         type(value["schemaVersion"]) is not int
         or value["schemaVersion"] not in (SCHEMA_VERSION, 2)
@@ -1453,7 +1622,7 @@ def _marker(state_root: str, run_key: str) -> dict[str, Any]:
             ) is None
         )
     ):
-        _fail("recovery")
+        _fail("recovery", "transaction-marker-binding")
     if value["phase"] not in (
         "preparing",
         "prepared",
@@ -1462,11 +1631,11 @@ def _marker(state_root: str, run_key: str) -> dict[str, Any]:
         "rolling-back",
         "finalizing",
     ):
-        _fail("recovery")
+        _fail("recovery", "transaction-marker-phase")
     if value["durableDisposition"] not in ("none", "created", "reused"):
-        _fail("recovery")
+        _fail("recovery", "transaction-marker-disposition")
     if type(value["providerEnabled"]) is not bool:
-        _fail("recovery")
+        _fail("recovery", "transaction-marker-provider")
     return value
 
 
@@ -1511,9 +1680,9 @@ def _validate_identity(value: Any) -> None:
         "predecessor",
         "durable",
     }:
-        _fail("recovery")
+        _fail("recovery", "credential-identity-shape")
     if type(value["schemaVersion"]) is not int or value["schemaVersion"] != SCHEMA_VERSION:
-        _fail("recovery")
+        _fail("recovery", "credential-identity-version")
     for record in (value["predecessor"], value["durable"]):
         if not isinstance(record, dict) or set(record) != {
             "device",
@@ -1521,12 +1690,12 @@ def _validate_identity(value: Any) -> None:
             "mtimeNs",
             "ctimeNs",
         }:
-            _fail("recovery")
+            _fail("recovery", "credential-identity-fields")
         if any(
             type(record[key]) is not int or record[key] < 0
             for key in record
         ):
-            _fail("recovery")
+            _fail("recovery", "credential-identity-values")
 
 
 FORWARD_IDENTITY_KEYS = frozenset(
@@ -1556,7 +1725,7 @@ FORWARD_REQUIRED_CHILDREN = frozenset({
 def _forward_identity(value: Any) -> None:
     if (not isinstance(value, dict) or set(value) != FORWARD_IDENTITY_KEYS
             or any(type(item) is not int or item < 0 for item in value.values())):
-        _fail("recovery")
+        _fail("recovery", "receipt-file-identity")
 
 
 def _forward_identity_from_stat(info: os.stat_result) -> dict[str, int]:
@@ -1577,7 +1746,7 @@ def _forward_path(value: Any) -> None:
     if (not isinstance(value, str) or not value.startswith("/")
             or "\x00" in value
             or any(part in ("", ".", "..") for part in value.split("/")[1:])):
-        _fail("recovery")
+        _fail("recovery", "receipt-source-path")
 
 
 def _forward_external_paths(successor: str) -> dict[str, str]:
@@ -1604,6 +1773,13 @@ def _forward_original_base_witness(witness: dict[str, Any]) -> bool:
 
 def _forward_static(inspect: dict[str, Any]) -> dict[str, Any]:
     """Only the nonsecret fields compared by stopped-runtime admission."""
+    try:
+        return _forward_static_record(inspect)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "stopped-static-shape")
+
+
+def _forward_static_record(inspect: dict[str, Any]) -> dict[str, Any]:
     config, host = inspect["Config"], inspect["HostConfig"]
     mounts = [{
         "type": mount.get("Type", ""),
@@ -1651,6 +1827,13 @@ def _forward_static(inspect: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_forward_static(value: Any) -> None:
+    try:
+        _validate_forward_static_record(value)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "stopped-static-shape")
+
+
+def _validate_forward_static_record(value: Any) -> None:
     if (not isinstance(value, dict) or set(value) != {
             "entrypoint", "cmd", "user", "mounts", "networks", "hardening"}
             or value["entrypoint"] != ["java", "-jar", "app.jar"]
@@ -1659,7 +1842,7 @@ def _validate_forward_static(value: Any) -> None:
             or not isinstance(value["mounts"], list)
             or not isinstance(value["networks"], list)
             or len(value["networks"]) != 1):
-        _fail("recovery")
+        _fail("recovery", "stopped-static-shape")
     network = value["networks"][0]
     if (not isinstance(network, dict) or set(network) != {
             "network", "aliases", "driverOpts", "ipAddress", "ipPrefixLen", "gateway",
@@ -1672,12 +1855,12 @@ def _validate_forward_static(value: Any) -> None:
             or not isinstance(network["driverOpts"], dict)
             or any(not isinstance(key, str) or not isinstance(item, str)
                    for key, item in network["driverOpts"].items())):
-        _fail("recovery")
+        _fail("recovery", "stopped-network-shape")
     for key in ("aliases", "links"):
         if (not isinstance(network[key], list)
                 or any(not isinstance(item, str) for item in network[key])
                 or network[key] != sorted(set(network[key]))):
-            _fail("recovery")
+            _fail("recovery", "stopped-network-aliases")
     destinations = []
     for mount in value["mounts"]:
         if (not isinstance(mount, dict) or set(mount) != {
@@ -1685,24 +1868,24 @@ def _validate_forward_static(value: Any) -> None:
                 or any(not isinstance(mount[key], str) for key in (
                     "type", "source", "destination", "propagation"))
                 or type(mount["readOnly"]) is not bool):
-            _fail("recovery")
+            _fail("recovery", "stopped-mount-shape")
         destinations.append(mount["destination"])
         if mount["destination"] == "/data/uploads":
             if (mount["type"] != "volume"
                     or mount["source"] != "meet-production_uploads_data"
                     or mount["readOnly"]):
-                _fail("recovery")
+                _fail("recovery", "stopped-upload-mount")
         elif mount["destination"] == "/tmp":
             if mount["type"] != "tmpfs":
-                _fail("recovery")
+                _fail("recovery", "stopped-tmpfs-mount")
         elif mount["destination"] == CONTAINER_CREDENTIAL_PATH:
             if mount["type"] != "bind" or not mount["readOnly"]:
-                _fail("recovery")
+                _fail("recovery", "stopped-credential-mount")
         else:
-            _fail("recovery")
+            _fail("recovery", "stopped-mount-destination")
     if (destinations != sorted(set(destinations))
             or "/data/uploads" not in destinations):
-        _fail("recovery")
+        _fail("recovery", "stopped-mount-set")
     hardening = value["hardening"]
     if (not isinstance(hardening, dict) or set(hardening) != {
             "readOnly", "restart", "logging", "capDrop", "securityOpt", "tmpfs",
@@ -1729,7 +1912,7 @@ def _validate_forward_static(value: Any) -> None:
                 "http://127.0.0.1:8080/meetings"]
             or not isinstance(hardening["ports"], dict)
             or set(hardening["ports"]) != {"8080/tcp"}):
-        _fail("recovery")
+        _fail("recovery", "stopped-hardening")
     ports = hardening["ports"]["8080/tcp"]
     if (not isinstance(ports, list) or len(ports) != 1
             or not isinstance(ports[0], dict)
@@ -1738,11 +1921,18 @@ def _validate_forward_static(value: Any) -> None:
             or not isinstance(ports[0]["HostPort"], str)
             or not re.fullmatch(r"[1-9][0-9]{0,4}", ports[0]["HostPort"])
             or int(ports[0]["HostPort"]) > 65535):
-        _fail("recovery")
+        _fail("recovery", "stopped-ports")
 
 
 def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any]:
     """Strictly validate the immutable origin-to-successor ownership receipt."""
+    try:
+        return _validate_forward_adoption_record(data, successor_key)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "receipt-shape")
+
+
+def _validate_forward_adoption_record(data: bytes, successor_key: str) -> dict[str, Any]:
     value = _json(data, "recovery")
     expected = {
         "schemaVersion", "originRunKey", "successorRunKey", "originState",
@@ -1751,27 +1941,27 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
         "stoppedWitness",
     }
     if not isinstance(value, dict) or set(value) != expected:
-        _fail("recovery")
+        _fail("recovery", "receipt-shape")
     if (type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1
             or value["originRunKey"] != FORWARD_ORIGIN_KEY
             or value["successorRunKey"] != successor_key
             or value["originState"] != FORWARD_ORIGIN_STATE):
-        _fail("recovery")
+        _fail("recovery", "receipt-origin")
     if (not isinstance(successor_key, str)
             or re.fullmatch(r"[1-9][0-9]*-1", successor_key) is None
             or successor_key == FORWARD_ORIGIN_KEY):
-        _fail("recovery")
+        _fail("recovery", "receipt-successor")
     marker = value["originalMarker"]
     if (not isinstance(marker, dict) or set(marker) != {"bytesBase64", "identity"}
             or not isinstance(marker["bytesBase64"], str)):
-        _fail("recovery")
+        _fail("recovery", "receipt-marker-shape")
     try:
         import base64
         marker_bytes = base64.b64decode(marker["bytesBase64"], validate=True)
     except (ValueError, TypeError):
-        _fail("recovery")
+        _fail("recovery", "receipt-marker-encoding")
     if base64.b64encode(marker_bytes).decode("ascii") != marker["bytesBase64"]:
-        _fail("recovery")
+        _fail("recovery", "receipt-marker-encoding")
     _forward_identity(marker["identity"])
     marker_value = _json(marker_bytes, "recovery")
     if (not isinstance(marker_value, dict)
@@ -1785,25 +1975,25 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
             or marker_value["phase"] != "applying"
             or type(marker_value["providerEnabled"]) is not bool
             or marker_value["durableDisposition"] not in ("none", "created", "reused")):
-        _fail("recovery")
+        _fail("recovery", "receipt-marker-binding")
     enabled = marker_value["providerEnabled"]
     if ((enabled and marker_value["durableDisposition"] not in ("created", "reused"))
             or (not enabled and marker_value["durableDisposition"] != "none")):
-        _fail("recovery")
+        _fail("recovery", "receipt-marker-disposition")
     if value["originCredentialRunKey"] != (FORWARD_ORIGIN_KEY if enabled else None):
-        _fail("recovery")
+        _fail("recovery", "receipt-credential-owner")
     if value["target"] != FORWARD_TARGET:
-        _fail("recovery")
+        _fail("recovery", "receipt-target")
     _validate_target_image_proof(value["targetImageProof"], None, forward=True)
     _forward_identity(value["originalStateIdentity"])
     archive = value["plannedArchive"]
     if (not isinstance(archive, dict) or set(archive) != {"path", "parentIdentity"}
             or archive["path"] != FORWARD_ARCHIVE):
-        _fail("recovery")
+        _fail("recovery", "receipt-archive")
     _forward_identity(archive["parentIdentity"])
     witnesses = value["sourceWitnesses"]
     if not isinstance(witnesses, list) or not witnesses:
-        _fail("recovery")
+        _fail("recovery", "receipt-witness-list")
     previous = ""
     copied_bytes = 0
     origin_paths = 0
@@ -1813,11 +2003,11 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
     external_roles: set[str] = set()
     for witness in witnesses:
         if not isinstance(witness, dict) or set(witness) != FORWARD_SOURCE_KEYS:
-            _fail("recovery")
+            _fail("recovery", "receipt-witness-shape")
         role, path, kind = witness["role"], witness["path"], witness["kind"]
         if (not isinstance(role, str) or not role or not isinstance(path, str)
                 or path <= previous):
-            _fail("recovery")
+            _fail("recovery", "receipt-witness-order")
         previous = path
         _forward_path(path)
         _forward_identity(witness["identity"])
@@ -1834,12 +2024,12 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
                     identity["mode"] not in (stat.S_IFREG | 0o600, stat.S_IFREG | 0o644)
                     or role not in _forward_external_paths(successor_key)
                     and identity["mode"] != stat.S_IFREG | 0o600)):
-            _fail("recovery")
+            _fail("recovery", "receipt-witness-metadata")
         if path.endswith("/" + FORWARD_ORIGIN_STATE):
             if role != "origin-state" or kind != "directory":
-                _fail("recovery")
+                _fail("recovery", "receipt-origin-witness")
             if witness["identity"] != value["originalStateIdentity"]:
-                _fail("recovery")
+                _fail("recovery", "receipt-origin-identity")
             origin_paths += 1
             origin_directory = path.rstrip("/")
         elif (path.endswith("/" + FORWARD_ORIGIN_STATE + "/" + OWNER_MARKER)
@@ -1847,15 +2037,15 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
             if (role != "owner-marker" or kind != "regular-file"
                     or witness["snapshotRef"] is not None
                     or not isinstance(witness["bytesBase64"], str)):
-                _fail("recovery")
+                _fail("recovery", "receipt-owner-witness")
             try:
                 owner_bytes = base64.b64decode(
                     witness["bytesBase64"], validate=True
                 )
             except (ValueError, TypeError):
-                _fail("recovery")
+                _fail("recovery", "receipt-owner-encoding")
             if base64.b64encode(owner_bytes).decode("ascii") != witness["bytesBase64"]:
-                _fail("recovery")
+                _fail("recovery", "receipt-owner-encoding")
             _parse_state_marker(
                 owner_bytes, FORWARD_ORIGIN_KEY, "final-deploy"
             )
@@ -1867,51 +2057,51 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
                     or witness["snapshotRef"] is None
                     or witness["bytesBase64"] is not None
                     or role == "original-base" and not _forward_original_base_witness(witness)):
-                _fail("recovery")
+                _fail("recovery", "receipt-external-witness")
             external_roles.add(role)
         else:
             if origin_directory is None or not path.startswith(origin_directory + "/"):
-                _fail("recovery")
+                _fail("recovery", "receipt-child-path")
             relative = path[len(origin_directory) + 1:]
             if ("/" in relative or relative not in RETENTION_CHILDREN
                     or relative == OWNER_MARKER
                     or role != "state-snapshot" or kind != "regular-file"):
-                _fail("recovery")
+                _fail("recovery", "receipt-child-role")
             if relative in ("terminal.json", "forward-adoption.json", "forward-acceptance.json"):
-                _fail("recovery")
+                _fail("recovery", "receipt-child-forbidden")
             source_children.add(relative)
             if witness["snapshotRef"] != relative or witness["bytesBase64"] is not None:
-                _fail("recovery")
+                _fail("recovery", "receipt-child-snapshot")
         if kind == "directory":
             if witness["snapshotRef"] is not None or witness["bytesBase64"] is not None:
-                _fail("recovery")
+                _fail("recovery", "receipt-directory-payload")
         elif kind == "regular-file":
             ref, encoded = witness["snapshotRef"], witness["bytesBase64"]
             if witness["identity"]["nlink"] != 1:
-                _fail("recovery")
+                _fail("recovery", "receipt-file-links")
             if ((ref is None) == (encoded is None)
                     or ref is not None and (
                         not isinstance(ref, str) or ref not in RETENTION_CHILDREN
                     )
                     or encoded is not None and not isinstance(encoded, str)):
-                _fail("recovery")
+                _fail("recovery", "receipt-file-payload")
             if encoded is not None:
                 try:
                     raw = base64.b64decode(encoded, validate=True)
                 except (ValueError, TypeError):
-                    _fail("recovery")
+                    _fail("recovery", "receipt-file-encoding")
                 if base64.b64encode(raw).decode("ascii") != encoded:
-                    _fail("recovery")
+                    _fail("recovery", "receipt-file-encoding")
                 copied_bytes += len(raw)
         else:
-            _fail("recovery")
+            _fail("recovery", "receipt-witness-kind")
     if (origin_paths != 1 or owner_paths != 1 or origin_directory is None
             or not FORWARD_REQUIRED_CHILDREN <= source_children
             or external_roles != set(_forward_external_paths(successor_key))):
-        _fail("recovery")
+        _fail("recovery", "receipt-witness-set")
     stopped = value["stoppedWitness"]
     if not isinstance(stopped, dict) or set(stopped) != FORWARD_STOPPED_KEYS:
-        _fail("recovery")
+        _fail("recovery", "receipt-stopped-shape")
     if (not re.fullmatch(r"[0-9a-f]{64}", stopped["containerId"] or "")
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", stopped["imageId"] or "")
             or not re.fullmatch(r"[0-9a-f]{40}", stopped["revision"] or "")
@@ -1927,21 +2117,29 @@ def _validate_forward_adoption(data: bytes, successor_key: str) -> dict[str, Any
             or stopped["running"] or stopped["paused"] or stopped["restarting"] or stopped["dead"]
             or stopped["envSnapshotRef"] != "config.env.production"
             or stopped["envComparison"] != "pending-off-predecessor-pass"):
-        _fail("recovery")
+        _fail("recovery", "receipt-stopped-binding")
     _validate_forward_static(stopped["staticInspect"])
     if copied_bytes > MAX_WITNESS_BYTES or len(data) > MAX_WITNESS_BYTES:
-        _fail("recovery")
+        _fail("recovery", "receipt-size")
     return value
 
 
 def _validate_forward_acceptance(data: bytes, adoption_data: bytes,
                                  successor_key: str) -> dict[str, Any]:
+    try:
+        return _validate_forward_acceptance_record(data, adoption_data, successor_key)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "acceptance-shape")
+
+
+def _validate_forward_acceptance_record(data: bytes, adoption_data: bytes,
+                                      successor_key: str) -> dict[str, Any]:
     value = _json(data, "recovery")
     if not isinstance(value, dict) or set(value) != {
         "schemaVersion", "originRunKey", "successorRunKey", "adoptionSha256",
         "target", "candidate", "checks", "plannedArchive",
     }:
-        _fail("recovery")
+        _fail("recovery", "acceptance-shape")
     adoption = _validate_forward_adoption(adoption_data, successor_key)
     candidate = value["candidate"]
     checks = value["checks"]
@@ -1962,7 +2160,7 @@ def _validate_forward_acceptance(data: bytes, adoption_data: bytes,
             or not isinstance(checks, dict)
             or set(checks) != {"runtime", "pendingOff", "provider", "publicHealth"}
             or any(result != "pass" for result in checks.values())):
-        _fail("recovery")
+        _fail("recovery", "acceptance-binding")
     return value
 
 
@@ -2050,14 +2248,17 @@ def _forward_state_module() -> Any:
                         "test_vps_state_admission.py")
     spec = importlib.util.spec_from_file_location("_provider_state_admission", path)
     if spec is None or spec.loader is None:
-        _fail("recovery")
+        _fail("recovery", "inventory-module-spec")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
-    except (OSError, ImportError):
+    except OSError as exc:
         sys.modules.pop(spec.name, None)
-        _fail("recovery")
+        raise _os_error("inventory-module-load", exc) from None
+    except ImportError:
+        sys.modules.pop(spec.name, None)
+        _fail("recovery", "inventory-module-load")
     return module
 
 
@@ -2069,17 +2270,20 @@ def _forward_adoption_interlocks(root_fd: int, state_root: str) -> state_admissi
     try:
         pointer = _json(pointer_data, "recovery")
     finally:
-        os.close(pointer_fd)
+        _close_fd(pointer_fd)
     if (not isinstance(pointer, dict)
             or set(pointer) != {"schemaVersion", "runKey", "phase",
                                 "providerEnabled", "durableDisposition"}):
-        _fail("recovery")
+        _fail("recovery", "inventory-pointer-shape")
     inventory = _forward_inventory(root_fd, state_root)
     try:
         _forward_credential_interlocks(pointer)
         return inventory
     except BaseException:
-        inventory.close()
+        try:
+            inventory.close()
+        except OSError as exc:
+            raise _os_error("inventory-close", exc) from None
         raise
 
 
@@ -2092,28 +2296,36 @@ def _forward_inventory(root_fd: int, state_root: str,
     opaque = set()
     try:
         root_names = state_admission.names(root_fd, state_admission.ROOT_ENTRIES)
-    except (state_admission.Rejected, OSError):
-        _fail("recovery")
+    except state_admission.Rejected as exc:
+        _reject_forward_inventory(exc)
+    except OSError as exc:
+        raise _os_error("inventory-root-scan", exc) from None
     for name in root_names:
         if name in own:
             continue
         if name == ".smtp-transaction.current" or name.startswith(
             (".provider-transaction.", ".provider-state.")
         ):
-            _fail("recovery")
+            _fail("recovery", "inventory-transaction-interlock")
         if re.fullmatch(
             r"[0-9]+-[0-9]+-(?:rollback-drill|final-deploy)", name
         ):
-            info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            try:
+                info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise _os_error("inventory-state-stat", exc) from None
             if not stat.S_ISDIR(info.st_mode):
-                _fail("recovery")
-            fd = os.open(
-                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=root_fd,
-            )
+                _fail("recovery", "inventory-state-type")
+            try:
+                fd = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+            except OSError as exc:
+                raise _os_error("inventory-state-open", exc) from None
             try:
                 if not _same_inode(os.fstat(fd), info):
-                    _fail("recovery")
+                    _fail("recovery", "inventory-state-identity", "changed")
                 try:
                     os.stat(OWNER_MARKER, dir_fd=fd, follow_symlinks=False)
                 except FileNotFoundError:
@@ -2124,23 +2336,86 @@ def _forward_inventory(root_fd: int, state_root: str,
                 _owned_state_fd(fd, name, require_terminal=True)
                 children = _bounded_retention_children(fd)
                 if children is None:
-                    _fail("recovery")
+                    _fail("recovery", "inventory-state-children")
                 _validate_forward_retention_fd(
                     fd, state_root, name, children
                 )
+            except OSError as exc:
+                raise _os_error("inventory-state-read", exc) from None
             finally:
-                os.close(fd)
+                _close_fd(fd)
             opaque.add(name)
             continue
     _forward_read_external(os.path.join(state_root, ".deploy.lock"))
     try:
         inventory = state_admission.Inventory(root_fd, own, opaque, state_root)
         if inventory.root_names != root_names:
-            inventory.close()
-            _fail("recovery")
+            try:
+                inventory.close()
+            except OSError as exc:
+                raise _os_error("inventory-close", exc) from None
+            _fail("recovery", "inventory-root-entries", "changed")
         return inventory
-    except (state_admission.Rejected, OSError, ValueError):
-        _fail("recovery")
+    except state_admission.Rejected as exc:
+        _reject_forward_inventory(exc)
+    except OSError as exc:
+        raise _os_error("inventory-constructor-io", exc) from None
+    except ValueError:
+        _fail("recovery", "inventory-constructor-value")
+
+
+def _reject_forward_inventory(error: Exception) -> None:
+    # Explicit translation of the classifier's finite, nonsecret reason codes.
+    # Unknown codes remain visibly unmapped; never invent a successful diagnosis.
+    checks = {
+        "root_changed": "inventory-root-identity",
+        "root_inventory_changed": "inventory-root-entries",
+        "inventory_changed": "inventory-root-entries",
+        "witness_changed": "inventory-witness-identity",
+        "inode_changed": "inventory-witness-identity",
+        "bytes_changed": "inventory-witness-content",
+        "descendants_changed": "inventory-descendants",
+        "named_binding": "inventory-named-binding",
+        "root_binding": "inventory-root-binding",
+        "mount_escape": "inventory-mount",
+        "mount_unavailable": "inventory-mount-unavailable",
+        "unsafe_acl": "inventory-acl",
+        "acl_unavailable": "inventory-acl-unavailable",
+        "resource_budget": "inventory-resource",
+        "entry_budget": "inventory-entry-budget",
+        "basename_budget": "inventory-name-budget",
+        "depth_budget": "inventory-depth-budget",
+        "file_budget": "inventory-file-budget",
+        "read_budget": "inventory-read-budget",
+        "record_budget": "inventory-record-budget",
+        "short_read": "inventory-short-read",
+        "root_path": "inventory-root-path",
+        "unsafe_ancestor": "inventory-ancestor",
+        "unsafe_inode": "inventory-inode",
+        "unsafe_type": "inventory-type",
+        "duplicate_witness": "inventory-duplicate-witness",
+        "duplicate_key": "inventory-duplicate-key",
+        "invalid_json": "inventory-json",
+        "invalid_record": "inventory-record",
+        "generation_name": "inventory-generation-name",
+        "manifest_encoding": "inventory-manifest-encoding",
+        "selector_encoding": "inventory-selector-encoding",
+        "selector": "inventory-selector",
+        "dangling_selector": "inventory-dangling-selector",
+        "smtp_transaction": "inventory-smtp-transaction",
+        "orphan_smtp_transaction": "inventory-orphan-transaction",
+        "beta_not_clean": "inventory-beta-cleanliness",
+        "beta_nonterminal": "inventory-beta-terminal",
+        "unbound_probe_sidecar": "inventory-probe-sidecar",
+        "unknown": "inventory-unknown-entry",
+    }
+    check = checks.get(str(error))
+    reason = ("changed" if str(error) in {
+        "root_changed", "root_inventory_changed", "inventory_changed",
+        "witness_changed", "inode_changed", "bytes_changed",
+        "descendants_changed", "named_binding", "root_binding",
+    } else "rejected")
+    _fail("recovery", check, reason)
 
 
 def _forward_inventory_recheck(inventory: state_admission.Inventory, *,
@@ -2150,20 +2425,11 @@ def _forward_inventory_recheck(inventory: state_admission.Inventory, *,
     try:
         inventory.recheck(added=added, removed=removed)
     except state_admission.Rejected as exc:
-        checks = {
-            "root_changed": "inventory-root-identity",
-            "root_inventory_changed": "inventory-root-entries",
-            "witness_changed": "inventory-witness-identity",
-            "bytes_changed": "inventory-witness-content",
-            "descendants_changed": "inventory-descendants",
-            "named_binding": "inventory-named-binding",
-            "mount_escape": "inventory-mount",
-            "unsafe_acl": "inventory-acl",
-            "resource_budget": "inventory-resource",
-        }
-        _fail("recovery", checks.get(str(exc)))
-    except (OSError, ValueError):
-        _fail("recovery")
+        _reject_forward_inventory(exc)
+    except OSError as exc:
+        raise _os_error("inventory-recheck-io", exc) from None
+    except ValueError:
+        _fail("recovery", "inventory-recheck-value")
 
 
 def _forward_credential_interlocks(pointer: dict[str, Any]) -> None:
@@ -2180,9 +2446,9 @@ def _forward_credential_interlocks(pointer: dict[str, Any]) -> None:
                 if pointer["providerEnabled"] is True else set()
             )
             if transactions != allowed:
-                _fail("recovery")
+                _fail("recovery", "credential-transaction-interlock")
         finally:
-            os.close(parent_fd)
+            _close_fd(parent_fd)
 
 
 def _forward_archive_preflight(
@@ -2194,23 +2460,23 @@ def _forward_archive_preflight(
     parent = os.path.dirname(FORWARD_ARCHIVE)
     try:
         parent_info = os.stat(parent, follow_symlinks=False)
-    except OSError:
-        _fail("recovery")
+    except OSError as exc:
+        raise _os_error("archive-parent-stat", exc) from None
     if (not stat.S_ISDIR(parent_info.st_mode)
             or parent_info.st_uid != 0
             or stat.S_IMODE(parent_info.st_mode) != 0o700
             or parent_info.st_dev != root_info.st_dev
             or _forward_identity_from_stat(parent_info)
             != adoption["plannedArchive"]["parentIdentity"]):
-        _fail("recovery")
+        _fail("recovery", "archive-parent-identity")
     _acl_is_safe(parent, category="recovery")
     try:
         os.stat(FORWARD_ARCHIVE, follow_symlinks=False)
     except FileNotFoundError:
         return
-    except OSError:
-        _fail("recovery")
-    _fail("recovery")
+    except OSError as exc:
+        raise _os_error("archive-destination-stat", exc) from None
+    _fail("recovery", "archive-destination-absent")
 
 
 def _forward_validate_origin(
@@ -2220,10 +2486,13 @@ def _forward_validate_origin(
     snapshots: dict[str, bytes],
 ) -> None:
     origin_name = FORWARD_ORIGIN_STATE
-    origin_fd = os.open(
-        origin_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-        dir_fd=root_fd,
-    )
+    try:
+        origin_fd = os.open(
+            origin_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+    except OSError as exc:
+        raise _os_error("origin-directory-open", exc) from None
     try:
         origin_info = os.fstat(origin_fd)
         origin_path_info = os.stat(
@@ -2233,14 +2502,14 @@ def _forward_validate_origin(
                 != adoption["originalStateIdentity"]
                 or _forward_identity_from_stat(origin_path_info)
                 != adoption["originalStateIdentity"]):
-            _fail("recovery")
+            _fail("recovery", "origin-directory-identity", "changed")
         _validate_state_directory_fd(origin_fd, origin_name)
         if (_forward_identity_from_stat(os.fstat(origin_fd))
                 != adoption["originalStateIdentity"]
                 or _forward_identity_from_stat(os.stat(
                     origin_name, dir_fd=root_fd, follow_symlinks=False
                 )) != adoption["originalStateIdentity"]):
-            _fail("recovery")
+            _fail("recovery", "origin-directory-recheck", "changed")
         children: dict[str, dict[str, Any]] = {}
         for witness in adoption["sourceWitnesses"]:
             path = witness["path"]
@@ -2253,33 +2522,33 @@ def _forward_validate_origin(
                 continue
             child = path[len(prefix):]
             if "/" in child or child in children:
-                _fail("recovery")
+                _fail("recovery", "origin-child-name")
             children[child] = witness
         if set(_iter_directory_fd_names(origin_fd)) != set(children):
-            _fail("recovery")
+            _fail("recovery", "origin-child-set", "changed")
         for child, witness in children.items():
             info = os.stat(child, dir_fd=origin_fd, follow_symlinks=False)
             if _forward_identity_from_stat(info) != witness["identity"]:
-                _fail("recovery")
+                _fail("recovery", "origin-child-identity", "changed")
             if child == "terminal.json":
-                _fail("recovery")
+                _fail("recovery", "origin-terminal-absent")
             if witness["kind"] == "directory":
                 if not stat.S_ISDIR(info.st_mode):
-                    _fail("recovery")
+                    _fail("recovery", "origin-child-type")
                 continue
             if not stat.S_ISREG(info.st_mode):
-                _fail("recovery")
+                _fail("recovery", "origin-child-type")
             fd, opened, content = _open_private_state_file_at(origin_fd, child)
             try:
                 if _forward_identity_from_stat(opened) != witness["identity"]:
-                    _fail("recovery")
+                    _fail("recovery", "origin-child-open-identity", "changed")
             finally:
-                os.close(fd)
+                _close_fd(fd)
             final_path_info = os.stat(
                 child, dir_fd=origin_fd, follow_symlinks=False
             )
             if _forward_identity_from_stat(final_path_info) != witness["identity"]:
-                _fail("recovery")
+                _fail("recovery", "origin-child-named-identity", "changed")
             if witness["role"] == "owner-marker":
                 expected = base64.b64decode(witness["bytesBase64"], validate=True)
             elif witness["snapshotRef"] is not None:
@@ -2287,42 +2556,49 @@ def _forward_validate_origin(
             else:
                 expected = base64.b64decode(witness["bytesBase64"], validate=True)
             if content != expected:
-                _fail("recovery")
+                _fail("recovery", "origin-child-content", "changed")
         try:
             os.stat("terminal.json", dir_fd=origin_fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
         else:
-            _fail("recovery")
+            _fail("recovery", "origin-terminal-absent")
         if (_forward_identity_from_stat(os.fstat(origin_fd))
                 != adoption["originalStateIdentity"]
                 or _forward_identity_from_stat(os.stat(
                     origin_name, dir_fd=root_fd, follow_symlinks=False))
                 != adoption["originalStateIdentity"]):
-            _fail("recovery")
+            _fail("recovery", "origin-directory-final-identity", "changed")
+    except OSError as exc:
+        raise _os_error("origin-directory-read", exc) from None
     finally:
-        os.close(origin_fd)
+        _close_fd(origin_fd)
 
 
 def _forward_read_external(path: str) -> tuple[dict[str, int], bytes]:
     _check_ancestors(path, category="recovery")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise _os_error("external-file-open", exc) from None
     try:
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
                 or stat.S_IMODE(info.st_mode) not in (0o600, 0o644)
                 or info.st_nlink != 1):
-            _fail("recovery")
+            _fail("recovery", "external-file-metadata")
         _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
         data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
         identity = _forward_identity_from_stat(info)
         if (identity != _forward_identity_from_stat(os.fstat(fd))
                 or identity != _forward_identity_from_stat(
                     os.stat(path, follow_symlinks=False))):
-            _fail("recovery")
+            _fail("recovery", "external-file-identity", "changed")
         return identity, data
+    except OSError as exc:
+        raise _os_error("external-file-read", exc) from None
     finally:
-        os.close(fd)
+        _close_fd(fd)
 
 
 @contextlib.contextmanager
@@ -2330,7 +2606,10 @@ def _forward_pinned_parent(path: str) -> Iterable[tuple[int, str]]:
     """Keep every trusted ancestor open, including its named-entry binding."""
     _forward_path(path)
     parts = path.split("/")[1:]
-    descriptors = [os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)]
+    try:
+        descriptors = [os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)]
+    except OSError as exc:
+        raise _os_error("pinned-ancestor-root-open", exc) from None
     identities = []
     try:
         for index in range(len(parts)):
@@ -2338,7 +2617,7 @@ def _forward_pinned_parent(path: str) -> Iterable[tuple[int, str]]:
             info = os.fstat(fd)
             if (info.st_uid != 0
                     or stat.S_IMODE(info.st_mode) & 0o022):
-                _fail("recovery")
+                _fail("recovery", "pinned-ancestor-metadata")
             _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
             identities.append(_forward_identity_from_stat(info))
             if index < len(parts) - 1:
@@ -2348,15 +2627,17 @@ def _forward_pinned_parent(path: str) -> Iterable[tuple[int, str]]:
         yield descriptors[-1], parts[-1]
         for index, (fd, identity) in enumerate(zip(descriptors, identities)):
             if identity != _forward_identity_from_stat(os.fstat(fd)):
-                _fail("recovery")
+                _fail("recovery", "pinned-ancestor-identity", "changed")
             _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
             if index and identity != _forward_identity_from_stat(os.stat(
                     parts[index - 1], dir_fd=descriptors[index - 1],
                     follow_symlinks=False)):
-                _fail("recovery")
+                _fail("recovery", "pinned-ancestor-binding", "changed")
+    except OSError as exc:
+        raise _os_error("pinned-ancestor-inspection", exc) from None
     finally:
         for fd in reversed(descriptors):
-            os.close(fd)
+            _close_fd(fd)
 
 
 def _forward_read_original_base(
@@ -2365,55 +2646,70 @@ def _forward_read_original_base(
     """Authenticate historical evidence; Compose consumes its private copy."""
     if (path != _forward_external_paths("")["original-base"]
             or os.path.basename(origin) != FORWARD_ORIGIN_STATE):
-        _fail("recovery")
+        _fail("recovery", "historical-base-path")
     with _forward_pinned_parent(os.path.join(origin, OWNER_MARKER)) as (origin_fd, _):
-        info = os.fstat(origin_fd)
+        try:
+            info = os.fstat(origin_fd)
+        except OSError as exc:
+            raise _os_error("historical-origin-stat", exc) from None
         if (info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o700):
-            _fail("recovery")
+            _fail("recovery", "historical-origin-metadata")
         trusted = {}
         with contextlib.ExitStack() as stack:
             for name in (OWNER_MARKER, "config.base-compose.yml",
                          "config.base-compose.yml.identity"):
                 fd, before, data = _open_private_state_file_at(origin_fd, name)
-                stack.callback(os.close, fd)
+                stack.callback(_close_fd, fd)
                 identity = _forward_identity_from_stat(before)
                 if before.st_gid != 0:
-                    _fail("recovery")
+                    _fail("recovery", "historical-authority-group")
                 trusted[name] = (fd, identity, data)
             _parse_state_marker(
                 trusted[OWNER_MARKER][2], FORWARD_ORIGIN_KEY, "final-deploy")
             for name in ("config.base-compose.yml", "config.base-compose.yml.identity"):
                 if trusted[name][2] != snapshots[name]:
-                    _fail("recovery")
+                    _fail("recovery", "historical-authority-content", "changed")
             with _forward_pinned_parent(path) as (parent_fd, name):
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-                             | os.O_NOATIME, dir_fd=parent_fd)
-                stack.callback(os.close, fd)
-                info = os.fstat(fd)
+                try:
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                                 | os.O_NOATIME, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise _os_error("historical-base-open", exc) from None
+                stack.callback(_close_fd, fd)
+                try:
+                    info = os.fstat(fd)
+                except OSError as exc:
+                    raise _os_error("historical-base-stat", exc) from None
                 if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                         or (info.st_uid, info.st_gid) not in ((0, 0), (1001, 1001))
                         or stat.S_IMODE(info.st_mode) not in (0o600, 0o644)):
-                    _fail("recovery")
+                    _fail("recovery", "historical-base-metadata")
                 _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
                 identity = _forward_identity_from_stat(info)
                 data = _read_fd_bounded(fd, MAX_WITNESS_BYTES)
                 if data != trusted["config.base-compose.yml"][2]:
-                    _fail("recovery")
+                    _fail("recovery", "historical-base-content", "changed")
                 _forward_saved_identity(trusted["config.base-compose.yml.identity"][2],
                                         identity, data)
                 original_identity, original_data = identity, data
                 for saved_name, (saved_fd, saved_identity, saved_data) in trusted.items():
-                    if (_read_fd_bounded(saved_fd, MAX_WITNESS_BYTES) != saved_data
-                            or _forward_identity_from_stat(os.fstat(saved_fd)) != saved_identity
+                    try:
+                        if (_read_fd_bounded(saved_fd, MAX_WITNESS_BYTES) != saved_data
+                                or _forward_identity_from_stat(os.fstat(saved_fd)) != saved_identity
+                                or _forward_identity_from_stat(os.stat(
+                                    saved_name, dir_fd=origin_fd,
+                                    follow_symlinks=False)) != saved_identity):
+                            _fail("recovery", "historical-authority-recheck", "changed")
+                    except OSError as exc:
+                        raise _os_error("historical-authority-stat", exc) from None
+                try:
+                    if (_read_fd_bounded(fd, MAX_WITNESS_BYTES) != data
+                            or _forward_identity_from_stat(os.fstat(fd)) != identity
                             or _forward_identity_from_stat(os.stat(
-                                saved_name, dir_fd=origin_fd,
-                                follow_symlinks=False)) != saved_identity):
-                        _fail("recovery")
-                if (_read_fd_bounded(fd, MAX_WITNESS_BYTES) != data
-                        or _forward_identity_from_stat(os.fstat(fd)) != identity
-                        or _forward_identity_from_stat(os.stat(
-                            name, dir_fd=parent_fd, follow_symlinks=False)) != identity):
-                    _fail("recovery")
+                                name, dir_fd=parent_fd, follow_symlinks=False)) != identity):
+                        _fail("recovery", "historical-base-recheck", "changed")
+                except OSError as exc:
+                    raise _os_error("historical-base-recheck-stat", exc) from None
     return original_identity, original_data
 
 
@@ -2443,32 +2739,56 @@ def _forward_saved_identity(data: bytes, actual: dict[str, int],
 def _forward_deployment_lock(state_root: str) -> None:
     path = os.path.join(state_root, ".deploy.lock")
     identity, data = _forward_read_external(path)
-    if data or _forward_identity_from_stat(os.fstat(9)) != identity:
-        _fail("recovery")
+    try:
+        if data or _forward_identity_from_stat(os.fstat(9)) != identity:
+            _fail("recovery", "deployment-lock-binding", "changed")
+    except OSError as exc:
+        raise _os_error("deployment-lock-descriptor", exc) from None
     if fcntl is None:
         _fail("prerequisite")
-    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        raise _os_error("deployment-lock-acquire", exc) from None
 
 
 def _forward_pending_module() -> Any:
-    spec = importlib.util.spec_from_file_location(
-        "forward_pending", os.path.join(os.path.dirname(__file__),
-                                       "test-vps-locationiq-pending-off.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "forward_pending", os.path.join(os.path.dirname(__file__),
+                                           "test-vps-locationiq-pending-off.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except OSError as exc:
+        raise _os_error("pending-module-load", exc) from None
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "pending-module-shape")
     return module
 
 
 def _forward_stopped(inspect: dict[str, Any],
                      snapshots: dict[str, bytes]) -> dict[str, Any]:
+    try:
+        return _forward_stopped_record(inspect, snapshots)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "stopped-record-shape")
+
+
+def _forward_stopped_record(inspect: dict[str, Any],
+                            snapshots: dict[str, bytes]) -> dict[str, Any]:
     pending = _forward_pending_module()
     try:
         pending.stopped_predecessor_record(
             [inspect], inspect["Id"], FORWARD_FINISHED)
+    except (ValueError, pending.Rejected, TypeError, KeyError, AttributeError,
+            RecursionError):
+        _fail("recovery", "stopped-predecessor")
+    try:
         pending.compare_predecessor_environment(
             snapshots["config.env.production"], inspect)
-    except (ValueError, pending.Rejected):
-        _fail("recovery")
+    except (ValueError, pending.Rejected, TypeError, KeyError, AttributeError,
+            RecursionError):
+        _fail("recovery", "stopped-environment")
     labels = inspect["Config"]["Labels"]
     fields = {
         "imageId": "previous-image-id", "revision": "previous-revision",
@@ -2490,7 +2810,7 @@ def _forward_stopped(inspect: dict[str, Any],
     }
     for field, snapshot in fields.items():
         if snapshots[snapshot] != (result[field] + "\n").encode():
-            _fail("recovery")
+            _fail("recovery", "stopped-snapshot-binding")
     if (not result["containerId"].startswith("6d4a33264076")
             or result["imageId"] !=
             "sha256:8e405258c34d70d6b42d226458c381f55df47d37fa743b754e1066e05f3ae1a0"
@@ -2498,7 +2818,7 @@ def _forward_stopped(inspect: dict[str, Any],
             snapshots["previous-image"].decode()
             or labels["org.opencontainers.image.source"] !=
             "https://github.com/NickolayMamonov/meet-backend-v3"):
-        _fail("recovery")
+        _fail("recovery", "stopped-image-binding")
     _validate_forward_static(result["staticInspect"])
     return result
 
@@ -2508,14 +2828,14 @@ def _forward_credential_preflight(marker: dict[str, Any],
     enabled, _ = _provider_state(inspect)
     _, _, source = _provider_mount(inspect, enabled, allow_external_source=True)
     if marker["providerEnabled"] != enabled:
-        _fail("recovery")
+        _fail("recovery", "credential-provider-binding")
     tx = _transaction(HOST_CREDENTIAL_PARENT, FORWARD_ORIGIN_KEY)
     if not enabled:
         if marker["durableDisposition"] != "none" or os.path.lexists(tx):
-            _fail("recovery")
+            _fail("recovery", "credential-disabled-transaction")
         return
     if marker["durableDisposition"] not in ("created", "reused") or source is None:
-        _fail("recovery")
+        _fail("recovery", "credential-disposition")
     _validate_transaction(tx)
     snapshot = _read_private(os.path.join(tx, "snapshot"))
     identity = _json(_read_private(os.path.join(tx, "identity.json")), "recovery")
@@ -2525,16 +2845,30 @@ def _forward_credential_preflight(marker: dict[str, Any],
     durable_identity, durable_data = _read_existing(HOST_CREDENTIAL_PATH)
     if (source_data != snapshot or source_identity != identity["predecessor"]
             or durable_data != snapshot or durable_identity != identity["durable"]):
-        _fail("recovery")
+        _fail("recovery", "credential-source-binding", "changed")
     if marker["durableDisposition"] == "created":
         _verify_created_publication(tx, HOST_CREDENTIAL_PATH, identity, snapshot)
-    elif set(os.listdir(tx)) != {"snapshot", "identity.json"}:
-        _fail("recovery")
+    else:
+        try:
+            names = set(os.listdir(tx))
+        except OSError as exc:
+            raise _os_error("credential-reused-children", exc) from None
+        if names != {"snapshot", "identity.json"}:
+            _fail("recovery", "credential-reused-children")
 
 
 def _forward_image(image: dict[str, Any], image_id: str,
                    revision: str, version: str,
-                   check: str | None = None) -> None:
+                   check: str | None = "previous-image-binding") -> None:
+    try:
+        _forward_image_record(image, image_id, revision, version, check)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "image-record-shape")
+
+
+def _forward_image_record(image: dict[str, Any], image_id: str,
+                          revision: str, version: str,
+                          check: str | None) -> None:
     config = image["Config"]
     labels = config["Labels"]
     if (image["Id"] != image_id or config["User"] != "10001:10001"
@@ -2550,6 +2884,14 @@ def _forward_image(image: dict[str, Any], image_id: str,
 
 def _forward_rendered(config: dict[str, Any], backend: dict[str, Any],
                        target: dict[str, Any], env: bytes) -> None:
+    try:
+        _forward_rendered_record(config, backend, target, env)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "rendered-shape")
+
+
+def _forward_rendered_record(config: dict[str, Any], backend: dict[str, Any],
+                            target: dict[str, Any], env: bytes) -> None:
     pending = _forward_pending_module()
     values = pending.file_environment(env)
     service = config["services"]["backend"]
@@ -2568,42 +2910,42 @@ def _forward_rendered(config: dict[str, Any], backend: dict[str, Any],
             or service["mem_limit"] != backend["HostConfig"]["Memory"]
             or service.get("entrypoint") is not None
             or service.get("command") is not None):
-        _fail("recovery")
+        _fail("recovery", "rendered-hardening")
     effective = dict(_env_entries(target))
     effective.update(service["environment"])
     if any(effective.get(key) != value for key, value in values.items()):
-        _fail("recovery")
+        _fail("recovery", "rendered-environment")
     proposed = {
         "Config": {"Env": [key + "=" + value for key, value in effective.items()]},
         "Mounts": [],
     }
     if _effective_tuple(proposed) != _effective_tuple(backend):
-        _fail("recovery")
+        _fail("recovery", "rendered-provider")
     ports = service["ports"]
     expected_port = backend["HostConfig"]["PortBindings"]["8080/tcp"][0]
     if (len(ports) != 1 or ports[0].get("host_ip") != "127.0.0.1"
             or ports[0].get("target") != 8080
             or str(ports[0].get("published")) != expected_port["HostPort"]
             or ports[0].get("protocol", "tcp") != "tcp"):
-        _fail("recovery")
+        _fail("recovery", "rendered-ports")
     mounts = service["volumes"]
     enabled = _provider_state(backend)[0]
     expected_destinations = {"/data/uploads"}
     if enabled:
         expected_destinations.add(CONTAINER_CREDENTIAL_PATH)
     if {mount["target"] for mount in mounts} != expected_destinations:
-        _fail("recovery")
+        _fail("recovery", "rendered-mount-set")
     if len(mounts) != len(expected_destinations):
-        _fail("recovery")
+        _fail("recovery", "rendered-mount-count")
     for mount in mounts:
         if mount["target"] == "/data/uploads":
             if (mount["type"] != "volume" or mount["source"] != "uploads_data"
                     or mount.get("read_only", False)):
-                _fail("recovery")
+                _fail("recovery", "rendered-upload-mount")
         elif (mount["type"] != "bind" or mount["source"] != HOST_CREDENTIAL_PATH
                 or mount.get("read_only") is not True
                 or mount["bind"].get("create_host_path") is not False):
-            _fail("recovery")
+            _fail("recovery", "rendered-credential-mount")
     if (service["healthcheck"]["test"] !=
             backend["Config"]["Healthcheck"]["Test"]
             or set(config["volumes"]) != {"postgres_data", "uploads_data"}
@@ -2611,7 +2953,35 @@ def _forward_rendered(config: dict[str, Any], backend: dict[str, Any],
             "meet-production_postgres_data"
             or config["volumes"]["uploads_data"]["name"] !=
             "meet-production_uploads_data"):
-        _fail("recovery")
+        _fail("recovery", "rendered-health-volumes")
+
+
+def _forward_environment(snapshots: dict[str, bytes]) -> dict[str, str]:
+    pending = _forward_pending_module()
+    try:
+        before = pending.file_environment(snapshots["config.env.production"])
+        replacements = {
+            "BACKEND_IMAGE": pending.IMAGE, "BACKEND_REVISION": pending.REVISION,
+            "BACKEND_VERSION": pending.VERSION,
+        }
+        lines = []
+        for line in snapshots["config.env.production"].decode().splitlines(keepends=True):
+            name = line.split("=", 1)[0]
+            if name in replacements:
+                ending = line[len(line.rstrip("\r\n")):]
+                line = name + "=" + replacements[name] + ending
+            lines.append(line)
+        if (not set(replacements) <= set(before)
+                or "".join(lines).encode() != snapshots["config.env.target"]
+                or snapshots["config.env.previous"] != snapshots["config.env.production"]
+                or any(before[key] + "\n" != snapshots[name].decode() for key, name in (
+                    ("BACKEND_IMAGE", "previous-image"),
+                    ("BACKEND_REVISION", "previous-revision"),
+                    ("BACKEND_VERSION", "previous-version")))):
+            _fail("recovery", "admission-environment-transition")
+        return before
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "admission-environment-shape")
 
 
 def _forward_admission(state_root: str, run_key: str, deployment_root: str,
@@ -2621,16 +2991,19 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
     if (deployment_root != FORWARD_ROOT or base_compose != paths["reviewed-base"]
             or not re.fullmatch(r"[1-9][0-9]*-1", run_key)
             or run_key == FORWARD_ORIGIN_KEY):
-        _fail("recovery")
+        _fail("recovery", "admission-arguments")
     _forward_deployment_lock(state_root)
     bundle = _json(inspection_data, "recovery")
     if not isinstance(bundle, dict) or set(bundle) != {
             "backend", "previousImage", "targetImage", "targetImageProof", "rendered"}:
-        _fail("recovery")
+        _fail("recovery", "admission-bundle")
     origin = os.path.join(state_root, FORWARD_ORIGIN_STATE)
     _validate_state_directory(origin, FORWARD_ORIGIN_STATE)
-    origin_info = os.stat(origin, follow_symlinks=False)
-    names = set(os.listdir(origin))
+    try:
+        origin_info = os.stat(origin, follow_symlinks=False)
+        names = set(os.listdir(origin))
+    except OSError as exc:
+        raise _os_error("admission-origin-inventory", exc) from None
     forbidden = {
         "terminal.json", "forward-adoption.json", "forward-acceptance.json",
         "predecessor.json", "candidate.json", "final.json", "rollback.json",
@@ -2638,7 +3011,7 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
     }
     if (not FORWARD_REQUIRED_CHILDREN <= names or not names <= RETENTION_CHILDREN
             or names & forbidden):
-        _fail("recovery")
+        _fail("recovery", "admission-origin-children")
     snapshots: dict[str, bytes] = {}
     aggregate_size = 0
     witnesses = [{
@@ -2648,10 +3021,10 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
     }]
     for name in sorted(names):
         fd, info, content = _open_private_state_file(os.path.join(origin, name))
-        os.close(fd)
+        _close_fd(fd)
         aggregate_size += len(content)
         if aggregate_size > MAX_WITNESS_BYTES:
-            _fail("recovery")
+            _fail("recovery", "admission-snapshot-budget")
         embedded = name == OWNER_MARKER or name.endswith(".identity")
         if not embedded:
             snapshots[name] = content
@@ -2689,7 +3062,7 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
             identity, content = _forward_read_external(path)
         ref = refs[role]
         if content != snapshots[ref]:
-            _fail("recovery")
+            _fail("recovery", "admission-source-content", "changed")
         saved = {
             "production-env": "config.env.target.identity",
             "original-base": "config.base-compose.yml.identity",
@@ -2705,28 +3078,8 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
     if (snapshots["candidate-active-compose.yml"] != snapshots["config.base-compose.yml"]
             or snapshots["candidate-active-runtime.yml"] !=
             snapshots["target-runtime.override.yml"]):
-        _fail("recovery")
-    pending = _forward_pending_module()
-    before = pending.file_environment(snapshots["config.env.production"])
-    replacements = {
-        "BACKEND_IMAGE": pending.IMAGE, "BACKEND_REVISION": pending.REVISION,
-        "BACKEND_VERSION": pending.VERSION,
-    }
-    lines = []
-    for line in snapshots["config.env.production"].decode().splitlines(keepends=True):
-        name = line.split("=", 1)[0]
-        if name in replacements:
-            ending = line[len(line.rstrip("\r\n")):]
-            line = name + "=" + replacements[name] + ending
-        lines.append(line)
-    if (not set(replacements) <= set(before)
-            or "".join(lines).encode() != snapshots["config.env.target"]
-            or snapshots["config.env.previous"] != snapshots["config.env.production"]
-            or any(before[key] + "\n" != snapshots[name].decode() for key, name in (
-                ("BACKEND_IMAGE", "previous-image"),
-                ("BACKEND_REVISION", "previous-revision"),
-                ("BACKEND_VERSION", "previous-version")))):
-        _fail("recovery")
+        _fail("recovery", "admission-active-snapshots")
+    before = _forward_environment(snapshots)
     backend = _inspect(json.dumps(bundle["backend"]).encode())
     stopped = _forward_stopped(backend, snapshots)
     old_image = _inspect(json.dumps(bundle["previousImage"]).encode())
@@ -2739,9 +3092,14 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
     _forward_rendered(bundle["rendered"], backend, target, snapshots["config.env.target"])
     pointer_fd, pointer_info, pointer_data = _open_private_state_file(
         os.path.join(state_root, ".provider-transaction.current"))
-    os.close(pointer_fd)
+    _close_fd(pointer_fd)
     marker = _marker(state_root, FORWARD_ORIGIN_KEY)
     _forward_credential_preflight(marker, backend)
+    try:
+        archive_identity = _forward_identity_from_stat(
+            os.stat(os.path.dirname(FORWARD_ARCHIVE), follow_symlinks=False))
+    except OSError as exc:
+        raise _os_error("admission-archive-parent", exc) from None
     adoption = {
         "schemaVersion": 1, "originRunKey": FORWARD_ORIGIN_KEY,
         "successorRunKey": run_key, "originState": FORWARD_ORIGIN_STATE,
@@ -2755,8 +3113,7 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
         "originalStateIdentity": _forward_identity_from_stat(origin_info),
         "plannedArchive": {
             "path": FORWARD_ARCHIVE,
-            "parentIdentity": _forward_identity_from_stat(
-                os.stat(os.path.dirname(FORWARD_ARCHIVE), follow_symlinks=False)),
+            "parentIdentity": archive_identity,
         },
         "sourceWitnesses": sorted(witnesses, key=lambda item: item["path"]),
         "stoppedWitness": stopped,
@@ -2764,7 +3121,7 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
     encoded = json.dumps(adoption, separators=(",", ":")).encode()
     intended_key = before["LOCATIONIQ_KEY"].encode()
     if intended_key in encoded or base64.b64encode(intended_key) in encoded:
-        _fail("recovery")
+        _fail("recovery", "admission-secret-reflection")
     _validate_forward_adoption(encoded, run_key)
     _forward_adopt(state_root, json.dumps({
         "adoptionReceiptBase64": base64.b64encode(encoded).decode(),
@@ -2781,24 +3138,24 @@ def _forward_adopt(state_root: str, request_data: bytes,
             or set(request) != {"adoptionReceiptBase64", "snapshots"}
             or not isinstance(request["adoptionReceiptBase64"], str)
             or not isinstance(request["snapshots"], dict)):
-        _fail("recovery")
+        _fail("recovery", "adopt-request-shape")
     try:
         receipt_data = base64.b64decode(
             request["adoptionReceiptBase64"], validate=True
         )
     except (ValueError, TypeError):
-        _fail("recovery")
+        _fail("recovery", "adopt-receipt-encoding")
     if (base64.b64encode(receipt_data).decode("ascii")
             != request["adoptionReceiptBase64"]):
-        _fail("recovery")
+        _fail("recovery", "adopt-receipt-encoding")
     receipt = _json(receipt_data, "recovery")
     successor_key = receipt.get("successorRunKey") if isinstance(receipt, dict) else None
     if not isinstance(successor_key, str):
-        _fail("recovery")
+        _fail("recovery", "adopt-successor")
     _run_key(successor_key)
     adoption = _validate_forward_adoption(receipt_data, successor_key)
     if len(request_data) > MAX_WITNESS_BYTES * 2:
-        _fail("recovery")
+        _fail("recovery", "adopt-request-budget")
 
     snapshot_refs = {
         witness["snapshotRef"]
@@ -2813,16 +3170,16 @@ def _forward_adopt(state_root: str, request_data: bytes,
                 or name in (OWNER_MARKER, "terminal.json",
                             "forward-adoption.json", "forward-acceptance.json")
                 or not isinstance(encoded, str)):
-            _fail("recovery")
+            _fail("recovery", "adopt-snapshot-name")
         try:
             content = base64.b64decode(encoded, validate=True)
         except (ValueError, TypeError):
-            _fail("recovery")
+            _fail("recovery", "adopt-snapshot-encoding")
         if base64.b64encode(content).decode("ascii") != encoded:
-            _fail("recovery")
+            _fail("recovery", "adopt-snapshot-encoding")
         snapshots[name] = content
     if set(snapshots) != snapshot_refs:
-        _fail("recovery")
+        _fail("recovery", "adopt-snapshot-set")
     if (
         len(receipt_data) + sum(map(len, snapshots.values()))
         + sum(map(len, (base64.b64decode(
@@ -2831,25 +3188,34 @@ def _forward_adopt(state_root: str, request_data: bytes,
           if witness["bytesBase64"] is not None)))
         > MAX_WITNESS_BYTES
     ):
-        _fail("recovery")
+        _fail("recovery", "adopt-snapshot-budget")
 
     expected_root = _validate_retention_state_root_path(state_root)
-    root_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        root_fd = os.open(state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise _os_error("adopt-root-open", exc) from None
     staging = ".provider-state." + successor_key + "-final-deploy.tmp"
     destination = successor_key + "-final-deploy"
     temporary_pointer = ".provider-transaction." + successor_key + ".forward"
     credential_parent_fd = None
     inventory = None
     try:
-        if not _same_inode(os.fstat(root_fd), expected_root):
-            _fail("recovery")
+        try:
+            if not _same_inode(os.fstat(root_fd), expected_root):
+                _fail("recovery", "adopt-root-identity", "changed")
+        except OSError as exc:
+            raise _os_error("adopt-root-stat", exc) from None
         _lock_directory(root_fd)
-        root_info = os.fstat(root_fd)
-        if (not _same_inode(root_info, expected_root)
-                or _forward_identity_from_stat(root_info)
-                != _forward_identity_from_stat(os.stat(
-                    state_root, follow_symlinks=False))):
-            _fail("recovery")
+        try:
+            root_info = os.fstat(root_fd)
+            if (not _same_inode(root_info, expected_root)
+                    or _forward_identity_from_stat(root_info)
+                    != _forward_identity_from_stat(os.stat(
+                        state_root, follow_symlinks=False))):
+                _fail("recovery", "adopt-root-binding", "changed")
+        except OSError as exc:
+            raise _os_error("adopt-root-stat", exc) from None
         _validate_retention_state_root_fd(root_fd)
         credential_parent_fd = _open_optional_directory_reference(HOST_CREDENTIAL_PARENT)
         if credential_parent_fd is not None:
@@ -2860,19 +3226,26 @@ def _forward_adopt(state_root: str, request_data: bytes,
             os.stat(destination, dir_fd=root_fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            raise _os_error("adopt-destination-stat", exc) from None
         else:
-            _fail("recovery")
+            _fail("recovery", "adopt-destination-absent")
         for candidate in (staging, temporary_pointer):
             try:
                 os.stat(candidate, dir_fd=root_fd, follow_symlinks=False)
             except FileNotFoundError:
                 continue
-            _fail("recovery")
+            except OSError as exc:
+                raise _os_error("adopt-temporary-stat", exc) from None
+            _fail("recovery", "adopt-temporary-absent")
 
         pointer_name = ".provider-transaction.current"
-        pointer_path_info = os.stat(
-            pointer_name, dir_fd=root_fd, follow_symlinks=False
-        )
+        try:
+            pointer_path_info = os.stat(
+                pointer_name, dir_fd=root_fd, follow_symlinks=False
+            )
+        except OSError as exc:
+            raise _os_error("adopt-pointer-stat", exc) from None
         pointer_fd, pointer_info, pointer_data = _open_private_state_file(
             os.path.join(state_root, pointer_name)
         )
@@ -2884,7 +3257,7 @@ def _forward_adopt(state_root: str, request_data: bytes,
                     != original_marker["identity"]
                     or pointer_data != base64.b64decode(
                         original_marker["bytesBase64"], validate=True)):
-                _fail("recovery")
+                _fail("recovery", "adopt-pointer-witness", "changed")
             marker = _json(pointer_data, "recovery")
             if (not isinstance(marker, dict)
                     or set(marker) != {"schemaVersion", "runKey", "phase",
@@ -2897,23 +3270,32 @@ def _forward_adopt(state_root: str, request_data: bytes,
                     or marker["durableDisposition"] not in ("none", "created", "reused")
                     or marker["providerEnabled"]
                     != (marker["durableDisposition"] != "none")):
-                _fail("recovery")
+                _fail("recovery", "adopt-pointer-binding")
         finally:
-            os.close(pointer_fd)
+            _close_fd(pointer_fd)
 
         _forward_validate_origin(state_root, root_fd, adoption, snapshots)
         if before_commit is not None:
             before_commit()
 
         _forward_inventory_recheck(inventory)
-        os.mkdir(staging, 0o700, dir_fd=root_fd)
-        staging_fd = os.open(
-            staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=root_fd,
-        )
         try:
-            os.fchown(staging_fd, 0, 0)
-            os.fchmod(staging_fd, 0o700)
+            os.mkdir(staging, 0o700, dir_fd=root_fd)
+        except OSError as exc:
+            raise _os_error("adopt-staging-create", exc) from None
+        try:
+            staging_fd = os.open(
+                staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+        except OSError as exc:
+            raise _os_error("adopt-staging-open", exc) from None
+        try:
+            try:
+                os.fchown(staging_fd, 0, 0)
+                os.fchmod(staging_fd, 0o700)
+            except OSError as exc:
+                raise _os_error("adopt-staging-metadata", exc) from None
             proof_data = json.dumps(
                 adoption["targetImageProof"], separators=(",", ":")
             ).encode()
@@ -2931,22 +3313,34 @@ def _forward_adopt(state_root: str, request_data: bytes,
             _write_private_at(staging_fd, "forward-adoption.json", receipt_data, 0o600)
             for name in sorted(snapshots):
                 _write_private_at(staging_fd, name, snapshots[name], 0o600)
-            os.fsync(staging_fd)
+            try:
+                os.fsync(staging_fd)
+            except OSError as exc:
+                raise _os_error("adopt-staging-sync", exc) from None
             _validate_state_directory_fd(staging_fd, destination)
-            os.fsync(root_fd)
+            try:
+                os.fsync(root_fd)
+            except OSError as exc:
+                raise _os_error("adopt-staging-parent-sync", exc) from None
             _forward_adopt_boundary("state-staged")
             _forward_inventory_recheck(inventory, added=frozenset({staging}))
+            try:
+                staging_inode = (
+                    os.fstat(staging_fd).st_dev, os.fstat(staging_fd).st_ino)
+            except OSError as exc:
+                raise _os_error("adopt-staging-stat", exc) from None
             _rename_noreplace(
                 root_fd, staging, destination,
                 expected_source_fd=staging_fd,
-                expected_source_inode=(
-                    os.fstat(staging_fd).st_dev, os.fstat(staging_fd).st_ino
-                ),
+                expected_source_inode=staging_inode,
             )
-            published_fd = os.open(
-                destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=root_fd,
-            )
+            try:
+                published_fd = os.open(
+                    destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+            except OSError as exc:
+                raise _os_error("adopt-published-open", exc) from None
             try:
                 published_info = os.fstat(published_fd)
                 published_path_info = os.stat(
@@ -2954,14 +3348,19 @@ def _forward_adopt(state_root: str, request_data: bytes,
                 )
                 if (not _same_inode(published_info, os.fstat(staging_fd))
                         or not _same_inode(published_path_info, published_info)):
-                    _fail("recovery")
+                    _fail("recovery", "adopt-published-identity", "changed")
                 _validate_state_directory_fd(published_fd, destination)
+            except OSError as exc:
+                raise _os_error("adopt-published-stat", exc) from None
             finally:
-                os.close(published_fd)
-            os.fsync(root_fd)
+                _close_fd(published_fd)
+            try:
+                os.fsync(root_fd)
+            except OSError as exc:
+                raise _os_error("adopt-published-parent-sync", exc) from None
             _forward_adopt_boundary("state-published")
         finally:
-            os.close(staging_fd)
+            _close_fd(staging_fd)
 
         _forward_validate_origin(state_root, root_fd, adoption, snapshots)
         _forward_inventory_recheck(inventory, added=frozenset({destination}))
@@ -2983,9 +3382,12 @@ def _forward_adopt(state_root: str, request_data: bytes,
         _forward_validate_origin(state_root, root_fd, adoption, snapshots)
         _forward_inventory_recheck(
             inventory, added=frozenset({destination, temporary_pointer}))
-        current_path_info = os.stat(
-            pointer_name, dir_fd=root_fd, follow_symlinks=False
-        )
+        try:
+            current_path_info = os.stat(
+                pointer_name, dir_fd=root_fd, follow_symlinks=False
+            )
+        except OSError as exc:
+            raise _os_error("adopt-pointer-recheck-stat", exc) from None
         current_fd, current_info, current_data = _open_private_state_file(
             os.path.join(state_root, pointer_name)
         )
@@ -2995,23 +3397,30 @@ def _forward_adopt(state_root: str, request_data: bytes,
                     or _forward_identity_from_stat(current_info)
                     != adoption["originalMarker"]["identity"]
                     or current_data != pointer_data):
-                _fail("recovery")
+                _fail("recovery", "adopt-pointer-recheck", "changed")
         finally:
-            os.close(current_fd)
+            _close_fd(current_fd)
         _forward_adopt_boundary("pointer-ready")
         if before_commit is not None:
             before_commit()
         _forward_validate_origin(state_root, root_fd, adoption, snapshots)
-        _forward_archive_preflight(state_root, os.fstat(root_fd), adoption)
-        if (credential_parent_fd is not None and not _same_inode(
-                os.fstat(credential_parent_fd),
-                os.stat(HOST_CREDENTIAL_PARENT, follow_symlinks=False))):
-            _fail("recovery")
+        try:
+            archive_root = os.fstat(root_fd)
+        except OSError as exc:
+            raise _os_error("adopt-archive-root-stat", exc) from None
+        _forward_archive_preflight(state_root, archive_root, adoption)
+        try:
+            if (credential_parent_fd is not None and not _same_inode(
+                    os.fstat(credential_parent_fd),
+                    os.stat(HOST_CREDENTIAL_PARENT, follow_symlinks=False))):
+                _fail("recovery", "adopt-credential-parent-binding", "changed")
+        except OSError as exc:
+            raise _os_error("adopt-credential-parent-stat", exc) from None
         check_fd, check_info, check_data = _open_private_state_file_at(root_fd, pointer_name)
-        os.close(check_fd)
+        _close_fd(check_fd)
         if (_forward_identity_from_stat(check_info) != adoption["originalMarker"]["identity"]
                 or check_data != pointer_data):
-            _fail("recovery")
+            _fail("recovery", "adopt-pointer-final-witness", "changed")
         _forward_inventory_recheck(
             inventory, added=frozenset({destination, temporary_pointer}))
         try:
@@ -3019,24 +3428,23 @@ def _forward_adopt(state_root: str, request_data: bytes,
                 temporary_pointer, pointer_name,
                 src_dir_fd=root_fd, dst_dir_fd=root_fd,
             )
-        except OSError:
-            raise ProviderError(
-                ERRORS["recovery"], "pointer-replace", "other"
-            ) from None
+        except OSError as exc:
+            raise _os_error("pointer-replace", exc) from None
         _forward_adopt_boundary("pointer-renamed")
         try:
             os.fsync(root_fd)
-        except OSError:
-            raise ProviderError(
-                ERRORS["recovery"], "pointer-replace-sync", "other"
-            ) from None
+        except OSError as exc:
+            raise _os_error("pointer-replace-sync", exc) from None
         _forward_adopt_boundary("pointer-replaced")
     finally:
         if inventory is not None:
-            inventory.close()
+            try:
+                inventory.close()
+            except OSError as exc:
+                raise _os_error("inventory-close", exc) from None
         if credential_parent_fd is not None:
-            os.close(credential_parent_fd)
-        os.close(root_fd)
+            _close_fd(credential_parent_fd)
+        _close_fd(root_fd)
     _result(marker["providerEnabled"], False, False, "forward-adopted")
 
 
@@ -3310,22 +3718,28 @@ def _credential_owner_key(
 
 def _validate_transaction(tx: str) -> None:
     if not os.path.isdir(tx) or os.path.islink(tx):
-        _fail("recovery")
+        _fail("recovery", "credential-transaction-type")
     _check_ancestors(tx, category="recovery")
-    info = os.stat(tx, follow_symlinks=False)
+    try:
+        info = os.stat(tx, follow_symlinks=False)
+    except OSError as exc:
+        raise _os_error("credential-transaction-stat", exc) from None
     if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
-        _fail("recovery")
+        _fail("recovery", "credential-transaction-metadata")
     _acl_is_safe(tx, category="recovery")
     allowed = {"snapshot", "publication", "identity.json"}
-    names = set(os.listdir(tx))
+    try:
+        names = set(os.listdir(tx))
+    except OSError as exc:
+        raise _os_error("credential-transaction-list", exc) from None
     if not names.issubset(allowed):
-        _fail("recovery")
+        _fail("recovery", "credential-transaction-children")
     if not {"snapshot", "identity.json"}.issubset(names):
-        _fail("recovery")
+        _fail("recovery", "credential-transaction-required")
     for name in names:
         path = os.path.join(tx, name)
         if os.path.islink(path):
-            _fail("recovery")
+            _fail("recovery", "credential-transaction-symlink")
         _acl_is_safe(path, category="recovery")
 
 
@@ -3337,7 +3751,7 @@ def _verify_created_publication(
 ) -> dict[str, int]:
     publication = os.path.join(tx, "publication")
     if not os.path.isfile(publication) or os.path.islink(publication):
-        _fail("recovery")
+        _fail("recovery", "credential-publication-type")
     try:
         publication_identity, publication_data = _read_existing(
             publication,
@@ -3349,7 +3763,9 @@ def _verify_created_publication(
     except ProviderError as error:
         if error.category == ERRORS["recovery"]:
             raise
-        _fail("recovery")
+        _fail("recovery", "credential-publication-read")
+    except OSError as exc:
+        raise _os_error("credential-publication-stat", exc) from None
     if (
         publication_identity != durable_identity
         or identity["durable"] != durable_identity
@@ -3363,7 +3779,7 @@ def _verify_created_publication(
         or durable_info.st_gid != 10001
         or stat.S_IMODE(durable_info.st_mode) != 0o440
     ):
-        _fail("recovery")
+        _fail("recovery", "credential-publication-binding", "changed")
     return durable_identity
 
 
@@ -3945,25 +4361,30 @@ def _retention_reference(path: str) -> str:
         or "\x00" in path
         or any(part in ("", ".", "..") for part in path.split("/")[1:])
     ):
-        _fail("recovery")
+        _fail("recovery", "protected-reference-path")
     current = "/"
     for component in path.split("/")[1:]:
         current = os.path.join(current, component)
         if os.path.islink(current):
-            _fail("recovery")
+            _fail("recovery", "protected-reference-symlink")
     if os.path.lexists(path) and os.path.realpath(path) != path:
-        _fail("recovery")
+        _fail("recovery", "protected-reference-binding")
     return path
 
 
 def _open_reference_parent(path: str) -> tuple[int, str]:
     components = path.split("/")[1:]
     if not components or any(not component for component in components):
-        _fail("recovery")
-    parent_fd = os.open(
-        "/",
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
+        _fail("recovery", "protected-parent-path")
+    try:
+        parent_fd = os.open(
+            "/",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise _os_error("protected-parent-open", exc) from None
     try:
         for component in components[:-1]:
             next_fd = os.open(
@@ -3974,8 +4395,14 @@ def _open_reference_parent(path: str) -> tuple[int, str]:
             os.close(parent_fd)
             parent_fd = next_fd
         return parent_fd, components[-1]
+    except FileNotFoundError:
+        _close_fd(parent_fd)
+        raise
+    except OSError as exc:
+        _close_fd(parent_fd)
+        raise _os_error("protected-parent-walk", exc) from None
     except Exception:
-        os.close(parent_fd)
+        _close_fd(parent_fd)
         raise
 
 
@@ -4053,13 +4480,16 @@ def _owned_state(path: str, name: str, *, require_terminal: bool) -> tuple[str, 
 
 def _validate_state_directory_fd(directory_fd: int, name: str) -> tuple[str, str]:
     run_key, state_kind = _state_parts(name)
-    info = os.fstat(directory_fd)
+    try:
+        info = os.fstat(directory_fd)
+    except OSError as exc:
+        raise _os_error("state-directory-fstat", exc) from None
     if (
         not stat.S_ISDIR(info.st_mode)
         or info.st_uid != 0
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
-        _fail("recovery")
+        _fail("recovery", "state-directory-metadata")
     _acl_is_safe(
         f"/proc/self/fd/{directory_fd}",
         follow_symlinks=True,
@@ -4069,19 +4499,26 @@ def _validate_state_directory_fd(directory_fd: int, name: str) -> tuple[str, str
         directory_fd,
         OWNER_MARKER,
     )
-    os.close(marker_fd)
+    _close_fd(marker_fd)
     if (
         marker_info.st_uid != 0
         or marker_info.st_nlink != 1
         or stat.S_IMODE(marker_info.st_mode) != 0o600
     ):
-        _fail("recovery")
+        _fail("recovery", "owner-marker-metadata")
     schema_version, proof_digest = _parse_state_marker(data, run_key, state_kind)
     _validate_state_image_proof_fd(directory_fd, schema_version, proof_digest)
     return run_key, state_kind
 
 
 def _parse_terminal_state_data(data: bytes, name: str) -> tuple[str, bool]:
+    try:
+        return _terminal_state_record(data, name)
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _fail("recovery", "terminal-shape")
+
+
+def _terminal_state_record(data: bytes, name: str) -> tuple[str, bool]:
     value = _json(data, "recovery")
     run_key, _ = _state_parts(name)
     if set(value) != {
@@ -4090,7 +4527,7 @@ def _parse_terminal_state_data(data: bytes, name: str) -> tuple[str, bool]:
         "outcome",
         "providerEnabled",
     }:
-        _fail("recovery")
+        _fail("recovery", "terminal-shape")
     if (
         type(value["schemaVersion"]) is not int
         or value["schemaVersion"] != SCHEMA_VERSION
@@ -4100,7 +4537,7 @@ def _parse_terminal_state_data(data: bytes, name: str) -> tuple[str, bool]:
         or value["outcome"] not in ("committed", "rolled-back")
         or type(value["providerEnabled"]) is not bool
     ):
-        _fail("recovery")
+        _fail("recovery", "terminal-binding")
     return value["outcome"], value["providerEnabled"]
 
 
@@ -4118,9 +4555,9 @@ def _validate_terminal_state_fd(directory_fd: int, name: str) -> None:
         directory_fd,
         "terminal.json",
     )
-    os.close(terminal_fd)
+    _close_fd(terminal_fd)
     if terminal_info.st_uid != 0 or terminal_info.st_nlink != 1:
-        _fail("recovery")
+        _fail("recovery", "terminal-metadata")
     _parse_terminal_state_data(terminal_data, name)
 
 
@@ -4137,9 +4574,12 @@ def _owned_state_fd(
 
 
 def _iter_directory_fd_names(directory_fd: int) -> Iterable[str]:
-    with os.scandir(f"/proc/self/fd/{directory_fd}") as entries:
-        for entry in entries:
-            yield entry.name
+    try:
+        with os.scandir(f"/proc/self/fd/{directory_fd}") as entries:
+            for entry in entries:
+                yield entry.name
+    except OSError as exc:
+        raise _os_error("directory-scan", exc) from None
 
 
 def _open_optional_directory_reference(path: str) -> int | None:
@@ -4159,7 +4599,7 @@ def _open_optional_directory_reference(path: str) -> int | None:
             or expected.st_uid != 0
             or stat.S_IMODE(expected.st_mode) != 0o700
         ):
-            _fail("recovery")
+            _fail("recovery", "credential-parent-metadata")
         directory_fd = os.open(
             name,
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -4167,16 +4607,18 @@ def _open_optional_directory_reference(path: str) -> int | None:
         )
         opened = os.fstat(directory_fd)
         if not _same_inode(opened, expected):
-            os.close(directory_fd)
-            _fail("recovery")
+            _close_fd(directory_fd)
+            _fail("recovery", "credential-parent-identity", "changed")
         _acl_is_safe(
             f"/proc/self/fd/{directory_fd}",
             follow_symlinks=True,
             category="recovery",
         )
         return directory_fd
+    except OSError as exc:
+        raise _os_error("credential-parent-open", exc) from None
     finally:
-        os.close(parent_fd)
+        _close_fd(parent_fd)
 
 
 def _retention_interlocks_fd(
@@ -4235,23 +4677,29 @@ def _validate_retention_state_root_path(state_root: str) -> os.stat_result:
         or os.path.islink(state_root)
         or not os.path.isdir(state_root)
     ):
-        _fail("recovery")
-    info = os.stat(state_root, follow_symlinks=False)
+        _fail("recovery", "state-root-path")
+    try:
+        info = os.stat(state_root, follow_symlinks=False)
+    except OSError as exc:
+        raise _os_error("state-root-stat", exc) from None
     if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
-        _fail("recovery")
+        _fail("recovery", "state-root-metadata")
     _check_ancestors(state_root, category="recovery")
     _acl_is_safe(state_root, category="recovery")
     return info
 
 
 def _validate_retention_state_root_fd(fd: int) -> None:
-    info = os.fstat(fd)
+    try:
+        info = os.fstat(fd)
+    except OSError as exc:
+        raise _os_error("state-root-fstat", exc) from None
     if (
         not stat.S_ISDIR(info.st_mode)
         or info.st_uid != 0
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
-        _fail("recovery")
+        _fail("recovery", "state-root-metadata")
     _acl_is_safe(f"/proc/self/fd/{fd}", follow_symlinks=True, category="recovery")
 
 
@@ -4500,13 +4948,13 @@ def _validate_forward_archive(
         _check_ancestors(archive_path, category="recovery")
         root_info = os.stat(archive_root, follow_symlinks=False)
         archive_info = os.stat(archive_path, follow_symlinks=False)
-    except OSError:
-        _fail("recovery")
+    except OSError as exc:
+        raise _os_error("retained-archive-stat", exc) from None
     if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0
             or stat.S_IMODE(root_info.st_mode) != 0o700
             or not stat.S_ISDIR(archive_info.st_mode)
             or archive_info.st_uid != 0 or stat.S_IMODE(archive_info.st_mode) != 0o700):
-        _fail("recovery")
+        _fail("recovery", "retained-archive-metadata")
     _acl_is_safe(archive_root, category="recovery")
     _acl_is_safe(archive_path, category="recovery")
     source_identity = adoption["originalStateIdentity"]
@@ -4515,10 +4963,10 @@ def _validate_forward_archive(
     # and permissions remain the identity proof for the archived state root.
     for key in FORWARD_IDENTITY_KEYS - {"ctimeNs"}:
         if actual_archive_identity[key] != source_identity[key]:
-            _fail("recovery")
+            _fail("recovery", "retained-archive-identity", "changed")
     state_path = os.path.join(state_root, FORWARD_ORIGIN_STATE)
     if require_source_absent and os.path.lexists(state_path):
-        _fail("recovery")
+        _fail("recovery", "retained-archive-source-absent")
 
     expected: dict[str, dict[str, Any]] = {}
     root_witnesses = 0
@@ -4526,74 +4974,79 @@ def _validate_forward_archive(
         path = witness["path"]
         if path == state_path:
             if witness["kind"] != "directory":
-                _fail("recovery")
+                _fail("recovery", "retained-archive-witness-kind")
             root_witnesses += 1
             if witness["identity"] != source_identity:
-                _fail("recovery")
+                _fail("recovery", "retained-archive-witness-identity")
             continue
         if path.startswith(state_path + "/"):
             relative = path[len(state_path) + 1:]
             if "/" in relative or relative in ("", ".", "..") or relative in expected:
-                _fail("recovery")
+                _fail("recovery", "retained-archive-child-name")
             expected[relative] = witness
     if root_witnesses != 1:
-        _fail("recovery")
+        _fail("recovery", "retained-archive-witness-count")
     parent_identity = _forward_identity_from_stat(root_info)
     for key in ("device", "inode", "mode", "uid", "gid"):
         if parent_identity[key] != adoption["plannedArchive"]["parentIdentity"][key]:
-            _fail("recovery")
+            _fail("recovery", "retained-archive-parent-identity", "changed")
     try:
         actual_names = set(os.listdir(archive_path))
-    except OSError:
-        _fail("recovery")
+    except OSError as exc:
+        raise _os_error("retained-archive-list", exc) from None
     if actual_names != set(expected):
-        _fail("recovery")
-    archive_fd = os.open(
-        archive_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    )
+        _fail("recovery", "retained-archive-child-set", "changed")
+    try:
+        archive_fd = os.open(
+            archive_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+    except OSError as exc:
+        raise _os_error("retained-archive-open", exc) from None
     try:
         if (_forward_identity_from_stat(os.fstat(archive_fd))
                 != actual_archive_identity):
-            _fail("recovery")
+            _fail("recovery", "retained-archive-open-identity", "changed")
         for name, witness in expected.items():
             try:
                 info = os.stat(name, dir_fd=archive_fd, follow_symlinks=False)
-            except OSError:
-                _fail("recovery")
+            except OSError as exc:
+                raise _os_error("retained-archive-child-stat", exc) from None
             identity = witness["identity"]
             if _forward_identity_from_stat(info) != identity:
-                _fail("recovery")
+                _fail("recovery", "retained-archive-child-identity", "changed")
             if witness["kind"] == "directory":
                 if not stat.S_ISDIR(info.st_mode):
-                    _fail("recovery")
+                    _fail("recovery", "retained-archive-child-type")
                 continue
             if not stat.S_ISREG(info.st_mode):
-                _fail("recovery")
+                _fail("recovery", "retained-archive-child-type")
             fd, opened, data = _open_private_state_file_at(archive_fd, name)
             try:
                 if _forward_identity_from_stat(opened) != identity:
-                    _fail("recovery")
+                    _fail("recovery", "retained-archive-child-open-identity", "changed")
                 if witness["snapshotRef"] is not None:
                     reference_fd, _, reference = _open_private_state_file(
                         os.path.join(state_root, adoption["successorRunKey"]
                                      + "-final-deploy", witness["snapshotRef"])
                     )
-                    os.close(reference_fd)
+                    _close_fd(reference_fd)
                     if data != reference:
-                        _fail("recovery")
+                        _fail("recovery", "retained-archive-child-content", "changed")
                 else:
                     import base64
                     embedded = base64.b64decode(witness["bytesBase64"], validate=True)
                     if data != embedded:
-                        _fail("recovery")
+                        _fail("recovery", "retained-archive-child-content", "changed")
             finally:
-                os.close(fd)
+                _close_fd(fd)
         if (_forward_identity_from_stat(os.fstat(archive_fd))
                 != _forward_identity_from_stat(os.stat(
                     archive_path, follow_symlinks=False))):
-            _fail("recovery")
+            _fail("recovery", "retained-archive-final-identity", "changed")
+    except OSError as exc:
+        raise _os_error("retained-archive-read", exc) from None
     finally:
-        os.close(archive_fd)
+        _close_fd(archive_fd)
 
 
 def _validate_forward_retention_fd(
@@ -4605,17 +5058,17 @@ def _validate_forward_retention_fd(
     if child_names is None:
         if {"forward-adoption.json", "forward-acceptance.json"} & set(
                 _iter_directory_fd_names(state_fd)):
-            _fail("recovery")
+            _fail("recovery", "retained-receipt-children")
         return
     has_adoption = "forward-adoption.json" in (child_names or set())
     has_acceptance = "forward-acceptance.json" in (child_names or set())
     if has_adoption != has_acceptance:
-        _fail("recovery")
+        _fail("recovery", "retained-receipt-pair")
     if not has_adoption:
         return
     successor, kind = _state_parts(state_name)
     if kind != "final-deploy":
-        _fail("recovery")
+        _fail("recovery", "retained-receipt-kind")
     adoption_fd, _, adoption_data = _open_private_state_file_at(
         state_fd, "forward-adoption.json"
     )
@@ -4628,23 +5081,23 @@ def _validate_forward_retention_fd(
             acceptance_data, adoption_data, successor
         )
     finally:
-        os.close(adoption_fd)
-        os.close(acceptance_fd)
+        _close_fd(adoption_fd)
+        _close_fd(acceptance_fd)
     terminal_fd, _, terminal_data = _open_private_state_file_at(
         state_fd, "terminal.json"
     )
-    os.close(terminal_fd)
+    _close_fd(terminal_fd)
     outcome, enabled = _parse_terminal_state_data(terminal_data, state_name)
     original_marker = _json(base64.b64decode(
         adoption["originalMarker"]["bytesBase64"]), "recovery")
     if outcome != "committed" or enabled != original_marker["providerEnabled"]:
-        _fail("recovery")
+        _fail("recovery", "retained-terminal-binding")
     _validate_forward_archive(adoption, state_root, require_source_absent=True)
     transaction = _transaction(
         HOST_CREDENTIAL_PARENT, FORWARD_ORIGIN_KEY
     )
     if os.path.lexists(transaction):
-        _fail("recovery")
+        _fail("recovery", "retained-credential-transaction")
 
 
 def _retention_delete(
@@ -4982,6 +5435,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
     except ProviderError as exc:
         if (command == "forward-adopt"
+                and exc.category == ERRORS["recovery"]
                 and exc.check in FORWARD_ADOPT_CHECKS
                 and exc.reason in FORWARD_ADOPT_REASONS):
             sys.stderr.write(

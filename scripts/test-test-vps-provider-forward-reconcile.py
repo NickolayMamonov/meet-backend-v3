@@ -5,6 +5,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import base64
+import ast
 import contextlib
 import copy
 import errno
@@ -528,6 +529,24 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(stderr.getvalue(), "RECOVERY_REQUIRED\n")
 
+    def test_attribution_is_suppressed_for_non_recovery_categories(self):
+        stderr = io.StringIO()
+        args = mock.Mock(command="forward-adopt")
+        parser = mock.Mock()
+        parser.parse_args.return_value = args
+        with (mock.patch.object(helper, "_parser", return_value=parser),
+              mock.patch.object(
+                  helper, "_forward_admission",
+                  side_effect=helper.ProviderError(
+                      "PROVIDER_STATE_INVALID", "target-proof-platform", "rejected"
+                  ),
+              ),
+              mock.patch.object(helper, "_bounded_stdin", return_value=b""),
+              mock.patch.object(helper.sys, "stderr", stderr)):
+            result = helper.main([])
+        self.assertEqual(result, 1)
+        self.assertEqual(stderr.getvalue(), "PROVIDER_STATE_INVALID\n")
+
     def test_forward_adopt_json_depth_rejection_keeps_legacy_provider_category(self):
         nested = []
         for _ in range(helper.MAX_JSON_DEPTH + 2):
@@ -536,6 +555,400 @@ class FixtureTests(unittest.TestCase):
             helper._json(encode(nested), "recovery", "target-proof-index")
         self.assertEqual(raised.exception.category, "PROVIDER_STATE_INVALID")
         self.assertIsNone(raised.exception.check)
+
+
+class FullAttributionTests(FixtureTests):
+    @staticmethod
+    def reachable_functions():
+        tree = ast.parse((SCRIPTS / "test-vps-provider-credential.py").read_text())
+        functions = {node.name: node for node in tree.body
+                     if isinstance(node, ast.FunctionDef)}
+        reachable = set()
+        pending = ["_forward_admission", "_bounded_stdin"]
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            pending.extend(
+                node.func.id for node in ast.walk(functions[name])
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in functions)
+        return tree, functions, reachable
+
+    def test_reachable_recovery_guards_and_os_sites_have_static_attribution(self):
+        tree, functions, reachable = self.reachable_functions()
+        parents = {child: parent for parent in ast.walk(tree)
+                   for child in ast.iter_child_nodes(parent)}
+        # These helpers receive their checks from validated, fixed call sites.
+        dynamic = {"_target_image_proof_record", "_forward_image_record",
+                   "_reject_forward_inventory", "_os_error"}
+        syscalls = {"open", "close", "stat", "fstat", "read", "write", "lseek",
+                    "pread", "scandir", "getxattr", "mkdir", "fchown", "fchmod",
+                    "fsync", "replace"}
+        checked_guards = checked_io = 0
+        for name in sorted(reachable):
+            function = functions[name]
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call):
+                    continue
+                if isinstance(node.func, ast.Name) and node.func.id in ("_fail", "_os_error"):
+                    index = 1 if node.func.id == "_fail" else 0
+                    if node.func.id == "_fail" and not (
+                            isinstance(node.args[0], ast.Constant)
+                            and node.args[0].value == "recovery"):
+                        continue
+                    with self.subTest(function=name, line=node.lineno):
+                        self.assertGreater(len(node.args), index)
+                        check = node.args[index]
+                        if isinstance(check, ast.Constant):
+                            self.assertIn(check.value, helper.FORWARD_ADOPT_CHECKS)
+                        else:
+                            self.assertIn(name, dynamic)
+                    checked_guards += 1
+                if (isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "os" and node.func.attr in syscalls):
+                    parent = node
+                    caught = False
+                    while parent in parents and parent is not function:
+                        child, parent = parent, parents[parent]
+                        if (isinstance(parent, ast.Try) and child in parent.body
+                                and any(handler.type is not None
+                                        and "OSError" in ast.unparse(handler.type)
+                                        for handler in parent.handlers)):
+                            caught = True
+                    with self.subTest(function=name, syscall=node.func.attr, line=node.lineno):
+                        self.assertTrue(caught)
+                    checked_io += 1
+        self.assertGreater(checked_guards, 200)
+        self.assertGreater(checked_io, 100)
+        for check in helper.FORWARD_ADOPT_CHECKS:
+            self.assertRegex(check, r"^[a-z]+(?:-[a-z]+)*$")
+            self.assertLessEqual(len(check), 48)
+
+    def test_every_classifier_reason_is_translated_for_constructor_and_rechecks(self):
+        source = ast.parse((SCRIPTS / "test_vps_state_admission.py").read_text())
+        reasons = {"invalid_record"}
+        reachable = ast.Module(body=[
+            node for node in source.body
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+            and node.name not in ("main", "_record_file")
+        ], type_ignores=[])
+
+        def reason_values(expression):
+            if isinstance(expression, ast.Constant):
+                return {expression.value}
+            self.assertIsInstance(expression, ast.IfExp)
+            return reason_values(expression.body) | reason_values(expression.orelse)
+
+        for node in ast.walk(reachable):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id == "require" and len(node.args) > 1:
+                argument = node.args[1]
+            elif node.func.id == "Rejected" and node.args:
+                argument = node.args[0]
+                if isinstance(argument, ast.Name):
+                    # require() forwards only its fixed default or call-site code.
+                    self.assertEqual(argument.id, "reason")
+                    continue
+            else:
+                continue
+            reasons.update(reason_values(argument))
+        self.assertGreater(len(reasons), 30)
+        module = helper._forward_state_module()
+        for reason in sorted(reasons):
+            with self.subTest(reason=reason):
+                with self.assertRaises(helper.ProviderError) as raised:
+                    helper._reject_forward_inventory(module.Rejected(reason))
+                self.assertEqual(raised.exception.category, "RECOVERY_REQUIRED")
+                self.assertIsNotNone(raised.exception.check, reason)
+                self.assertIn(raised.exception.check, helper.FORWARD_ADOPT_CHECKS)
+                self.assertIn(raised.exception.reason, helper.FORWARD_ADOPT_REASONS)
+        for operation, check in (
+                ("constructor", "inventory-constructor-io"),
+                ("recheck", "inventory-recheck-io")):
+            fixture = self.fresh()
+            with self.subTest(operation=operation), contextlib.ExitStack() as stack:
+                error = OSError(errno.EACCES, KEY, str(fixture.root))
+                if operation == "constructor":
+                    stack.enter_context(mock.patch.object(module, "Inventory", side_effect=error))
+                    invoke = fixture.admit
+                else:
+                    inventory = mock.Mock()
+                    inventory.recheck.side_effect = error
+                    invoke = lambda: helper._forward_inventory_recheck(inventory)
+                with self.assertRaises(helper.ProviderError) as raised:
+                    invoke()
+                self.assertEqual((raised.exception.check, raised.exception.reason),
+                                 (check, "denied"))
+                self.unchanged(fixture)
+
+    def test_errno_and_cli_allowlists_never_reflect_private_exception_data(self):
+        for code, reason in (
+                (errno.ENOENT, "missing"), (errno.EACCES, "denied"),
+                (errno.EPERM, "denied"), (errno.ESTALE, "changed"),
+                (errno.EIO, "other"), (errno.EMFILE, "other"),
+                (None, "other")):
+            error = helper._os_error(
+                "pointer-replace", OSError(code, KEY, "/private/" + KEY))
+            self.assertEqual((error.category, error.check, error.reason),
+                             ("RECOVERY_REQUIRED", "pointer-replace", reason))
+        for command in helper._parser()._actions[0].choices:
+            for category in helper.ERRORS.values():
+                stderr = io.StringIO()
+                parser = mock.Mock()
+                parser.parse_args.return_value = mock.Mock(command=command)
+                with (mock.patch.object(helper, "_parser", return_value=parser),
+                      mock.patch.object(helper, "_bounded_stdin",
+                                        side_effect=helper.ProviderError(
+                                            category, "private-file-open", "missing")),
+                      mock.patch.object(helper, "_check",
+                                        side_effect=helper.ProviderError(
+                                            category, "private-file-open", "missing")),
+                      mock.patch.object(helper, "_run_key",
+                                        side_effect=helper.ProviderError(
+                                            category, "private-file-open", "missing")),
+                      mock.patch.object(helper, "_forward_phase",
+                                        side_effect=helper.ProviderError(
+                                            category, "private-file-open", "missing")),
+                      mock.patch.object(helper, "_retention_list",
+                                        side_effect=helper.ProviderError(
+                                            category, "private-file-open", "missing")),
+                      mock.patch.object(helper, "_retention_check",
+                                        side_effect=helper.ProviderError(
+                                            category, "private-file-open", "missing")),
+                      mock.patch.object(helper, "_retention_delete",
+                                        side_effect=helper.ProviderError(
+                                            category, "private-file-open", "missing")),
+                      mock.patch.object(helper.sys, "stderr", stderr)):
+                    self.assertEqual(helper.main([]), 1)
+                expected = category + "\n"
+                if command == "forward-adopt" and category == "RECOVERY_REQUIRED":
+                    expected = ("forward_adopt_rejected_check=private-file-open "
+                                "reason=missing\n" + expected)
+                with self.subTest(command=command, category=category):
+                    self.assertEqual(stderr.getvalue(), expected)
+        for check, reason in ((KEY, "other"), ("private-file-open", KEY), (None, "other")):
+            stderr = io.StringIO()
+            with (mock.patch.object(helper, "_forward_admission",
+                                    side_effect=helper.ProviderError(
+                                        "RECOVERY_REQUIRED", check, reason)),
+                  mock.patch.object(helper, "_bounded_stdin", return_value=b""),
+                  mock.patch.object(helper.sys, "stderr", stderr)):
+                self.assertEqual(helper.main(["forward-adopt"]), 1)
+            self.assertEqual(stderr.getvalue(), "RECOVERY_REQUIRED\n")
+
+    def test_native_cli_success_and_malformed_shape_failures_keep_output_contract(self):
+        mutations = (
+            ("success", lambda fixture: None, None),
+            ("stopped-started", lambda fixture:
+             fixture.backend["State"].pop("StartedAt"), "stopped-record-shape"),
+            ("stopped-host", lambda fixture:
+             fixture.backend.pop("HostConfig"), "stopped-static-shape"),
+            ("stopped-network", lambda fixture:
+             fixture.backend["NetworkSettings"].update(Networks={"network": 1}),
+             "stopped-static-shape"),
+            ("image-label", lambda fixture:
+             fixture.old_image["Config"]["Labels"].pop("org.opencontainers.image.version"),
+             "image-record-shape"),
+            ("rendered-services", lambda fixture:
+             fixture.rendered.pop("services"), "rendered-shape"),
+            ("rendered-environment", lambda fixture:
+             fixture.rendered["services"]["backend"].update(environment=7),
+             "rendered-shape"),
+            ("rendered-ports", lambda fixture:
+             fixture.rendered["services"]["backend"].update(ports=7), "rendered-shape"),
+            ("rendered-mounts", lambda fixture:
+             fixture.rendered["services"]["backend"].update(volumes=[None]),
+             "rendered-shape"),
+        )
+        for label, mutate, check in mutations:
+            with self.subTest(case=label):
+                fixture = self.fresh("reused")
+                fixture.historical_original()
+                mutate(fixture)
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (mock.patch.object(helper, "_bounded_stdin", return_value=fixture.bundle()),
+                      mock.patch.object(helper.sys, "stdout", stdout),
+                      mock.patch.object(helper.sys, "stderr", stderr)):
+                    result = helper.main([
+                        "forward-adopt", "--state-root", str(fixture.states),
+                        "--run-key", SUCCESSOR, "--deployment-root", str(fixture.app),
+                        "--base-compose", fixture.paths["reviewed-base"],
+                    ])
+                if check is None:
+                    self.assertEqual(result, 0)
+                    self.assertEqual(stderr.getvalue(), "")
+                    self.assertEqual(json.loads(stdout.getvalue())["outcome"], "forward-adopted")
+                    self.assertEqual(fixture.marker()["runKey"], SUCCESSOR)
+                else:
+                    self.assertEqual(result, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(stderr.getvalue(),
+                                     f"forward_adopt_rejected_check={check} reason=rejected\n"
+                                     "RECOVERY_REQUIRED\n")
+                    self.unchanged(fixture)
+                for private in (str(fixture.root), KEY, "fictional@example.invalid",
+                                hashlib.sha256(KEY.encode()).hexdigest()):
+                    self.assertNotIn(private, stdout.getvalue() + stderr.getvalue())
+
+    def test_preexisting_plain_pending_rejections_remain_outside_category_contract(self):
+        pending = helper._forward_pending_module()
+        fixture = self.fresh()
+        # This class is intentionally not among main()'s historical catches.
+        self.assertFalse(issubclass(pending.Rejected, ValueError))
+        with self.assertRaises(pending.Rejected):
+            helper._forward_environment({"config.env.production": b"GEOCODER_ENABLED=true\n"})
+        with self.assertRaises(pending.Rejected):
+            helper._forward_rendered({}, {}, {}, b"GEOCODER_ENABLED=true\n")
+        self.unchanged(fixture)
+
+    def test_every_bundle_field_shape_preserves_category_and_attributes_native_recovery(self):
+        fixture = self.fresh()
+        bundle = json.loads(fixture.bundle())
+        arguments = [
+            "forward-adopt", "--state-root", str(fixture.states),
+            "--run-key", SUCCESSOR, "--deployment-root", str(fixture.app),
+            "--base-compose", fixture.paths["reviewed-base"],
+        ]
+
+        def fields(value, path=()):
+            yield path, value
+            children = value.items() if isinstance(value, dict) else (
+                enumerate(value) if isinstance(value, list) else ())
+            for key, child in children:
+                yield from fields(child, path + (key,))
+
+        cases = recovery = 0
+        with mock.patch.object(helper, "_forward_adopt"):
+            for path, original in fields(bundle):
+                for replacement in (None, False, 0, "", [], {}):
+                    if type(original) is type(replacement) and original == replacement:
+                        continue
+                    value = copy.deepcopy(bundle)
+                    if path:
+                        parent = value
+                        for key in path[:-1]:
+                            parent = parent[key]
+                        parent[path[-1]] = replacement
+                    else:
+                        value = replacement
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with (self.subTest(path=path, replacement=type(replacement).__name__),
+                          mock.patch.object(helper, "_bounded_stdin", return_value=encode(value)),
+                          mock.patch.object(helper.sys, "stdout", stdout),
+                          mock.patch.object(helper.sys, "stderr", stderr)):
+                        status = helper.main(arguments)
+                        lines = stderr.getvalue().splitlines()
+                        if lines and lines[-1] == "RECOVERY_REQUIRED":
+                            recovery += 1
+                            self.assertEqual(status, 1)
+                            self.assertEqual(len(lines), 2, path)
+                            check, reason = lines[0].removeprefix(
+                                "forward_adopt_rejected_check=").split(" reason=")
+                            self.assertIn(check, helper.FORWARD_ADOPT_CHECKS)
+                            self.assertIn(reason, helper.FORWARD_ADOPT_REASONS)
+                        elif lines:
+                            self.assertEqual(status, 1)
+                            self.assertEqual(len(lines), 1)
+                            self.assertIn(lines[0], helper.ERRORS.values())
+                        else:
+                            self.assertEqual(status, 0)
+                        self.assertEqual(stdout.getvalue(), "")
+                    cases += 1
+        self.assertGreater(cases, 500)
+        self.assertGreater(recovery, 300)
+        self.unchanged(fixture)
+        print(f"NATIVE_BUNDLE_SHAPE_ATTRIBUTION_PASS cases={cases} recovery={recovery}",
+              flush=True)
+
+    def test_each_observed_native_os_site_reports_a_fixed_leaf_on_failure(self):
+        operations = ("open", "close", "stat", "fstat", "read", "write", "lseek",
+                      "scandir", "getxattr", "mkdir", "fchown", "fchmod", "fsync",
+                      "replace")
+        originals = {name: getattr(os, name) for name in operations}
+        sites = {}
+        target = [None]
+        fired = [False]
+        disposition = [None]
+
+        def intercept(operation):
+            actual = originals[operation]
+            def invoke(*args, **kwargs):
+                frame = sys._getframe(1)
+                site = (frame.f_code.co_name, frame.f_lineno, operation)
+                native = frame.f_code.co_filename == helper.__file__
+                if native:
+                    sites.setdefault(site, disposition[0])
+                if native and site == target[0] and not fired[0]:
+                    fired[0] = True
+                    # A failed close may have closed its fd. Finish that close
+                    # in the fixture so error-path observation cannot leak it.
+                    if operation == "close":
+                        actual(*args, **kwargs)
+                    raise OSError(errno.EIO, KEY, "/private/" + KEY)
+                return actual(*args, **kwargs)
+            return invoke
+
+        def instrument():
+            stack = contextlib.ExitStack()
+            for operation in operations:
+                stack.enter_context(mock.patch.object(
+                    helper.os, operation, new=intercept(operation)))
+            return stack
+
+        def live_fds():
+            result = set()
+            for name in os.listdir("/proc/self/fd"):
+                try:
+                    originals["fstat"](int(name))
+                except OSError:
+                    # scandir's own descriptor may appear after it is closed.
+                    continue
+                result.add(int(name))
+            return result
+
+        for mode in ("none", "created", "reused"):
+            disposition[0] = mode
+            fixture = self.fresh(mode)
+            fixture.historical_original()
+            with instrument():
+                fixture.admit()
+        observed = tuple(sorted(sites.items()))
+        self.assertGreater(len(observed), 70)
+        for site, mode in observed:
+            with self.subTest(site=site, disposition=mode):
+                disposition[0] = mode
+                fixture = self.fresh(mode)
+                fixture.historical_original()
+                before_fds = live_fds()
+                target[0], fired[0] = site, False
+                try:
+                    with instrument(), self.assertRaises(helper.ProviderError) as raised:
+                        fixture.admit()
+                    self.assertTrue(fired[0])
+                    if raised.exception.category == "RECOVERY_REQUIRED":
+                        self.assertIn(raised.exception.check, helper.FORWARD_ADOPT_CHECKS)
+                        self.assertIn(raised.exception.reason, helper.FORWARD_ADOPT_REASONS)
+                    self.assertIn(fixture.marker()["runKey"],
+                                  (helper.FORWARD_ORIGIN_KEY, SUCCESSOR))
+                    self.assertTrue(fixture.origin.exists())
+                    self.assertFalse(fixture.archive.exists())
+                    self.assertEqual(Path(fixture.paths["production-env"]).read_bytes(),
+                                     fixture.target_env)
+                finally:
+                    target[0] = None
+                    # Some pre-existing failed-acquire paths leave an opened
+                    # fd behind. This test does not change their lifecycle.
+                    for fd in live_fds() - before_fds:
+                        try:
+                            originals["close"](fd)
+                        except OSError:
+                            pass
+                    self.assertEqual(live_fds(), before_fds)
+        print(f"NATIVE_OS_SITE_ATTRIBUTION_PASS sites={len(observed)}", flush=True)
 
 
 class TargetImageStateProofTests(unittest.TestCase):
@@ -1087,8 +1500,11 @@ class ForwardTests(FixtureTests):
             with self.subTest(case=label):
                 fixture = self.fresh()
                 mutate(fixture)
-                with self.assertRaises((helper.ProviderError, OSError, ValueError)):
+                with self.assertRaises(helper.ProviderError) as raised:
                     fixture.admit()
+                if raised.exception.category == "RECOVERY_REQUIRED":
+                    self.assertIn(raised.exception.check, helper.FORWARD_ADOPT_CHECKS)
+                    self.assertIn(raised.exception.reason, helper.FORWARD_ADOPT_REASONS)
                 self.assertEqual(fixture.marker()["runKey"], helper.FORWARD_ORIGIN_KEY)
                 self.assertFalse(fixture.successor.exists())
 
@@ -1288,8 +1704,14 @@ class ForwardTests(FixtureTests):
                                 raised.exception.check, "pointer-replace-sync"
                             )
                         else:
-                            with self.assertRaises(OSError):
+                            with self.assertRaises(
+                                    helper.ProviderError if operation_name == "adopt"
+                                    else (helper.ProviderError, OSError)) as raised:
                                 operation()
+                            if isinstance(raised.exception, helper.ProviderError):
+                                self.assertEqual(raised.exception.category, "RECOVERY_REQUIRED")
+                                self.assertIn(raised.exception.check, helper.FORWARD_ADOPT_CHECKS)
+                                self.assertIn(raised.exception.reason, helper.FORWARD_ADOPT_REASONS)
                     if fixture.pointer.exists():
                         self.assertIn(fixture.marker()["runKey"], (helper.FORWARD_ORIGIN_KEY, SUCCESSOR))
                     else:
