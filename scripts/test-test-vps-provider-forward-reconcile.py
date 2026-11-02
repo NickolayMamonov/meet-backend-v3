@@ -1163,6 +1163,176 @@ class StagedOwnershipTests(unittest.TestCase):
 
 
 class ForwardTests(FixtureTests):
+    def test_rendered_credential_bind_requires_false_host_path_creation(self):
+        fixture = self.fresh("created")
+
+        for bind in ({}, {"create_host_path": False}):
+            with self.subTest(accepted_bind=bind):
+                config = copy.deepcopy(fixture.rendered)
+                rendered_credential = next(
+                    volume for volume in config["services"]["backend"]["volumes"]
+                    if volume["target"] == helper.CONTAINER_CREDENTIAL_PATH)
+                rendered_credential["bind"] = bind
+                helper._forward_rendered(
+                    config, fixture.backend, fixture.target, fixture.target_env)
+
+        for bind in (None, True, 0, 1, "false",
+                     {"create_host_path": None},
+                     {"create_host_path": True},
+                     {"create_host_path": 0},
+                     {"create_host_path": 1},
+                     {"create_host_path": "false"},
+                     {"propagation": "rprivate"}):
+            with self.subTest(rejected_bind=repr(bind)):
+                config = copy.deepcopy(fixture.rendered)
+                rendered_credential = next(
+                    volume for volume in config["services"]["backend"]["volumes"]
+                    if volume["target"] == helper.CONTAINER_CREDENTIAL_PATH)
+                rendered_credential["bind"] = bind
+                with self.assertRaises(helper.ProviderError) as error:
+                    helper._forward_rendered(
+                        config, fixture.backend, fixture.target, fixture.target_env)
+                self.assertEqual(error.exception.check, "rendered-credential-mount")
+
+        config = copy.deepcopy(fixture.rendered)
+        rendered_credential = next(
+            volume for volume in config["services"]["backend"]["volumes"]
+            if volume["target"] == helper.CONTAINER_CREDENTIAL_PATH)
+        del rendered_credential["bind"]
+        with self.assertRaises(helper.ProviderError) as error:
+            helper._forward_rendered(
+                config, fixture.backend, fixture.target, fixture.target_env)
+        self.assertEqual(error.exception.check, "rendered-credential-mount")
+
+    def test_real_compose_credential_bind_serialization_matches_admission(self):
+        compose = shutil.which("docker")
+        if compose is None:
+            self.skipTest("Docker Compose CLI is unavailable")
+        try:
+            version = subprocess.run(
+                [compose, "compose", "version"], capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            self.skipTest("Docker Compose CLI is unavailable")
+        if version.returncode != 0:
+            self.skipTest("Docker Compose CLI is unavailable")
+
+        process_env = {
+            key: os.environ[key]
+            for key in ("PATH", "HOME", "SYSTEMROOT", "WINDIR", "USERPROFILE")
+            if key in os.environ
+        }
+        process_env.update({
+            "DB_NAME": "fictional_db",
+            "DB_USERNAME": "fictional_user",
+            "DB_PASSWORD": "fictional_password",
+            "APP_JWT_SECRET": "fictional_jwt_secret",
+            "APP_STORAGE_BASE_URL": "https://example.invalid/uploads",
+        })
+        compose_file = SCRIPTS.parent / "docker-compose.production.yml"
+
+        def render(fixture, credential_volume):
+            with tempfile.TemporaryDirectory() as directory:
+                project_dir = Path(directory)
+                (project_dir / ".env.production").write_bytes(fixture.target_env)
+                override = {
+                    "services": {
+                        "backend": {
+                            "healthcheck": {
+                                "test": fixture.backend["Config"]["Healthcheck"]["Test"],
+                            },
+                        },
+                    },
+                }
+                if credential_volume is not None:
+                    override["services"]["backend"]["volumes"] = [credential_volume]
+                override_path = project_dir / "runtime.override.yml"
+                override_path.write_text(json.dumps(override), encoding="utf-8")
+                result = subprocess.run(
+                    [compose, "compose", "-p", "meet-production",
+                     "--project-directory", str(project_dir),
+                     "--env-file", ".env.production",
+                     "-f", str(compose_file), "-f", str(override_path),
+                     "config", "--format", "json"],
+                    cwd=project_dir, env=process_env, capture_output=True,
+                    text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        def credential_volume(fixture, bind_marker):
+            if bind_marker == "short":
+                return (
+                    f"{helper.HOST_CREDENTIAL_PATH}:"
+                    f"{helper.CONTAINER_CREDENTIAL_PATH}:ro")
+            volume = {
+                "type": "bind",
+                "source": helper.HOST_CREDENTIAL_PATH,
+                "target": helper.CONTAINER_CREDENTIAL_PATH,
+                "read_only": True,
+            }
+            if bind_marker is not ...:
+                volume["bind"] = bind_marker
+            return volume
+
+        for disposition in ("created", "reused"):
+            with self.subTest(disposition=disposition):
+                fixture = self.fresh(disposition)
+                config = render(
+                    fixture, credential_volume(
+                        fixture, {"create_host_path": False}))
+                rendered_credential = next(
+                    volume for volume in config["services"]["backend"]["volumes"]
+                    if volume.get("target") == helper.CONTAINER_CREDENTIAL_PATH)
+                self.assertIs(type(rendered_credential.get("bind")), dict)
+                self.assertIs(
+                    rendered_credential["bind"].get("create_host_path", False), False)
+                helper._forward_rendered(
+                    config, fixture.backend, fixture.target, fixture.target_env)
+
+        fixture = self.fresh("none")
+        config = render(fixture, None)
+        self.assertNotIn(
+            helper.CONTAINER_CREDENTIAL_PATH,
+            {volume.get("target") for volume in config["services"]["backend"]["volumes"]})
+        helper._forward_rendered(
+            config, fixture.backend, fixture.target, fixture.target_env)
+
+        fixture = self.fresh("created")
+        controls = (
+            ("explicit-true", {"create_host_path": True}, "true"),
+            ("missing-create-host-path", {"propagation": "rprivate"}, "missing-key"),
+            ("empty-bind-options", {}, "false"),
+            ("missing-bind-object", ..., "missing"),
+            ("short-syntax", "short", "true"),
+        )
+        for control, bind, normalized_creation in controls:
+            with self.subTest(control=control):
+                config = render(fixture, credential_volume(fixture, bind))
+                rendered_credential = next(
+                    volume for volume in config["services"]["backend"]["volumes"]
+                    if volume.get("target") == helper.CONTAINER_CREDENTIAL_PATH)
+                if normalized_creation == "missing":
+                    self.assertNotIn("bind", rendered_credential)
+                elif normalized_creation == "missing-key":
+                    self.assertIs(type(rendered_credential.get("bind")), dict)
+                    self.assertNotIn(
+                        "create_host_path", rendered_credential["bind"])
+                elif normalized_creation == "true":
+                    self.assertIs(
+                        rendered_credential.get("bind", {}).get("create_host_path"), True,
+                        f"normalized bind options: {rendered_credential.get('bind')!r}")
+                elif normalized_creation == "false":
+                    self.assertIs(type(rendered_credential.get("bind")), dict)
+                    self.assertIs(
+                        rendered_credential["bind"].get("create_host_path", False), False)
+                if normalized_creation in ("true", "missing", "missing-key"):
+                    with self.assertRaises(helper.ProviderError) as error:
+                        helper._forward_rendered(
+                            config, fixture.backend, fixture.target, fixture.target_env)
+                    self.assertEqual(error.exception.check, "rendered-credential-mount")
+                elif normalized_creation == "false":
+                    helper._forward_rendered(
+                        config, fixture.backend, fixture.target, fixture.target_env)
+
     def test_rendered_memory_requires_a_canonical_exact_positive_match(self):
         fixture = self.fresh()
 

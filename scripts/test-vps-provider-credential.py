@@ -2952,7 +2952,9 @@ def _forward_rendered_record(config: dict[str, Any], backend: dict[str, Any],
                 _fail("recovery", "rendered-upload-mount")
         elif (mount["type"] != "bind" or mount["source"] != HOST_CREDENTIAL_PATH
                 or mount.get("read_only") is not True
-                or mount["bind"].get("create_host_path") is not False):
+                or type(mount.get("bind")) is not dict
+                or (mount["bind"] != {}
+                    and mount["bind"].get("create_host_path") is not False)):
             _fail("recovery", "rendered-credential-mount")
     if (service["healthcheck"]["test"] !=
             backend["Config"]["Healthcheck"]["Test"]
