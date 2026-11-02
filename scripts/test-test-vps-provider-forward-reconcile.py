@@ -39,6 +39,28 @@ SUCCESSOR = "99999999999-1"
 KEY = "FICTIONAL_LOCATIONIQ_KEY_ONLY"
 IMAGE = "ghcr.io/nickolaymamonov/meet-backend-v3@" + helper.FORWARD_TARGET["indexDigest"]
 SOURCE = "https://github.com/NickolayMamonov/meet-backend-v3"
+ENABLED_RUNTIME_OVERRIDE = (
+    b"services:\n"
+    b"  backend:\n"
+    b"    healthcheck:\n"
+    b"      test:\n"
+    b"        - CMD\n"
+    b"        - curl\n"
+    b"        - --fail\n"
+    b"        - --silent\n"
+    b"        - --show-error\n"
+    b"        - http://127.0.0.1:8080/meetings\n"
+    b"    volumes:\n"
+    b"      - type: bind\n"
+    b"        source: /var/lib/meet-production/credentials/firebase-service-account.json\n"
+    b"        target: /run/secrets/meet-firebase-service-account.json\n"
+    b"        read_only: true\n"
+    b"        bind:\n"
+    b"          create_host_path: false\n"
+)
+if hashlib.sha256(ENABLED_RUNTIME_OVERRIDE).hexdigest() != (
+        helper.FORWARD_ENABLED_RUNTIME_SHA256):
+    raise AssertionError("historical enabled runtime override bytes or digest changed")
 INDEX_BYTES = (SCRIPTS / "fixtures" / "selected-platform" / "image-index.json"
                ).read_bytes().removesuffix(b"\n")
 if hashlib.sha256(INDEX_BYTES).hexdigest() != helper.FORWARD_TARGET[
@@ -147,7 +169,9 @@ class Fixture:
         self.fallback = self.app / "docker-compose.production.yml"
         self.write(self.fallback, b"# unrelated root fallback: no historical witness\n")
         self.write(self.paths["active-compose"], b"services: {}\n")
-        self.write(self.paths["active-runtime"], b"services: {backend: {}}\n")
+        self.runtime_override = (
+            ENABLED_RUNTIME_OVERRIDE if self.enabled else b"services: {backend: {}}\n")
+        self.write(self.paths["active-runtime"], self.runtime_override)
         self.write(self.states / ".deploy.lock", b"")
         self.lock_fd = os.open(self.states / ".deploy.lock", os.O_RDWR)
         self.saved_nine = None
@@ -198,9 +222,9 @@ class Fixture:
             "config.base-compose.yml.identity": self.saved_identity(self.paths["original-base"]),
             "candidate-active-compose.yml": b"services: {}\n",
             "candidate-active-compose.identity": self.saved_identity(self.paths["active-compose"]),
-            "candidate-active-runtime.yml": b"services: {backend: {}}\n",
+            "candidate-active-runtime.yml": self.runtime_override,
             "candidate-active-runtime.identity": self.saved_identity(self.paths["active-runtime"]),
-            "target-runtime.override.yml": b"services: {backend: {}}\n",
+            "target-runtime.override.yml": self.runtime_override,
             "previous-image": (self.old_ref + "\n").encode(),
             "previous-image-id": (OLD_IMAGE + "\n").encode(),
             "previous-revision": (REVISION + "\n").encode(),
@@ -802,7 +826,8 @@ class FullAttributionTests(FixtureTests):
         with self.assertRaises(pending.Rejected):
             helper._forward_environment({"config.env.production": b"GEOCODER_ENABLED=true\n"})
         with self.assertRaises(pending.Rejected):
-            helper._forward_rendered({}, {}, {}, b"GEOCODER_ENABLED=true\n")
+            helper._forward_rendered(
+                {}, {}, {}, b"GEOCODER_ENABLED=true\n", fixture.runtime_override)
         self.unchanged(fixture)
 
     def test_every_bundle_field_shape_preserves_category_and_attributes_native_recovery(self):
@@ -1174,7 +1199,8 @@ class ForwardTests(FixtureTests):
                     if volume["target"] == helper.CONTAINER_CREDENTIAL_PATH)
                 rendered_credential["bind"] = bind
                 helper._forward_rendered(
-                    config, fixture.backend, fixture.target, fixture.target_env)
+                    config, fixture.backend, fixture.target, fixture.target_env,
+                    fixture.runtime_override)
 
         for bind in (None, True, 0, 1, "false",
                      {"create_host_path": None},
@@ -1191,7 +1217,8 @@ class ForwardTests(FixtureTests):
                 rendered_credential["bind"] = bind
                 with self.assertRaises(helper.ProviderError) as error:
                     helper._forward_rendered(
-                        config, fixture.backend, fixture.target, fixture.target_env)
+                        config, fixture.backend, fixture.target, fixture.target_env,
+                        fixture.runtime_override)
                 self.assertEqual(error.exception.check, "rendered-credential-mount")
 
         config = copy.deepcopy(fixture.rendered)
@@ -1201,7 +1228,39 @@ class ForwardTests(FixtureTests):
         del rendered_credential["bind"]
         with self.assertRaises(helper.ProviderError) as error:
             helper._forward_rendered(
-                config, fixture.backend, fixture.target, fixture.target_env)
+                config, fixture.backend, fixture.target, fixture.target_env,
+                fixture.runtime_override)
+        self.assertEqual(error.exception.check, "rendered-credential-mount")
+
+        rendered_credential["bind"] = {}
+        for untrusted_runtime in (
+                b"",
+                fixture.runtime_override + b"# altered\n",
+                fixture.runtime_override.replace(
+                    b"create_host_path: false", b"create_host_path: true")):
+            with self.subTest(untrusted_runtime=repr(untrusted_runtime[-32:])):
+                with self.assertRaises(helper.ProviderError) as error:
+                    helper._forward_rendered(
+                        config, fixture.backend, fixture.target, fixture.target_env,
+                        untrusted_runtime)
+                self.assertEqual(error.exception.check, "rendered-credential-mount")
+
+    def test_mutable_runtime_snapshot_cannot_authorize_empty_bind(self):
+        fixture = self.fresh("created")
+        mutable_runtime = fixture.runtime_override.replace(
+            b"create_host_path: false", b"create_host_path: true")
+        fixture.write(fixture.paths["active-runtime"], mutable_runtime)
+        identity = fixture.saved_identity(fixture.paths["active-runtime"])
+        fixture.original_files["candidate-active-runtime.yml"] = mutable_runtime
+        fixture.original_files["candidate-active-runtime.identity"] = identity
+        fixture.original_files["target-runtime.override.yml"] = mutable_runtime
+        for name in ("candidate-active-runtime.yml",
+                     "candidate-active-runtime.identity",
+                     "target-runtime.override.yml"):
+            fixture.write(fixture.origin / name, fixture.original_files[name])
+        fixture.rendered["services"]["backend"]["volumes"][-1]["bind"] = {}
+        with self.assertRaises(helper.ProviderError) as error:
+            fixture.admit()
         self.assertEqual(error.exception.check, "rendered-credential-mount")
 
     def test_real_compose_credential_bind_serialization_matches_admission(self):
@@ -1286,7 +1345,8 @@ class ForwardTests(FixtureTests):
                 self.assertIs(
                     rendered_credential["bind"].get("create_host_path", False), False)
                 helper._forward_rendered(
-                    config, fixture.backend, fixture.target, fixture.target_env)
+                    config, fixture.backend, fixture.target, fixture.target_env,
+                    fixture.runtime_override)
 
         fixture = self.fresh("none")
         config = render(fixture, None)
@@ -1294,7 +1354,8 @@ class ForwardTests(FixtureTests):
             helper.CONTAINER_CREDENTIAL_PATH,
             {volume.get("target") for volume in config["services"]["backend"]["volumes"]})
         helper._forward_rendered(
-            config, fixture.backend, fixture.target, fixture.target_env)
+            config, fixture.backend, fixture.target, fixture.target_env,
+            fixture.runtime_override)
 
         fixture = self.fresh("created")
         controls = (
@@ -1327,11 +1388,13 @@ class ForwardTests(FixtureTests):
                 if normalized_creation in ("true", "missing", "missing-key"):
                     with self.assertRaises(helper.ProviderError) as error:
                         helper._forward_rendered(
-                            config, fixture.backend, fixture.target, fixture.target_env)
+                            config, fixture.backend, fixture.target, fixture.target_env,
+                            fixture.runtime_override)
                     self.assertEqual(error.exception.check, "rendered-credential-mount")
                 elif normalized_creation == "false":
                     helper._forward_rendered(
-                        config, fixture.backend, fixture.target, fixture.target_env)
+                        config, fixture.backend, fixture.target, fixture.target_env,
+                        fixture.runtime_override)
 
     def test_rendered_memory_requires_a_canonical_exact_positive_match(self):
         fixture = self.fresh()
@@ -1342,7 +1405,8 @@ class ForwardTests(FixtureTests):
                 backend["HostConfig"]["Memory"] = inspected
                 with self.assertRaises(helper.ProviderError) as error:
                     helper._forward_rendered(
-                        fixture.rendered, backend, fixture.target, fixture.target_env)
+                        fixture.rendered, backend, fixture.target, fixture.target_env,
+                        fixture.runtime_override)
                 self.assertEqual(error.exception.check, "rendered-hardening")
 
         for rendered in (
@@ -1354,7 +1418,8 @@ class ForwardTests(FixtureTests):
                 config["services"]["backend"]["mem_limit"] = rendered
                 with self.assertRaises(helper.ProviderError) as error:
                     helper._forward_rendered(
-                        config, fixture.backend, fixture.target, fixture.target_env)
+                        config, fixture.backend, fixture.target, fixture.target_env,
+                        fixture.runtime_override)
                 self.assertEqual(error.exception.check, "rendered-hardening")
 
         for rendered in (805306368, "805306368"):
@@ -1362,7 +1427,8 @@ class ForwardTests(FixtureTests):
                 config = copy.deepcopy(fixture.rendered)
                 config["services"]["backend"]["mem_limit"] = rendered
                 helper._forward_rendered(
-                    config, fixture.backend, fixture.target, fixture.target_env)
+                    config, fixture.backend, fixture.target, fixture.target_env,
+                    fixture.runtime_override)
 
     def test_production_compose_memory_normalization_matches_forward_admission(self):
         compose = shutil.which("docker")
@@ -1408,7 +1474,8 @@ class ForwardTests(FixtureTests):
         fixture = self.fresh()
         fixture.rendered["services"]["backend"]["mem_limit"] = rendered_memory
         helper._forward_rendered(
-            fixture.rendered, fixture.backend, fixture.target, fixture.target_env)
+            fixture.rendered, fixture.backend, fixture.target, fixture.target_env,
+            fixture.runtime_override)
 
     def test_competing_deployment_lock_blocks_admission_without_publication(self):
         fixture = self.fresh()
