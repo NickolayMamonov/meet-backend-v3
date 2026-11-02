@@ -69,6 +69,12 @@ FORWARD_TARGET = {
     "indexDigest": "sha256:1f2c56da34fa905553739f79bf91647d0087ec72159efc40828ba91622033d4b",
     "amd64ManifestDigest": "sha256:9178741bc9fd1e9319acab54252e908fa2d439e66f628d0da20c169837c60cfe",
 }
+FORWARD_ENABLED_RUNTIME_SHA256 = (
+    # Exact 430-byte enabled override emitted by release controller source
+    # 466a9e74a5bdabf606d0e0e283cffbf5f664d04e; only this trusted source
+    # proves that Compose's empty bind serialization represents explicit false.
+    "4957dbf00abc1342e2711729665251571dcfc709c1a720097e7b69f2ecf46bd0"
+)
 RENAME_NOREPLACE = 1
 PUSH_KEYS = (
     "APP_PUSH_PROVIDER_ENABLED",
@@ -2883,15 +2889,17 @@ def _forward_image_record(image: dict[str, Any], image_id: str,
 
 
 def _forward_rendered(config: dict[str, Any], backend: dict[str, Any],
-                       target: dict[str, Any], env: bytes) -> None:
+                       target: dict[str, Any], env: bytes,
+                       target_runtime: bytes) -> None:
     try:
-        _forward_rendered_record(config, backend, target, env)
+        _forward_rendered_record(config, backend, target, env, target_runtime)
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
         _fail("recovery", "rendered-shape")
 
 
 def _forward_rendered_record(config: dict[str, Any], backend: dict[str, Any],
-                            target: dict[str, Any], env: bytes) -> None:
+                            target: dict[str, Any], env: bytes,
+                            target_runtime: bytes) -> None:
     pending = _forward_pending_module()
     values = pending.file_environment(env)
     service = config["services"]["backend"]
@@ -2952,7 +2960,12 @@ def _forward_rendered_record(config: dict[str, Any], backend: dict[str, Any],
                 _fail("recovery", "rendered-upload-mount")
         elif (mount["type"] != "bind" or mount["source"] != HOST_CREDENTIAL_PATH
                 or mount.get("read_only") is not True
-                or mount["bind"].get("create_host_path") is not False):
+                or type(mount.get("bind")) is not dict
+                or (mount["bind"] != {}
+                    and mount["bind"].get("create_host_path") is not False)
+                or (mount["bind"] == {}
+                    and hashlib.sha256(target_runtime).hexdigest()
+                    != FORWARD_ENABLED_RUNTIME_SHA256)):
             _fail("recovery", "rendered-credential-mount")
     if (service["healthcheck"]["test"] !=
             backend["Config"]["Healthcheck"]["Test"]
@@ -3097,7 +3110,9 @@ def _forward_admission(state_root: str, run_key: str, deployment_root: str,
         bundle["targetImageProof"], target, forward=True
     )
     target_id = target_proof["engineImageId"]
-    _forward_rendered(bundle["rendered"], backend, target, snapshots["config.env.target"])
+    _forward_rendered(
+        bundle["rendered"], backend, target, snapshots["config.env.target"],
+        snapshots["target-runtime.override.yml"])
     pointer_fd, pointer_info, pointer_data = _open_private_state_file(
         os.path.join(state_root, ".provider-transaction.current"))
     _close_fd(pointer_fd)
