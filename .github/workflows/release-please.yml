@@ -40,9 +40,12 @@ jobs:
           fetch-depth: 0
 
       - name: Enforce exact v1.7.0 recovery invocation
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_AFTER: ${{ github.event.after }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REPOSITORY" = nickolaymamonov/meet-backend-v3
+          test "$GITHUB_REPOSITORY" = NickolayMamonov/meet-backend-v3
           test "$GITHUB_EVENT_NAME" = push
           test "$GITHUB_REF" = refs/heads/dev
           test "$GITHUB_RUN_ATTEMPT" = 1
@@ -328,9 +331,12 @@ jobs:
             --credential-proof "$RUNNER_TEMP/reader-proof.json"
 
       - name: Verify canonical publication tuple
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_AFTER: ${{ github.event.after }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REPOSITORY" = nickolaymamonov/meet-backend-v3
+          test "$GITHUB_REPOSITORY" = NickolayMamonov/meet-backend-v3
           test "$GITHUB_EVENT_NAME" = push
           test "$GITHUB_REF" = refs/heads/dev
           test "$GITHUB_RUN_ATTEMPT" = 1
