@@ -9,8 +9,6 @@ import dev.whysoezzy.meet.ingestion.RawEvent
 import mu.KotlinLogging
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.stereotype.Component
-import java.time.LocalDate
-import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.net.URI
@@ -31,8 +29,9 @@ class TimepadProvider(
     override fun fetch(context: FetchContext): ProviderFetchResult {
         val zone = ZoneId.of(props.zone)
         val observedAt = context.observedAt.toEpochMilli()
-        val startMin = LocalDate.now(zone).format(DateTimeFormatter.ISO_LOCAL_DATE)
-        val startMax = LocalDate.now(zone).plusDays(180).format(DateTimeFormatter.ISO_LOCAL_DATE)
+        val observedDate = context.observedAt.atZone(zone).toLocalDate()
+        val startMin = observedDate.format(DateTimeFormatter.ISO_LOCAL_DATE)
+        val startMax = observedDate.plusDays(180).format(DateTimeFormatter.ISO_LOCAL_DATE)
         if (context.savedExternalIds.size > 500) return ProviderFetchResult.Incomplete("saved_id_budget")
         return try {
             val discovery = linkedMapOf<String, TimepadEvent>()
@@ -137,7 +136,6 @@ class TimepadProvider(
             "fields" to "location,categories,ends_at,access_status,registration_data,locale",
             "starts_at_min" to startMin,
             "starts_at_max" to startMax,
-            "cities" to "Москва",
             "category_ids" to "452",
             "category_ids_exclude" to "379",
         ))
@@ -203,7 +201,7 @@ class TimepadProvider(
         if (endsAtEpochMs != null && endsAtEpochMs < startsAtEpochMs) {
             throw EventMappingRejection("end_before_start")
         }
-        val physicalAddress = TimepadPolicy.physicalMoscowAddress(city, address)
+        val venue = TimepadPolicy.classifyVenue(city, address)
             ?: throw EventMappingRejection("location")
         if (!TimepadPolicy.eventStartAllowed(startsAtEpochMs, observedAt, saved, endsAtEpochMs)) {
             throw EventMappingRejection("start_window")
@@ -216,15 +214,15 @@ class TimepadProvider(
         return RawEvent(
             sourceExternalId = id.toString(),
             title = title,
-            description = TimepadPolicy.description(groups, startsAtEpochMs, physicalAddress),
+            description = TimepadPolicy.description(groups, startsAtEpochMs, venue),
             imageUrl = "$publicAssetBase/timepad-assets/v1/${groups.first().asset}.png",
             startsAtEpochMs = startsAtEpochMs,
             endsAtEpochMs = endsAtEpochMs,
-            address = physicalAddress,
-            latitude = lat,
-            longitude = lng,
+            address = venue.address,
+            latitude = if (venue.isOnline) 0.0 else lat,
+            longitude = if (venue.isOnline) 0.0 else lng,
             externalUrl = registrationUrl,
-            isOnline = false,
+            isOnline = venue.isOnline,
             topicKeywords = categoryNames.toSet(),
             timepadGroups = groups.map { it.displayName },
         )

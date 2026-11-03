@@ -15,6 +15,7 @@ import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.ZoneId
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -64,7 +65,7 @@ class TimepadProviderTest {
             }
             val transport = TimepadHttpClient(properties, ObjectMapper())
             val response = TimepadProvider(properties, transport).fetch(
-                FetchContext(Instant.parse("2026-10-21T10:00:00Z"), emptyList()),
+                FetchContext(Instant.parse("2026-10-21T21:00:00Z"), emptyList()),
             ) as ProviderFetchResult.Complete
             val event = response.accepted.single()
 
@@ -88,12 +89,161 @@ class TimepadProviderTest {
             assertFalse(event.isOnline)
             assertContains(requestQuery.get(), "ends_at")
             val query = URLDecoder.decode(requestQuery.get(), StandardCharsets.UTF_8)
-            assertContains(query, "cities=Москва")
+            assertFalse(query.contains("cities="))
             assertContains(query, "category_ids=452")
             assertContains(query, "category_ids_exclude=379")
+            assertContains(query, "limit=100")
+            assertContains(query, "skip=0")
+            assertContains(query, "sort=+starts_at")
+            assertContains(query, "fields=location,categories,ends_at,access_status,registration_data,locale")
+            assertContains(query, "starts_at_min=2026-10-22")
+            assertContains(query, "starts_at_max=2027-04-20")
         } finally {
             server.stop(0)
         }
+    }
+
+    @Test
+    fun `maps only exact online venue markers to owned zero-point online events`() {
+        val base = validEvent(4242)
+        val onlineAddress = base
+            .replace(
+                "\"city\": \"Москва\", \"address\": \"Тестовая улица, 1\"",
+                "\"city\": \"Казань\", \"address\": \" online \", \"coordinates\": [55.75, 37.61]",
+            )
+        val onlineCity = validEvent(4243)
+            .replace(
+                "\"city\": \"Москва\", \"address\": \"Тестовая улица, 1\"",
+                "\"city\": \"ОНЛАЙН\", \"address\": \"provider prose must not escape\", \"coordinates\": [55.75, 37.61]",
+            )
+        val onlineFromAddress = listOf(onlineAddress, onlineCity).mapIndexed { index, event ->
+            val id = 4242 + index
+            val mappedEvent = event.replace("\"id\": 4242", "\"id\": $id")
+            val result = fetchDiscovery("""{"total":1,"values":[$mappedEvent]}""")
+            assertTrue(result is ProviderFetchResult.Complete, "unexpected result for $event: $result")
+            val mapped = result.accepted.single()
+            assertEquals("Онлайн", mapped.address)
+            assertEquals(0.0, mapped.latitude)
+            assertEquals(0.0, mapped.longitude)
+            assertTrue(mapped.isOnline)
+            assertContains(mapped.description, "Формат: Онлайн. ")
+            assertContains(mapped.description, "Место: Онлайн.")
+            assertFalse(mapped.description.contains("provider prose"))
+            mapped
+        }
+        assertEquals(listOf("4242", "4243"), onlineFromAddress.map { it.sourceExternalId })
+
+        val nearMatch = base.replace(
+            "\"city\": \"Москва\", \"address\": \"Тестовая улица, 1\"",
+            "\"city\": \"Тверь\", \"address\": \"Online courses, floor 2\"",
+        )
+        val rejected = fetchDiscovery("""{"total":1,"values":[$nearMatch]}""") as ProviderFetchResult.Complete
+        assertTrue(rejected.accepted.isEmpty())
+        val savedRejected = fetchDiscovery(
+            """{"total":1,"values":[${nearMatch.replace("\"id\": 4242", "\"id\": 4244")}]}""",
+            savedIds = listOf("4244"),
+        ) as ProviderFetchResult.Complete
+        assertTrue(savedRejected.accepted.isEmpty())
+        assertEquals(setOf("4244"), savedRejected.rejectedSavedExternalIds)
+    }
+
+    @Test
+    fun `online city and address retain the full shared eligibility policy`() {
+        val onlineAccepted = listOf(
+            withOnlineVenue(validEvent(4300), OnlineMarkerField.CITY),
+            withOnlineVenue(validEvent(4301), OnlineMarkerField.ADDRESS),
+        )
+        val accepted = fetchDiscovery(
+            """{"total":2,"values":[${onlineAccepted.joinToString(",")}]}""",
+        ) as ProviderFetchResult.Complete
+        assertEquals(setOf("4300", "4301"), accepted.accepted.map { it.sourceExternalId }.toSet())
+        assertTrue(accepted.rejectedSavedExternalIds.isEmpty())
+        accepted.accepted.forEach { assertTrue(it.isOnline) }
+
+        val invalidCases: List<Pair<String, (Int) -> String>> = listOf(
+            "non-IT topic" to { id -> validEvent(id).replace("Kotlin backend", "Product manager meetup") },
+            "child audience" to { id -> validEvent(id).replace("Kotlin backend", "Kotlin for children") },
+            "non-Russian locale" to { id -> validEvent(id).replace("\"locale\": \"ru\"", "\"locale\": \"en\"") },
+            "private event" to { id ->
+                validEvent(id).replace("\"access_status\": \"public\"", "\"access_status\": \"private\"")
+            },
+            "closed registration" to { id -> validEvent(id).replace(
+                "\"is_registration_open\": true", "\"is_registration_open\": false",
+            ) },
+            "unsafe registration URL" to { id ->
+                validEvent(id).replace("https://timepad.ru/", "https://example.com/")
+            },
+            "malformed start" to { id -> validEvent(id).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"not-a-time\"",
+            ) },
+            "malformed end" to { id -> validEvent(id).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\", \"ends_at\": \"not-a-time\"",
+            ) },
+            "end before start" to { id -> validEvent(id).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\", \"ends_at\": \"2026-12-15T18:00:00+03:00\"",
+            ) },
+            "ended event" to { id -> validEvent(id).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-10-20T12:00:00+03:00\", \"ends_at\": \"2026-10-20T13:00:00+03:00\"",
+            ) },
+            "too-early new event" to { id -> validEvent(id).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-10-21T13:00:00+03:00\", \"ends_at\": \"2026-10-21T14:00:00+03:00\"",
+            ) },
+            "too-far-future new event" to { id -> validEvent(id).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2027-04-20T19:00:00+03:00\"",
+            ) },
+        )
+        val onlineInvalid = invalidCases.flatMapIndexed { caseIndex, (reason, mutate) ->
+            listOf(OnlineMarkerField.CITY, OnlineMarkerField.ADDRESS).mapIndexed { index, field ->
+                val id = 4400 + caseIndex * 2 + index
+                val event = mutate(id)
+                val expectedHost = if (reason == "unsafe registration URL") "example.com" else "timepad.ru"
+                assertContains(event, "\"id\": $id,")
+                assertContains(event, "https://$expectedHost/event/$id/")
+                withOnlineVenue(event, field)
+            }
+        }
+        val savedOngoing = withOnlineVenue(
+            validEvent(4500).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-10-20T12:00:00+03:00\", \"ends_at\": \"2026-10-21T14:00:00+03:00\"",
+            ),
+            OnlineMarkerField.CITY,
+        )
+        val savedBeyondDiscoveryWindow = withOnlineVenue(
+            validEvent(4501).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2027-04-20T19:00:00+03:00\"",
+            ),
+            OnlineMarkerField.ADDRESS,
+        )
+        val allEvents = onlineInvalid + savedOngoing + savedBeyondDiscoveryWindow
+        val payload = """{"total":${allEvents.size},"values":[${allEvents.joinToString(",")}]}"""
+        val discovery = fetchDiscovery(payload) as ProviderFetchResult.Complete
+        assertTrue(discovery.accepted.isEmpty())
+
+        val newEventWindowCases = setOf("too-early new event", "too-far-future new event")
+        val savedIds = invalidCases.flatMapIndexed { caseIndex, (reason, _) ->
+            if (reason in newEventWindowCases) {
+                emptyList()
+            } else {
+                listOf((4400 + caseIndex * 2).toString(), (4401 + caseIndex * 2).toString())
+            }
+        } + listOf("4500", "4501")
+        val savedRejectedEvents = invalidCases.flatMapIndexed { caseIndex, (reason, _) ->
+            if (reason in newEventWindowCases) emptyList() else onlineInvalid.slice(caseIndex * 2..caseIndex * 2 + 1)
+        }
+        val savedPayloadEvents = savedRejectedEvents + savedOngoing + savedBeyondDiscoveryWindow
+        val savedPayload =
+            """{"total":${savedPayloadEvents.size},"values":[${savedPayloadEvents.joinToString(",")}]}"""
+        val savedRefresh = fetchResponses(listOf(payload, savedPayload), savedIds) as ProviderFetchResult.Complete
+        assertEquals(setOf("4500", "4501"), savedRefresh.accepted.map { it.sourceExternalId }.toSet())
+        assertEquals(savedIds.toSet() - setOf("4500", "4501"), savedRefresh.rejectedSavedExternalIds)
     }
 
     @Test
@@ -179,10 +329,63 @@ class TimepadProviderTest {
         }
     }
 
+    @Test
+    fun `global discovery still fails closed above the fixed event budget`() {
+        assertEquals(
+            ProviderFetchResult.Incomplete("discovery_budget"),
+            fetchDiscovery("""{"total":501,"values":[]}"""),
+        )
+        assertEquals(
+            ProviderFetchResult.Incomplete("discovery_budget"),
+            fetchDiscovery("""{"total":101,"values":[${(1..101).joinToString(",") { validEvent(it) }}]}"""),
+        )
+    }
+
+    @Test
+    fun `zero and saved snapshots remain complete while malformed and changing snapshots fail closed`() {
+        assertEquals(
+            ProviderFetchResult.Complete(emptyList(), emptySet(), 0),
+            fetchDiscovery("""{"total":0,"values":[]}"""),
+        )
+        val event = validEvent(4242)
+        val saved = fetchDiscovery(
+            """{"total":1,"values":[$event]}""", savedIds = listOf("4242"),
+        ) as ProviderFetchResult.Complete
+        assertEquals(1, saved.accepted.size)
+        assertTrue(saved.rejectedSavedExternalIds.isEmpty())
+
+        val firstPage = """{"total":101,"values":[${(1..100).joinToString(",") { validEvent(it) }}]}"""
+        assertEquals(
+            ProviderFetchResult.Incomplete("changing_total"),
+            fetchResponses(listOf(firstPage, """{"total":102,"values":[]}""")),
+        )
+        val changedSaved = event.replace("Kotlin backend", "Python backend")
+        assertEquals(
+            ProviderFetchResult.Incomplete("changing_saved_observation"),
+            fetchResponses(
+                listOf(
+                    """{"total":1,"values":[$event]}""",
+                    """{"total":1,"values":[$changedSaved]}""",
+                ),
+                savedIds = listOf("4242"),
+            ),
+        )
+        assertTrue(fetchDiscovery("""{"total":1,"values":"malformed"}""") is ProviderFetchResult.Incomplete)
+    }
+
     private fun fetchDiscovery(payload: String, savedIds: List<String> = emptyList()): ProviderFetchResult {
+        return fetchResponses(listOf(payload), savedIds)
+    }
+
+    private fun fetchResponses(
+        payloads: List<String>,
+        savedIds: List<String> = emptyList(),
+    ): ProviderFetchResult {
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val requestIndex = AtomicInteger()
         server.createContext("/events.json") { exchange ->
-            val body = payload.toByteArray()
+            val index = requestIndex.getAndIncrement().coerceAtMost(payloads.lastIndex)
+            val body = payloads[index].toByteArray()
             exchange.responseHeaders.add("Content-Type", "application/json")
             exchange.sendResponseHeaders(200, body.size.toLong())
             exchange.responseBody.use { it.write(body) }
@@ -214,5 +417,19 @@ class TimepadProviderTest {
           "categories": []
         }
     """.trimIndent()
+
+    private fun withOnlineVenue(event: String, field: OnlineMarkerField): String =
+        when (field) {
+            OnlineMarkerField.CITY -> event.replace(
+                "\"city\": \"Москва\"",
+                "\"city\": \"Онлайн\"",
+            )
+            OnlineMarkerField.ADDRESS -> event.replace(
+                "\"address\": \"Тестовая улица, 1\"",
+                "\"address\": \" online \", \"coordinates\": [55.75, 37.61]",
+            )
+        }
+
+    private enum class OnlineMarkerField { CITY, ADDRESS }
 
 }

@@ -16,8 +16,22 @@ enum class TimepadGroup(val displayName: String, val asset: String) {
 }
 
 object TimepadPolicy {
-    const val VERSION = "timepad-mvp-v1"
+    const val VERSION = "timepad-mvp-v2"
     val MOSCOW: ZoneId = ZoneId.of("Europe/Moscow")
+
+    sealed interface Venue {
+        val address: String
+        val isOnline: Boolean
+
+        data class Physical(override val address: String) : Venue {
+            override val isOnline = false
+        }
+
+        data object Online : Venue {
+            override val address = "Онлайн"
+            override val isOnline = true
+        }
+    }
 
     private val included = linkedMapOf(
         TimepadGroup.IT to listOf(
@@ -144,6 +158,11 @@ object TimepadPolicy {
         return physical
     }
 
+    fun classifyVenue(city: String?, address: String?): Venue? {
+        physicalMoscowAddress(city, address)?.let { return Venue.Physical(it) }
+        return if (isOnlineMarker(city) || isOnlineMarker(address)) Venue.Online else null
+    }
+
     fun validRegistrationUrl(value: String?, eventId: Long): String? {
         val uri = runCatching { URI(value) }.getOrNull() ?: return null
         val host = uri.host?.lowercase(Locale.ROOT) ?: return null
@@ -157,14 +176,20 @@ object TimepadPolicy {
         return uri.toASCIIString()
     }
 
-    fun description(groups: List<TimepadGroup>, startsAt: Long, address: String): String {
+    fun description(groups: List<TimepadGroup>, startsAt: Long, venue: Venue): String {
         val groupText = groups.joinToString(", ") { it.displayName }
         val local = java.time.Instant.ofEpochMilli(startsAt).atZone(MOSCOW)
         val date = local.format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"))
-        return "Тема: $groupText. Формат: Очно. Начало: $date МСК. Место: $address. " +
+        val format = if (venue.isOnline) "Онлайн" else "Очно"
+        return "Тема: $groupText. Формат: $format. Начало: $date МСК. Место: ${venue.address}. " +
             "Источник: Timepad. Регистрация и актуальные условия — на странице события. " +
             "Интерес в приложении не является регистрацией."
     }
+
+    private fun isOnlineMarker(value: String?): Boolean =
+        value?.trim()?.let {
+            it.equals("online", ignoreCase = true) || it.equals("онлайн", ignoreCase = true)
+        } ?: false
 
     fun parseTimestamp(value: String?, zone: ZoneId = MOSCOW): Long? {
         if (value.isNullOrBlank()) return null

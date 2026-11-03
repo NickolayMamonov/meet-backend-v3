@@ -139,6 +139,30 @@ class TimepadPolicyTest {
     }
 
     @Test
+    fun `venue classification accepts only exact online markers after physical Moscow priority`() {
+        assertEquals(
+            TimepadPolicy.Venue.Physical("ул. Пример, 1"),
+            TimepadPolicy.classifyVenue("Москва", " ул. Пример, 1 "),
+        )
+        assertEquals(TimepadPolicy.Venue.Online, TimepadPolicy.classifyVenue(" ONLINE ", ""))
+        assertEquals(
+            TimepadPolicy.Venue.Online,
+            TimepadPolicy.classifyVenue("Новосибирск", "  Онлайн "),
+        )
+        assertEquals(TimepadPolicy.Venue.Online, TimepadPolicy.classifyVenue("ОНЛАЙН", null))
+        for ((city, address) in listOf(
+            "Новосибирск" to "ул. Онлайн, 1",
+            "Moscow" to "Курс по Online marketing",
+            "Москва" to "TBA",
+            "Москва" to "",
+            "" to "дистанционно",
+            null to null,
+        )) {
+            assertNull(TimepadPolicy.classifyVenue(city, address), "$city / $address")
+        }
+    }
+
+    @Test
     fun `registration URL is strict and tied to the event id`() {
         assertEquals(
             "https://timepad.ru/event/42/",
@@ -186,7 +210,17 @@ class TimepadPolicyTest {
             "Тема: IT, Цифровой продукт, UX/UI-дизайн. Формат: Очно. Начало: 15.12.2026 19:00 МСК. " +
                 "Место: ул. Пример, 1. Источник: Timepad. Регистрация и актуальные условия — на странице события. " +
                 "Интерес в приложении не является регистрацией.",
-            TimepadPolicy.description(TimepadGroup.entries, starts, "ул. Пример, 1"),
+            TimepadPolicy.description(
+                TimepadGroup.entries, starts, TimepadPolicy.Venue.Physical("ул. Пример, 1"),
+            ),
+        )
+        assertEquals(
+            "Тема: IT. Формат: Онлайн. Начало: 15.12.2026 19:00 МСК. Место: Онлайн. " +
+                "Источник: Timepad. Регистрация и актуальные условия — на странице события. " +
+                "Интерес в приложении не является регистрацией.",
+            TimepadPolicy.description(
+                listOf(TimepadGroup.IT), starts, TimepadPolicy.Venue.Online,
+            ),
         )
     }
 }

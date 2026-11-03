@@ -46,18 +46,29 @@ For emergency withdrawal, stop the backend.
 
 ## Limits and evidence
 
-First-launch discovery is restricted to Moscow (`cities=Москва`) and Timepad's
-IT/internet category (`category_ids=452`), excluding children (`379`).
+Discovery requests Timepad's IT/internet category (`category_ids=452`), excluding
+children (`379`), without a city filter so eligible online events are discoverable
+outside Moscow. The unchanged five-page/500-event limit is global: a larger or
+incomplete snapshot fails closed and does not partially update the catalog.
+
+Local venue classification accepts a validated physical Moscow address first.
+Otherwise, only an exact trimmed, case-insensitive `Online` or `Онлайн` marker
+in the structured city or address identifies an online event, regardless of the
+organizer's city. Online entries are stored with the project-authored address
+`Онлайн`, `isOnline=true`, and zero coordinates even if Timepad supplies a
+point. Physical Moscow entries retain their validated address and source-point
+behavior. Empty, ambiguous, near-match, or non-Moscow physical venues are
+rejected; title or description prose is never a venue signal.
+
 The independent local policy still requires a professional IT signal and rejects
 children/school events, including saved-ID refreshes. Product/UX-only events are
-not in this first-launch scope; an explicit organizer `18+` label is not required.
-The generic IT/internet category alone never establishes professional eligibility;
-a specific IT keyword in the title or category text is required. All discovery
-pages must still fit the complete 500-event budget; no first-page truncation.
-Audience matching is conservative: ambiguous `child`/`children` wording is
-excluded unless followed by a recognized technical noun (for example process,
-coroutine, or props). This can omit adult events whose audience is unclear;
-text and provider labels are not proof of the organizer's actual audience.
+not in scope; an explicit organizer `18+` label is not required. The generic
+IT/internet category alone never establishes professional eligibility; a specific
+IT keyword in the title or category text is required. Audience matching is
+conservative: ambiguous `child`/`children` wording is excluded unless followed
+by a recognized technical noun (for example process, coroutine, or props). This
+can omit adult events whose audience is unclear; text and provider labels are
+not proof of the organizer's actual audience.
 
 The feed fails closed on incomplete snapshots and bounded catalog limits.
 No qualifying catalog is not evidence of success; do not invent events or
