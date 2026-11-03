@@ -7,14 +7,23 @@ import dev.whysoezzy.meet.ingestion.UpsertResult
 import dev.whysoezzy.meet.ingestion.Coordinates
 import dev.whysoezzy.meet.ingestion.PreparedTimepadPoint
 import dev.whysoezzy.meet.ingestion.SavedTimepadVenue
+import dev.whysoezzy.meet.ingestion.GeocodingService
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.test.context.bean.override.mockito.MockitoBean
+import org.mockito.Mockito.never
+import org.mockito.Mockito.verify
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class MeetingUpsertServicePostgresTest(
     @Autowired private val upsertService: MeetingUpsertService,
 ) : IntegrationTestSupport() {
+    @MockitoBean private lateinit var geocodingService: GeocodingService
+
     @BeforeEach
     fun clearDatabase() = resetDatabase()
 
@@ -54,6 +63,37 @@ class MeetingUpsertServicePostgresTest(
         assertPoint(event.sourceExternalId, Coordinates(14.0, 36.0))
         upsertService.upsertTimepad(event.copy(isOnline = true), 500)
         assertPoint(event.sourceExternalId, Coordinates(0.0, 0.0))
+    }
+
+    @Test
+    fun `format flips clear prior point and never request geocoding for online venue`() {
+        val physical = offline("format-flip").copy(latitude = 55.75, longitude = 37.61)
+        upsertService.upsertTimepad(physical, 100)
+        val first = meetings.findBySourceAndSourceExternalId(EventSource.TIMEPAD, physical.sourceExternalId)!!
+        val id = first.id
+        assertPoint(physical.sourceExternalId, Coordinates(55.75, 37.61))
+
+        val online = physical.copy(
+            address = "Онлайн", latitude = 0.0, longitude = 0.0, isOnline = true,
+        )
+        upsertService.upsertTimepad(online, 200)
+        val onlineRow = meetings.findBySourceAndSourceExternalId(EventSource.TIMEPAD, physical.sourceExternalId)!!
+        assertEquals(id, onlineRow.id)
+        assertTrue(onlineRow.isOnline)
+        assertEquals("Онлайн", onlineRow.address)
+        assertPoint(physical.sourceExternalId, Coordinates(0.0, 0.0))
+        assertNull(upsertService.prepareTimepadPoint(online, SavedTimepadVenue.from(onlineRow)))
+        verify(geocodingService, never()).geocodeTimepad("Онлайн")
+
+        val offlineAgain = physical.copy(latitude = 0.0, longitude = 0.0)
+        upsertService.upsertTimepad(offlineAgain, 300)
+        val offlineRow = meetings.findBySourceAndSourceExternalId(
+            EventSource.TIMEPAD, physical.sourceExternalId,
+        )!!
+        assertEquals(id, offlineRow.id)
+        assertFalse(offlineRow.isOnline)
+        assertEquals("Test street 1", offlineRow.address)
+        assertPoint(physical.sourceExternalId, Coordinates(0.0, 0.0))
     }
 
     @Test
