@@ -340,30 +340,41 @@ expect_selector() {
     exit 1
   }
 }
+resolver_marker=$TMP/ordinary-resolver-invoked
+resolver_stub=$TMP/forbidden-normal-resolver
+printf '#!/usr/bin/env bash\ntouch %q\n' "$resolver_marker" >"$resolver_stub"
+chmod +x "$resolver_stub"
+selector_with_resolver="$TMP/workflow-selector-with-resolver.sh"
+cp "$selector_script" "$selector_with_resolver"
+printf '%s\n' '"$FORBIDDEN_RESOLVER_STUB"' >>"$selector_with_resolver"
+expect_rejection_without_resolver() {
+  local snapshot=$1
+  rm -f -- "$resolver_marker"
+  if FORBIDDEN_RESOLVER_STUB="$resolver_stub" \
+    bash "$selector_with_resolver" "$snapshot" >/dev/null 2>&1; then
+    echo "exact recovery selector unexpectedly continued for $snapshot" >&2
+    exit 1
+  fi
+  [ ! -e "$resolver_marker" ] || {
+    echo "ordinary descriptor resolver ran before exact recovery rejection" >&2
+    exit 1
+  }
+}
 printf '%s\n' '[]' >"$TMP/absent.json"
-if bash "$selector_script" "$TMP/absent.json" >/dev/null 2>&1; then
-  echo "exact recovery selector fell through on absent continuation" >&2
-  exit 1
-fi
+expect_rejection_without_resolver "$TMP/absent.json"
 jq -n --arg source "$SOURCE_170" '[{
   id:432691220,name:"v1.7.0",tag_name:"v1.7.0",target_commitish:$source,
   immutable:false,draft:true,prerelease:false,published_at:null,assets:[]
 }]' >"$TMP/pending-170.json"
 expect_selector "pending/432691220/v1.7.0/$SOURCE_170" "$TMP/pending-170.json"
-if bash "$selector_script" "$TMP/releases.json" >/dev/null 2>&1 ||
-   bash "$selector_script" "$TMP/releases-151.json" >/dev/null 2>&1; then
-  echo "exact recovery selector accepted another pending continuation" >&2
-  exit 1
-fi
+expect_rejection_without_resolver "$TMP/releases.json"
+expect_rejection_without_resolver "$TMP/releases-151.json"
 jq -n --arg source "$SOURCE_170" '[{
   id:432691220,name:"v1.7.0",tag_name:"v1.7.0",target_commitish:$source,
   immutable:true,draft:false,prerelease:false,published_at:"2026-11-03T00:00:00Z",
   assets:[]
 }]' >"$TMP/published-170.json"
-if bash "$selector_script" "$TMP/published-170.json" >/dev/null 2>&1; then
-  echo "exact recovery selector accepted an already-published draft" >&2
-  exit 1
-fi
+expect_rejection_without_resolver "$TMP/published-170.json"
 for partial_filter in \
   '.[0].draft=false' \
   '.[0].target_commitish="'"$SOURCE"'"'; do
@@ -390,28 +401,19 @@ jq -n --arg source "$SOURCE_151" '[
     ]
   }
 ]' >"$TMP/published-151.json"
-if bash "$selector_script" "$TMP/published-151.json" >/dev/null 2>&1; then
-  echo "exact recovery selector fell through on published continuation" >&2
-  exit 1
-fi
+expect_rejection_without_resolver "$TMP/published-151.json"
 jq -n --arg source "$SOURCE_151" '[{
   id:421705542,name:"v1.5.1",tag_name:"v1.5.1",target_commitish:$source,
   immutable:false,draft:"yes",prerelease:false,published_at:null,assets:[]
 }]' >"$TMP/invalid-state.json"
-if bash "$selector_script" "$TMP/invalid-state.json" >/dev/null 2>&1; then
-  echo "workflow selector accepted an invalid authorized continuation state" >&2
-  exit 1
-fi
+expect_rejection_without_resolver "$TMP/invalid-state.json"
 jq -n --arg source13 "$SOURCE" --arg source151 "$SOURCE_151" '[
   {id:377201468,name:"v1.3.0",tag_name:"v1.3.0",target_commitish:$source13,
    immutable:false,draft:true,prerelease:false,published_at:null,assets:[]},
   {id:421705542,name:"v1.5.1",tag_name:"v1.5.1",target_commitish:$source151,
    immutable:false,draft:true,prerelease:false,published_at:null,assets:[]}
 ]' >"$TMP/multiple-pending.json"
-if bash "$selector_script" "$TMP/multiple-pending.json" >/dev/null 2>&1; then
-  echo "workflow selector accepted multiple pending authorized continuations" >&2
-  exit 1
-fi
+expect_rejection_without_resolver "$TMP/multiple-pending.json"
 
 admission_source=$(sed -n '1,$p' "$ADMIT")
 line_of() {
