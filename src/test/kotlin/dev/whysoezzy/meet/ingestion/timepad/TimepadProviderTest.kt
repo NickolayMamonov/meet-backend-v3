@@ -221,9 +221,21 @@ class TimepadProviderTest {
         val discovery = fetchDiscovery(payload) as ProviderFetchResult.Complete
         assertTrue(discovery.accepted.isEmpty())
 
-        val savedIds = (4400..(4400 + invalidCases.size * 2 - 1)).map(Int::toString) +
-            listOf("4500", "4501")
-        val savedRefresh = fetchDiscovery(payload, savedIds) as ProviderFetchResult.Complete
+        val newEventWindowCases = setOf("too-early new event", "too-far-future new event")
+        val savedIds = invalidCases.flatMapIndexed { caseIndex, (reason, _) ->
+            if (reason in newEventWindowCases) {
+                emptyList()
+            } else {
+                listOf((4400 + caseIndex * 2).toString(), (4401 + caseIndex * 2).toString())
+            }
+        } + listOf("4500", "4501")
+        val savedRejectedEvents = invalidCases.flatMapIndexed { caseIndex, (reason, _) ->
+            if (reason in newEventWindowCases) emptyList() else onlineInvalid.slice(caseIndex * 2..caseIndex * 2 + 1)
+        }
+        val savedPayloadEvents = savedRejectedEvents + savedOngoing + savedBeyondDiscoveryWindow
+        val savedPayload =
+            """{"total":${savedPayloadEvents.size},"values":[${savedPayloadEvents.joinToString(",")}]}"""
+        val savedRefresh = fetchResponses(listOf(payload, savedPayload), savedIds) as ProviderFetchResult.Complete
         assertEquals(setOf("4500", "4501"), savedRefresh.accepted.map { it.sourceExternalId }.toSet())
         assertEquals(savedIds.toSet() - setOf("4500", "4501"), savedRefresh.rejectedSavedExternalIds)
     }
