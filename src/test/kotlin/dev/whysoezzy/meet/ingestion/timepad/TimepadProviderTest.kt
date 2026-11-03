@@ -148,6 +148,87 @@ class TimepadProviderTest {
     }
 
     @Test
+    fun `online city and address retain the full shared eligibility policy`() {
+        val onlineAccepted = listOf(
+            withOnlineVenue(validEvent(4300), OnlineMarkerField.CITY),
+            withOnlineVenue(validEvent(4301), OnlineMarkerField.ADDRESS),
+        )
+        val accepted = fetchDiscovery(
+            """{"total":2,"values":[${onlineAccepted.joinToString(",")}]}""",
+        ) as ProviderFetchResult.Complete
+        assertEquals(setOf("4300", "4301"), accepted.accepted.map { it.sourceExternalId }.toSet())
+        assertTrue(accepted.rejectedSavedExternalIds.isEmpty())
+        accepted.accepted.forEach { assertTrue(it.isOnline) }
+
+        val invalidCases = listOf(
+            "non-IT topic" to validEvent(4310).replace("Kotlin backend", "Product manager meetup"),
+            "child audience" to validEvent(4311).replace("Kotlin backend", "Kotlin for children"),
+            "non-Russian locale" to validEvent(4312).replace("\"locale\": \"ru\"", "\"locale\": \"en\""),
+            "private event" to validEvent(4313).replace("\"access_status\": \"public\"", "\"access_status\": \"private\""),
+            "closed registration" to validEvent(4314).replace(
+                "\"is_registration_open\": true", "\"is_registration_open\": false",
+            ),
+            "unsafe registration URL" to validEvent(4315).replace(
+                "https://timepad.ru/", "https://example.com/",
+            ),
+            "malformed start" to validEvent(4316).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"not-a-time\"",
+            ),
+            "malformed end" to validEvent(4317).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\", \"ends_at\": \"not-a-time\"",
+            ),
+            "end before start" to validEvent(4318).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\", \"ends_at\": \"2026-12-15T18:00:00+03:00\"",
+            ),
+            "ended event" to validEvent(4319).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-10-20T12:00:00+03:00\", \"ends_at\": \"2026-10-20T13:00:00+03:00\"",
+            ),
+            "too-early new event" to validEvent(4320).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-10-21T13:00:00+03:00\", \"ends_at\": \"2026-10-21T14:00:00+03:00\"",
+            ),
+            "too-far-future new event" to validEvent(4321).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2027-04-20T19:00:00+03:00\"",
+            ),
+        )
+        val onlineInvalid = invalidCases.flatMapIndexed { caseIndex, (reason, event) ->
+            listOf(OnlineMarkerField.CITY, OnlineMarkerField.ADDRESS).mapIndexed { index, field ->
+                val id = 4400 + caseIndex * 2 + index
+                withOnlineVenue(event.replace(Regex("\"id\": \\d+"), "\"id\": $id"), field)
+            }
+        }
+        val savedOngoing = withOnlineVenue(
+            validEvent(4500).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2026-10-20T12:00:00+03:00\", \"ends_at\": \"2026-10-21T14:00:00+03:00\"",
+            ),
+            OnlineMarkerField.CITY,
+        )
+        val savedBeyondDiscoveryWindow = withOnlineVenue(
+            validEvent(4501).replace(
+                "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
+                "\"starts_at\": \"2027-04-20T19:00:00+03:00\"",
+            ),
+            OnlineMarkerField.ADDRESS,
+        )
+        val allEvents = onlineInvalid + savedOngoing + savedBeyondDiscoveryWindow
+        val payload = """{"total":${allEvents.size},"values":[${allEvents.joinToString(",")}]}"""
+        val discovery = fetchDiscovery(payload) as ProviderFetchResult.Complete
+        assertTrue(discovery.accepted.isEmpty())
+
+        val savedIds = (4400..(4400 + invalidCases.size * 2 - 1)).map(Int::toString) +
+            listOf("4500", "4501")
+        val savedRefresh = fetchDiscovery(payload, savedIds) as ProviderFetchResult.Complete
+        assertEquals(setOf("4500", "4501"), savedRefresh.accepted.map { it.sourceExternalId }.toSet())
+        assertEquals(savedIds.toSet() - setOf("4500", "4501"), savedRefresh.rejectedSavedExternalIds)
+    }
+
+    @Test
     fun `adult professional IT scope is enforced independently of discovery filters`() {
         val event = validEvent(4242)
         val rejected = listOf(
@@ -318,5 +399,19 @@ class TimepadProviderTest {
           "categories": []
         }
     """.trimIndent()
+
+    private fun withOnlineVenue(event: String, field: OnlineMarkerField): String =
+        when (field) {
+            OnlineMarkerField.CITY -> event.replace(
+                "\"city\": \"Москва\"",
+                "\"city\": \"Онлайн\"",
+            )
+            OnlineMarkerField.ADDRESS -> event.replace(
+                "\"address\": \"Тестовая улица, 1\"",
+                "\"address\": \" online \", \"coordinates\": [55.75, 37.61]",
+            )
+        }
+
+    private enum class OnlineMarkerField { CITY, ADDRESS }
 
 }
