@@ -1,215 +1,204 @@
-# Meet Backend - Clean Implementation
+# Meet Backend
 
-REST API для Android приложения Meeting - платформы для организации встреч и мероприятий.
+Backend REST API для Android-приложения Meet: встречи, сообщества,
+пользователи, авторизация, медиа и интеграции импорта. Этот README — точка
+входа для разработчика и оператора закрытого beta-тестирования.
 
-## 🚀 Технологии
+Документ описывает код, уже находящийся в репозитории. Наличие кода,
+конфигурации или операционной процедуры здесь не является доказательством
+деплоя, запуска процедуры или готовности внешней инфраструктуры.
 
-- **Kotlin** 2.2.21
-- **Spring Boot** 4.1.0
-- **PostgreSQL** 16
-- **Flyway** - миграции БД
-- **SpringDoc OpenAPI** - документация API
+## Стек и предпосылки
 
-## 📦 Архитектура
+- Kotlin **2.2.21** и JVM **21**.
+- Spring Boot **4.1.0**, Spring Web, Validation, Security, Data JPA и
+  RestClient.
+- Gradle Wrapper **8.14.3**.
+- PostgreSQL **16**, Hibernate/JPA и Flyway.
+- SpringDoc OpenAPI **3.0.3**.
+- JUnit 5, Spring Boot Test и Testcontainers для PostgreSQL-backed тестов.
 
-```
-meet-backend-clean/
-├── domain/
-│   ├── entity/          # JPA entities
-│   └── repository/      # Spring Data репозитории
-├── api/
-│   ├── dto/             # Data Transfer Objects
-│   └── controller/      # REST контроллеры
-├── service/             # Бизнес-логика
-└── resources/
-    ├── db/migration/    # Flyway миграции
-    └── application.yml  # Конфигурация
-```
+Для локальной работы нужны JDK 21 и Docker Compose. PostgreSQL запускается
+отдельным сервисом из [`docker-compose.yml`](docker-compose.yml).
 
-## 🛠️ Запуск
-
-### 1. Запустить PostgreSQL
+## Быстрый локальный запуск
 
 ```bash
 cp .env.example .env
-docker-compose up -d
-```
-
-### 2. Запустить приложение
-
-```bash
+docker compose up -d postgres
 SPRING_PROFILES_ACTIVE=dev ./gradlew bootRun
 ```
 
-Приложение будет доступно на `http://localhost:8080`
+После запуска приложение доступно по адресу
+`http://localhost:8080`. Команда запуска явно выбирает профиль `dev`; запуск
+без профиля или в production-режиме нельзя считать development-safe.
 
-### 3. Swagger UI
+## Конфигурация и секреты
 
-Откройте в браузере: `http://localhost:8080/swagger-ui.html`
+Шаблоны окружения:
 
-## 📱 Android API Endpoints
+- [`.env.example`](.env.example) — локальная конфигурация и имена
+  переменных для разработки.
+- [`.env.production.example`](.env.production.example) — форма production
+  окружения и границы обязательных значений.
 
-### Meetings
-```
-GET    /meetings/main              # Главные встречи
-GET    /meetings/popular           # Популярные
-GET    /meetings                   # Все встречи
-GET    /meetings/search?query=X    # Поиск
-GET    /meetings/{id}              # По ID
-POST   /meetings/{id}/join         # Присоединиться
-DELETE /meetings/{id}/leave        # Покинуть
-GET    /user/meetings              # Встречи пользователя
-```
+Шаблоны содержат только структуру и безопасные заполнители. Не коммитьте
+`.env` или `.env.production`, не переносите production-шаблон поверх уже
+существующего окружения и не печатайте значения конфигурации в логи,
+отчёты или README. База данных, JWT, OTP/HMAC, SMTP, Firebase/provider,
+административные, signing и recovery-значения являются защищёнными
+входными данными. Сюда также относятся пароли, токены, OTP, JWT и refresh
+tokens.
 
-### Communities
-```
-GET    /communities/recommended
-GET    /communities/{id}
-POST   /communities/{id}/subscribe
-DELETE /communities/{id}/subscribe
-GET    /communities/search?query=X
-GET    /communities/{id}/meetings
-```
+### Классификация runtime
 
-### Users
-```
-GET    /users/profile              # Текущий пользователь (mock ID=1)
-GET    /users/{id}
-```
+Правила реализованы в `RuntimeConfigurationValidator` и применяются при
+старте:
 
-### Tags
-```
-GET    /api/v1/tags
-```
+- ровно набор активных профилей `{dev}` — development;
+- ровно `{test}` — test;
+- любой другой набор, включая отсутствие активного профиля, `{prod}` и
+  любой другой профиль, — production mode;
+- набор из нескольких профилей, содержащий `dev` или `test`, отклоняется.
 
-## 🔧 Конфигурация
+Провайдеры и ключи подчиняются той же классификации:
 
-Локальная конфигурация намеренно изолирована в профиле `dev`. Файл `.env` не
-коммитится; создайте его из `.env.example` для Docker PostgreSQL. Приложение
-локально запускается только с `SPRING_PROFILES_ACTIVE=dev`.
+- `APP_SMS_PROVIDER` (`app.sms.provider`) со значением `fake` разрешён
+  только при ровно профиле `dev`;
+- production требует `APP_EMAIL_PROVIDER` (`app.email.provider`) со
+  значением `smtp` и не разрешает fake email;
+- OTP HMAC key ring обязателен;
+- production отклоняет документированные dev/test OTP HMAC identifiers и
+  material;
+- если выбран SMTP, SMTP-настройки валидируются всегда: обязательны host,
+  credentials и sender, а connect/read/write timeout должны быть в диапазоне
+  1–30 секунд. Используются SMTP, authentication, обязательный STARTTLS и
+  проверка имени сертификата; JNDI, SMTPS, startup test-connection,
+  небезопасные TLS/socket-factory/trust overrides и debug/trace mail-logging
+  отклоняются.
 
-Для production передайте значения через secret manager или переменные окружения:
+Имена `APP_OTP_HMAC_CURRENT_KEY_ID`, `APP_OTP_HMAC_CURRENT_KEY_BASE64` и
+опциональной previous-пары обозначают защищённый key ring; их значения не
+должны появляться в исходниках, логах или документации.
 
-```text
-DB_HOST
-DB_PORT                 # optional, defaults to 5432
-DB_NAME
-DB_USERNAME
-DB_PASSWORD
-APP_JWT_SECRET          # at least 32 UTF-8 bytes
-ADMIN_API_KEY           # optional at startup; a nonblank value enables /admin/** endpoints
-APP_EMAIL_PROVIDER      # must be smtp outside exactly dev/test
-APP_EMAIL_FROM
-APP_EMAIL_FROM_NAME
-SPRING_MAIL_HOST
-SPRING_MAIL_PORT        # optional, defaults to 587
-SPRING_MAIL_USERNAME
-SPRING_MAIL_PASSWORD
-APP_EMAIL_CONNECT_TIMEOUT_MS
-APP_EMAIL_READ_TIMEOUT_MS
-APP_EMAIL_WRITE_TIMEOUT_MS
-APP_OTP_HMAC_CURRENT_KEY_ID
-APP_OTP_HMAC_CURRENT_KEY_BASE64
-APP_OTP_HMAC_PREVIOUS_KEY_ID       # optional; configure both previous values
-APP_OTP_HMAC_PREVIOUS_KEY_BASE64
-APP_HTTP_CLIENT_IP_TRUSTED_PROXY_CIDRS  # optional comma-separated controlled proxy CIDRs
-APP_HTTP_CLIENT_IP_MAX_FORWARDED_HOPS   # optional, defaults to 10
-```
+В production профиль по умолчанию отключает плановые ingestion, geocoder и
+Timepad-интеграцию до явного включения оператором. OpenAPI-документация в
+production также отключена по умолчанию.
 
-`APP_SMS_PROVIDER=fake` разрешён только при `SPRING_PROFILES_ACTIVE=dev`.
-По умолчанию `APP_SMS_PROVIDER=disabled`: приложение запускается, но
-`POST /auth/send-otp` возвращает `503 SMS_UNAVAILABLE` и не сохраняет OTP.
-Реальный адаптер SMS ещё не реализован; при его добавлении передавайте
-учётные данные через environment/secret manager, не через `application.yml`,
-Compose или Git.
+## API и авторизация
 
-Email OTP требует SMTP и отдельный HMAC key ring во всех режимах, кроме ровно
-`dev` или ровно `test`. Пустой набор профилей считается production. Смешанные
-профили (`prod,dev`, `dev,test`) отклоняются при старте. Production SMTP всегда
-использует authentication, обязательный STARTTLS, проверку имени сертификата и
-таймауты 1–30 секунд; JNDI, SMTPS, test-connection, mail debug/trace,
-trust-all/custom socket factories и ослабляющие overrides запрещены.
+OpenAPI:
 
-Для локального запуска профиль `dev` использует fake email sender, который
-ничего не логирует. Для ручной проверки письма переключите dev на SMTP и
-используйте локальный inbox (например, Mailpit), не добавляя OTP или адреса в
-логи. Production checklist, rotation и rollback описаны в
-`docs/operations/email-otp.md`.
+- JSON-документация: `/api-docs`;
+- Swagger UI: `/swagger-ui.html`.
 
-### Логирование
+В production обе поверхности отключены по умолчанию настройками профиля
+`prod`. Пути `/v3/api-docs/**` и `/swagger-ui/**` также относятся к
+OpenAPI-поверхности security-конфигурации.
 
-Без активного профиля `dev` приложение использует `INFO` для пакета
-`dev.whysoezzy` (и для root logger). Профиль `dev` явно повышает уровень
-`dev.whysoezzy` до `DEBUG` для локальной диагностики. Production-логи
-содержат только безопасные операционные категории и метаданные; не
-добавляйте в них значения запросов, адреса, URL/пути файлов, токены, OTP,
-секреты, HMAC key IDs/material, SMTP credentials, provider payload/message ID
-или тексты provider-исключений/stack trace.
+Основные семейства endpoint'ов:
 
-В production- и `dev`-профилях `spring.mvc.log-resolved-exception=false`:
-Spring MVC не пишет в лог детали исключений, уже преобразованных в API-ответ.
+- **Авторизация:** `/auth/send-otp`, `/auth/verify-otp`,
+  `/auth/email/send-otp`, `/auth/email/verify-otp`, `/auth/refresh`,
+  `/auth/logout`.
+- **Встречи:** `/meetings/main`, `/meetings/popular`, `/meetings`,
+  `/meetings/search`, `/meetings/{id}`, `/meetings/{id}/participants`,
+  `/meetings/{id}/join`, `/meetings/{id}/leave`, `/user/meetings`.
+- **Сообщества:** `/communities/recommended`, `/communities/{id}`,
+  `/communities/search`, `/communities/{id}/meetings`,
+  `/communities/{id}/subscribers`, а также subscribe/unsubscribe для
+  `/communities/{id}/subscribe`.
+- **Пользователи и профиль:** `/profile`, `/users/{id}`,
+  `/profile/fcm-token`, `/users/{id}/meetings`,
+  `/users/{id}/communities`, а также операции удаления профиля.
+- **Теги и рекламные блоки:** `/api/v1/tags` и `/api/ads/{id}` вместе с
+  коллекцией `/api/ads`.
+- **Медиа:** загрузка avatar, meeting и community через
+  `POST /media/avatar`, `POST /media/meeting` и `POST /media/community`;
+  GET-доступ к сохранённым медиа обслуживается отдельно.
+- **Административный импорт и очистка:** `POST /admin/ingest` и
+  `DELETE /admin/purge?source=...`.
+- **Demo catalog:** `POST /admin/demo-catalog/bootstrap` доступен только
+  когда bootstrap явно включён; публичные страницы —
+  `/demo-events/organize-online` и `/demo-events/networking-online`.
 
-## 🧪 Тестовые данные
+### Доступ к `/admin/**`
 
-После первого запуска БД будет содержать:
-- **User ID=1** - тестовый пользователь (используется везде)
-- **3 сообщества** - Android Dev, Kotlin UG, Mobile Design
-- **5 встреч** - с разными тегами и локациями
-- **12 тегов** - Android, Kotlin, Compose, и др.
+`ADMIN_API_KEY` — защищённый вход, а не значение для публикации. Пустой или
+состоящий из пробелов ключ оставляет административные маршруты
+недоступными. Для запроса нужен заголовок `X-Admin-Key` с точным
+совпадением настроенного ключа; при совпадении `AdminKeyAuthFilter` создаёт
+аутентификацию с `ROLE_ADMIN`, которую требует `SecurityConfig`. Отсутствующий
+или неверный ключ получает `403 Forbidden`.
 
-## 📝 Особенности
+`JwtAuthFilter` при валидном пользовательском JWT создаёт только
+`ROLE_USER`. Обычный JWT не заменяет `X-Admin-Key` и не может обойти
+административный gate. Деструктивные и импортирующие endpoint'ы остаются
+защищёнными этим правилом.
 
-- ✅ **Без авторизации** - используется mock пользователь (ID=1)
-- ✅ **Полное соответствие Android моделям** - все DTO совпадают
-- ✅ **Правильные URL paths** - как ожидает Android клиент
-- ✅ **Flyway миграции** - версионирование БД
-- ✅ **Swagger документация** - автоматическая генерация
-- ✅ **Логирование** - kotlin-logging
+## Архитектура и данные
 
-## 🔜 TODO
+Код организован по слоям:
 
-- [ ] Добавить JWT авторизацию
-- [ ] Добавить валидацию запросов
-- [ ] Добавить пагинацию для больших списков
-- [ ] Добавить фильтрацию встреч по тегам и датам
-- [ ] Добавить загрузку изображений
-- [ ] Добавить тесты
+- `api/controller` — HTTP-маршруты и валидация запросов;
+- `api/dto` — контрактные входные и выходные модели API;
+- `service` — бизнес-логика;
+- `domain/entity` и `domain/repository` — JPA-модель и доступ к данным;
+- `ingestion` — общий импорт и upsert;
+- `ingestion/timepad` — изолированный Timepad provider;
+- `src/main/resources/application*.yml` — конфигурация профилей;
+- `src/main/resources/db/migration` — история схемы;
+- `src/test` — unit, MVC и PostgreSQL-backed проверки.
 
-## 📄 Лицензия
+Контроллеры **никогда не сериализуют JPA entities напрямую**. Доменные
+payload'ы преобразуются в API DTO. При этом контракт не обещает, что каждый
+ответ — DTO: endpoint-specific wrappers, `Map`-ответы и бинарные
+`ByteArray`-ответы остаются допустимыми формами для соответствующих
+маршрутов.
 
-MIT
+`MeetingDto` и изменения endpoint'ов, потребляемые Android, расширяют
+контракт аддитивно. Импорт сохраняет изоляцию Timepad-логики, ограничивает
+внешний paging параметрами provider'а и выполняет idempotent upsert по паре
+`(source, sourceExternalId)`. Повторная обработка того же внешнего события
+не должна создавать дубликаты.
 
-## Integration tests
+## Миграции и тесты
 
-`ApiMvcIntegrationTest` runs the production Spring context, Flyway migrations, security filters, repositories,
-and MockMvc against PostgreSQL. By default it starts `postgres:16-alpine` through Testcontainers:
+Flyway-ресурсы находятся в
+[`src/main/resources/db/migration`](src/main/resources/db/migration).
+Hibernate работает с `ddl-auto: validate`, поэтому схема не создаётся
+молчаливой автогенерацией приложения.
 
-```bash
-./gradlew test --tests dev.whysoezzy.meet.integration.ApiMvcIntegrationTest
-```
+Применённые миграции V1–V9 являются неизменяемой историей. Новое изменение
+схемы оформляйте следующей монотонной версией; уже применённый файл нельзя
+редактировать. План отката должен учитывать, что rollback миграции и
+совместимость приложения — отдельные операционные решения.
 
-For CI or a host where Docker is unavailable, point it at an existing disposable PostgreSQL database. The test
-creates a unique schema and applies Flyway migrations there:
+Обычный набор проверок:
 
 ```bash
-TEST_POSTGRES_JDBC_URL=jdbc:postgresql://localhost:5432/postgres \
-TEST_POSTGRES_USERNAME=postgres \
-TEST_POSTGRES_PASSWORD=postgres \
-./gradlew test --tests dev.whysoezzy.meet.integration.ApiMvcIntegrationTest
+./gradlew test
+./gradlew postgresTest
 ```
 
-## Production deployment
+Эти команды перечислены как контракт репозитория; их выполнение не
+утверждается этой документацией.
 
-The repository includes a fixed-UID multi-stage image, immutable release identity,
-health/readiness probes, bounded container logs, persistent volumes, and a
-fail-fast production configuration. Production email OTP is wired to SMTP and
-requires operator-managed SMTP credentials plus an application OTP HMAC key ring;
-SMS remains disabled.
+## Операции закрытого beta-тестирования
 
-See [`docs/production-deployment.md`](docs/production-deployment.md).
+Операционные документы являются источниками процедур. Перед действием
+проверьте их предусловия, права доступа и границы изменения окружения:
 
-For the future-only immutable release controller and hosted publication proof,
-see [`docs/operations/backend-release-publishing.md`](docs/operations/backend-release-publishing.md).
-For the separate manual deployment path to the current test VPS, including
-the automatic image rollback drill, see
-[`docs/operations/test-vps-deployment.md`](docs/operations/test-vps-deployment.md).
+- [Production deployment](docs/production-deployment.md)
+- [Backend release publishing](docs/operations/backend-release-publishing.md)
+- [Test VPS deployment](docs/operations/test-vps-deployment.md)
+- [Email OTP](docs/operations/email-otp.md)
+- [Demo catalog bootstrap](docs/operations/demo-catalog-bootstrap.md)
+- [Closed-beta backup and restore](docs/operations/closed-beta-backup-restore.md)
+- [SPKI rollover drill](docs/operations/spki-rollover-drill.md)
+
+Production Compose описан в
+[`docker-compose.production.yml`](docker-compose.production.yml). Этот
+README не заявляет выполнение деплоя, публикации, bootstrap, backup/restore,
+recovery drill или rollout; перед операционным изменением используйте
+соответствующую процедуру и её доказательства.
