@@ -172,8 +172,6 @@ for required_text in \
   'test "$GITHUB_RUN_ATTEMPT" = 1' \
   'test "$GITHUB_EVENT_BEFORE" = 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' \
   'test "$continuation_state" = pending' \
-  'test "$RELEASE_ID" = 432691220' \
-  'test "$VERSION" = 1.7.0' \
   'while read -r candidate_id candidate_version candidate_source; do' \
   'candidate_state=$(scripts/classify-release-continuation.sh \' \
   '--release-id "$candidate_id"' \
@@ -187,6 +185,15 @@ for required_text in \
   'continuation classifier returned an invalid state'; do
   grep -Fq -- "$required_text" <<<"$controller" ||
     fail "continuation classifier routing misses required invariant: $required_text"
+done
+for required_text in \
+  'test "$RELEASE_ID" = 432691220' \
+  'test "$TAG" = v1.7.0' \
+  'test "$VERSION" = 1.7.0' \
+  'test "$SOURCE_SHA" = 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' \
+  'current_dev=$(git ls-remote origin refs/heads/dev'; do
+  grep -Fq -- "$required_text" <<<"$workflow" ||
+    fail "publication checkpoint misses exact recovery invariant: $required_text"
 done
 for inline_predicate in \
   'then "pending"' 'then "published"' \
