@@ -160,46 +160,52 @@ class TimepadProviderTest {
         assertTrue(accepted.rejectedSavedExternalIds.isEmpty())
         accepted.accepted.forEach { assertTrue(it.isOnline) }
 
-        val invalidCases = listOf(
-            "non-IT topic" to validEvent(4310).replace("Kotlin backend", "Product manager meetup"),
-            "child audience" to validEvent(4311).replace("Kotlin backend", "Kotlin for children"),
-            "non-Russian locale" to validEvent(4312).replace("\"locale\": \"ru\"", "\"locale\": \"en\""),
-            "private event" to validEvent(4313).replace("\"access_status\": \"public\"", "\"access_status\": \"private\""),
-            "closed registration" to validEvent(4314).replace(
+        val invalidCases: List<Pair<String, (Int) -> String>> = listOf(
+            "non-IT topic" to { id -> validEvent(id).replace("Kotlin backend", "Product manager meetup") },
+            "child audience" to { id -> validEvent(id).replace("Kotlin backend", "Kotlin for children") },
+            "non-Russian locale" to { id -> validEvent(id).replace("\"locale\": \"ru\"", "\"locale\": \"en\"") },
+            "private event" to { id ->
+                validEvent(id).replace("\"access_status\": \"public\"", "\"access_status\": \"private\"")
+            },
+            "closed registration" to { id -> validEvent(id).replace(
                 "\"is_registration_open\": true", "\"is_registration_open\": false",
-            ),
-            "unsafe registration URL" to validEvent(4315).replace(
-                "https://timepad.ru/", "https://example.com/",
-            ),
-            "malformed start" to validEvent(4316).replace(
+            ) },
+            "unsafe registration URL" to { id ->
+                validEvent(id).replace("https://timepad.ru/", "https://example.com/")
+            },
+            "malformed start" to { id -> validEvent(id).replace(
                 "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
                 "\"starts_at\": \"not-a-time\"",
-            ),
-            "malformed end" to validEvent(4317).replace(
+            ) },
+            "malformed end" to { id -> validEvent(id).replace(
                 "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
                 "\"starts_at\": \"2026-12-15T19:00:00+03:00\", \"ends_at\": \"not-a-time\"",
-            ),
-            "end before start" to validEvent(4318).replace(
+            ) },
+            "end before start" to { id -> validEvent(id).replace(
                 "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
                 "\"starts_at\": \"2026-12-15T19:00:00+03:00\", \"ends_at\": \"2026-12-15T18:00:00+03:00\"",
-            ),
-            "ended event" to validEvent(4319).replace(
+            ) },
+            "ended event" to { id -> validEvent(id).replace(
                 "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
                 "\"starts_at\": \"2026-10-20T12:00:00+03:00\", \"ends_at\": \"2026-10-20T13:00:00+03:00\"",
-            ),
-            "too-early new event" to validEvent(4320).replace(
+            ) },
+            "too-early new event" to { id -> validEvent(id).replace(
                 "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
                 "\"starts_at\": \"2026-10-21T13:00:00+03:00\", \"ends_at\": \"2026-10-21T14:00:00+03:00\"",
-            ),
-            "too-far-future new event" to validEvent(4321).replace(
+            ) },
+            "too-far-future new event" to { id -> validEvent(id).replace(
                 "\"starts_at\": \"2026-12-15T19:00:00+03:00\"",
                 "\"starts_at\": \"2027-04-20T19:00:00+03:00\"",
-            ),
+            ) },
         )
-        val onlineInvalid = invalidCases.flatMapIndexed { caseIndex, (reason, event) ->
+        val onlineInvalid = invalidCases.flatMapIndexed { caseIndex, (reason, mutate) ->
             listOf(OnlineMarkerField.CITY, OnlineMarkerField.ADDRESS).mapIndexed { index, field ->
                 val id = 4400 + caseIndex * 2 + index
-                withOnlineVenue(event.replace(Regex("\"id\": \\d+"), "\"id\": $id"), field)
+                val event = mutate(id)
+                val expectedHost = if (reason == "unsafe registration URL") "example.com" else "timepad.ru"
+                assertContains(event, "\"id\": $id,")
+                assertContains(event, "https://$expectedHost/event/$id/")
+                withOnlineVenue(event, field)
             }
         }
         val savedOngoing = withOnlineVenue(
