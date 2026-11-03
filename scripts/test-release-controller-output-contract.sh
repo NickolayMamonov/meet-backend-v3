@@ -30,9 +30,22 @@ grep -Fq 'echo "version=$PRE_VERSION" >>"$GITHUB_OUTPUT"' <<<"$route_step"
 for invariant in \
   '377201468 1.3.0 a7abfe04f6852f479291a4710ebdee23e9ae8a34' \
   '421705542 1.5.1 51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce' \
+  '432691220 1.7.0 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' \
+  'test "$continuation_state" = pending' \
+  "test \"\$continuation_id\" = 432691220" \
+  "test \"\$continuation_tag\" = v1.7.0" \
+  "test \"\$continuation_source\" = 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0" \
   'multiple pending authorized continuations'; do
   grep -Fq "$invariant" <<<"$controller"
 done
+grep -Fq 'Enforce exact v1.7.0 recovery invocation' <<<"$controller"
+grep -Fq 'GITHUB_EVENT_BEFORE' <<<"$controller"
+grep -Fq 'GITHUB_RUN_ATTEMPT' <<<"$controller"
+grep -Fq "grep -Fxq 'route=materialize'" <<<"$pre_action_step"
+grep -Fq "grep -Fxq 'release_id=432691220'" <<<"$pre_action_step"
+grep -Fq "grep -Fxq 'tag=v1.7.0'" <<<"$pre_action_step"
+grep -Fq "grep -Fxq 'version=1.7.0'" <<<"$pre_action_step"
+grep -Fq "grep -Fxq 'source_sha=9362e47e64c402d7eb38fd2c7e0420e7b01e78a0'" <<<"$pre_action_step"
 continuation_call=$(awk '
   /descriptor=\$\(scripts\/admit-empty-release-continuation.sh/ { in_call=1 }
   in_call { print }
@@ -108,6 +121,10 @@ grep -Fq '$VERSION" =~ ^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$' <<
 grep -Fq 'test "$TAG" = "v$VERSION"' <<<"$publication_step"
 grep -Fq '[[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]' <<<"$publication_step"
 grep -Fq '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]' <<<"$publication_step"
+grep -Fq 'test "$RELEASE_ID" = 432691220' <<<"$publication_step"
+grep -Fq 'test "$TAG" = v1.7.0' <<<"$publication_step"
+grep -Fq 'test "$VERSION" = 1.7.0' <<<"$publication_step"
+grep -Fq 'current_dev=$(git ls-remote origin refs/heads/dev' <<<"$publication_step"
 if grep -Fq 'v1.2.0' <<<"$publication_step"; then
   echo "publication tuple remains v1.2.0-specific" >&2
   exit 1

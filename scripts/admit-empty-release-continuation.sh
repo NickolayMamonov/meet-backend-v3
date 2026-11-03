@@ -63,7 +63,8 @@ done
   fail "permanently denied source"
 case "$release_id/$tag/$version/$source_sha" in
   377201468/v1.3.0/1.3.0/a7abfe04f6852f479291a4710ebdee23e9ae8a34 | \
-  421705542/v1.5.1/1.5.1/51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce) ;;
+  421705542/v1.5.1/1.5.1/51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce | \
+  432691220/v1.7.0/1.7.0/9362e47e64c402d7eb38fd2c7e0420e7b01e78a0) ;;
   *) fail "only an exact authorized empty draft may continue" ;;
 esac
 

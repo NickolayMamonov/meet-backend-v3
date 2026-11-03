@@ -41,6 +41,27 @@ also normal resolution, while every other object or state for this ID fails
 closed. It is never deleted, recreated, retagged, or adopted through a
 different tuple.
 
+## Temporary v1.7.0 recovery boundary
+
+The separately approved local recovery change is restricted to release ID
+`432691220`, tag `v1.7.0`, version `1.7.0`, and application source
+`9362e47e64c402d7eb38fd2c7e0420e7b01e78a0`. Its activation edge is one push
+to `dev` whose event `before` is exactly that same SHA, with event `after`,
+checkout `HEAD`, and current `dev` all equal to the event SHA, on attempt 1.
+Any other repository, event, ref, before/after SHA, attempt, or current-branch
+state stops before Release Please or publication. The exact pending draft must
+be the sole pending continuation; absence, publication, partial/conflicting
+state, or another pending tuple never falls through to ordinary resolution.
+The descriptor and publication checkpoint independently pin the exact tuple.
+
+This boundary does not authorize retries, retargeting, fallback, or changes to
+the activation SHA. If the approved `before` SHA ceases to be fresh, stop for
+revised authorization and independent review. Retirement is a separate,
+reviewed and authorized source change only after immutable publication proof;
+it is not automatic on success, failure, disappearance, version advance, or
+timeout. Until that retirement lands, the invocation restriction remains
+active.
+
 ## Historical recovery records
 
 Release ID `371012814` was the prior quarantined `v1.2.0` continuation,
