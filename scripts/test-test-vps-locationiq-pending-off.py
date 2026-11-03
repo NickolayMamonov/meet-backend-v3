@@ -29,6 +29,8 @@ IMAGE_ID = "sha256:" + "c" * 64
 BASE = ("BACKEND_IMAGE=old@sha256:old\nBACKEND_REVISION=" + "d" * 40 +
         "\nBACKEND_VERSION=1.5.1\nOTHER=unchanged\nGEOCODER_ENABLED=false\nLOCATIONIQ_KEY=" +
         KEY + "\n").encode()
+ORDINARY_BASE = BASE.replace(
+    b"GEOCODER_ENABLED=false\nLOCATIONIQ_KEY=" + KEY.encode() + b"\n", b"")
 
 
 def record(env=None):
@@ -383,7 +385,7 @@ root=$3
 
 class IntegrationTests(unittest.TestCase):
     """Real deploy CLI, private files and pure policy; all infrastructure is fake."""
-    def run_case(self, failure="", opted=True, extra=()):
+    def run_case(self, failure="", opted=True, extra=(), ordinary=False):
         with tempfile.TemporaryDirectory(dir="/root") as tmp:
             root = Path(tmp)
             app, stage, state = root / "app", root / "scripts", root / "state"
@@ -393,7 +395,8 @@ class IntegrationTests(unittest.TestCase):
                 (SCRIPTS / "fixtures/selected-platform/image-index.json")
                 .read_bytes().removesuffix(b"\n"))
             state.mkdir(mode=0o700)
-            (app / ".env.production").write_bytes(BASE)
+            initial_env = ORDINARY_BASE if ordinary else BASE
+            (app / ".env.production").write_bytes(initial_env)
             (app / ".env.production").chmod(0o600)
             (app / "docker-compose.production.yml").write_text("services: {}\n")
             compose = root / "target-compose.yml"
@@ -456,7 +459,7 @@ verify_runtime_invariants() {
                     "--revision", tool.REVISION, "--version", tool.VERSION, "--run-key", "123-1",
                     "--mode", "deploy", "--failure-policy", "manual-stop",
                     "--public-url", "https://fixture.invalid"]
-            if opted:
+            if opted and not ordinary:
                 args.append("--pending-locationiq-off")
             args.extend(extra)
             result = subprocess.run(args, env=env, capture_output=True, timeout=30)
@@ -481,6 +484,33 @@ verify_runtime_invariants() {
         self.assertIn(b"GEOCODER_ENABLED=false\n", after)
         self.assertIn(KEY.encode(), after)
         self.assertIn(b"outcome\":\"committed", result.stdout)
+
+    def test_real_cli_ordinary_deploy_commits_with_valid_candidate_started_at(self):
+        result, trace, after = self.run_case(ordinary=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode() + trace)
+        self.assertEqual(trace.count("up-new"), 1)
+        self.assertNotIn("stop", trace)
+        self.assertIn("finish", trace)
+        self.assertIn(b"deployment=completed", result.stdout)
+        self.assertIn(b"BACKEND_VERSION=1.6.0\n", after)
+        self.assertIn(b"OTHER=unchanged\n", after)
+
+    def test_real_cli_ordinary_deploy_requires_stable_nonempty_candidate_started_at(self):
+        for failure, expected in (
+            ("candidate-started-missing", b"RECOVERY_REQUIRED"),
+            ("candidate-started-empty", b"RECOVERY_REQUIRED"),
+            ("candidate-started-invalid", b"RECOVERY_REQUIRED"),
+            ("candidate-started-changed", b"PROVIDER_STATE_INVALID"),
+        ):
+            with self.subTest(failure=failure):
+                result, trace, after = self.run_case(failure=failure, ordinary=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+                self.assertEqual(trace.count("up-new"), 1)
+                self.assertEqual(trace.count("call compose stop backend"), 1)
+                self.assertNotIn("finish", trace)
+                self.assertIn(b"BACKEND_VERSION=1.6.0\n", after)
+                self.assertIn(b"OTHER=unchanged\n", after)
 
     def test_real_cli_strict_default_rejects_pending_without_activation(self):
         result, trace, after = self.run_case(opted=False)
@@ -566,6 +596,8 @@ def record():
     (r / "record-count").write_text(str(count + 1))
     started = "new-start" if new else "old-start"
     if not new and failure == "prewriter-restart" and (r / "prepared").exists(): started = "raced"
+    if new and failure == "candidate-started-changed" and (r / "candidate-started-seen").exists():
+        started = "changed-start"
     rec = {"Id": newid if new else oldid,
       "Image": os.environ["CASE_IMAGE_ID"] if new else os.environ["CASE_OLD_IMAGE_ID"],
       "State":{"Running":True,"Health":{"Status":"healthy"},"StartedAt":started},
@@ -576,6 +608,12 @@ def record():
           "org.opencontainers.image.source":"https://github.com/NickolayMamonov/meet-backend-v3",
           "org.opencontainers.image.revision":os.environ["CASE_REVISION"],
           "org.opencontainers.image.version":"1.6.0"}}}
+    if new and failure == "candidate-started-missing":
+        rec["State"].pop("StartedAt")
+    if new and failure == "candidate-started-empty":
+        rec["State"]["StartedAt"] = ""
+    if new and failure == "candidate-started-invalid":
+        rec["State"]["StartedAt"] = 1729
     if new and failure == "candidate-id": rec["Id"] = oldid
     if new and failure == "candidate-image": rec["Image"] = "wrong"
     if new and failure == "candidate-health": rec["State"]["Health"]["Status"] = "unhealthy"
@@ -660,6 +698,8 @@ elif kind == "docker":
         elif "StartedAt" in fmt: print(rec["State"]["StartedAt"])
         elif "range .Config.Env" in fmt: print("\n".join(rec["Config"]["Env"]))
         else: print(json.dumps([rec]))
+        if new and failure == "candidate-started-changed" and not fmt:
+            (r / "candidate-started-seen").touch()
     elif args[:1] == ["compose"]:
         rec = record()
         print(json.dumps({"services":{"backend":{"environment":dict(x.split("=",1) for x in rec["Config"]["Env"])}}}))
