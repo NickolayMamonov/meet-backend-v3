@@ -385,7 +385,8 @@ root=$3
 
 class IntegrationTests(unittest.TestCase):
     """Real deploy CLI, private files and pure policy; all infrastructure is fake."""
-    def run_case(self, failure="", opted=True, extra=(), ordinary=False):
+    def run_case(self, failure="", opted=True, extra=(), ordinary=False,
+                 preserve_off=False):
         with tempfile.TemporaryDirectory(dir="/root") as tmp:
             root = Path(tmp)
             app, stage, state = root / "app", root / "scripts", root / "state"
@@ -395,7 +396,7 @@ class IntegrationTests(unittest.TestCase):
                 (SCRIPTS / "fixtures/selected-platform/image-index.json")
                 .read_bytes().removesuffix(b"\n"))
             state.mkdir(mode=0o700)
-            initial_env = ORDINARY_BASE if ordinary else BASE
+            initial_env = BASE if preserve_off else ORDINARY_BASE if ordinary else BASE
             (app / ".env.production").write_bytes(initial_env)
             (app / ".env.production").chmod(0o600)
             (app / "docker-compose.production.yml").write_text("services: {}\n")
@@ -450,6 +451,7 @@ verify_runtime_invariants() {
                        CASE_OLD_IMAGE_ID="sha256:" + "e" * 64,
                        CASE_IMAGE_ID=IMAGE_ID, CASE_IMAGE=tool.IMAGE, CASE_REVISION=tool.REVISION,
                        CASE_KEY=KEY, CASE_OLD=OLD, CASE_NEW=NEW,
+                       CASE_PRESERVE_OFF="true" if preserve_off else "false",
                        TEST_VPS_STATE_ROOT=str(state), PRODUCTION_STATE_DIR=str(root / "active"),
                        # An inherited mode must never activate the opt-in.
                        APPLY_PENDING_LOCATIONIQ_OFF="true")
@@ -494,6 +496,16 @@ verify_runtime_invariants() {
         self.assertIn(b"deployment=completed", result.stdout)
         self.assertIn(b"BACKEND_VERSION=1.6.0\n", after)
         self.assertIn(b"OTHER=unchanged\n", after)
+
+    def test_real_cli_ordinary_deploy_preserves_configured_geocoder_off_and_key(self):
+        result, trace, after = self.run_case(ordinary=True, preserve_off=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode() + trace)
+        self.assertEqual(trace.count("up-new"), 1)
+        self.assertNotIn("stop", trace)
+        self.assertIn("finish", trace)
+        self.assertIn(b"deployment=completed", result.stdout)
+        self.assertIn(b"GEOCODER_ENABLED=false\n", after)
+        self.assertIn(b"LOCATIONIQ_KEY=" + KEY.encode() + b"\n", after)
 
     def test_real_cli_ordinary_deploy_requires_stable_nonempty_candidate_started_at(self):
         for failure, expected in (
@@ -583,7 +595,7 @@ def die(): raise SystemExit(1)
 trace("call " + kind + " " + " ".join(args))
 def record():
     data = (r / "app/.env.production").read_text().splitlines()
-    if not new:
+    if not new and os.environ.get("CASE_PRESERVE_OFF") != "true":
         data = [x for x in data if not x.startswith(("GEOCODER_ENABLED=", "LOCATIONIQ_KEY="))]
     if new and failure == "candidate-key":
         data = [x if not x.startswith("LOCATIONIQ_KEY=") else "LOCATIONIQ_KEY=wrong" for x in data]
