@@ -9,6 +9,7 @@ trap 'rm -r -- "$TMP"' EXIT
 REPO=$ROOT_DIR
 SOURCE=a7abfe04f6852f479291a4710ebdee23e9ae8a34
 SOURCE_151=51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce
+SOURCE_170=9362e47e64c402d7eb38fd2c7e0420e7b01e78a0
 
 jq -n --arg source "$SOURCE" '[{
   id:377201468,name:"v1.3.0",tag_name:"v1.3.0",target_commitish:$source,immutable:false,draft:true,
@@ -69,6 +70,20 @@ run_admission() {
 }
 
 run_admission | grep -Fx 'route=materialize'
+
+# Exact recovery draft and a later current-dev descendant retain only the
+# approved source/version authority while exercising the production helper.
+jq -n --arg source "$SOURCE_170" '[{
+  id:432691220,name:"v1.7.0",tag_name:"v1.7.0",target_commitish:$source,
+  immutable:false,draft:true,prerelease:false,published_at:null,assets:[]
+}]' >"$TMP/releases-170.json"
+printf '%s\n' 'v1.7.0 absent' '1.7.0 absent' "sha-$SOURCE_170 absent" \
+  'latest=absent' 'state=empty' >"$TMP/registry-170.txt"
+"$ADMIT" --repository NickolayMamonov/meet-backend-v3 --repo-dir "$REPO" \
+  --dev-ref HEAD --release-id 432691220 --tag v1.7.0 --version 1.7.0 \
+  --source-sha "$SOURCE_170" --releases-file "$TMP/releases-170.json" \
+  --registry-state-file "$TMP/registry-170.txt" --refs-file "$TMP/refs.json" |
+  grep -Fx 'route=materialize'
 
 cp "$TMP/registry.txt" "$TMP/registry-ok.txt"
 awk '$0 == "v1.3.0 absent" { print "v1.3.0 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; next } { print }' "$TMP/registry-ok.txt" >"$TMP/registry.txt"
@@ -309,8 +324,11 @@ workflow=$ROOT_DIR/.github/workflows/release-please.yml
 selector_script="$TMP/workflow-selector.sh"
 {
   printf '%s\n' 'set -euo pipefail' 'releases_before=$1'
-  sed -n '/^          continuation_state=absent$/,/^          CONTINUATIONS$/p' \
-    "$workflow" | sed 's/^          //'
+  awk '
+    /^          continuation_state=absent$/ { in_selector=1 }
+    in_selector && /^          case "\$continuation_state" in$/ { exit }
+    in_selector { sub(/^          /, ""); print }
+  ' "$workflow"
   printf '%s\n' \
     'printf "%s/%s/%s/%s\n" "$continuation_state" "${continuation_id-}" "${continuation_tag-}" "${continuation_source-}"'
 } >"$selector_script"
@@ -323,9 +341,42 @@ expect_selector() {
   }
 }
 printf '%s\n' '[]' >"$TMP/absent.json"
-expect_selector absent/// "$TMP/absent.json"
-expect_selector "pending/377201468/v1.3.0/$SOURCE" "$TMP/releases.json"
-expect_selector "pending/421705542/v1.5.1/$SOURCE_151" "$TMP/releases-151.json"
+if bash "$selector_script" "$TMP/absent.json" >/dev/null 2>&1; then
+  echo "exact recovery selector fell through on absent continuation" >&2
+  exit 1
+fi
+jq -n --arg source "$SOURCE_170" '[{
+  id:432691220,name:"v1.7.0",tag_name:"v1.7.0",target_commitish:$source,
+  immutable:false,draft:true,prerelease:false,published_at:null,assets:[]
+}]' >"$TMP/pending-170.json"
+expect_selector "pending/432691220/v1.7.0/$SOURCE_170" "$TMP/pending-170.json"
+if bash "$selector_script" "$TMP/releases.json" >/dev/null 2>&1 ||
+   bash "$selector_script" "$TMP/releases-151.json" >/dev/null 2>&1; then
+  echo "exact recovery selector accepted another pending continuation" >&2
+  exit 1
+fi
+jq -n --arg source "$SOURCE_170" '[{
+  id:432691220,name:"v1.7.0",tag_name:"v1.7.0",target_commitish:$source,
+  immutable:true,draft:false,prerelease:false,published_at:"2026-11-03T00:00:00Z",
+  assets:[]
+}]' >"$TMP/published-170.json"
+if bash "$selector_script" "$TMP/published-170.json" >/dev/null 2>&1; then
+  echo "exact recovery selector accepted an already-published draft" >&2
+  exit 1
+fi
+for partial_filter in \
+  '.[0].draft=false' \
+  '.[0].target_commitish="'"$SOURCE"'"'; do
+  jq "$partial_filter" "$TMP/pending-170.json" >"$TMP/partial-170.json"
+  if "$ADMIT" --repository NickolayMamonov/meet-backend-v3 --repo-dir "$REPO" \
+    --dev-ref HEAD --release-id 432691220 --tag v1.7.0 --version 1.7.0 \
+    --source-sha "$SOURCE_170" --releases-file "$TMP/partial-170.json" \
+    --registry-state-file "$TMP/registry-170.txt" --refs-file "$TMP/refs.json" \
+    >/dev/null 2>&1; then
+    echo "exact recovery helper admitted partial/conflicting draft state" >&2
+    exit 1
+  fi
+done
 
 jq -n --arg source "$SOURCE_151" '[
   {
@@ -339,7 +390,10 @@ jq -n --arg source "$SOURCE_151" '[
     ]
   }
 ]' >"$TMP/published-151.json"
-expect_selector absent/// "$TMP/published-151.json"
+if bash "$selector_script" "$TMP/published-151.json" >/dev/null 2>&1; then
+  echo "exact recovery selector fell through on published continuation" >&2
+  exit 1
+fi
 jq -n --arg source "$SOURCE_151" '[{
   id:421705542,name:"v1.5.1",tag_name:"v1.5.1",target_commitish:$source,
   immutable:false,draft:"yes",prerelease:false,published_at:null,assets:[]
