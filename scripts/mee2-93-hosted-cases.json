@@ -1,0 +1,199 @@
+{
+  "version": 1,
+  "subject": {
+    "commit": "c5841d67bb2d9e782c00135846557728bc37a8ef",
+    "tree": "417fa86f55a711fac543f5114473d5facf4e79c8",
+    "files": [
+      {
+        "path": "scripts/test-test-vps-retention.sh",
+        "sha256": "d248f84faa1e67382097307b149ec022004d7b9dae0067c3ccb191b5f71315ec"
+      },
+      {
+        "path": "scripts/test-test-vps-provider-runtime.sh",
+        "sha256": "a88c560705e25baec1f8894f9f880639ce54a605999cd55e66ef04ef51c494dc"
+      },
+      {
+        "path": "scripts/test-vps-provider-credential.py",
+        "sha256": "60ebf2c29b6106a04b0ebfacdc15a0e16d35057f0f8780e031d8d0095a88f801"
+      },
+      {
+        "path": "scripts/test-test-vps-provider-credential.py",
+        "sha256": "d3b5fcb8c927999ca375360530323260d1dfee3e17466bc76473dde459403591"
+      },
+      {
+        "path": "scripts/deploy-test-vps-provider-release.sh",
+        "sha256": "99ab8156edeb6b8198e0f700513772f2392bed6de82987db8d211f6d7c3cb392"
+      },
+      {
+        "path": "scripts/deploy-test-vps-release.sh",
+        "sha256": "fcaa0c8630fb63810b8bdfad5eaa1dd0e1c15845647432aeb412c5cf7d837d30"
+      },
+      {
+        "path": "docker-compose.production.yml",
+        "sha256": "a238daac708bab8d7e03863c885b7bb38e75d5130ffe7c237f665555c7200381"
+      },
+      {
+        "path": ".github/workflows/deploy-test-vps.yml",
+        "sha256": "a078e818704183abfe9bfab41fddcaf4ee9685b5f16efd2bec3dcea975ebf482"
+      }
+    ]
+  },
+  "images": {
+    "predecessor": "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:e92bf70ddd26cf723ec48ae79d1e3bea77b6a4c0f2100e1573f8fb458c6cedda",
+    "target": "ghcr.io/nickolaymamonov/meet-backend-v3@sha256:88b697872331ed2786f2d9009c769a87c32470086702faacf9874576fe094e9e",
+    "postgres": "postgres:16-alpine@sha256:4327b9fd295502f326f44153a1045a7170ddbfffed1c3829798328556cfd09e2"
+  },
+  "groups": {
+    "filesystem": {
+      "publication": [
+        "_state_publish",
+        "swap_publication_root_after_lock",
+        "inject_publication_interlock",
+        "replace_publication_source_at_boundary"
+      ],
+      "credential_lifecycle": [
+        "prepare_marker",
+        "ACL/private-read helpers",
+        "expect_provider_error",
+        "prepare_finalizing",
+        "reject_descriptor_unlink",
+        "transaction and retention child replacement"
+      ],
+      "retention_races": [
+        "valid_retention_state",
+        "assert_direct_retention_refusal",
+        "swap_root_after_interlocks",
+        "replace_protected_reference",
+        "synthetic_protected_alias",
+        "replace_final_boundary_reference",
+        "replace_terminal_after_witness"
+      ],
+      "crash_recovery": [
+        "expect_fault",
+        "fail_publication_fsync",
+        "retention_fault",
+        "fail_quarantine_fsync",
+        "fail_child_unlink",
+        "fail_owner_unlink",
+        "fail_rmdir",
+        "fail_final_fsync",
+        "replace_quarantine_after_rename",
+        "inject_interlock_before_quarantine",
+        "malformed boolean marker"
+      ],
+      "helper_contract": [
+        "scripts/test-test-vps-provider-credential.py",
+        "typed marker/primitive",
+        "bounded JSON",
+        "channel/alias",
+        "allowlisted-output"
+      ],
+      "descriptor_stability": [
+        "descriptor_transferred_missing",
+        "descriptor_transferred_replaced_regular",
+        "descriptor_transferred_replaced_symlink",
+        "descriptor_retention_post_acquisition",
+        "descriptor_growth_fails_verdict",
+        "descriptor_rescue_cannot_clear_failure",
+        "descriptor_measurements_closed_schema"
+      ]
+    },
+    "retention": {
+      "legacy_preservation": [
+        "31885558214-1-rollback-drill",
+        "31886011287-1-rollback-drill",
+        "31886542144-1-final-deploy",
+        "31886542144-1-rollback-drill",
+        "31887546557-1-final-deploy",
+        "33076843662-1-final-deploy",
+        "33076843662-1-rollback-drill",
+        "35471104657-1-rollback-drill"
+      ],
+      "deletion_boundaries": [
+        "fixed-root refusal",
+        "owner marker",
+        "protected mounts/references",
+        "unknown/concurrent children",
+        "symlink/prefix collision"
+      ],
+      "timeout_recovery": [
+        "timeout RECOVERY_REQUIRED",
+        "retry",
+        "self-tooling",
+        "repeated cleanup"
+      ]
+    },
+    "immutableRuntime": {
+      "disabled_rollback_deploy": [
+        "run_image_case",
+        "rollback",
+        "deploy",
+        "assert_postgres_image",
+        "verify_case_runtime",
+        "assert_provider_state",
+        "assert_terminal_state",
+        "assert_private_state_snapshots",
+        "assert_internal_network",
+        "assert_outbound_blocked",
+        "legacy_digest",
+        "scan_case_secrets"
+      ],
+      "enabled_rollback_deploy": [
+        "run_image_case",
+        "rollback",
+        "deploy",
+        "assert_postgres_image",
+        "verify_case_runtime",
+        "assert_provider_state",
+        "assert_terminal_state",
+        "assert_private_state_snapshots",
+        "assert_internal_network",
+        "assert_outbound_blocked",
+        "legacy_digest",
+        "scan_case_secrets"
+      ],
+      "filesystem_tail": [
+        "lines 1477-2938",
+        "canonical filesystem assertions",
+        "provider helper suite",
+        "retention and cleanup markers"
+      ]
+    }
+  },
+  "commands": [
+    "bash scripts/test-test-vps-provider-runtime.sh --filesystem-only",
+    "bash scripts/test-test-vps-retention.sh",
+    "bash scripts/test-test-vps-provider-runtime.sh --previous-image PREDECESSOR --target-image TARGET"
+  ],
+  "legacyFixtures": [
+    "31885558214-1-rollback-drill",
+    "31886011287-1-rollback-drill",
+    "31886542144-1-final-deploy",
+    "31886542144-1-rollback-drill",
+    "31887546557-1-final-deploy",
+    "33076843662-1-final-deploy",
+    "33076843662-1-rollback-drill",
+    "35471104657-1-rollback-drill"
+  ],
+  "cleanupResources": [
+    "/var/lib/meet-production",
+    "/var/lib/meet-test-vps-deploy",
+    "/var/lib/meet-retention-production",
+    "/var/lib/meet-provider-image.*",
+    "/var/lib/meet-provider-fixture.*",
+    "/var/lib/mee2-95-descriptor.*",
+    "/tmp/meet-retention-fixture.*",
+    "compose:meet-production",
+    "network:meet-production_default",
+    "volume:meet-production_postgres_data",
+    "volume:meet-production_uploads_data"
+  ],
+  "evidence": {
+    "schemaVersion": 1,
+    "retentionDays": 90,
+    "files": [
+      "proof.json",
+      "SHA256SUMS"
+    ]
+  }
+}
