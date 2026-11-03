@@ -39,12 +39,29 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Enforce exact v1.7.0 recovery invocation
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = NickolayMamonov/meet-backend-v3
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/dev
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_EVENT_AFTER" = "$GITHUB_SHA"
+          test "$GITHUB_EVENT_BEFORE" = 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0
+          git merge-base --is-ancestor \
+            9362e47e64c402d7eb38fd2c7e0420e7b01e78a0 HEAD
+
       - name: Fetch exact current-action authority
         run: |
           set -euo pipefail
           git fetch --no-tags origin '+refs/heads/dev:refs/remotes/origin/dev'
           test "$(git rev-parse origin/dev)" = \
             "$(git ls-remote origin refs/heads/dev | awk '{print $1}')"
+          test "$(git rev-parse origin/dev)" = "$GITHUB_SHA"
 
       - name: Mint and verify immutable-policy reader
         env:
@@ -116,7 +133,13 @@ jobs:
           done <<'CONTINUATIONS'
           377201468 1.3.0 a7abfe04f6852f479291a4710ebdee23e9ae8a34
           421705542 1.5.1 51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce
+          432691220 1.7.0 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0
           CONTINUATIONS
+          test "$continuation_state" = pending
+          test "$continuation_id" = 432691220
+          test "$continuation_tag" = v1.7.0
+          test "$continuation_version" = 1.7.0
+          test "$continuation_source" = 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0
           case "$continuation_state" in
             pending)
               registry_state="$RUNNER_TEMP/$continuation_tag-continuation-registry.txt"
@@ -142,6 +165,16 @@ jobs:
               exit 1
               ;;
           esac
+          test "$(grep -c '^route=' <<<"$descriptor")" -eq 1
+          test "$(grep -c '^release_id=' <<<"$descriptor")" -eq 1
+          test "$(grep -c '^tag=' <<<"$descriptor")" -eq 1
+          test "$(grep -c '^version=' <<<"$descriptor")" -eq 1
+          test "$(grep -c '^source_sha=' <<<"$descriptor")" -eq 1
+          grep -Fxq 'route=materialize' <<<"$descriptor"
+          grep -Fxq 'release_id=432691220' <<<"$descriptor"
+          grep -Fxq 'tag=v1.7.0' <<<"$descriptor"
+          grep -Fxq 'version=1.7.0' <<<"$descriptor"
+          grep -Fxq 'source_sha=9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' <<<"$descriptor"
           printf '%s\n' "$descriptor"
           awk -F= '{print $1 "=" $2}' <<<"$descriptor" >>"$GITHUB_OUTPUT"
 
@@ -298,12 +331,30 @@ jobs:
             --credential-proof "$RUNNER_TEMP/reader-proof.json"
 
       - name: Verify canonical publication tuple
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_AFTER: ${{ github.event.after }}
         run: |
           set -euo pipefail
+          test "$GITHUB_REPOSITORY" = NickolayMamonov/meet-backend-v3
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/dev
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_EVENT_BEFORE" = 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0
+          test "$GITHUB_EVENT_AFTER" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor \
+            9362e47e64c402d7eb38fd2c7e0420e7b01e78a0 HEAD
+          test "$RELEASE_ID" = 432691220
+          test "$TAG" = v1.7.0
+          test "$VERSION" = 1.7.0
+          test "$SOURCE_SHA" = 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0
           [[ "$VERSION" =~ ^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]]
           test "$TAG" = "v$VERSION"
           [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          current_dev=$(git ls-remote origin refs/heads/dev | awk '{print $1}')
+          test "$current_dev" = "$GITHUB_SHA"
 
       - name: Enforce protected history before publication writers
         run: |
