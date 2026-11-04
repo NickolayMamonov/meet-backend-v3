@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.7.1](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.7.0...v1.7.1) (2026-11-04)
+
+
+### Fixes
+
+* **release:** retire v1.7.0 recovery restrictions ([bf134e2](https://github.com/NickolayMamonov/meet-backend-v3/commit/bf134e2a8d6bd31723baa7b7b9750602071d2988))
+* **release:** retire v1.7.0 recovery restrictions ([9152042](https://github.com/NickolayMamonov/meet-backend-v3/commit/91520425f4172d98c52fdf2b9192a3cc7e237a50))
+* **test-vps:** validate ordinary candidate start time ([0ca9f61](https://github.com/NickolayMamonov/meet-backend-v3/commit/0ca9f61c6402b489487bf348a1fc59d6153c7643))
+
 ## [1.7.0](https://github.com/NickolayMamonov/meet-backend-v3/compare/v1.6.0...v1.7.0) (2026-11-03)
 
 
