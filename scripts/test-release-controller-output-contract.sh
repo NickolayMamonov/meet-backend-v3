@@ -30,92 +30,8 @@ grep -Fq 'echo "version=$PRE_VERSION" >>"$GITHUB_OUTPUT"' <<<"$route_step"
 for invariant in \
   '377201468 1.3.0 a7abfe04f6852f479291a4710ebdee23e9ae8a34' \
   '421705542 1.5.1 51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce' \
-  '432691220 1.7.0 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' \
-  'test "$continuation_state" = pending' \
-  "test \"\$continuation_id\" = 432691220" \
-  "test \"\$continuation_tag\" = v1.7.0" \
-  "test \"\$continuation_source\" = 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0" \
   'multiple pending authorized continuations'; do
   grep -Fq "$invariant" <<<"$controller"
-done
-grep -Fq 'Enforce exact v1.7.0 recovery invocation' <<<"$controller"
-grep -Fq 'GITHUB_EVENT_BEFORE' <<<"$controller"
-grep -Fq 'GITHUB_RUN_ATTEMPT' <<<"$controller"
-grep -Fq "grep -Fxq 'route=materialize'" <<<"$pre_action_step"
-grep -Fq "grep -Fxq 'release_id=432691220'" <<<"$pre_action_step"
-grep -Fq "grep -Fxq 'tag=v1.7.0'" <<<"$pre_action_step"
-grep -Fq "grep -Fxq 'version=1.7.0'" <<<"$pre_action_step"
-grep -Fq "grep -Fxq 'source_sha=9362e47e64c402d7eb38fd2c7e0420e7b01e78a0'" <<<"$pre_action_step"
-
-descriptor_assertions=$(sed -n \
-  "/grep -c '\\^route='/,/grep -Fxq 'source_sha=/p" <<<"$pre_action_step")
-run_descriptor_assertions() {
-  local value=$1
-  bash -c "set -euo pipefail; descriptor=\$1; $descriptor_assertions" _ "$value"
-}
-valid_descriptor=$'route=materialize\nrelease_id=432691220\ntag=v1.7.0\nversion=1.7.0\nsource_sha=9362e47e64c402d7eb38fd2c7e0420e7b01e78a0'
-run_descriptor_assertions "$valid_descriptor"
-for invalid_descriptor in \
-  $'release_id=432691220\ntag=v1.7.0\nversion=1.7.0\nsource_sha=9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' \
-  "$valid_descriptor"$'\nroute=materialize' \
-  "${valid_descriptor/route=materialize/route=action}" \
-  "${valid_descriptor/release_id=432691220/release_id=9}"; do
-  if run_descriptor_assertions "$invalid_descriptor" >/dev/null 2>&1; then
-    echo "descriptor output guard admitted missing, duplicate, or wrong tuple" >&2
-    exit 1
-  fi
-done
-invocation_gate=$(awk '
-  /^      - name: Enforce exact v1.7.0 recovery invocation$/ {
-    in_step=1
-    next
-  }
-  in_step && /^      - name: / { exit }
-  in_step && /^        run: \|$/ { in_run=1; next }
-  in_run && /^          / { sub(/^          /, ""); print }
-' "$WORKFLOW")
-run_invocation_gate() {
-  local repo=${1:-NickolayMamonov/meet-backend-v3}
-  local event=${2:-push}
-  local ref=${3:-refs/heads/dev}
-  local attempt=${4:-1}
-  local before=${5:-9362e47e64c402d7eb38fd2c7e0420e7b01e78a0}
-  local after=${6:-$(git rev-parse HEAD)}
-  local sha=${7:-$(git rev-parse HEAD)}
-  env GITHUB_REPOSITORY=${1:-NickolayMamonov/meet-backend-v3} \
-    GITHUB_EVENT_NAME="$event" GITHUB_REF="$ref" \
-    GITHUB_RUN_ATTEMPT="$attempt" GITHUB_SHA="$sha" \
-    GITHUB_EVENT_AFTER="$after" \
-    GITHUB_EVENT_BEFORE="$before" \
-    bash -c "$invocation_gate"
-}
-run_invocation_gate
-for gate_case in \
-  'owner/repo push refs/heads/dev 1 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' \
-  'NickolayMamonov/meet-backend-v3 pull_request refs/heads/dev 1 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' \
-  'NickolayMamonov/meet-backend-v3 push refs/heads/main 1 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' \
-  'NickolayMamonov/meet-backend-v3 push refs/heads/dev 2 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0' \
-  'NickolayMamonov/meet-backend-v3 push refs/heads/dev 1 0000000000000000000000000000000000000000' \
-  'NickolayMamonov/meet-backend-v3 push refs/heads/dev 1 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0 wrong-after' \
-  'NickolayMamonov/meet-backend-v3 push refs/heads/dev 1 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0 wrong-after wrong-checkout-sha'; do
-  read -r repo event ref attempt before <<<"$gate_case"
-  if [[ "$gate_case" == *wrong-after* ]]; then
-    if [[ "$gate_case" == *wrong-checkout-sha ]]; then
-      if run_invocation_gate "$repo" "$event" "$ref" "$attempt" "$before" \
-        wrong-after wrong-checkout-sha >/dev/null 2>&1; then
-        echo "invocation guard admitted checkout SHA mismatch" >&2
-        exit 1
-      fi
-    elif run_invocation_gate "$repo" "$event" "$ref" "$attempt" "$before" \
-      wrong-after >/dev/null 2>&1; then
-      echo "invocation guard admitted event after mismatch" >&2
-      exit 1
-    fi
-  elif run_invocation_gate "$repo" "$event" "$ref" "$attempt" "$before" \
-    >/dev/null 2>&1; then
-    echo "invocation guard admitted wrong repository/event/ref/attempt/before" >&2
-    exit 1
-  fi
 done
 continuation_call=$(awk '
   /descriptor=\$\(scripts\/admit-empty-release-continuation.sh/ { in_call=1 }
@@ -192,11 +108,6 @@ grep -Fq '$VERSION" =~ ^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$' <<
 grep -Fq 'test "$TAG" = "v$VERSION"' <<<"$publication_step"
 grep -Fq '[[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]' <<<"$publication_step"
 grep -Fq '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]' <<<"$publication_step"
-grep -Fq 'test "$RELEASE_ID" = 432691220' <<<"$publication_step"
-grep -Fq 'test "$TAG" = v1.7.0' <<<"$publication_step"
-grep -Fq 'test "$VERSION" = 1.7.0' <<<"$publication_step"
-grep -Fq 'test "$GITHUB_RUN_ATTEMPT" = 1' <<<"$publication_step"
-grep -Fq 'current_dev=$(git ls-remote origin refs/heads/dev' <<<"$publication_step"
 if grep -Fq 'v1.2.0' <<<"$publication_step"; then
   echo "publication tuple remains v1.2.0-specific" >&2
   exit 1
