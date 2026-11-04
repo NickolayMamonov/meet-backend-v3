@@ -41,27 +41,6 @@ also normal resolution, while every other object or state for this ID fails
 closed. It is never deleted, recreated, retagged, or adopted through a
 different tuple.
 
-## Temporary v1.7.0 recovery boundary
-
-The separately approved local recovery change is restricted to release ID
-`432691220`, tag `v1.7.0`, version `1.7.0`, and application source
-`9362e47e64c402d7eb38fd2c7e0420e7b01e78a0`. Its activation edge is one push
-to `dev` whose event `before` is exactly that same SHA, with event `after`,
-checkout `HEAD`, and current `dev` all equal to the event SHA, on attempt 1.
-Any other repository, event, ref, before/after SHA, attempt, or current-branch
-state stops before Release Please or publication. The exact pending draft must
-be the sole pending continuation; absence, publication, partial/conflicting
-state, or another pending tuple never falls through to ordinary resolution.
-The descriptor and publication checkpoint independently pin the exact tuple.
-
-This boundary does not authorize retries, retargeting, fallback, or changes to
-the activation SHA. If the approved `before` SHA ceases to be fresh, stop for
-revised authorization and independent review. Retirement is a separate,
-reviewed and authorized source change only after immutable publication proof;
-it is not automatic on success, failure, disappearance, version advance, or
-timeout. Until that retirement lands, the invocation restriction remains
-active.
-
 ## Historical recovery records
 
 Release ID `371012814` was the prior quarantined `v1.2.0` continuation,
@@ -74,6 +53,15 @@ Release ID `368531227`, tag `v1.1.0`, version `1.1.0`, and source
 Their four assets, absent ref, package aliases, draft state, and attestation
 state are protected by the canonical snapshot and must remain byte-for-byte
 unchanged.
+
+Release ID `432691220`, tag `v1.7.0`, version `1.7.0`, and application source
+`9362e47e64c402d7eb38fd2c7e0420e7b01e78a0` completed the one-time recovery
+through run `41726352439` (attempt 1, success). The release became immutable
+at `2026-11-03T22:14:50Z`; its image-index digest is
+`sha256:511b3561fd87e7c635b07c90b8d75a817c873734befc4779158e7e80b389c636`,
+with selected `linux/amd64` manifest
+`sha256:9f2950900fac96be9dad62038f9d0fe62dc442ea38e4b04c51841f58cf31a72b`.
+This is a closed historical record, not a continuing recovery authority.
 
 ## Normal controller routes
 

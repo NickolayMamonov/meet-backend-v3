@@ -37,14 +37,6 @@ manifest=$(awk '
     $0 !~ /Generate deterministic release manifest$/ { exit }
   in_step { print }
 ' <<<"$publish")
-publication_checkpoint=$(awk '
-  /^      - name: Verify canonical publication tuple$/ { in_step=1 }
-  in_step && /^      - name: / &&
-    $0 !~ /Verify canonical publication tuple$/ { exit }
-  in_step && /^        run: \|$/ { in_run=1; next }
-  in_run && /^          / { sub(/^          /, ""); print }
-' <<<"$publish")
-
 grep -Fq 'ref: ${{ github.sha }}' <<<"$tooling"
 if grep -Fq 'path:' <<<"$tooling"; then
   echo "reviewed publication tooling must own the workspace root" >&2
@@ -120,65 +112,5 @@ if grep -Fq 'sed "s#  $RUNNER_TEMP/release-assets/##"' <<<"$manifest"; then
   echo "release checksums must be generated from inside the asset directory" >&2
   exit 1
 fi
-
-MOCK_HEAD=$(command git rev-parse HEAD)
-git() {
-  case "$*" in
-    'rev-parse HEAD') printf '%s\n' "$MOCK_HEAD" ;;
-    'merge-base --is-ancestor 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0 HEAD') return 0 ;;
-    'ls-remote origin refs/heads/dev')
-      printf '%s\trefs/heads/dev\n' "$MOCK_CURRENT_DEV"
-      ;;
-    *) echo "unexpected git invocation in publication checkpoint: $*" >&2; return 97 ;;
-  esac
-}
-export -f git
-run_publication_checkpoint() {
-  local attempt=$1 current_dev=$2 writer_sentinel=$3
-  env GITHUB_REPOSITORY=NickolayMamonov/meet-backend-v3 \
-    GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/dev \
-    GITHUB_RUN_ATTEMPT="$attempt" \
-    GITHUB_EVENT_BEFORE=9362e47e64c402d7eb38fd2c7e0420e7b01e78a0 \
-    GITHUB_EVENT_AFTER="$MOCK_HEAD" GITHUB_SHA="$MOCK_HEAD" \
-    RELEASE_ID=432691220 TAG=v1.7.0 VERSION=1.7.0 \
-    SOURCE_SHA=9362e47e64c402d7eb38fd2c7e0420e7b01e78a0 \
-    MOCK_HEAD="$MOCK_HEAD" MOCK_CURRENT_DEV="$current_dev" \
-    WRITER_SENTINEL="$writer_sentinel" \
-    bash -c "$publication_checkpoint"$'\n''touch "$WRITER_SENTINEL"'
-}
-same_dev_sentinel=$TMP/publication-writer-ran
-run_publication_checkpoint 1 "$MOCK_HEAD" "$same_dev_sentinel"
-[ -f "$same_dev_sentinel" ] || {
-  echo "exact tuple/attempt-1/current-dev publication control was rejected" >&2
-  exit 1
-}
-blocked_sentinel=$TMP/attempt-2-writer-ran
-if run_publication_checkpoint 2 "$MOCK_HEAD" "$blocked_sentinel" \
-  >/dev/null 2>&1; then
-  echo "publication checkpoint admitted attempt 2" >&2
-  exit 1
-fi
-[ ! -e "$blocked_sentinel" ] || {
-  echo "publication writer ran after attempt-2 guard rejection" >&2
-  exit 1
-}
-for drift_kind in unchanged-version advanced-version; do
-  blocked_sentinel=$TMP/$drift_kind-writer-ran
-  if [ "$drift_kind" = unchanged-version ]; then
-    drift_sha=1111111111111111111111111111111111111111
-  else
-    drift_sha=2222222222222222222222222222222222222222
-  fi
-  if run_publication_checkpoint 1 \
-    "$drift_sha" "$blocked_sentinel" \
-    >/dev/null 2>&1; then
-    echo "publication checkpoint admitted current-dev drift ($drift_kind)" >&2
-    exit 1
-  fi
-  [ ! -e "$blocked_sentinel" ] || {
-    echo "publication writer ran after current-dev drift ($drift_kind)" >&2
-    exit 1
-  }
-done
 
 echo "release publication tooling-routing fixture passed"

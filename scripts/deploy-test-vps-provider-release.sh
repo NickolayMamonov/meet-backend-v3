@@ -1685,10 +1685,8 @@ compose_up -d --no-deps --no-build --pull never --force-recreate \
 candidate_container=$(compose ps -q backend)
 candidate_inspect=$(docker_container_inspect "$candidate_container" 2>/dev/null) ||
   fail "RECOVERY_REQUIRED"
-if [ "$pending_locationiq_off" = true ]; then
-  candidate_started=$(jq -er '.[0].State.StartedAt | select(type == "string" and length > 0)' \
-    <<<"$candidate_inspect") || fail "RECOVERY_REQUIRED"
-fi
+candidate_started=$(jq -er '.[0].State.StartedAt | select(type == "string" and length > 0)' \
+  <<<"$candidate_inspect") || fail "RECOVERY_REQUIRED"
 target_hash=$(docker_container_inspect "$candidate_container" \
   --format '{{index .Config.Labels "com.docker.compose.config-hash"}}') ||
   fail "RECOVERY_REQUIRED"

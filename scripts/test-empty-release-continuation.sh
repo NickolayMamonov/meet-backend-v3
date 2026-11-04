@@ -9,7 +9,6 @@ trap 'rm -r -- "$TMP"' EXIT
 REPO=$ROOT_DIR
 SOURCE=a7abfe04f6852f479291a4710ebdee23e9ae8a34
 SOURCE_151=51bac7c8ab8284dfbef7d72d1e6d61e5d61539ce
-SOURCE_170=9362e47e64c402d7eb38fd2c7e0420e7b01e78a0
 
 jq -n --arg source "$SOURCE" '[{
   id:377201468,name:"v1.3.0",tag_name:"v1.3.0",target_commitish:$source,immutable:false,draft:true,
@@ -70,20 +69,6 @@ run_admission() {
 }
 
 run_admission | grep -Fx 'route=materialize'
-
-# Exact recovery draft and a later current-dev descendant retain only the
-# approved source/version authority while exercising the production helper.
-jq -n --arg source "$SOURCE_170" '[{
-  id:432691220,name:"v1.7.0",tag_name:"v1.7.0",target_commitish:$source,
-  immutable:false,draft:true,prerelease:false,published_at:null,assets:[]
-}]' >"$TMP/releases-170.json"
-printf '%s\n' 'v1.7.0 absent' '1.7.0 absent' "sha-$SOURCE_170 absent" \
-  'latest=absent' 'state=empty' >"$TMP/registry-170.txt"
-"$ADMIT" --repository NickolayMamonov/meet-backend-v3 --repo-dir "$REPO" \
-  --dev-ref HEAD --release-id 432691220 --tag v1.7.0 --version 1.7.0 \
-  --source-sha "$SOURCE_170" --releases-file "$TMP/releases-170.json" \
-  --registry-state-file "$TMP/registry-170.txt" --refs-file "$TMP/refs.json" |
-  grep -Fx 'route=materialize'
 
 cp "$TMP/registry.txt" "$TMP/registry-ok.txt"
 awk '$0 == "v1.3.0 absent" { print "v1.3.0 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; next } { print }' "$TMP/registry-ok.txt" >"$TMP/registry.txt"
@@ -319,16 +304,14 @@ expect_rejection "$ADMIT" --repository owner/repo --repo-dir "$REPO" \
   --releases-file "$TMP/releases-151.json" \
   --registry-state-file "$TMP/registry-151.txt" --refs-file "$TMP/refs.json"
 
-# Execute the selector loop extracted from the workflow against local snapshots.
+# Execute the ordinary selector loop extracted from the workflow against local
+# snapshots.
 workflow=$ROOT_DIR/.github/workflows/release-please.yml
 selector_script="$TMP/workflow-selector.sh"
 {
   printf '%s\n' 'set -euo pipefail' 'releases_before=$1'
-  awk '
-    /^          continuation_state=absent$/ { in_selector=1 }
-    in_selector && /^          case "\$continuation_state" in$/ { exit }
-    in_selector { sub(/^          /, ""); print }
-  ' "$workflow"
+  sed -n '/^          continuation_state=absent$/,/^          CONTINUATIONS$/p' \
+    "$workflow" | sed 's/^          //'
   printf '%s\n' \
     'printf "%s/%s/%s/%s\n" "$continuation_state" "${continuation_id-}" "${continuation_tag-}" "${continuation_source-}"'
 } >"$selector_script"
@@ -340,54 +323,10 @@ expect_selector() {
     exit 1
   }
 }
-resolver_marker=$TMP/ordinary-resolver-invoked
-resolver_stub=$TMP/forbidden-normal-resolver
-printf '#!/usr/bin/env bash\ntouch %q\n' "$resolver_marker" >"$resolver_stub"
-chmod +x "$resolver_stub"
-selector_with_resolver="$TMP/workflow-selector-with-resolver.sh"
-cp "$selector_script" "$selector_with_resolver"
-printf '%s\n' '"$FORBIDDEN_RESOLVER_STUB"' >>"$selector_with_resolver"
-expect_rejection_without_resolver() {
-  local snapshot=$1
-  rm -f -- "$resolver_marker"
-  if FORBIDDEN_RESOLVER_STUB="$resolver_stub" \
-    bash "$selector_with_resolver" "$snapshot" >/dev/null 2>&1; then
-    echo "exact recovery selector unexpectedly continued for $snapshot" >&2
-    exit 1
-  fi
-  [ ! -e "$resolver_marker" ] || {
-    echo "ordinary descriptor resolver ran before exact recovery rejection" >&2
-    exit 1
-  }
-}
 printf '%s\n' '[]' >"$TMP/absent.json"
-expect_rejection_without_resolver "$TMP/absent.json"
-jq -n --arg source "$SOURCE_170" '[{
-  id:432691220,name:"v1.7.0",tag_name:"v1.7.0",target_commitish:$source,
-  immutable:false,draft:true,prerelease:false,published_at:null,assets:[]
-}]' >"$TMP/pending-170.json"
-expect_selector "pending/432691220/v1.7.0/$SOURCE_170" "$TMP/pending-170.json"
-expect_rejection_without_resolver "$TMP/releases.json"
-expect_rejection_without_resolver "$TMP/releases-151.json"
-jq -n --arg source "$SOURCE_170" '[{
-  id:432691220,name:"v1.7.0",tag_name:"v1.7.0",target_commitish:$source,
-  immutable:true,draft:false,prerelease:false,published_at:"2026-11-03T00:00:00Z",
-  assets:[]
-}]' >"$TMP/published-170.json"
-expect_rejection_without_resolver "$TMP/published-170.json"
-for partial_filter in \
-  '.[0].draft=false' \
-  '.[0].target_commitish="'"$SOURCE"'"'; do
-  jq "$partial_filter" "$TMP/pending-170.json" >"$TMP/partial-170.json"
-  if "$ADMIT" --repository NickolayMamonov/meet-backend-v3 --repo-dir "$REPO" \
-    --dev-ref HEAD --release-id 432691220 --tag v1.7.0 --version 1.7.0 \
-    --source-sha "$SOURCE_170" --releases-file "$TMP/partial-170.json" \
-    --registry-state-file "$TMP/registry-170.txt" --refs-file "$TMP/refs.json" \
-    >/dev/null 2>&1; then
-    echo "exact recovery helper admitted partial/conflicting draft state" >&2
-    exit 1
-  fi
-done
+expect_selector absent/// "$TMP/absent.json"
+expect_selector "pending/377201468/v1.3.0/$SOURCE" "$TMP/releases.json"
+expect_selector "pending/421705542/v1.5.1/$SOURCE_151" "$TMP/releases-151.json"
 
 jq -n --arg source "$SOURCE_151" '[
   {
@@ -401,19 +340,33 @@ jq -n --arg source "$SOURCE_151" '[
     ]
   }
 ]' >"$TMP/published-151.json"
-expect_rejection_without_resolver "$TMP/published-151.json"
+expect_selector absent/// "$TMP/published-151.json"
 jq -n --arg source "$SOURCE_151" '[{
   id:421705542,name:"v1.5.1",tag_name:"v1.5.1",target_commitish:$source,
   immutable:false,draft:"yes",prerelease:false,published_at:null,assets:[]
 }]' >"$TMP/invalid-state.json"
-expect_rejection_without_resolver "$TMP/invalid-state.json"
+if bash "$selector_script" "$TMP/invalid-state.json" >/dev/null 2>&1; then
+  echo "workflow selector accepted an invalid authorized continuation state" >&2
+  exit 1
+fi
 jq -n --arg source13 "$SOURCE" --arg source151 "$SOURCE_151" '[
   {id:377201468,name:"v1.3.0",tag_name:"v1.3.0",target_commitish:$source13,
    immutable:false,draft:true,prerelease:false,published_at:null,assets:[]},
   {id:421705542,name:"v1.5.1",tag_name:"v1.5.1",target_commitish:$source151,
    immutable:false,draft:true,prerelease:false,published_at:null,assets:[]}
 ]' >"$TMP/multiple-pending.json"
-expect_rejection_without_resolver "$TMP/multiple-pending.json"
+if bash "$selector_script" "$TMP/multiple-pending.json" >/dev/null 2>&1; then
+  echo "workflow selector accepted multiple pending authorized continuations" >&2
+  exit 1
+fi
+
+# The one-time v1.7.0 recovery authority is closed after immutable publication.
+expect_rejection "$ADMIT" --repository NickolayMamonov/meet-backend-v3 \
+  --repo-dir "$REPO" --dev-ref HEAD \
+  --release-id 432691220 --tag v1.7.0 --version 1.7.0 \
+  --source-sha 9362e47e64c402d7eb38fd2c7e0420e7b01e78a0 \
+  --releases-file "$TMP/releases.json" --registry-state-file "$TMP/registry.txt" \
+  --refs-file "$TMP/refs.json"
 
 admission_source=$(sed -n '1,$p' "$ADMIT")
 line_of() {
