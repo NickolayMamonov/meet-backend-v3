@@ -2097,6 +2097,72 @@ class ForwardTests(FixtureTests):
             self.assertTrue(fixture.origin.exists())
             self.assertFalse((fixture.successor / "forward-acceptance.json").exists())
 
+def setup_hostile_character_device(path):
+    """Use one explicitly nominated real inode, or normal CI's original mknod."""
+    variable = "MEET_IV_HOSTILE_DEVICE_ASSET"
+    if variable not in os.environ:
+        os.mknod(path, stat.S_IFCHR | 0o600, os.makedev(1, 3))
+        return
+
+    def require_setup(ok, reason):
+        if not ok:
+            raise AssertionError("hostile device setup: " + reason)
+
+    @contextlib.contextmanager
+    def parent_fd(value):
+        require_setup(isinstance(value, str) and value and "\0" not in value,
+                      "empty or invalid nominated path")
+        candidate = Path(value)
+        require_setup(candidate.is_absolute() and str(candidate) == value and
+                      ".." not in candidate.parts and candidate.name,
+                      "path must be canonical and absolute")
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for position, component in enumerate((None, *candidate.parts[1:-1])):
+                if component is not None:
+                    child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=fd)
+                    os.close(fd)
+                    fd = child
+                info = os.fstat(fd)
+                # Only the exact sticky /tmp may have writable group/other bits.
+                sticky_tmp = (position == 1 and component == "tmp" and
+                              stat.S_IMODE(info.st_mode) == 0o1777)
+                require_setup(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0
+                              and (not info.st_mode & 0o022 or sticky_tmp),
+                              "unsafe or non-root parent")
+            yield fd, candidate.name
+        finally:
+            os.close(fd)
+
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_rdev,
+                info.st_uid, info.st_gid)
+
+    with parent_fd(os.environ[variable]) as (source_fd, source_name):
+        require_setup(stat.S_IMODE(os.fstat(source_fd).st_mode) == 0o700,
+                      "asset parent must be private mode0700")
+        source = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
+        require_setup(stat.S_ISCHR(source.st_mode) and source.st_rdev == os.makedev(1, 3)
+                      and source.st_uid == source.st_gid == 0
+                      and stat.S_IMODE(source.st_mode) == 0o600 and source.st_nlink == 1,
+                      "asset must be one-link root:root character1:3 mode0600")
+        with parent_fd(str(path)) as (destination_fd, destination_name):
+            require_setup(os.fstat(destination_fd).st_dev == source.st_dev,
+                          "asset and destination must share a filesystem")
+            os.link(source_name, destination_name, src_dir_fd=source_fd,
+                    dst_dir_fd=destination_fd, follow_symlinks=False)
+            linked = os.stat(destination_name, dir_fd=destination_fd, follow_symlinks=False)
+            remaining = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
+            require_setup(identity(linked) == identity(remaining) == identity(source)
+                          and linked.st_nlink == remaining.st_nlink == 2,
+                          "hardlink identity or link count differs")
+            os.unlink(source_name, dir_fd=source_fd)
+            final = os.stat(destination_name, dir_fd=destination_fd, follow_symlinks=False)
+            require_setup(identity(final) == identity(source) and final.st_nlink == 1,
+                          "destination must retain the original single-link inode")
+
+
 class HistoricalOriginalTests(FixtureTests):
     """Real Linux ownership/ACL/inode behavior, with read-only reject evidence."""
 
@@ -2266,7 +2332,7 @@ class HistoricalOriginalTests(FixtureTests):
                         with socket.socket(socket.AF_UNIX) as sock:
                             sock.bind(str(path))
                     else:
-                        os.mknod(path, stat.S_IFCHR | 0o600, os.makedev(1, 3))
+                        setup_hostile_character_device(path)
                 self.rejected_unchanged(fixture)
 
     def test_strict_roles_and_untrusted_saved_authority_reject_readonly(self):

@@ -25,6 +25,232 @@ baseline=6b0bc309eb00c2c3b0628f4fd86f61e60a26d79d
   [ -f "$retention_fixture" ] && [ -f "$public_probes" ] &&
   [ -f "$public_probe" ] && [ -f "$closed_beta_fixture" ]
 workflow_text=$(<"$workflow")
+# deploy_runner_routing_and_admission: no real tools, sockets or transports.
+python3 - "$workflow" <<'PY'
+import contextlib
+import copy
+import hashlib
+import io
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+
+text = pathlib.Path(sys.argv[1]).read_text()
+assert re.search(r"      use_self_hosted_deploy:\n        description: [^\n]+\n"
+                 r"        required: true\n        default: false\n        type: boolean\n", text)
+routing = "inputs.use_self_hosted_deploy && 'meet-deploy-v170-once' || 'ubuntu-24.04'"
+assert "    runs-on: ${{ " + routing + " }}" in text
+assert "    timeout-minutes: ${{ inputs.use_self_hosted_deploy && 45 || 360 }}" in text
+assert text.split("    steps:\n", 1)[1].startswith(
+    "      - name: Admit disposable deploy-only runner\n        if: ${{ inputs.use_self_hosted_deploy }}\n")
+assert ("      - name: Set up Buildx for immutable descriptor verification\n"
+        "        if: ${{ !inputs.use_self_hosted_deploy }}\n"
+        "        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435") in text
+for inputs, host, minutes in (({}, "ubuntu-24.04", 360),
+                              ({"use_self_hosted_deploy": False}, "ubuntu-24.04", 360),
+                              ({"use_self_hosted_deploy": True}, "meet-deploy-v170-once", 45)):
+    enabled = inputs.get("use_self_hosted_deploy", False)
+    assert (enabled and "meet-deploy-v170-once" or "ubuntu-24.04") == host
+    assert (enabled and 45 or 360) == minutes
+step = text.split("      - name: Admit disposable deploy-only runner\n", 1)[1]
+step = step.split("\n      - name: ", 1)[0]
+shell = step.split("        run: |\n", 1)[1]
+shell = "\n".join(line[10:] if line.startswith("          ") else line
+                  for line in shell.splitlines())
+code = compile(shell.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0], "workflow admission", "exec")
+
+# All pins and binaries below are fictional IN-MEMORY fixture data, never manifests.
+paths = {"docker": "/opt/meet-deploy-tools/bin/docker",
+         "buildx": "/opt/meet-deploy-tools/lib/docker/cli-plugins/docker-buildx",
+         "gh": "/opt/meet-deploy-tools/bin/gh",
+         "runner": "/opt/meet-deploy-runner/bin/Runner.Listener"}
+binaries = {path: ("fixture-only:" + name).encode() for name, path in paths.items()}
+pins = {"schema": "meet-deploy-toolchain/v1", "tools": {
+    name: {"path": path, "sha256": hashlib.sha256(binaries[path]).hexdigest(),
+           "version": "fixture-only-" + name} for name, path in paths.items()},
+    "engine": {"id": "fixture-only-engine", "server_version": "fixture-only-version"}}
+inputs = {"release_tag": "v1.7.0", "failure_policy": "manual-stop",
+          "run_rollback_drill": False, "apply_pending_locationiq_off": False,
+          "reconcile_failed_40368479855_forward": False, "use_self_hosted_deploy": True}
+launch = {"schema": "meet-deploy-runner/v1", "repository": "NickolayMamonov/meet-backend-v3",
+          "workflow_ref": "NickolayMamonov/meet-backend-v3/.github/workflows/deploy-test-vps.yml@refs/heads/dev",
+          "tooling_sha": "a" * 40, "run_id": "12345", "attempt": 1, "inputs": inputs,
+          "toolchain_sha256": ""}
+runtime = {"RUNNER_OS": "Linux", "RUNNER_ARCH": "X64", "GITHUB_REPOSITORY": launch["repository"],
+           "GITHUB_WORKFLOW_REF": launch["workflow_ref"], "GITHUB_EVENT_NAME": "workflow_dispatch",
+           "GITHUB_REF": "refs/heads/dev", "GITHUB_SHA": launch["tooling_sha"],
+           "GITHUB_WORKFLOW_SHA": launch["tooling_sha"], "GITHUB_RUN_ID": "12345",
+           "GITHUB_RUN_ATTEMPT": "1", "ADMISSION_INPUTS_JSON": json.dumps(inputs),
+           "GITHUB_ENV": "fixture-only-env", "HOME": "wrong", "DOCKER_CONTEXT": "wrong",
+           "DOCKER_TLS_VERIFY": "1", "DOCKER_CERT_PATH": "wrong", "DOCKER_AUTH_CONFIG": "wrong",
+           "DOCKER_HOST": "unix:///var/run/docker.sock", "BUILDX_BUILDER": "wrong", "BUILDKIT_HOST": "wrong"}
+engine = {"ID": pins["engine"]["id"], "ServerVersion": pins["engine"]["server_version"],
+          "OSType": "linux", "Architecture": "x86_64", "SecurityOptions": ["name=rootless"],
+          "DockerRootDir": "/var/lib/meet-verifier/docker", "Containers": 0,
+          "ClientInfo": {"Plugins": [{"Name": "buildx", "Path": paths["buildx"]}]}}
+cases = 0
+
+def admission_case(name, reject=False, change_launch=None, change_lock=None, change_engine=None,
+                   env_change=None, metadata=None, missing=None, raw_launch=None, raw_lock=None,
+                   bad_binary=None, bad_version=None, reused_home=False, failed_tool=False):
+    global cases
+    bound, lock, env, info = map(copy.deepcopy, (launch, pins, runtime, engine))
+    if change_lock:
+        change_lock(lock)
+    lock_bytes = raw_lock if raw_lock is not None else json.dumps(lock).encode()
+    bound["toolchain_sha256"] = hashlib.sha256(lock_bytes).hexdigest()
+    if change_launch:
+        change_launch(bound)
+    if change_engine:
+        change_engine(info)
+    env.update(env_change or {})
+    files = {"/opt/meet-deploy-admission/launch.json":
+             raw_launch if raw_launch is not None else json.dumps(bound).encode(),
+             "/opt/meet-deploy-admission/toolchain.lock.json": lock_bytes}
+    calls, created, published = [], [], []
+    class EnvStream(io.StringIO):
+        def close(self):
+            published.append(self.getvalue())
+            super().close()
+    class FixturePath(pathlib.PurePosixPath):
+        def lstat(self):
+            path = str(self)
+            if path == missing:
+                raise FileNotFoundError(path)
+            mode, uid = stat.S_IFDIR | 0o755, 0
+            if path in files:
+                mode = stat.S_IFREG | 0o644
+            if path in binaries:
+                mode = stat.S_IFREG | 0o755
+            if path == "/home/meet-deploy":
+                mode, uid = stat.S_IFDIR | 0o700, 1001
+            if path == "/run/meet-verifier/docker.sock":
+                mode, uid = stat.S_IFSOCK | 0o600, 1001
+            if metadata and path == metadata[0]:
+                mode, uid = metadata[1:]
+            return SimpleNamespace(st_mode=mode, st_uid=uid, st_size=len(files.get(path, b"")))
+        stat = lstat
+        def read_bytes(self):
+            return files[str(self)]
+        def open(self, mode):
+            assert mode == "rb" and str(self) in binaries
+            return io.BytesIO(b"wrong" if str(self) == bad_binary else binaries[str(self)])
+        def mkdir(self, mode):
+            assert mode == 0o700
+            if reused_home and str(self).endswith("/job"):
+                raise FileExistsError(str(self))
+            created.append(str(self))
+        def write_text(self, value):
+            assert str(self) == "/home/meet-deploy/job/.docker/config.json"
+            assert json.loads(value) == {"cliPluginsExtraDirs":
+                                        ["/opt/meet-deploy-tools/lib/docker/cli-plugins"]}
+    versions = {path: pins["tools"][name]["version"] for name, path in paths.items()}
+    allowed = [[paths[name], flag] for name, flag in
+               (("docker", "--version"), ("buildx", "version"), ("gh", "--version"), ("runner", "--version"))]
+    allowed += [[paths["docker"], "buildx", "version"],
+                [paths["docker"], "info", "--format", "{{json .}}"]]
+    def fake_run(argv, **kwargs):
+        assert argv == allowed[len(calls)], (name, argv)
+        calls.append(argv)
+        assert kwargs == {"check": True, "capture_output": True, "text": True, "timeout": 30}
+        assert os.environ["DOCKER_HOST"] == "unix:///run/meet-verifier/docker.sock"
+        assert os.environ["HOME"] == "/home/meet-deploy/job"
+        assert not any(os.environ.get(key) for key in
+                       ("DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
+                        "DOCKER_AUTH_CONFIG", "BUILDX_BUILDER", "BUILDKIT_HOST"))
+        if failed_tool:
+            raise subprocess.CalledProcessError(1, argv)
+        value = (json.dumps(info) if argv == allowed[-1] else
+                 versions[paths["buildx"]] if argv == allowed[-2] else versions[argv[0]])
+        return SimpleNamespace(stdout=value + ("-wrong" if argv[0] == bad_version else "") + "\n")
+    def env_open(path, mode, **kwargs):
+        assert path == "fixture-only-env" and mode == "a" and kwargs == {"encoding": "utf-8"}
+        return EnvStream()
+    error = None
+    output = io.StringIO()
+    with patch.dict(os.environ, env, clear=True), patch("pathlib.Path", FixturePath), \
+            patch("os.getuid", return_value=1001, create=True), patch("os.access", return_value=True), \
+            patch("subprocess.run", fake_run), patch("builtins.open", env_open), \
+            contextlib.redirect_stdout(output):
+        try:
+            exec(code, {"__name__": "__main__"})
+        except (SystemExit, ValueError, FileNotFoundError, FileExistsError,
+                KeyError, subprocess.CalledProcessError) as caught:
+            error = caught
+    assert (error is not None) == reject, (name, error)
+    if reject:
+        assert not published, name
+    else:
+        assert len(calls) == 6 and len(published) == 1, name
+        assert created == ["/home/meet-deploy/job", "/home/meet-deploy/job/.docker"]
+        values = dict(line.split("=", 1) for line in published[0].splitlines())
+        assert values == {**{key: "" for key in runtime if key.startswith(("DOCKER_", "BUILDX_", "BUILDKIT_"))},
+                          "HOME": "/home/meet-deploy/job", "DOCKER_CONFIG": "/home/meet-deploy/job/.docker",
+                          "GH_CONFIG_DIR": "/home/meet-deploy/job/.config/gh",
+                          "DOCKER_HOST": "unix:///run/meet-verifier/docker.sock",
+                          "PATH": "/opt/meet-deploy-tools/bin:/usr/bin:/bin"}
+        assert output.getvalue().strip() == "deploy_runner_admission=approved"
+    cases += 1
+
+admission_case("valid, with inherited overrides")
+for key, value in (("repository", "wrong"), ("workflow_ref", "wrong"), ("schema", "wrong"),
+                   ("tooling_sha", "b" * 40), ("run_id", 12345), ("run_id", "012345"),
+                   ("attempt", True), ("attempt", 2), ("toolchain_sha256", "0" * 64)):
+    admission_case("launch " + key, True, change_launch=lambda x, k=key, v=value: x.update({k: v}))
+admission_case("missing launch key", True, change_launch=lambda x: x.pop("run_id"))
+admission_case("extra launch key", True, change_launch=lambda x: x.update(extra=True))
+for key, value in inputs.items():
+    admission_case("input " + key, True, change_launch=lambda x, k=key, v=value:
+                   x["inputs"].update({k: "wrong" if type(v) is str else not v}))
+    if type(value) is bool:
+        admission_case("integer boolean " + key, True, change_launch=lambda x, k=key:
+                       x["inputs"].update({k: int(inputs[k])}))
+admission_case("extra input", True, change_launch=lambda x: x["inputs"].update(extra=False))
+admission_case("runtime typed input", True, env_change={
+    "ADMISSION_INPUTS_JSON": json.dumps(dict(inputs, use_self_hosted_deploy="true"))})
+for key in ("GITHUB_SHA", "GITHUB_WORKFLOW_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+            "GITHUB_REPOSITORY", "GITHUB_WORKFLOW_REF", "GITHUB_EVENT_NAME", "GITHUB_REF",
+            "RUNNER_OS", "RUNNER_ARCH"):
+    admission_case("runtime " + key, True, env_change={key: "wrong"})
+for raw in (b'{', b'{"schema":1,"schema":2}', b'{"schema":NaN}', b' ' * 65537):
+    admission_case("invalid launch JSON", True, raw_launch=raw)
+for raw in (b'{"schema":1,"schema":2}', b' ' * 65537):
+    admission_case("invalid lock JSON", True, raw_lock=raw)
+for filename in ("launch.json", "toolchain.lock.json"):
+    admission_case("missing manifest", True, missing="/opt/meet-deploy-admission/" + filename)
+admission_case("extra lock key", True, change_lock=lambda x: x.update(extra=True))
+admission_case("lock schema", True, change_lock=lambda x: x.update(schema="wrong"))
+for name, path in paths.items():
+    admission_case("digest " + name, True, bad_binary=path)
+    admission_case("version " + name, True, bad_version=path)
+    admission_case("path " + name, True, change_lock=lambda x, n=name: x["tools"][n].update(path="/wrong"))
+for path in ("/opt", "/opt/meet-deploy-admission", "/opt/meet-deploy-admission/launch.json",
+             "/opt/meet-deploy-admission/toolchain.lock.json", paths["docker"]):
+    kind = stat.S_IFREG if path in binaries or path.endswith(".json") else stat.S_IFDIR
+    for mode, uid in ((kind | 0o777, 0), (stat.S_IFLNK | 0o777, 0), (kind | 0o755, 1001)):
+        admission_case("untrusted path " + path, True, metadata=(path, mode, uid))
+admission_case("reused HOME", True, reused_home=True)
+admission_case("nonprivate HOME", True, metadata=("/home/meet-deploy", stat.S_IFDIR | 0o755, 1001))
+for mode, uid in ((stat.S_IFREG | 0o600, 1001), (stat.S_IFSOCK | 0o666, 1001),
+                  (stat.S_IFSOCK | 0o600, 0), (stat.S_IFLNK | 0o777, 1001)):
+    admission_case("socket identity", True, metadata=("/run/meet-verifier/docker.sock", mode, uid))
+for key, value in (("ID", "wrong"), ("ServerVersion", "wrong"), ("OSType", "windows"),
+                   ("Architecture", "arm64"), ("SecurityOptions", []),
+                   ("DockerRootDir", "/var/lib/docker"), ("Containers", 1), ("Containers", False)):
+    admission_case("engine " + key, True, change_engine=lambda x, k=key, v=value: x.update({k: v}))
+admission_case("selected plugin", True, change_engine=lambda x:
+               x["ClientInfo"]["Plugins"][0].update(Path="/wrong"))
+admission_case("duplicate plugin", True, change_engine=lambda x:
+               x["ClientInfo"]["Plugins"].append(copy.deepcopy(x["ClientInfo"]["Plugins"][0])))
+admission_case("tool failure", True, failed_tool=True)
+print(f"deploy_runner_routing_and_admission=passed cases={cases} valid=1 rejected={cases - 1}")
+PY
 python3 - "$workflow" <<'PY'
 import json
 import pathlib
