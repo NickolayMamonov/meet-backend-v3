@@ -31,6 +31,11 @@ on:
         required: true
         default: false
         type: boolean
+      use_self_hosted_deploy:
+        description: Use the separately approved disposable deploy-only runner
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -40,7 +45,8 @@ permissions:
 jobs:
   deploy:
     if: github.ref == 'refs/heads/dev'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.use_self_hosted_deploy && 'meet-deploy-v170-once' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ inputs.use_self_hosted_deploy && 45 || 360 }}
     concurrency:
       group: test-vps-deploy-${{ github.repository }}
       cancel-in-progress: false
@@ -61,6 +67,173 @@ jobs:
       IMAGE: ghcr.io/nickolaymamonov/meet-backend-v3
       PUBLIC_URL: https://api.whysoezzy.online
     steps:
+      - name: Admit disposable deploy-only runner
+        if: ${{ inputs.use_self_hosted_deploy }}
+        env:
+          ADMISSION_INPUTS_JSON: ${{ toJSON(inputs) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import stat
+          import subprocess
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit("deploy admission rejected: " + message)
+
+          def closed(value, keys):
+              require(type(value) is dict and set(value) == set(keys), "closed object")
+              return value
+
+          def unique(pairs):
+              result = {}
+              for key, value in pairs:
+                  require(key not in result, "duplicate key")
+                  result[key] = value
+              return result
+
+          def parse(raw):
+              return json.loads(raw, object_pairs_hook=unique,
+                                parse_constant=lambda _: require(False, "JSON constant"))
+
+          def trusted(path, directory=False):
+              path = pathlib.Path(path)
+              for parent in reversed(path.parents):
+                  info = parent.lstat()
+                  require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and
+                          not info.st_mode & 0o022, "readonly root-owned parent")
+              info = path.lstat()
+              kind = stat.S_ISDIR if directory else stat.S_ISREG
+              require(kind(info.st_mode) and info.st_uid == 0 and
+                      not info.st_mode & 0o022, "readonly root-owned path")
+              return path
+
+          def read_manifest(path):
+              path = trusted(path)
+              require(path.stat().st_size <= 65536, "manifest size")
+              return path.read_bytes()
+
+          env = os.environ
+          require(os.getuid() != 0 and env.get("RUNNER_OS") == "Linux" and
+                  env.get("RUNNER_ARCH") == "X64", "non-root Linux x64")
+          repository = "NickolayMamonov/meet-backend-v3"
+          workflow_ref = repository + "/.github/workflows/deploy-test-vps.yml@refs/heads/dev"
+          expected_inputs = {
+              "release_tag": "v1.7.0", "failure_policy": "manual-stop",
+              "run_rollback_drill": False, "apply_pending_locationiq_off": False,
+              "reconcile_failed_40368479855_forward": False, "use_self_hosted_deploy": True,
+          }
+          launch = closed(parse(read_manifest("/opt/meet-deploy-admission/launch.json")),
+                          ("schema", "repository", "workflow_ref", "tooling_sha",
+                           "run_id", "attempt", "inputs", "toolchain_sha256"))
+          for key in ("schema", "repository", "workflow_ref", "tooling_sha",
+                      "run_id", "toolchain_sha256"):
+              require(type(launch[key]) is str, "launch string type")
+          require(launch["schema"] == "meet-deploy-runner/v1" and
+                  launch["repository"] == env.get("GITHUB_REPOSITORY") == repository and
+                  launch["workflow_ref"] == env.get("GITHUB_WORKFLOW_REF") == workflow_ref and
+                  env.get("GITHUB_EVENT_NAME") == "workflow_dispatch" and
+                  env.get("GITHUB_REF") == "refs/heads/dev", "workflow identity")
+          require(re.fullmatch("[0-9a-f]{40}", launch["tooling_sha"]) and
+                  launch["tooling_sha"] == env.get("GITHUB_SHA") ==
+                  env.get("GITHUB_WORKFLOW_SHA"), "approved tooling SHA")
+          require(re.fullmatch("[1-9][0-9]*", launch["run_id"]) and
+                  launch["run_id"] == env.get("GITHUB_RUN_ID") and
+                  type(launch["attempt"]) is int and launch["attempt"] == 1 and
+                  env.get("GITHUB_RUN_ATTEMPT") == "1", "initial bound run")
+          for inputs in (launch["inputs"], parse(env["ADMISSION_INPUTS_JSON"])):
+              closed(inputs, expected_inputs)
+              require(all(type(inputs[key]) is type(value) and inputs[key] == value
+                          for key, value in expected_inputs.items()), "approved inputs")
+          raw_lock = read_manifest("/opt/meet-deploy-admission/toolchain.lock.json")
+          require(re.fullmatch("[0-9a-f]{64}", launch["toolchain_sha256"]) and
+                  hashlib.sha256(raw_lock).hexdigest() == launch["toolchain_sha256"],
+                  "hash-bound toolchain")
+          lock = closed(parse(raw_lock), ("schema", "tools", "engine"))
+          require(lock["schema"] == "meet-deploy-toolchain/v1", "lock schema")
+          tools = closed(lock["tools"], ("docker", "buildx", "gh", "runner"))
+          paths = {
+              "docker": "/opt/meet-deploy-tools/bin/docker",
+              "buildx": "/opt/meet-deploy-tools/lib/docker/cli-plugins/docker-buildx",
+              "gh": "/opt/meet-deploy-tools/bin/gh",
+              "runner": "/opt/meet-deploy-runner/bin/Runner.Listener",
+          }
+          for name, path in paths.items():
+              pin = closed(tools[name], ("path", "sha256", "version"))
+              require(all(type(pin[key]) is str for key in pin) and pin["path"] == path and
+                      re.fullmatch("[0-9a-f]{64}", pin["sha256"]) and
+                      0 < len(pin["version"]) <= 512, "tool pin")
+              binary = trusted(path)
+              require(os.access(binary, os.X_OK), "executable tool")
+              with binary.open("rb") as stream:
+                  require(hashlib.file_digest(stream, "sha256").hexdigest() == pin["sha256"],
+                          "binary digest")
+          engine = closed(lock["engine"], ("id", "server_version"))
+          require(all(type(value) is str and 0 < len(value) <= 256
+                      for value in engine.values()), "engine pin")
+
+          # The external sandbox provides these paths; never provision or repair it here.
+          trusted("/home", directory=True)
+          home_parent = pathlib.Path("/home/meet-deploy")
+          info = home_parent.lstat()
+          require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                  stat.S_IMODE(info.st_mode) == 0o700, "private home parent")
+          home = home_parent / "job"
+          home.mkdir(mode=0o700)  # Exclusive creation rejects reuse of an earlier job.
+          config = home / ".docker"
+          config.mkdir(mode=0o700)
+          (config / "config.json").write_text(json.dumps({
+              "cliPluginsExtraDirs": [str(pathlib.Path(paths["buildx"]).parent)]
+          }))
+          cleared = [key for key in env if key.startswith(("DOCKER_", "BUILDX_", "BUILDKIT_"))]
+          for key in cleared:
+              del env[key]
+          fixed = {
+              "HOME": str(home), "DOCKER_CONFIG": str(config),
+              "GH_CONFIG_DIR": str(home / ".config/gh"),
+              "DOCKER_HOST": "unix:///run/meet-verifier/docker.sock",
+              "PATH": "/opt/meet-deploy-tools/bin:/usr/bin:/bin",
+          }
+          env.update(fixed)
+
+          def output(argv):
+              return subprocess.run(argv, check=True, capture_output=True, text=True,
+                                    timeout=30).stdout.strip()
+
+          for name, flag in (("docker", "--version"), ("buildx", "version"),
+                             ("gh", "--version"), ("runner", "--version")):
+              require(output([paths[name], flag]) == tools[name]["version"], "tool version")
+          require(output([paths["docker"], "buildx", "version"]) == tools["buildx"]["version"],
+                  "selected Buildx version")
+          trusted("/run/meet-verifier", directory=True)
+          socket = pathlib.Path("/run/meet-verifier/docker.sock").lstat()
+          require(stat.S_ISSOCK(socket.st_mode) and socket.st_uid == os.getuid() and
+                  stat.S_IMODE(socket.st_mode) == 0o600, "private socket identity")
+          info = parse(output([paths["docker"], "info", "--format", "{{json .}}"]))
+          require(info["ID"] == engine["id"] and info["ServerVersion"] == engine["server_version"] and
+                  info["OSType"] == "linux" and info["Architecture"] == "x86_64" and
+                  "name=rootless" in info["SecurityOptions"] and
+                  info["DockerRootDir"] == "/var/lib/meet-verifier/docker" and
+                  type(info["Containers"]) is int and info["Containers"] == 0,
+                  "fresh rootless verification engine")
+          plugins = [plugin for plugin in info["ClientInfo"]["Plugins"] if plugin["Name"] == "buildx"]
+          require(len(plugins) == 1 and plugins[0]["Path"] == paths["buildx"],
+                  "selected Buildx binary")
+          # Persist only after all checks. Empty values suppress inherited Docker overrides.
+          with open(env["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+              for key in cleared:
+                  stream.write(key + "=\n")
+              for key, value in fixed.items():
+                  stream.write(key + "=" + value + "\n")
+          print("deploy_runner_admission=approved")
+          PY
+
       - name: Protected test-VPS preflight
         shell: bash
         run: |
@@ -110,6 +283,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Buildx for immutable descriptor verification
+        if: ${{ !inputs.use_self_hosted_deploy }}
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
 
       - name: Resolve and verify published immutable release
